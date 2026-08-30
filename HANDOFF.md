@@ -35,8 +35,24 @@ ANA-2 (orchestration design) gate most MODs; MOD-1 (TUI scaffold) can start imme
   item state, OneDev canonical for story/discussion, `items.json` a derived snapshot for offline /
   fresh-clone use), conflict rule on concurrent edits from two boxes (proposal: `updated_at` +
   uuid, last-writer-wins per field, sync job reports divergence instead of silently merging), and
-  where run transcripts live (proposal: filesystem under a data dir, path + digest in DB — not
-  BLOBs). Output: `docs/ANA-1.md` with the schema DDL sketch. Spawns MOD-5, MOD-6, MOD-7.
+  where run transcripts live. Transcript proposal (settled 2026-08-30, session with maintainer):
+  **split, two destinations** — the distilled step summary / final message goes to the OneDev
+  issue as a *comment* (human story), the full raw transcript goes up as an issue *attachment*
+  (big, on-demand debugging), written locally first and referenced as `run.transcript_ref text`
+  (`file://...` until uploaded, `onedev://<issue>/<attachment>` after) with `prompt_digest` kept
+  beside it; the uploader **must scrub secrets** (env vars, tokens echoed in tool output) before
+  anything leaves the box, since an attachment is visible to everyone with repo access. Two more
+  settled shapes the DDL must carry: **(a)** an `artifact` table (`item_id`, optional `run_id`,
+  `kind` in `prd|plan|review|summary`, markdown `content` capped ~4-8 KB because it is
+  prompt-injected, `created_at`) — agents never receive raw transcripts of previous items, the
+  prompt builder injects linked items' artifacts instead (same index-plus-one-write-up economy the
+  dingine workflow uses); `kind='summary'` is the DB-native decision write-up MOD-4 emits on
+  completion. **(b)** an `item_link` edge table (`from_item`, `to_item`, `kind` in
+  `blocks|origin|relates|supersedes`, composite PK) **replacing** any `blocked_on` array or
+  `origin` column on `item` — traversal is a recursive CTE, no graph database; the prompt builder
+  walks 1-2 hops and collects neighbors' `summary`/`review` artifacts, so htui bounds the token
+  cost, not the agent. Output: `docs/ANA-1.md` with the schema DDL sketch. Spawns MOD-5, MOD-6,
+  MOD-7.
 - [ ] **ANA-2 - Orchestration pipeline design.** Design the multi-agent chain (ultracode-like, but
   agy is a first-class step): a run is a typed step graph, e.g. PRD (claude) → plan (claude) →
   implement (agy, possibly fan-out) → review (claude, cpp-reviewer persona for C++ targets), each
@@ -62,8 +78,10 @@ ANA-2 (orchestration design) gate most MODs; MOD-1 (TUI scaffold) can start imme
   headless/streaming mode (claude: `-p --output-format stream-json`; confirm agy's equivalent).
   Running an item opens a new tab streaming the chat (user/assistant/tool events rendered, input
   box for follow-ups). Prompt builder per the ANA-2 contract: one self-contained initial prompt
-  (item body + box characteristics + injected skill text + htui-selected file excerpts), system
-  skills disabled on the agent invocation. Blocked on MOD-1; the prompt/skill contract is ANA-2's.
+  (item body + box characteristics + injected skill text + htui-selected file excerpts + linked
+  items' `summary`/`review` artifacts via a 1-2 hop `item_link` walk, per ANA-1 — never raw
+  transcripts), system skills disabled on the agent invocation. Blocked on MOD-1; the prompt/skill
+  contract is ANA-2's.
 - [ ] **MOD-3 - Diff tab + code explorer.** Diff tab: working-tree diff of the target repo
   (`git diff` via `git2` or subprocess), side-by-side or unified, refreshable while an agent runs.
   Code explorer main tab: file tree + read-only viewer with syntax highlighting, enough to inspect
@@ -76,7 +94,10 @@ ANA-2 (orchestration design) gate most MODs; MOD-1 (TUI scaffold) can start imme
 - [ ] **MOD-5 - OneDev issue sync** (from ANA-1). Direct REST client against the OneDev instance
   (token auth), no agent involvement: create/update an issue per item, mirror status transitions,
   keep story + long-form discussion on the issue, pull remote edits back into the DB per ANA-1's
-  conflict rule. Manual "sync now" plus sync-on-item-change. Blocked on ANA-1 and MOD-6.
+  conflict rule. Also carries the transcript path from ANA-1: post the step summary as an issue
+  comment, upload the full transcript as an issue attachment (secret-scrub pass first), flip
+  `run.transcript_ref` to the `onedev://` form. Manual "sync now" plus sync-on-item-change.
+  Blocked on ANA-1 and MOD-6.
 - [ ] **MOD-6 - Item store: `items.json` + Postgres** (from ANA-1). Implement the ANA-1 schema:
   `sqlx` (or `tokio-postgres`) migrations, the store trait from MOD-1 gets a DB-backed
   implementation, `items.json` written as a derived snapshot on change, uuid minted at item
