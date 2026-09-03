@@ -30,6 +30,13 @@ unsafe_code                   = "forbid"
 missing_debug_implementations = "warn"
 unused_qualifications         = "warn"
 
+[workspace.lints.rustdoc]
+# Named lints, not the `rustdoc::all` group: a future rustc adding one cannot break the build
+# (blueprint A.4 reason 2). Inert outside `cargo doc`, so the TDD loop is untouched.
+broken_intra_doc_links   = "deny"
+private_intra_doc_links  = "deny"
+redundant_explicit_links = "deny"
+
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 # clippy::pedantic is deliberately NOT enabled.

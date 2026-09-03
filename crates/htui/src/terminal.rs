@@ -18,7 +18,7 @@ pub struct TerminalGuard {
 /// Installs the panic hook and takes the terminal over.
 ///
 /// Panics if the terminal cannot be put into raw mode, which is
-/// [`ratatui::init`]'s contract; there is no usable TUI in that case.
+/// [`ratatui::init()`]'s contract; there is no usable TUI in that case.
 #[must_use]
 pub fn init() -> TerminalGuard {
     install_panic_hook();

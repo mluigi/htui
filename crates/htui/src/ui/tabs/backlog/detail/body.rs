@@ -1,5 +1,7 @@
 //! The Body sub-tab: the item's head fields and its markdown body.
 
+use std::borrow::Cow;
+
 use htui_core::model::{Item, ItemId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -75,17 +77,17 @@ impl DetailTab for BodyTab {
             return;
         };
 
-        let tags = if item.required_tags.is_empty() {
-            "no tags".to_owned()
+        let tags: Cow<'_, str> = if item.required_tags.is_empty() {
+            Cow::Borrowed("no tags")
         } else {
-            item.required_tags.join(", ")
+            Cow::Owned(item.required_tags.join(", "))
         };
         let head = Text::from(vec![
-            Line::styled(item.title.clone(), ctx.theme.title),
+            Line::styled(item.title.as_str(), ctx.theme.title),
             Line::from(vec![
-                Span::styled(item.key.clone(), ctx.theme.accent),
+                Span::styled(item.key.as_str(), ctx.theme.accent),
                 Span::raw("  "),
-                Span::styled(item.key_prefix.clone(), ctx.theme.dim),
+                Span::styled(item.key_prefix.as_str(), ctx.theme.dim),
                 Span::raw("  "),
                 Span::styled(item.status.as_str(), ctx.theme.status_style(item.status)),
             ]),
@@ -108,7 +110,7 @@ impl DetailTab for BodyTab {
             return;
         }
         frame.render_widget(
-            Paragraph::new(Text::raw(item.body.clone()))
+            Paragraph::new(Text::raw(item.body.as_str()))
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll.offset(), 0)),
             body_area,

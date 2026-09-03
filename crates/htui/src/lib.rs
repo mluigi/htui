@@ -3,7 +3,7 @@
 //! The crate is a library with a thin binary on top: an integration test can only link a lib
 //! target, and T4/T5's snapshot tests live under `tests/` (blueprint A.1).
 //!
-//! Shape, from the outside in: [`store_worker`] owns the only [`Backend`](htui_core::store::Backend)
+//! Shape, from the outside in: [`store_worker`] owns the only [`Backend`]
 //! and answers over two unbounded channels; [`app`] holds the state and is the only place a state
 //! change happens; [`ui`] draws and emits actions. No view holds a store handle or a channel,
 //! which is `R-NF-3` by construction rather than by convention (plan D4).

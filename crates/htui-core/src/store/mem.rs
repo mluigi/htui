@@ -1,7 +1,7 @@
 //! In-memory store (`MemStore`), blueprint B.8.
 //!
 //! Every row of `docs/ANA-9.md` §5 the TUI reads lives in one [`std::sync::RwLock`]-guarded map,
-//! and every trait method is a single call to [`MemStore::read`] or [`MemStore::write`] with a
+//! and every trait method is a single call to the private `read` or `write` helper with a
 //! plain, non-async closure that computes and clones owned values. The async bodies contain no
 //! `.await` at all, so holding a lock guard across a suspension point is structurally impossible
 //! rather than a convention (plan D6).
@@ -518,6 +518,8 @@ impl State {
                 new.id
             )));
         }
+        // Before the counter moves: a §4.1 key number a refused mint consumed is never given back.
+        require_author(new.created_by, "item.created_by")?;
 
         let prefix = kind.prefix.clone();
         let counter = self
@@ -595,14 +597,28 @@ impl State {
             return Ok(UpdateOutcome::Diverged { head, ancestor });
         }
 
+        // Everything that can refuse the edit runs here, after the compare-and-set and before the
+        // first write: `item` is borrowed mutably, so an `Err` returned mid-apply would leave a
+        // half-edited item with no version bump and no revision.
+        require_author(patch.author_id, "item_revision.author_id")?;
+        if let Some(kind_id) = patch.kind_id {
+            let kind = self.kinds.get(&kind_id).ok_or_else(|| {
+                StoreError::Constraint(format!("item_kind `{kind_id}` does not exist"))
+            })?;
+            if kind.project_id != item.project_id {
+                return Err(StoreError::Constraint(format!(
+                    "item_kind `{}` belongs to project `{}`, not `{}`",
+                    kind.prefix, kind.project_id, item.project_id
+                )));
+            }
+            item.kind_id = kind_id;
+        }
+
         if let Some(title) = patch.title {
             item.title = title;
         }
         if let Some(body) = patch.body {
             item.body = body;
-        }
-        if let Some(kind_id) = patch.kind_id {
-            item.kind_id = kind_id;
         }
         if let Some(required_tags) = patch.required_tags {
             item.required_tags = required_tags;
@@ -638,6 +654,9 @@ impl State {
     }
 
     /// Compare-and-set on `status` alone: never bumps `version`, never writes a revision (§4.2).
+    ///
+    /// `closed_at` tracks the current status, not the history: it is set on a move to a terminal
+    /// status and cleared on a move back to a live one (blueprint Errata).
     fn transition(
         &mut self,
         id: ItemId,
@@ -657,11 +676,22 @@ impl State {
         }
         item.status = to;
         item.updated_at = now;
-        if to.is_terminal() {
-            item.closed_at = Some(now);
-        }
+        item.closed_at = to.is_terminal().then_some(now);
         Ok(true)
     }
+}
+
+/// A revision author must name a real `app_user` row (§5.5 `REFERENCES app_user(id)`); the nil
+/// UUID is what `UserId::default()` yields, so it is rejected here rather than written and later
+/// refused by MOD-6's `PgStore`. An author that is non-nil but unknown is out of scope: the
+/// default [`MemStore::new`] holds no users at all (plan D7).
+fn require_author(id: UserId, column: &str) -> Result<()> {
+    if id.as_uuid().is_nil() {
+        return Err(StoreError::Constraint(format!(
+            "{column} must reference an app_user; the nil UUID does not"
+        )));
+    }
+    Ok(())
 }
 
 impl ReadStore for MemStore {

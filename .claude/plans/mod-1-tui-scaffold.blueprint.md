@@ -1308,3 +1308,34 @@ Found by the adversarial verifiers; the code follows the corrected reading.
   no tabs; `OverlayId::ANY` wildcard scope added so `Esc` can bind before any overlay exists.
 - **§D "Startup"**: `register_all` names the switcher as `App::startup_overlay`; the first frame
   is the bare shell, and only an empty first `Workspaces` reply opens the switcher.
+- **§C.2 `transition`**: the rule is `closed_at = to.is_terminal().then_some(now)`, not
+  `if to.is_terminal() { closed_at = Some(now) }` — the one-armed form leaves a stale `closed_at`
+  on an item moved back from a terminal status to a live one. ANA-9 §4.2 states the status CAS
+  without naming `closed_at`, so this corrects the blueprint alone. MOD-6's `PgStore` writes
+  `closed_at = CASE WHEN $new IN ('done','closed') THEN now() END` in the same statement;
+  `status_cas_keeps_version` (§B.9) carries the reopen leg.
+- **§B.8 `update_item`**: "apply only `Some` fields" is not the whole rule for `kind_id`; the
+  patched kind must exist and belong to the item's project, the same predicate `mint` applies,
+  checked after the `version` compare-and-set so a stale edit still answers `Diverged`. Like
+  `mint_unknown_kind_rejected` this is application-level: ANA-9 §5.5 has no composite
+  `(project_id, kind_id)` FK, so MOD-6's `PgStore` needs an explicit
+  `EXISTS (SELECT 1 FROM item_kind k WHERE k.id = $kind AND k.project_id = item.project_id)`
+  guard (or ANA-9 gains `UNIQUE (project_id, id)` on `item_kind` plus a composite FK).
+  `key_prefix`/`key_number`/`key` stay as minted (§4.1), even across a kind change.
+- **§B.8 authorship**: `mint_item` rejects a nil `created_by` and `update_item` a nil
+  `patch.author_id` with `StoreError::Constraint`, because `ItemPatch`/`UserId` derive `Default`
+  and §5.5 declares `item.created_by` / `item_revision.author_id REFERENCES app_user(id)`. The
+  mint check runs before the key counter moves, the update check after the compare-and-set and
+  before the first field write. MOD-6 must map Postgres SQLSTATE 23503 to `StoreError::Constraint`
+  for `PgStore` to pass the case. Validating against `State::users` is out of scope: `MemStore::new`
+  seeds none (plan D7). Reshaping `ItemPatch` itself is deferred to MOD-13.
+- **§B.9**: the table names thirteen cases; the suite runs fifteen. Added, never renamed:
+  `update_kind_keeps_key_and_project` (after `update_cas_success`) and `nil_author_rejected`
+  (last). `crates/htui-core/tests/mem_store.rs` asserts the new count.
+- **§F `event_loop.rs`**: `else => break` is unreachable; `_ = ticker.tick()` is an irrefutable arm
+  that never disables, so `select!` can never run out of branches and `else` can never run. The
+  code matches `None` on the terminal stream instead and drops the `else` arm; still three arms.
+- **§C.2 staleness gate**: the `StoreReply::Failed` status-line write sits *below* the gate, not
+  above it - a superseded failure is dropped like any other stale reply. It goes through
+  `Action::Error` (§C.3), which is therefore the only writer of `App.status`; `App::on_key` clears
+  the line so an error survives until the user's next key rather than for the whole session.

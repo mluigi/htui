@@ -11,7 +11,7 @@ use core::future::Future;
 use crate::fixtures::ids;
 use crate::model::{
     EventKind, EventRole, ItemFilter, ItemId, ItemKindId, ItemPatch, ItemSummary, LinkKind,
-    NewItem, ProjectId, Scope, Status, StepId,
+    NewItem, ProjectId, Scope, Status, StepId, UserId,
 };
 use crate::store::error::StoreError;
 use crate::store::traits::{UpdateOutcome, WriteStore};
@@ -23,6 +23,7 @@ pub const CASES: &[&str] = &[
     "mint_writes_revision_v1",
     "mint_unknown_kind_rejected",
     "update_cas_success",
+    "update_kind_keeps_key_and_project",
     "update_cas_diverged",
     "status_cas_keeps_version",
     "no_delete_path",
@@ -31,6 +32,7 @@ pub const CASES: &[&str] = &[
     "documents_ordered_by_version",
     "notes_ordered_by_created_at",
     "events_ordered_by_seq",
+    "nil_author_rejected",
 ];
 
 /// Runs every case in [`CASES`].
@@ -49,6 +51,7 @@ where
     mint_writes_revision_v1(&make().await).await;
     mint_unknown_kind_rejected(&make().await).await;
     update_cas_success(&make().await).await;
+    update_kind_keeps_key_and_project(&make().await).await;
     update_cas_diverged(&make().await).await;
     status_cas_keeps_version(&make().await).await;
     no_delete_path(&make().await).await;
@@ -57,6 +60,7 @@ where
     documents_ordered_by_version(&make().await).await;
     notes_ordered_by_created_at(&make().await).await;
     events_ordered_by_seq(&make().await).await;
+    nil_author_rejected(&make().await).await;
 }
 
 /// The `Platform` workspace of the fixture: projects `htui` (position 0) then `agy` (position 1).
@@ -257,6 +261,73 @@ async fn update_cas_success<S: WriteStore>(store: &S) {
     );
 }
 
+/// Re-kinding keeps the key minted under the old kind and never moves the item between projects
+/// (§4.1: `key_prefix` is copied at mint time and never rewritten; §4.2 covers `kind_id`).
+async fn update_kind_keeps_key_and_project<S: WriteStore>(store: &S) {
+    let before = store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .expect("update_kind_keeps_key_and_project: read must not fail")
+        .expect("update_kind_keeps_key_and_project: the fixture item exists");
+
+    let outcome = store
+        .update_item(
+            before.id,
+            before.version,
+            ItemPatch {
+                kind_id: Some(ids::KIND_HTUI_FEAT),
+                ..title_patch(&before.title, "edited")
+            },
+        )
+        .await
+        .expect("update_kind_keeps_key_and_project: update must not fail");
+    let UpdateOutcome::Updated(head) = outcome else {
+        panic!("update_kind_keeps_key_and_project: the edit must match at the head version")
+    };
+
+    assert_eq!(
+        head.kind_id,
+        ids::KIND_HTUI_FEAT,
+        "update_kind_keeps_key_and_project: kind_id is a covered column (§4.2)"
+    );
+    assert_eq!(
+        head.version,
+        before.version + 1,
+        "update_kind_keeps_key_and_project: version"
+    );
+    assert_eq!(
+        head.key_prefix, before.key_prefix,
+        "update_kind_keeps_key_and_project: key_prefix is never rewritten (§4.1)"
+    );
+    assert_eq!(
+        head.key_number, before.key_number,
+        "update_kind_keeps_key_and_project: key_number is never rewritten (§4.1)"
+    );
+    assert_eq!(
+        head.key, before.key,
+        "update_kind_keeps_key_and_project: the key is never rewritten (§4.1)"
+    );
+    assert_eq!(
+        head.project_id, before.project_id,
+        "update_kind_keeps_key_and_project: an edit never moves an item between projects"
+    );
+
+    let cross = store
+        .update_item(
+            head.id,
+            head.version,
+            ItemPatch {
+                kind_id: Some(ids::KIND_AGY_FEAT),
+                ..title_patch(&head.title, "edited")
+            },
+        )
+        .await;
+    assert!(
+        matches!(cross, Err(StoreError::Constraint(_))),
+        "update_kind_keeps_key_and_project: a kind of another project is refused, got {cross:?}"
+    );
+}
+
 /// A second edit at a stale version is refused with both sides and the ancestor (§4.2).
 async fn update_cas_diverged<S: WriteStore>(store: &S) {
     let before = store
@@ -353,6 +424,45 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
         unmoved.status,
         Status::Queued,
         "status_cas_keeps_version: a refused move is a no-op"
+    );
+
+    // `closed_at` tracks the current status, not the history: a move to a terminal status sets
+    // it, a move back to a live one clears it (§4.2; blueprint Errata).
+    assert!(
+        store
+            .transition(before.id, Status::Queued, Status::Done)
+            .await
+            .expect("status_cas_keeps_version: transition must not fail"),
+        "status_cas_keeps_version: queued -> done matches"
+    );
+    let done = store
+        .item(before.id)
+        .await
+        .expect("status_cas_keeps_version: read must not fail")
+        .expect("status_cas_keeps_version: the item still exists");
+    assert!(
+        done.closed_at.is_some(),
+        "status_cas_keeps_version: a terminal move sets closed_at"
+    );
+    assert!(
+        store
+            .transition(before.id, Status::Done, Status::Open)
+            .await
+            .expect("status_cas_keeps_version: transition must not fail"),
+        "status_cas_keeps_version: done -> open matches"
+    );
+    let reopened = store
+        .item(before.id)
+        .await
+        .expect("status_cas_keeps_version: read must not fail")
+        .expect("status_cas_keeps_version: the item still exists");
+    assert_eq!(
+        reopened.closed_at, None,
+        "status_cas_keeps_version: a reopen clears closed_at"
+    );
+    assert_eq!(
+        reopened.version, before.version,
+        "status_cas_keeps_version: neither move bumped the version"
     );
 
     // No revision was written: the edit at the pre-transition version still lands, and the
@@ -740,6 +850,65 @@ async fn events_ordered_by_seq<S: WriteStore>(store: &S) {
     assert!(
         uncached.is_none(),
         "events_ordered_by_seq: an uncached step is None, not an error"
+    );
+}
+
+/// A revision author must name a real `app_user` row: the nil UUID that `UserId::default()`
+/// yields is refused on both write paths (§5.5 `author_id REFERENCES app_user(id)`).
+async fn nil_author_rejected<S: WriteStore>(store: &S) {
+    let minted = store
+        .mint_item(NewItem {
+            created_by: UserId::default(),
+            ..new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "no author")
+        })
+        .await;
+    assert!(
+        matches!(minted, Err(StoreError::Constraint(_))),
+        "nil_author_rejected: a mint without a known author is refused, got {minted:?}"
+    );
+
+    // The refused mint consumed no key number: a §4.1 counter only moves for a mint that lands.
+    let landed = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "authored"))
+        .await
+        .expect("nil_author_rejected: an authored mint must succeed");
+    assert_eq!(
+        landed.key, "FEAT-4",
+        "nil_author_rejected: the refused mint left the counter alone"
+    );
+
+    let before = store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .expect("nil_author_rejected: read must not fail")
+        .expect("nil_author_rejected: the fixture item exists");
+    let edited = store
+        .update_item(
+            before.id,
+            before.version,
+            ItemPatch {
+                author_id: UserId::default(),
+                ..title_patch("Retitled", "edited")
+            },
+        )
+        .await;
+    assert!(
+        matches!(edited, Err(StoreError::Constraint(_))),
+        "nil_author_rejected: an edit without a known author is refused, got {edited:?}"
+    );
+
+    let after = store
+        .item(before.id)
+        .await
+        .expect("nil_author_rejected: read must not fail")
+        .expect("nil_author_rejected: the item still exists");
+    assert_eq!(
+        after.version, before.version,
+        "nil_author_rejected: the refused edit left no half-applied change"
+    );
+    assert_eq!(
+        after.title, before.title,
+        "nil_author_rejected: the refused edit wrote no field"
     );
 }
 

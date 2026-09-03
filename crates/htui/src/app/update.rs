@@ -97,12 +97,14 @@ impl App {
     /// A reply came back: top bar first, then the staleness gate, then the addressee.
     fn on_reply(&mut self, envelope: ReplyEnvelope) {
         self.observe_reply(&envelope.reply);
-        if let StoreReply::Failed { request, message } = &envelope.reply {
-            self.status = Some(format!("{request}: {message}"));
-        }
         if !self.is_fresh(&envelope.origin, envelope.seq) {
             // A newer request of the same kind was issued from the same origin (blueprint C.2).
             return;
+        }
+        // Below the gate: a superseded failure is as stale as any other reply, and reporting it
+        // would blame the user's current selection for a request they have already moved past.
+        if let StoreReply::Failed { request, message } = &envelope.reply {
+            self.update(Action::Error(format!("{request}: {message}")));
         }
         let ReplyEnvelope { origin, reply, .. } = envelope;
         match origin {
@@ -226,7 +228,7 @@ mod tests {
     use crate::keymap::Keymap;
     use crate::store_worker::RequestEnvelope;
     use crate::ui::tabs::{Tab, TabId};
-    use crossterm::event::KeyEvent;
+    use crossterm::event::{KeyCode, KeyEvent};
     use htui_core::fixtures::ids;
     use htui_core::model::{
         ItemFilter, ItemId, ItemKindId, ItemSummary, ProjectId, ProjectRef, Status,
@@ -399,18 +401,55 @@ mod tests {
         assert!(saw_active_runs);
     }
 
-    #[test]
-    fn the_status_line_shows_a_failed_reply() {
-        let (mut app, _rx, _seen) = shell();
-        app.update(Action::Reply(ReplyEnvelope {
-            seq: 0,
-            origin: Origin::App,
+    /// A `Failed` reply at `seq`, addressed to the recorder tab.
+    fn failed_reply(seq: u64) -> ReplyEnvelope {
+        ReplyEnvelope {
+            seq,
+            origin: Origin::Tab(Recorder::ID),
             reply: StoreReply::Failed {
                 request: "items",
                 message: "boom".to_owned(),
             },
-        }));
+        }
+    }
+
+    #[test]
+    fn the_status_line_shows_a_failed_reply() {
+        let (mut app, mut rx, _seen) = shell();
+        let seq = next_items_seq(&mut rx);
+        app.update(Action::Reply(failed_reply(seq)));
         assert_eq!(app.status.as_deref(), Some("items: boom"));
+    }
+
+    #[test]
+    fn a_failure_overtaken_by_a_newer_request_never_reaches_the_status_line() {
+        let (mut app, mut rx, seen) = shell();
+        let first = next_items_seq(&mut rx);
+
+        // A scope change re-issues `Items` from the same origin: `first` is now stale.
+        app.update(Action::SetScope {
+            workspace: workspace("Platform"),
+        });
+        let second = next_items_seq(&mut rx);
+        assert_ne!(first, second);
+
+        app.update(Action::Reply(failed_reply(first)));
+        assert_eq!(
+            app.status, None,
+            "a stale failure is dropped like any other"
+        );
+        assert!(seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_next_key_clears_a_failure_from_the_status_line() {
+        let (mut app, mut rx, _seen) = shell();
+        let seq = next_items_seq(&mut rx);
+        app.update(Action::Reply(failed_reply(seq)));
+        assert_eq!(app.status.as_deref(), Some("items: boom"));
+
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(app.status, None, "the help line comes back on the next key");
     }
 
     #[test]

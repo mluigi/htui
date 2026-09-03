@@ -30,10 +30,16 @@ pub async fn run(
     term.terminal_mut().draw(|frame| app.render(frame))?;
     loop {
         tokio::select! {
-            Some(event) = events.next() => app.on_terminal_event(event?),
+            event = events.next() => match event {
+                // crossterm's `EventStream` does not end in practice - errors arrive as
+                // `Some(Err(..))` - but matching `None` explicitly keeps exhausted input a
+                // shutdown instead of an arm that silently disables itself. No `else` arm:
+                // `ticker.tick()` is irrefutable, so `select!` can never run out of branches.
+                Some(event) => app.on_terminal_event(event?),
+                None => break,
+            },
             Some(envelope) = replies.recv() => app.update(Action::Reply(envelope)),
             _ = ticker.tick() => app.update(Action::Tick),
-            else => break,
         }
         if app.should_quit {
             break;

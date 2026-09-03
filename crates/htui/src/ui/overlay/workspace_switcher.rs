@@ -2,7 +2,7 @@
 //!
 //! The overlay asks for [`StoreRequest::Workspaces`] when it is pushed, lists what comes back with
 //! each workspace's project count, and turns `Enter` into an
-//! [`Action::SetScope`](crate::app::Action::SetScope) that the shell applies. It holds no store
+//! [`Action::SetScope`] that the shell applies. It holds no store
 //! handle and no channel: data arrives through `on_reply`, effects leave through `Ctx` (`R-NF-3`).
 //!
 //! Creating a workspace is MOD-15, so an empty store renders "no workspaces" rather than an editor.

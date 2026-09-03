@@ -92,7 +92,7 @@ pub fn demo_at(day: i64, hour: i64) -> DateTime<Utc> {
 /// Every identifier of the fixture, named as in the blueprint §G tables.
 ///
 /// Phase and prompt-template ids are not listed: they are generated from the per-project formula
-/// in [`super::demo_data`] and nothing outside this module refers to one.
+/// in [`demo_data`] and nothing outside this module refers to one.
 pub mod ids {
     use super::{class, demo_uuid};
     use crate::model::{

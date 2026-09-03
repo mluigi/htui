@@ -305,6 +305,9 @@ impl App {
     /// The propagation chain of blueprint C.4, stopping at the first `Handled::Consumed`.
     pub fn on_key(&mut self, key: KeyEvent) {
         self.dirty = true;
+        // An error survives until the user does something, then the help line comes back. Cleared
+        // before the key is dispatched, so a failure this key causes still lands.
+        self.status = None;
         let chord = KeyChord::from_event(key);
 
         if let Some(id) = self.overlays.top().map(Overlay::id) {
