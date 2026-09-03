@@ -7,15 +7,46 @@ pub mod update;
 pub use action::{Action, Handled, OverlayAction, TabAction};
 pub use state::{App, Ctx, Emit, TopBarState};
 
-use crate::ui::tabs::{SettingsTab, SkillsTab};
+use crossterm::event::{KeyCode, KeyModifiers};
 
-/// Registers every tab and every overlay factory.
+use crate::keymap::{Binding, KeyChord, KeyScope};
+use crate::ui::overlay::WorkspaceSwitcher;
+use crate::ui::tabs::{BacklogTab, SettingsTab, SkillsTab};
+
+/// Registers every tab and every overlay factory, and opens the workspace switcher.
 ///
 /// This is the whole registration surface: MOD-2's Chat tab and MOD-13's filter overlay are one
 /// line each here plus their own file, with no change to the event loop (plan D5).
 ///
-/// T6 puts `BacklogTab` first, registers T5's workspace switcher factory and binds global `w`.
+/// Three things happen, in this order:
+///
+/// 1. Backlog, Skills and Settings are registered. Registration order is tab-strip order and
+///    `1`..`9` order, so Backlog first is what makes it the tab a user lands on.
+/// 2. The switcher's factory goes in under its own [`OverlayId`](crate::ui::overlay::OverlayId)
+///    and global `w` is bound to opening it. The binding is added here rather than in
+///    [`Keymap::default_global`](crate::keymap::Keymap::default_global) because it names an
+///    overlay, and the key table must not know which views exist.
+/// 3. The switcher is opened over the still-scopeless shell. The first workspace list either
+///    picks a startup scope — and entering a workspace closes every overlay
+///    (`App::set_scope`), so `--demo` never shows the switcher for a whole frame — or it is
+///    empty, and the switcher stays up reading "no workspaces" instead of a blank shell
+///    (blueprint D, "Startup").
+///
+/// Calling this twice would stack a second switcher; the shell calls it exactly once, between
+/// [`App::new`] and [`App::start`].
 pub fn register_all(app: &mut App) {
+    app.register_tab(Box::new(BacklogTab::new()));
     app.register_tab(Box::new(SkillsTab::new()));
     app.register_tab(Box::new(SettingsTab::new()));
+
+    app.overlay_factories
+        .register(WorkspaceSwitcher::ID, || Box::new(WorkspaceSwitcher::new()));
+    app.keymap.bind(Binding {
+        scope: KeyScope::Global,
+        key: KeyChord::new(KeyCode::Char('w'), KeyModifiers::NONE),
+        action: Action::Overlay(OverlayAction::Open(WorkspaceSwitcher::ID)),
+        help: "workspaces",
+    });
+
+    app.update(Action::Overlay(OverlayAction::Open(WorkspaceSwitcher::ID)));
 }

@@ -4,3 +4,4 @@ pub mod registry;
 pub mod workspace_switcher;
 
 pub use registry::{Overlay, OverlayId, OverlayRegistry, OverlayStack};
+pub use workspace_switcher::WorkspaceSwitcher;

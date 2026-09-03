@@ -205,7 +205,7 @@ mod tests {
     use ratatui::widgets::Paragraph;
 
     #[tokio::test]
-    async fn an_empty_store_renders_the_top_bar_the_tab_strip_and_the_skills_stub() {
+    async fn an_empty_store_renders_the_shell_with_the_switcher_over_it() {
         let mut harness = Harness::empty();
         crate::app::register_all(harness.app());
         harness.settle().await;
@@ -217,17 +217,20 @@ mod tests {
         let mut harness = Harness::empty();
         crate::app::register_all(harness.app());
         harness.settle().await;
+        // An empty store leaves the registration's switcher up and a modal overlay swallows what
+        // it does not handle, so the tab bindings only apply once it is closed.
+        harness.key("esc");
         harness.key("tab");
         harness.settle().await;
-        assert!(harness.render().contains("Settings"));
+        assert!(harness.render().contains("Skills"));
         assert_eq!(
             harness.app().tabs.active_id().map(|id| id.0),
-            Some("settings")
+            Some("skills")
         );
         harness.key("1");
         assert_eq!(
             harness.app().tabs.active_id().map(|id| id.0),
-            Some("skills")
+            Some("backlog")
         );
     }
 

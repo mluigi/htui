@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/shell.rs
+source: crates/htui/tests/integration.rs
 expression: frame
 ---
 Graphics · DESKTOP-HTUI · memory · 0 runs
@@ -14,12 +14,12 @@ Graphics · DESKTOP-HTUI · memory · 0 runs
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                             ┌ Workspaces ──────────────────────────┐                             │
-│                             │> Graphics  1 project                 │                             │
-│                             │  Platform  2 projects                │                             │
-│                             │                                      │                             │
-│                             │  j/k move · Enter switch · Esc close │                             │
-│                             └──────────────────────────────────────┘                             │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

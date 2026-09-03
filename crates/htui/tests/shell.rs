@@ -143,7 +143,10 @@ async fn esc_closes_the_switcher_and_leaves_the_scope_alone() {
 
 #[tokio::test]
 async fn an_empty_store_shows_no_workspaces() {
-    let mut harness = Harness::empty().with_overlay(Box::new(WorkspaceSwitcher::new()));
+    // `register_all` opens the switcher over a shell that never entered a workspace (blueprint D,
+    // "Startup"), so this one does not push its own: two overlays sharing an id would put the
+    // second one out of reach of every reply, which `OverlayStack::by_id_mut` addresses by id.
+    let mut harness = Harness::empty();
     register_all(harness.app());
     harness.settle().await;
     let frame = harness.render();

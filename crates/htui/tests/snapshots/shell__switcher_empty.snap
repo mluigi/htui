@@ -3,32 +3,32 @@ source: crates/htui/tests/shell.rs
 expression: frame
 ---
 no workspace · no box · memory · 0 runs
- 1 Skills  2 Settings
-┌ Skills ──────────────────────────────────────────────────────────────────────────────────────────┐
-│Skill registry and capability tags arrive with MOD-12.                                            │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
+ 1 Backlog  2 Skills  3 Settings
+┌ Backlog (0) ────────────────────────────────────────┐┌ Detail ───────────────────────────────────┐
+│No items in this workspace.                          ││ Body  Runs  Graph  Documents  Notes       │
+│                                                     ││No item selected.                          │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
 │                       ┌ Workspaces ───────────────────────────────────────┐                      │
 │                       │  no workspaces — creating one arrives with MOD-15 │                      │
 │                       │                                                   │                      │
 │                       │  j/k move · Enter switch · Esc close              │                      │
 │                       └───────────────────────────────────────────────────┘                      │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces
