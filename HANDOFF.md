@@ -50,35 +50,58 @@ MOD-6 can start now.
 ### Next features
 
 - [ ] **MOD-1 - TUI scaffold.** `R-TUI-1..3`, `R-NF-1`, `R-NF-3`. Rust binary, `ratatui` +
-  `crossterm` + `tokio`. Top bar, Backlog tab with grouped list and tabbed detail pane (Body, Runs,
-  Graph, Documents, Notes), Skills and Settings tabs as stubs, workspace switcher overlay. Store
-  behind a trait with an in-memory implementation until MOD-6. Not blocked.
-- [ ] **MOD-2 - Agent driver + chat tab** (from ANA-4). `R-AGT-1..8`, `R-TUI-6`, `R-HIS-1..2`. ACP
-  client, CLI adapter, agent registry, autodiscovery, quota tracking, streamed chat tab with
-  follow-ups and inline permissions, event persistence and replay. Prompt builder per ANA-5.
-  Blocked on MOD-1, ANA-4, ANA-5.
+  `crossterm` + `tokio`. Skeleton only: top bar, Backlog tab with grouped list and tabbed detail
+  pane (Body, Runs, Graph, Documents, Notes) as read-only views, Skills and Settings tabs as stubs,
+  workspace switcher overlay. Store seam is `docs/ANA-9.md` §6.1 (`ReadStore`/`WriteStore`,
+  `Backend`) with `MemStore` until MOD-6; domain types follow §5. The TUI scope is always a
+  workspace (maintainer decision 2026-09-03; the `R-ENT-2` no-workspace fallback is not surfaced).
+  Filters, actions and editing are MOD-13, Graph traversal is MOD-14, hierarchy management is
+  MOD-15. Not blocked.
+- [ ] **MOD-2 - Agent driver + chat tab** (from ANA-4). `R-AGT-1..8`, `R-TUI-6`, `R-TUI-8`,
+  `R-HIS-1..2`. ACP client, CLI adapter, agent registry with its Settings tab section (agents and
+  quota), autodiscovery, quota tracking, streamed chat tab with follow-ups and inline permissions,
+  event persistence and replay. Prompt builder per ANA-5. Blocked on MOD-1, ANA-4, ANA-5.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
-  `R-TUI-4`. Step graphs per kind, gates, retries, review loop, fan-out with isolation modes and
-  selection, capability check, promotion to chat, run records. Blocked on ANA-2, MOD-2, MOD-6.
+  `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
+  modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
+  close-out (summary document, status, commit hashes). The `run` and `close` actions of `R-TUI-2`.
+  Blocked on ANA-2, MOD-2, MOD-6.
 - [ ] **MOD-6 - Postgres store + cache** (from ANA-9). `R-STO-1..6`, `R-ENT-1..12`, `R-USR-2`.
   Migrations, DB-backed store trait, keyring for the DSN, per-box read-only cache with background
   refresh, offline mode. Design: `docs/ANA-9.md` (DDL §5, store trait §6.1, scope §9). Not blocked.
-- [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`. Probe,
-  registration, capability tags and quirks editor, per-box paths, agent autodiscovery hook. Blocked
-  on MOD-6; the probe can land with MOD-1 behind the store trait.
+- [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
+  Probe, registration, capability tags and quirks editor (Settings tab box profile section),
+  per-box paths, agent autodiscovery hook. Blocked on MOD-6; the probe can land with MOD-1 behind
+  the store trait.
 - [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
   project and phase bindings, template rows, Skills tab editor with version diff, import of
   existing skill markdown files.
   Blocked on MOD-6.
-- [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`. `SecretProvider` trait, Infisical
-  implementation, environment injection at run start, scrubber with exact-match and pattern masks,
-  fail-closed persistence gate. Blocked on ANA-7, MOD-2.
+- [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
+  Infisical implementation, environment injection at run start, scrubber with exact-match and
+  pattern masks, fail-closed persistence gate, Settings tab secret provider section. Blocked on
+  ANA-7, MOD-2.
 - [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
   `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
   per-box class limits; per-phase exposure. Blocked on MOD-2, MOD-4.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
-  gates, `R-AGT-7..8` caps. Ready-item selection, capability filter, concurrency with overlap rule,
-  queue overlay, escalation. Target box stored, local execution only. Blocked on MOD-4.
+  gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
+  overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
+  `queue` action of `R-TUI-2`. Target box stored, local execution only. Blocked on MOD-4.
+- [ ] **MOD-13 - Backlog filters and item editing** (from MOD-1). `R-TUI-2`, `R-ENT-5`,
+  `R-ENT-10..12`. Filters by status, project, capability and readiness; `new` and `edit` actions
+  with the compare-and-set on `version` and the three-way divergence view (`docs/ANA-9.md` §4.2,
+  §7.2), external `$EDITOR` round-trip, note thread append, hand-written documents; mint per §7.1.
+  Blocked on MOD-1; lands against `MemStore`, real mint and revisions arrive with MOD-6.
+- [ ] **MOD-14 - Graph tab** (from MOD-1). `R-TUI-5`, `R-ENT-9`. Item neighbourhood one to N hops
+  across projects through `ReadStore::links` (`docs/ANA-9.md` §6.1), status and link kind per
+  edge, keyboard navigation that re-roots the Backlog selection; the `open graph` action of
+  `R-TUI-2`. Blocked on MOD-1.
+- [ ] **MOD-15 - Workspace, project, repo and kind management** (from MOD-1). `R-ENT-1..4`,
+  `R-ENT-6`, `R-BOX-4`, `R-TUI-8`. Create and edit workspaces, projects (seeded kinds, graphs and
+  templates per `docs/ANA-9.md` §5.10), repos with primary flag and per-box paths, workspace root
+  paths per box; item kind editor with the prefix-change warning (§10); Settings tab sections for
+  kinds and step graphs per project. Blocked on MOD-1, MOD-6.
 
 ### Deferred backlog
 
@@ -93,6 +116,6 @@ MOD-6 can start now.
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 5 (ANA-2 orchestration, ANA-3 context tools, ANA-4 ACP, ANA-5 prompt assembly, ANA-7 secrets) |
-| MOD-N   | 12 (MOD-1 TUI, MOD-2 driver, MOD-4 orchestrator, MOD-6 store, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 15 (MOD-1 TUI, MOD-2 driver, MOD-4 orchestrator, MOD-6 store, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 0                                                                                         |

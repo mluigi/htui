@@ -1,0 +1,41 @@
+[package]
+name        = "htui"
+version     = "0.1.0"
+description = "Terminal UI for htui: tabs, overlays, keymap and the store worker seam"
+
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[lib]
+name = "htui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "htui"
+path = "src/main.rs"
+
+[features]
+default = []
+# Compiles `testkit::Harness` into the library so integration tests under `tests/` (T4, T5) can
+# build an `App`, feed keys and render to a `TestBackend`.
+testkit = []
+
+[dependencies]
+htui-core          = { workspace = true, features = ["demo"] }
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+crossterm          = { workspace = true }
+futures            = { workspace = true }
+ratatui            = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

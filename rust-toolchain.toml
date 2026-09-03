@@ -1,0 +1,4 @@
+[toolchain]
+channel    = "1.98.1"          # exact pin: snapshots and -D warnings must not move under us
+components = ["rustfmt", "clippy"]
+profile    = "minimal"
