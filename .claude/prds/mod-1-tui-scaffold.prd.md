@@ -82,10 +82,10 @@ Maintainer decisions (2026-09-03) that bound the MVP:
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Shell boots | Binary starts on the three OSes, draws top bar and tab strip, handles quit and terminal restore, and has the off-thread work pattern in place (`R-NF-1`, `R-NF-3`) | in-progress | `.claude/plans/mod-1-tui-scaffold.plan.md` |
-| 2 | Store seam | ANA-9 §6.1 traits and `Backend`, domain types mirroring §5, `MemStore` with demo fixtures and a trait-level test suite MOD-6 will reuse | in-progress | `.claude/plans/mod-1-tui-scaffold.plan.md` |
-| 3 | Backlog tab | Grouped item list per project of the current workspace; Body, Runs, Graph, Documents, Notes read-only sub-tabs fed through `ReadStore` (`R-TUI-2..3` skeleton) | in-progress | `.claude/plans/mod-1-tui-scaffold.plan.md` |
-| 4 | Scope and stubs | Workspace switcher overlay changes scope and re-queries; top bar fields fed from app state; Skills and Settings placeholder tabs (`R-TUI-1` skeleton) | in-progress | `.claude/plans/mod-1-tui-scaffold.plan.md` |
+| 1 | Shell boots | Binary starts on the three OSes, draws top bar and tab strip, handles quit and terminal restore, and has the off-thread work pattern in place (`R-NF-1`, `R-NF-3`) | complete | `.claude/plans/mod-1-tui-scaffold.plan.md` |
+| 2 | Store seam | ANA-9 §6.1 traits and `Backend`, domain types mirroring §5, `MemStore` with demo fixtures and a trait-level test suite MOD-6 will reuse | complete | `.claude/plans/mod-1-tui-scaffold.plan.md` |
+| 3 | Backlog tab | Grouped item list per project of the current workspace; Body, Runs, Graph, Documents, Notes read-only sub-tabs fed through `ReadStore` (`R-TUI-2..3` skeleton) | complete | `.claude/plans/mod-1-tui-scaffold.plan.md` |
+| 4 | Scope and stubs | Workspace switcher overlay changes scope and re-queries; top bar fields fed from app state; Skills and Settings placeholder tabs (`R-TUI-1` skeleton) | complete | `.claude/plans/mod-1-tui-scaffold.plan.md` |
 
 ## Open Questions
 Resolved by the maintainer on 2026-09-03:
@@ -104,4 +104,4 @@ Resolved by the maintainer on 2026-09-03:
 | Terminal left raw on panic | Low | Bad first impression on every crash | Panic hook plus drop guard restore the terminal on every exit path |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: COMPLETE — all milestones landed 2026-09-04; write-up `docs/decisions/mod/mod-1.md`.*

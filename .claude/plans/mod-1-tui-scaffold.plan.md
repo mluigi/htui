@@ -203,8 +203,8 @@ probe against rustc 1.98.1 in the session scratch dir.
 | `std::sync::RwLock` held across `.await` in `MemStore` | Low | Reviewer checklist item; the async fns lock, clone, drop, then return |
 
 ## Acceptance
-- [ ] All tasks complete
-- [ ] Validation passes on Windows; Linux/macOS build recorded
-- [ ] Patterns mirrored, not reinvented (ANA-9 §5 / §6.1 verbatim)
-- [ ] `rust-reviewer` findings applied or deferred with the maintainer
-- [ ] PRD milestone rows updated
+- [x] All tasks complete (commits fdf1182, dbb166a, 73f21ec, 2774907, f83ac97, dc3d2c9)
+- [x] Validation passes on Windows; Linux/macOS not built (only the Windows target installed)
+- [x] Patterns mirrored, not reinvented (ANA-9 §5 / §6.1 verbatim, verified by reviewer)
+- [x] `rust-reviewer` findings applied (7 + 2 carried, all verified real); verdict approve at dc3d2c9
+- [x] PRD milestone rows updated
