@@ -30,6 +30,9 @@ this before touching any of them.
 - **`docs/ANA-N.md`** - one file per analysis, the actual research/design doc (survey of prior art,
   options considered, verdict, phasing). `HANDOFF.md`/`DECISIONS.md` only ever summarize an ANA;
   the detail stays in the `docs/ANA-N.md` file itself and isn't duplicated.
+- **`docs/REQUIREMENTS.md`** (htui only) - product requirements with stable `R-<AREA>-<N>` IDs.
+  Sits above every ANA and MOD: an ANA decides how a requirement is met, a MOD cites the IDs it
+  satisfies. Edited only by explicit maintainer decision, never at item close-out.
 
 ## Item ID prefixes
 

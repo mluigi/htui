@@ -1,5 +1,11 @@
 # ANA-1 - Data model, box registry, and sync topology
 
+> **Superseded (2026-09-03):** `docs/REQUIREMENTS.md` replaces this document where they conflict.
+> Superseded here: the DDL, `items.json`, `artifact`/`artifact_link`, timestamp LWW conflict rule,
+> `sync_state`, `external_issue_mapping`. Surviving, as restated in REQUIREMENTS §2, §8, §9: box
+> registry and prompt injection, transcript split, local scrubbing. Schema v2 is ANA-9. Kept as
+> history; do not implement from this file.
+>
 > **Scope note:** Design authority for the persistence layer, machine profiling, and synchronization
 > architecture of `htui`. Governed by `.claude/rules/workflow-docs.md` and `CONCEPTS.md`.
 >

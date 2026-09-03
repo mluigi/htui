@@ -1,5 +1,11 @@
 # ANA-8 - Project and workspace hierarchy model: multi-project workspaces vs global multi-project instance
 
+> **Superseded (2026-09-03):** `docs/REQUIREMENTS.md` replaces this document where they conflict.
+> Surviving, as restated in REQUIREMENTS §3: three-tier hierarchy, workspace-centric topology,
+> cross-project UUID links, per-box paths. Superseded here: implicit workspaces, `items.json` v2,
+> `htui-workspace.json`, the `V002` migration, the TUI mockups. Schema v2 is ANA-9. Kept as
+> history; do not implement from this file.
+>
 > **Scope note:** Design authority for the top-level entity hierarchy, multi-project and workspace scoping,
 > cross-project dependency resolution, navigation UX, and schema additions of `htui`. Governed by
 > `.claude/rules/workflow-docs.md` and `CONCEPTS.md`.
