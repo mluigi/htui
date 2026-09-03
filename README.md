@@ -91,7 +91,9 @@ terminal layer is `crossterm` and the drawing layer is `ratatui`.
 - **Legacy `conhost.exe`** (the old console host, and `cmd.exe` windows opened outside Windows
   Terminal) is **best-effort**: it runs, but box-drawing and the `·` separator depend on the
   console code page and the font, so expect replacement characters with a raster font.
-- **Linux / macOS**: any `xterm`-compatible terminal with UTF-8.
+- **Linux / macOS**: any `xterm`-compatible terminal with UTF-8. Not built on either in MOD-1
+  (this box has only the Windows target installed); the crate uses only `crossterm` and
+  `ratatui`, so nothing is expected to be platform-specific, but it is unverified.
 
 The terminal is restored on every exit path, panics included: a panic hook runs `ratatui::restore()`
 before the default hook prints, and the terminal guard restores again on drop.

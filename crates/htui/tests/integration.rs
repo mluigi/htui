@@ -39,7 +39,7 @@ async fn the_demo_shell_starts_inside_the_first_workspace_on_the_backlog_tab() {
     );
     assert!(
         harness.app().overlays.is_empty(),
-        "entering the startup workspace closes the switcher the registration opened"
+        "the startup workspace was entered from the first reply, so no switcher was ever opened"
     );
     assert_eq!(
         top_bar(&frame),
@@ -137,7 +137,7 @@ async fn an_empty_store_starts_with_the_switcher_open_over_no_workspaces() {
     assert_eq!(
         harness.app().overlays.top().map(|o| o.id()),
         Some(WorkspaceSwitcher::ID),
-        "nothing entered a workspace, so the switcher the registration opened is still up"
+        "nothing entered a workspace, so the empty first reply opened the startup switcher"
     );
     assert!(
         frame.contains("no workspaces"),

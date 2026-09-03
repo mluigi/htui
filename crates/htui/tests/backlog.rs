@@ -3,6 +3,7 @@
 //! Everything runs against `Harness::demo()` and the tab's own public surface, so no T3 or T5
 //! file is touched and the T6 registration does not have to exist yet. Frames are 100x30, the
 //! size the whole snapshot suite is pinned to (plan risk row).
+#![cfg(feature = "testkit")]
 
 use htui::app::Action;
 use htui::testkit::Harness;

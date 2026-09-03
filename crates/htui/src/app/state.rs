@@ -160,6 +160,11 @@ pub struct App {
     pub(super) next_seq: Seq,
     /// Ticks since startup; the top bar refreshes every fourth one.
     pub(super) ticks: u64,
+    /// Overlay to open when the first `Workspaces` reply is empty (blueprint D, "Startup").
+    ///
+    /// Set by [`register_all`](crate::app::register_all); `None` leaves an empty store on the
+    /// bare shell. Held as an id, not a view, so the shell never names a concrete overlay.
+    pub startup_overlay: Option<crate::ui::overlay::OverlayId>,
 }
 
 impl App {
@@ -190,6 +195,7 @@ impl App {
             latest: HashMap::new(),
             next_seq: 0,
             ticks: 0,
+            startup_overlay: None,
         }
     }
 

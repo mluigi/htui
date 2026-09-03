@@ -1288,3 +1288,23 @@ v2, the two `plan` rows `produced_by_step_id = ids::STEP_PLAN` (the Documents su
 5. Every model struct field name equals its §5 column name (D3).
 6. Terminal is restored on: normal quit, `?` panic, and an `Err` bubbling out of `run` (D8).
 7. T4 and T5 file sets remain disjoint; registration lives only in T6's three files (V6).
+
+---
+
+## Errata (recorded at implementation, 2026-09-03)
+
+Found by the adversarial verifiers; the code follows the corrected reading.
+
+- **§A.4 / §E T1**: the root `Cargo.toml` `members` list cannot name `crates/htui` before T3
+  creates it; T1 lands `["crates/htui-core"]`, T3 adds `"crates/htui"`.
+- **§B.9 `links_hops_1_vs_2`**: `agy FEAT-1 --relates--> htui FEAT-2` is a direct edge per §G,
+  so with both-direction traversal (§B.8) it is at hop 1, not hop 2. Same node set at hops ≤ 2.
+- **§E T4**: list rows sort by `(key_prefix, key_number)`, not `key_number` alone, so prefixes
+  do not interleave inside a project.
+- **§E T5**: after `Enter` on the second workspace the top bar reads
+  `Platform · <box> · memory · 1 run`; the startup workspace is `Graphics` with `0 runs`
+  (workspaces sort by name; the fixture's active run lives in Platform).
+- **§C.5 `TabRegistry::active` / `active_id`**: return `Option`, because `Harness::empty()` has
+  no tabs; `OverlayId::ANY` wildcard scope added so `Esc` can bind before any overlay exists.
+- **§D "Startup"**: `register_all` names the switcher as `App::startup_overlay`; the first frame
+  is the bare shell, and only an empty first `Workspaces` reply opens the switcher.

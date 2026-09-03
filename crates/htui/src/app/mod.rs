@@ -13,7 +13,8 @@ use crate::keymap::{Binding, KeyChord, KeyScope};
 use crate::ui::overlay::WorkspaceSwitcher;
 use crate::ui::tabs::{BacklogTab, SettingsTab, SkillsTab};
 
-/// Registers every tab and every overlay factory, and opens the workspace switcher.
+/// Registers every tab and every overlay factory, and names the workspace switcher as the
+/// startup overlay.
 ///
 /// This is the whole registration surface: MOD-2's Chat tab and MOD-13's filter overlay are one
 /// line each here plus their own file, with no change to the event loop (plan D5).
@@ -26,11 +27,10 @@ use crate::ui::tabs::{BacklogTab, SettingsTab, SkillsTab};
 ///    and global `w` is bound to opening it. The binding is added here rather than in
 ///    [`Keymap::default_global`](crate::keymap::Keymap::default_global) because it names an
 ///    overlay, and the key table must not know which views exist.
-/// 3. The switcher is opened over the still-scopeless shell. The first workspace list either
-///    picks a startup scope — and entering a workspace closes every overlay
-///    (`App::set_scope`), so `--demo` never shows the switcher for a whole frame — or it is
-///    empty, and the switcher stays up reading "no workspaces" instead of a blank shell
-///    (blueprint D, "Startup").
+/// 3. The switcher is named as the startup overlay. Nothing opens here: the first frame is the
+///    bare shell, and the first workspace list either picks a startup scope (`--demo`) or is
+///    empty, in which case `App::on_app_reply` opens the switcher reading "no workspaces"
+///    instead of leaving a blank shell (blueprint D, "Startup").
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -48,5 +48,5 @@ pub fn register_all(app: &mut App) {
         help: "workspaces",
     });
 
-    app.update(Action::Overlay(OverlayAction::Open(WorkspaceSwitcher::ID)));
+    app.startup_overlay = Some(WorkspaceSwitcher::ID);
 }

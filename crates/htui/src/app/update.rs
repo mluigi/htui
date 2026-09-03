@@ -195,15 +195,26 @@ impl App {
     /// Replies the shell asked for itself.
     ///
     /// The first workspace list picks the startup scope, which is what makes `--demo` open
-    /// inside a workspace instead of an empty shell (blueprint D, "Startup").
+    /// inside a workspace instead of an empty shell. An empty list opens `startup_overlay`
+    /// (the switcher, once registered) over the bare shell instead of leaving it blank
+    /// (blueprint D, "Startup"). Nothing is opened before that reply, so the first frame is
+    /// always the shell itself.
     fn on_app_reply(&mut self, reply: &StoreReply) {
         if let StoreReply::Workspaces(workspaces) = reply
             && !self.has_scope()
-            && let Some(first) = workspaces.first()
         {
-            self.update(Action::SetScope {
-                workspace: first.clone(),
-            });
+            match workspaces.first() {
+                Some(first) => self.update(Action::SetScope {
+                    workspace: first.clone(),
+                }),
+                None => {
+                    if let Some(id) = self.startup_overlay
+                        && !self.overlays.iter().any(|o| o.id() == id)
+                    {
+                        self.update(Action::Overlay(OverlayAction::Open(id)));
+                    }
+                }
+            }
         }
     }
 }
