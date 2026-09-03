@@ -14,10 +14,10 @@
   `.claude/rules/workflow-docs.md` in the dingine workspace — this repo is outside the
   `sync-workflow-surface` default target list, pass `-Targets` explicitly to receive the surface).
 
-**Current status (2026-08-30):** Repo bootstrapped, no code yet. ANA-1 (data model + sync),
+**Current status (2026-09-03):** Repo bootstrapped, no code yet. ANA-1 (data model + sync),
 ANA-2 (orchestration design), ANA-3 (tooling & intelligence augmentations), ANA-4 (ACP protocol),
-ANA-5 (execution model: granular control vs interactive), and ANA-6 (OneDev necessity) gate most MODs;
-MOD-1 (TUI scaffold) can start immediately.
+ANA-5 (execution model: granular control vs interactive), ANA-6 (OneDev necessity), and
+ANA-7 (Infisical secret management) gate most MODs; MOD-1 (TUI scaffold) can start immediately.
 
 ---
 
@@ -166,6 +166,23 @@ MOD-1 (TUI scaffold) can start immediately.
   **(d) Impact on Roadmap:** If OneDev is decoupled or dropped, assess simplifying ANA-1 (collapsing
   dual-canonical complexity to single-canonical Postgres) and eliminating or deferring MOD-5 (OneDev sync).
   Output: `docs/ANA-6.md`. Informs ANA-1, MOD-5, MOD-6.
+- [ ] **ANA-7 - Secret management and injection: Infisical integration, multi-box sync, and transcript scrubbing.** Evaluate
+  integrating Infisical as the centralized secret management layer across multi-box environments:
+  **(a) Provisioning & Storage:** Centralized storage for Postgres credentials, OneDev API tokens,
+  LLM API keys (Anthropic, Antigravity), and local proxy tokens. Evaluate Infisical Rust SDK vs.
+  Infisical CLI (`infisical run -- ...`) for injecting environment variables into wrapped agent
+  subprocesses (`claude`, `agy`) on demand.
+  **(b) Multi-Box Synchronization:** How htui instances on different registered boxes (`MOD-7`)
+  authenticate to Infisical (machine identities, universal auth, or local CLI session) without
+  persisting plaintext secrets in repo files or local config databases.
+  **(c) Transcript & Diff Scrubbing:** Leverage Infisical's secret inventory to dynamically generate
+  high-precision regex/literal redaction masks, ensuring any secret managed by Infisical is
+  guaranteed to be scrubbed from raw transcripts and diffs before they leave the box (`ANA-1`).
+  **(d) Offline & Fallback Mechanics:** Fallback behavior when Infisical is unreachable (local encrypted
+  cache via OS keyring / `.env.local` fallback).
+  Must settle: Infisical SDK vs CLI subprocess wrapping; machine identity bootstrap flow per box;
+  and secret masking pipeline for transcript uploads.
+  Output: `docs/ANA-7.md`. Informs ANA-1, MOD-2, MOD-5, MOD-7.
 
 ### Next features
 
@@ -216,7 +233,7 @@ MOD-1 (TUI scaffold) can start immediately.
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 6 (ANA-1 data model + sync, ANA-2 orchestration, ANA-3 tooling, ANA-4 ACP, ANA-5 exec model, ANA-6 OneDev necessity) |
+| ANA-N   | 7 (ANA-1 data model + sync, ANA-2 orchestration, ANA-3 tooling, ANA-4 ACP, ANA-5 exec model, ANA-6 OneDev necessity, ANA-7 Infisical secret management) |
 | MOD-N   | 7 (MOD-1 TUI scaffold, MOD-2 agent driver, MOD-3 diff + explorer, MOD-4 orchestrator, MOD-5 OneDev sync, MOD-6 item store, MOD-7 box registry) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 0                                                                                         |
