@@ -14,8 +14,10 @@
   `.claude/rules/workflow-docs.md` in the dingine workspace — this repo is outside the
   `sync-workflow-surface` default target list, pass `-Targets` explicitly to receive the surface).
 
-**Current status (2026-08-30):** Repo bootstrapped, no code yet. ANA-1 (data model + sync) and
-ANA-2 (orchestration design) gate most MODs; MOD-1 (TUI scaffold) can start immediately.
+**Current status (2026-08-30):** Repo bootstrapped, no code yet. ANA-1 (data model + sync),
+ANA-2 (orchestration design), ANA-3 (tooling & intelligence augmentations), ANA-4 (ACP protocol),
+ANA-5 (execution model: granular control vs interactive), and ANA-6 (OneDev necessity) gate most MODs;
+MOD-1 (TUI scaffold) can start immediately.
 
 ---
 
@@ -65,6 +67,105 @@ ANA-2 (orchestration design) gate most MODs; MOD-1 (TUI scaffold) can start imme
   body, plan/PRD artifact, box characteristics from the registry, injected skill text, file
   excerpts chosen by htui) so the agent reads as few files as possible. Output: `docs/ANA-2.md`.
   Spawns MOD-4.
+- [ ] **ANA-3 - Tooling and intelligence augmentations: Headroom, Serena, Graphify, and AST tools.**
+  Evaluate and design the integration of external context optimizers, semantic code graphs, and
+  LSP/AST intelligence tools into htui's agent execution and exploration layers:
+  **(a) Headroom (Context Optimization & Token Compression):** Evaluate routing wrapped agent
+  subprocesses (`claude`, `agy`) through a local Headroom proxy (`headroom proxy`, e.g. at
+  `http://127.0.0.1:8787` via `ANTHROPIC_BASE_URL` or `headroom wrap`). Leverage reversible
+  Compress-Cache-Retrieve (CCR), SmartCrusher (JSON), CodeCompressor (AST parsing), and CacheAligner
+  (KV prefix cache stability) to compress large tool outputs and repetitively queried files by
+  60–95%. Determine if htui manages the proxy daemon lifecycle or delegates to the host box
+  registry (`ANA-1`/`MOD-7`). Also evaluate embedding Headroom's bundled tool binaries (`ast-grep` /
+  `sg`, `difftastic` / `diff`, `scc` / `loc`) directly into the TUI Code Explorer and Diff tabs
+  (`MOD-3`).
+  **(b) Serena (LSP Semantic Code Intelligence via MCP):** Evaluate integrating Serena
+  (`oraios/serena`) as a standardized MCP server across managed repos. Instead of agents performing
+  fragile text surgery (regex/string replace) or reading entire files into context, Serena provides
+  symbol-level navigation (`find_symbol`, `find_referencing_symbols`, `insert_after_symbol`, symbol
+  renaming, type definitions) across 40+ languages (Rust, C++, Python, TS, etc.). Settle how htui
+  dynamically configures Serena's LSP server per target repo and how htui can leverage Serena's
+  symbol graph to auto-extract targeted code excerpts for `ANA-2`'s prompt budget contract.
+  **(c) Graphify (Knowledge Graph, Architectural Hubs, & Pre-Tool Guards):** Evaluate integrating
+  `graphify` graphs (`graphify-out/graph.json`): htui queries god-nodes (architectural hubs),
+  community clusters, and 1–2 hop callflow relationships during initial prompt construction (`ANA-2`),
+  giving agents instant architectural orientation without expensive exploration turns. Evaluate
+  enforcing pre-tool hook guards (`graphify hook-guard`) to prevent agents from launching unconstrained
+  grep/read spirals, exposing the `graphify.serve` MCP server, and aggregating multi-repo global
+  graphs (`graphify global`) across htui-managed workspaces.
+  **(d) Structural Diffing & Inspection:** Upgrade MOD-3's diff tab and review steps from raw line-based
+  `git diff` to syntax-aware structural diffing (`difftastic` / `difft`), allowing agents and users to
+  see semantic AST changes instead of whitespace or formatting noise.
+  Must settle: whether htui acts as an MCP gateway/supervisor or writes ephemeral `.mcp.json` configs;
+  how external tool availability is probed and recorded in the Box Registry (`ANA-1`/`MOD-7`); and
+  fail-open vs fail-closed fallbacks when an external daemon (Headroom proxy, LSP server) is missing.
+  Output: `docs/ANA-3.md`. Informs MOD-2, MOD-3, MOD-7.
+- [ ] **ANA-4 - Agent communication protocol: ACP (Agent Client / Context Protocol) vs CLI subprocess streaming.**
+  Investigate protocol-level integration standards between htui and underlying AI coding agents,
+  focusing on ACP:
+  **(a) Agent Client Protocol (Zed / open standard JSON-RPC 2.0):** Evaluate implementing an ACP
+  client in Rust (`agent-client-protocol` crate) within htui instead of scraping or multiplexing ad-hoc
+  CLI flags (`claude -p --output-format stream-json`, `agy ...`). ACP standardizes the boundary between
+  the editor/harness and the agent: the agent acts as an ACP server emitting structured notifications
+  (thought chunks, tool execution requests, proposed edits, permission checks), while htui acts as
+  the ACP client managing tool approvals, workspace state, and diff presentations. Assess whether
+  both target agents (`claude` / Claude Code, `agy` / Antigravity) natively support ACP or require thin
+  adapters.
+  **(b) Agent Context Protocol & Structured Memory Harnesses:** Evaluate standardized context-passing
+  mechanisms (machine-readable task specifications, explicit boundary declarations) compared to htui's
+  custom markdown `artifact` table and prompt templates.
+  **(c) Trade-off Analysis:** ACP provides typed, bi-directional IPC, clean cancellation, structured
+  tool interception, and client-driven diff reviews out of the box, avoiding brittle JSON stream
+  parsing. Conversely, CLI subprocess wrapping requires zero external protocol support from agents
+  that lack ACP servers. Settle: should htui adopt ACP as its primary internal agent driver trait
+  (`MOD-2`), falling back to CLI streaming where ACP is unavailable?
+  Output: `docs/ANA-4.md`. Informs MOD-2, MOD-4.
+- [ ] **ANA-5 - Agent execution model: Granular per-message control with explicit context (@file) vs autonomous interactive sessions.**
+  Evaluate and design the operational boundary between automated, step-by-step agent control and
+  open-ended interactive user sessions during item execution:
+  **(a) Granular Per-Message Control (Automated Step Engine):** htui acts as the strict conductor. For
+  automated item execution (e.g. PRD, Plan, Implement), htui drives the agent turn-by-turn or
+  message-by-message, explicitly including only relevant file context via `@file` references, AST
+  excerpts, and prior step artifacts (`artifact` table). The agent is run with strict step bounds
+  (single goal, verified outputs, immediate pass/fail gate) rather than an open-ended autonomous loop,
+  eliminating runaway token burn, irrelevant file grepping, and divergent reasoning paths.
+  **(b) Interactive Sessions (Exploration & Human Escalation):** Interactive sessions remain essential
+  for initial brainstorming, user-steered refactoring, and deep debugging when automated steps fail
+  their verification gates. In this mode, the agent runs with conversational agency in an interactive
+  chat tab (`MOD-2`), receiving user follow-ups in real time.
+  **(c) Seamless Handshake & State Transition:** Design the bidirectional bridge between both modes:
+  automated steps run headless/turn-by-turn with `@file` injection and artifact capping; if a step fails
+  or requests human clarification, htui seamlessly promotes the run into an interactive chat tab,
+  preserving exact context, tool calls, and diff history. Once the human and agent resolve the blocker,
+  htui extracts the step artifact, commits the decision summary, and resumes the automated pipeline.
+  Must settle: syntax and resolution mechanics for `@` file/symbol inclusion in htui prompts; how per-turn
+  token budgets are calculated; and how the TUI UI/UX handles transitioning between automated step cards
+  and interactive streaming chat tabs.
+  Output: `docs/ANA-5.md`. Informs MOD-1, MOD-2, MOD-4.
+- [ ] **ANA-6 - Architectural necessity and alternatives to OneDev as issue tracker.** Evaluate
+  whether an external OneDev instance is actually necessary in the htui topology, or whether it
+  introduces excessive operational overhead and architectural bloat:
+  **(a) Redundancy with Postgres:** htui's central Postgres database already holds item state,
+  run history, machine characteristics, execution artifacts (`artifact` table), and relationship
+  graphs (`item_link`). Evaluate storing human discussions, comments, and story descriptions directly
+  in an `item_comment` table in Postgres, eliminating the need for an external sync service and
+  token management.
+  **(b) Operational & Infrastructure Weight:** OneDev is a heavyweight Java/JVM application requiring
+  dedicated hosting, database management, and container maintenance. Evaluate the friction this imposes
+  on single-developer or multi-box setups versus a zero-extra-infrastructure design where htui only
+  depends on Postgres (or embedded SQLite for local/offline workflows).
+  **(c) Alternatives for Discussion & Transcript Storage:** If OneDev is eliminated or made optional:
+  how are long-form stories and transcripts stored? Options:
+  1. *Pure Postgres + Object Storage:* Discussion in Postgres; full transcripts stored locally or
+     in S3/MinIO / static HTTP file server.
+  2. *Git-Native Storage:* Embed issue discussions and stories into repo-local markdown files or git notes
+     (similar to git-bug / beads), keeping repos completely self-contained.
+  3. *Pluggable Issue Tracker Trait:* Decouple issue tracking behind an optional `IssueSync` trait,
+     making Postgres the sole canonical source of truth while supporting OneDev, GitHub Issues, or
+     Linear as optional downstream sinks rather than hard architectural dependencies.
+  **(d) Impact on Roadmap:** If OneDev is decoupled or dropped, assess simplifying ANA-1 (collapsing
+  dual-canonical complexity to single-canonical Postgres) and eliminating or deferring MOD-5 (OneDev sync).
+  Output: `docs/ANA-6.md`. Informs ANA-1, MOD-5, MOD-6.
 
 ### Next features
 
@@ -115,7 +216,7 @@ ANA-2 (orchestration design) gate most MODs; MOD-1 (TUI scaffold) can start imme
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 2 (ANA-1 data model + sync, ANA-2 orchestration design)                                   |
+| ANA-N   | 6 (ANA-1 data model + sync, ANA-2 orchestration, ANA-3 tooling, ANA-4 ACP, ANA-5 exec model, ANA-6 OneDev necessity) |
 | MOD-N   | 7 (MOD-1 TUI scaffold, MOD-2 agent driver, MOD-3 diff + explorer, MOD-4 orchestrator, MOD-5 OneDev sync, MOD-6 item store, MOD-7 box registry) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 0                                                                                         |
