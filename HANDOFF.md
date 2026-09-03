@@ -14,8 +14,8 @@
   `.claude/rules/workflow-docs.md` in the dingine workspace — this repo is outside the
   `sync-workflow-surface` default target list, pass `-Targets` explicitly to receive the surface).
 
-**Current status (2026-09-03):** Repo bootstrapped, no code yet. ANA-1 (data model + sync)
-concluded with maintainer supervision. ANA-2 (orchestration design), ANA-3 (tooling & intelligence),
+**Current status (2026-09-03):** Repo bootstrapped, no code yet. ANA-8 (project and workspace hierarchy)
+and ANA-1 (data model + sync) concluded. ANA-2 (orchestration design), ANA-3 (tooling & intelligence),
 ANA-4 (ACP protocol), ANA-5 (execution model), ANA-6 (OneDev necessity), and ANA-7 (Infisical secret management)
 gate remaining MODs; MOD-1 (TUI scaffold) can start immediately.
 
@@ -153,19 +153,6 @@ gate remaining MODs; MOD-1 (TUI scaffold) can start immediately.
   Must settle: Infisical SDK vs CLI subprocess wrapping; machine identity bootstrap flow per box;
   and secret masking pipeline for transcript uploads.
   Output: `docs/ANA-7.md`. Informs ANA-1, MOD-2, MOD-5, MOD-7.
-- [ ] **ANA-8 - Project and workspace hierarchy model: multi-project workspaces vs global multi-project instance.** Evaluate
-  extending htui's top-level entity model beyond a single `repo` to support `project` and `workspace` concepts:
-  **(a) Hierarchy & Scope:** Define the relationship between `workspace`, `project`, and `repo` (e.g. a workspace
-  grouping multiple repos/projects sharing context and toolchains vs standalone single-repo projects).
-  **(b) Workspace-Centric vs Global Topology:** Compare a workspace-centric model (where the user opens or switches
-  isolated workspaces containing multiple projects, similar to VS Code / Cargo workspaces) against a single global
-  daemon/instance managing all projects simultaneously across boxes. Lean towards a workspace model with fast switching.
-  **(c) Cross-Project Dependencies & Navigation:** Design how `item_link` resolves cross-project dependencies within
-  the same workspace vs across workspaces, and how the TUI navigation (`MOD-1`) switches context between projects and
-  workspaces.
-  **(d) Schema & Migration Impact:** Specify DDL schema additions for `workspace` and `project` tables in Postgres
-  (`ANA-1`), and determine impact on `items.json` placement and the legacy migration importer (`MOD-8`).
-  Output: `docs/ANA-8.md`. Informs MOD-1, MOD-6, MOD-8.
 
 ### Next features
 
@@ -215,13 +202,13 @@ gate remaining MODs; MOD-1 (TUI scaffold) can start immediately.
   htui to import existing projects using legacy markdown workflow docs (`HANDOFF.md`, `DECISIONS.md`, `docs/decisions/**`,
   `docs/ANA-*.md`) into htui's data model (`repo`, `item`, `item_document`, `artifact`, `items.json`). Parse open
   checklist items, historical decision write-ups, and analysis docs, minting UUIDs and preserving status, timestamps,
-  and cross-item dependency links (`item_link`) without data loss. Blocked on MOD-6 and informed by ANA-8.
+  and cross-item dependency links (`item_link`) without data loss. Blocked on MOD-6 and informed by [ANA-8](docs/decisions/ana/ana-8.md).
 
 ## Summary
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 7 (ANA-2 orchestration, ANA-3 tooling, ANA-4 ACP, ANA-5 exec model, ANA-6 OneDev necessity, ANA-7 Infisical secret management, ANA-8 project & workspace model) |
+| ANA-N   | 6 (ANA-2 orchestration, ANA-3 tooling, ANA-4 ACP, ANA-5 exec model, ANA-6 OneDev necessity, ANA-7 Infisical secret management) |
 | MOD-N   | 8 (MOD-1 TUI scaffold, MOD-2 agent driver, MOD-3 diff + explorer, MOD-4 orchestrator, MOD-5 OneDev sync, MOD-6 item store, MOD-7 box registry, MOD-8 legacy migration) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 0                                                                                         |
