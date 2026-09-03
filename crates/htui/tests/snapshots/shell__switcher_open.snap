@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/shell.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Skills  2 Settings
+┌ Skills ──────────────────────────────────────────────────────────────────────────────────────────┐
+│Skill registry and capability tags arrive with MOD-12.                                            │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                             ┌ Workspaces ──────────────────────────┐                             │
+│                             │> Graphics  1 project                 │                             │
+│                             │  Platform  2 projects                │                             │
+│                             │                                      │                             │
+│                             │  j/k move · Enter switch · Esc close │                             │
+│                             └──────────────────────────────────────┘                             │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
