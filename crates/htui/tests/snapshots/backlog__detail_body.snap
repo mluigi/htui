@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/backlog.rs
+expression: harness.render()
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog
+┌ Backlog (11) ───────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
+│▾ htui (8)                                           ││ Body  Runs  Graph  Documents  Notes       │
+│  ANA-1    done               Data model, box regist…││TUI scaffold                               │
+│  ANA-2    open               Orchestrator step grap…││FEAT-1  FEAT  in_progress                  │
+│  CLEAN-1  failed             Drop the legacy markdo…││rust · priority 2 · version 1              │
+│  FEAT-1   in_progress        TUI scaffold           ││                                           │
+│  FEAT-2   blocked            Agent driver and chat …││Stand up the terminal application: a       │
+│  FEAT-3   queued             Postgres store and cac…││workspace-scoped shell with a tab strip, a │
+│  FIX-1    closed             Terminal left raw afte…││top bar and a                              │
+│  TOOL-1   awaiting_approval  CI matrix for the thre…││backlog tab, all reading through the store │
+│▾ agy (3)                                            ││seam.                                      │
+│  ANA-1    done               Prompt assembly survey ││                                           │
+│  FEAT-1   open               ACP transport upgrade  ││Shape                                      │
+│  FIX-1    open               Session leak on cancel ││- Two crates: `htui-core` holds the domain │
+│                                                     ││model and the store traits, `htui` holds   │
+│                                                     ││the terminal                               │
+│                                                     ││  application. Nothing in the view layer   │
+│                                                     ││holds a store handle.                      │
+│                                                     ││- A store worker task owns the backend. The│
+│                                                     ││UI sends a request, the worker replies, the│
+│                                                     ││event                                      │
+│                                                     ││  loop folds the reply into state. Three   │
+│                                                     ││select arms: terminal events, store        │
+│                                                     ││replies, a tick.                           │
+│                                                     ││- Tabs, detail sub-tabs and overlays are   │
+│                                                     ││trait objects in registries, so a later    │
+└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

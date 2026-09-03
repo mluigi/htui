@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/backlog.rs
+expression: frame
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog
+┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
+│▾ htui (8)                                           ││ Body  Runs  Graph  Documents  Notes       │
+│  ANA-1    done               Data model, box regist…││Data model, box registry and sync topology │
+│  ANA-2    open               Orchestrator step grap…││ANA-1  ANA  done                           │
+│  CLEAN-1  failed             Drop the legacy markdo…││no tags · priority 0 · version 1           │
+│  FEAT-1   in_progress        TUI scaffold           ││                                           │
+│  FEAT-2   blocked            Agent driver and chat …││The store seam is the one interface every  │
+│  FEAT-3   queued             Postgres store and cac…││other module reaches through, so it is     │
+│  FIX-1    closed             Terminal left raw afte…││settled first.                             │
+│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
+│▾ agy (3)                                            ││Postgres holds the truth; every box keeps a│
+│  ANA-1    done               Prompt assembly survey ││read-only cache it refreshes on connect.   │
+│  FEAT-1   open               ACP transport upgrade  ││Writes are                                 │
+│  FIX-1    open               Session leak on cancel ││compare-and-set on a version column, so a  │
+│                                                     ││losing edit is shown against its common    │
+│                                                     ││ancestor rather                            │
+│                                                     ││than silently dropped.                     │
+│                                                     ││                                           │
+│                                                     ││Item keys are minted from a per-project    │
+│                                                     ││counter table, which keeps numbers gapless │
+│                                                     ││and lets the                               │
+│                                                     ││legacy importer align the counter above the│
+│                                                     ││numbers it brings in.                      │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
