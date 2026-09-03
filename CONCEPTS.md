@@ -25,7 +25,11 @@ a local-first, developer-guided harness [R-ID-2].
 - **Offline is read-only** from a per-box cache; keys are minted online, so no offline collision
   and no sync engine [R-STO-3, R-STO-4, R-ENT-7].
 - **No silent merges.** Concurrent edits on the same item version are rejected and shown as a
-  divergence against the common ancestor; no timestamp last-writer-wins [R-ENT-10].
+  divergence against the common ancestor; no timestamp last-writer-wins [R-ENT-10]. `version`
+  guards the human-edited spec only; status moves are their own compare-and-set and never bump it
+  (`docs/ANA-9.md` §4.2).
+- **One cache writer.** The per-box cache is a SQLite mirror written only by the refresh task,
+  never by user actions; live reads while connected go to Postgres (`docs/ANA-9.md` §6.3).
 - **No agent in any bookkeeping path.** Sync, cache, import and status transitions are
   deterministic code [R-ID-6].
 

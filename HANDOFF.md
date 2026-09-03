@@ -14,9 +14,11 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-03):** No code yet. `docs/REQUIREMENTS.md` approved; ANA-1 and ANA-8
-superseded by it (kept as history), ANA-6 closed by it. ANA-9 (data model v2) gates the store;
-ANA-4 (ACP) gates the driver; ANA-2 (orchestration) gates the orchestrator. MOD-1 can start now.
+**Current status (2026-09-03):** No code yet. ANA-9 concluded (`docs/ANA-9.md`: schema v2, key
+counters, `version` CAS, `session_event` rows, SQLite cache with `updated_at` cursor) and unblocks
+MOD-6. `docs/REQUIREMENTS.md` approved; ANA-1 and ANA-8 superseded by it (kept as history), ANA-6
+closed by it. ANA-4 (ACP) gates the driver; ANA-2 (orchestration) gates the orchestrator. MOD-1 and
+MOD-6 can start now.
 
 ---
 
@@ -24,12 +26,6 @@ ANA-4 (ACP) gates the driver; ANA-2 (orchestration) gates the orchestrator. MOD-
 
 ### Analyses
 
-- [ ] **ANA-9 - Data model v2.** Postgres schema for `R-USR`, `R-BOX`, `R-ENT`, `R-STO`, `R-HIS`,
-  `R-SKL`, `R-PRM-4`, `R-AGT-4`, `R-ORCH-1`, `R-ORCH-11`: user, box, workspace, project, repo, per-box
-  paths, item kinds, items, links, revisions, notes, documents, step graphs, runs, steps, session
-  events, skills, bindings, templates, agent registry. Must settle: per-project key sequences,
-  divergence detection on `version`, event row shape for replay, cache file format and refresh
-  cursor. Replaces ANA-1 and ANA-8 DDL. Output: `docs/ANA-9.md`. Spawns MOD-6.
 - [ ] **ANA-4 - Agent protocol: ACP client and CLI fallback.** `R-AGT-1..6`. Settle the
   `AgentDriver` trait and event model, the ACP client design (`agent-client-protocol` crate or
   hand-rolled JSON-RPC), permission and edit-proposal handling, how `claude` is reached over ACP,
@@ -66,7 +62,7 @@ ANA-4 (ACP) gates the driver; ANA-2 (orchestration) gates the orchestrator. MOD-
   selection, capability check, promotion to chat, run records. Blocked on ANA-2, MOD-2, MOD-6.
 - [ ] **MOD-6 - Postgres store + cache** (from ANA-9). `R-STO-1..6`, `R-ENT-1..12`, `R-USR-2`.
   Migrations, DB-backed store trait, keyring for the DSN, per-box read-only cache with background
-  refresh, offline mode. Blocked on ANA-9.
+  refresh, offline mode. Design: `docs/ANA-9.md` (DDL §5, store trait §6.1, scope §9). Not blocked.
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`. Probe,
   registration, capability tags and quirks editor, per-box paths, agent autodiscovery hook. Blocked
   on MOD-6; the probe can land with MOD-1 behind the store trait.
@@ -96,7 +92,7 @@ ANA-4 (ACP) gates the driver; ANA-2 (orchestration) gates the orchestrator. MOD-
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 6 (ANA-2 orchestration, ANA-3 context tools, ANA-4 ACP, ANA-5 prompt assembly, ANA-7 secrets, ANA-9 data model v2) |
+| ANA-N   | 5 (ANA-2 orchestration, ANA-3 context tools, ANA-4 ACP, ANA-5 prompt assembly, ANA-7 secrets) |
 | MOD-N   | 12 (MOD-1 TUI, MOD-2 driver, MOD-4 orchestrator, MOD-6 store, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 0                                                                                         |
