@@ -3,4 +3,4 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
-(no resolved items yet)
+- **[ANA-1](docs/decisions/ana/ana-1.md)** - Data model, box registry and sync topology (done, 2026-09-03)

@@ -14,10 +14,10 @@
   `.claude/rules/workflow-docs.md` in the dingine workspace — this repo is outside the
   `sync-workflow-surface` default target list, pass `-Targets` explicitly to receive the surface).
 
-**Current status (2026-09-03):** Repo bootstrapped, no code yet. ANA-1 (data model + sync),
-ANA-2 (orchestration design), ANA-3 (tooling & intelligence augmentations), ANA-4 (ACP protocol),
-ANA-5 (execution model: granular control vs interactive), ANA-6 (OneDev necessity), and
-ANA-7 (Infisical secret management) gate most MODs; MOD-1 (TUI scaffold) can start immediately.
+**Current status (2026-09-03):** Repo bootstrapped, no code yet. ANA-1 (data model + sync)
+concluded with maintainer supervision. ANA-2 (orchestration design), ANA-3 (tooling & intelligence),
+ANA-4 (ACP protocol), ANA-5 (execution model), ANA-6 (OneDev necessity), and ANA-7 (Infisical secret management)
+gate remaining MODs; MOD-1 (TUI scaffold) can start immediately.
 
 ---
 
@@ -25,36 +25,6 @@ ANA-7 (Infisical secret management) gate most MODs; MOD-1 (TUI scaffold) can sta
 
 ### Analyses
 
-- [ ] **ANA-1 - Data model, box registry and sync topology.** Design the persistent layer before
-  any storage code: Postgres schema (items, boxes, runs, sync state), the thin per-repo
-  `items.json` shape (uuid, item key, title, status — nothing else, so the repo file stays
-  merge-friendly and the DB carries the body), the OneDev issue mapping (item ↔ issue number,
-  story/comments live in OneDev, sync over its REST API with a token — **no agent in the sync
-  path**, it is a pure API client to keep token usage at zero), and the box registry (machine
-  characteristics captured at registration: OS, arch, compiler + toolchain versions, env quirks —
-  motivation: recurring build errors that differ per box; characteristics get injected into every
-  agent prompt). Must settle: which store is canonical for which field (proposal: DB canonical for
-  item state, OneDev canonical for story/discussion, `items.json` a derived snapshot for offline /
-  fresh-clone use), conflict rule on concurrent edits from two boxes (proposal: `updated_at` +
-  uuid, last-writer-wins per field, sync job reports divergence instead of silently merging), and
-  where run transcripts live. Transcript proposal (settled 2026-08-30, session with maintainer):
-  **split, two destinations** — the distilled step summary / final message goes to the OneDev
-  issue as a *comment* (human story), the full raw transcript goes up as an issue *attachment*
-  (big, on-demand debugging), written locally first and referenced as `run.transcript_ref text`
-  (`file://...` until uploaded, `onedev://<issue>/<attachment>` after) with `prompt_digest` kept
-  beside it; the uploader **must scrub secrets** (env vars, tokens echoed in tool output) before
-  anything leaves the box, since an attachment is visible to everyone with repo access. Two more
-  settled shapes the DDL must carry: **(a)** an `artifact` table (`item_id`, optional `run_id`,
-  `kind` in `prd|plan|review|summary`, markdown `content` capped ~4-8 KB because it is
-  prompt-injected, `created_at`) — agents never receive raw transcripts of previous items, the
-  prompt builder injects linked items' artifacts instead (same index-plus-one-write-up economy the
-  dingine workflow uses); `kind='summary'` is the DB-native decision write-up MOD-4 emits on
-  completion. **(b)** an `item_link` edge table (`from_item`, `to_item`, `kind` in
-  `blocks|origin|relates|supersedes`, composite PK) **replacing** any `blocked_on` array or
-  `origin` column on `item` — traversal is a recursive CTE, no graph database; the prompt builder
-  walks 1-2 hops and collects neighbors' `summary`/`review` artifacts, so htui bounds the token
-  cost, not the agent. Output: `docs/ANA-1.md` with the schema DDL sketch. Spawns MOD-5, MOD-6,
-  MOD-7.
 - [ ] **ANA-2 - Orchestration pipeline design.** Design the multi-agent chain (ultracode-like, but
   agy is a first-class step): a run is a typed step graph, e.g. PRD (claude) → plan (claude) →
   implement (agy, possibly fan-out) → review (claude, cpp-reviewer persona for C++ targets), each
@@ -233,7 +203,7 @@ ANA-7 (Infisical secret management) gate most MODs; MOD-1 (TUI scaffold) can sta
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 7 (ANA-1 data model + sync, ANA-2 orchestration, ANA-3 tooling, ANA-4 ACP, ANA-5 exec model, ANA-6 OneDev necessity, ANA-7 Infisical secret management) |
+| ANA-N   | 6 (ANA-2 orchestration, ANA-3 tooling, ANA-4 ACP, ANA-5 exec model, ANA-6 OneDev necessity, ANA-7 Infisical secret management) |
 | MOD-N   | 7 (MOD-1 TUI scaffold, MOD-2 agent driver, MOD-3 diff + explorer, MOD-4 orchestrator, MOD-5 OneDev sync, MOD-6 item store, MOD-7 box registry) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 0                                                                                         |
