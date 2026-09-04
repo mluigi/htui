@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[MOD-6](docs/decisions/mod/mod-6.md)** - Postgres store + cache: htui-store crate, 0001_init migration, PgStore, SQLite mirror with cursor refresh, keyring DSN, Online/Offline backend (done, 2026-09-04)
 - **[MOD-1](docs/decisions/mod/mod-1.md)** - TUI scaffold: workspace, htui-core store seam and MemStore, htui shell with Backlog tab and workspace switcher (done, 2026-09-04)
 - **[ANA-9](docs/decisions/ana/ana-9.md)** - Data model v2: Postgres schema, key sequences, divergence, event rows, cache (done, 2026-09-03)
 - **[ANA-6](docs/decisions/ana/ana-6.md)** - OneDev necessity: Postgres sole source of truth, trackers become optional later-tier mirrors (done, 2026-09-03)

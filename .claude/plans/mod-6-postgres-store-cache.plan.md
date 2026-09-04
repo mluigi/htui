@@ -246,9 +246,9 @@ silent; helper required). Plan-level amendments: D3 reads "strong-enum derive wi
 | Test databases leak on a panicking test | Low | Names carry the `htui_test_` prefix; README notes `DROP DATABASE` cleanup |
 
 ## Acceptance
-- [ ] All tasks complete
-- [ ] Validation block passes; Postgres tests run green with the env var set
-- [ ] ANA-9 §11 criteria 1–7 each mapped to a passing test or a recorded manual measurement
-- [ ] Patterns mirrored, not reinvented (§5 DDL, §7 queries, §6.2 algorithm verbatim)
-- [ ] `rust-reviewer` findings applied or deferred with the maintainer
-- [ ] HANDOFF / DECISIONS bookkeeping per `lifecycle.md` P2, validator green
+- [x] All tasks complete (commits 2b0125f, f8364e6, e977bc8, d0fe7b1, 8427cf9, f16c972, 946bfed)
+- [x] Validation block passes; 157 tests green with the env var set (Postgres 16.15, plus 17.11 for migrations and conformance)
+- [x] ANA-9 §11 criteria 1–4, 6, 7 mapped to passing tests; 5 (warm start) left as a manual measurement in the write-up
+- [x] Patterns mirrored, not reinvented (§5 DDL, §7 queries, §6.2 algorithm verbatim; reviewer verified)
+- [x] `rust-reviewer` findings F1–F9 all applied; verdict approve at f16c972, F8/F9 at 946bfed
+- [x] HANDOFF / DECISIONS bookkeeping per `lifecycle.md` P2, validator green
