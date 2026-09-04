@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.run_step_id, c.repo_id, c.before_hash, c.after_hash, s.updated_at as \"ts!\"\n             FROM run_step_commit c\n             JOIN run_step s ON s.id = c.run_step_id\n             JOIN run r      ON r.id = s.run_id\n            WHERE r.project_id = $1 AND s.updated_at > $2\n            ORDER BY s.updated_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_step_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step_commit",
+            "name": "run_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repo_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step_commit",
+            "name": "repo_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "before_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step_commit",
+            "name": "before_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "after_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step_commit",
+            "name": "after_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "ts!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "2bb052d99995f4640ba654d26bde95c93bee67578979c281e002031892ab3a7b"
+}

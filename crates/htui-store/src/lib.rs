@@ -8,10 +8,12 @@
 //! worker of the `htui` crate is the only caller.
 #![warn(missing_docs)]
 
+pub mod cache;
 pub mod error;
 pub mod identity;
 pub mod pg;
 
+pub use cache::{CacheMeta, CacheStore};
 pub use error::map_sqlx;
 pub use identity::Identity;
 pub use pg::{Connected, MigrationState, PgStore};
@@ -22,3 +24,10 @@ pub use pg::{Connected, MigrationState, PgStore};
 /// editing an applied migration changes its checksum and [`PgStore::connect`] then refuses
 /// (`R-STO-5`).
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// The embedded SQLite mirror schema (ANA-9 §4.4), applied by [`CacheStore::open`].
+///
+/// Independent of [`MIGRATOR`]: this one versions the *local* file, and a mismatch between
+/// `cache_meta.schema_version` and [`PgStore::schema_version`] is what rebuilds it (plan D8), so
+/// the mirror never has to migrate its own data forward.
+pub static CACHE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./cache_migrations");

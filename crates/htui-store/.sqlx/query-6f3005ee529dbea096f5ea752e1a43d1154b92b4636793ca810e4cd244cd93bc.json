@@ -1,0 +1,101 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT from_item_id, to_item_id, kind, proposed_by_step_id, created_at, updated_at, deleted_at FROM item_link WHERE (from_item_id IN (SELECT id FROM item WHERE project_id = $1) OR to_item_id IN (SELECT id FROM item WHERE project_id = $1)) AND updated_at > $2 ORDER BY updated_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "from_item_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "from_item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "to_item_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "to_item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "proposed_by_step_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "proposed_by_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "deleted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "6f3005ee529dbea096f5ea752e1a43d1154b92b4636793ca810e4cd244cd93bc"
+}

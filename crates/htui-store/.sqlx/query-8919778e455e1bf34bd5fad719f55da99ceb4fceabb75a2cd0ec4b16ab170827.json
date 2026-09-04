@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO session_event (run_step_id, seq, turn, kind, role, tool_call_id, payload, raw, at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (run_step_id, seq) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8919778e455e1bf34bd5fad719f55da99ceb4fceabb75a2cd0ec4b16ab170827"
+}

@@ -1,0 +1,257 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, status, gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, usage, isolation_path, started_at, finished_at, updated_at FROM run_step WHERE run_id IN (SELECT id FROM run WHERE project_id = $1) AND updated_at > $2 ORDER BY updated_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "run_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "attempt",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "attempt"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "fanout_index",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "fanout_index"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "phase_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "phase_name"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "agent_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "model"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "gate_outcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "gate_outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "gate_note",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "gate_note"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "selected",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "selected"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "exit_code",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "exit_code"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "prompt_digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "prompt_digest"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "trim_record",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "trim_record"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "usage",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "usage"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "isolation_path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "isolation_path"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "finished_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "finished_at"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "ec121f796c46c1afde5472e057cdadc9a8f28219c7ccb23127a0819c79647930"
+}
