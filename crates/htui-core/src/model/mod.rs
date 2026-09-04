@@ -31,10 +31,13 @@ macro_rules! str_enum {
     ) => {
         $(#[$enum_meta])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+        #[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+        #[cfg_attr(feature = "sqlx", sqlx(type_name = "text"))]
         pub enum $name {
             $(
                 $(#[$variant_meta])*
                 #[serde(rename = $text)]
+                #[cfg_attr(feature = "sqlx", sqlx(rename = $text))]
                 $variant,
             )+
         }

@@ -21,6 +21,8 @@ macro_rules! id_newtype {
                 Deserialize,
             )]
             #[serde(transparent)]
+            #[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+            #[cfg_attr(feature = "sqlx", sqlx(transparent))]
             pub struct $name(pub Uuid);
 
             impl $name {

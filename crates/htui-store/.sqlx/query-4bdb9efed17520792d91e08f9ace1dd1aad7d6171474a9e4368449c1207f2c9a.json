@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO capability_tag (tag, seeded) SELECT t, true FROM UNNEST($1::text[]) AS t ON CONFLICT (tag) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4bdb9efed17520792d91e08f9ace1dd1aad7d6171474a9e4368449c1207f2c9a"
+}

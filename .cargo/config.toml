@@ -1,0 +1,6 @@
+# sqlx compile-time query checking runs against the committed `crates/htui-store/.sqlx/` data, so
+# `cargo build` / `clippy` / `doc` never need a database (plan D2). `cargo sqlx prepare` sets
+# SQLX_OFFLINE=false in the child `cargo check` it spawns, and a non-forced `[env]` entry does not
+# override an already-set variable, so regeneration still works from here.
+[env]
+SQLX_OFFLINE = "true"

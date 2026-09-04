@@ -35,32 +35,54 @@ pub const CASES: &[&str] = &[
     "nil_author_rejected",
 ];
 
-/// Runs every case in [`CASES`].
+/// Runs one case by name against an already-loaded store.
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case, and on an unknown `name`. The return type is
+/// `()` and not `Result<(), String>` deliberately: the cases are written as `assert_eq!` chains
+/// that carry their own messages, and turning fifteen bodies into error-returning functions would
+/// rewrite the whole suite to gain a string the panic already prints. MOD-6's `pg_conformance.rs`
+/// gets its per-case reporting from the loop, not from a `Result`.
+pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
+    match name {
+        "mint_consecutive_keys" => mint_consecutive_keys(store).await,
+        "mint_prefix_isolation" => mint_prefix_isolation(store).await,
+        "mint_writes_revision_v1" => mint_writes_revision_v1(store).await,
+        "mint_unknown_kind_rejected" => mint_unknown_kind_rejected(store).await,
+        "update_cas_success" => update_cas_success(store).await,
+        "update_kind_keeps_key_and_project" => update_kind_keeps_key_and_project(store).await,
+        "update_cas_diverged" => update_cas_diverged(store).await,
+        "status_cas_keeps_version" => status_cas_keeps_version(store).await,
+        "no_delete_path" => no_delete_path(store).await,
+        "links_hops_1_vs_2" => links_hops_1_vs_2(store).await,
+        "filter_status_project_tags_ready" => filter_status_project_tags_ready(store).await,
+        "documents_ordered_by_version" => documents_ordered_by_version(store).await,
+        "notes_ordered_by_created_at" => notes_ordered_by_created_at(store).await,
+        "events_ordered_by_seq" => events_ordered_by_seq(store).await,
+        "nil_author_rejected" => nil_author_rejected(store).await,
+        other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
+    }
+}
+
+/// Runs every case in [`CASES`], each against a store `make` produced fresh.
 ///
 /// `make` must return a store freshly loaded with [`crate::fixtures::DemoData`] and nothing else;
 /// each case gets its own store, so a case is free to mint, edit and transition without
-/// disturbing the next one. Panics on the first failed assertion, naming the case.
+/// disturbing the next one.
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case.
 pub async fn run_all<S, F, Fut>(make: F)
 where
     S: WriteStore,
     F: Fn() -> Fut,
     Fut: Future<Output = S>,
 {
-    mint_consecutive_keys(&make().await).await;
-    mint_prefix_isolation(&make().await).await;
-    mint_writes_revision_v1(&make().await).await;
-    mint_unknown_kind_rejected(&make().await).await;
-    update_cas_success(&make().await).await;
-    update_kind_keeps_key_and_project(&make().await).await;
-    update_cas_diverged(&make().await).await;
-    status_cas_keeps_version(&make().await).await;
-    no_delete_path(&make().await).await;
-    links_hops_1_vs_2(&make().await).await;
-    filter_status_project_tags_ready(&make().await).await;
-    documents_ordered_by_version(&make().await).await;
-    notes_ordered_by_created_at(&make().await).await;
-    events_ordered_by_seq(&make().await).await;
-    nil_author_rejected(&make().await).await;
+    for name in CASES {
+        run_case(name, &make().await).await;
+    }
 }
 
 /// The `Platform` workspace of the fixture: projects `htui` (position 0) then `agy` (position 1).
@@ -914,7 +936,8 @@ async fn nil_author_rejected<S: WriteStore>(store: &S) {
 
 #[cfg(test)]
 mod tests {
-    use super::CASES;
+    use super::{CASES, run_case};
+    use crate::store::MemStore;
 
     #[test]
     fn case_names_are_unique() {
@@ -922,5 +945,14 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
+    }
+
+    #[tokio::test]
+    async fn run_case_accepts_every_name_in_cases() {
+        // `run_case` panics on a name it does not know, which is the whole point of its `match`:
+        // running the list through it is what keeps `CASES` and the dispatcher in step.
+        for name in CASES {
+            run_case(name, &MemStore::demo()).await;
+        }
     }
 }
