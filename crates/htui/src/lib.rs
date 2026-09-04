@@ -64,9 +64,8 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
         Started::detached(Backend::memory(MemStore::demo()))
     } else {
         connect::start(StartOptions {
-            dsn: None,
             offline: args.offline,
-            config_root: identity::config_root()?,
+            ..StartOptions::new(identity::config_root()?)
         })
         .await?
     };

@@ -36,12 +36,16 @@ const EXTENSION: &str = "jsonl";
 ///
 /// A file that cannot be parsed - a bad name, a bad line, or no events at all - is left in place
 /// and logged at `warn`. It is never deleted and never fatal: a corrupt buffer must not cost the
-/// user every other buffered chat, and it stays on disk for inspection.
+/// user every other buffered chat, and it stays on disk for inspection. A file the *server*
+/// refuses ([`StoreError::Constraint`]: a project deleted while this box was offline, a `kind`
+/// outside its `CHECK`) is treated the same way, because no later pass will change the answer and
+/// one poisoned buffer must not block every buffer queued behind it.
 ///
 /// # Errors
 ///
-/// Whatever the driver reports, through [`map_sqlx`], and [`StoreError::Backend`] when
-/// `pending/` exists but cannot be listed.
+/// Whatever else the driver reports, through [`map_sqlx`] - an unreachable server aborts the
+/// upload and the next pass retries it - and [`StoreError::Backend`] when `pending/` exists but
+/// cannot be listed.
 pub async fn upload_pending(
     pool: &PgPool,
     dir: &Path,
@@ -64,7 +68,23 @@ pub async fn upload_pending(
     let mut uploaded = 0usize;
     for path in files {
         let Some(buffer) = parse(&path) else { continue };
-        upload_one(pool, &buffer, this_box, this_user).await?;
+        match upload_one(pool, &buffer, this_box, this_user).await {
+            Ok(()) => {}
+            // The server parsed it and said no - a project deleted while this box was offline, a
+            // `kind` outside its `CHECK`. Nothing about the next pass will change its mind, so
+            // propagating it would abort the upload half of *every* later pass and cost the user
+            // every buffer queued behind this one. It stays on disk, like a malformed file.
+            Err(StoreError::Constraint(why)) => {
+                tracing::warn!(
+                    file = %path.display(),
+                    reason = %why,
+                    "cache: the server refused a pending file; leaving it in place",
+                );
+                continue;
+            }
+            // Anything else is the server, not the file: stop and let the next pass retry.
+            Err(err) => return Err(err),
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => uploaded += 1,
             Err(e) => {

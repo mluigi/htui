@@ -252,11 +252,35 @@ async fn mirror_reads_equal_the_reference_store() {
             text: Some("scaffold".to_owned()),
             ..ItemFilter::default()
         },
+        // `text` is a literal substring in every store, so a LIKE wildcard matches nothing.
+        ItemFilter {
+            text: Some("_".to_owned()),
+            ..ItemFilter::default()
+        },
+        ItemFilter {
+            text: Some("%".to_owned()),
+            ..ItemFilter::default()
+        },
     ] {
         assert_eq!(
             cache.items(&scope, &filter).await.expect("cache items"),
             mem.items(&scope, &filter).await.expect("mem items"),
             "items for {filter:?}"
+        );
+    }
+
+    for wildcard in ["_", "%", "%aff%", "sc_ffold"] {
+        let filter = ItemFilter {
+            text: Some(wildcard.to_owned()),
+            ..ItemFilter::default()
+        };
+        assert!(
+            cache
+                .items(&scope, &filter)
+                .await
+                .expect("cache items")
+                .is_empty(),
+            "`{wildcard}` is a literal needle in the mirror too, so nothing matches"
         );
     }
 
@@ -683,6 +707,99 @@ async fn steps_beyond_n_lose_their_events() {
     teardown(db, &[&cache]).await;
 }
 
+/// §6.2 step 4 selects the last N **finished** steps.
+///
+/// The presence probe of `refresh_transcripts` is existence-only ("this step already has rows, so
+/// skip it"), which is sound for a finished step - `session_event` is append-only - and wrong for a
+/// running one: its first partial copy would be frozen for the rest of the session. A running step
+/// is therefore not a candidate at all until it has a `finished_at`.
+#[tokio::test]
+async fn a_running_step_is_mirrored_only_once_it_has_finished() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    // A step of the fixture's finished run that is still going: no `finished_at`, three events.
+    let running = StepId::new();
+    sqlx::query(
+        "INSERT INTO run_step (id, run_id, position, attempt, fanout_index, phase_name, status, \
+                               started_at, finished_at) \
+         VALUES ($1, $2, 99, 1, 0, 'implement', 'running', now(), NULL)",
+    )
+    .bind(running.as_uuid())
+    .bind(ids::RUN_1.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("insert a running step");
+    for seq in 0..3 {
+        let event = pending_event(running, seq);
+        sqlx::query(
+            "INSERT INTO session_event (run_step_id, seq, turn, kind, role, payload, at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(event.run_step_id.as_uuid())
+        .bind(event.seq)
+        .bind(event.turn)
+        .bind(event.kind.as_str())
+        .bind(event.role.as_str())
+        .bind(&event.payload)
+        .bind(event.at)
+        .execute(&db.pool)
+        .await
+        .expect("insert an event on the running step");
+    }
+
+    let cache = open_cache(&db).await;
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the pass that sees the step running");
+    assert_eq!(
+        cache.step_events(running).await.expect("read"),
+        None,
+        "a running step is not one of the last N finished steps (6.2)",
+    );
+
+    // Two more events land and the step finishes; now the whole log is copied at once.
+    for seq in 3..5 {
+        let event = pending_event(running, seq);
+        sqlx::query(
+            "INSERT INTO session_event (run_step_id, seq, turn, kind, role, payload, at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(event.run_step_id.as_uuid())
+        .bind(event.seq)
+        .bind(event.turn)
+        .bind(event.kind.as_str())
+        .bind(event.role.as_str())
+        .bind(&event.payload)
+        .bind(event.at)
+        .execute(&db.pool)
+        .await
+        .expect("insert a later event");
+    }
+    sqlx::query("UPDATE run_step SET status = 'done', finished_at = now() WHERE id = $1")
+        .bind(running.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("finish the step");
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the pass that sees it finished");
+    let mirrored = cache
+        .step_events(running)
+        .await
+        .expect("read")
+        .expect("a finished step is mirrored");
+    assert_eq!(
+        mirrored.iter().map(|e| e.seq).collect::<Vec<i32>>(),
+        vec![0, 1, 2, 3, 4],
+        "every event of the finished step is there, not the three of the first pass",
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 // ------------------------------------------------------------------------------------------------
 // Rebuild rules (§4.4, plan D8)
 // ------------------------------------------------------------------------------------------------
@@ -965,6 +1082,77 @@ async fn pending_upload_is_idempotent() {
     assert_eq!(common::count(&db.pool, "run").await, runs);
     assert_eq!(common::count(&db.pool, "run_step").await, steps);
     assert_eq!(common::count(&db.pool, "session_event").await, events);
+
+    teardown(db, &[&cache]).await;
+}
+
+/// A buffer the *server* refuses is skipped, not fatal, and does not block the files after it.
+///
+/// A malformed file never reaches Postgres; this one parses and is rejected on arrival - here by
+/// `run.project_id REFERENCES project(id)`, in the field by a project deleted while the box was
+/// offline or a `kind` outside its `CHECK`. Propagating that would abort the upload half of every
+/// later pass, so one poisoned file would cost the user every chat buffered after it.
+#[tokio::test]
+async fn a_pending_file_the_server_refuses_does_not_block_the_ones_after_it() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    // A project that does not exist. Its id sorts before every fixture id, which all start at
+    // `demo_uuid`'s epoch, so `upload_pending` meets this file first.
+    let bogus_project: ProjectId = "00000000-0000-7000-8000-000000000000"
+        .parse()
+        .expect("a syntactically valid project id");
+    let bogus_step = StepId::new();
+    let bogus_lines: Vec<String> = (0..3)
+        .map(|seq| serde_json::to_string(&pending_event(bogus_step, seq)).expect("serialise"))
+        .collect();
+    let refused = write_pending(cache.dir(), bogus_project, RunId::new(), &bogus_lines);
+
+    let good_run = RunId::new();
+    let good_step = StepId::new();
+    let good_lines: Vec<String> = (0..3)
+        .map(|seq| serde_json::to_string(&pending_event(good_step, seq)).expect("serialise"))
+        .collect();
+    let accepted = write_pending(cache.dir(), ids::PROJECT_HTUI, good_run, &good_lines);
+    assert!(
+        refused.file_name() < accepted.file_name(),
+        "the refused file has to be the one `list` reaches first"
+    );
+
+    let uploaded = upload_pending(
+        &db.pool,
+        cache.dir(),
+        db.store.this_box(),
+        db.store.this_user(),
+    )
+    .await
+    .expect("a file the server refuses is not a failed pass");
+
+    assert_eq!(uploaded, 1, "only the file that landed is counted");
+    assert!(
+        refused.exists(),
+        "the refused file stays on disk for inspection"
+    );
+    assert!(
+        !accepted.exists(),
+        "the file after it still landed and went"
+    );
+
+    let seqs: Vec<i32> =
+        sqlx::query_scalar("SELECT seq FROM session_event WHERE run_step_id = $1 ORDER BY seq")
+            .bind(good_step.as_uuid())
+            .fetch_all(&db.pool)
+            .await
+            .expect("the events of the accepted buffer");
+    assert_eq!(seqs, vec![0, 1, 2]);
+    let refused_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run WHERE project_id = $1")
+        .bind(bogus_project.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the refused run");
+    assert_eq!(refused_rows, 0, "its transaction rolled back whole");
 
     teardown(db, &[&cache]).await;
 }

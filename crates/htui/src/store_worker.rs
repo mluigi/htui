@@ -4,15 +4,22 @@
 //! render side") is a fact about this module's ownership, not a convention. [`serve`] is the pure
 //! request -> reply function; [`spawn`] is a loop around it, and the test harness calls it inline
 //! so snapshots need no sleeps (blueprint C.1, C.8).
+//!
+//! **The channels stay unbounded** (MOD-1 D4). A bounded pair would make `App::dispatch` either
+//! `.await` on a full queue - on the render task, which `R-NF-3` forbids - or drop requests, and
+//! the reply half would let a slow UI stall the one task that owns the store. Backpressure is
+//! deferred until `PgStore` read latency has actually been measured against a populated database;
+//! until then the queue depth is bounded in practice by the keystrokes a user can produce.
 
 use htui_core::model::{
     BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note, ProjectId,
     RunSummary, Scope, WorkspaceSummary,
 };
-use htui_core::store::ReadStore;
+use htui_core::store::{ReadStore, Result as StoreResult, StoreError};
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
 use htui_store::{Backend, ConnEvent, PgStore, Started, connect};
 use tokio::sync::{mpsc, watch};
+use tokio::time::MissedTickBehavior;
 
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
@@ -169,54 +176,43 @@ pub struct ReplyEnvelope {
 /// [`spawn`] loop, which intercepts both before reaching here. This is the answer the test harness
 /// and a `--demo` shell get, and both are right: a `MemStore` has no schema to migrate.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreReply {
-    let name = request.name();
-    match request {
-        StoreRequest::Workspaces => match backend.workspaces().await {
-            Ok(rows) => StoreReply::Workspaces(rows),
-            Err(err) => failed(name, &err),
-        },
-        StoreRequest::BoxInfo => match backend.box_info().await {
-            Ok(info) => StoreReply::BoxInfo(info),
-            Err(err) => failed(name, &err),
-        },
-        StoreRequest::ActiveRuns { scope } => match backend.active_runs(scope).await {
-            Ok(count) => StoreReply::ActiveRuns(count),
-            Err(err) => failed(name, &err),
-        },
-        StoreRequest::Items { scope, filter } => match backend.items(scope, filter).await {
-            Ok(rows) => StoreReply::Items(rows),
-            Err(err) => failed(name, &err),
-        },
-        StoreRequest::Item(id) => match backend.item(*id).await {
-            Ok(item) => StoreReply::Item(Box::new(item)),
-            Err(err) => failed(name, &err),
-        },
-        StoreRequest::Links { id, hops } => match backend.links(*id, *hops).await {
-            Ok(graph) => StoreReply::Links(graph),
-            Err(err) => failed(name, &err),
-        },
-        StoreRequest::Documents(id) => match backend.documents(*id).await {
-            Ok(rows) => StoreReply::Documents(rows),
-            Err(err) => failed(name, &err),
-        },
-        StoreRequest::Notes(id) => match backend.notes(*id).await {
-            Ok(rows) => StoreReply::Notes(rows),
-            Err(err) => failed(name, &err),
-        },
-        StoreRequest::Runs(id) => match backend.runs(*id).await {
-            Ok(rows) => StoreReply::Runs(rows),
-            Err(err) => failed(name, &err),
-        },
+    match try_serve(backend, request).await {
+        Ok(reply) => reply,
+        Err(err) => failed(request.name(), &err),
+    }
+}
+
+/// [`serve`] with the `StoreError` still visible, for the one caller that has to act on it.
+///
+/// [`spawn`] needs to tell [`StoreError::Unreachable`] from every other failure so it can drop an
+/// `Online` backend onto the mirror, and [`StoreReply::Failed`] carries only rendered text - which
+/// is what the asking view shows. Widening the reply with a machine-readable field would put a
+/// store concept into every view for the benefit of one match in this file.
+async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<StoreReply> {
+    Ok(match request {
+        StoreRequest::Workspaces => StoreReply::Workspaces(backend.workspaces().await?),
+        StoreRequest::BoxInfo => StoreReply::BoxInfo(backend.box_info().await?),
+        StoreRequest::ActiveRuns { scope } => {
+            StoreReply::ActiveRuns(backend.active_runs(scope).await?)
+        }
+        StoreRequest::Items { scope, filter } => {
+            StoreReply::Items(backend.items(scope, filter).await?)
+        }
+        StoreRequest::Item(id) => StoreReply::Item(Box::new(backend.item(*id).await?)),
+        StoreRequest::Links { id, hops } => StoreReply::Links(backend.links(*id, *hops).await?),
+        StoreRequest::Documents(id) => StoreReply::Documents(backend.documents(*id).await?),
+        StoreRequest::Notes(id) => StoreReply::Notes(backend.notes(*id).await?),
+        StoreRequest::Runs(id) => StoreReply::Runs(backend.runs(*id).await?),
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,
         },
         StoreRequest::ApplyMigrations => StoreReply::MigrationsApplied { applied: 0 },
-    }
+    })
 }
 
 /// Renders a store error into the reply the asking view receives.
-fn failed(request: &'static str, err: &htui_core::store::StoreError) -> StoreReply {
+fn failed(request: &'static str, err: &StoreError) -> StoreReply {
     StoreReply::Failed {
         request,
         message: err.to_string(),
@@ -238,8 +234,16 @@ fn failed(request: &'static str, err: &htui_core::store::StoreError) -> StoreRep
 ///   `PgStore::apply_migrations` takes `&mut self`, which a `&PgStore` cannot give — same
 ///   components, correct ownership.)
 /// - [`ConnEvent::Failed`] turns the first `connecting` into `offline · 0s` and nothing else.
+/// - An `Online` backend that stops answering goes the other way: a [`StoreError::Unreachable`]
+///   from a served request, or the same from the [`Refresher`]'s last pass, swaps `Online` back
+///   for `Offline { since: Some(now) }` over the same mirror, aborts the refresher and lets the
+///   ticker start dialling again. The request that noticed still gets its
+///   [`StoreReply::Failed`]: exactly one reply per request, whatever the backend did.
 /// - The ticker re-dials every [`connect::RECONNECT`], and only while there is a DSN to dial, no
-///   writable backend and no store waiting for an answer to the migration prompt.
+///   writable backend and no store waiting for an answer to the migration prompt. Its missed-tick
+///   behaviour is `Delay`, not the default `Burst`: a dial that overran its slot - a ten-second
+///   acquire timeout inside a thirty-second interval, or a laptop that was suspended - must not
+///   be followed by a queue of catch-up dials fired back to back.
 ///
 /// `started` is the bundle [`connect::start`] hands back; `Started::detached` is the `--demo` and
 /// test form, whose event channel is never written and whose ticker is disarmed, so the worker
@@ -264,12 +268,16 @@ pub fn spawn(
         let mut pending: Option<usize> = None;
         let mut held: Option<PgStore> = None;
         let mut refresher: Option<Refresher> = None;
+        // The refresher's last pass outcome, for as long as there is a refresher.
+        let mut health: Option<watch::Receiver<Option<StoreError>>> = None;
         // `interval_at`, not `interval`: the first tick of an `interval` completes immediately,
         // which would re-dial in the same breath as `start`'s own attempt.
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + connect::RECONNECT,
             connect::RECONNECT,
         );
+        // A dial that overran its slot must not then be followed by a burst of catch-up dials.
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -298,7 +306,8 @@ pub fn spawn(
                                         let applied = pending.take().unwrap_or(0);
                                         tracing::info!(applied, "schema migrations applied");
                                         go_online(
-                                            &mut backend, pg, &mut refresher, &projects, settings,
+                                            &mut backend, pg, &mut refresher, &mut health,
+                                            &projects, settings,
                                         ).await;
                                         StoreReply::MigrationsApplied { applied }
                                     }
@@ -311,7 +320,17 @@ pub fn spawn(
                                 None => StoreReply::MigrationsApplied { applied: 0 },
                             }
                         }
-                        other => serve(&backend, other).await,
+                        other => match try_serve(&backend, other).await {
+                            Ok(reply) => reply,
+                            Err(err) => {
+                                // This read is what noticed the server had gone. The asking view
+                                // still hears back exactly once; the next read finds the mirror.
+                                if matches!(err, StoreError::Unreachable(_)) {
+                                    go_offline(&mut backend, &mut refresher, &mut health, &err);
+                                }
+                                failed(other.name(), &err)
+                            }
+                        },
                     };
 
                     let answer = ReplyEnvelope { seq: envelope.seq, origin: envelope.origin, reply };
@@ -324,7 +343,10 @@ pub fn spawn(
                     ConnEvent::Online(pg) => {
                         pending = None;
                         held = None;
-                        go_online(&mut backend, pg, &mut refresher, &projects, settings).await;
+                        go_online(
+                            &mut backend, pg, &mut refresher, &mut health, &projects, settings,
+                        )
+                        .await;
                         tracing::info!(label = backend.label(), "store online");
                     }
                     ConnEvent::MigrationsPending(pg, n) => {
@@ -341,6 +363,11 @@ pub fn spawn(
                         tracing::warn!(%why, "connect failed");
                     }
                 },
+
+                err = lost_the_server(health.clone()) => {
+                    // The refresher passes every `interval`, so it usually notices first.
+                    go_offline(&mut backend, &mut refresher, &mut health, &err);
+                }
 
                 _ = ticker.tick(),
                     if reconnect.is_some() && !backend.is_writable() && held.is_none() =>
@@ -369,6 +396,7 @@ async fn go_online(
     backend: &mut Backend,
     pg: PgStore,
     refresher: &mut Option<Refresher>,
+    health: &mut Option<watch::Receiver<Option<StoreError>>>,
     projects: &watch::Sender<Vec<ProjectId>>,
     base: RefreshSettings,
 ) {
@@ -384,6 +412,58 @@ async fn go_online(
         previous.abort();
     }
     *refresher = spawn_refresher(backend, projects, settings);
+    *health = refresher.as_ref().map(Refresher::health);
+}
+
+/// The reverse of [`go_online`]: an `Online` backend that lost its server falls back on the mirror.
+///
+/// Aborts the refresher - there is nothing left to mirror *from*, and its failing passes would
+/// otherwise report the same loss every interval - and drops the health watch, which disarms the
+/// `select!` arm that reads it. The reconnect ticker re-arms itself, its guard being
+/// `!backend.is_writable()`.
+///
+/// A no-op on every backend that is not `Online`, so a second notice - a read and the refresher
+/// racing to report the same drop - does not restart the offline age.
+fn go_offline(
+    backend: &mut Backend,
+    refresher: &mut Option<Refresher>,
+    health: &mut Option<watch::Receiver<Option<StoreError>>>,
+    why: &StoreError,
+) {
+    if !backend.went_offline() {
+        return;
+    }
+    if let Some(previous) = refresher.take() {
+        previous.abort();
+    }
+    *health = None;
+    tracing::warn!(%why, "store unreachable; falling back to the mirror");
+}
+
+/// Resolves with the error when the refresher reports an unreachable server, and never otherwise.
+///
+/// Takes the receiver by value - `watch::Receiver` is `Clone` and a clone keeps the seen version -
+/// so the `select!` arm's body is free to reassign the worker's own `health`.
+///
+/// Parks forever when there is no refresher and when its sender is gone, which leaves the arm
+/// disabled rather than spinning on a closed channel. A pass that succeeded, or that failed for
+/// any other reason, is not a signal: the loop keeps waiting.
+async fn lost_the_server(health: Option<watch::Receiver<Option<StoreError>>>) -> StoreError {
+    let Some(mut passes) = health else {
+        return std::future::pending().await;
+    };
+    loop {
+        if passes.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+        let lost = match &*passes.borrow() {
+            Some(StoreError::Unreachable(why)) => Some(why.clone()),
+            _ => None,
+        };
+        if let Some(why) = lost {
+            return StoreError::Unreachable(why);
+        }
+    }
 }
 
 /// The refresher for an online backend, or `None` for any other (blueprint D.2).
@@ -406,8 +486,9 @@ fn spawn_refresher(
 mod tests {
     use super::*;
     use htui_core::fixtures::ids;
+    use htui_core::model::BoxId;
     use htui_core::store::MemStore;
-    use htui_store::CacheStore;
+    use htui_store::{CacheStore, Identity};
 
     fn demo() -> Backend {
         Backend::memory(MemStore::demo())
@@ -727,5 +808,117 @@ mod tests {
         drop(req_tx);
         worker.await.expect("the worker stops with its channel");
         cache.close().await;
+    }
+
+    /// The mid-session `Online` → `Offline` transition, driven by an injected unreachable store.
+    ///
+    /// `PgStore::lazy` opens no socket, so the *first* read is what dials - at a DSN nothing
+    /// listens on, which is a `StoreError::Unreachable` and therefore exactly the outcome a
+    /// server that went away mid-session produces. Restarting Postgres under a live pool is not
+    /// something a unit test can do; this drives the same code path without one.
+    #[tokio::test]
+    async fn an_unreachable_read_drops_an_online_backend_onto_the_mirror() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-swap", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let identity = Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(Backend::Online {
+            pg,
+            cache: cache.clone(),
+        });
+        // `detached` leaves the ticker disarmed, so nothing re-dials behind the assertions.
+        started.reconnect = None;
+        let worker = spawn(started, req_rx, rep_tx);
+
+        let StoreReply::StoreState { label, .. } =
+            round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert_eq!(label, "online", "nothing has asked the server yet");
+
+        // The read that notices. It still gets its one reply.
+        let reply = round_trip(&req_tx, &mut rep_rx, StoreRequest::Workspaces).await;
+        assert!(
+            matches!(
+                &reply,
+                StoreReply::Failed {
+                    request: "workspaces",
+                    ..
+                }
+            ),
+            "the asking view hears back exactly once, even as the backend swaps: {reply:?}"
+        );
+
+        let StoreReply::StoreState { label, .. } =
+            round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert!(
+            label.starts_with("offline · "),
+            "an unreachable read drops the backend onto the mirror: {label}"
+        );
+
+        // And the next read answers from the mirror instead of failing again.
+        let reply = round_trip(&req_tx, &mut rep_rx, StoreRequest::Workspaces).await;
+        assert!(
+            matches!(&reply, StoreReply::Workspaces(rows) if rows.is_empty()),
+            "an unfilled mirror is empty, not broken: {reply:?}"
+        );
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+        cache.close().await;
+    }
+
+    /// A failure that is *not* a lost connection leaves an online backend alone.
+    #[tokio::test]
+    async fn lost_the_server_ignores_a_pass_that_failed_for_another_reason() {
+        let (health, watcher) = watch::channel(None);
+        let mut backend = demo();
+        let mut refresher = None;
+        let mut seen = Some(watcher.clone());
+
+        health.send_replace(Some(StoreError::Backend("a bad query".to_owned())));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                lost_the_server(Some(watcher.clone())),
+            )
+            .await
+            .is_err(),
+            "only StoreError::Unreachable is the signal"
+        );
+
+        health.send_replace(Some(StoreError::Unreachable("gone".to_owned())));
+        let err = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            lost_the_server(Some(watcher)),
+        )
+        .await
+        .expect("an unreachable pass resolves it");
+        assert!(matches!(err, StoreError::Unreachable(_)));
+
+        // A memory backend has no mirror, so the swap is refused and the watch is left alone.
+        go_offline(&mut backend, &mut refresher, &mut seen, &err);
+        assert_eq!(backend.label(), "memory");
+        assert!(
+            seen.is_some(),
+            "nothing was swapped, so nothing was dropped"
+        );
     }
 }

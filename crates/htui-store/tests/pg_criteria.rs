@@ -16,7 +16,7 @@ mod common;
 
 use futures::future::join_all;
 use htui_core::fixtures::ids;
-use htui_core::model::{ItemId, ItemKindId, ItemPatch, NewItem, ProjectId, Status};
+use htui_core::model::{ItemFilter, ItemId, ItemKindId, ItemPatch, NewItem, ProjectId, Status};
 use htui_core::store::{ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_store::PgStore;
 use sqlx::postgres::PgPool;
@@ -607,6 +607,31 @@ async fn inherent_reads_answer_the_fixture() {
         db.store.this_box(),
         "box_info answers for this box"
     );
+
+    // `ItemFilter::text` is a literal substring, not a pattern: `MemStore` uses `contains` and the
+    // mirror uses `instr`, so `%` and `_` must not act as LIKE wildcards here either.
+    let text_filter = |needle: &str| ItemFilter {
+        text: Some(needle.to_owned()),
+        ..ItemFilter::default()
+    };
+    assert!(
+        !db.store
+            .items(&scope, &text_filter("EAT-"))
+            .await
+            .expect("items must not fail")
+            .is_empty(),
+        "a literal substring of a key still matches"
+    );
+    for wildcard in ["_", "%", "%EAT%", "F_AT-1"] {
+        assert!(
+            db.store
+                .items(&scope, &text_filter(wildcard))
+                .await
+                .expect("items must not fail")
+                .is_empty(),
+            "`{wildcard}` is a literal needle, and no fixture key or title contains it"
+        );
+    }
 
     db.drop_db().await;
 }

@@ -87,8 +87,12 @@ impl ReadStore for PgStore {
                AND ($2::uuid[] IS NULL OR i.project_id = ANY($2))
                AND ($3::text[] IS NULL OR i.status = ANY($3))
                AND ($4::text[] IS NULL OR i.required_tags @> $4)
-               AND ($5::text IS NULL OR i.key ILIKE '%' || $5 || '%'
-                                     OR i.title ILIKE '%' || $5 || '%')
+               -- `position`, not ILIKE: the needle is a literal substring, so `%` and `_` in it
+               -- must not act as wildcards. `MemStore` uses `contains` and the mirror uses
+               -- `instr(lower(..), lower(..))`; all three agree.
+               AND ($5::text IS NULL
+                    OR position(lower($5::text) in lower(i.key)) > 0
+                    OR position(lower($5::text) in lower(i.title)) > 0)
                AND ($6::bool IS NULL OR $6 = (
                         i.status = 'open'
                     AND NOT EXISTS (

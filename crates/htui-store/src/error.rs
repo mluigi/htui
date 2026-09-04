@@ -6,7 +6,8 @@ use sqlx::migrate::MigrateError;
 /// Maps a [`sqlx::Error`] onto the one [`StoreError`] every store returns.
 ///
 /// SQLSTATE class `23` (integrity constraint violation) is [`StoreError::Constraint`], a missing
-/// row is [`StoreError::NotFound`], everything else is [`StoreError::Backend`] (ANA-9 §6.1, MOD-1
+/// row is [`StoreError::NotFound`], a lost connection is [`StoreError::Unreachable`] (see
+/// [`is_unreachable`]) and everything else is [`StoreError::Backend`] (ANA-9 §6.1, MOD-1
 /// blueprint B.5). The SQLSTATE prefix is the rule rather than `sqlx`'s own `ErrorKind`, which
 /// collapses `23502` into `NotNullViolation` but leaves `23000` and `23001` as `Other`.
 ///
@@ -24,6 +25,9 @@ pub fn map_sqlx_for(
     id: impl core::fmt::Display,
     err: sqlx::Error,
 ) -> StoreError {
+    if is_unreachable(&err) {
+        return StoreError::Unreachable(err.to_string());
+    }
     match err {
         sqlx::Error::RowNotFound => StoreError::NotFound {
             entity,
@@ -44,6 +48,33 @@ pub fn map_sqlx_for(
             }
         }
         other => StoreError::Backend(other.to_string()),
+    }
+}
+
+/// Whether a [`sqlx::Error`] means "the server is not reachable" rather than "the query was wrong".
+///
+/// Four driver-side arms - [`sqlx::Error::Io`] (the socket), `PoolTimedOut` (no connection became
+/// available in the acquire timeout), `PoolClosed` and `WorkerCrashed` - plus the server-side ones
+/// that arrive as a `Database` error over a connection that is about to go away:
+///
+/// - SQLSTATE class `08`, *connection exception*: `08000`, `08003`, `08006`, `08001`, `08004`,
+///   `08007`, `08P01`;
+/// - `57P01` admin shutdown, `57P02` crash shutdown, `57P03` cannot connect now (the server is
+///   starting up or in recovery).
+///
+/// `57014` (query cancelled) and `57P04` (database dropped) are deliberately **not** here: the
+/// connection survives both, so dropping to the mirror would be wrong.
+#[must_use]
+pub fn is_unreachable(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Io(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => true,
+        sqlx::Error::Database(db) => db.code().is_some_and(|code| {
+            code.starts_with("08") || matches!(&*code, "57P01" | "57P02" | "57P03")
+        }),
+        _ => false,
     }
 }
 
@@ -75,4 +106,55 @@ pub fn schema_is_newer(version: i64) -> String {
 #[must_use]
 pub fn checksum_drift(version: i64) -> String {
     format!("migration {version} was applied with a different checksum")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_unreachable, map_sqlx, map_sqlx_for};
+    use htui_core::store::StoreError;
+
+    /// The four driver-side arms of [`is_unreachable`].
+    ///
+    /// The SQLSTATE half needs a real server to produce a `DatabaseError`, so it is covered by
+    /// `tests/connect.rs::a_terminated_backend_is_an_unreachable_error`.
+    #[test]
+    fn the_driver_side_arms_are_unreachable() {
+        for err in [
+            sqlx::Error::PoolClosed,
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::WorkerCrashed,
+            sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ] {
+            assert!(is_unreachable(&err), "{err:?} is a lost connection");
+            let text = err.to_string();
+            assert_eq!(
+                map_sqlx(err),
+                StoreError::Unreachable(text),
+                "and map_sqlx says so"
+            );
+        }
+    }
+
+    #[test]
+    fn a_query_that_is_merely_wrong_is_not_unreachable() {
+        for err in [
+            sqlx::Error::Protocol("nonsense on the wire".to_owned()),
+            sqlx::Error::ColumnNotFound("nope".to_owned()),
+        ] {
+            assert!(!is_unreachable(&err), "{err:?} is not a lost connection");
+            assert!(matches!(map_sqlx(err), StoreError::Backend(_)));
+        }
+    }
+
+    #[test]
+    fn a_missing_row_still_names_its_entity() {
+        assert!(!is_unreachable(&sqlx::Error::RowNotFound));
+        assert_eq!(
+            map_sqlx_for("item", "FEAT-1", sqlx::Error::RowNotFound),
+            StoreError::NotFound {
+                entity: "item",
+                id: "FEAT-1".to_owned(),
+            }
+        );
+    }
 }

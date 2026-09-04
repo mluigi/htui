@@ -35,6 +35,12 @@ const SEEDED_TAGS: [&str; 10] = [
     "heavy_build",
 ];
 
+/// How long [`PgStore::connect`] waits for its first connection.
+///
+/// [`PgStore::connect_with`] takes it as an argument so a test that dials a port nothing listens
+/// on does not have to sit out the full ten seconds.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The `app_setting` defaults ANA-9 §5.10 seeds (plan D5, D8, D9).
 const SEEDED_SETTINGS: [(&str, i32); 2] = [
     ("cache_refresh_seconds", 30),
@@ -107,10 +113,28 @@ impl PgStore {
     /// `R-STO-5`). Anything the driver reports comes back through
     /// [`map_sqlx`].
     pub async fn connect(dsn: &str, identity: &Identity) -> Result<Connected> {
+        Self::connect_with(dsn, identity, CONNECT_TIMEOUT).await
+    }
+
+    /// [`PgStore::connect`] with a caller-chosen acquire timeout.
+    ///
+    /// Only the wait differs. A test that dials a port nothing listens on gets its refusal from
+    /// the OS immediately on some platforms and waits out the whole timeout on others (a dropped
+    /// SYN, a firewall), so the knob is what keeps such a case fast everywhere rather than an
+    /// assumption about the loopback.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`PgStore::connect`].
+    pub async fn connect_with(
+        dsn: &str,
+        identity: &Identity,
+        connect_timeout: Duration,
+    ) -> Result<Connected> {
         let options = PgConnectOptions::from_str(dsn).map_err(map_sqlx)?;
         let pool = PgPoolOptions::new()
             .max_connections(8)
-            .acquire_timeout(Duration::from_secs(10))
+            .acquire_timeout(connect_timeout)
             .connect_with(options)
             .await
             .map_err(map_sqlx)?;
@@ -126,6 +150,35 @@ impl PgStore {
             store.bootstrap().await?;
         }
         Ok(Connected { store, migrations })
+    }
+
+    /// A store over a pool that has **never** connected, for tests that need an `Online`
+    /// [`Backend`](crate::Backend) without a server (feature `demo`).
+    ///
+    /// `connect_lazy_with` opens no socket: the first query is what dials, so against a DSN
+    /// nothing listens on every read fails with [`StoreError::Unreachable`]. That is how the
+    /// `htui` store worker's swap test injects a mid-session drop - restarting Postgres under a
+    /// live pool is not something a unit test can do. `this_box` and `this_user` are nil: nothing
+    /// seeded them, and nothing that uses this store may write.
+    ///
+    /// `acquire_timeout` is how long one failing read waits before it gives up.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] when `dsn` is not a Postgres connection string. Never a connection
+    /// error: there is no connection.
+    #[cfg(feature = "demo")]
+    pub fn lazy(dsn: &str, identity: &Identity, acquire_timeout: Duration) -> Result<Self> {
+        let options = PgConnectOptions::from_str(dsn).map_err(map_sqlx)?;
+        Ok(Self {
+            pool: PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(acquire_timeout)
+                .connect_lazy_with(options),
+            identity: identity.clone(),
+            this_box: BoxId::default(),
+            this_user: UserId::default(),
+        })
     }
 
     /// Runs the pending migrations, then seeds and registers as [`PgStore::connect`] would have.
@@ -144,21 +197,43 @@ impl PgStore {
 
     /// Seeds ANA-9 §5.10's global part if it is not there, and returns the single `app_user`.
     ///
-    /// Idempotent: every insert is `ON CONFLICT DO NOTHING`. Seeds one `app_user` (name from
-    /// `USERNAME` / `USER`, fallback `htui`), the ten `capability_tag` rows with `seeded = true`
-    /// and the `app_setting` defaults `cache_refresh_seconds` = 30 and `cache_overlap_seconds` =
-    /// 300. **No `agent` rows**: `agent.launch` is `JSONB NOT NULL` and its shape is ANA-4's, so
-    /// seeding one would be a guess ANA-4 then has to migrate away (plan D5, blueprint H.2).
+    /// [`seed_if_empty_as`](PgStore::seed_if_empty_as) with the name `USERNAME` / `USER` reports,
+    /// falling back to `htui`.
     ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub async fn seed_if_empty(&self) -> Result<UserId> {
-        let name = seed_user_name();
+        self.seed_if_empty_as(&seed_user_name()).await
+    }
+
+    /// [`seed_if_empty`](PgStore::seed_if_empty) under a caller-supplied `app_user.name`.
+    ///
+    /// Idempotent: every insert is conditional. Seeds one `app_user`, the ten `capability_tag`
+    /// rows with `seeded = true` and the `app_setting` defaults `cache_refresh_seconds` = 30 and
+    /// `cache_overlap_seconds` = 300. **No `agent` rows**: `agent.launch` is `JSONB NOT NULL` and
+    /// its shape is ANA-4's, so seeding one would be a guess ANA-4 then has to migrate away
+    /// (plan D5, blueprint H.2).
+    ///
+    /// **`R-USR-2`, one row, whatever the OS user is called.** The `app_user` insert is guarded by
+    /// `WHERE NOT EXISTS (SELECT 1 FROM app_user)` rather than by `ON CONFLICT (name)`: a second
+    /// box whose `USERNAME` differs would otherwise seed a *second* user and every row it wrote
+    /// would be attributed to it. For the same reason the returned id is the oldest row's, not the
+    /// one matching `name` - the name is what a first, empty database is stamped with, and never a
+    /// lookup key.
+    ///
+    /// The name is an argument rather than always the env-derived one so a test can exercise a
+    /// second box without mutating the process environment.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn seed_if_empty_as(&self, name: &str) -> Result<UserId> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
         sqlx::query!(
-            "INSERT INTO app_user (id, name) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+            "INSERT INTO app_user (id, name) SELECT $1, $2 \
+             WHERE NOT EXISTS (SELECT 1 FROM app_user) ON CONFLICT (name) DO NOTHING",
             UserId::new().as_uuid(),
             name,
         )
@@ -187,9 +262,10 @@ impl PgStore {
             .map_err(map_sqlx)?;
         }
 
+        // The oldest row, not `WHERE name = $1`: this box's OS user name is how an empty database
+        // is stamped, not how the single `app_user` of `R-USR-2` is found again.
         let row = sqlx::query!(
-            r#"SELECT id as "id: UserId" FROM app_user WHERE name = $1"#,
-            name,
+            r#"SELECT id as "id: UserId" FROM app_user ORDER BY created_at, id LIMIT 1"#,
         )
         .fetch_one(&mut *tx)
         .await

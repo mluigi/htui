@@ -117,6 +117,28 @@ impl Backend {
         }
     }
 
+    /// Records that a server that *was* answering stopped: `online` becomes `offline · 0s`.
+    ///
+    /// The mid-session counterpart of [`Backend::gave_up`], which only ever turns the first
+    /// `connecting` into an age. The mirror is moved across rather than re-opened - it is the file
+    /// the refresher has been filling since the `Online` swap - and `since` starts now, because
+    /// this is the moment the process lost the server.
+    ///
+    /// Answers whether the swap happened: `false` on [`Backend::Memory`] (no mirror to fall back
+    /// to) and on [`Backend::Offline`] (already there, and its `since` must not be restarted), so
+    /// the store worker can use it as the "did I just go offline" test. The caller is what stops
+    /// the refresher: this type does not own it.
+    pub fn went_offline(&mut self) -> bool {
+        let Self::Online { cache, .. } = self else {
+            return false;
+        };
+        *self = Self::Offline {
+            cache: cache.clone(),
+            since: Some(Utc::now()),
+        };
+        true
+    }
+
     /// The mirror, when there is one; `None` for [`Backend::Memory`].
     ///
     /// This is how the store worker moves the cache from an offline backend into an online one
@@ -268,11 +290,16 @@ mod tests {
 
     #[test]
     fn the_memory_backend_is_writable_and_has_no_mirror() {
-        let backend = Backend::memory(MemStore::new());
+        let mut backend = Backend::memory(MemStore::new());
         assert_eq!(backend.label(), "memory");
         assert!(backend.is_writable());
         assert!(backend.writable().is_none(), "MemStore is not a PgStore");
         assert!(backend.cache().is_none());
+        assert!(
+            !backend.went_offline(),
+            "there is no mirror to fall back to"
+        );
+        assert_eq!(backend.label(), "memory");
     }
 
     #[test]
@@ -315,11 +342,20 @@ mod tests {
         );
         assert!(connecting.cache().is_some());
 
-        let gave_up = Backend::Offline {
+        let mut gave_up = Backend::Offline {
             cache: cache.clone(),
             since: Some(Utc::now() - TimeDelta::seconds(220)),
         };
         assert_eq!(gave_up.label(), "offline · 3m");
+        assert!(
+            !gave_up.went_offline(),
+            "an offline backend is already there"
+        );
+        assert_eq!(
+            gave_up.label(),
+            "offline · 3m",
+            "and its age is not restarted"
+        );
 
         // An empty mirror answers rather than fails: offline reads go to the file (plan D12).
         assert!(

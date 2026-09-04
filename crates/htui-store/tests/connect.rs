@@ -9,8 +9,9 @@ mod common;
 
 use std::time::Duration;
 
+use htui_core::store::StoreError;
 use htui_store::connect::{ConnEvent, StartOptions, Started, refresh_settings, start};
-use htui_store::{Backend, MigrationState};
+use htui_store::{Backend, MigrationState, map_sqlx};
 
 /// How long a `ConnEvent` may take. The connect pool's own acquire timeout is ten seconds, so this
 /// is "the attempt answered at all", not a performance assertion.
@@ -42,7 +43,7 @@ async fn start_opens_the_mirror_offline_and_reports_online_over_a_migrated_datab
     let mut started = start(StartOptions {
         dsn: Some(db.url.clone()),
         offline: false,
-        config_root: root.path().to_owned(),
+        ..StartOptions::new(root.path().to_owned())
     })
     .await
     .expect("start");
@@ -98,7 +99,7 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
     let mut started = start(StartOptions {
         dsn: Some(db.url.clone()),
         offline: false,
-        config_root: root.path().to_owned(),
+        ..StartOptions::new(root.path().to_owned())
     })
     .await
     .expect("start");
@@ -115,14 +116,100 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
     db.drop_db().await;
 }
 
+/// The server-side half of `error::is_unreachable`, which a unit test cannot reach.
+///
+/// A `PgStore` that is already connected loses its server mid-session. Nothing here restarts
+/// Postgres: `pg_terminate_backend` on this pool's own backends is the same thing from the
+/// client's side - the connection goes away under a query and the driver reports either a
+/// SQLSTATE `57P01` (admin shutdown) or the socket error that follows it. Both are
+/// [`StoreError::Unreachable`], which is what makes the store worker drop to the mirror.
+#[tokio::test]
+async fn a_terminated_backend_is_an_unreachable_error() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    // Every backend of this database except the one issuing the kill.
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = current_database() AND pid <> pg_backend_pid()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("terminate the other backends");
+    db.pool.close().await;
+
+    let err = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&db.pool)
+        .await
+        .expect_err("a closed pool cannot answer");
+    assert!(
+        htui_store::error::is_unreachable(&err),
+        "a lost connection is unreachable, not a bad query: {err:?}"
+    );
+    assert!(
+        matches!(map_sqlx(err), StoreError::Unreachable(_)),
+        "and map_sqlx classifies it as such"
+    );
+
+    db.drop_db().await;
+}
+
+/// `Backend::went_offline`, the mid-session half of the `Online` / `Offline` pair.
+///
+/// It needs a real [`PgStore`] because `Backend::Online` holds one; the swap itself is pure.
+#[tokio::test]
+async fn an_online_backend_falls_back_onto_its_own_mirror() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let cache = htui_store::CacheStore::open(root.path(), "went-offline", 1)
+        .await
+        .expect("open a throwaway mirror");
+
+    let mut backend = Backend::Online {
+        pg: db.store.clone(),
+        cache: cache.clone(),
+    };
+    assert_eq!(backend.label(), "online");
+    assert!(backend.is_writable());
+
+    assert!(backend.went_offline(), "the server stopped answering");
+    assert_eq!(backend.label(), "offline · 0s");
+    assert!(!backend.is_writable(), "there is no write path any more");
+    assert!(
+        backend.writable().is_none(),
+        "and no way to reach a PgStore"
+    );
+    assert!(
+        backend.cache().is_some(),
+        "the mirror moved across rather than being re-opened"
+    );
+    assert!(
+        backend
+            .workspaces()
+            .await
+            .expect("the mirror answers")
+            .is_empty(),
+        "reads now come from the file, and an unfilled mirror is empty rather than broken"
+    );
+    assert!(!backend.went_offline(), "a second call is a no-op");
+
+    cache.close().await;
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn an_unreachable_server_is_a_failed_event_and_the_shell_still_starts() {
     let root = tempfile::tempdir().expect("temp root");
-    // Port 1 on the loopback: refused immediately, no DNS, no server needed.
+    // Port 1 on the loopback: no DNS and no server needed. A second is plenty for a dial that
+    // nothing is listening for, and it is what keeps this case off the ten-second default.
     let mut started = start(StartOptions {
         dsn: Some("postgres://nobody:nothing@127.0.0.1:1/none".to_owned()),
         offline: false,
-        config_root: root.path().to_owned(),
+        connect_timeout: Duration::from_secs(1),
+        ..StartOptions::new(root.path().to_owned())
     })
     .await
     .expect("start still opens the mirror");
@@ -142,7 +229,7 @@ async fn offline_never_dials_and_starts_at_an_age() {
     let mut started = start(StartOptions {
         dsn: Some("postgres://nobody:nothing@127.0.0.1:1/none".to_owned()),
         offline: true,
-        config_root: root.path().to_owned(),
+        ..StartOptions::new(root.path().to_owned())
     })
     .await
     .expect("start offline");
@@ -170,7 +257,7 @@ async fn the_mirror_directory_is_the_dsn_fingerprint() {
     let started = start(StartOptions {
         dsn: Some(dsn.to_owned()),
         offline: true,
-        config_root: root.path().to_owned(),
+        ..StartOptions::new(root.path().to_owned())
     })
     .await
     .expect("start offline");

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO app_user (id, name) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM app_user) ON CONFLICT (name) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "178cd221d7bc3acccf28dc5e7d7f0549bbaa4da0a60d5500855172aa76700e9f"
+}

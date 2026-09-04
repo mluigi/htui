@@ -23,7 +23,17 @@ pub enum StoreError {
     /// The backend cannot write; the offline backend of MOD-6 is the only one that returns this.
     #[error("this backend is read-only ({0})")]
     ReadOnly(&'static str),
-    /// The underlying driver failed; MOD-6 wraps `sqlx` here.
+    /// The server cannot be reached: the socket, the pool or the connection itself is gone.
+    ///
+    /// The narrower half of [`StoreError::Backend`], and the only one that means *retrying later
+    /// may work*. MOD-6's store worker treats it as the mid-session `Online` → `Offline`
+    /// transition: it swaps the backend for the mirror, stops the refresher and lets the reconnect
+    /// ticker re-dial. A query that is merely wrong stays [`StoreError::Backend`], because
+    /// dropping to the mirror would not help and would hide the bug.
+    #[error("store unreachable: {0}")]
+    Unreachable(String),
+    /// The underlying driver failed; MOD-6 wraps `sqlx` here. Everything that is neither a missing
+    /// row, a violated constraint nor a lost connection.
     #[error("store backend error: {0}")]
     Backend(String),
     /// A stored enum text is not in the `CHECK` list any more.

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id as \"id: UserId\" FROM app_user WHERE name = $1",
+  "query": "SELECT id as \"id: UserId\" FROM app_user ORDER BY created_at, id LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -16,13 +16,11 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Text"
-      ]
+      "Left": []
     },
     "nullable": [
       false
     ]
   },
-  "hash": "7e934eee833c1b20ffda591020a12af5e74f6176ec79d401dbe9ac7e3a04f19c"
+  "hash": "c9346d3a7b05476a0dbdafc980097ed7d1fc61081f9c3b8885bb8c3ee46fd0ec"
 }

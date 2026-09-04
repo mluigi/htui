@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id WHERE r.project_id = $1 ORDER BY s.finished_at DESC NULLS LAST, s.updated_at DESC LIMIT $2",
+  "query": "SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id WHERE r.project_id = $1 AND s.finished_at IS NOT NULL ORDER BY s.finished_at DESC, s.updated_at DESC LIMIT $2",
   "describe": {
     "columns": [
       {
@@ -25,5 +25,5 @@
       false
     ]
   },
-  "hash": "afec598768341643a9bf67257d3b756e12987a928cecb8546468f5c60bcafe99"
+  "hash": "3f6804c603b8914efd72658440619823ac7e5be27b41406ce49d2d0819650751"
 }

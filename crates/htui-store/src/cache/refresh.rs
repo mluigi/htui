@@ -107,6 +107,11 @@ impl PassReport {
 pub struct Refresher {
     handle: JoinHandle<()>,
     wake: Arc<Notify>,
+    /// Outcome of the last pass, published for [`Refresher::health`].
+    ///
+    /// Held here rather than only in the task so the receivers of a live `Refresher` never see a
+    /// closed channel; the task holds a clone of the same `Arc`.
+    health: Arc<watch::Sender<Option<StoreError>>>,
 }
 
 impl Refresher {
@@ -125,6 +130,8 @@ impl Refresher {
     ) -> Self {
         let wake = Arc::new(Notify::new());
         let woken = Arc::clone(&wake);
+        let health = Arc::new(watch::Sender::new(None));
+        let reported = Arc::clone(&health);
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(settings.interval);
             // A pass that overran its slot must not then run twice back to back.
@@ -137,19 +144,46 @@ impl Refresher {
                 // Cloned out of the guard on its own line: a `watch::Ref` must never be alive
                 // across the `.await` below.
                 let scope = projects.borrow().clone();
-                match run_pass(&pool, &cache, &scope, &settings).await {
-                    Ok(report) => tracing::info!(?report, "cache: refresh pass"),
-                    Err(error) => tracing::warn!(%error, "cache: refresh pass failed"),
-                }
+                let outcome = match run_pass(&pool, &cache, &scope, &settings).await {
+                    Ok(report) => {
+                        tracing::info!(?report, "cache: refresh pass");
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "cache: refresh pass failed");
+                        Some(error)
+                    }
+                };
+                // `send_replace`, so every pass marks the watch changed even when two in a row
+                // report the same thing: the store worker wants each outcome, not each change.
+                reported.send_replace(outcome);
             }
         });
-        Self { handle, wake }
+        Self {
+            handle,
+            wake,
+            health,
+        }
     }
 
     /// The task handle, for tests and for shutdown.
     #[must_use]
     pub const fn handle(&self) -> &JoinHandle<()> {
         &self.handle
+    }
+
+    /// The outcome of the last pass: `None` while they succeed, `Some(err)` after one failed.
+    ///
+    /// The store worker watches this for [`StoreError::Unreachable`], which is its `Online` →
+    /// `Offline` signal - the refresher runs every `interval` and is therefore what notices a
+    /// server that went away between two UI reads. [`Refresher::handle`]'s `is_finished` cannot
+    /// serve instead: a failed pass is a `warn!` and this loop deliberately keeps going, so the
+    /// task is still very much alive.
+    ///
+    /// The receiver stays open for as long as the `Refresher` does, whatever the task is doing.
+    #[must_use]
+    pub fn health(&self) -> watch::Receiver<Option<StoreError>> {
+        self.health.subscribe()
     }
 
     /// Stops the task. Called when the backend leaves `Online`.
@@ -187,8 +221,8 @@ const RUN_STEP_COMMIT: &str = "run_step_commit";
 ///    boxes is irrelevant. `run_step_commit` has no timestamp of its own and rides its parent
 ///    step's `updated_at` (H.3). An `item_link` row with `deleted_at` set is *deleted* from the
 ///    mirror instead of upserted and still advances the cursor (§4.4);
-/// 4. the last-N transcripts per project, copied for steps not already mirrored, then trimmed
-///    scoped to that project so another project's cached steps survive;
+/// 4. the last-N **finished** transcripts per project, copied for steps not already mirrored, then
+///    trimmed scoped to that project so another project's cached steps survive;
 /// 5. the `pending/*.jsonl` upload, once, after the tables (§6.2's last line, §4.3);
 /// 6. `cache_meta.last_full_refresh_at`, set only when every cursor was `0` at the top of the pass.
 ///
@@ -1193,10 +1227,14 @@ async fn refresh_transcripts(
 ) -> Result<Transcripts> {
     let limit = transcript_steps(sqlite, project, settings.transcript_steps).await?;
 
+    // `finished_at IS NOT NULL`: §6.2 says "last N **finished** run_step ids", and the presence
+    // probe below is existence-only. A running step copied mid-flight would be skipped by every
+    // later pass and frozen at whatever prefix of its log the first one saw; it becomes a
+    // candidate once it has finished and its log can no longer grow.
     let wanted: Vec<Uuid> = sqlx::query_scalar!(
         "SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
-          WHERE r.project_id = $1 \
-          ORDER BY s.finished_at DESC NULLS LAST, s.updated_at DESC \
+          WHERE r.project_id = $1 AND s.finished_at IS NOT NULL \
+          ORDER BY s.finished_at DESC, s.updated_at DESC \
           LIMIT $2",
         project.as_uuid(),
         limit,

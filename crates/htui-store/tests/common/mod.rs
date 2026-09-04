@@ -109,14 +109,34 @@ pub async fn fresh_db() -> Option<TestDb> {
     Some(db)
 }
 
-/// [`fresh_db`] plus `store.load_demo(&fixtures::demo_data())`.
+/// [`fresh_db`] plus `store.load_demo(&fixtures::demo_data())`, with the seeded user removed.
+///
+/// `apply_migrations` seeds an `app_user` named after this OS user and registers this box under
+/// it; the fixture then brings its own, whose `created_at` is the epoch. Two rows is exactly what
+/// `R-USR-2` forbids, and `PgStore::seed_if_empty_as` answers with the oldest of them - so a
+/// second `PgStore::connect` against such a database would register this hostname under the
+/// fixture's user while the row already exists under the seeded one, and collide on `box_pkey`.
+/// The seeded pair therefore goes, leaving the fixture's world as the only one. `db.store` needs
+/// no reconnect: `load_demo` repoints `this_box` / `this_user` at the fixture itself.
 #[cfg(feature = "demo")]
 pub async fn demo_db() -> Option<TestDb> {
     let mut db = fresh_db().await?;
+    let seeded = db.store.this_user();
     db.store
         .load_demo(&htui_core::fixtures::demo_data())
         .await
         .expect("load the demo fixture");
+
+    sqlx::query("DELETE FROM box WHERE user_id = $1")
+        .bind(seeded.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("drop the box row of the seeded user");
+    sqlx::query("DELETE FROM app_user WHERE id = $1")
+        .bind(seeded.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("drop the seeded app_user");
     Some(db)
 }
 

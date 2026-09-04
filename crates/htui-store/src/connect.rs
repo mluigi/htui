@@ -79,6 +79,11 @@ pub struct StartOptions {
     /// Where `box.toml` and `cache/` live: [`identity::config_root`] in the binary, a temporary
     /// directory under test, so a test never writes into the user's configuration.
     pub config_root: PathBuf,
+    /// How long one attempt waits for a connection, [`crate::pg::CONNECT_TIMEOUT`] by default.
+    ///
+    /// Threaded down to [`PgStore::connect_with`]. The tests dial a port nothing listens on and
+    /// shorten it, so an unreachable-server case answers in a second rather than in ten.
+    pub connect_timeout: Duration,
 }
 
 impl StartOptions {
@@ -89,6 +94,7 @@ impl StartOptions {
             dsn: None,
             offline: false,
             config_root,
+            connect_timeout: crate::pg::CONNECT_TIMEOUT,
         }
     }
 }
@@ -188,13 +194,14 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
 
     let (events_tx, events) = mpsc::channel(EVENT_QUEUE);
     let (projects, _) = watch::channel(Vec::new());
+    let timeout = opts.connect_timeout;
     let reconnect: Option<Reconnect> = if connecting {
         let dsn = dsn.clone();
         let root = root.clone();
         Some(Arc::new(move || {
             let dsn = dsn.clone();
             let root = root.clone();
-            Box::pin(attempt(dsn, root)) as ConnFuture
+            Box::pin(attempt(dsn, root, timeout)) as ConnFuture
         }))
     } else {
         None
@@ -203,7 +210,7 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
     if connecting {
         let sender = events_tx.clone();
         tokio::spawn(async move {
-            let event = attempt(dsn, root).await;
+            let event = attempt(dsn, root, timeout).await;
             // The worker is gone if this fails, and there is nobody left to tell.
             let _ = sender.send(event).await;
         });
@@ -230,7 +237,7 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
 /// shows, because "no DSN" and "server down" are states the shell renders rather than crashes on.
 /// The identity is re-read from `root` per attempt, so an id adopted by an earlier attempt
 /// (plan D6) is the one the next one registers under.
-pub async fn attempt(dsn: Option<String>, root: PathBuf) -> ConnEvent {
+pub async fn attempt(dsn: Option<String>, root: PathBuf, connect_timeout: Duration) -> ConnEvent {
     let Some(dsn) = dsn else {
         return ConnEvent::Failed(NO_DSN.to_owned());
     };
@@ -238,7 +245,7 @@ pub async fn attempt(dsn: Option<String>, root: PathBuf) -> ConnEvent {
         Ok(identity) => identity,
         Err(err) => return ConnEvent::Failed(err.to_string()),
     };
-    match try_connect(&dsn, &identity, &root).await {
+    match try_connect(&dsn, &identity, &root, connect_timeout).await {
         Ok(Connected { store, migrations }) => match migrations {
             MigrationState::UpToDate => ConnEvent::Online(store),
             MigrationState::Pending(n) => ConnEvent::MigrationsPending(store, n),
@@ -257,8 +264,13 @@ pub async fn attempt(dsn: Option<String>, root: PathBuf) -> ConnEvent {
 ///
 /// Whatever [`PgStore::connect`] reports — an unreachable server, a refused schema — and
 /// [`htui_core::store::StoreError::Backend`] when the adopted id cannot be written back.
-pub async fn try_connect(dsn: &str, identity: &Identity, root: &Path) -> Result<Connected> {
-    let connected = PgStore::connect(dsn, identity).await?;
+pub async fn try_connect(
+    dsn: &str,
+    identity: &Identity,
+    root: &Path,
+    connect_timeout: Duration,
+) -> Result<Connected> {
+    let connected = PgStore::connect_with(dsn, identity, connect_timeout).await?;
     let adopted = connected.store.identity();
     if adopted.box_id != identity.box_id {
         tracing::info!(
@@ -322,7 +334,7 @@ mod tests {
         let started = start(StartOptions {
             dsn: Some("postgres://nobody@127.0.0.1:1/none".to_owned()),
             offline: true,
-            config_root: root.path().to_owned(),
+            ..StartOptions::new(root.path().to_owned())
         })
         .await
         .expect("start offline");
@@ -346,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn no_dsn_is_a_failed_event_and_not_an_error() {
         let root = tempfile::tempdir().expect("temp root");
-        match attempt(None, root.path().to_owned()).await {
+        match attempt(None, root.path().to_owned(), crate::pg::CONNECT_TIMEOUT).await {
             super::ConnEvent::Failed(why) => assert_eq!(why, NO_DSN),
             other => panic!("expected Failed, got {other:?}"),
         }

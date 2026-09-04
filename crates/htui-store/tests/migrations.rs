@@ -317,6 +317,49 @@ async fn seed_is_idempotent() {
     db.drop_db().await;
 }
 
+/// `R-USR-2`: one `app_user`, however many boxes and whatever their OS user is called.
+///
+/// The seed name is injected rather than pushed through `USERNAME` / `USER` so the case does not
+/// mutate the process environment other tests read.
+#[tokio::test]
+async fn a_second_box_under_another_os_user_name_seeds_no_second_app_user() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let seeded = db.store.this_user();
+
+    // Another box: another `box.toml` identity, another hostname, another OS user name.
+    let elsewhere = identity::Identity {
+        box_id: BoxId::new(),
+        hostname: format!("HTUI-TEST-{}", uuid::Uuid::now_v7().simple()),
+    };
+    let second = PgStore::connect(&db.url, &elsewhere)
+        .await
+        .expect("a second box connects to the same database")
+        .store;
+    let adopted = second
+        .seed_if_empty_as("another-os-user")
+        .await
+        .expect("seed from the second box");
+
+    assert_eq!(
+        common::count(&db.pool, "app_user").await,
+        1,
+        "a differently named OS user must not seed a second app_user (R-USR-2)"
+    );
+    assert_eq!(
+        adopted, seeded,
+        "the second box adopts the row the first one seeded"
+    );
+    assert_eq!(
+        second.this_user(),
+        seeded,
+        "and both stores answer the same app_user"
+    );
+
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn register_box_upserts_and_adopts() {
     let Some(db) = common::fresh_db().await else {
