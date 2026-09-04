@@ -67,12 +67,20 @@ impl App {
     }
 
     /// The 250 ms timer. Only every fourth tick costs a redraw, and it is the one that re-reads
-    /// the active-run count so the top bar stays live without a request per tick.
+    /// the store state and the active-run count so the top bar stays live without a request per
+    /// tick.
+    ///
+    /// `StoreState` is **not** gated on a non-empty scope: `connecting`, `offline · 3m` and a
+    /// pending-migration count all have to keep arriving on a shell that never entered a
+    /// workspace, which is exactly the shell a first launch shows (blueprint D.5).
     fn on_tick(&mut self) {
         self.ticks += 1;
-        if self.ticks % TICKS_PER_REFRESH == 0 && !self.scope.is_empty() {
-            let scope = self.scope.clone();
-            self.dispatch(Origin::App, StoreRequest::ActiveRuns { scope });
+        if self.ticks % TICKS_PER_REFRESH == 0 {
+            self.dispatch(Origin::App, StoreRequest::StoreState);
+            if !self.scope.is_empty() {
+                let scope = self.scope.clone();
+                self.dispatch(Origin::App, StoreRequest::ActiveRuns { scope });
+            }
             self.dirty = true;
         }
     }
@@ -182,8 +190,40 @@ impl App {
             }
             StoreReply::BoxInfo(Some(info)) => self.top_bar.box_name = info.hostname.clone(),
             StoreReply::ActiveRuns(count) => self.top_bar.active_runs = *count,
+            StoreReply::StoreState {
+                label,
+                migrations_pending,
+            } => {
+                self.top_bar.store = label.clone();
+                if migrations_pending.is_some_and(|n| n > 0) {
+                    self.offer_migration_prompt();
+                }
+            }
+            StoreReply::MigrationsApplied { applied } => {
+                self.status = Some(format!("applied {applied} migration(s)"));
+            }
             _ => {}
         }
+    }
+
+    /// Opens the migration prompt, once per session (`R-STO-5`, plan D11).
+    ///
+    /// Opening an overlay is the one thing `observe_reply` does beyond the top bar, and
+    /// `migration_prompt_shown` is why it can: the count is re-reported every fourth tick, so
+    /// without it an answered `n` would be asked again a second later. The overlay is named by id
+    /// and set by `register_all`, so the shell still never names a concrete view.
+    fn offer_migration_prompt(&mut self) {
+        if self.migration_prompt_shown {
+            return;
+        }
+        let Some(id) = self.migration_overlay else {
+            return;
+        };
+        if self.overlays.iter().any(|overlay| overlay.id() == id) {
+            return;
+        }
+        self.migration_prompt_shown = true;
+        self.update(Action::Overlay(OverlayAction::Open(id)));
     }
 
     /// Whether a workspace has been entered yet.
@@ -227,6 +267,7 @@ mod tests {
     use crate::app::Handled;
     use crate::keymap::Keymap;
     use crate::store_worker::RequestEnvelope;
+    use crate::ui::overlay::MigrationPrompt;
     use crate::ui::tabs::{Tab, TabId};
     use crossterm::event::{KeyCode, KeyEvent};
     use htui_core::fixtures::ids;
@@ -453,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tick_only_asks_for_the_run_count_once_a_second() {
+    fn a_tick_only_asks_for_the_top_bar_once_a_second() {
         let (mut app, mut rx, _seen) = shell();
         app.update(Action::SetScope {
             workspace: workspace("Platform"),
@@ -463,10 +504,74 @@ mod tests {
             app.update(Action::Tick);
         }
         let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2, "one refresh per second, not per tick");
+        assert!(matches!(requests[0].request, StoreRequest::StoreState));
         assert!(matches!(
-            requests[0].request,
+            requests[1].request,
             StoreRequest::ActiveRuns { .. }
         ));
+    }
+
+    #[test]
+    fn the_store_state_refresh_is_not_gated_on_a_scope() {
+        // A first launch never enters a workspace, and `offline · 3m` still has to keep ticking.
+        let (mut app, mut rx, _seen) = shell();
+        while rx.try_recv().is_ok() {}
+        for _ in 0..TICKS_PER_REFRESH {
+            app.update(Action::Tick);
+        }
+        let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests[0].request, StoreRequest::StoreState));
+    }
+
+    /// A `StoreState` reply addressed to the shell.
+    fn store_state(label: &str, migrations_pending: Option<usize>) -> ReplyEnvelope {
+        ReplyEnvelope {
+            seq: 0,
+            origin: Origin::App,
+            reply: StoreReply::StoreState {
+                label: label.to_owned(),
+                migrations_pending,
+            },
+        }
+    }
+
+    #[test]
+    fn a_store_state_reply_writes_the_top_bar_and_opens_the_prompt_once() {
+        let (mut app, _rx, _seen) = shell();
+        // The real prompt, registered as `register_all` registers it: the shell names it by id.
+        app.overlay_factories
+            .register(MigrationPrompt::ID, || Box::new(MigrationPrompt::new()));
+        app.migration_overlay = Some(MigrationPrompt::ID);
+
+        app.update(Action::Reply(store_state("offline · 3m", None)));
+        assert_eq!(app.top_bar.store, "offline · 3m");
+        assert!(
+            app.overlays.is_empty(),
+            "no pending count, no prompt (plan D11)"
+        );
+
+        app.update(Action::Reply(store_state("online", Some(3))));
+        assert_eq!(app.top_bar.store, "online");
+        assert_eq!(app.overlays.iter().count(), 1, "the prompt opened");
+
+        app.update(Action::Overlay(OverlayAction::Close));
+        app.update(Action::Reply(store_state("online", Some(3))));
+        assert!(
+            app.overlays.is_empty(),
+            "an answered prompt is not re-asked every fourth tick"
+        );
+    }
+
+    #[test]
+    fn an_applied_migration_lands_on_the_status_line() {
+        let (mut app, _rx, _seen) = shell();
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: 0,
+            origin: Origin::App,
+            reply: StoreReply::MigrationsApplied { applied: 2 },
+        }));
+        assert_eq!(app.status.as_deref(), Some("applied 2 migration(s)"));
     }
 }

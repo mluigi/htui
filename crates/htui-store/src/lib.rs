@@ -2,18 +2,25 @@
 //!
 //! `htui-core` owns the domain model and the `ReadStore` / `WriteStore` seam; this crate owns the
 //! concrete Postgres backend behind it, the box identity file the schema's `box` row is keyed on,
-//! and (from MOD-6 T3 onwards) the per-box SQLite mirror the TUI reads while offline.
+//! the per-box SQLite mirror the TUI reads while offline, the keyring the DSN lives in, and the
+//! [`Backend`] enum the TUI holds (moved here from `htui-core` in MOD-6 T4, because it names
+//! [`PgStore`] and the domain crate must not pull `sqlx` in).
 //!
 //! Everything here is `async` and none of it may be called from the UI task (`R-NF-3`): the store
 //! worker of the `htui` crate is the only caller.
 #![warn(missing_docs)]
 
+pub mod backend;
 pub mod cache;
+pub mod connect;
 pub mod error;
 pub mod identity;
 pub mod pg;
+pub mod secret;
 
+pub use backend::Backend;
 pub use cache::{CacheMeta, CacheStore};
+pub use connect::{ConnEvent, StartOptions, Started};
 pub use error::map_sqlx;
 pub use identity::Identity;
 pub use pg::{Connected, MigrationState, PgStore};

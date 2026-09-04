@@ -24,6 +24,7 @@ testkit = []
 
 [dependencies]
 htui-core          = { workspace = true, features = ["demo"] }
+htui-store         = { workspace = true, features = ["demo"] }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
 crossterm          = { workspace = true }
@@ -34,8 +35,10 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-insta = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
+insta    = { workspace = true }
+tokio    = { workspace = true, features = ["test-util"] }
+# The store worker's swap tests open a throwaway `cache.sqlite`, never the user's.
+tempfile = "3"
 
 [lints]
 workspace = true

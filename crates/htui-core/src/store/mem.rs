@@ -146,7 +146,7 @@ impl MemStore {
     /// The workspaces of this store, ordered by name.
     ///
     /// Inherent rather than a [`ReadStore`] method: §6.1 is quoted verbatim and has no
-    /// `workspaces()`, so [`crate::store::Backend`] exposes hierarchy reads inherently
+    /// `workspaces()`, so the `Backend` enum of `htui-store` exposes hierarchy reads inherently
     /// (blueprint B.7).
     pub async fn workspaces(&self) -> Result<Vec<WorkspaceSummary>> {
         Ok(self.read(State::workspace_summaries))

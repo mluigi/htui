@@ -6,8 +6,12 @@ body, runs, link graph, documents and notes side by side. The product contract i
 `docs/REQUIREMENTS.md` (`R-TUI-1..3` for the surfaces, `R-NF-1` for the platforms, `R-NF-3` for
 "the UI never blocks"), and the data it shows is shaped by `docs/ANA-9.md`, the concluded data
 model: every view reads through the ANA-9 §6.1 store seam (`ReadStore` / `WriteStore` / `Backend`)
-rather than through a database handle, so the in-memory store this milestone ships behind that seam
-is replaceable by the Postgres store and the per-box cache (MOD-6) without a single view changing.
+rather than through a database handle, so the in-memory store of MOD-1, the Postgres store and the
+per-box SQLite cache all sit behind the same seam without a single view changing.
+
+The store lives on **Postgres 16 or newer** (the schema uses `UNIQUE NULLS NOT DISTINCT`, a
+Postgres 15 feature; 16 is the floor the suite runs against). A mirror of what you browse is kept
+in a local SQLite file, so `htui` starts and renders with the server unreachable.
 
 ## Build
 
@@ -28,13 +32,97 @@ cargo run -p htui -- --demo
 
 | Flag | Meaning |
 |---|---|
-| `--demo` | Load the deterministic demo fixture (two workspaces, three projects, items, runs, notes and documents) instead of an empty store. |
+| `--demo` | Load the deterministic demo fixture (two workspaces, three projects, items, runs, notes and documents) into memory instead of connecting. |
+| `--offline` | Open from the local cache and never attempt a connection. |
+| `--set-dsn` | Read a Postgres DSN from stdin, store it in the OS keyring and exit. |
+| `--clear-dsn` | Remove the stored DSN from the OS keyring and exit. |
 | `--log <PATH>` | Append `tracing` output to a file. Never stdout — stdout is the TUI. Also read from `HTUI_LOG`; `HTUI_LOG_FILTER` overrides the default `info` level. |
 | `--help`, `--version` | Print usage / version and exit. |
 
 With `--demo` the shell enters the first workspace by name (`Graphics`) and opens on the Backlog
 tab. With an empty store nothing can be entered, so the workspace switcher stays up over the shell
 reading `no workspaces` — creating one is MOD-15.
+
+## The database connection
+
+### Storing the DSN
+
+The DSN lives in the **OS keyring** — Windows Credential Manager, macOS Keychain, the Linux secret
+service — under service `htui`, user `postgres-dsn`. There is no environment-variable fallback and
+no configuration file for it (`R-STO-1`), so the DSN never reaches `argv` or a shell history.
+
+```
+htui --set-dsn        # then paste the DSN and press Enter
+htui --clear-dsn      # removes the entry again
+```
+
+Both flags exit before the TUI starts. The DSN is read from stdin, so it can also be piped in:
+
+```
+echo postgres://postgres:htui@localhost:5433/htui | htui --set-dsn
+```
+
+TLS is whatever the DSN asks for (`?sslmode=require`, …); nothing overrides it (`R-STO-2`).
+
+### A development server
+
+`compose.yaml` at the repo root runs the minimum supported server, `postgres:16`, on host port
+**5433**, so a locally installed Postgres on 5432 never collides:
+
+```
+docker compose up -d
+echo postgres://postgres:htui@localhost:5433/htui | htui --set-dsn
+```
+
+The container's `htui` database is the one to point the TUI at; `postgres` is the maintenance
+database the test suite creates its throwaway databases through.
+
+### Startup, offline mode and the cache
+
+`htui` opens the local mirror first and renders from it immediately, then connects on a background
+task (ANA-9 §4.4): the UI never waits for the network. The store field of the top bar says which
+state it is in.
+
+| Top bar | Meaning |
+|---|---|
+| `memory` | `--demo`: an in-process store, no server and no cache. |
+| `connecting` | The first connection attempt has not answered yet. |
+| `online` | Connected. Reads go to Postgres and the cursor pass keeps the mirror warm in the background. |
+| `offline · 3m` | No connection for three minutes (`s` / `m` / `h`). Reads come from the mirror and there is no write path at all. |
+
+An offline shell retries every 30 seconds and switches to `online` on its own. `--offline` skips
+connecting entirely, which is the way to look at the cache on purpose.
+
+The cache lives next to the box identity under the user's configuration directory —
+`%APPDATA%\htui` on Windows, `~/.config/htui` on Linux, `~/Library/Application Support/htui` on
+macOS:
+
+```
+%APPDATA%\htui\box.toml                                # this box's id (UUIDv7) and its hostname
+%APPDATA%\htui\cache\<fingerprint>\cache.sqlite        # the mirror, one per server
+%APPDATA%\htui\cache\<fingerprint>\pending\*.jsonl     # offline chat buffers, uploaded on connect
+```
+
+`<fingerprint>` is `sha256(host:port/dbname)` and never contains credentials, so pointing `htui` at
+a second server gives it a second mirror rather than a mixed one. `box.toml` is minted on first
+launch and its id survives a hostname change (`R-BOX-4`). Deleting `cache/` is safe: it is refilled
+from the server, and it is rebuilt automatically when the server's schema version changes.
+
+### The migration prompt
+
+A schema that is behind this binary is **never migrated without being asked** (`R-STO-5`). When the
+connected database is behind, a modal box appears:
+
+```
+3 schema migrations are pending. Apply them now?
+
+y apply · n / Esc stay offline
+```
+
+`y` applies them and goes online; `n` and `Esc` leave the database untouched and the shell reading
+from the cache. The question is asked once per session. A database whose schema is *newer* than
+this binary, or whose applied migrations have different checksums, is refused outright: the top bar
+stays offline and the reason is on the status line.
 
 ## Keys
 
@@ -62,6 +150,16 @@ bindings, then the active tab, then the tab's bindings, then the global table.
 
 `Esc` closes any overlay; the switcher is modal, so a key it does not handle never reaches the tab
 underneath.
+
+### Schema prompt (overlay)
+
+| Key | Action |
+|---|---|
+| `y` | Apply the pending migrations and go online |
+| `n` / `Esc` | Leave the database untouched and stay on the cache |
+
+The prompt has no key that opens it: it is opened by the shell when the connected database reports
+pending migrations, and never by the user.
 
 ### Backlog tab
 
@@ -106,6 +204,44 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 ```
 
+### Tests that need a server
+
+The Postgres and cache suites read **`HTUI_TEST_DATABASE_URL`**, a *maintenance* DSN whose user may
+`CREATEDB`. Each test creates its own `htui_test_<hex>` database, migrates it and drops it on its
+last line. With the variable unset every such test prints `skipped: HTUI_TEST_DATABASE_URL not set`
+and passes, so the command above stays green on a box without a server.
+
+```
+docker compose up -d
+HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5433/postgres cargo test --workspace --all-features
+```
+
+Nothing under `%APPDATA%\htui` is touched by the suite: every test mints its `box.toml` and opens
+its mirror in a throwaway directory, and the keyring tests use their own `htui-test-<pid>` service
+rather than the real entry. A test process killed mid-run can leave a database behind; they all
+carry the `htui_test_` prefix, so `DROP DATABASE htui_test_…` is the cleanup.
+
+### `sqlx` offline query data
+
+Postgres queries are checked at compile time against the **committed** `crates/htui-store/.sqlx/`
+data, with `SQLX_OFFLINE=true` in `.cargo/config.toml`, so `cargo build`, `clippy` and `doc` never
+need a server. After adding or changing a `query!`, regenerate it **from inside the crate** —
+`cargo sqlx prepare` has no `-p` flag and writes to the manifest directory:
+
+```
+cargo install sqlx-cli --no-default-features --features postgres,sqlite   # once
+psql postgres://postgres:htui@localhost:5433/postgres -c "CREATE DATABASE htui_sqlx;"
+DATABASE_URL=postgres://postgres:htui@localhost:5433/htui_sqlx cargo sqlx migrate run --source crates/htui-store/migrations
+
+cd crates/htui-store
+DATABASE_URL=postgres://postgres:htui@localhost:5433/htui_sqlx cargo sqlx prepare -- --all-targets --all-features
+```
+
+`--all-targets --all-features` is not optional: without it the queries inside `#[cfg(test)]`,
+inside `tests/*.rs` and behind the `demo` feature are garbage-collected out of the cache.
+`cargo sqlx prepare --check` is the CI form. The SQLite mirror is checked at run time instead and
+contributes no files.
+
 The UI tests are `insta` snapshots rendered against a `TestBackend` at 100x30 through
 `htui::testkit::Harness`, which serves store requests inline: no sleeps, no spawned worker, so a
 snapshot is byte-stable. Snapshots live next to their tests in `crates/htui/tests/snapshots/` and
@@ -113,12 +249,18 @@ snapshot is byte-stable. Snapshots live next to their tests in `crates/htui/test
 `INSTA_UPDATE=always cargo test --workspace --all-features`, then run the suite again without the
 variable to confirm the recorded snapshots match, and commit the `.snap` files.
 
-## Scope of this milestone (MOD-1)
+## Scope
 
-MOD-1 is the **scaffold**: the shell, the key table, the tab and overlay registries, the store
-worker seam and **read-only** views over an in-memory store loaded with demo fixtures. Nothing here
-writes. The rest is tracked as its own item and lands as an additive module — a file plus one
-registration line, with no change to the event loop:
+MOD-1 was the **scaffold**: the shell, the key table, the tab and overlay registries, the store
+worker seam and read-only views over an in-memory store loaded with demo fixtures.
+
+**MOD-6** adds the real store: `crates/htui-store` with the ANA-9 §5 Postgres schema and its
+backend (`PgStore`), the per-box SQLite mirror (`CacheStore`) with the background cursor refresh,
+the box identity, the keyring DSN and the `Backend` enum the store worker holds. Item editing is
+still MOD-13's: the write paths exist on `PgStore` and no view calls them yet.
+
+The rest is tracked as its own item and lands as an additive module — a file plus one registration
+line, with no change to the event loop:
 
 | Deferred to | What |
 |---|---|
@@ -126,7 +268,6 @@ registration line, with no change to the event loop:
 | **MOD-14** | Navigable Graph traversal, re-rooting and multi-hop |
 | **MOD-15** | Hierarchy management: creating workspaces, projects, repos and item kinds |
 | **MOD-4** | Run actions: run, approve, reject, retry, cancel |
-| **MOD-6** | The Postgres store and the per-box offline cache behind the same seam |
 | **MOD-2** | The Chat tab |
 
 The TUI scope is always a workspace (a single project still lives in one), and the store seam is

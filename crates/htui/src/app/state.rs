@@ -165,6 +165,16 @@ pub struct App {
     /// Set by [`register_all`](crate::app::register_all); `None` leaves an empty store on the
     /// bare shell. Held as an id, not a view, so the shell never names a concrete overlay.
     pub startup_overlay: Option<crate::ui::overlay::OverlayId>,
+    /// Overlay to open when a `StoreState` reply carries a pending-migration count (plan D11).
+    ///
+    /// Set by [`register_all`](crate::app::register_all), and an id for the same reason
+    /// `startup_overlay` is one: the shell must not name a concrete view (MOD-1 blueprint D).
+    pub migration_overlay: Option<crate::ui::overlay::OverlayId>,
+    /// Whether the migration prompt has already been offered this session.
+    ///
+    /// `StoreState` is re-read every fourth tick, so without this an answered `n` would re-open
+    /// the prompt a second later, forever (blueprint D.5).
+    pub(super) migration_prompt_shown: bool,
 }
 
 impl App {
@@ -196,15 +206,21 @@ impl App {
             next_seq: 0,
             ticks: 0,
             startup_overlay: None,
+            migration_overlay: None,
+            migration_prompt_shown: false,
         }
     }
 
-    /// Issues the reads the shell itself needs: the workspace list and this box's row.
+    /// Issues the reads the shell itself needs: the workspace list, this box's row and the store
+    /// state.
     ///
-    /// The first `Workspaces` reply also picks the startup scope (blueprint D, "Startup").
+    /// The first `Workspaces` reply also picks the startup scope (blueprint D, "Startup"); the
+    /// `StoreState` one is what makes the top bar right on the first frame rather than a second
+    /// later, and what carries a pending-migration count into the shell (plan D11).
     pub fn start(&mut self) {
         self.dispatch(Origin::App, StoreRequest::Workspaces);
         self.dispatch(Origin::App, StoreRequest::BoxInfo);
+        self.dispatch(Origin::App, StoreRequest::StoreState);
     }
 
     /// Registers a tab and, when it becomes the active one, issues its requests.

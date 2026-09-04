@@ -11,7 +11,8 @@
 
 use std::collections::VecDeque;
 
-use htui_core::store::{Backend, MemStore};
+use htui_core::store::MemStore;
+use htui_store::Backend;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -19,7 +20,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use crate::app::{Action, App};
 use crate::keymap::{KeyChord, Keymap};
-use crate::store_worker::{self, ReplyEnvelope, RequestEnvelope};
+use crate::store_worker::{self, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
 use crate::ui::overlay::Overlay;
 use crate::ui::tabs::Tab;
 
@@ -37,6 +38,9 @@ pub struct Harness {
     backend: Backend,
     /// What the shell sent to the (absent) worker.
     rx: UnboundedReceiver<RequestEnvelope>,
+    /// What [`Harness::settle`] answers `StoreRequest::StoreState` with, when a test asks for
+    /// something a memory backend cannot represent.
+    store_state: Option<(String, Option<usize>)>,
     /// Where frames are drawn.
     term: Terminal<TestBackend>,
     /// Overlays queued by [`Harness::with_overlay`], pushed once the startup scope is settled.
@@ -79,9 +83,23 @@ impl Harness {
             app,
             backend,
             rx,
+            store_state: None,
             term: terminal(width, height),
             pending: VecDeque::new(),
         }
+    }
+
+    /// Answers every `StoreRequest::StoreState` with this label and pending count.
+    ///
+    /// The one thing a `Backend::Memory` cannot represent: `connecting`, `offline · 3m` and a
+    /// pending-migration count are states of a *connection*, and the harness deliberately has
+    /// none. Without an override the harness behaves exactly as it did in MOD-1 — the reply is
+    /// `store_worker::serve`'s, i.e. `"memory"` and no pending count — so no existing snapshot
+    /// moves.
+    #[must_use]
+    pub fn with_store_state(mut self, label: &str, migrations_pending: Option<usize>) -> Self {
+        self.store_state = Some((label.to_owned(), migrations_pending));
+        self
     }
 
     /// Registers a tab, as [`register_all`](crate::app::register_all) would.
@@ -118,7 +136,15 @@ impl Harness {
         for _ in 0..SETTLE_ROUNDS {
             let mut served = false;
             while let Ok(envelope) = self.rx.try_recv() {
-                let reply = store_worker::serve(&self.backend, &envelope.request).await;
+                let reply = match (&envelope.request, &self.store_state) {
+                    (StoreRequest::StoreState, Some((label, migrations_pending))) => {
+                        StoreReply::StoreState {
+                            label: label.clone(),
+                            migrations_pending: *migrations_pending,
+                        }
+                    }
+                    (request, _) => store_worker::serve(&self.backend, request).await,
+                };
                 self.app.update(Action::Reply(ReplyEnvelope {
                     seq: envelope.seq,
                     origin: envelope.origin,
@@ -195,7 +221,6 @@ fn buffer_text(buffer: &Buffer) -> String {
 mod tests {
     use super::*;
     use crate::app::{Ctx, Handled};
-    use crate::store_worker::{StoreReply, StoreRequest};
     use crate::ui::layout::centered;
     use crate::ui::overlay::OverlayId;
     use crossterm::event::{KeyCode, KeyEvent};

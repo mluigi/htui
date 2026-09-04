@@ -6,11 +6,13 @@
 //! so snapshots need no sleeps (blueprint C.1, C.8).
 
 use htui_core::model::{
-    BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note, RunSummary,
-    Scope, WorkspaceSummary,
+    BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note, ProjectId,
+    RunSummary, Scope, WorkspaceSummary,
 };
-use htui_core::store::{Backend, ReadStore};
-use tokio::sync::mpsc;
+use htui_core::store::ReadStore;
+use htui_store::cache::refresh::{RefreshSettings, Refresher};
+use htui_store::{Backend, ConnEvent, PgStore, Started, connect};
+use tokio::sync::{mpsc, watch};
 
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
@@ -65,6 +67,10 @@ pub enum StoreRequest {
     Notes(ItemId),
     /// The item's runs with their steps.
     Runs(ItemId),
+    /// The top bar's store field and the pending-migration count (plan D11).
+    StoreState,
+    /// Apply the pending migrations (`R-STO-5`), after the user answered `y`.
+    ApplyMigrations,
 }
 
 impl StoreRequest {
@@ -81,6 +87,8 @@ impl StoreRequest {
             Self::Documents(_) => "documents",
             Self::Notes(_) => "notes",
             Self::Runs(_) => "runs",
+            Self::StoreState => "store_state",
+            Self::ApplyMigrations => "apply_migrations",
         }
     }
 }
@@ -106,6 +114,19 @@ pub enum StoreReply {
     Notes(Vec<Note>),
     /// Answer to [`StoreRequest::Runs`].
     Runs(Vec<RunSummary>),
+    /// Answer to [`StoreRequest::StoreState`].
+    StoreState {
+        /// `Backend::label()`: `memory`, `connecting`, `online` or `offline · <age>`.
+        label: String,
+        /// How many migrations are pending; `None` when the question does not apply — a memory
+        /// backend, an offline one, or a connected one whose schema is up to date.
+        migrations_pending: Option<usize>,
+    },
+    /// Answer to [`StoreRequest::ApplyMigrations`].
+    MigrationsApplied {
+        /// How many were pending before the run; `0` when there was nothing to do.
+        applied: usize,
+    },
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -141,6 +162,12 @@ pub struct ReplyEnvelope {
 ///
 /// A `StoreError` becomes [`StoreReply::Failed`] rather than a panic or a dropped reply, so the
 /// asking view always hears back exactly once.
+///
+/// The two connection-aware requests are answered here as far as a `&Backend` can answer them —
+/// [`StoreRequest::StoreState`] without a pending count, [`StoreRequest::ApplyMigrations`] with
+/// nothing to apply — because the pending count and the store it belongs to are state of the
+/// [`spawn`] loop, which intercepts both before reaching here. This is the answer the test harness
+/// and a `--demo` shell get, and both are right: a `MemStore` has no schema to migrate.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreReply {
     let name = request.name();
     match request {
@@ -180,6 +207,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreReply {
             Ok(rows) => StoreReply::Runs(rows),
             Err(err) => failed(name, &err),
         },
+        StoreRequest::StoreState => StoreReply::StoreState {
+            label: backend.label(),
+            migrations_pending: None,
+        },
+        StoreRequest::ApplyMigrations => StoreReply::MigrationsApplied { applied: 0 },
     }
 }
 
@@ -191,26 +223,183 @@ fn failed(request: &'static str, err: &htui_core::store::StoreError) -> StoreRep
     }
 }
 
-/// Spawns the worker. The `Backend` moves in and no other task can reach it afterwards (D4).
+/// Spawns the worker. The `Backend` moves in and no other task can reach it afterwards (plan D4).
+///
+/// The loop is a `select!` over three sources — the UI's requests, the connect task's
+/// [`ConnEvent`]s and a reconnect ticker — and it owns every backend swap:
+///
+/// - [`ConnEvent::Online`] replaces `Offline { cache, .. }` with `Online { pg, cache }` (the same
+///   mirror, not a re-opened one) and starts the [`Refresher`].
+/// - [`ConnEvent::MigrationsPending`] holds the store **aside** instead of swapping: the schema is
+///   not one this binary has finished writing, so nothing reads through it and no refresher fills
+///   the mirror from it. The count is reported in the next [`StoreReply::StoreState`], which is
+///   what opens the migration prompt, and [`StoreRequest::ApplyMigrations`] is what makes the swap
+///   happen. (Blueprint D.2 swaps here and applies through `Backend::writable()`;
+///   `PgStore::apply_migrations` takes `&mut self`, which a `&PgStore` cannot give — same
+///   components, correct ownership.)
+/// - [`ConnEvent::Failed`] turns the first `connecting` into `offline · 0s` and nothing else.
+/// - The ticker re-dials every [`connect::RECONNECT`], and only while there is a DSN to dial, no
+///   writable backend and no store waiting for an answer to the migration prompt.
+///
+/// `started` is the bundle [`connect::start`] hands back; `Started::detached` is the `--demo` and
+/// test form, whose event channel is never written and whose ticker is disarmed, so the worker
+/// behaves exactly as it did in MOD-1 (deviation from blueprint D.2's eight-argument `spawn`: the
+/// pieces are the same, passed as the struct that already carries them).
 pub fn spawn(
-    backend: Backend,
+    started: Started,
     mut rx: mpsc::UnboundedReceiver<RequestEnvelope>,
     tx: mpsc::UnboundedSender<ReplyEnvelope>,
 ) -> tokio::task::JoinHandle<()> {
+    let Started {
+        mut backend,
+        mut events,
+        events_tx,
+        projects,
+        settings,
+        reconnect,
+    } = started;
+
     tokio::spawn(async move {
-        while let Some(envelope) = rx.recv().await {
-            let reply = serve(&backend, &envelope.request).await;
-            let answer = ReplyEnvelope {
-                seq: envelope.seq,
-                origin: envelope.origin,
-                reply,
-            };
-            if tx.send(answer).is_err() {
-                // The UI is gone; there is nobody left to answer.
-                break;
+        // How many migrations are waiting, and the store that is waiting to apply them.
+        let mut pending: Option<usize> = None;
+        let mut held: Option<PgStore> = None;
+        let mut refresher: Option<Refresher> = None;
+        // `interval_at`, not `interval`: the first tick of an `interval` completes immediately,
+        // which would re-dial in the same breath as `start`'s own attempt.
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + connect::RECONNECT,
+            connect::RECONNECT,
+        );
+
+        loop {
+            tokio::select! {
+                envelope = rx.recv() => {
+                    // The UI is gone; there is nobody left to answer.
+                    let Some(envelope) = envelope else { break };
+
+                    // Publish the scope so the refresher follows what the user is looking at
+                    // (plan D9). On every `Items` request, not only on a change: the send is a
+                    // pointer swap and a missed update mirrors the wrong project.
+                    if let StoreRequest::Items { scope, .. } = &envelope.request {
+                        projects.send_replace(scope.project_ids.clone());
+                    }
+
+                    let reply = match &envelope.request {
+                        StoreRequest::StoreState => StoreReply::StoreState {
+                            label: backend.label(),
+                            migrations_pending: pending,
+                        },
+                        StoreRequest::ApplyMigrations if held.is_some() => {
+                            // `if held.is_some()` above, so this cannot be the `None` arm; the
+                            // store has to be moved out to be applied (`&mut self`).
+                            match held.take() {
+                                Some(mut pg) => match pg.apply_migrations().await {
+                                    Ok(()) => {
+                                        let applied = pending.take().unwrap_or(0);
+                                        tracing::info!(applied, "schema migrations applied");
+                                        go_online(
+                                            &mut backend, pg, &mut refresher, &projects, settings,
+                                        ).await;
+                                        StoreReply::MigrationsApplied { applied }
+                                    }
+                                    Err(err) => {
+                                        // Still pending, still held: `y` can be answered again.
+                                        held = Some(pg);
+                                        failed("apply_migrations", &err)
+                                    }
+                                },
+                                None => StoreReply::MigrationsApplied { applied: 0 },
+                            }
+                        }
+                        other => serve(&backend, other).await,
+                    };
+
+                    let answer = ReplyEnvelope { seq: envelope.seq, origin: envelope.origin, reply };
+                    if tx.send(answer).is_err() {
+                        break;
+                    }
+                }
+
+                Some(event) = events.recv() => match event {
+                    ConnEvent::Online(pg) => {
+                        pending = None;
+                        held = None;
+                        go_online(&mut backend, pg, &mut refresher, &projects, settings).await;
+                        tracing::info!(label = backend.label(), "store online");
+                    }
+                    ConnEvent::MigrationsPending(pg, n) => {
+                        pending = Some(n);
+                        held = Some(pg);
+                        // The mirror stays the read path and the top bar stops saying
+                        // `connecting`: nothing reads through a schema this binary refuses to
+                        // use until the user has answered the prompt.
+                        backend.gave_up();
+                        tracing::warn!(pending = n, "schema has pending migrations");
+                    }
+                    ConnEvent::Failed(why) => {
+                        backend.gave_up();
+                        tracing::warn!(%why, "connect failed");
+                    }
+                },
+
+                _ = ticker.tick(),
+                    if reconnect.is_some() && !backend.is_writable() && held.is_none() =>
+                {
+                    if let Some(dial) = reconnect.clone() {
+                        let sender = events_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = sender.send(dial().await).await;
+                        });
+                    }
+                }
             }
         }
+
+        if let Some(refresher) = refresher {
+            refresher.abort();
+        }
     })
+}
+
+/// Swaps `Offline { cache, .. }` for `Online { pg, cache }` and (re)starts the refresher.
+///
+/// The mirror is moved across rather than re-opened: it is the file the shell has been reading
+/// from since startup, and `CacheStore` is a handle on one pool.
+async fn go_online(
+    backend: &mut Backend,
+    pg: PgStore,
+    refresher: &mut Option<Refresher>,
+    projects: &watch::Sender<Vec<ProjectId>>,
+    base: RefreshSettings,
+) {
+    let Some(cache) = backend.cache().cloned() else {
+        tracing::error!("no mirror to go online over; keeping the current backend");
+        return;
+    };
+    // Read before the move: `this_box`, `this_user` and the two cache settings are what only a
+    // connected server knows (blueprint C.13's `RefreshSettings`).
+    let settings = connect::refresh_settings(&pg, base).await;
+    *backend = Backend::Online { pg, cache };
+    if let Some(previous) = refresher.take() {
+        previous.abort();
+    }
+    *refresher = spawn_refresher(backend, projects, settings);
+}
+
+/// The refresher for an online backend, or `None` for any other (blueprint D.2).
+fn spawn_refresher(
+    backend: &Backend,
+    projects: &watch::Sender<Vec<ProjectId>>,
+    settings: RefreshSettings,
+) -> Option<Refresher> {
+    let pg = backend.writable()?;
+    let cache = backend.cache()?;
+    Some(Refresher::spawn(
+        pg.pool().clone(),
+        cache.clone(),
+        projects.subscribe(),
+        settings,
+    ))
 }
 
 #[cfg(test)]
@@ -218,9 +407,39 @@ mod tests {
     use super::*;
     use htui_core::fixtures::ids;
     use htui_core::store::MemStore;
+    use htui_store::CacheStore;
 
     fn demo() -> Backend {
         Backend::memory(MemStore::demo())
+    }
+
+    /// A worker over a backend that never connects, plus the two channel ends the UI holds.
+    fn detached(
+        backend: Backend,
+    ) -> (
+        mpsc::UnboundedSender<RequestEnvelope>,
+        mpsc::UnboundedReceiver<ReplyEnvelope>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn(Started::detached(backend), req_rx, rep_tx);
+        (req_tx, rep_rx, worker)
+    }
+
+    /// One request through a spawned worker, and its reply.
+    async fn round_trip(
+        tx: &mpsc::UnboundedSender<RequestEnvelope>,
+        rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>,
+        request: StoreRequest,
+    ) -> StoreReply {
+        tx.send(RequestEnvelope {
+            seq: 0,
+            origin: Origin::App,
+            request,
+        })
+        .expect("the worker is alive");
+        rx.recv().await.expect("the worker answers").reply
     }
 
     async fn platform_scope(backend: &Backend) -> Scope {
@@ -369,7 +588,7 @@ mod tests {
     async fn spawn_answers_with_the_request_seq_and_origin() {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
-        let worker = spawn(demo(), req_rx, rep_tx);
+        let worker = spawn(Started::detached(demo()), req_rx, rep_tx);
         req_tx
             .send(RequestEnvelope {
                 seq: 7,
@@ -383,5 +602,130 @@ mod tests {
         assert!(matches!(envelope.reply, StoreReply::Workspaces(_)));
         drop(req_tx);
         worker.await.expect("the worker stops with its channel");
+    }
+
+    #[tokio::test]
+    async fn store_state_reports_the_backend_label_and_no_pending_count() {
+        let (tx, mut rx, worker) = detached(demo());
+        let StoreReply::StoreState {
+            label,
+            migrations_pending,
+        } = round_trip(&tx, &mut rx, StoreRequest::StoreState).await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert_eq!(label, "memory");
+        assert_eq!(
+            migrations_pending, None,
+            "a memory backend has no schema to migrate"
+        );
+        drop(tx);
+        worker.await.expect("the worker stops with its channel");
+    }
+
+    #[tokio::test]
+    async fn apply_migrations_without_a_held_store_applies_nothing() {
+        let (tx, mut rx, worker) = detached(demo());
+        let reply = round_trip(&tx, &mut rx, StoreRequest::ApplyMigrations).await;
+        assert!(
+            matches!(reply, StoreReply::MigrationsApplied { applied: 0 }),
+            "nothing was pending, so nothing was applied: {reply:?}"
+        );
+        drop(tx);
+        worker.await.expect("the worker stops with its channel");
+    }
+
+    #[tokio::test]
+    async fn every_items_request_publishes_its_scope_to_the_refresher() {
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(demo());
+        // The receiver the refresher would hold; `Refresher::spawn` calls `subscribe` the same way.
+        let scope_rx = started.projects.subscribe();
+        started.settings.interval = std::time::Duration::from_secs(3600);
+        let worker = spawn(started, req_rx, rep_tx);
+
+        assert!(
+            scope_rx.borrow().is_empty(),
+            "no scope before the first read"
+        );
+
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        };
+        let reply = round_trip(
+            &req_tx,
+            &mut rep_rx,
+            StoreRequest::Items {
+                scope: scope.clone(),
+                filter: ItemFilter::default(),
+            },
+        )
+        .await;
+        assert!(matches!(reply, StoreReply::Items(_)));
+        assert_eq!(
+            *scope_rx.borrow(),
+            scope.project_ids,
+            "the refresher follows what the user is looking at (plan D9)"
+        );
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_event_turns_connecting_into_an_age() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-test", 1)
+            .await
+            .expect("open a throwaway mirror");
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(Backend::Offline {
+            cache: cache.clone(),
+            since: None,
+        });
+        let events_tx = started.events_tx.clone();
+        // A DSN would arm the ticker; `detached` leaves it disarmed, which is what keeps this test
+        // from dialling anything.
+        started.reconnect = None;
+        let worker = spawn(started, req_rx, rep_tx);
+
+        let StoreReply::StoreState { label, .. } =
+            round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert_eq!(label, "connecting", "no attempt has answered yet");
+
+        events_tx
+            .send(ConnEvent::Failed("no server".to_owned()))
+            .await
+            .expect("the worker is alive");
+
+        // The request and the event are both ready; `select!` picks at random, so ask until the
+        // event has been taken rather than assuming the first round trip loses the race.
+        let mut label = String::new();
+        for _ in 0..32 {
+            let StoreReply::StoreState { label: seen, .. } =
+                round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
+            else {
+                panic!("wrong reply variant")
+            };
+            label = seen;
+            if label != "connecting" {
+                break;
+            }
+        }
+        assert!(
+            label.starts_with("offline · "),
+            "a failed attempt gives up on `connecting`: {label}"
+        );
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+        cache.close().await;
     }
 }

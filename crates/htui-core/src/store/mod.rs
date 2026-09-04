@@ -1,7 +1,8 @@
-//! The store seam: the `ReadStore` / `WriteStore` split of `docs/ANA-9.md` §6.1 and the concrete
-//! [`Backend`] the TUI holds.
+//! The store seam: the `ReadStore` / `WriteStore` split of `docs/ANA-9.md` §6.1.
+//!
+//! The concrete `Backend` enum the TUI holds lives in `htui-store`, not here: it names `PgStore`
+//! and `CacheStore`, and this crate must stay free of `sqlx` (MOD-6 plan D1).
 
-pub mod backend;
 pub mod error;
 pub mod mem;
 pub mod traits;
@@ -9,7 +10,6 @@ pub mod traits;
 #[cfg(feature = "test-support")]
 pub mod conformance;
 
-pub use backend::Backend;
 pub use error::{Result, StoreError};
 pub use mem::MemStore;
 pub use traits::{ReadStore, UpdateOutcome, WriteStore};

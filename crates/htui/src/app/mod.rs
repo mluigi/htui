@@ -10,7 +10,7 @@ pub use state::{App, Ctx, Emit, TopBarState};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::keymap::{Binding, KeyChord, KeyScope};
-use crate::ui::overlay::WorkspaceSwitcher;
+use crate::ui::overlay::{MigrationPrompt, WorkspaceSwitcher};
 use crate::ui::tabs::{BacklogTab, SettingsTab, SkillsTab};
 
 /// Registers every tab and every overlay factory, and names the workspace switcher as the
@@ -31,6 +31,9 @@ use crate::ui::tabs::{BacklogTab, SettingsTab, SkillsTab};
 ///    bare shell, and the first workspace list either picks a startup scope (`--demo`) or is
 ///    empty, in which case `App::on_app_reply` opens the switcher reading "no workspaces"
 ///    instead of leaving a blank shell (blueprint D, "Startup").
+/// 4. The migration prompt's factory goes in and it is named as the migration overlay. It has no
+///    key binding on purpose: it is opened by the shell when a `StoreState` reply reports a
+///    pending schema, never by the user (`R-STO-5`, plan D11).
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -49,4 +52,8 @@ pub fn register_all(app: &mut App) {
     });
 
     app.startup_overlay = Some(WorkspaceSwitcher::ID);
+
+    app.overlay_factories
+        .register(MigrationPrompt::ID, || Box::new(MigrationPrompt::new()));
+    app.migration_overlay = Some(MigrationPrompt::ID);
 }
