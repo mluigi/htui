@@ -1,0 +1,34 @@
+# Development Postgres for htui (MOD-6).
+#
+# Postgres 16 is the minimum server ANA-9 §3 names, so developing against it keeps every query
+# inside the supported floor. Port 5433 on the host so a locally installed Postgres on 5432 never
+# collides. Credentials are development-only; the real DSN lives in the OS keyring (R-STO-1).
+#
+#   docker compose up -d
+#   export HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5433/postgres
+#   cargo test -p htui-store --all-features
+#
+# The store tests create and drop `htui_test_*` databases through this maintenance DSN; the
+# `htui` database below is the one to point the TUI at (`htui --set-dsn`).
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: htui-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: htui
+      POSTGRES_DB: htui
+    ports:
+      - "5433:5432"
+    volumes:
+      - htui-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d htui"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  htui-pgdata:
