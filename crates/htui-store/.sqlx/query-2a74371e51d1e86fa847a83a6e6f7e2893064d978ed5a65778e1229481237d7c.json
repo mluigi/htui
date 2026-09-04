@@ -1,0 +1,125 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT item_id   AS \"item_id: ItemId\",\n                   version,\n                   title,\n                   body,\n                   required_tags,\n                   author_id AS \"author_id: htui_core::model::UserId\",\n                   box_id    AS \"box_id: htui_core::model::BoxId\",\n                   reason,\n                   created_at\n              FROM item_revision WHERE item_id = $1 AND version = $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_revision",
+            "name": "item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item_revision",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "title",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_revision",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "body",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_revision",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "required_tags",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "item_revision",
+            "name": "required_tags"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "author_id: htui_core::model::UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_revision",
+            "name": "author_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "box_id: htui_core::model::BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_revision",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_revision",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_revision",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "2a74371e51d1e86fa847a83a6e6f7e2893064d978ed5a65778e1229481237d7c"
+}

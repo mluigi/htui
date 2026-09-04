@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT p.id AS \"project_id: ProjectId\", p.slug, p.name, wp.position\n              FROM workspace_project wp JOIN project p ON p.id = wp.project_id\n             WHERE wp.workspace_id = $1 AND p.id = ANY($2)\n             ORDER BY wp.position\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "project_id: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "workspace_project",
+            "name": "position"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8d0352ddc0efbadfd67ba7601985f960f58d3a985cecc1a8c4e3fd1b43c4b9ed"
+}

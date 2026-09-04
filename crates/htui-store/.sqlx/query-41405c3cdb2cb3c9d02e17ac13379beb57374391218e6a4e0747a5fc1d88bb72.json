@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH c AS (\n            INSERT INTO item_key_counter (project_id, prefix, last_value)\n            SELECT $2, k.prefix, $4 FROM item_kind k WHERE k.id = $3 AND k.project_id = $2\n            ON CONFLICT (project_id, prefix)\n            DO UPDATE SET last_value = GREATEST(item_key_counter.last_value, $4)\n            RETURNING prefix, last_value\n        ), i AS (\n            INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, title, body,\n                              priority, required_tags, touched_paths, step_graph_id, created_by)\n            SELECT $1, $2, $3, c.prefix, $4, 'imported', '', 0,\n                   '{}'::text[], '{}'::text[], NULL::uuid, $5 FROM c\n            RETURNING key_number\n        )\n        SELECT i.key_number AS \"key_number!\" FROM i\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key_number!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key_number"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "41405c3cdb2cb3c9d02e17ac13379beb57374391218e6a4e0747a5fc1d88bb72"
+}

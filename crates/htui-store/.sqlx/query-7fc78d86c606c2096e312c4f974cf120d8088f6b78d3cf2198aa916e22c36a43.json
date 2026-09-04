@@ -1,0 +1,244 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH u AS (\n                UPDATE item SET\n                    title         = COALESCE($3, title),\n                    body          = COALESCE($4, body),\n                    kind_id       = COALESCE($5, kind_id),\n                    required_tags = COALESCE($6, required_tags),\n                    priority      = COALESCE($7, priority),\n                    touched_paths = COALESCE($8, touched_paths),\n                    step_graph_id = CASE WHEN $9 THEN $10 ELSE step_graph_id END,\n                    version       = version + 1\n                 WHERE id = $1\n                   AND version = $2\n                   AND ($5::uuid IS NULL OR EXISTS (\n                           SELECT 1 FROM item_kind k\n                            WHERE k.id = $5 AND k.project_id = item.project_id))\n                RETURNING id, project_id, kind_id, key_prefix, key_number, key, title, body, status,\n                          priority, required_tags, touched_paths, step_graph_id, version,\n                          created_by, created_at, updated_at, closed_at\n            ), r AS (\n                INSERT INTO item_revision (item_id, version, title, body, required_tags,\n                                           author_id, box_id, reason)\n                SELECT id, version, title, body, required_tags, $11, $12, $13 FROM u\n                RETURNING item_id\n            )\n            SELECT u.id            AS \"id!: ItemId\",\n                   u.project_id    AS \"project_id!: htui_core::model::ProjectId\",\n                   u.kind_id       AS \"kind_id!: htui_core::model::ItemKindId\",\n                   u.key_prefix    AS \"key_prefix!\",\n                   u.key_number    AS \"key_number!\",\n                   u.key           AS \"key!\",\n                   u.title         AS \"title!\",\n                   u.body          AS \"body!\",\n                   u.status        AS \"status!: Status\",\n                   u.priority      AS \"priority!\",\n                   u.required_tags AS \"required_tags!\",\n                   u.touched_paths AS \"touched_paths!\",\n                   u.step_graph_id AS \"step_graph_id?: htui_core::model::StepGraphId\",\n                   u.version       AS \"version!\",\n                   u.created_by    AS \"created_by!: htui_core::model::UserId\",\n                   u.created_at    AS \"created_at!\",\n                   u.updated_at    AS \"updated_at!\",\n                   u.closed_at     AS \"closed_at?\"\n              FROM u, r\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id!: htui_core::model::ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind_id!: htui_core::model::ItemKindId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "kind_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "key_prefix!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key_prefix"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "key_number!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key_number"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "title!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "body!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "status!: Status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "priority!",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "priority"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "required_tags!",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "required_tags"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "touched_paths!",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "touched_paths"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "step_graph_id?: htui_core::model::StepGraphId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "step_graph_id"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "created_by!: htui_core::model::UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "updated_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "closed_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "closed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Text",
+        "Uuid",
+        "TextArray",
+        "Int2",
+        "TextArray",
+        "Bool",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "7fc78d86c606c2096e312c4f974cf120d8088f6b78d3cf2198aa916e22c36a43"
+}

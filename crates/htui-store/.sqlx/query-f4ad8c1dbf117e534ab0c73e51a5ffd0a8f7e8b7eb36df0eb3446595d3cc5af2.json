@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id          AS \"id: htui_core::model::NoteId\",\n                   item_id     AS \"item_id: ItemId\",\n                   body,\n                   created_by  AS \"created_by: htui_core::model::UserId\",\n                   box_id      AS \"box_id: htui_core::model::BoxId\",\n                   via_step_id AS \"via_step_id: StepId\",\n                   created_at\n              FROM item_note WHERE item_id = $1 ORDER BY created_at, id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: htui_core::model::NoteId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_note",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_note",
+            "name": "item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "body",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_note",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_by: htui_core::model::UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_note",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "box_id: htui_core::model::BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_note",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "via_step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_note",
+            "name": "via_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_note",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "f4ad8c1dbf117e534ab0c73e51a5ffd0a8f7e8b7eb36df0eb3446595d3cc5af2"
+}

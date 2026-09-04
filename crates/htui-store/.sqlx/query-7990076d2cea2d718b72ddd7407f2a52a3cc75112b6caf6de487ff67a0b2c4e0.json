@@ -1,0 +1,98 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT w.id   AS \"workspace_id: htui_core::model::WorkspaceId\",\n                   w.slug,\n                   w.name,\n                   p.id    AS \"project_id?: ProjectId\",\n                   p.slug  AS \"project_slug?\",\n                   p.name  AS \"project_name?\",\n                   wp.position AS \"position?\"\n              FROM workspace w\n              LEFT JOIN workspace_project wp ON wp.workspace_id = w.id\n              LEFT JOIN project p            ON p.id = wp.project_id\n             ORDER BY w.name, wp.position\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id: htui_core::model::WorkspaceId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "workspace",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "workspace",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "workspace",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "project_id?: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "project_slug?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "project_name?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "position?",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "workspace_project",
+            "name": "position"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "7990076d2cea2d718b72ddd7407f2a52a3cc75112b6caf6de487ff67a0b2c4e0"
+}

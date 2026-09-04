@@ -5,6 +5,9 @@
 
 #[cfg(feature = "demo")]
 mod demo;
+mod read;
+mod rows;
+mod write;
 
 use std::str::FromStr as _;
 use std::time::Duration;

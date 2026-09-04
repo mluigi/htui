@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO session_event (run_step_id, seq, turn, kind, role, tool_call_id, payload, at) SELECT $1, s, s / 100, 'assistant_text', 'agent', NULL, jsonb_build_object('seq', s, 'text', 'event ' || s), now() FROM UNNEST($2::int[]) AS s",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8b4d7de1569fdd08e79bfd65e5fee328141d916d017de2645ff505a0db4cd501"
+}

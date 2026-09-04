@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT run_step_id AS \"run_step_id: StepId\",\n                   seq,\n                   turn,\n                   kind         AS \"kind: htui_core::model::EventKind\",\n                   role         AS \"role: htui_core::model::EventRole\",\n                   tool_call_id,\n                   payload,\n                   raw,\n                   at\n              FROM session_event WHERE run_step_id = $1 ORDER BY seq\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "session_event",
+            "name": "run_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "seq",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "session_event",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "turn",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "session_event",
+            "name": "turn"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "kind: htui_core::model::EventKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "session_event",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "role: htui_core::model::EventRole",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "session_event",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "tool_call_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "session_event",
+            "name": "tool_call_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "session_event",
+            "name": "payload"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "raw",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "session_event",
+            "name": "raw"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "session_event",
+            "name": "at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "0a31d78d0acba978bb4eba670390eb1374c73032a746725083fcdadd4dd3aef6"
+}

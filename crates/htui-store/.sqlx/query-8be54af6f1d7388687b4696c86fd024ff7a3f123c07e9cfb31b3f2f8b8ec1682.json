@@ -1,0 +1,160 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT s.run_id       AS \"run_id: RunId\",\n                   s.id           AS \"id: StepId\",\n                   s.position,\n                   s.attempt,\n                   s.fanout_index,\n                   s.phase_name,\n                   s.agent_id     AS \"agent_id: htui_core::model::AgentId\",\n                   s.model,\n                   s.status       AS \"status: htui_core::model::StepStatus\",\n                   s.gate_outcome AS \"gate_outcome: htui_core::model::GateOutcome\",\n                   s.started_at,\n                   s.finished_at\n              FROM run_step s\n             WHERE s.run_id = ANY($1)\n             ORDER BY s.run_id, s.position, s.attempt, s.fanout_index\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "run_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "attempt",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "attempt"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "fanout_index",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "fanout_index"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "phase_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "phase_name"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "agent_id: htui_core::model::AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "model"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "status: htui_core::model::StepStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "gate_outcome: htui_core::model::GateOutcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "gate_outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "finished_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "finished_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "8be54af6f1d7388687b4696c86fd024ff7a3f123c07e9cfb31b3f2f8b8ec1682"
+}

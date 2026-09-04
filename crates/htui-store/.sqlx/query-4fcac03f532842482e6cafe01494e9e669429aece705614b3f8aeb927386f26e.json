@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT last_value FROM item_key_counter WHERE project_id = $1 AND prefix = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_value",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item_key_counter",
+            "name": "last_value"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4fcac03f532842482e6cafe01494e9e669429aece705614b3f8aeb927386f26e"
+}

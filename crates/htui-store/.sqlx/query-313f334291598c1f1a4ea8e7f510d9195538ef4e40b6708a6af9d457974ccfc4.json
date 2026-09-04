@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO item_kind (id, project_id, prefix, name, description, default_graph_id, position) VALUES ($1, $2, $3, 'race', '', $4, 99)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "313f334291598c1f1a4ea8e7f510d9195538ef4e40b6708a6af9d457974ccfc4"
+}

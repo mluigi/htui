@@ -1,0 +1,91 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH RECURSIVE walk(item_id, depth) AS (\n                    SELECT $1::uuid, 0\n                UNION\n                    SELECT CASE WHEN l.from_item_id = w.item_id\n                                THEN l.to_item_id ELSE l.from_item_id END,\n                           w.depth + 1\n                      FROM walk w\n                      JOIN item_link l\n                        ON (l.from_item_id = w.item_id OR l.to_item_id = w.item_id)\n                     WHERE l.deleted_at IS NULL AND w.depth < $2::int\n            ),\n            node AS (SELECT item_id, MIN(depth) AS depth FROM walk GROUP BY item_id)\n            SELECT n.item_id     AS \"item_id!: ItemId\",\n                   i.project_id  AS \"project_id!: ProjectId\",\n                   p.slug        AS \"project_slug!\",\n                   i.key         AS \"key!\",\n                   i.title       AS \"title!\",\n                   i.status      AS \"status!: htui_core::model::Status\",\n                   n.depth       AS \"depth!\"\n              FROM node n\n              JOIN item i    ON i.id = n.item_id\n              JOIN project p ON p.id = i.project_id\n             ORDER BY n.depth, i.key\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id!: ItemId",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id!: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "project_slug!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "title!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "status!: htui_core::model::Status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "depth!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      true,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "798965684fdae4335cefd9718a5c95b0acf56936197297b11c76a3e99eab38e2"
+}
