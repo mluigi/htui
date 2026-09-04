@@ -360,6 +360,78 @@ async fn a_second_box_under_another_os_user_name_seeds_no_second_app_user() {
     db.drop_db().await;
 }
 
+/// `R-USR-2` again, with the two first-ever connects *overlapping* rather than ordered.
+///
+/// `INSERT ... WHERE NOT EXISTS` does not serialise under READ COMMITTED: both statements read a
+/// snapshot taken when they started, both find `app_user` empty and both insert, and two differing
+/// names slip past `ON CONFLICT (name)`. `seed_if_empty_as` therefore locks `app_user` in SHARE
+/// ROW EXCLUSIVE as its transaction's first statement. Each round empties `app_user` - and the
+/// `box` rows that reference it - so both seeds race for a genuinely first-ever database; ten of
+/// them, because one round losing the race is luck and ten is not.
+#[tokio::test]
+async fn two_overlapping_first_connects_seed_one_app_user() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    let timeout = std::time::Duration::from_secs(10);
+    let one = PgStore::connect_with(
+        &db.url,
+        &identity::Identity {
+            box_id: BoxId::new(),
+            hostname: format!("HTUI-TEST-{}", uuid::Uuid::now_v7().simple()),
+        },
+        timeout,
+    )
+    .await
+    .expect("the first box connects")
+    .store;
+    let two = PgStore::connect_with(
+        &db.url,
+        &identity::Identity {
+            box_id: BoxId::new(),
+            hostname: format!("HTUI-TEST-{}", uuid::Uuid::now_v7().simple()),
+        },
+        timeout,
+    )
+    .await
+    .expect("the second box connects")
+    .store;
+
+    for round in 0..10 {
+        // `box.user_id` references `app_user`, so the boxes the two connects registered go first.
+        sqlx::query("DELETE FROM box")
+            .execute(&db.pool)
+            .await
+            .expect("clear box");
+        sqlx::query("DELETE FROM app_user")
+            .execute(&db.pool)
+            .await
+            .expect("clear app_user");
+
+        let (first, second) = tokio::join!(
+            one.seed_if_empty_as("os-user-one"),
+            two.seed_if_empty_as("os-user-two"),
+        );
+        let first = first.expect("the first seed succeeds");
+        let second = second.expect("the second seed succeeds");
+
+        assert_eq!(
+            common::count(&db.pool, "app_user").await,
+            1,
+            "round {round}: two overlapping first connects must seed one app_user (R-USR-2)"
+        );
+        assert_eq!(
+            first, second,
+            "round {round}: whichever seed lost the race adopts the row the other one wrote"
+        );
+    }
+
+    one.pool().close().await;
+    two.pool().close().await;
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn register_box_upserts_and_adopts() {
     let Some(db) = common::fresh_db().await else {

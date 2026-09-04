@@ -422,21 +422,25 @@ async fn go_online(
 /// `select!` arm that reads it. The reconnect ticker re-arms itself, its guard being
 /// `!backend.is_writable()`.
 ///
-/// A no-op on every backend that is not `Online`, so a second notice - a read and the refresher
-/// racing to report the same drop - does not restart the offline age.
+/// **The refresher and the watch go first, and unconditionally.** Only the offline *age* may not
+/// be restarted by a second notice - a read and the refresher racing to report the same drop - so
+/// [`Backend::went_offline`] guards the log line and nothing else. Returning early on a backend
+/// that is not `Online` would leave a live watch behind whose sender keeps republishing the same
+/// `Unreachable`; [`lost_the_server`] would then resolve on every poll and the `select!` would
+/// spin. A health watch may never outlive the `Online` backend it was armed for.
 fn go_offline(
     backend: &mut Backend,
     refresher: &mut Option<Refresher>,
     health: &mut Option<watch::Receiver<Option<StoreError>>>,
     why: &StoreError,
 ) {
-    if !backend.went_offline() {
-        return;
-    }
     if let Some(previous) = refresher.take() {
         previous.abort();
     }
     *health = None;
+    if !backend.went_offline() {
+        return;
+    }
     tracing::warn!(%why, "store unreachable; falling back to the mirror");
 }
 
@@ -913,12 +917,51 @@ mod tests {
         .expect("an unreachable pass resolves it");
         assert!(matches!(err, StoreError::Unreachable(_)));
 
-        // A memory backend has no mirror, so the swap is refused and the watch is left alone.
+        // A memory backend has no mirror, so the swap is refused.
         go_offline(&mut backend, &mut refresher, &mut seen, &err);
         assert_eq!(backend.label(), "memory");
-        assert!(
-            seen.is_some(),
-            "nothing was swapped, so nothing was dropped"
-        );
+    }
+
+    /// `go_offline` disarms the `lost_the_server` arm whatever the backend was.
+    ///
+    /// A health watch that outlived its `Online` backend would keep republishing the same
+    /// `Unreachable`, and the arm would resolve on every poll instead of parking - a spin. The
+    /// watch therefore goes before the `went_offline` guard, not after it.
+    #[tokio::test]
+    async fn go_offline_drops_the_health_watch_on_a_backend_that_is_not_online() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-go-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let err = StoreError::Unreachable("gone".to_owned());
+
+        for mut backend in [
+            demo(),
+            Backend::Offline {
+                cache: cache.clone(),
+                since: None,
+            },
+        ] {
+            let was = backend.label();
+            // The sender stays alive for the whole round, so a watch left behind would be a live
+            // one: `seen.is_none()` is the assertion, not a closed-channel accident.
+            let (_health, watcher) = watch::channel(Some(err.clone()));
+            let mut refresher = None;
+            let mut seen = Some(watcher);
+
+            go_offline(&mut backend, &mut refresher, &mut seen, &err);
+
+            assert_eq!(
+                backend.label(),
+                was,
+                "a backend that is not Online stays where it was"
+            );
+            assert!(
+                seen.is_none(),
+                "the watch is dropped whatever the backend was: {was}"
+            );
+        }
+
+        cache.close().await;
     }
 }

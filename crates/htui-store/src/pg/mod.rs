@@ -225,11 +225,24 @@ impl PgStore {
     /// The name is an argument rather than always the env-derived one so a test can exercise a
     /// second box without mutating the process environment.
     ///
+    /// **`SHARE ROW EXCLUSIVE` on `app_user` is the transaction's first statement.** Under READ
+    /// COMMITTED - the default, and what this pool uses - `WHERE NOT EXISTS` is evaluated against
+    /// a snapshot taken when the statement starts, so two first-ever connects that overlap both
+    /// see an empty table and both insert; the differing names slip past `ON CONFLICT (name)` and
+    /// `R-USR-2` is broken. The lock conflicts with itself and not with the readers, so the second
+    /// connect waits for the first to commit and then sees the row it seeded. It is taken before
+    /// any other statement so two seeds can never hold half of it each and deadlock.
+    ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub async fn seed_if_empty_as(&self, name: &str) -> Result<UserId> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        sqlx::query("LOCK TABLE app_user IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
 
         sqlx::query!(
             "INSERT INTO app_user (id, name) SELECT $1, $2 \
