@@ -221,6 +221,18 @@ Opus `Agent` calls for every implementer, Fable for the reviewer).
 | V11 | `UNIQUE NULLS NOT DISTINCT` needs Postgres 15+; both available servers qualify | **true** | ANA-9 §3; PG 18.6 local, 16 via docker |
 | V12 | `sqlx::query!` macros build without a server once `.sqlx/` exists and `SQLX_OFFLINE=true` | **known behaviour, not probed** | documented `sqlx` offline mode; first exercised in T1 with the server up |
 
+## Blueprint errata (post-CONFIRM, 2026-09-04)
+`.claude/plans/mod-6-postgres-store-cache.blueprint.md` §H lists 17 errata found against ANA-9,
+the code and the sqlx 0.9.0 sources; the implementation follows the blueprint's corrected
+reading. Three were re-probed by the router against the live databases and hold: H.8 (a
+`str_enum!` enum needs `#[sqlx(type_name = "text")]`; the plain derive fails decode and bind
+against `TEXT`), H.9 (sqlx decodes `Uuid` on SQLite as BLOB, so mirror UUIDs go through a
+`String` helper), H.10 (an INTEGER-microseconds column does not decode as `DateTime`, error not
+silent; helper required). Plan-level amendments: D3 reads "strong-enum derive with
+`type_name = "text"`"; D10's `start` returns `Started` and the worker spawns the refresher on
+`Online`; D1's `Offline.since` is an `Option` (`None` = `connecting`); the pending file is
+`pending/<project_id>.<run_id>.jsonl`; `cargo sqlx prepare` runs from `crates/htui-store`.
+
 ## Risks
 | Risk | Likelihood | Mitigation |
 |---|---|---|
