@@ -104,6 +104,17 @@ keyring DSN, `Backend::{Online, Offline}`; dev Postgres via `compose.yaml` (port
   preserve keys, build links. Later tier; MOD-6 landed (`docs/decisions/mod/mod-6.md`, importer
   mint variant per ANA-9 §7.1 still to write).
 
+### Tooling findings
+
+- [ ] **TOOL-1 - next-item blocked-on regex counts only the first ID per phrase.**
+  `next-item.ps1` / `.sh` (`$refPattern`, line ~124) match `blocked on <ID>` once, so
+  comma-separated blockers (`Blocked on ANA-4, ANA-5` on MOD-2; `Blocked on ANA-7, MOD-2` on
+  MOD-10, wrapping to the next line) drop every ID after the first: R2 dependent counts undercount,
+  and a wrapped blocker can hide entirely. Fix both twins identically (repeat-match the ID list
+  after the phrase, join across a line wrap), add a fixture with a two-ID and a wrapped case, keep
+  the `WORKFLOW_ALLOW_SH_ON_WINDOWS=1` parity check green. Found during `/handoff-run next` on
+  2026-09-04.
+
 ## Summary
 
 | Area    | Open                                                                                     |
@@ -111,4 +122,4 @@ keyring DSN, `Backend::{Online, Offline}`; dev Postgres via `compose.yaml` (port
 | ANA-N   | 4 (ANA-2 orchestration, ANA-3 context tools, ANA-5 prompt assembly, ANA-7 secrets) |
 | MOD-N   | 13 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                         |
-| TOOL-N  | 0                                                                                         |
+| TOOL-N  | 1 (TOOL-1 next-item blocked-on regex)                                                     |
