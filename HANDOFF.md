@@ -14,13 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-04):** MOD-6 landed (`docs/decisions/mod/mod-6.md`): `htui-store`
-crate with `PgStore`, the SQLite mirror and refresher, keyring DSN, `Backend::{Online, Offline}`;
-dev Postgres via `compose.yaml` (port 5433), tests need
+**Current status (2026-09-05):** ANA-4 concluded (`docs/ANA-4.md`,
+`docs/decisions/ana/ana-4.md`): `AgentDriver`/`AgentSession` traits, `agent-client-protocol =2.1.0`
+(MSRV moves to 1.88 in MOD-2), `claude` via `claude-agent-acp`, `agy` via `agy_acp_server`, new
+`htui-agent` crate, migration `0002_agent_probe.sql`; MOD-2 now waits on ANA-5 only. MOD-6 landed
+(`docs/decisions/mod/mod-6.md`): `htui-store` crate with `PgStore`, the SQLite mirror and refresher,
+keyring DSN, `Backend::{Online, Offline}`; dev Postgres via `compose.yaml` (port 5433), tests need
 `HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5433/postgres`. MOD-1 landed
-(`docs/decisions/mod/mod-1.md`): workspace, `htui-core` store seam, `htui` shell. ANA-4 (ACP)
-gates the driver; ANA-2 (orchestration) gates the orchestrator. MOD-7, MOD-9, MOD-13, MOD-14 and
-MOD-15 can start now.
+(`docs/decisions/mod/mod-1.md`): workspace, `htui-core` store seam, `htui` shell. ANA-2
+(orchestration) gates the orchestrator. MOD-7, MOD-9, MOD-13, MOD-14 and MOD-15 can start now.
 
 ---
 
@@ -28,11 +30,6 @@ MOD-15 can start now.
 
 ### Analyses
 
-- [ ] **ANA-4 - Agent protocol: ACP client and CLI fallback.** `R-AGT-1..6`. Settle the
-  `AgentDriver` trait and event model, the ACP client design (`agent-client-protocol` crate or
-  hand-rolled JSON-RPC), permission and edit-proposal handling, how `claude` is reached over ACP,
-  whether `agy` speaks ACP or needs the CLI adapter, and autodiscovery probes per agent. Output:
-  `docs/ANA-4.md`. Gates MOD-2.
 - [ ] **ANA-2 - Orchestration design.** `R-ORCH-1..11`, `R-ENT-6`, `R-ENT-8`. Settle the step
   graph data shape, phase contract (inputs, output document kind, gate, retry, verification), status
   transitions, review-to-implement loop, fan-out selection (human or judge), isolation modes
@@ -54,7 +51,8 @@ MOD-15 can start now.
 - [ ] **MOD-2 - Agent driver + chat tab** (from ANA-4). `R-AGT-1..8`, `R-TUI-6`, `R-TUI-8`,
   `R-HIS-1..2`. ACP client, CLI adapter, agent registry with its Settings tab section (agents and
   quota), autodiscovery, quota tracking, streamed chat tab with follow-ups and inline permissions,
-  event persistence and replay. Prompt builder per ANA-5. Blocked on ANA-4, ANA-5.
+  event persistence and replay. Prompt builder per ANA-5. Driver design concluded in
+  `docs/ANA-4.md` (ANA-4, `docs/decisions/ana/ana-4.md`). Blocked on ANA-5.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
@@ -110,7 +108,7 @@ MOD-15 can start now.
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 5 (ANA-2 orchestration, ANA-3 context tools, ANA-4 ACP, ANA-5 prompt assembly, ANA-7 secrets) |
+| ANA-N   | 4 (ANA-2 orchestration, ANA-3 context tools, ANA-5 prompt assembly, ANA-7 secrets) |
 | MOD-N   | 13 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 0                                                                                         |
