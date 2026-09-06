@@ -14,15 +14,19 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-05):** ANA-4 concluded (`docs/ANA-4.md`,
-`docs/decisions/ana/ana-4.md`): `AgentDriver`/`AgentSession` traits, `agent-client-protocol =2.1.0`
-(MSRV moves to 1.88 in MOD-2), `claude` via `claude-agent-acp`, `agy` via `agy_acp_server`, new
-`htui-agent` crate, migration `0002_agent_probe.sql`; MOD-2 now waits on ANA-5 only. MOD-6 landed
-(`docs/decisions/mod/mod-6.md`): `htui-store` crate with `PgStore`, the SQLite mirror and refresher,
-keyring DSN, `Backend::{Online, Offline}`; dev Postgres via `compose.yaml` (port 5433), tests need
-`HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5433/postgres`. MOD-1 landed
-(`docs/decisions/mod/mod-1.md`): workspace, `htui-core` store seam, `htui` shell. ANA-2
-(orchestration) gates the orchestrator. MOD-7, MOD-9, MOD-13, MOD-14 and MOD-15 can start now.
+**Current status (2026-09-06):** ANA-2 concluded (`docs/ANA-2.md`,
+`docs/decisions/ana/ana-2.md`): ANA-9 §5.4 graph shape kept with semantics fixed, three
+compare-and-set status tables (stored `blocked` = a human must clear it, dependency-blocked stays
+derived), review loop at the same `position` with `attempt + 1`, judge as `judge_agent_id` plus a
+`run_step` at `fanout_index = -1`, per-repo `run_step_tree`, repo-qualified `touched_paths` with
+prefix overlap, promotion in place, lease-based resume, migration `0003_orchestration.sql` (after
+MOD-2's `0002`), new crate `htui-orch`; MOD-4 now waits on MOD-2 only. ANA-4 concluded
+(`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`AgentSession` traits,
+`agent-client-protocol =2.1.0` (MSRV moves to 1.88 in MOD-2), new `htui-agent` crate, migration
+`0002_agent_probe.sql`; MOD-2 waits on ANA-5 only. MOD-6 landed (`docs/decisions/mod/mod-6.md`):
+`htui-store` crate; dev Postgres via `compose.yaml` (port 5433), tests need
+`HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5433/postgres`. MOD-7, MOD-9, MOD-13,
+MOD-14 and MOD-15 can start now.
 
 ---
 
@@ -30,15 +34,13 @@ keyring DSN, `Backend::{Online, Offline}`; dev Postgres via `compose.yaml` (port
 
 ### Analyses
 
-- [ ] **ANA-2 - Orchestration design.** `R-ORCH-1..11`, `R-ENT-6`, `R-ENT-8`. Settle the step
-  graph data shape, phase contract (inputs, output document kind, gate, retry, verification), status
-  transitions, review-to-implement loop, fan-out selection (human or judge), isolation modes
-  including `copy` and `local` semantics, overlap rule for concurrent items, promotion to chat and
-  resume. Output: `docs/ANA-2.md`. Gates MOD-4, MOD-12.
 - [ ] **ANA-5 - Prompt assembly and file excerpt selection.** `R-PRM-1..4`, `R-ID-5`. Settle the
   template placeholder contract, the upstream-summary walk within workspace bounds, the trim order
   and budget accounting, and how `htui` selects file excerpts without an external tool (external
-  providers are `R-LATER-7`). Output: `docs/ANA-5.md`. Gates MOD-2 prompt builder.
+  providers are `R-LATER-7`). Output: `docs/ANA-5.md`. Gates MOD-2 prompt builder. ANA-2
+  (`docs/ANA-2.md` §4.4, §4.5, §4.8, §9) names three templates it must also supply: `judge`, the
+  review-loop forwarded set rendered as prompt sections, and the promotion handoff prompt, plus a
+  stable serialisation so `prompt_digest` is reproducible.
 - [ ] **ANA-7 - Secret provider and scrubbing.** `R-SEC-1..4`, `R-ID-7`. Settle Infisical SDK vs
   CLI, machine identity bootstrap per box, keyring usage for `htui`'s own credentials, scrub mask
   construction and the fail-closed check. Output: `docs/ANA-7.md`. Gates MOD-10.
@@ -52,16 +54,28 @@ keyring DSN, `Backend::{Online, Offline}`; dev Postgres via `compose.yaml` (port
   `R-HIS-1..2`. ACP client, CLI adapter, agent registry with its Settings tab section (agents and
   quota), autodiscovery, quota tracking, streamed chat tab with follow-ups and inline permissions,
   event persistence and replay. Prompt builder per ANA-5. Driver design concluded in
-  `docs/ANA-4.md` (ANA-4, `docs/decisions/ana/ana-4.md`). Blocked on ANA-5.
+  `docs/ANA-4.md` (ANA-4, `docs/decisions/ana/ana-4.md`). MOD-4 consumes `DriverCaps`,
+  `SessionSpec.cwd`/`extra_dirs`, `session_ref` and the `session_started` row (`docs/ANA-2.md`
+  §4.2, §4.8), and `0002_agent_probe.sql` must land before ANA-2's `0003`. Blocked on ANA-5.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
   close-out (summary document, status, commit hashes). The `run` and `close` actions of `R-TUI-2`.
-  Blocked on ANA-2, MOD-2 (MOD-6 landed, `docs/decisions/mod/mod-6.md`).
+  Design concluded in `docs/ANA-2.md` (ANA-2, `docs/decisions/ana/ana-2.md`): new crate
+  `htui-orch` plus `crates/htui/src/run_worker.rs` (§8), migration `0003_orchestration.sql` and
+  `cache_migrations/0002_orchestration.sql` (§9; never applied before MOD-2's `0002`), sixteen
+  `WriteStore` methods and the `PgStore` reads of §8 with conformance cases, `can_move_to` on the
+  three status enums (§4.3), typed `BoxSettings`/`ProjectSettings` (§4.7), projection additions
+  (§6.2), fixture corrections (`attempt` 1-based, non-NULL `graph_snapshot`, `review` in
+  `implement.input_kinds`, `gate_hard` seed), `gix` as the git dependency; build order in §9,
+  steps 1 to 4 need nothing from MOD-2. Blocked on MOD-2 (MOD-6 landed,
+  `docs/decisions/mod/mod-6.md`).
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
   per-box paths, agent autodiscovery hook. Not blocked (MOD-6 landed,
   `docs/decisions/mod/mod-6.md`: `register_box` writes the minimal row, the probe fills the rest).
+  MOD-4 and MOD-12 need `probed_tags`/`declared_tags` from a real probe, `repo_box_path` rows for
+  every isolation mode, and `agent_box.probe.status` (`docs/ANA-2.md` §4.10, §7).
 - [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
   project and phase bindings, template rows, Skills tab editor with version diff, import of
   existing skill markdown files.
@@ -72,18 +86,26 @@ keyring DSN, `Backend::{Online, Offline}`; dev Postgres via `compose.yaml` (port
   ANA-7, MOD-2.
 - [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
   `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
-  per-box class limits; per-phase exposure. Blocked on MOD-2, MOD-4.
+  per-box class limits; per-phase exposure. Per ANA-2 (`docs/ANA-2.md` §4.2, §8, risk 11):
+  `document_write` calls `WriteStore::write_document` (orchestrator-allocated version), `command_run`
+  accepts class `verify` for `verify_command`, and an `item_status` request is recorded as an
+  `item_note` with `via_step_id`, never a transition. Blocked on MOD-2, MOD-4.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
-  `queue` action of `R-TUI-2`. Target box stored, local execution only. Blocked on MOD-4.
+  `queue` action of `R-TUI-2`. Target box stored, local execution only. Design concluded in
+  `docs/ANA-2.md` (§4.10, §9): `ready_items` per ANA-9 §7.4 in full, the same `claim_run`
+  admission as MOD-4, batch caps as `SUM(run_step.usage)`, escalations in the queue overlay, the
+  `scheduler_window` key stored but not enforced; a graph with a `gate_hard` phase is never fully
+  unattended, so `FIX`/`CLEAN`/`TOOL` are the first targets. Blocked on MOD-4.
 - [ ] **MOD-13 - Backlog filters and item editing** (from MOD-1). `R-TUI-2`, `R-ENT-5`,
   `R-ENT-10..12`. Filters by status, project, capability and readiness; `new` and `edit` actions
   with the compare-and-set on `version` and the three-way divergence view (`docs/ANA-9.md` §4.2,
   §7.2), external `$EDITOR` round-trip, note thread append, hand-written documents; mint per §7.1.
   Not blocked (MOD-1 landed, `docs/decisions/mod/mod-1.md`); lands against `MemStore` through
   the `DetailRegistry` and overlay registry; `PgStore` (MOD-6, `docs/decisions/mod/mod-6.md`)
-  supplies the real mint and revisions.
+  supplies the real mint and revisions. The `touched_paths` edit path accepts and validates the
+  `repo_name:glob` qualification of `docs/ANA-2.md` §4.7 (bare glob = primary repo).
 - [ ] **MOD-14 - Graph tab** (from MOD-1). `R-TUI-5`, `R-ENT-9`. Item neighbourhood one to N hops
   across projects through `ReadStore::links` (`docs/ANA-9.md` §6.1), status and link kind per
   edge, keyboard navigation that re-roots the Backlog selection; the `open graph` action of
@@ -93,7 +115,9 @@ keyring DSN, `Backend::{Online, Offline}`; dev Postgres via `compose.yaml` (port
   templates per `docs/ANA-9.md` §5.10), repos with primary flag and per-box paths, workspace root
   paths per box; item kind editor with the prefix-change warning (§10); Settings tab sections for
   kinds and step graphs per project. Not blocked (MOD-6 landed, `docs/decisions/mod/mod-6.md`;
-  `Settings > Rebuild cache` calls `CacheStore::rebuild()`).
+  `Settings > Rebuild cache` calls `CacheStore::rebuild()`). Seed graphs per `docs/ANA-2.md` §4.1
+  (`review` in `implement`/`fix` `input_kinds`, `gate_hard` on `prd`, `plan` and `verdict`,
+  `is_override = false`); whichever of MOD-15 and MOD-4 lands second owns the seed amendment.
 
 ### Deferred backlog
 
@@ -119,7 +143,7 @@ keyring DSN, `Backend::{Online, Offline}`; dev Postgres via `compose.yaml` (port
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 4 (ANA-2 orchestration, ANA-3 context tools, ANA-5 prompt assembly, ANA-7 secrets) |
+| ANA-N   | 3 (ANA-3 context tools, ANA-5 prompt assembly, ANA-7 secrets)                       |
 | MOD-N   | 13 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 1 (TOOL-1 next-item blocked-on regex)                                                     |

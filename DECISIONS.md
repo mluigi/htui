@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[ANA-2](docs/decisions/ana/ana-2.md)** - Orchestration design: step graphs, phase contract, status machines, fan-out, isolation, resume (done, 2026-09-06)
 - **[ANA-4](docs/decisions/ana/ana-4.md)** - Agent protocol: ACP client and CLI fallback (done, 2026-09-05)
 - **[MOD-6](docs/decisions/mod/mod-6.md)** - Postgres store + cache: htui-store crate, 0001_init migration, PgStore, SQLite mirror with cursor refresh, keyring DSN, Online/Offline backend (done, 2026-09-04)
 - **[MOD-1](docs/decisions/mod/mod-1.md)** - TUI scaffold: workspace, htui-core store seam and MemStore, htui shell with Backlog tab and workspace switcher (done, 2026-09-04)
