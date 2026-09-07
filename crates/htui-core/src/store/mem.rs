@@ -16,16 +16,21 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use chrono::{DateTime, Utc};
 
+use serde_json::Value;
+
 use crate::model::{
-    Agent, AgentId, AppUser, BoxId, BoxInfo, BoxRow, Document, DocumentHead, Item, ItemFilter,
-    ItemId, ItemKind, ItemKindId, ItemLink, ItemPatch, ItemRevision, ItemSummary, LinkEdge,
-    LinkGraph, LinkKind, LinkNode, NewItem, Note, Project, ProjectId, ProjectRef, PromptTemplate,
-    Run, RunId, RunStep, RunStepSummary, RunSummary, Scope, SessionEvent, Status, StepGraph,
-    StepGraphId, StepGraphPhase, StepId, UserId, Workspace, WorkspaceId, WorkspaceProject,
+    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoxId, BoxInfo, BoxRow, ChatRunSpec, Document,
+    DocumentHead, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemLink, ItemPatch,
+    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewItem, Note, Project,
+    ProjectId, ProjectRef, PromptTemplate, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepSummary, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId,
+    StepGraphPhase, StepId, StepStatus, UserId, Workspace, WorkspaceId, WorkspaceProject,
     WorkspaceSummary,
 };
 use crate::store::error::{Result, StoreError};
-use crate::store::traits::{ReadStore, UpdateOutcome, WriteStore};
+use crate::store::traits::{
+    ReadStore, UpdateOutcome, WriteStore, chat_step_status, not_a_terminal_status,
+};
 
 /// The store the TUI runs against in MOD-1: every row in process memory, cloned out under a lock
 /// that is never held across an `.await` (plan D6).
@@ -61,9 +66,11 @@ struct State {
     /// `prompt_template`. Held for the modules that read it: no §6.1 method exposes it yet (blueprint B.8).
     #[expect(dead_code, reason = "loaded now, read by MOD-2 / MOD-4 / MOD-15")]
     templates: Vec<PromptTemplate>,
-    /// `agent`. Held for the modules that read it: no §6.1 method exposes it yet (blueprint B.8).
-    #[expect(dead_code, reason = "loaded now, read by MOD-2 / MOD-4 / MOD-15")]
+    /// `agent`, read by the inherent [`MemStore::agents`] (MOD-2 plan D3).
     agents: HashMap<AgentId, Agent>,
+    /// `agent_box`, keyed as its composite primary key is. Empty until something probes a box:
+    /// no fixture loads it (MOD-2 plan D3).
+    agent_boxes: HashMap<(AgentId, BoxId), AgentBox>,
     /// `item_key_counter` (§4.1): the highest number minted per `(project, prefix)`.
     item_key_counter: HashMap<(ProjectId, String), i32>,
     /// `item`.
@@ -118,6 +125,7 @@ impl MemStore {
             phases: data.phases,
             templates: data.templates,
             agents: data.agents.into_iter().map(|row| (row.id, row)).collect(),
+            agent_boxes: HashMap::new(),
             item_key_counter: data.item_key_counter,
             items: data.items.into_iter().map(|row| (row.id, row)).collect(),
             revisions: data
@@ -179,6 +187,20 @@ impl MemStore {
     /// The scope's projects, ordered by `workspace_project.position`.
     pub async fn projects(&self, scope: &Scope) -> Result<Vec<ProjectRef>> {
         Ok(self.read(|state| state.project_refs(scope)))
+    }
+
+    /// The agent registry, ordered by `agent.name`, each row carrying **this box's** `agent_box`
+    /// when there is one.
+    ///
+    /// Inherent for the same reason the four reads above are, and one more: `agent` and
+    /// `agent_box` are not mirrored (`docs/ANA-9.md` §4.4), so no offline backend could answer it
+    /// (MOD-2 plan D3).
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn agents(&self) -> Result<Vec<AgentSummary>> {
+        Ok(self.read(State::agent_summaries))
     }
 
     /// Takes the read lock, runs `f`, drops the guard and returns `f`'s owned result.
@@ -679,6 +701,234 @@ impl State {
         item.closed_at = to.is_terminal().then_some(now);
         Ok(true)
     }
+
+    /// The registry rows, ordered by name, each joined to this box's `agent_box` (MOD-2 plan D3).
+    fn agent_summaries(&self) -> Vec<AgentSummary> {
+        let mut rows: Vec<&Agent> = self.agents.values().collect();
+        rows.sort_by(|left, right| left.name.cmp(&right.name));
+        rows.into_iter()
+            .map(|agent| AgentSummary {
+                agent: agent.clone(),
+                on_box: self
+                    .this_box
+                    .and_then(|box_id| self.agent_boxes.get(&(agent.id, box_id)))
+                    .cloned(),
+            })
+            .collect()
+    }
+
+    /// Appends events, skipping every `(run_step_id, seq)` already stored, and answers how many
+    /// rows landed (§4.3).
+    ///
+    /// Every event is validated **before** the first insert, because Postgres does the whole batch
+    /// in one statement: a batch naming a step that does not exist must write none of its rows.
+    fn append_events(&mut self, events: &[SessionEvent]) -> Result<usize> {
+        for event in events {
+            if !self.steps.contains_key(&event.run_step_id) {
+                return Err(StoreError::Constraint(format!(
+                    "session_event.run_step_id `{}` references no run_step",
+                    event.run_step_id
+                )));
+            }
+        }
+
+        let mut inserted = 0;
+        for event in events {
+            // The primary key is the backstop, in the batch as well as against what is stored.
+            if self
+                .events
+                .iter()
+                .any(|row| row.run_step_id == event.run_step_id && row.seq == event.seq)
+            {
+                continue;
+            }
+            self.events.push(event.clone());
+            inserted += 1;
+        }
+        Ok(inserted)
+    }
+
+    /// `run_step.usage`, plus `prompt_digest` when one is supplied (`docs/ANA-4.md` §4.1).
+    fn set_step_usage(
+        &mut self,
+        step: StepId,
+        usage: Value,
+        prompt_digest: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let row = self
+            .steps
+            .get_mut(&step)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })?;
+        row.usage = Some(usage);
+        if let Some(digest) = prompt_digest {
+            row.prompt_digest = Some(digest);
+        }
+        row.updated_at = now;
+        Ok(())
+    }
+
+    /// Insert-or-update on `agent.id`, with `agent.name` unique across every other id (§5.7).
+    ///
+    /// `created_at` is the stored row's on an update, never the caller's, and `updated_at` is the
+    /// clock: that is what Postgres's `BEFORE UPDATE` trigger does, written out.
+    fn upsert_agent(&mut self, agent: &Agent, now: DateTime<Utc>) -> Result<()> {
+        if self
+            .agents
+            .values()
+            .any(|row| row.id != agent.id && row.name == agent.name)
+        {
+            return Err(StoreError::Constraint(format!(
+                "agent_name_key: another agent is already named `{}`",
+                agent.name
+            )));
+        }
+        match self.agents.get_mut(&agent.id) {
+            Some(stored) => {
+                let created_at = stored.created_at;
+                *stored = agent.clone();
+                stored.created_at = created_at;
+                stored.updated_at = now;
+            }
+            None => {
+                self.agents.insert(agent.id, agent.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert-or-update on the composite primary key `(agent_id, box_id)`, both referents required
+    /// (§5.7).
+    fn upsert_agent_box(&mut self, row: &AgentBox, now: DateTime<Utc>) -> Result<()> {
+        if !self.agents.contains_key(&row.agent_id) {
+            return Err(StoreError::Constraint(format!(
+                "agent_box.agent_id `{}` references no agent",
+                row.agent_id
+            )));
+        }
+        if !self.boxes.contains_key(&row.box_id) {
+            return Err(StoreError::Constraint(format!(
+                "agent_box.box_id `{}` references no box",
+                row.box_id
+            )));
+        }
+        match self.agent_boxes.get_mut(&(row.agent_id, row.box_id)) {
+            Some(stored) => {
+                *stored = row.clone();
+                stored.updated_at = now;
+            }
+            None => {
+                self.agent_boxes
+                    .insert((row.agent_id, row.box_id), row.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// The `run` / `run_step` pair of a free-standing chat, both a no-op when the id is already
+    /// stored (plan D4: `ON CONFLICT (id) DO NOTHING`).
+    fn start_chat_run(&mut self, chat: &ChatRunSpec) -> Result<()> {
+        if !self.projects.contains_key(&chat.project_id) {
+            return Err(StoreError::Constraint(format!(
+                "run.project_id `{}` references no project",
+                chat.project_id
+            )));
+        }
+        if !self.boxes.contains_key(&chat.target_box_id) {
+            return Err(StoreError::Constraint(format!(
+                "run.target_box_id `{}` references no box",
+                chat.target_box_id
+            )));
+        }
+        require_author(chat.started_by, "run.started_by")?;
+        if let Some(agent) = chat.agent_id
+            && !self.agents.contains_key(&agent)
+        {
+            return Err(StoreError::Constraint(format!(
+                "run_step.agent_id `{agent}` references no agent"
+            )));
+        }
+
+        self.runs.entry(chat.run_id).or_insert_with(|| Run {
+            id: chat.run_id,
+            project_id: chat.project_id,
+            item_id: None,
+            kind: RunKind::Chat,
+            mode: RunMode::Manual,
+            status: RunStatus::Running,
+            target_box_id: chat.target_box_id,
+            executing_box_id: Some(chat.target_box_id),
+            graph_snapshot: None,
+            started_by: chat.started_by,
+            queued_at: chat.started_at,
+            started_at: Some(chat.started_at),
+            finished_at: None,
+            failure: None,
+            updated_at: chat.started_at,
+        });
+        self.steps.entry(chat.step_id).or_insert_with(|| RunStep {
+            id: chat.step_id,
+            run_id: chat.run_id,
+            position: 0,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "chat".to_owned(),
+            agent_id: chat.agent_id,
+            model: chat.model.clone(),
+            status: StepStatus::Running,
+            gate_outcome: None,
+            gate_note: None,
+            selected: None,
+            exit_code: None,
+            prompt_digest: None,
+            trim_record: None,
+            usage: None,
+            isolation_path: None,
+            started_at: Some(chat.started_at),
+            finished_at: None,
+            updated_at: chat.started_at,
+        });
+        Ok(())
+    }
+
+    /// Closes both rows of a chat run (plan D4).
+    fn finish_chat_run(
+        &mut self,
+        run: RunId,
+        step: StepId,
+        status: RunStatus,
+        finished_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let step_status = chat_step_status(status)
+            .ok_or_else(|| StoreError::Constraint(not_a_terminal_status(status)))?;
+        if !self.runs.contains_key(&run) {
+            return Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            });
+        }
+        if !self.steps.contains_key(&step) {
+            return Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            });
+        }
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.status = status;
+            row.finished_at = Some(finished_at);
+            row.updated_at = now;
+        }
+        if let Some(row) = self.steps.get_mut(&step) {
+            row.status = step_status;
+            row.finished_at = Some(finished_at);
+            row.updated_at = now;
+        }
+        Ok(())
+    }
 }
 
 /// A revision author must name a real `app_user` row (§5.5 `REFERENCES app_user(id)`); the nil
@@ -743,5 +993,234 @@ impl WriteStore for MemStore {
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         let now = Utc::now();
         self.write(|state| state.transition(id, from, to, now))
+    }
+
+    async fn append_events(&self, events: &[SessionEvent]) -> Result<usize> {
+        self.write(|state| state.append_events(events))
+    }
+
+    async fn set_step_usage(
+        &self,
+        step: StepId,
+        usage: Value,
+        prompt_digest: Option<String>,
+    ) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.set_step_usage(step, usage, prompt_digest, now))
+    }
+
+    async fn upsert_agent(&self, agent: &Agent) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.upsert_agent(agent, now))
+    }
+
+    async fn upsert_agent_box(&self, row: &AgentBox) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.upsert_agent_box(row, now))
+    }
+
+    async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
+        self.write(|state| state.start_chat_run(chat))
+    }
+
+    async fn finish_chat_run(
+        &self,
+        run: RunId,
+        step: StepId,
+        status: RunStatus,
+        finished_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.finish_chat_run(run, step, status, finished_at, now))
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::MemStore;
+    use crate::fixtures::ids;
+    use crate::model::{AgentBox, ChatRunSpec, RunStatus, StepStatus};
+    use crate::store::WriteStore as _;
+    use chrono::Utc;
+    use serde_json::json;
+
+    /// The columns `store::conformance` cannot see, because §6.1 returns neither `run_step.usage`
+    /// nor `run_step.prompt_digest` (plan D15(a)). Read straight out of `State`, which is what a
+    /// unit test in this module is for; `pg_criteria.rs` asserts the same rule in SQL.
+    #[tokio::test]
+    async fn set_step_usage_writes_usage_every_time_and_the_digest_only_when_supplied() {
+        let store = MemStore::demo();
+        store
+            .set_step_usage(
+                ids::STEP_IMPL,
+                json!({ "input_tokens": 7 }),
+                Some("abc".to_owned()),
+            )
+            .await
+            .expect("the first write lands");
+        store
+            .set_step_usage(ids::STEP_IMPL, json!({ "input_tokens": 9 }), None)
+            .await
+            .expect("the second write lands");
+
+        let step = store.read(|state| {
+            state
+                .steps
+                .get(&ids::STEP_IMPL)
+                .cloned()
+                .expect("the fixture step")
+        });
+        assert_eq!(
+            step.usage,
+            Some(json!({ "input_tokens": 9 })),
+            "usage is overwritten by every call"
+        );
+        assert_eq!(
+            step.prompt_digest.as_deref(),
+            Some("abc"),
+            "a `None` digest leaves the stored one alone (plan D15(b))"
+        );
+    }
+
+    /// The chat pair of plan D4: the columns `pending.rs` writes, with `running` in place of the
+    /// upload's terminal values, and `finish_chat_run` closing both rows.
+    #[tokio::test]
+    async fn a_chat_run_mints_the_two_rows_the_offline_upload_would() {
+        let store = MemStore::demo();
+        let before = store
+            .active_runs(&crate::model::Scope {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+            })
+            .await
+            .expect("active_runs must not fail");
+
+        let chat = ChatRunSpec::mint(
+            ids::PROJECT_HTUI,
+            ids::BOX,
+            ids::USER,
+            Some(ids::AGENT_CLAUDE),
+            Some("sonnet".to_owned()),
+        );
+        store.start_chat_run(&chat).await.expect("the mint lands");
+
+        let (run, step) = store.read(|state| {
+            (
+                state.runs.get(&chat.run_id).cloned().expect("the run row"),
+                state
+                    .steps
+                    .get(&chat.step_id)
+                    .cloned()
+                    .expect("the step row"),
+            )
+        });
+        assert_eq!(run.kind, crate::model::RunKind::Chat, "run.kind");
+        assert_eq!(run.mode, crate::model::RunMode::Manual, "run.mode");
+        assert_eq!(run.item_id, None, "run.item_id is NULL for a chat");
+        assert_eq!(run.status, RunStatus::Running, "run.status");
+        assert_eq!(run.finished_at, None, "run.finished_at");
+        assert_eq!(run.executing_box_id, Some(ids::BOX), "run.executing_box_id");
+        assert_eq!(step.position, 0, "run_step.position");
+        assert_eq!(step.attempt, 1, "run_step.attempt");
+        assert_eq!(step.fanout_index, 0, "run_step.fanout_index");
+        assert_eq!(step.phase_name, "chat", "run_step.phase_name");
+        assert_eq!(step.status, StepStatus::Running, "run_step.status");
+        assert_eq!(step.agent_id, Some(ids::AGENT_CLAUDE), "run_step.agent_id");
+
+        let scope = crate::model::Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        };
+        assert_eq!(
+            store.active_runs(&scope).await.expect("active_runs"),
+            before + 1,
+            "a running chat is an active run"
+        );
+
+        let at = Utc::now();
+        store
+            .finish_chat_run(chat.run_id, chat.step_id, RunStatus::Done, at)
+            .await
+            .expect("the close lands");
+        assert_eq!(
+            store.active_runs(&scope).await.expect("active_runs"),
+            before,
+            "closing it brings the count back (plan D4, assumption A1)"
+        );
+        let (run, step) = store.read(|state| {
+            (
+                state.runs.get(&chat.run_id).cloned().expect("the run row"),
+                state
+                    .steps
+                    .get(&chat.step_id)
+                    .cloned()
+                    .expect("the step row"),
+            )
+        });
+        assert_eq!(run.finished_at, Some(at), "run.finished_at");
+        assert_eq!(
+            step.status,
+            StepStatus::Done,
+            "run_step.status by the same name"
+        );
+        assert_eq!(step.finished_at, Some(at), "run_step.finished_at");
+    }
+
+    /// `agents()` joins this box's `agent_box`, and only this box's.
+    #[tokio::test]
+    async fn agents_join_this_box_only() {
+        let store = MemStore::demo();
+        let plain = store.agents().await.expect("agents must not fail");
+        assert_eq!(
+            plain
+                .iter()
+                .map(|row| row.agent.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agy", "claude"],
+            "ordered by agent.name"
+        );
+        assert!(
+            plain.iter().all(|row| row.on_box.is_none()),
+            "no fixture loads agent_box"
+        );
+
+        let now = Utc::now();
+        store
+            .upsert_agent_box(&AgentBox {
+                agent_id: ids::AGENT_CLAUDE,
+                box_id: ids::BOX,
+                enabled: true,
+                version: Some("1.2.3".to_owned()),
+                path: Some("claude".to_owned()),
+                probed_at: Some(now),
+                quota: None,
+                quota_at: None,
+                updated_at: now,
+            })
+            .await
+            .expect("the probe row lands");
+
+        let joined = store.agents().await.expect("agents must not fail");
+        let claude = joined
+            .iter()
+            .find(|row| row.agent.name == "claude")
+            .expect("claude is registered");
+        assert_eq!(
+            claude
+                .on_box
+                .as_ref()
+                .and_then(|row| row.version.as_deref()),
+            Some("1.2.3"),
+            "this box's agent_box is joined in"
+        );
+        assert!(
+            joined
+                .iter()
+                .find(|row| row.agent.name == "agy")
+                .expect("agy is registered")
+                .on_box
+                .is_none(),
+            "an agent with no row for this box stays None"
+        );
     }
 }

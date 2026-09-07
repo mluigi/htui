@@ -21,5 +21,9 @@ async fn demo_store_loads_the_fixture() {
         13,
         "the §G fixture holds thirteen items"
     );
-    assert_eq!(conformance::CASES.len(), 15, "B.9 names fifteen cases");
+    assert_eq!(
+        conformance::CASES.len(),
+        20,
+        "B.9's fifteen cases plus MOD-2's five store-seam cases (plan D3)"
+    );
 }

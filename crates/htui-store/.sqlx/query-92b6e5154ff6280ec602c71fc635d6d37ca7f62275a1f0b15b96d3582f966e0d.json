@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, started_by, queued_at, started_at, finished_at) VALUES ($1, $2, NULL, 'chat', 'manual', 'running', $3, $3, $4, $5, $5, NULL) ON CONFLICT (id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "92b6e5154ff6280ec602c71fc635d6d37ca7f62275a1f0b15b96d3582f966e0d"
+}

@@ -12,4 +12,4 @@ pub mod conformance;
 
 pub use error::{Result, StoreError};
 pub use mem::MemStore;
-pub use traits::{ReadStore, UpdateOutcome, WriteStore};
+pub use traits::{ReadStore, UpdateOutcome, WriteStore, chat_step_status, not_a_terminal_status};

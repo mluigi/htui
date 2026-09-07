@@ -91,7 +91,7 @@ pub mod run;
 pub mod scope;
 pub mod user;
 
-pub use agent::{Agent, AgentBox, Billing, Transport};
+pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
 pub use box_::{BoxInfo, BoxRow, BoxTool, OsFamily};
 pub use document::{Document, DocumentHead};
 pub use event::{EventKind, EventRole, SessionEvent};
@@ -110,8 +110,8 @@ pub use kind::{
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode};
 pub use note::Note;
 pub use run::{
-    GateOutcome, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunSummary, StepStatus,
+    ChatRunSpec, GateOutcome, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepSummary, RunSummary, StepStatus,
 };
 pub use scope::Scope;
 pub use user::{AppUser, CapabilityTag};

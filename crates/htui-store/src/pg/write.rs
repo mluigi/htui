@@ -1,17 +1,29 @@
-//! `impl WriteStore for PgStore` (blueprint C.9): the three write paths of ANA-9 §4.1 and §4.2.
+//! `impl WriteStore for PgStore` (blueprint C.9): the three write paths of ANA-9 §4.1 and §4.2,
+//! plus MOD-2's six (plan D3, `docs/ANA-4.md` §4.1).
 //!
 //! Each one is a **single statement**, so atomicity comes from Postgres rather than from an
 //! explicit transaction: a `WITH ... RETURNING` CTE either lands whole or not at all, and under
 //! `READ COMMITTED` the loser of a compare-and-set race blocks on the row lock, re-evaluates
-//! `version = $2` against the committed value and matches nothing (ANA-9 §11.3).
+//! `version = $2` against the committed value and matches nothing (ANA-9 §11.3). The two
+//! exceptions are MOD-2's chat-run pair, which writes one `run` and one `run_step` and therefore
+//! takes an explicit transaction, exactly as the pending-buffer upload does
+//! (`crate::cache::pending`).
 //!
 //! There is **no `DELETE FROM item`** in this file and none may be added: §4.1's "keys are never
 //! reused" is enforced by the absence of the path, and the conformance case `no_delete_path` is
-//! what pins it. Nor does any statement write `updated_at` - the `BEFORE UPDATE` trigger of the
-//! migration owns it, and `RETURNING` sees the trigger-modified row.
+//! what pins it. Nor does any statement write `updated_at` on an update path - the `BEFORE UPDATE`
+//! trigger of the migration owns it, and `RETURNING` sees the trigger-modified row.
 
-use htui_core::model::{Item, ItemId, ItemPatch, ItemRevision, NewItem, Status};
-use htui_core::store::{ReadStore as _, Result, StoreError, UpdateOutcome, WriteStore};
+use chrono::{DateTime, Utc};
+use htui_core::model::{
+    Agent, AgentBox, ChatRunSpec, Item, ItemId, ItemPatch, ItemRevision, NewItem, RunId, RunStatus,
+    SessionEvent, Status, StepId,
+};
+use htui_core::store::{
+    ReadStore as _, Result, StoreError, UpdateOutcome, WriteStore, chat_step_status,
+    not_a_terminal_status,
+};
+use serde_json::Value;
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
@@ -266,6 +278,289 @@ impl WriteStore for PgStore {
                 id: id.to_string(),
             })
         }
+    }
+
+    /// Appends session events in one `INSERT`, skipping the `(run_step_id, seq)` pairs already
+    /// stored (ANA-9 §4.3, plan D3).
+    ///
+    /// The batch is carried as **one** `jsonb` parameter and expanded by `jsonb_to_recordset`,
+    /// rather than as nine parallel arrays: `SessionEvent`'s serde form already *is* the row -
+    /// field names are the column names verbatim - which is the same fact the pending buffer's
+    /// line format rests on (`crate::cache::pending`), and nullable `text[]` / `jsonb[]` parameters
+    /// are avoided entirely.
+    ///
+    /// `rows_affected()` counts inserts only, because `ON CONFLICT ... DO NOTHING` reports the
+    /// skipped rows as unaffected: that is the "how many landed" answer §4.1 asks for, and it is
+    /// what makes a replayed offline buffer distinguishable from a fresh one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when an event names a `run_step` that does not exist (`23503`)
+    /// or a `kind` / `role` outside the §4.3 `CHECK` lists (`23514`). One statement, so a refused
+    /// batch writes none of its rows.
+    async fn append_events(&self, events: &[SessionEvent]) -> Result<usize> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let rows = serde_json::to_value(events).map_err(|err| {
+            StoreError::Backend(format!("session_event does not serialise: {err}"))
+        })?;
+
+        let inserted = sqlx::query!(
+            r#"
+            INSERT INTO session_event (run_step_id, seq, turn, kind, role, tool_call_id,
+                                       payload, raw, at)
+            SELECT e.run_step_id, e.seq, e.turn, e.kind, e.role, e.tool_call_id, e.payload,
+                   e.raw, e.at
+              FROM jsonb_to_recordset($1::jsonb)
+                   AS e(run_step_id uuid, seq int, turn int, kind text, role text,
+                        tool_call_id text, payload jsonb, raw jsonb, at timestamptz)
+            ON CONFLICT (run_step_id, seq) DO NOTHING
+            "#,
+            rows,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        Ok(usize::try_from(inserted).unwrap_or(0))
+    }
+
+    /// `run_step.usage` on every call, `run_step.prompt_digest` only when one is supplied
+    /// (`docs/ANA-4.md` §4.1, plan D15(b)).
+    ///
+    /// `COALESCE($3, prompt_digest)` is what makes `None` mean "leave it": the recorder computes
+    /// the digest once, at the prompt, and every later usage write for the same step passes `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when the step does not exist - zero rows updated is the only thing
+    /// this statement can mean.
+    async fn set_step_usage(
+        &self,
+        step: StepId,
+        usage: Value,
+        prompt_digest: Option<String>,
+    ) -> Result<()> {
+        let updated = sqlx::query!(
+            "UPDATE run_step \
+                SET usage = $2, prompt_digest = COALESCE($3, prompt_digest) \
+              WHERE id = $1",
+            step.as_uuid(),
+            usage,
+            prompt_digest.as_deref(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Inserts or updates one `agent` row, keyed by `agent.id` (`docs/ANA-4.md` §4.1, ANA-9 §5.7).
+    ///
+    /// `created_at` and `updated_at` are supplied on the insert and neither is in the `DO UPDATE`
+    /// `SET` list: the row keeps the creation stamp it was first written with, and the migration's
+    /// `BEFORE UPDATE` trigger owns `updated_at` on every later write.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when another id already holds the name (`23505` on
+    /// `agent_name_key`).
+    async fn upsert_agent(&self, agent: &Agent) -> Result<()> {
+        sqlx::query!(
+            "INSERT INTO agent (id, name, transport, launch, models, default_model, billing, \
+                                enabled, settings, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (id) DO UPDATE SET \
+                 name          = EXCLUDED.name, \
+                 transport     = EXCLUDED.transport, \
+                 launch        = EXCLUDED.launch, \
+                 models        = EXCLUDED.models, \
+                 default_model = EXCLUDED.default_model, \
+                 billing       = EXCLUDED.billing, \
+                 enabled       = EXCLUDED.enabled, \
+                 settings      = EXCLUDED.settings",
+            agent.id.as_uuid(),
+            agent.name,
+            agent.transport.as_str(),
+            &agent.launch,
+            &agent.models[..],
+            agent.default_model.as_deref(),
+            agent.billing.as_str(),
+            agent.enabled,
+            &agent.settings,
+            agent.created_at,
+            agent.updated_at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Inserts or updates one `agent_box` row on its composite primary key (`docs/ANA-4.md` §4.1,
+    /// ANA-9 §5.7).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when the agent or the box does not exist (`23503`).
+    async fn upsert_agent_box(&self, row: &AgentBox) -> Result<()> {
+        sqlx::query!(
+            "INSERT INTO agent_box (agent_id, box_id, enabled, version, path, probed_at, quota, \
+                                    quota_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (agent_id, box_id) DO UPDATE SET \
+                 enabled   = EXCLUDED.enabled, \
+                 version   = EXCLUDED.version, \
+                 path      = EXCLUDED.path, \
+                 probed_at = EXCLUDED.probed_at, \
+                 quota     = EXCLUDED.quota, \
+                 quota_at  = EXCLUDED.quota_at",
+            row.agent_id.as_uuid(),
+            row.box_id.as_uuid(),
+            row.enabled,
+            row.version.as_deref(),
+            row.path.as_deref(),
+            row.probed_at,
+            row.quota.as_ref(),
+            row.quota_at,
+            row.updated_at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both
+    /// `ON CONFLICT (id) DO NOTHING` (plan D4).
+    ///
+    /// The pair has the shape `crate::cache::pending`'s upload gives the same chat - `kind 'chat'`,
+    /// `mode 'manual'`, `item_id NULL`, `phase_name 'chat'`, `position 0`, `attempt 1`,
+    /// `fanout_index 0`, `executing_box_id` = the target box - and, because the ids are minted
+    /// client-side and both paths insert `ON CONFLICT (id) DO NOTHING`, an online start followed by
+    /// a replayed upload (or the reverse) converges on **one** such pair rather than colliding
+    /// (ANA-9 §4.3).
+    ///
+    /// It is the row count that converges, not every column: `DO NOTHING` hands the values to
+    /// whichever path lands first, and this one differs from the upload in four groups. `status` is
+    /// `running` rather than the upload's terminal `done` and `finished_at` is NULL, which
+    /// [`WriteStore::finish_chat_run`] closes; `agent_id` and `model` come from the spec, where the
+    /// upload leaves both NULL because the pending line format carries neither; and every stamp is
+    /// `chat.started_at`, where the upload derives them from the buffered events' `at`. An
+    /// offline-first chat therefore keeps a NULL `agent_id` after a later online start - see
+    /// [`ChatRunSpec`] for the whole asymmetry, and `tests/pg_criteria.rs`
+    /// (`chat_run_rows_converge_with_the_offline_mint`,
+    /// `an_offline_first_chat_keeps_the_uploaded_columns`) for both directions in SQL. Carrying
+    /// `agent_id` / `model` in the pending format is the offline session path's, MOD-2 milestone 4
+    /// (plan D16).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when the project, box, user or agent does not exist (`23503`).
+    async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        sqlx::query!(
+            "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
+                              executing_box_id, started_by, queued_at, started_at, finished_at) \
+             VALUES ($1, $2, NULL, 'chat', 'manual', 'running', $3, $3, $4, $5, $5, NULL) \
+             ON CONFLICT (id) DO NOTHING",
+            chat.run_id.as_uuid(),
+            chat.project_id.as_uuid(),
+            chat.target_box_id.as_uuid(),
+            chat.started_by.as_uuid(),
+            chat.started_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        sqlx::query!(
+            "INSERT INTO run_step (id, run_id, position, attempt, fanout_index, phase_name, \
+                                   agent_id, model, status, started_at, finished_at) \
+             VALUES ($1, $2, 0, 1, 0, 'chat', $3, $4, 'running', $5, NULL) \
+             ON CONFLICT (id) DO NOTHING",
+            chat.step_id.as_uuid(),
+            chat.run_id.as_uuid(),
+            chat.agent_id.map(htui_core::model::AgentId::as_uuid),
+            chat.model.as_deref(),
+            chat.started_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)
+    }
+
+    /// Closes both rows of a chat run in one transaction (plan D4, assumption A1).
+    ///
+    /// Without it `active_runs` would count a finished chat forever. The step takes the status of
+    /// the same name; the three values `RunStatus` and `StepStatus` share are the only ones
+    /// accepted, so a live status is refused before either row is touched rather than leaving the
+    /// pair half-closed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] for a non-terminal `status`; [`StoreError::NotFound`] when the
+    /// run or the step does not exist.
+    async fn finish_chat_run(
+        &self,
+        run: RunId,
+        step: StepId,
+        status: RunStatus,
+        finished_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let step_status = chat_step_status(status)
+            .ok_or_else(|| StoreError::Constraint(not_a_terminal_status(status)))?;
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let closed_run = sqlx::query!(
+            "UPDATE run SET status = $2, finished_at = $3 WHERE id = $1",
+            run.as_uuid(),
+            status.as_str(),
+            finished_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        if closed_run == 0 {
+            return Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            });
+        }
+
+        let closed_step = sqlx::query!(
+            "UPDATE run_step SET status = $2, finished_at = $3 WHERE id = $1",
+            step.as_uuid(),
+            step_status.as_str(),
+            finished_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        if closed_step == 0 {
+            return Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            });
+        }
+
+        tx.commit().await.map_err(map_sqlx)
     }
 }
 

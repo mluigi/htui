@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO session_event (run_step_id, seq, turn, kind, role, tool_call_id,\n                                       payload, raw, at)\n            SELECT e.run_step_id, e.seq, e.turn, e.kind, e.role, e.tool_call_id, e.payload,\n                   e.raw, e.at\n              FROM jsonb_to_recordset($1::jsonb)\n                   AS e(run_step_id uuid, seq int, turn int, kind text, role text,\n                        tool_call_id text, payload jsonb, raw jsonb, at timestamptz)\n            ON CONFLICT (run_step_id, seq) DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c42d3f5c7f7223150dd669d3266bbbeeab82135aa59d83827ec652a650ff5f96"
+}

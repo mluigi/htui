@@ -8,10 +8,14 @@
 
 use core::future::Future;
 
+use chrono::Utc;
+use serde_json::json;
+
 use crate::fixtures::ids;
 use crate::model::{
-    EventKind, EventRole, ItemFilter, ItemId, ItemKindId, ItemPatch, ItemSummary, LinkKind,
-    NewItem, ProjectId, Scope, Status, StepId, UserId,
+    Agent, AgentBox, AgentId, Billing, ChatRunSpec, EventKind, EventRole, ItemFilter, ItemId,
+    ItemKindId, ItemPatch, ItemSummary, LinkKind, NewItem, ProjectId, RunId, RunStatus, Scope,
+    SessionEvent, Status, StepId, Transport, UserId,
 };
 use crate::store::error::StoreError;
 use crate::store::traits::{UpdateOutcome, WriteStore};
@@ -33,6 +37,11 @@ pub const CASES: &[&str] = &[
     "notes_ordered_by_created_at",
     "events_ordered_by_seq",
     "nil_author_rejected",
+    "append_events_idempotent_and_ordered",
+    "set_step_usage_writes_usage_and_digest",
+    "start_chat_run_mints_chat_rows",
+    "upsert_agent_by_id_name_unique",
+    "upsert_agent_box_by_pk",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -41,7 +50,7 @@ pub const CASES: &[&str] = &[
 ///
 /// On the first failed assertion, naming the case, and on an unknown `name`. The return type is
 /// `()` and not `Result<(), String>` deliberately: the cases are written as `assert_eq!` chains
-/// that carry their own messages, and turning fifteen bodies into error-returning functions would
+/// that carry their own messages, and turning twenty bodies into error-returning functions would
 /// rewrite the whole suite to gain a string the panic already prints. MOD-6's `pg_conformance.rs`
 /// gets its per-case reporting from the loop, not from a `Result`.
 pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
@@ -61,6 +70,13 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "notes_ordered_by_created_at" => notes_ordered_by_created_at(store).await,
         "events_ordered_by_seq" => events_ordered_by_seq(store).await,
         "nil_author_rejected" => nil_author_rejected(store).await,
+        "append_events_idempotent_and_ordered" => append_events_idempotent_and_ordered(store).await,
+        "set_step_usage_writes_usage_and_digest" => {
+            set_step_usage_writes_usage_and_digest(store).await;
+        }
+        "start_chat_run_mints_chat_rows" => start_chat_run_mints_chat_rows(store).await,
+        "upsert_agent_by_id_name_unique" => upsert_agent_by_id_name_unique(store).await,
+        "upsert_agent_box_by_pk" => upsert_agent_box_by_pk(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -934,6 +950,348 @@ async fn nil_author_rejected<S: WriteStore>(store: &S) {
     );
 }
 
+// ------------------------------------------------------------------------------------------
+// MOD-2 (plan D3, D4, D15): the five write paths the driver records through.
+//
+// Every assertion below goes through [`WriteStore`] / [`ReadStore`] alone, which is what the
+// suite is for. Three of the six methods write columns no §6.1 read returns - `run_step.usage`,
+// `run_step.prompt_digest` and the `agent` / `agent_box` rows, which `agents()` answers *inherently*
+// rather than through `ReadStore` (D3) - so the cases pin the *rules* (idempotence, ordering,
+// uniqueness, refusals) and the per-backend tests pin the *column values*:
+// `crates/htui-store/tests/pg_criteria.rs` reads them back in SQL and `store::mem`'s own unit tests
+// read them out of `State`. D15(a) defers a `ReadStore`-shaped suite to milestone 9; adding a read
+// method here to make a case observable is exactly what that ruling forbids.
+// ------------------------------------------------------------------------------------------
+
+/// One `assistant_text` row for `step` at `seq`, in the §4.3 payload shape.
+fn chat_event(step: StepId, seq: i32) -> SessionEvent {
+    SessionEvent {
+        run_step_id: step,
+        seq,
+        turn: 0,
+        kind: EventKind::AssistantText,
+        role: EventRole::Agent,
+        tool_call_id: None,
+        payload: json!({ "text": format!("chunk {seq}") }),
+        raw: None,
+        at: Utc::now(),
+    }
+}
+
+/// A registry row with the given id and name; every other column is a legal §5.7 value.
+fn test_agent(id: AgentId, name: &str, model: &str) -> Agent {
+    let now = Utc::now();
+    Agent {
+        id,
+        name: name.to_owned(),
+        transport: Transport::Cli,
+        launch: json!({ "command": "tester", "args": [], "env": {} }),
+        models: vec![model.to_owned()],
+        default_model: Some(model.to_owned()),
+        billing: Billing::PerToken,
+        enabled: true,
+        settings: json!({ "cli": { "stream": "fake" } }),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// `append_events` is idempotent on `(run_step_id, seq)`, returns the number of rows it actually
+/// inserted, orders by `seq` on the way out, and refuses a step that does not exist (§4.3, D3).
+async fn append_events_idempotent_and_ordered<S: WriteStore>(store: &S) {
+    let step = ids::STEP_IMPL;
+    assert!(
+        store
+            .step_events(step)
+            .await
+            .expect("append_events_idempotent_and_ordered: read must not fail")
+            .is_none(),
+        "append_events_idempotent_and_ordered: the fixture caches no log for the implement step"
+    );
+
+    let first: Vec<SessionEvent> = (0..5).map(|seq| chat_event(step, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(&first)
+            .await
+            .expect("append_events_idempotent_and_ordered: the first append must land"),
+        5,
+        "append_events_idempotent_and_ordered: five new rows are five inserts"
+    );
+
+    // The same five plus two more: the primary key swallows the replay and only the new pair lands.
+    let mut again = first.clone();
+    again.push(chat_event(step, 5));
+    again.push(chat_event(step, 6));
+    assert_eq!(
+        store
+            .append_events(&again)
+            .await
+            .expect("append_events_idempotent_and_ordered: the replay must not fail"),
+        2,
+        "append_events_idempotent_and_ordered: a replayed row is skipped, not counted (§4.3)"
+    );
+
+    let events = store
+        .step_events(step)
+        .await
+        .expect("append_events_idempotent_and_ordered: read must not fail")
+        .expect("append_events_idempotent_and_ordered: the step now has a log");
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<i32>>(),
+        (0..7).collect::<Vec<i32>>(),
+        "append_events_idempotent_and_ordered: seq 0..7 in order, no duplicate"
+    );
+    assert_eq!(
+        events[0].payload,
+        json!({ "text": "chunk 0" }),
+        "append_events_idempotent_and_ordered: the replay did not overwrite the first write"
+    );
+
+    // A step that does not exist is a constraint violation, and the whole batch is refused: the
+    // statement is one `INSERT`, so a bad row cannot leave the good ones behind (§5.8 FK).
+    let orphan = StepId::new();
+    let mixed = vec![chat_event(step, 7), chat_event(orphan, 0)];
+    let refused = store.append_events(&mixed).await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "append_events_idempotent_and_ordered: an unknown run_step_id is refused, got {refused:?}"
+    );
+    let after = store
+        .step_events(step)
+        .await
+        .expect("append_events_idempotent_and_ordered: read must not fail")
+        .expect("append_events_idempotent_and_ordered: the step still has its log");
+    assert_eq!(
+        after.len(),
+        7,
+        "append_events_idempotent_and_ordered: a refused batch writes none of its rows"
+    );
+
+    assert_eq!(
+        store
+            .append_events(&[])
+            .await
+            .expect("append_events_idempotent_and_ordered: an empty batch must not fail"),
+        0,
+        "append_events_idempotent_and_ordered: an empty batch inserts nothing"
+    );
+}
+
+/// `set_step_usage` writes `run_step.usage` every time and `run_step.prompt_digest` only when the
+/// caller supplies one; an unknown step is [`StoreError::NotFound`] (ANA-4 §4.1, D15(b)).
+///
+/// Neither column is readable through §6.1, so the values are asserted per backend: `store::mem`'s
+/// `set_step_usage_writes_usage_every_time_and_the_digest_only_when_supplied` and
+/// `pg_criteria.rs::set_step_usage_keeps_the_digest_a_none_call_does_not_supply`, each of which
+/// makes both writes below and then reads the two columns back. The names are checked by
+/// `every_cross_referenced_test_name_exists` in this module's `tests`.
+async fn set_step_usage_writes_usage_and_digest<S: WriteStore>(store: &S) {
+    let step = ids::STEP_IMPL;
+    store
+        .set_step_usage(
+            step,
+            json!({ "input_tokens": 10, "output_tokens": 20 }),
+            Some("9f8e7d".to_owned()),
+        )
+        .await
+        .expect("set_step_usage_writes_usage_and_digest: the first write must land");
+    store
+        .set_step_usage(step, json!({ "input_tokens": 30 }), None)
+        .await
+        .expect("set_step_usage_writes_usage_and_digest: a digest-free write must land");
+
+    let unknown = store.set_step_usage(StepId::new(), json!({}), None).await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "set_step_usage_writes_usage_and_digest: an unknown step is NotFound, got {unknown:?}"
+    );
+}
+
+/// `start_chat_run` mints the `run` / `run_step` pair a free-standing chat records into, is a
+/// no-op on replay, leaves every item's run list alone, and `finish_chat_run` closes both rows
+/// (plan D4).
+///
+/// It is the same *pair of rows*, addressed by the same client-side ids, that
+/// `crates/htui-store/src/cache/pending.rs` inserts on upload - not the same column values: see
+/// [`ChatRunSpec`] for the asymmetry `ON CONFLICT (id) DO NOTHING` leaves between the two paths.
+async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
+    let before = store
+        .runs(ids::HTUI_FEAT_1)
+        .await
+        .expect("start_chat_run_mints_chat_rows: read must not fail");
+
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+
+    // Nothing to record into yet: the step row is what the event FK points at.
+    let early = store.append_events(&[chat_event(chat.step_id, 0)]).await;
+    assert!(
+        matches!(early, Err(StoreError::Constraint(_))),
+        "start_chat_run_mints_chat_rows: no step exists before the mint, got {early:?}"
+    );
+
+    store
+        .start_chat_run(&chat)
+        .await
+        .expect("start_chat_run_mints_chat_rows: the mint must land");
+    let rows: Vec<SessionEvent> = (0..3).map(|seq| chat_event(chat.step_id, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(&rows)
+            .await
+            .expect("start_chat_run_mints_chat_rows: the chat's events must land"),
+        3,
+        "start_chat_run_mints_chat_rows: the minted step accepts events"
+    );
+
+    // `ON CONFLICT (id) DO NOTHING` on both rows: a second start is a no-op, not a duplicate-key
+    // error and not a truncation of what the first one recorded (D4).
+    store
+        .start_chat_run(&chat)
+        .await
+        .expect("start_chat_run_mints_chat_rows: a replayed mint must not fail");
+    assert_eq!(
+        store
+            .step_events(chat.step_id)
+            .await
+            .expect("start_chat_run_mints_chat_rows: read must not fail")
+            .expect("start_chat_run_mints_chat_rows: the chat step has a log")
+            .len(),
+        3,
+        "start_chat_run_mints_chat_rows: the replayed mint left the recorded rows alone"
+    );
+
+    // `item_id` is NULL, so a chat never shows up under an item (§5.8).
+    assert_eq!(
+        store
+            .runs(ids::HTUI_FEAT_1)
+            .await
+            .expect("start_chat_run_mints_chat_rows: read must not fail"),
+        before,
+        "start_chat_run_mints_chat_rows: a chat run belongs to no item"
+    );
+
+    store
+        .finish_chat_run(chat.run_id, chat.step_id, RunStatus::Done, Utc::now())
+        .await
+        .expect("start_chat_run_mints_chat_rows: the close must land");
+
+    let missing = store
+        .finish_chat_run(RunId::new(), StepId::new(), RunStatus::Done, Utc::now())
+        .await;
+    assert!(
+        matches!(missing, Err(StoreError::NotFound { entity: "run", .. })),
+        "start_chat_run_mints_chat_rows: closing an unknown run is NotFound, got {missing:?}"
+    );
+
+    // `RunStatus` and `StepStatus` share only `done | failed | cancelled`; a live status has no
+    // `run_step` counterpart, so it is refused rather than half-written (D4).
+    let live = store
+        .finish_chat_run(chat.run_id, chat.step_id, RunStatus::Queued, Utc::now())
+        .await;
+    assert!(
+        matches!(live, Err(StoreError::Constraint(_))),
+        "start_chat_run_mints_chat_rows: a non-terminal finish status is refused, got {live:?}"
+    );
+}
+
+/// `upsert_agent` keys on `agent.id` and keeps `agent.name` unique (§5.7 `name TEXT NOT NULL
+/// UNIQUE`): a second write of the same id is an update, a second id under a taken name is refused.
+///
+/// The registry read is inherent, not a [`WriteStore`] or `ReadStore` method (MOD-2 plan D3), so
+/// this case can assert only that the second write is *accepted*. That the row was updated **in
+/// place** and kept its `created_at` is read back per backend, by
+/// `pg_criteria.rs::upsert_agent_updates_in_place_and_keeps_created_at`.
+async fn upsert_agent_by_id_name_unique<S: WriteStore>(store: &S) {
+    let id = AgentId::new();
+    store
+        .upsert_agent(&test_agent(id, "tester", "small"))
+        .await
+        .expect("upsert_agent_by_id_name_unique: the insert must land");
+
+    // Same id, different columns: an update in place, not a duplicate-key refusal.
+    store
+        .upsert_agent(&test_agent(id, "tester", "large"))
+        .await
+        .expect("upsert_agent_by_id_name_unique: the update must land");
+
+    let stolen = store
+        .upsert_agent(&test_agent(AgentId::new(), "tester", "small"))
+        .await;
+    assert!(
+        matches!(stolen, Err(StoreError::Constraint(_))),
+        "upsert_agent_by_id_name_unique: a second id under a taken name is refused, got {stolen:?}"
+    );
+
+    let seeded = store
+        .upsert_agent(&test_agent(AgentId::new(), "claude", "small"))
+        .await;
+    assert!(
+        matches!(seeded, Err(StoreError::Constraint(_))),
+        "upsert_agent_by_id_name_unique: the fixture's own names are taken too, got {seeded:?}"
+    );
+
+    // The refused writes left the row that did land alone: it still answers to its own id.
+    store
+        .upsert_agent(&test_agent(id, "tester", "largest"))
+        .await
+        .expect("upsert_agent_by_id_name_unique: the row is still updatable by its id");
+}
+
+/// `upsert_agent_box` keys on the composite primary key `(agent_id, box_id)` and needs both
+/// referents to exist (§5.7).
+async fn upsert_agent_box_by_pk<S: WriteStore>(store: &S) {
+    let row = AgentBox {
+        agent_id: ids::AGENT_CLAUDE,
+        box_id: ids::BOX,
+        enabled: true,
+        version: Some("1.2.3".to_owned()),
+        path: Some("/usr/bin/claude".to_owned()),
+        probed_at: Some(Utc::now()),
+        quota: Some(json!({ "remaining": 100 })),
+        quota_at: Some(Utc::now()),
+        updated_at: Utc::now(),
+    };
+    store
+        .upsert_agent_box(&row)
+        .await
+        .expect("upsert_agent_box_by_pk: the insert must land");
+
+    store
+        .upsert_agent_box(&AgentBox {
+            enabled: false,
+            version: Some("1.3.0".to_owned()),
+            quota: None,
+            quota_at: None,
+            ..row.clone()
+        })
+        .await
+        .expect("upsert_agent_box_by_pk: the same primary key is an update, not a duplicate");
+
+    let orphan = store
+        .upsert_agent_box(&AgentBox {
+            agent_id: AgentId::new(),
+            ..row
+        })
+        .await;
+    assert!(
+        matches!(orphan, Err(StoreError::Constraint(_))),
+        "upsert_agent_box_by_pk: a row for an unknown agent is refused, got {orphan:?}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, run_case};
@@ -945,6 +1303,86 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
+    }
+
+    /// Every test this module's doc comments cross-refer to exists under the name they give it.
+    ///
+    /// The suite delegates what §6.1 cannot read back - `run_step.usage`, `run_step.prompt_digest`,
+    /// the `agent` row - to *named* per-backend tests, so a name that never existed (or has since
+    /// been renamed) turns the delegation into a dead end that reads like coverage:
+    /// `set_step_usage_writes_usage_and_digest` shipped naming a `store::mem` test that was never
+    /// written. Two shapes of reference are checked, both taken from inline-code spans: a bare
+    /// snake_case name of four or more underscores (a test in this crate) and `<file>.rs::<name>`
+    /// (a test in the named file). A file the table below does not know is a failure, not a skip:
+    /// an unchecked reference is exactly the hole this test exists to close. Spans that are not
+    /// plain snake_case are skipped, which is what keeps this test's own message templates -
+    /// compiled into the source it scans - from being read as references.
+    #[test]
+    fn every_cross_referenced_test_name_exists() {
+        /// This module's own source: the text that was compiled, doc comments included.
+        const SELF: &str = include_str!("conformance.rs");
+        /// The sibling `MemStore` unit tests.
+        const MEM: &str = include_str!("mem.rs");
+
+        // Another crate's integration test binary, so it is read at run time rather than through
+        // `include_str!`: `htui-core` must not take a compile-time dependency on `htui-store`.
+        let pg_criteria = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../htui-store/tests/pg_criteria.rs"),
+        )
+        .expect("read crates/htui-store/tests/pg_criteria.rs");
+
+        // `(` for a plain fn, `<` for a generic one: every case in this module is `fn name<S: ..>`.
+        let defines = |source: &str, name: &str| {
+            source.contains(&format!("fn {name}(")) || source.contains(&format!("fn {name}<"))
+        };
+        let snake_case = |token: &str| {
+            token.starts_with(|c: char| c.is_ascii_lowercase())
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
+
+        let mut checked = 0_usize;
+        // Inline-code spans, line by line: a span never wraps a line in this file, and taking the
+        // odd fields of a line-local split keeps an unbalanced backtick from shifting every later
+        // token by one.
+        for token in SELF
+            .lines()
+            .flat_map(|line| line.split('`').skip(1).step_by(2))
+        {
+            if let Some((file, name)) = token.split_once(".rs::") {
+                if !snake_case(file) || !snake_case(name) {
+                    continue;
+                }
+                let source = match file {
+                    "conformance" => SELF,
+                    "mem" => MEM,
+                    "pg_criteria" => pg_criteria.as_str(),
+                    other => panic!(
+                        "`{other}.rs::{name}` points at a file this test cannot read: add it to \
+                         the table in `every_cross_referenced_test_name_exists`"
+                    ),
+                };
+                assert!(
+                    defines(source, name),
+                    "a doc comment names `{file}.rs::{name}`, but `{file}.rs` defines no such fn"
+                );
+                checked += 1;
+            } else if snake_case(token) && token.matches('_').count() >= 4 {
+                assert!(
+                    defines(SELF, token) || defines(MEM, token),
+                    "a doc comment names the test `{token}`, but neither `conformance.rs` nor \
+                     `mem.rs` defines a fn by that name"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 4,
+            "the scanner found only {checked} cross-references: the doc comments it reads have \
+             been reshaped and it is no longer checking them"
+        );
     }
 
     #[tokio::test]

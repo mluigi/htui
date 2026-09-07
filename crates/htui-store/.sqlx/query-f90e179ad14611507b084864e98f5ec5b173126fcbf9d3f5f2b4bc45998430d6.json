@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT COUNT(*) FROM run      WHERE id = $1)          AS \"runs!\",\n                  (SELECT COUNT(*) FROM run_step WHERE run_id = $1)      AS \"steps!\",\n                  (SELECT COUNT(*) FROM session_event WHERE run_step_id = $2) AS \"events!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "runs!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "steps!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "events!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "f90e179ad14611507b084864e98f5ec5b173126fcbf9d3f5f2b4bc45998430d6"
+}

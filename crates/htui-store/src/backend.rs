@@ -11,10 +11,10 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note, ProjectRef,
-    RunSummary, Scope, SessionEvent, StepId, WorkspaceSummary,
+    AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note,
+    ProjectRef, RunSummary, Scope, SessionEvent, StepId, WorkspaceSummary,
 };
-use htui_core::store::{MemStore, ReadStore, Result};
+use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 
 use crate::cache::CacheStore;
 use crate::pg::PgStore;
@@ -203,6 +203,32 @@ impl Backend {
             Self::Memory(store) => store.projects(scope).await,
             Self::Online { pg, .. } => pg.projects(scope).await,
             Self::Offline { cache, .. } => cache.projects(scope).await,
+        }
+    }
+
+    /// The agent registry, ordered by `agent.name`, each row carrying this box's `agent_box`
+    /// (MOD-2 plan D3, D14).
+    ///
+    /// The one inherent read with no [`Backend::Offline`] answer: `agent` and `agent_box` are
+    /// absent from the mirrored table list (`docs/ANA-9.md` §4.4), so there is nothing in the
+    /// mirror to read and the arm refuses instead of returning a misleading empty list. The refusal
+    /// is [`StoreError::Unreachable`] rather than
+    /// [`ReadOnly`](htui_core::store::StoreError::ReadOnly) because retrying once the server is
+    /// back **does** work; it is harmless to a backend that is already `Offline`, whose
+    /// `went_offline()` returns `false` and whose store worker therefore does not re-enter the
+    /// transition (assumption A9).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports, and [`StoreError::Unreachable`] on
+    /// [`Backend::Offline`].
+    pub async fn agents(&self) -> Result<Vec<AgentSummary>> {
+        match self {
+            Self::Memory(store) => store.agents().await,
+            Self::Online { pg, .. } => pg.agents().await,
+            Self::Offline { .. } => Err(StoreError::Unreachable(
+                "agent registry is not mirrored".to_owned(),
+            )),
         }
     }
 }

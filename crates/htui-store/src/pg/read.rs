@@ -11,9 +11,9 @@
 //! `Decode`.
 
 use htui_core::model::{
-    BoxInfo, DocumentHead, Item, ItemFilter, ItemId, LinkEdge, LinkGraph, LinkKind, Note,
-    ProjectId, ProjectRef, RunId, RunStepSummary, RunSummary, Scope, SessionEvent, StepId,
-    WorkspaceSummary,
+    Agent, AgentBox, AgentId, AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId,
+    LinkEdge, LinkGraph, LinkKind, Note, ProjectId, ProjectRef, RunId, RunStepSummary, RunSummary,
+    Scope, SessionEvent, StepId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use uuid::Uuid;
@@ -375,11 +375,15 @@ impl ReadStore for PgStore {
     }
 }
 
-/// The four reads `Backend` dispatches over that are not [`ReadStore`] methods.
+/// The reads `Backend` dispatches over that are not [`ReadStore`] methods.
 ///
 /// ANA-9 §6.1 is quoted verbatim in `htui_core::store::traits` and has none of them, so they stay
-/// inherent - the same four signatures `MemStore` and (from T3) `CacheStore` carry, which is what
+/// inherent - the same signatures `MemStore` and (from T3) `CacheStore` carry, which is what
 /// lets `Backend` dispatch over three arms without a fourth trait (MOD-1 blueprint B.7).
+///
+/// MOD-2's `agents` is inherent for a second reason on top of that one: `agent` and `agent_box`
+/// are absent from the mirrored table list (`docs/ANA-9.md` §4.4), so `CacheStore` could not
+/// answer it at all and `Backend::agents` refuses while offline (MOD-2 plan D3, D14).
 impl PgStore {
     /// Every workspace with its projects, ordered by name then by `workspace_project.position`.
     ///
@@ -519,6 +523,83 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)
+    }
+
+    /// The agent registry, ordered by `agent.name`, each row carrying **this box's** `agent_box`
+    /// when there is one (MOD-2 plan D3, `docs/ANA-4.md` §4.1).
+    ///
+    /// One statement with a `LEFT JOIN` narrowed to `this_box` in the join condition rather than
+    /// in the `WHERE`, so an agent that has never been probed here still gets a row with
+    /// `on_box: None` - which is what the Settings tab renders as "not probed".
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn agents(&self) -> Result<Vec<AgentSummary>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT a.id            AS "id: AgentId",
+                   a.name,
+                   a.transport     AS "transport: htui_core::model::Transport",
+                   a.launch,
+                   a.models,
+                   a.default_model,
+                   a.billing       AS "billing: htui_core::model::Billing",
+                   a.enabled,
+                   a.settings,
+                   a.created_at,
+                   a.updated_at,
+                   ab.box_id       AS "box_id?: htui_core::model::BoxId",
+                   ab.enabled      AS "box_enabled?",
+                   ab.version      AS "box_version?",
+                   ab.path         AS "box_path?",
+                   ab.probed_at    AS "box_probed_at?",
+                   ab.quota        AS "box_quota?",
+                   ab.quota_at     AS "box_quota_at?",
+                   ab.updated_at   AS "box_updated_at?"
+              FROM agent a
+              LEFT JOIN agent_box ab ON ab.agent_id = a.id AND ab.box_id = $1
+             ORDER BY a.name
+            "#,
+            self.this_box.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let agent = Agent {
+                    id: row.id,
+                    name: row.name,
+                    transport: row.transport,
+                    launch: row.launch,
+                    models: row.models,
+                    default_model: row.default_model,
+                    billing: row.billing,
+                    enabled: row.enabled,
+                    settings: row.settings,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                };
+                let on_box = match (row.box_id, row.box_enabled, row.box_updated_at) {
+                    (Some(box_id), Some(enabled), Some(updated_at)) => Some(AgentBox {
+                        agent_id: agent.id,
+                        box_id,
+                        enabled,
+                        version: row.box_version,
+                        path: row.box_path,
+                        probed_at: row.box_probed_at,
+                        quota: row.box_quota,
+                        quota_at: row.box_quota_at,
+                        updated_at,
+                    }),
+                    _ => None,
+                };
+                AgentSummary { agent, on_box }
+            })
+            .collect())
     }
 }
 

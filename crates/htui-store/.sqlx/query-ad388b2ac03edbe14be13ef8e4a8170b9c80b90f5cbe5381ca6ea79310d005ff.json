@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET usage = $2, prompt_digest = COALESCE($3, prompt_digest) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ad388b2ac03edbe14be13ef8e4a8170b9c80b90f5cbe5381ca6ea79310d005ff"
+}

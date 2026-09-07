@@ -1,6 +1,6 @@
 //! Runs, steps and their commits (`docs/ANA-9.md` §5.8).
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound as _, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -166,6 +166,84 @@ pub struct RunStep {
     pub finished_at: Option<DateTime<Utc>>,
     /// `run_step.updated_at`.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Fractional-second digits Postgres `timestamptz` keeps: microseconds (§5.8).
+const TIMESTAMPTZ_DIGITS: u16 = 6;
+
+/// The two rows a free-standing chat needs before its first event can be recorded: one `run`
+/// (`kind = 'chat'`, `item_id NULL`) and one `run_step` (`phase_name = 'chat'`, position 0)
+/// (MOD-2 plan D4).
+///
+/// The ids are minted client-side, so both paths address the *same* two rows: written straight to
+/// Postgres by [`WriteStore::start_chat_run`](crate::store::WriteStore::start_chat_run), or
+/// buffered to `<cache_dir>/pending/<project_id>.<run_id>.jsonl` and uploaded later
+/// (`docs/ANA-9.md` §4.3). Both inserts are `ON CONFLICT (id) DO NOTHING`, so however the two
+/// interleave the database ends up with one `run` and one `run_step` for the chat, never a second
+/// pair and never a duplicate-key error.
+///
+/// What converges is the row **count**, not every column. `DO NOTHING` means the path that lands
+/// first owns the values, and the two paths do not write the same ones. `start_chat_run` writes
+/// this spec's `agent_id` and `model`, `status = 'running'` on both rows (closed later by
+/// `finish_chat_run`) and [`ChatRunSpec::started_at`] as every stamp. The upload
+/// (`crates/htui-store/src/cache/pending.rs`) writes `agent_id` and `model` NULL - the pending line
+/// format carries neither - `status = 'done'`, and stamps taken from the buffered events' `at`.
+///
+/// So an online-first chat keeps the spec's agent and model when the upload replays over it, while
+/// an **offline-first** chat keeps a NULL `agent_id` even after a later online start. Carrying
+/// `agent_id` and `model` in the pending format belongs to the offline session path, MOD-2
+/// milestone 4 (plan D16); until it lands, that asymmetry is the guarantee. Both directions are
+/// pinned in `crates/htui-store/tests/pg_criteria.rs`, by
+/// `chat_run_rows_converge_with_the_offline_mint` and
+/// `an_offline_first_chat_keeps_the_uploaded_columns`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatRunSpec {
+    /// `run.id`.
+    pub run_id: RunId,
+    /// `run_step.id` of the chat's only step.
+    pub step_id: StepId,
+    /// `run.project_id`.
+    pub project_id: ProjectId,
+    /// `run.target_box_id`; version one executes only when it is local, so it is also
+    /// `run.executing_box_id`.
+    pub target_box_id: BoxId,
+    /// `run.started_by`.
+    pub started_by: UserId,
+    /// `run_step.agent_id`.
+    pub agent_id: Option<AgentId>,
+    /// `run_step.model`.
+    pub model: Option<String>,
+    /// `run.queued_at`, `run.started_at` and `run_step.started_at`: one clock reading for the whole
+    /// mint, so the two rows agree.
+    ///
+    /// Truncated to microseconds by [`ChatRunSpec::mint`], which is `timestamptz`'s resolution: an
+    /// untruncated Windows clock reading would come back from Postgres different from the one held
+    /// in memory, and the two backends would disagree about a column neither of them changed.
+    pub started_at: DateTime<Utc>,
+}
+
+impl ChatRunSpec {
+    /// Mints the ids and stamps the clock: the one place a chat's `run.id` and `run_step.id` come
+    /// from, online or offline (plan D4).
+    #[must_use]
+    pub fn mint(
+        project_id: ProjectId,
+        target_box_id: BoxId,
+        started_by: UserId,
+        agent_id: Option<AgentId>,
+        model: Option<String>,
+    ) -> Self {
+        Self {
+            run_id: RunId::new(),
+            step_id: StepId::new(),
+            project_id,
+            target_box_id,
+            started_by,
+            agent_id,
+            model,
+            started_at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+        }
+    }
 }
 
 /// A row of `run_step_commit` (§5.8): the before/after commit of one repository for one step.

@@ -14,11 +14,16 @@
 
 mod common;
 
+use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use htui_core::fixtures::ids;
-use htui_core::model::{ItemFilter, ItemId, ItemKindId, ItemPatch, NewItem, ProjectId, Status};
+use htui_core::model::{
+    Agent, AgentId, Billing, ItemFilter, ItemId, ItemKindId, ItemPatch, NewItem, ProjectId, Status,
+    StepId, Transport,
+};
 use htui_core::store::{ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_store::PgStore;
+use sqlx::Row as _;
 use sqlx::postgres::PgPool;
 
 /// The prefix the concurrency cases mint under: its own `item_kind`, so the counter starts empty
@@ -84,6 +89,31 @@ async fn revision_count(pool: &PgPool, item: ItemId) -> i64 {
     .fetch_one(pool)
     .await
     .expect("count item_revision")
+}
+
+/// `run_step.prompt_digest` and `run_step.usage`, the two columns §6.1 does not return.
+///
+/// Runtime-checked rather than `query!`, like the other reads this file adds: a new `query!` string
+/// would need a `cargo sqlx prepare` pass, and `.sqlx/` belongs to the crate, not to a test.
+async fn step_usage(pool: &PgPool, step: StepId) -> (Option<String>, Option<serde_json::Value>) {
+    let row = sqlx::query("SELECT prompt_digest, usage FROM run_step WHERE id = $1")
+        .bind(step.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("read run_step");
+    (row.get("prompt_digest"), row.get("usage"))
+}
+
+/// One registry row by id, out of the inherent `agents()` read (MOD-2 plan D3).
+async fn agent_row(store: &PgStore, id: AgentId) -> Agent {
+    store
+        .agents()
+        .await
+        .expect("agents must not fail")
+        .into_iter()
+        .find(|row| row.agent.id == id)
+        .expect("the agent is in the registry")
+        .agent
 }
 
 /// §11.2, first clause: two independent pools minting the same prefix produce consecutive numbers.
@@ -542,6 +572,562 @@ async fn five_thousand_events_replay_in_seq_order() {
     db.drop_db().await;
 }
 
+/// MOD-2 plan D4, **online first**: the two rows `start_chat_run` mints are the two rows the
+/// offline buffer's upload would address for the same chat, so the two paths converge on one pair
+/// instead of colliding.
+///
+/// The chat is started **online**, then the very same events are buffered to a `pending/` file and
+/// uploaded, which is the offline path arriving late. Both `ON CONFLICT (id) DO NOTHING` clauses
+/// must make that upload a no-op on the `run` and `run_step` rows and the
+/// `PRIMARY KEY (run_step_id, seq)` a no-op on every event, so the database still holds exactly one
+/// run, one step and one copy of each event, with the online path's column values untouched.
+///
+/// What converges is the row *count*; the columns belong to whichever path landed first. The
+/// mirror image - upload first, online start second - is
+/// [`an_offline_first_chat_keeps_the_uploaded_columns`].
+///
+/// The column values `store::conformance` cannot see - `run_step.usage`, `run_step.prompt_digest`
+/// and every column of the minted pair - are asserted here in SQL, because §6.1 returns none of
+/// them (plan D15(a)).
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_run_rows_converge_with_the_offline_mint() {
+    use htui_core::model::{ChatRunSpec, EventKind, EventRole, RunStatus, SessionEvent};
+    use htui_store::cache::pending::{append_pending, upload_pending};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let workspaces = db.store.workspaces().await.expect("workspaces");
+    let platform = workspaces
+        .iter()
+        .find(|ws| ws.workspace_id == ids::WORKSPACE_PLATFORM)
+        .expect("the Platform workspace");
+    let scope = htui_core::model::Scope::from_workspace(platform);
+    let before = db.store.active_runs(&scope).await.expect("active_runs");
+
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        db.store.this_box(),
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+    db.store
+        .start_chat_run(&chat)
+        .await
+        .expect("the chat mint must land");
+
+    let events: Vec<SessionEvent> = (0..3)
+        .map(|seq| SessionEvent {
+            run_step_id: chat.step_id,
+            seq,
+            turn: 0,
+            kind: EventKind::AssistantText,
+            role: EventRole::Agent,
+            tool_call_id: None,
+            payload: serde_json::json!({ "text": format!("chunk {seq}") }),
+            raw: None,
+            at: chat.started_at,
+        })
+        .collect();
+    assert_eq!(
+        db.store
+            .append_events(&events)
+            .await
+            .expect("the events must land"),
+        3,
+        "three new rows are three inserts"
+    );
+    db.store
+        .set_step_usage(
+            chat.step_id,
+            serde_json::json!({ "input_tokens": 11, "output_tokens": 22 }),
+            Some("d1ge57".to_owned()),
+        )
+        .await
+        .expect("the usage write must land");
+
+    // The `run` row, column by column, against `cache/pending.rs`'s upload values.
+    let run = sqlx::query!(
+        r#"SELECT item_id, kind, mode, status, target_box_id, executing_box_id,
+                  started_by, queued_at, started_at, finished_at
+             FROM run WHERE id = $1"#,
+        chat.run_id.as_uuid(),
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the run row exists");
+    assert_eq!(run.item_id, None, "run.item_id is NULL for a chat");
+    assert_eq!(run.kind, "chat", "run.kind");
+    assert_eq!(run.mode, "manual", "run.mode");
+    assert_eq!(run.status, "running", "run.status, not the upload's 'done'");
+    assert_eq!(run.finished_at, None, "run.finished_at is open");
+    assert_eq!(
+        run.executing_box_id,
+        Some(db.store.this_box().as_uuid()),
+        "a chat executes on the box it was started from"
+    );
+    assert_eq!(run.queued_at, chat.started_at, "run.queued_at");
+    assert_eq!(run.started_at, Some(chat.started_at), "run.started_at");
+    assert_eq!(run.started_by, ids::USER.as_uuid(), "run.started_by");
+
+    let step = sqlx::query!(
+        r#"SELECT run_id, position, attempt, fanout_index, phase_name, agent_id, model, status,
+                  prompt_digest, usage, started_at, finished_at
+             FROM run_step WHERE id = $1"#,
+        chat.step_id.as_uuid(),
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the run_step row exists");
+    assert_eq!(step.run_id, chat.run_id.as_uuid(), "run_step.run_id");
+    assert_eq!(step.position, 0, "run_step.position");
+    assert_eq!(step.attempt, 1, "run_step.attempt");
+    assert_eq!(step.fanout_index, 0, "run_step.fanout_index");
+    assert_eq!(step.phase_name, "chat", "run_step.phase_name");
+    assert_eq!(step.status, "running", "run_step.status");
+    assert_eq!(
+        step.agent_id,
+        Some(ids::AGENT_CLAUDE.as_uuid()),
+        "run_step.agent_id comes from the spec"
+    );
+    assert_eq!(step.model.as_deref(), Some("sonnet"), "run_step.model");
+    assert_eq!(step.finished_at, None, "run_step.finished_at is open");
+    assert_eq!(
+        step.prompt_digest.as_deref(),
+        Some("d1ge57"),
+        "set_step_usage wrote the digest"
+    );
+    assert_eq!(
+        step.usage,
+        Some(serde_json::json!({ "input_tokens": 11, "output_tokens": 22 })),
+        "set_step_usage wrote the usage"
+    );
+
+    assert_eq!(
+        db.store.active_runs(&scope).await.expect("active_runs"),
+        before + 1,
+        "a running chat counts towards the active-run indicator"
+    );
+
+    // The offline path arriving late for the same chat: same ids, same events, own file.
+    let root = tempfile::tempdir().expect("temp cache root");
+    append_pending(root.path(), chat.project_id, chat.run_id, &events)
+        .await
+        .expect("the buffer must be written");
+    assert_eq!(
+        upload_pending(&db.pool, root.path(), db.store.this_box(), ids::USER)
+            .await
+            .expect("the upload must not fail"),
+        1,
+        "one buffer file landed"
+    );
+
+    let counts = sqlx::query!(
+        r#"SELECT (SELECT COUNT(*) FROM run      WHERE id = $1)          AS "runs!",
+                  (SELECT COUNT(*) FROM run_step WHERE run_id = $1)      AS "steps!",
+                  (SELECT COUNT(*) FROM session_event WHERE run_step_id = $2) AS "events!""#,
+        chat.run_id.as_uuid(),
+        chat.step_id.as_uuid(),
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("count the converged rows");
+    assert_eq!(counts.runs, 1, "the upload inserted no second run (D4)");
+    assert_eq!(counts.steps, 1, "the upload inserted no second step (D4)");
+    assert_eq!(
+        counts.events, 3,
+        "the primary key swallowed the replayed events (§4.3)"
+    );
+
+    let after_upload = sqlx::query!(
+        "SELECT status, finished_at FROM run WHERE id = $1",
+        chat.run_id.as_uuid(),
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the run row survives");
+    assert_eq!(
+        after_upload.status, "running",
+        "`DO NOTHING` left the online row's status alone"
+    );
+    assert_eq!(
+        after_upload.finished_at, None,
+        "and did not close a run that is still open"
+    );
+
+    // Closing it is what takes it back out of the active count (assumption A1).
+    let closed_at = chat.started_at + chrono::TimeDelta::seconds(5);
+    db.store
+        .finish_chat_run(chat.run_id, chat.step_id, RunStatus::Done, closed_at)
+        .await
+        .expect("the close must land");
+    assert_eq!(
+        db.store.active_runs(&scope).await.expect("active_runs"),
+        before,
+        "a closed chat stops counting"
+    );
+    let done = sqlx::query!(
+        r#"SELECT r.status AS "run_status!", r.finished_at AS "run_finished?",
+                  s.status AS "step_status!", s.finished_at AS "step_finished?"
+             FROM run r JOIN run_step s ON s.id = $2 WHERE r.id = $1"#,
+        chat.run_id.as_uuid(),
+        chat.step_id.as_uuid(),
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("both rows exist");
+    assert_eq!(done.run_status, "done", "run.status");
+    assert_eq!(done.step_status, "done", "run_step.status by the same name");
+    assert_eq!(done.run_finished, Some(closed_at), "run.finished_at");
+    assert_eq!(done.step_finished, Some(closed_at), "run_step.finished_at");
+
+    db.drop_db().await;
+}
+
+/// The other half of MOD-2 plan D4's convergence claim: the same chat arriving **offline first**.
+///
+/// The buffer is uploaded while the chat is unknown to the server, and only then does the online
+/// `start_chat_run` replay. Row-count convergence still holds - one `run`, one `run_step`, one copy
+/// of each event - but every column is the *upload's*, because `ON CONFLICT (id) DO NOTHING` makes
+/// the second path a no-op: `status = 'done'`, timestamps taken from the events' `at`, and
+/// `agent_id` / `model` NULL, since the pending line format carries neither. So an offline-first
+/// chat keeps a NULL `agent_id` even though the spec that replayed over it names an agent. Carrying
+/// `agent_id` / `model` in the pending format belongs to the offline session path, MOD-2 milestone
+/// 4 (plan D16); until then this asymmetry is the honest guarantee, and this test is what pins it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offline_first_chat_keeps_the_uploaded_columns() {
+    use htui_core::model::{ChatRunSpec, EventKind, EventRole, SessionEvent};
+    use htui_store::cache::pending::{append_pending, upload_pending};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        db.store.this_box(),
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+    assert!(
+        chat.agent_id.is_some() && chat.model.is_some(),
+        "the spec that replays over the upload does name an agent and a model"
+    );
+
+    // Event stamps deliberately away from `chat.started_at`, so a row carrying the spec's stamp is
+    // distinguishable from one carrying the buffer's.
+    let first_at = chat.started_at + chrono::TimeDelta::seconds(30);
+    let events: Vec<SessionEvent> = (0..3)
+        .map(|seq| SessionEvent {
+            run_step_id: chat.step_id,
+            seq,
+            turn: 0,
+            kind: EventKind::AssistantText,
+            role: EventRole::Agent,
+            tool_call_id: None,
+            payload: serde_json::json!({ "text": format!("offline chunk {seq}") }),
+            raw: None,
+            at: first_at + chrono::TimeDelta::seconds(i64::from(seq)),
+        })
+        .collect();
+    let last_at = first_at + chrono::TimeDelta::seconds(2);
+
+    let root = tempfile::tempdir().expect("temp cache root");
+    append_pending(root.path(), chat.project_id, chat.run_id, &events)
+        .await
+        .expect("the buffer must be written");
+    assert_eq!(
+        upload_pending(&db.pool, root.path(), db.store.this_box(), ids::USER)
+            .await
+            .expect("the upload must not fail"),
+        1,
+        "one buffer file landed"
+    );
+
+    // The online path arriving late for the same chat: accepted, and a no-op on both rows.
+    db.store
+        .start_chat_run(&chat)
+        .await
+        .expect("a replayed online mint must not fail");
+
+    let counts = sqlx::query!(
+        r#"SELECT (SELECT COUNT(*) FROM run      WHERE id = $1)          AS "runs!",
+                  (SELECT COUNT(*) FROM run_step WHERE run_id = $1)      AS "steps!",
+                  (SELECT COUNT(*) FROM session_event WHERE run_step_id = $2) AS "events!""#,
+        chat.run_id.as_uuid(),
+        chat.step_id.as_uuid(),
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("count the converged rows");
+    assert_eq!(
+        counts.runs, 1,
+        "the online mint inserted no second run (D4)"
+    );
+    assert_eq!(
+        counts.steps, 1,
+        "the online mint inserted no second step (D4)"
+    );
+    assert_eq!(counts.events, 3, "and no event was duplicated (§4.3)");
+
+    let run =
+        sqlx::query("SELECT status, queued_at, started_at, finished_at FROM run WHERE id = $1")
+            .bind(chat.run_id.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("the run row exists");
+    assert_eq!(
+        run.get::<String, _>("status"),
+        "done",
+        "the upload's terminal status stands: the online mint's 'running' never landed"
+    );
+    assert_eq!(
+        run.get::<Option<DateTime<Utc>>, _>("finished_at"),
+        Some(last_at),
+        "run.finished_at is the last event's `at`, not NULL as the online mint writes"
+    );
+    assert_eq!(
+        run.get::<DateTime<Utc>, _>("queued_at"),
+        first_at,
+        "run.queued_at is the first event's `at`, not the spec's started_at"
+    );
+    assert_eq!(
+        run.get::<Option<DateTime<Utc>>, _>("started_at"),
+        Some(first_at),
+        "run.started_at likewise"
+    );
+
+    let step = sqlx::query(
+        "SELECT position, attempt, fanout_index, phase_name, agent_id, model, status, \
+                started_at, finished_at FROM run_step WHERE id = $1",
+    )
+    .bind(chat.step_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("the run_step row exists");
+    // What the two paths do agree on: the shape of the pair.
+    assert_eq!(step.get::<i32, _>("position"), 0, "run_step.position");
+    assert_eq!(step.get::<i32, _>("attempt"), 1, "run_step.attempt");
+    assert_eq!(
+        step.get::<i32, _>("fanout_index"),
+        0,
+        "run_step.fanout_index"
+    );
+    assert_eq!(
+        step.get::<String, _>("phase_name"),
+        "chat",
+        "run_step.phase_name"
+    );
+    // What they do not agree on, and what `DO NOTHING` therefore decides by arrival order.
+    assert_eq!(
+        step.get::<Option<uuid::Uuid>, _>("agent_id"),
+        None,
+        "run_step.agent_id stays NULL: the pending format carries no agent (MOD-2 milestone 4)"
+    );
+    assert_eq!(
+        step.get::<Option<String>, _>("model"),
+        None,
+        "run_step.model stays NULL for the same reason"
+    );
+    assert_eq!(
+        step.get::<String, _>("status"),
+        "done",
+        "run_step.status is the upload's"
+    );
+    assert_eq!(
+        step.get::<Option<DateTime<Utc>>, _>("started_at"),
+        Some(first_at),
+        "run_step.started_at is the step's first event"
+    );
+    assert_eq!(
+        step.get::<Option<DateTime<Utc>>, _>("finished_at"),
+        Some(last_at),
+        "run_step.finished_at is its last"
+    );
+
+    db.drop_db().await;
+}
+
+/// Plan D15(b) on Postgres: `set_step_usage` overwrites `run_step.usage` on every call, and
+/// `COALESCE($3, prompt_digest)` keeps the stored digest when the caller supplies `None`.
+///
+/// `store::conformance`'s `set_step_usage_writes_usage_and_digest` can assert only the `Ok` /
+/// `NotFound` shape, because §6.1 returns neither column (plan D15(a)); `store::mem`'s
+/// `set_step_usage_writes_usage_every_time_and_the_digest_only_when_supplied` is the memory half of
+/// the rule and this is the Postgres half. The third write is what keeps the second honest: the
+/// column *is* writable, so surviving a `None` is a property of `COALESCE`, not of a frozen column.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_step_usage_keeps_the_digest_a_none_call_does_not_supply() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let step = ids::STEP_IMPL;
+
+    db.store
+        .set_step_usage(
+            step,
+            serde_json::json!({ "input_tokens": 11 }),
+            Some("d1ge57".to_owned()),
+        )
+        .await
+        .expect("the first write must land");
+    assert_eq!(
+        step_usage(&db.pool, step).await,
+        (
+            Some("d1ge57".to_owned()),
+            Some(serde_json::json!({ "input_tokens": 11 })),
+        ),
+        "a write that supplies a digest stores both columns"
+    );
+
+    db.store
+        .set_step_usage(
+            step,
+            serde_json::json!({ "input_tokens": 30, "output_tokens": 40 }),
+            None,
+        )
+        .await
+        .expect("a digest-free write must land");
+    assert_eq!(
+        step_usage(&db.pool, step).await,
+        (
+            Some("d1ge57".to_owned()),
+            Some(serde_json::json!({ "input_tokens": 30, "output_tokens": 40 })),
+        ),
+        "`COALESCE($3, prompt_digest)`: usage is replaced, the digest a `None` does not supply \
+         survives (D15(b))"
+    );
+
+    db.store
+        .set_step_usage(step, serde_json::json!({}), Some("f00d".to_owned()))
+        .await
+        .expect("a second digest write must land");
+    assert_eq!(
+        step_usage(&db.pool, step).await,
+        (Some("f00d".to_owned()), Some(serde_json::json!({}))),
+        "a supplied digest does overwrite: the column is not merely immutable"
+    );
+
+    db.drop_db().await;
+}
+
+/// `PgStore::upsert_agent` read back through the inherent `agents()` (MOD-2 plan D3): a second
+/// write of the same `agent.id` updates the row **in place** - one row, the new column values - and
+/// `created_at` survives it, because the insert supplies it and the `DO UPDATE SET` list does not
+/// (§5.7). `updated_at` is the migration's `BEFORE UPDATE` trigger's, not the caller's.
+///
+/// `store::conformance`'s `upsert_agent_by_id_name_unique` can only assert that the second write is
+/// *accepted*: `upsert_agent` is a [`htui_core::store::WriteStore`] method while the registry read
+/// is inherent, so no conformance case can read the row back. This is that read-back.
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_agent_updates_in_place_and_keeps_created_at() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let id = AgentId::new();
+    let created: DateTime<Utc> = "2020-01-02T03:04:05.000006Z"
+        .parse()
+        .expect("a microsecond-precision literal, which is `timestamptz`'s resolution");
+    let inserted = Agent {
+        id,
+        name: "tester".to_owned(),
+        transport: Transport::Cli,
+        launch: serde_json::json!({ "argv": ["tester"], "env": {} }),
+        models: vec!["small".to_owned()],
+        default_model: Some("small".to_owned()),
+        billing: Billing::PerToken,
+        enabled: true,
+        settings: serde_json::json!({ "cli": { "stream": "fake" } }),
+        created_at: created,
+        updated_at: created,
+    };
+    db.store
+        .upsert_agent(&inserted)
+        .await
+        .expect("the insert must land");
+    assert_eq!(
+        agent_row(&db.store, id).await,
+        inserted,
+        "the insert round-trips column for column, both stamps included: the trigger is \
+         `BEFORE UPDATE` only"
+    );
+
+    // Postgres' own clock, so the trigger's stamp is compared against the server that set it.
+    let before: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the server clock");
+
+    let far_future: DateTime<Utc> = "2030-11-12T13:14:15.000016Z"
+        .parse()
+        .expect("a literal timestamp");
+    let updated = Agent {
+        name: "tester-renamed".to_owned(),
+        transport: Transport::Acp,
+        launch: serde_json::json!({ "argv": ["tester", "--acp"], "env": { "HTUI": "1" } }),
+        models: vec!["small".to_owned(), "large".to_owned()],
+        default_model: Some("large".to_owned()),
+        billing: Billing::Subscription,
+        enabled: false,
+        settings: serde_json::json!({ "acp": { "permission_modes": true } }),
+        created_at: far_future,
+        updated_at: far_future,
+        ..inserted.clone()
+    };
+    db.store
+        .upsert_agent(&updated)
+        .await
+        .expect("the update must land");
+
+    let registry = db.store.agents().await.expect("agents must not fail");
+    assert_eq!(
+        registry.iter().filter(|row| row.agent.id == id).count(),
+        1,
+        "the second write updated the row in place: `ON CONFLICT (id)`, no second row"
+    );
+    assert_eq!(
+        registry.len(),
+        3,
+        "the fixture's two agents plus this one, and the rename took no other row with it"
+    );
+    let after = registry
+        .into_iter()
+        .find(|row| row.agent.id == id)
+        .expect("the agent is in the registry");
+    assert!(
+        after.on_box.is_none(),
+        "upsert_agent writes no agent_box row"
+    );
+
+    assert_eq!(
+        after.agent,
+        Agent {
+            created_at: created,
+            updated_at: after.agent.updated_at,
+            ..updated.clone()
+        },
+        "every column in the `DO UPDATE SET` list took the second write's value, and `created_at` \
+         is still the insert's"
+    );
+    assert_ne!(
+        after.agent.created_at, far_future,
+        "`created_at` is not in the `SET` list, so the update could not move it"
+    );
+    assert!(
+        after.agent.updated_at > inserted.updated_at
+            && after.agent.updated_at >= before
+            && after.agent.updated_at != far_future,
+        "the `BEFORE UPDATE` trigger owns `updated_at`: it is this write's server clock, not the \
+         {far_future} the caller supplied, got {}",
+        after.agent.updated_at
+    );
+
+    db.drop_db().await;
+}
+
 /// The `PgStore` inherent reads T4's `Backend` dispatches over, against the fixture.
 #[tokio::test(flavor = "multi_thread")]
 async fn inherent_reads_answer_the_fixture() {
@@ -606,6 +1192,33 @@ async fn inherent_reads_answer_the_fixture() {
         info.box_id,
         db.store.this_box(),
         "box_info answers for this box"
+    );
+
+    // MOD-2 plan D3: the registry read is inherent too, because `agent` / `agent_box` are not
+    // mirrored. The demo loader inserts the two `agent` rows and no `agent_box` row at all, so
+    // every summary is unprobed on this box.
+    let agents = db.store.agents().await.expect("agents must not fail");
+    assert_eq!(
+        agents
+            .iter()
+            .map(|row| row.agent.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["agy", "claude"],
+        "the registry comes back ordered by agent.name"
+    );
+    assert!(
+        agents.iter().all(|row| row.on_box.is_none()),
+        "no agent_box row exists for this box, so every summary is unprobed"
+    );
+    assert_eq!(
+        agents
+            .iter()
+            .find(|row| row.agent.name == "claude")
+            .expect("claude is registered")
+            .agent
+            .id,
+        ids::AGENT_CLAUDE,
+        "the summary carries the whole agent row, id included"
     );
 
     // `ItemFilter::text` is a literal substring, not a pattern: `MemStore` uses `contains` and the

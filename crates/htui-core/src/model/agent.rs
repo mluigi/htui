@@ -76,3 +76,17 @@ pub struct AgentBox {
     /// `agent_box.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
+
+/// One registry row as the Settings tab lists it: the `agent` row plus **this box's**
+/// [`AgentBox`], when the box has one (MOD-2 plan D3 / D14).
+///
+/// The result row of the inherent `agents()` read, which is inherent rather than a
+/// [`ReadStore`](crate::store::ReadStore) method because neither `agent` nor `agent_box` is
+/// mirrored (`docs/ANA-9.md` §4.4): offline there is nothing to answer from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSummary {
+    /// The `agent` row.
+    pub agent: Agent,
+    /// This box's `agent_box` row; `None` until the box is probed (MOD-2 milestone 5).
+    pub on_box: Option<AgentBox>,
+}

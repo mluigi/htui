@@ -1,0 +1,244 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT a.id            AS \"id: AgentId\",\n                   a.name,\n                   a.transport     AS \"transport: htui_core::model::Transport\",\n                   a.launch,\n                   a.models,\n                   a.default_model,\n                   a.billing       AS \"billing: htui_core::model::Billing\",\n                   a.enabled,\n                   a.settings,\n                   a.created_at,\n                   a.updated_at,\n                   ab.box_id       AS \"box_id?: htui_core::model::BoxId\",\n                   ab.enabled      AS \"box_enabled?\",\n                   ab.version      AS \"box_version?\",\n                   ab.path         AS \"box_path?\",\n                   ab.probed_at    AS \"box_probed_at?\",\n                   ab.quota        AS \"box_quota?\",\n                   ab.quota_at     AS \"box_quota_at?\",\n                   ab.updated_at   AS \"box_updated_at?\"\n              FROM agent a\n              LEFT JOIN agent_box ab ON ab.agent_id = a.id AND ab.box_id = $1\n             ORDER BY a.name\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "transport: htui_core::model::Transport",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "transport"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "launch",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "launch"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "models",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "models"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "default_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "default_model"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "billing: htui_core::model::Billing",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "billing"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "settings",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "settings"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "box_id?: htui_core::model::BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "box_enabled?",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "box_version?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "box_path?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "path"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "box_probed_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "probed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "box_quota?",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "quota"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "box_quota_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "quota_at"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "box_updated_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "0b3a941d81d8af526e5197876896739cabe377527a3c4debf2f51ae9687dd655"
+}
