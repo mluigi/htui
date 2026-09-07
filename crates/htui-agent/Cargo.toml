@@ -1,0 +1,30 @@
+[package]
+name        = "htui-agent"
+version     = "0.1.0"
+description = "Agent driver seam, event model and recorder for htui"
+
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[features]
+default = []
+# Fakes and the transport-neutral conformance suite (plan MOD-2 D1); forwards to htui-core so a
+# case can build its assertions over `MemStore::demo()`.
+test-support = ["htui-core/test-support"]
+
+[dependencies]
+htui-core  = { workspace = true }
+chrono     = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+sha2       = { workspace = true }
+tokio      = { workspace = true, features = ["sync", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+
+[lints]
+workspace = true
