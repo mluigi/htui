@@ -64,6 +64,18 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   `DriverCaps`, `SessionSpec.cwd`/`extra_dirs`, `session_ref` and the `session_started` row
   (`docs/ANA-2.md` §4.2, §4.8), and `0002_agent_probe.sql` must land before ANA-2's `0003`. Not
   blocked (ANA-4 and ANA-5 concluded).
+  **Phase 1 landed (uncommitted, 2026-09-07):** PRD `.claude/prds/mod-2-agent-driver-chat.prd.md`
+  (nine milestones), plan `.claude/plans/mod-2-driver-seam-registry.plan.md` (milestones 1-2).
+  Milestone 1 complete: new `htui-agent` crate (ANA-4 §4.1 `AgentDriver`/`AgentSession` seam,
+  11-variant `DriverEvent`, recorder, `FakeDriver`, 13-case transport-neutral conformance suite),
+  `htui-core::scrub` (`Scrubber` + fail-closed `MinimalScrubber`, the ANA-7 stand-in MOD-10
+  replaces), six `WriteStore` methods incl. `start_chat_run`/`finish_chat_run`, inherent `agents()`
+  over three `Backend` arms, `append_pending`, `conformance::CASES` 15 -> 20. `rust-reviewer` ran
+  over the whole change set: 23 findings adjudicated by an adversarial pass (12 real, 5 partly,
+  6 refuted), 10 fixed with bite-proven tests, 7 deferred (see the plan's amendments). MSRV stays
+  1.85 until milestone 2, which raises it to **1.98** per maintainer override of ANA-4 §4.2's 1.88
+  (`sqlx-core 0.9.0` already floors at 1.94; plan X9). Milestone 2 (T7-T10: MSRV + dependency set,
+  launch/spawn, seed rows, `DriverFactory` + the `R-AGT-5` proof, Settings agent section) is next.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
@@ -159,6 +171,18 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   after the phrase, join across a line wrap), add a fixture with a two-ID and a wrapped case, keep
   the `WORKFLOW_ALLOW_SH_ON_WINDOWS=1` parity check green. Found during `/handoff-run next` on
   2026-09-04.
+- [ ] **TOOL-2 - Demo fixture's `app_user.name` collides with the OS username, failing every
+  Postgres test.** `R-NF-3`. `crates/htui-core/src/fixtures.rs:351` seeds `app_user.name =
+  "luigi"`, and `PgStore::seed_if_empty` derives the same name from the OS `USERNAME`, so
+  `common::demo_db()` hits `Constraint("app_user_name_key: duplicate key value violates unique
+  constraint \"app_user_name_key\"")` and every `--features demo` Postgres suite fails on any box
+  whose user is named `luigi`. Workaround in use: prefix `USERNAME=htui-ci`. This is worse than an
+  inconvenience - the failure mode is a *pass* elsewhere, because the suites' skip guard is an
+  early `return` that still reports `ok` when `HTUI_TEST_DATABASE_URL` is unset, so a run can look
+  green while proving nothing (it fooled MOD-2's reviewer, which reviewed the new SQL against
+  `.sqlx` alone and assumed the Postgres half passed). Fix: have `demo_db()` seed under a name the
+  fixture cannot hold (or parameterise the fixture's user), and consider making the skip path
+  distinguishable from a real pass. Found during MOD-2 milestone 1 on 2026-09-07; predates MOD-2.
 
 ## Summary
 
@@ -167,4 +191,4 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
 | ANA-N   | 2 (ANA-3 context tools, ANA-7 secrets)                                              |
 | MOD-N   | 13 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                         |
-| TOOL-N  | 1 (TOOL-1 next-item blocked-on regex)                                                     |
+| TOOL-N  | 2 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision)              |
