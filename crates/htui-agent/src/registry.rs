@@ -57,6 +57,20 @@ impl DriverFactory {
         Self::default()
     }
 
+    /// The production factory: one adapter, `acp` (milestone 3).
+    ///
+    /// Milestone 8 adds `cli/claude_stream_json` here and nothing else changes — that one line per
+    /// *transport*, and none per agent, is what `R-AGT-5` measures.
+    #[must_use]
+    pub fn with_acp() -> Self {
+        let mut factory = Self::new();
+        factory.register(
+            crate::acp::ADAPTER_ID,
+            Box::new(crate::acp::AcpAdapter) as Box<dyn TransportBuilder>,
+        );
+        factory
+    }
+
     /// Registers `builder` under an adapter id. A second registration under the same id replaces
     /// the first.
     pub fn register(&mut self, id: impl Into<String>, builder: Box<dyn TransportBuilder>) {

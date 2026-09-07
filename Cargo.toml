@@ -18,7 +18,7 @@ serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 thiserror          = "2"
 tokio              = { version = "1.53", features = ["rt-multi-thread", "sync", "macros", "time",
-                       "process", "io-util"] }
+                       "process", "io-util", "fs"] }
 ratatui            = "0.30.2"
 crossterm          = { version = "0.29", features = ["event-stream"] }
 futures            = "0.3"     # StreamExt for crossterm::event::EventStream (V4)

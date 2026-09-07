@@ -63,6 +63,7 @@ macro_rules! wire_enum {
     };
 }
 
+pub mod acp;
 #[cfg(feature = "test-support")]
 pub mod conformance;
 pub mod driver;
@@ -71,9 +72,14 @@ pub mod event;
 #[cfg(feature = "test-support")]
 pub mod fake;
 pub mod launch;
+pub mod permission;
 pub mod record;
 pub mod registry;
+pub mod tools;
 
+pub use acp::{
+    AcpAdapter, AcpDriver, AcpIo, AcpSession, SessionCommand, SessionOptions, Stamp, open_session,
+};
 pub use driver::{
     AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, McpServerSpec,
     PermissionAnswer, PermissionDefault, PermissionMatch, PermissionPolicy, PermissionRequestId,
@@ -91,8 +97,12 @@ pub use launch::{
     FallbackCommand, PlatformGlob, QuotaSettings, QuotaSource, ResolvedLaunch, SessionSettings,
     Spawned, ToolMap, ToolProbe, UsageScope, UsageSettings, VersionProbe, resolve, spawn,
 };
+pub use permission::{PolicyAnswer, PolicyStage, evaluate as evaluate_permission};
 pub use record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, RecorderSummary, pump};
 pub use registry::{DriverFactory, TransportBuilder, adapter_id, caps_for};
+// `resolve_tools`, not `resolve`: `launch::resolve` already owns that name at the crate root, and
+// the two are the halves of one step — find the tools, then substitute them into the row.
+pub use tools::{env_override_key, resolve as resolve_tools};
 
 #[cfg(feature = "test-support")]
 pub use conformance::{CASES, CaseHarness, Script, ScriptEvent, Turn, run_all, run_case};

@@ -21,7 +21,7 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
 sha2       = { workspace = true }
-tokio      = { workspace = true, features = ["sync", "rt", "time", "process", "io-util"] }
+tokio      = { workspace = true, features = ["sync", "rt", "time", "process", "io-util", "fs"] }
 tracing    = { workspace = true }
 # Milestone 2 (T7): the ACP config type the launch row builds, the process supervisor that owns
 # the child, `AsyncRead`/`AsyncWrite` -> `futures` adapters for the SDK's byte streams, and the
@@ -30,12 +30,18 @@ agent-client-protocol = { workspace = true }
 process-wrap          = { workspace = true }
 tokio-util            = { workspace = true }
 which                 = { workspace = true }
+# Milestone 3 (T11): `edit_proposal.diff` is a unified diff synthesized from the old/new full text
+# ACP carries (`docs/ANA-4.md` §4.3); this is the first consumer of the workspace declaration.
+similar               = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+# The tool resolver's `NodePackage` tier is tested against a `node_modules` tree in a throwaway
+# directory, never the developer's own (T11 step 2).
+tempfile = "3"
 
 [lints]
 workspace = true
