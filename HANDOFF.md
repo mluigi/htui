@@ -128,15 +128,41 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   --all-targets --all-features` is green (README "Checking the Windows-only code from Linux") and
   caught two defects a Linux build cannot see, but the job object's kill-on-close guarantee, the
   `.cmd` shim `CreateProcess` refuses and `CREATE_NO_WINDOW` are runtime facts that need a Windows
-  box; milestone 5 is the next to touch that path. Milestone 4 (durable history and replay: `StepEvents`, the offline buffer, read-only
-  replay) is next.
+  box; milestone 5 is the next to touch that path.
+  **Phase 4 landed (2026-09-08, `81d247b`):** durable history and replay, planned in
+  `.claude/plans/mod-2-durable-history-replay.plan.md` with the `code-architect` blueprint beside it.
+  An offline chat is no longer refused: the mirror gained the `agent` table (an unscoped full replace
+  beside `app_user`, `cache_migrations/0002_agent_mirror.sql` — **so MOD-4's cache migration is now
+  `0003_orchestration.sql`**, amending `docs/ANA-2.md` §9) plus `CacheStore::{agents, this_user,
+  user_named}`, and `Writer::Buffered` records through `append_pending` into
+  `<cache_dir>/pending/<project>.<run>.jsonl` while `is_writable()` still answers `false`.
+  `upload_pending` now fills `run_step.prompt_digest` and `run_step.usage`, the summing rule having
+  moved to `htui_core::model::UsageTotals` so the recorder and the uploader cannot drift (the
+  recorder also sums a masked `usage` payload now, which is what makes them agree in every row
+  shape). A live buffer is `<…>.jsonl.open` until `finish_chat_run` seals it, and a name collision
+  seals to `<project>.<run>.<n>.jsonl` rather than appending — every site tagged `[H-1]`, a
+  deviation from the plan's D35 kept cheap to revert, because the refresher would otherwise upload a
+  chat mid-flight and freeze its usage at a partial sum. Replay decodes rather than re-renders:
+  `htui_agent::replay` inverts the recorder's encode, `StoreRequest::StepEvents` answers with the
+  persisted rows (`None` = not on this box, distinct from "recorded nothing"), the Runs pane selects
+  a step with `J`/`K` and `Enter` emits `Action::Replay`, and the Chat tab's replay mode is
+  read-only structurally — `on_key_replay` takes no `Ctx`, so it cannot request. **§11 criterion 12
+  is proven end to end** (`crates/htui/tests/chat_offline.rs`): an offline chat driven by the
+  production runtime writes the buffer and `upload_pending` lands exactly those rows, second pass a
+  no-op. 410 tests green on **Linux** with Postgres live; `rust-reviewer` returned no CRITICAL and no
+  HIGH, and its two MEDIUM findings (both in the `[H-1]` sealing fallback) are fixed in this commit.
+  Known and accepted: an uploaded offline chat has `run_step.agent_id` and `model` NULL, the line
+  format carrying `session_event` columns only. Milestone 5 (autodiscovery and box probe, migration
+  `0002_agent_probe.sql`) is next.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
   close-out (summary document, status, commit hashes). The `run` and `close` actions of `R-TUI-2`.
   Design concluded in `docs/ANA-2.md` (ANA-2, `docs/decisions/ana/ana-2.md`): new crate
   `htui-orch` plus `crates/htui/src/run_worker.rs` (§8), migration `0003_orchestration.sql` and
-  `cache_migrations/0002_orchestration.sql` (§9; never applied before MOD-2's `0002`), sixteen
+  `cache_migrations/0003_orchestration.sql` (§9; never applied before MOD-2's `0002`. **The cache
+  migration is `0003`, not the `0002` ANA-2 §9 reserved:** MOD-2 milestone 4 spent
+  `cache_migrations/0002_agent_mirror.sql` mirroring the registry so an offline chat can start), sixteen
   `WriteStore` methods and the `PgStore` reads of §8 with conformance cases, `can_move_to` on the
   three status enums (§4.3), typed `BoxSettings`/`ProjectSettings` (§4.7), projection additions
   (§6.2), fixture corrections (`attempt` 1-based, non-NULL `graph_snapshot`, `review` in
