@@ -27,8 +27,8 @@ shape kept, three compare-and-set status tables, review loop at the same `positi
 `0003_orchestration.sql` (after `0002`), new crate `htui-orch`; MOD-4 waits on MOD-2 only. ANA-4
 concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`AgentSession`,
 `agent-client-protocol =2.1.0` (MSRV 1.88 in MOD-2), new `htui-agent` crate, migration
-`0002_agent_probe.sql`. Live coordinates: dev Postgres via `compose.yaml` (port 5433), tests need
-`HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5433/postgres`
+`0002_agent_probe.sql`. Live coordinates: dev Postgres via `compose.yaml` (port 5439), tests need
+`HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres`
 (`docs/decisions/mod/mod-6.md`). MOD-2, MOD-7, MOD-9, MOD-13, MOD-14 and MOD-15 can start now.
 
 ---
