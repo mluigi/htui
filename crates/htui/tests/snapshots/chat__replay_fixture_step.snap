@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/chat.rs
+expression: rendered
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Chat
+┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
+│replay · step …00000d01 · 7 rows · read-only · Esc leave                                          │
+│you  Plan the TUI scaffold against the store seam.                                                │
+│Reading the PRD and the ANA-9 seam.                                                               │
+│thought  The store trait is the only seam that matters here. (t to unfold)                        │
+│read Read docs/ANA-9.md  [ok]                                                                     │
+│plan                                                                                              │
+│  [completed] Split the crates                                                                    │
+│  [in_progress] Fix the store seam                                                                │
+│  [pending] Snapshot the shell                                                                    │
+│usage                                                                                             │
+│— turn ended (end_turn) —                                                                         │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│Esc leave replay · t thoughts · j/k scroll                                                        │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

@@ -12,7 +12,7 @@
 //! `TestDb` handle a database needs for its drop; `run_case` - which `run_all` itself is written
 //! over - lets the loop own the handle and report per case (blueprint E.2, MOD-1 watch item).
 
-mod common;
+use htui_store::testkit as common;
 
 /// The number of cases `crates/htui-core/tests/mem_store.rs` carries, asserted here too so a case
 /// added to `CASES` without a Postgres run fails loudly.

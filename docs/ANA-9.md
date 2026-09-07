@@ -303,12 +303,18 @@ CREATE TABLE cache_cursor (project_id TEXT NOT NULL, table_name TEXT NOT NULL,
                            PRIMARY KEY (project_id, table_name));
 ```
 
-Mirrored: `app_user`, `box` (own row only), `workspace`, `workspace_project`, `project`, `repo`,
-`item_kind`, `item`, `item_link`, `item_note`, `document`, `run`, `run_step`, `run_step_commit`,
-`session_event` (last N steps per project, `project.settings.cached_transcript_steps`, default 20).
-Not mirrored: revisions, skills, templates, graphs, agents, counters, settings, command queue -
-none is browsed offline. UUIDs are stored as `TEXT`, timestamps as `INTEGER` microseconds,
-`TEXT[]` as JSON arrays, `JSONB` as `TEXT`.
+Mirrored: `app_user`, `agent`, `box` (own row only), `workspace`, `workspace_project`, `project`,
+`repo`, `item_kind`, `item`, `item_link`, `item_note`, `document`, `run`, `run_step`,
+`run_step_commit`, `session_event` (last N steps per project,
+`project.settings.cached_transcript_steps`, default 20). Not mirrored: revisions, skills,
+templates, graphs, `agent_box`, counters, settings, command queue - none is browsed offline. UUIDs
+are stored as `TEXT`, timestamps as `INTEGER` microseconds, `TEXT[]` as JSON arrays, `JSONB` as
+`TEXT`.
+
+`agent` was in the "not mirrored" list until MOD-2 milestone 4 (plan D31) and moved because an
+offline chat has to resolve its driver from the registry row; it is unscoped, so it is a full
+replace with no `cache_cursor` row. `agent_box` stays out: it is a probe snapshot whose columns
+milestone 5 changes, and offline "which box" is always this box.
 
 **Cursor options.**
 

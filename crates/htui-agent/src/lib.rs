@@ -9,8 +9,13 @@
 //! 2) the transports live here, so the domain crate never grows a JSON-RPC SDK, a process
 //! supervisor or a diff library (ANA-4 §8).
 //!
+//! [`replay`] is [`record`] read backwards (plan D37): a persisted row back into the envelope the
+//! live path renders, so a reopened step and a running one reach the chat tab through one
+//! transcript. Milestone 4's offline sink is a `WriteStore` arm in `htui-store`, so this crate
+//! still records through the trait and knows nothing about where the rows land (plan D34).
+//!
 //! Deliberately absent in milestones 1–2 (plan D16): any wire protocol (`acp/`, `cli/`), probes,
-//! the chat tab, quota, and the offline session path. Each is a named seam, not a plan.
+//! the chat tab, and quota. Each is a named seam, not a plan.
 #![warn(missing_docs)]
 
 /// Declares a closed JSON vocabulary of `docs/ANA-4.md` §5 / §6 as an enum.
@@ -75,6 +80,7 @@ pub mod launch;
 pub mod permission;
 pub mod record;
 pub mod registry;
+pub mod replay;
 pub mod tools;
 
 pub use acp::{
@@ -100,6 +106,11 @@ pub use launch::{
 pub use permission::{PolicyAnswer, PolicyStage, evaluate as evaluate_permission};
 pub use record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, RecorderSummary, pump};
 pub use registry::{DriverFactory, TransportBuilder, adapter_id, caps_for};
+// `replay_envelopes`, not `envelopes`: at the crate root the bare name says nothing about which
+// direction it runs, and `record`'s counterpart is spelled out too.
+pub use replay::{
+    ReplayError, envelope_from_row, envelope_or_other, envelopes as replay_envelopes,
+};
 // `resolve_tools`, not `resolve`: `launch::resolve` already owns that name at the crate root, and
 // the two are the halves of one step — find the tools, then substitute them into the row.
 pub use tools::{env_override_key, resolve as resolve_tools};

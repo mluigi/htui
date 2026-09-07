@@ -5,7 +5,7 @@
 //! `HTUI_TEST_DATABASE_URL` unset each case prints `common::SKIP` and passes (plan D13); the two
 //! that need no server never skip.
 
-mod common;
+use htui_store::testkit as common;
 
 use std::time::Duration;
 

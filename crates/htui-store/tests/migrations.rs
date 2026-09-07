@@ -5,7 +5,7 @@
 //! prints `common::SKIP` and passes, so the suite is green on a box without a server (plan D13).
 //! `box_toml_mint_is_stable_across_two_reads` needs no server and therefore never skips.
 
-mod common;
+use htui_store::testkit as common;
 
 use std::collections::BTreeSet;
 

@@ -1,19 +1,32 @@
-//! Throwaway-database harness for the `htui-store` integration tests (blueprint E, plan D13).
+//! Throwaway-database harness and mirror seeder for the tests (MOD-6 blueprint E, plan D13).
 //!
 //! Every test that needs a server creates its own database, migrates it and drops it again, so the
 //! concurrency cases of ANA-9 §11 are deterministic and two test binaries never share state.
 //! `HTUI_TEST_DATABASE_URL` is a *maintenance* DSN whose user has `CREATEDB`; when it is unset the
 //! helpers print [`SKIP`] and answer `None`, which is what keeps `cargo test --workspace
 //! --all-features` green on a box without Postgres.
-#![allow(dead_code)] // each test binary compiles the whole module and uses a subset of it.
+//!
+//! This lived under `tests/common/` until MOD-2 milestone 4 (T21). It moved into the library
+//! behind the `test-support` feature because `docs/ANA-4.md` §11 criterion 12 is one sentence with
+//! two halves - a **driver** writes the offline buffer, a **server** lands it - and only the `htui`
+//! crate depends on both `htui-agent` and this one. A captured fixture as the joint between the
+//! two would not fail when the recorder and the uploader drift, which is the whole point of the
+//! criterion. `htui-core::fixtures` sets the precedent: test-only data, in the library, behind a
+//! feature.
 
 use std::path::PathBuf;
 use std::str::FromStr as _;
 
-use htui_store::{Identity, MigrationState, PgStore, identity};
+use htui_core::fixtures::DemoData;
+use htui_core::store::Result;
 use sqlx::postgres::{PgConnectOptions, PgPool};
 use sqlx::{AssertSqlSafe, Connection as _, PgConnection};
 use uuid::Uuid;
+
+use crate::cache::CacheStore;
+use crate::cache::read::ts_bind;
+use crate::error::map_sqlx;
+use crate::{Identity, MigrationState, PgStore, identity};
 
 /// The environment variable holding the maintenance DSN (plan D13).
 pub const ENV_URL: &str = "HTUI_TEST_DATABASE_URL";
@@ -118,7 +131,6 @@ pub async fn fresh_db() -> Option<TestDb> {
 /// fixture's user while the row already exists under the seeded one, and collide on `box_pkey`.
 /// The seeded pair therefore goes, leaving the fixture's world as the only one. `db.store` needs
 /// no reconnect: `load_demo` repoints `this_box` / `this_user` at the fixture itself.
-#[cfg(feature = "demo")]
 pub async fn demo_db() -> Option<TestDb> {
     let mut db = fresh_db().await?;
     let seeded = db.store.this_user();
@@ -220,6 +232,172 @@ pub fn with_database(dsn: &str, database: &str) -> String {
 #[must_use]
 pub fn parse_dsn(dsn: &str) -> PgConnectOptions {
     PgConnectOptions::from_str(dsn).expect("a parseable DSN")
+}
+
+/// Writes the six unscoped tables of a [`DemoData`] straight into a mirror, with no server.
+///
+/// The refresher is the only *production* writer of `cache.sqlite` and it needs a `PgPool`; a test
+/// that wants an offline box - one that has synced once and is now alone with its mirror - has no
+/// server to sync from. This is that box's history, written with the mirror's own encodings
+/// (microsecond stamps, JSON text, `0`/`1` booleans) so a test never hand-rolls a SQLite row and
+/// cannot drift from `cache::refresh`'s bind lists by accident.
+///
+/// Six tables, and deliberately only six: `app_user`, the own `box` row, `workspace`,
+/// `workspace_project`, `project` and `agent` - everything an offline chat resolves before it can
+/// start (`docs/ANA-4.md` §4.1: the box, the user, the registry row, the project it belongs to).
+/// Items, runs and events are the cursor-driven tables and no offline *write* path needs them.
+///
+/// Only `demo.this_box`'s row is written, because §4.4 says the mirror holds the own `box` row and
+/// no other.
+///
+/// # Errors
+///
+/// Whatever the driver reports, through [`map_sqlx`], and [`htui_core::store::StoreError::Backend`]
+/// when a JSON column cannot be serialised.
+pub async fn seed_mirror(cache: &CacheStore, demo: &DemoData) -> Result<()> {
+    let mut tx = cache.pool().begin().await.map_err(map_sqlx)?;
+
+    for user in &demo.users {
+        sqlx::query(
+            "INSERT INTO app_user (id, name, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user.id.to_string())
+        .bind(&user.name)
+        .bind(user.email.as_deref())
+        .bind(ts_bind(user.created_at))
+        .bind(ts_bind(user.updated_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    }
+
+    for row in demo
+        .boxes
+        .iter()
+        .filter(|row| demo.this_box.is_some_and(|id| id == row.id))
+    {
+        sqlx::query(
+            "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, cpu, ram_mb, \
+                              gpu_present, gpu_vendor, htui_version, probed_tags, declared_tags, \
+                              quirks, settings, registered_at, last_seen_at, last_probed_at, \
+                              updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(row.id.to_string())
+        .bind(row.user_id.to_string())
+        .bind(&row.hostname)
+        .bind(row.os_family.as_str())
+        .bind(&row.os_version)
+        .bind(&row.arch)
+        .bind(&row.cpu)
+        .bind(row.ram_mb.map(i64::from))
+        .bind(i64::from(row.gpu_present))
+        .bind(row.gpu_vendor.as_deref())
+        .bind(&row.htui_version)
+        .bind(strings(&row.probed_tags)?)
+        .bind(strings(&row.declared_tags)?)
+        .bind(&row.quirks)
+        .bind(json(&row.settings)?)
+        .bind(ts_bind(row.registered_at))
+        .bind(ts_bind(row.last_seen_at))
+        .bind(row.last_probed_at.map(ts_bind))
+        .bind(ts_bind(row.updated_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    }
+
+    for workspace in &demo.workspaces {
+        sqlx::query(
+            "INSERT INTO workspace (id, slug, name, description, created_by, created_at, \
+                                    updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(workspace.id.to_string())
+        .bind(&workspace.slug)
+        .bind(&workspace.name)
+        .bind(&workspace.description)
+        .bind(workspace.created_by.to_string())
+        .bind(ts_bind(workspace.created_at))
+        .bind(ts_bind(workspace.updated_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    }
+
+    for link in &demo.workspace_projects {
+        sqlx::query(
+            "INSERT INTO workspace_project (workspace_id, project_id, position) VALUES (?, ?, ?)",
+        )
+        .bind(link.workspace_id.to_string())
+        .bind(link.project_id.to_string())
+        .bind(i64::from(link.position))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    }
+
+    for project in &demo.projects {
+        sqlx::query(
+            "INSERT INTO project (id, slug, name, description, secret_provider, secret_scope, \
+                                  settings, created_by, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(project.id.to_string())
+        .bind(&project.slug)
+        .bind(&project.name)
+        .bind(&project.description)
+        .bind(project.secret_provider.as_deref())
+        .bind(project.secret_scope.as_deref())
+        .bind(json(&project.settings)?)
+        .bind(project.created_by.to_string())
+        .bind(ts_bind(project.created_at))
+        .bind(ts_bind(project.updated_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    }
+
+    for agent in &demo.agents {
+        sqlx::query(
+            "INSERT INTO agent (id, name, transport, launch, models, default_model, billing, \
+                                enabled, settings, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(agent.id.to_string())
+        .bind(&agent.name)
+        .bind(agent.transport.as_str())
+        .bind(json(&agent.launch)?)
+        .bind(strings(&agent.models)?)
+        .bind(agent.default_model.as_deref())
+        .bind(agent.billing.as_str())
+        .bind(i64::from(agent.enabled))
+        .bind(json(&agent.settings)?)
+        .bind(ts_bind(agent.created_at))
+        .bind(ts_bind(agent.updated_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    }
+
+    tx.commit().await.map_err(map_sqlx)
+}
+
+/// A `JSONB` column as the mirror's TEXT, the `cache::refresh` encoding.
+fn json(value: &serde_json::Value) -> Result<String> {
+    serde_json::to_string(value).map_err(|e| {
+        htui_core::store::StoreError::Backend(format!(
+            "testkit: cannot serialise a JSON column: {e}"
+        ))
+    })
+}
+
+/// A `TEXT[]` column as the mirror's JSON array, the `cache::refresh` encoding.
+fn strings(values: &[String]) -> Result<String> {
+    serde_json::to_string(values).map_err(|e| {
+        htui_core::store::StoreError::Backend(format!(
+            "testkit: cannot serialise a text[] column: {e}"
+        ))
+    })
 }
 
 /// `COUNT(*)` of one table, for the per-table round-trip assertions.

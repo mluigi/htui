@@ -12,7 +12,7 @@
 //! prints `common::SKIP` and passes (plan D13).
 #![cfg(feature = "demo")]
 
-mod common;
+use htui_store::testkit as common;
 
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
@@ -593,7 +593,7 @@ async fn five_thousand_events_replay_in_seq_order() {
 #[tokio::test(flavor = "multi_thread")]
 async fn chat_run_rows_converge_with_the_offline_mint() {
     use htui_core::model::{ChatRunSpec, EventKind, EventRole, RunStatus, SessionEvent};
-    use htui_store::cache::pending::{append_pending, upload_pending};
+    use htui_store::cache::pending::{append_pending, seal_pending, upload_pending};
 
     let Some(db) = common::demo_db().await else {
         return;
@@ -716,6 +716,9 @@ async fn chat_run_rows_converge_with_the_offline_mint() {
     append_pending(root.path(), chat.project_id, chat.run_id, &events)
         .await
         .expect("the buffer must be written");
+    seal_pending(root.path(), chat.project_id, chat.run_id)
+        .await
+        .expect("the chat ends, so its buffer is sealed (H-1)");
     assert_eq!(
         upload_pending(&db.pool, root.path(), db.store.this_box(), ids::USER)
             .await
@@ -799,7 +802,7 @@ async fn chat_run_rows_converge_with_the_offline_mint() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_offline_first_chat_keeps_the_uploaded_columns() {
     use htui_core::model::{ChatRunSpec, EventKind, EventRole, SessionEvent};
-    use htui_store::cache::pending::{append_pending, upload_pending};
+    use htui_store::cache::pending::{append_pending, seal_pending, upload_pending};
 
     let Some(db) = common::demo_db().await else {
         return;
@@ -839,6 +842,9 @@ async fn an_offline_first_chat_keeps_the_uploaded_columns() {
     append_pending(root.path(), chat.project_id, chat.run_id, &events)
         .await
         .expect("the buffer must be written");
+    seal_pending(root.path(), chat.project_id, chat.run_id)
+        .await
+        .expect("the chat ends, so its buffer is sealed (H-1)");
     assert_eq!(
         upload_pending(&db.pool, root.path(), db.store.this_box(), ids::USER)
             .await
@@ -947,6 +953,248 @@ async fn an_offline_first_chat_keeps_the_uploaded_columns() {
         Some(last_at),
         "run_step.finished_at is its last"
     );
+
+    db.drop_db().await;
+}
+
+/// §11 criteria 3 and 7 for a chat that happened **offline** (MOD-2 plan D36).
+///
+/// The recorder writes `run_step.prompt_digest` and `run_step.usage` through `set_step_usage`
+/// while a chat is online; offline it cannot, because the buffer's line format holds
+/// `session_event` columns only. So the uploader derives both from the rows it is uploading: the
+/// digest from the `prompt` row's payload, the usage from `UsageTotals::from_rows` - the same
+/// summing rule the recorder ran, which is what makes an uploaded step indistinguishable from one
+/// recorded online rather than one with an empty `usage`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uploaded_offline_chat_carries_its_digest_and_usage() {
+    use htui_core::model::{ChatRunSpec, EventKind, EventRole, SessionEvent, UsageTotals};
+    use htui_store::cache::pending::{append_pending, seal_pending, upload_pending};
+
+    /// The `sha256` shape milestone 9 writes; the uploader copies it verbatim.
+    const DIGEST: &str = "9f2c1b7a4e5d6038c1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708";
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        db.store.this_box(),
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        None,
+    );
+    let at = |seq: i64| chat.started_at + chrono::TimeDelta::seconds(seq);
+    let row =
+        |seq: i32, kind: EventKind, role: EventRole, payload: serde_json::Value| SessionEvent {
+            run_step_id: chat.step_id,
+            seq,
+            turn: 0,
+            kind,
+            role,
+            tool_call_id: None,
+            payload,
+            raw: None,
+            at: at(i64::from(seq)),
+        };
+
+    let events = vec![
+        row(
+            0,
+            EventKind::Prompt,
+            EventRole::Htui,
+            serde_json::json!({ "text": "offline?", "sections": [], "digest": DIGEST }),
+        ),
+        row(
+            1,
+            EventKind::AssistantText,
+            EventRole::Agent,
+            serde_json::json!({ "text": "yes" }),
+        ),
+        // Deltas, not cumulative totals: "take the last row" would answer 3 input tokens.
+        row(
+            2,
+            EventKind::Usage,
+            EventRole::Agent,
+            serde_json::json!({ "input_tokens": 10, "output_tokens": 4, "cost_micros": 100 }),
+        ),
+        row(
+            3,
+            EventKind::AssistantText,
+            EventRole::Agent,
+            serde_json::json!({ "text": "and buffered" }),
+        ),
+        row(
+            4,
+            EventKind::Usage,
+            EventRole::Agent,
+            serde_json::json!({ "input_tokens": 20, "cache_read_tokens": 7, "cost_micros": 250 }),
+        ),
+        row(
+            5,
+            EventKind::Usage,
+            EventRole::Agent,
+            serde_json::json!({ "input_tokens": 3, "output_tokens": 1, "cost_micros": 1 }),
+        ),
+        row(
+            6,
+            EventKind::Done,
+            EventRole::Agent,
+            serde_json::json!({ "stop_reason": "end_turn" }),
+        ),
+    ];
+    let expected_usage = UsageTotals::from_rows(&events).to_value();
+    assert_eq!(
+        expected_usage,
+        serde_json::json!({
+            "input_tokens": 33,
+            "output_tokens": 5,
+            "cache_read_tokens": 7,
+            "cache_write_tokens": serde_json::Value::Null,
+            "cost_micros": 351,
+        }),
+        "the fixture is the sum of the deltas, spelled out so the test cannot agree with a bug"
+    );
+
+    let root = tempfile::tempdir().expect("temp cache root");
+    append_pending(root.path(), chat.project_id, chat.run_id, &events)
+        .await
+        .expect("the buffer must be written");
+    seal_pending(root.path(), chat.project_id, chat.run_id)
+        .await
+        .expect("the chat ends (H-1)");
+    assert_eq!(
+        upload_pending(&db.pool, root.path(), db.store.this_box(), ids::USER)
+            .await
+            .expect("the upload must not fail"),
+        1,
+    );
+
+    assert_eq!(
+        step_usage(&db.pool, chat.step_id).await,
+        (Some(DIGEST.to_owned()), Some(expected_usage.clone())),
+        "both columns are the ones the online recorder would have written",
+    );
+
+    // The pass after the upload: the file is gone, so there is nothing to find and nothing to
+    // change - the return value is a count of files that landed, not of buffers that ever existed.
+    assert_eq!(
+        upload_pending(&db.pool, root.path(), db.store.this_box(), ids::USER)
+            .await
+            .expect("a pass with no buffer is not an error"),
+        0,
+    );
+
+    // The same buffer arriving twice - a crash between the commit and the delete - is the
+    // `ON CONFLICT (id) DO NOTHING` case: the file goes, and neither column moves.
+    append_pending(root.path(), chat.project_id, chat.run_id, &events)
+        .await
+        .expect("the buffer is written again");
+    seal_pending(root.path(), chat.project_id, chat.run_id)
+        .await
+        .expect("and sealed again");
+    let events_before = common::count(&db.pool, "session_event").await;
+    assert_eq!(
+        upload_pending(&db.pool, root.path(), db.store.this_box(), ids::USER)
+            .await
+            .expect("the second upload"),
+        1,
+    );
+    assert_eq!(
+        common::count(&db.pool, "session_event").await,
+        events_before,
+        "no event was duplicated",
+    );
+    assert_eq!(
+        step_usage(&db.pool, chat.step_id).await,
+        (Some(DIGEST.to_owned()), Some(expected_usage)),
+        "and the step's two columns are exactly what the first pass wrote",
+    );
+
+    db.drop_db().await;
+}
+
+/// A buffer holding the same `(run_step_id, seq)` line twice loads it **once** (M-1).
+///
+/// `session_event` is protected by `ON CONFLICT (run_step_id, seq) DO NOTHING`, so a duplicated
+/// line never becomes a duplicated row - but `run_step.usage` is summed from the parsed lines
+/// before any of that, and a `usage` row counted twice lands a step whose totals are double the
+/// conversation's (criterion 7). The loader therefore drops a repeat itself, keeping the first
+/// occurrence, so it is robust to a duplicate however it got onto the disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_duplicated_line_in_a_buffer_is_counted_once() {
+    use htui_core::model::{ChatRunSpec, EventKind, EventRole, SessionEvent, UsageTotals};
+    use htui_store::cache::pending::{append_pending, seal_pending, upload_pending};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        db.store.this_box(),
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        None,
+    );
+    let row =
+        |seq: i32, kind: EventKind, role: EventRole, payload: serde_json::Value| SessionEvent {
+            run_step_id: chat.step_id,
+            seq,
+            turn: 0,
+            kind,
+            role,
+            tool_call_id: None,
+            payload,
+            raw: None,
+            at: chat.started_at + chrono::TimeDelta::seconds(i64::from(seq)),
+        };
+    let events = vec![
+        row(
+            0,
+            EventKind::Prompt,
+            EventRole::Htui,
+            serde_json::json!({ "text": "twice?", "digest": "d" }),
+        ),
+        row(
+            1,
+            EventKind::Usage,
+            EventRole::Agent,
+            serde_json::json!({ "input_tokens": 10, "output_tokens": 4, "cost_micros": 100 }),
+        ),
+    ];
+    let once = UsageTotals::from_rows(&events).to_value();
+
+    let root = tempfile::tempdir().expect("temp cache root");
+    // The same lines, twice, in one buffer: what a crash in the middle of the old appending seal
+    // left behind, and what any second writer of the same rows would leave.
+    for _ in 0..2 {
+        append_pending(root.path(), chat.project_id, chat.run_id, &events)
+            .await
+            .expect("the buffer must be written");
+    }
+    seal_pending(root.path(), chat.project_id, chat.run_id)
+        .await
+        .expect("the chat ends (H-1)");
+    assert_eq!(
+        upload_pending(&db.pool, root.path(), db.store.this_box(), ids::USER)
+            .await
+            .expect("the upload must not fail"),
+        1,
+    );
+
+    assert_eq!(
+        step_usage(&db.pool, chat.step_id).await.1,
+        Some(once),
+        "the repeated usage row was summed once, not twice",
+    );
+    let seqs: Vec<i32> =
+        sqlx::query_scalar("SELECT seq FROM session_event WHERE run_step_id = $1 ORDER BY seq")
+            .bind(chat.step_id.as_uuid())
+            .fetch_all(&db.pool)
+            .await
+            .expect("the events");
+    assert_eq!(seqs, vec![0, 1], "and the log holds each seq exactly once");
 
     db.drop_db().await;
 }

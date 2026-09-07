@@ -153,6 +153,24 @@ pub fn cache_dir(root: &Path, dsn: &str) -> PathBuf {
     root.join("cache").join(db_fingerprint(dsn))
 }
 
+/// `app_user.name` of this OS user: `USERNAME`, then `USER`, then `htui` (ANA-9 §5.10).
+///
+/// One definition, two callers: [`crate::PgStore::seed_if_empty`] stamps a first, empty database
+/// with it, and [`crate::CacheStore::this_user`] looks the mirrored row up by it (MOD-2 plan D33).
+/// Two copies of this rule would mean an offline chat naming an author the server does not have,
+/// and `upload_pending` inserting a stranger.
+#[must_use]
+pub fn os_user_name() -> String {
+    for key in ["USERNAME", "USER"] {
+        if let Ok(value) = std::env::var(key)
+            && !value.trim().is_empty()
+        {
+            return value;
+        }
+    }
+    "htui".to_owned()
+}
+
 /// This machine's host name, or `unknown-host` when the OS will not say.
 fn hostname() -> String {
     let raw = gethostname::gethostname().to_string_lossy().into_owned();

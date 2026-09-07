@@ -12,6 +12,10 @@ publish.workspace      = true
 default = []
 # Forwards to htui-core so `PgStore::load_demo(&DemoData)` and `fixtures::ids` exist.
 demo    = ["htui-core/demo"]
+# Compiles `testkit` into the library: the throwaway-database harness and the mirror seeder. It
+# lives here rather than under `tests/` because MOD-2 milestone 4's criterion-12 case needs a
+# driver *and* a throwaway database in one test, and only the `htui` crate can hold both.
+test-support = ["demo"]
 
 [dependencies]
 htui-core   = { workspace = true, features = ["sqlx"] }
@@ -31,6 +35,7 @@ tracing     = { workspace = true }
 
 [dev-dependencies]
 htui-core = { workspace = true, features = ["test-support"] }
+htui-store = { workspace = true, features = ["test-support"] }
 tokio     = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 tempfile  = "3"
 futures   = { workspace = true }

@@ -1498,6 +1498,7 @@ dependencies = [
  "futures",
  "gethostname",
  "htui-core",
+ "htui-store",
  "keyring",
  "serde",
  "serde_json",

@@ -199,14 +199,16 @@ impl PgStore {
 
     /// Seeds ANA-9 §5.10's global part if it is not there, and returns the single `app_user`.
     ///
-    /// [`seed_if_empty_as`](PgStore::seed_if_empty_as) with the name `USERNAME` / `USER` reports,
-    /// falling back to `htui`.
+    /// [`seed_if_empty_as`](PgStore::seed_if_empty_as) with
+    /// [`identity::os_user_name`](crate::identity::os_user_name) - the one definition
+    /// [`CacheStore::this_user`](crate::CacheStore::this_user) reads back offline (MOD-2 D33).
     ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub async fn seed_if_empty(&self) -> Result<UserId> {
-        self.seed_if_empty_as(&seed_user_name()).await
+        self.seed_if_empty_as(&crate::identity::os_user_name())
+            .await
     }
 
     /// [`seed_if_empty`](PgStore::seed_if_empty) under a caller-supplied `app_user.name`.
@@ -467,18 +469,6 @@ async fn schema_state(pool: &PgPool) -> Result<MigrationState> {
     } else {
         Ok(MigrationState::Pending(pending))
     }
-}
-
-/// `app_user.name` for the seeded user: `USERNAME`, then `USER`, then `htui` (ANA-9 §5.10).
-fn seed_user_name() -> String {
-    for key in ["USERNAME", "USER"] {
-        if let Ok(value) = std::env::var(key)
-            && !value.trim().is_empty()
-        {
-            return value;
-        }
-    }
-    "htui".to_owned()
 }
 
 /// `std::env::consts::OS` mapped onto the three values `box.os_family` allows.

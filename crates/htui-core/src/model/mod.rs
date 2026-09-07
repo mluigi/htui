@@ -89,6 +89,7 @@ pub mod link;
 pub mod note;
 pub mod run;
 pub mod scope;
+pub mod usage;
 pub mod user;
 
 pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
@@ -114,6 +115,7 @@ pub use run::{
     RunStepSummary, RunSummary, StepStatus,
 };
 pub use scope::Scope;
+pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
 
 #[cfg(test)]

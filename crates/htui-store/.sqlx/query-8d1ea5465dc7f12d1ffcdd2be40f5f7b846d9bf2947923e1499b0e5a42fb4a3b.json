@@ -1,0 +1,146 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, name, transport, launch, models, default_model, billing, enabled, settings, created_at, updated_at FROM agent",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "transport",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "transport"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "launch",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "launch"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "models",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "models"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "default_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "default_model"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "billing",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "billing"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "settings",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "settings"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8d1ea5465dc7f12d1ffcdd2be40f5f7b846d9bf2947923e1499b0e5a42fb4a3b"
+}

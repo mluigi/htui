@@ -15,7 +15,7 @@ use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, Permissi
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_core::model::{
     AgentId, AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph,
-    Note, ProjectId, RunSummary, Scope, StepId, WorkspaceSummary,
+    Note, ProjectId, RunSummary, Scope, SessionEvent, StepId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result as StoreResult, StoreError};
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
@@ -41,9 +41,11 @@ pub enum Origin {
     Overlay(OverlayId),
 }
 
-/// Everything the UI can ask the store for in MOD-1.
+/// Everything the UI can ask the store for.
 ///
-/// MOD-2 adds `StepEvents(StepId)` here and one arm in [`serve`]; the event loop does not change.
+/// MOD-2 milestone 4 is the worked example of how this list grows: [`StoreRequest::StepEvents`]
+/// is one variant, one arm inside [`serve`] and one [`StoreRequest::name`] arm, and the event
+/// loop still does not change.
 #[derive(Debug, Clone)]
 pub enum StoreRequest {
     /// Every workspace with its projects (switcher, startup scope).
@@ -81,6 +83,11 @@ pub enum StoreRequest {
     ///
     /// Not scoped: `agent` is a global table, not a workspace one.
     Agents,
+    /// The persisted replay log of one step (MOD-2 D38, `R-HIS-2`).
+    ///
+    /// A read like any other, answered once: a replay is history, not a stream, so it costs one
+    /// request rather than a subscription that could still be arriving when the user leaves.
+    StepEvents(StepId),
     /// Start a chat: mint the `run` / `run_step` pair, open a session, send the first prompt
     /// (MOD-2 D27). Answered by [`StoreReply::ChatAccepted`] once the handshake is through, then
     /// by a [`StoreReply::Chat`] frame per event for the life of the session.
@@ -136,6 +143,7 @@ impl StoreRequest {
             Self::Notes(_) => "notes",
             Self::Runs(_) => "runs",
             Self::Agents => "agents",
+            Self::StepEvents(_) => "step_events",
             Self::ChatStart { .. } => "chat_start",
             Self::ChatSend { .. } => "chat_send",
             Self::ChatAnswer { .. } => "chat_answer",
@@ -169,6 +177,22 @@ pub enum StoreReply {
     Runs(Vec<RunSummary>),
     /// Answer to [`StoreRequest::Agents`], ordered by `agent.name`.
     Agents(Vec<AgentSummary>),
+    /// Answer to [`StoreRequest::StepEvents`], in `seq` order (MOD-2 D38).
+    ///
+    /// `events` is `None` when the backend does not hold the step — the mirror's window is the
+    /// last N steps (`docs/ANA-9.md` §4.4) — and the view says "this step is not on this box".
+    /// `Some(vec![])` is the other answer entirely: the step is here and recorded nothing.
+    /// Collapsing the two would make an unsynced step look like an empty conversation, which is
+    /// the one reading `R-HIS-1` forbids.
+    ///
+    /// `step_id` travels with the rows because the addressee may have asked twice: it is how a
+    /// tab tells the replay it is showing from the one it asked for next.
+    StepEvents {
+        /// The step the rows belong to.
+        step_id: StepId,
+        /// The step's rows, or `None` for "not on this box".
+        events: Option<Vec<SessionEvent>>,
+    },
     /// One frame of a live chat's stream (MOD-2 D27).
     ///
     /// Many of these answer one [`StoreRequest::ChatStart`], all carrying that request's `seq`, so
@@ -182,6 +206,14 @@ pub enum StoreReply {
         session_ref: Option<AgentSessionRef>,
         /// What this transport can do, for the tab's capability banner.
         caps: DriverCaps,
+        /// `Writer::label()` of the store this chat records into: `memory`, `online` or
+        /// `buffered` (MOD-2 D42).
+        ///
+        /// It travels on the acceptance because the tab must be able to say that a conversation is
+        /// only on this disk, and it cannot ask: `R-NF-3` keeps every store handle on the worker's
+        /// side, and inferring "offline therefore buffered" from the top bar would be a guess about
+        /// a backend the tab does not hold.
+        writer_label: &'static str,
     },
     /// Answer to [`StoreRequest::StoreState`].
     StoreState {
@@ -288,6 +320,13 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Notes(id) => StoreReply::Notes(backend.notes(*id).await?),
         StoreRequest::Runs(id) => StoreReply::Runs(backend.runs(*id).await?),
         StoreRequest::Agents => StoreReply::Agents(backend.agents().await?),
+        // Served through the ordinary read path on purpose: an `Unreachable` from it drops an
+        // `Online` backend onto the mirror exactly as any other read does, and the replay then
+        // answers from whatever the mirror kept.
+        StoreRequest::StepEvents(step) => StoreReply::StepEvents {
+            step_id: *step,
+            events: backend.step_events(*step).await?,
+        },
         // The four chat requests need the worker loop's own state (the live sessions), so they are
         // served ahead of this function, exactly as `ApplyMigrations` is. A chat request that
         // reaches here at all belongs to a caller with no runtime — the test harness without one —
@@ -782,6 +821,116 @@ mod tests {
         };
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].steps.len(), 4);
+    }
+
+    /// The read behind replay (MOD-2 D38): the `plan` step's eight fixture rows, in `seq` order.
+    #[tokio::test]
+    async fn step_events_answers_the_rows_of_a_recorded_step() {
+        let backend = demo();
+        let StoreReply::StepEvents { step_id, events } =
+            serve(&backend, &StoreRequest::StepEvents(ids::STEP_PLAN)).await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert_eq!(step_id, ids::STEP_PLAN, "the reply names the step it read");
+        let events = events.expect("the fixture records the plan step");
+        assert_eq!(events.len(), 8);
+        assert!(
+            events.windows(2).all(|pair| pair[0].seq < pair[1].seq),
+            "the rows arrive in `seq` order, which is replay order"
+        );
+    }
+
+    /// `None` is "not on this box", and every backend answers it for a step it holds no row of -
+    /// including a step that exists and recorded nothing (`STEP_PRD`).
+    #[tokio::test]
+    async fn a_step_this_backend_does_not_hold_answers_none() {
+        let backend = demo();
+        for step in [ids::STEP_PRD, StepId::new()] {
+            let StoreReply::StepEvents { step_id, events } =
+                serve(&backend, &StoreRequest::StepEvents(step)).await
+            else {
+                panic!("wrong reply variant")
+            };
+            assert_eq!(step_id, step);
+            assert_eq!(
+                events, None,
+                "no row for {step} is `None`, not an empty log"
+            );
+        }
+    }
+
+    /// `Some(vec![])` stays in the reply type even though no backend produces it (D38).
+    ///
+    /// All three read "no rows" as "not cached" (`mem.rs`'s `step_log`, `pg/read.rs`'s
+    /// `then_some`, `cache/read.rs`'s early return), so an empty log is currently unreachable
+    /// through this request. The type keeps it representable anyway: "the step is here and
+    /// recorded nothing" is a different sentence from "the step is not on this box", and the day
+    /// a backend can say the first one the view must not read it as the second.
+    #[tokio::test]
+    async fn a_served_step_log_is_never_empty_but_the_reply_can_be() {
+        let backend = demo();
+        for step in [ids::STEP_PRD, ids::STEP_PLAN, ids::STEP_R2_PRD] {
+            let StoreReply::StepEvents { events, .. } =
+                serve(&backend, &StoreRequest::StepEvents(step)).await
+            else {
+                panic!("wrong reply variant")
+            };
+            assert!(
+                events.as_ref().is_none_or(|rows| !rows.is_empty()),
+                "a backend answers rows or `None`, never an empty log: {step}"
+            );
+        }
+        assert!(
+            matches!(
+                StoreReply::StepEvents {
+                    step_id: ids::STEP_PRD,
+                    events: Some(Vec::new()),
+                },
+                StoreReply::StepEvents {
+                    events: Some(_),
+                    ..
+                }
+            ),
+            "and the reply can still carry one, which is the distinction D38 is about"
+        );
+    }
+
+    /// A store error carries [`StoreRequest::name`] into the status line, this request included.
+    #[tokio::test]
+    async fn a_failed_step_events_read_names_the_request() {
+        let identity = Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "step-events-failed", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let backend = Backend::Online {
+            pg,
+            cache: cache.clone(),
+        };
+
+        let reply = serve(&backend, &StoreRequest::StepEvents(ids::STEP_PLAN)).await;
+        assert!(
+            matches!(
+                &reply,
+                StoreReply::Failed {
+                    request: "step_events",
+                    ..
+                }
+            ),
+            "the asking view is told which read failed: {reply:?}"
+        );
+
+        cache.close().await;
     }
 
     #[tokio::test]

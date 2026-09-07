@@ -9,6 +9,7 @@ use htui_agent::driver::{AgentSessionRef, PermissionRequestId};
 use htui_agent::event::{
     DriverEnvelope, DriverEvent, PermissionOption, PlanEntry, StopReason, TerminalReason, ToolKind,
 };
+use htui_core::model::SessionEvent;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
@@ -165,10 +166,41 @@ impl Transcript {
         }
     }
 
+    /// A finished step's persisted rows, rendered through the live path (D37, `R-TUI-6`).
+    ///
+    /// The rows are decoded by [`htui_agent::replay`] and then handed to [`Transcript::apply`]
+    /// one by one — the *same* method a live frame goes through. That is the whole point: a
+    /// replay that rendered through a second code path would drift from the live one, and the
+    /// first thing it would drift on is the kind an adapter added last week.
+    ///
+    /// The lossy decode is deliberate (D37): a row nobody can read still reaches the screen as a
+    /// dim `<kind>` line rather than costing the reader the rest of the conversation.
+    #[must_use]
+    pub fn from_rows(rows: &[SessionEvent]) -> Self {
+        let mut transcript = Self::new();
+        for envelope in htui_agent::replay::envelopes(rows) {
+            transcript.apply(&envelope);
+        }
+        transcript
+    }
+
     /// Every row, for assertions.
     #[must_use]
     pub fn rows(&self) -> &[TranscriptRow] {
         &self.rows
+    }
+
+    /// How many rows are on screen — which is not how many rows were persisted: a `tool_result`
+    /// folds into its call and the session banner becomes the header.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether there is nothing to show.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
     }
 
     /// The agent-side session id the banner carried.
@@ -717,6 +749,64 @@ mod tests {
 
         transcript.on_key(KeyEvent::from(KeyCode::Char('t')));
         assert_eq!(transcript.lines(20, &theme).len(), 3, "unfolded");
+    }
+
+    /// The fixture's `plan` step is eight persisted rows and seven rendered ones: the
+    /// `tool_result` folds into its call, and every other row keeps its place and its order.
+    #[tokio::test]
+    async fn from_rows_renders_a_persisted_step_the_way_the_live_path_would() {
+        use htui_core::fixtures::ids;
+        use htui_core::store::{MemStore, ReadStore as _};
+
+        let rows = MemStore::demo()
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the memory store never fails")
+            .expect("the fixture's plan step has a log");
+        assert_eq!(rows.len(), 8, "the fixture's own row count");
+
+        let transcript = Transcript::from_rows(&rows);
+        assert_eq!(transcript.len(), 7);
+        assert!(matches!(
+            transcript.rows(),
+            [
+                TranscriptRow::Prompt { .. },
+                TranscriptRow::Assistant { .. },
+                TranscriptRow::Thought { .. },
+                TranscriptRow::ToolCall {
+                    status: CallStatus::Completed,
+                    ..
+                },
+                TranscriptRow::Plan { .. },
+                TranscriptRow::Usage { .. },
+                TranscriptRow::Done {
+                    stop_reason: StopReason::EndTurn
+                },
+            ]
+        ));
+    }
+
+    /// The decoder stamps one grouping key per persisted row, so two text rows stay two rows
+    /// rather than being glued into one by the transcript's own coalescing.
+    #[tokio::test]
+    async fn two_recorded_text_rows_stay_two_rows() {
+        use chrono::TimeZone as _;
+        use htui_core::fixtures::ids;
+        use htui_core::model::{EventKind, EventRole, SessionEvent};
+
+        let text = |seq: i32, text: &str| SessionEvent {
+            run_step_id: ids::STEP_PLAN,
+            seq,
+            turn: 0,
+            kind: EventKind::AssistantText,
+            role: EventRole::Agent,
+            tool_call_id: None,
+            payload: json!({ "text": text }),
+            raw: None,
+            at: Utc.timestamp_opt(0, 0).single().expect("epoch is a time"),
+        };
+        let transcript = Transcript::from_rows(&[text(0, "first"), text(1, "second")]);
+        assert_eq!(transcript.len(), 2, "one persisted row, one rendered row");
     }
 
     #[test]

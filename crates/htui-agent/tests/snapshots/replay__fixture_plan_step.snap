@@ -1,0 +1,162 @@
+---
+source: crates/htui-agent/tests/replay.rs
+expression: decoded
+---
+[
+    DriverEnvelope {
+        event: Other(
+            OtherEvent {
+                update: "prompt",
+                body: Object {
+                    "text": String("Plan the TUI scaffold against the store seam."),
+                    "digest": String("9f2c1b7e4a08d3556c9e1af0b74d28e63c05a91f7d4b8e2016a3c5d7f908b1e2"),
+                    "sections": Array [
+                        Object {
+                            "name": String("prd"),
+                            "tokens": Number(800),
+                            "trimmed": Bool(false),
+                        },
+                        Object {
+                            "name": String("skills"),
+                            "tokens": Number(300),
+                            "trimmed": Bool(false),
+                        },
+                    ],
+                },
+            },
+        ),
+        raw: None,
+        at: 2026-09-02T09:00:00Z,
+    },
+    DriverEnvelope {
+        event: AssistantChunk(
+            TextChunk {
+                text: "Reading the PRD and the ANA-9 seam.",
+                message_id: Some(
+                    "seq:1",
+                ),
+            },
+        ),
+        raw: None,
+        at: 2026-09-02T09:01:00Z,
+    },
+    DriverEnvelope {
+        event: ThoughtChunk(
+            TextChunk {
+                text: "The store trait is the only seam that matters here.",
+                message_id: Some(
+                    "seq:2",
+                ),
+            },
+        ),
+        raw: None,
+        at: 2026-09-02T09:02:00Z,
+    },
+    DriverEnvelope {
+        event: ToolCall(
+            ToolCallEvent {
+                tool_call_id: "call_1",
+                title: "Read docs/ANA-9.md",
+                tool_kind: Read,
+                input: Object {
+                    "path": String("docs/ANA-9.md"),
+                    "offset": Number(824),
+                    "limit": Number(24),
+                },
+                locations: [
+                    ToolLocation {
+                        path: "docs/ANA-9.md",
+                        line: Some(
+                            824,
+                        ),
+                    },
+                ],
+            },
+        ),
+        raw: None,
+        at: 2026-09-02T09:03:00Z,
+    },
+    DriverEnvelope {
+        event: ToolResult(
+            ToolResultEvent {
+                tool_call_id: "call_1",
+                status: Completed,
+                output: Some(
+                    String("pub trait ReadStore: Send + Sync { ... }"),
+                ),
+                locations: [
+                    ToolLocation {
+                        path: "docs/ANA-9.md",
+                        line: Some(
+                            824,
+                        ),
+                    },
+                ],
+                terminal_reason: None,
+            },
+        ),
+        raw: None,
+        at: 2026-09-02T09:04:00Z,
+    },
+    DriverEnvelope {
+        event: Plan(
+            PlanEvent {
+                entries: [
+                    PlanEntry {
+                        content: "Split the crates",
+                        status: Completed,
+                        priority: High,
+                    },
+                    PlanEntry {
+                        content: "Fix the store seam",
+                        status: InProgress,
+                        priority: High,
+                    },
+                    PlanEntry {
+                        content: "Snapshot the shell",
+                        status: Pending,
+                        priority: Medium,
+                    },
+                ],
+            },
+        ),
+        raw: None,
+        at: 2026-09-02T09:05:00Z,
+    },
+    DriverEnvelope {
+        event: Usage(
+            UsageEvent {
+                input_tokens: Some(
+                    12000,
+                ),
+                output_tokens: Some(
+                    2400,
+                ),
+                cache_read_tokens: Some(
+                    0,
+                ),
+                cache_write_tokens: Some(
+                    0,
+                ),
+                cost_micros: None,
+                context_used: None,
+                context_size: None,
+                cost_micros_total: None,
+                cost_amount: None,
+                cost_currency: None,
+                usage_scope: None,
+            },
+        ),
+        raw: None,
+        at: 2026-09-02T09:06:00Z,
+    },
+    DriverEnvelope {
+        event: Done(
+            DoneEvent {
+                stop_reason: EndTurn,
+            },
+        ),
+        raw: None,
+        at: 2026-09-02T09:07:00Z,
+    },
+]

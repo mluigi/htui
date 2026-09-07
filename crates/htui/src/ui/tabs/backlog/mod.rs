@@ -204,7 +204,15 @@ impl Tab for BacklogTab {
             KeyCode::Char('G') | KeyCode::End => self.jump(true, ctx),
             KeyCode::Char('l') | KeyCode::Char(']') | KeyCode::Right => self.detail.cycle_next(),
             KeyCode::Char('h') | KeyCode::Char('[') | KeyCode::Left => self.detail.cycle_prev(),
-            KeyCode::Enter => return self.fold(),
+            // A project header folds; on an item row there is nothing to fold, and `Enter` is
+            // the detail pane's — the Runs pane replays the step under its cursor with it
+            // (MOD-2 D39). Without this the pane would never see the key at all.
+            KeyCode::Enter => {
+                return match self.fold() {
+                    Handled::Consumed => Handled::Consumed,
+                    Handled::Pass => self.detail.on_key(key, ctx),
+                };
+            }
             _ => return self.detail.on_key(key, ctx),
         }
         Handled::Consumed

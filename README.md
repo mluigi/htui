@@ -180,8 +180,9 @@ pending migrations, and never by the user.
 | `Enter` | Fold or unfold the project group, when the cursor is on a project header |
 | `l` / `]` / `Right` | Next detail sub-tab |
 | `h` / `[` / `Left` | Previous detail sub-tab |
-| `J` / `K` | Scroll the detail pane one row down / up |
+| `J` / `K` | Scroll the detail pane one row down / up — in **Runs**, move the cursor over the runs and their steps |
 | `PageDown` / `PageUp` | Scroll the detail pane ten rows |
+| `Enter` (in **Runs**) | Replay the selected step in the Chat tab, read-only |
 
 The five detail sub-tabs are **Body**, **Runs**, **Graph**, **Documents** and **Notes**
 (`R-TUI-3`). The Skills tab is still a placeholder; the Settings tab lists the agent registry.
@@ -196,7 +197,7 @@ against a `chat` run, and streams what the agent does back into the transcript.
 | `i` / `Enter` | Compose; `Enter` sends, `Esc` leaves the composer |
 | `a` | Next enabled agent, before the first prompt |
 | `1`..`9` | Answer the permission request the agent is waiting on |
-| `Esc` `Esc` | End the session (the first `Esc` arms it, any other key disarms) |
+| `Esc` `Esc` | End the session (the first `Esc` arms it; any other key, and opening a replay, disarms) |
 | `t` | Fold or unfold the agent's thoughts |
 | `j` / `k` / `g` / `G` | Scroll the transcript |
 
@@ -205,9 +206,23 @@ it lists what the session **cannot** do — permission requests, edit proposals,
 the transport reports less than the full profile; it is computed from the driver's own
 capabilities, not from `agent.transport`.
 
-A chat needs a writable store: while the shell is offline it refuses to start one, because the
-offline event buffer arrives in a later milestone. Ending the app cancels every live session and
-waits for its process tree to die before the process exits.
+A chat can be started while the shell is offline. Its events go to a JSON-lines buffer under
+`cache/<fingerprint>/pending/`, the header says `buffered · uploads when the store returns`, and
+the next successful connection inserts the run, its step and every event in one transaction.
+Ending the app cancels every live session and waits for its process tree to die before the process
+exits.
+
+**Replay.** `Enter` on a step in the Backlog tab's Runs pane reopens that step's recorded log over
+the Chat tab, rendered by the same transcript the live view uses (`R-HIS-2`). It is read-only: the
+tab sends nothing while it is open, `1`..`9` answer nothing, and `Esc` closes it and puts the live
+conversation back exactly as it was. A step this box has never synced says so rather than reading
+as a conversation that said nothing.
+
+| Key | Action (while a replay is open) |
+|---|---|
+| `Esc` | Leave the replay |
+| `t` | Fold or unfold the thoughts |
+| `j` / `k` | Scroll the replayed transcript |
 
 Two environment knobs, both off by default:
 

@@ -1,5 +1,5 @@
 ---
-source: crates/htui/tests/backlog.rs
+source: crates/htui/tests/replay.rs
 expression: harness.render()
 ---
 Platform · DESKTOP-HTUI · memory · 1 run
@@ -10,8 +10,8 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │  ANA-2    open               Orchestrator step grap…││mode                          finished     │
 │  CLEAN-1  failed             Drop the legacy markdo…││graph  done      DESKTOP-HTUI 09-02 08:00  │
 │  FEAT-1   in_progress        TUI scaffold           ││manual                        09-02 12:00  │
-│  FEAT-2   blocked            Agent driver and chat …││▸ 0    done      prd          09-02 08:00  │
-│  FEAT-3   queued             Postgres store and cac…││  1    done      plan         09-02 09:00  │
+│  FEAT-2   blocked            Agent driver and chat …││  0    done      prd          09-02 08:00  │
+│  FEAT-3   queued             Postgres store and cac…││▸ 1    done      plan         09-02 09:00  │
 │  FIX-1    closed             Terminal left raw afte…││  2    done      implement    09-02 10:00  │
 │  TOOL-1   awaiting_approval  CI matrix for the thre…││  3    done      review       09-02 11:00  │
 │▾ agy (3)                                            ││                                           │

@@ -106,6 +106,10 @@ async fn harness_with(script: Script, transport: Transport) -> (Harness, MemStor
 
     let mut harness = Harness::over(store.clone())
         .with_tab(Box::new(ChatTab::new()))
+        // `register_all` names the Chat tab as the replay tab (D39); a hand-registered shell has
+        // to say so itself, and the replay cases below go through the same `Action::Replay` the
+        // Runs pane emits rather than reaching into the tab.
+        .with_replay_tab(ChatTab::ID)
         .with_agent_runtime(AgentRuntime::new(factory).with_grace(Duration::from_millis(0)));
     harness.drive().await;
     (harness, store)
@@ -367,6 +371,252 @@ async fn a_degraded_transport_banners_what_it_cannot_do() {
     compose(&mut harness, "hello");
     harness.drive().await;
     stable().bind(|| insta::assert_snapshot!("chat_capability_banner", harness.render()));
+}
+
+// -------------------------------------------------------------------------------------------
+// Replay (MOD-2 milestone 4, T20): the same tab, the same transcript, over persisted rows.
+// -------------------------------------------------------------------------------------------
+
+/// [`stable`] plus the step id in the replay header, which is a fresh UUID whenever the step
+/// under replay is one a chat in this test just minted.
+fn stable_step() -> insta::Settings {
+    let mut settings = stable();
+    settings.add_filter(r"step …[0-9a-f]{8} ", "step …<step> ");
+    settings
+}
+
+/// The transcript area of a rendered frame: everything between the tab's header line and its
+/// hint line. Four lines of chrome above (top bar, tab strip, block border, header) and three
+/// below (hint, block border, status line), all fixed by the layout — which is exactly why the
+/// live and the replayed body can be compared line for line.
+fn body_lines(render: &str) -> Vec<&str> {
+    let lines: Vec<&str> = render.lines().collect();
+    lines[4..lines.len() - 3].to_vec()
+}
+
+/// A shell over the demo fixture with a Chat tab and nothing running in it.
+async fn replay_only() -> Harness {
+    let mut harness = Harness::demo()
+        .with_tab(Box::new(ChatTab::new()))
+        .with_replay_tab(ChatTab::ID);
+    harness.settle().await;
+    harness
+}
+
+/// Opens a step's log in the Chat tab through the action the Runs pane emits (D39).
+async fn replay(harness: &mut Harness, step_id: htui_core::model::StepId) {
+    harness.app().update(htui::app::Action::Replay { step_id });
+    harness.drive().await;
+}
+
+/// `R-HIS-2`: a step nobody is running renders through the transcript a live one renders
+/// through — the prompt, the tool call and its result folded into one row, the plan, the usage
+/// line and the end of the turn.
+#[tokio::test]
+async fn a_recorded_step_replays_through_the_live_transcript() {
+    let mut harness = replay_only().await;
+    replay(&mut harness, htui_core::fixtures::ids::STEP_PLAN).await;
+
+    let rendered = harness.render();
+    let id = htui_core::fixtures::ids::STEP_PLAN.to_string();
+    let tail = &id[id.len() - 8..];
+    assert!(
+        rendered.contains(&format!("replay · step …{tail} · 7 rows · read-only")),
+        "the header names which step is on screen and that it is over: {rendered}"
+    );
+    insta::assert_snapshot!("replay_fixture_step", rendered);
+}
+
+/// D38: a step this box has no rows for is *unknown*, not empty. Rendering it as an empty
+/// conversation is the one reading `R-HIS-1` forbids.
+#[tokio::test]
+async fn a_step_that_is_not_on_this_box_says_so() {
+    let mut harness = replay_only().await;
+    replay(&mut harness, htui_core::fixtures::ids::STEP_PRD).await;
+    insta::assert_snapshot!("replay_missing", harness.render());
+}
+
+/// `R-TUI-6`, the property the mode exists for: what a replay draws and what the live session
+/// drew are the same lines, because they are the same renderer over the same events. Only the
+/// header differs, which is what tells the reader they are looking at history.
+#[tokio::test]
+async fn a_replayed_turn_renders_the_lines_the_live_one_did() {
+    let script = Script::one_turn(vec![
+        ScriptEvent::Emit(DriverEvent::ThoughtChunk(TextChunk {
+            text: "I should read the file first".to_owned(),
+            message_id: Some("t1".to_owned()),
+        })),
+        chunk("Reading it now. "),
+        ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id: "call-1".to_owned(),
+            title: "src/main.rs".to_owned(),
+            tool_kind: ToolKind::Read,
+            input: json!({ "path": "src/main.rs" }),
+            locations: Vec::new(),
+        })),
+        ScriptEvent::Emit(DriverEvent::ToolResult(ToolResultEvent {
+            tool_call_id: "call-1".to_owned(),
+            status: ToolResultStatus::Completed,
+            output: Some(json!("fn main() {}")),
+            locations: Vec::new(),
+            terminal_reason: None,
+        })),
+        chunk("It is empty."),
+        done(),
+    ]);
+    let (mut harness, _) = harness(script).await;
+    compose(&mut harness, "what is in main.rs");
+    harness.drive().await;
+    let live = harness.render();
+
+    let step = harness.chat_steps()[0];
+    replay(&mut harness, step).await;
+    let replayed = harness.render();
+    assert_eq!(
+        body_lines(&replayed),
+        body_lines(&live),
+        "the replayed body is the live body; only the header moved"
+    );
+    stable_step().bind(|| insta::assert_snapshot!("replay_streamed_turn", replayed));
+
+    // D40: leaving puts the live view back exactly as it was — replay never wrote to it.
+    harness.key("esc");
+    harness.drive().await;
+    assert_eq!(harness.render(), live);
+}
+
+/// D40 through the shell: every key the live tab acts on is swallowed, so a finished step
+/// cannot be prompted, answered or cancelled. The unit test beside `ChatTab` proves the tab
+/// emits nothing; this one proves the screen agrees.
+#[tokio::test]
+async fn replay_takes_no_prompt_and_no_answer() {
+    let (mut harness, _) = harness(Script::one_turn(vec![chunk("hello"), done()])).await;
+    compose(&mut harness, "hi");
+    harness.drive().await;
+    let step = harness.chat_steps()[0];
+    replay(&mut harness, step).await;
+    let opened = harness.render();
+
+    for pressed in ["i", "enter", "1", "9", "a"] {
+        harness.key(pressed);
+    }
+    harness.drive().await;
+    assert_eq!(
+        harness.render(),
+        opened,
+        "no composer opened, no turn was sent, nothing moved"
+    );
+    assert_eq!(
+        harness.chat_steps().len(),
+        1,
+        "and no second chat was started"
+    );
+}
+
+/// D41: a request and its answer replay resolved, through the very same `resolve_permission`
+/// the live path uses — including the answer the user typed and who typed it.
+#[tokio::test]
+async fn an_answered_permission_replays_resolved() {
+    let script = Script::one_turn(vec![
+        ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id: "call-1".to_owned(),
+            title: "rm -rf build".to_owned(),
+            tool_kind: ToolKind::Execute,
+            input: json!({ "command": "rm -rf build" }),
+            locations: Vec::new(),
+        })),
+        ScriptEvent::ParkPermission(PermissionRequestEvent {
+            request_id: PermissionRequestId::new("req-1"),
+            tool_call_id: Some("call-1".to_owned()),
+            options: vec![
+                PermissionOption {
+                    id: "allow".to_owned(),
+                    label: "Allow once".to_owned(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    id: "reject".to_owned(),
+                    label: "Reject".to_owned(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ],
+        }),
+        done(),
+    ]);
+    let (mut harness, _) = harness(script).await;
+    compose(&mut harness, "clean the build");
+    harness.drive().await;
+    harness.key("2");
+    harness.drive().await;
+
+    let step = harness.chat_steps()[0];
+    replay(&mut harness, step).await;
+    let rendered = harness.render();
+    assert!(
+        rendered.contains("permission  reject (by user)"),
+        "the log says who answered and with what: {rendered}"
+    );
+    stable_step().bind(|| insta::assert_snapshot!("replay_answered_permission", rendered));
+}
+
+/// D41's other half: a request nobody ever answered — a session that died with it outstanding —
+/// is history, so it renders parked-looking and is **not** answerable. No strip is offered, and
+/// the digit that would have answered it live does nothing.
+#[tokio::test]
+async fn an_unanswered_permission_replays_parked_but_answers_nothing() {
+    use chrono::TimeZone as _;
+    use htui_core::fixtures::ids;
+    use htui_core::model::{EventRole, SessionEvent};
+
+    let store = MemStore::demo();
+    let row = |seq: i32, kind: EventKind, payload: serde_json::Value| SessionEvent {
+        // A fixture step with no log of its own, so these rows are the whole conversation.
+        run_step_id: ids::STEP_PRD,
+        seq,
+        turn: 0,
+        kind,
+        role: EventRole::Agent,
+        tool_call_id: None,
+        payload,
+        raw: None,
+        at: chrono::Utc
+            .timestamp_opt(0, 0)
+            .single()
+            .expect("epoch is a time"),
+    };
+    store
+        .append_events(&[
+            row(0, EventKind::Prompt, json!({ "text": "clean the build" })),
+            row(
+                1,
+                EventKind::PermissionRequest,
+                json!({ "request_id": "req-1", "tool_call_id": "call-1",
+                        "options": [{ "id": "allow", "label": "Allow once",
+                                      "kind": "allow_once" }] }),
+            ),
+        ])
+        .await
+        .expect("the rows land on the fixture's step");
+
+    let mut harness = Harness::over(store)
+        .with_tab(Box::new(ChatTab::new()))
+        .with_replay_tab(ChatTab::ID);
+    harness.settle().await;
+    replay(&mut harness, ids::STEP_PRD).await;
+    let opened = harness.render();
+    assert!(
+        opened.contains("permission  waiting on you"),
+        "the row says the agent asked and nobody answered: {opened}"
+    );
+    insta::assert_snapshot!("replay_parked_permission", opened);
+
+    harness.key("1");
+    harness.drive().await;
+    assert_eq!(
+        harness.render(),
+        opened,
+        "a finished step answers nothing, however parked its last row looks"
+    );
 }
 
 #[tokio::test]

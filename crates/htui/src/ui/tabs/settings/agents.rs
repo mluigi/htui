@@ -27,7 +27,9 @@ const NONE: &str = "\u{2014}";
 pub struct AgentsSection {
     /// The registry, ordered by name.
     agents: Vec<AgentSummary>,
-    /// Set when the store could not answer — offline, since `agent` is not mirrored.
+    /// Set when the store could not answer. Since MOD-2 milestone 4 mirrored `agent` (plan D31) an
+    /// offline backend answers this section, so in practice only a store that is neither online nor
+    /// holding a mirror gets here.
     unavailable: Option<String>,
 }
 
@@ -68,9 +70,11 @@ impl SettingsSection for AgentsSection {
                 self.agents = agents.clone();
                 self.unavailable = None;
             }
-            // `agent` and `agent_box` are not mirrored (`docs/ANA-9.md` §4.4), so an offline
-            // backend answers `Unreachable` and there is nothing to fall back to. Saying so beats
-            // rendering an empty table that reads as "no agents registered".
+            // `agent` is mirrored since MOD-2 milestone 4 (plan D31), so an offline backend
+            // answers this read from the mirror; `agent_box` is not, which is why every offline
+            // row's `on this box` column reads `not probed`. A refusal is therefore a store that
+            // can reach neither the server nor a mirror, and saying so beats rendering an empty
+            // table that reads as "no agents registered".
             StoreReply::Failed { request, message } if *request == "agents" => {
                 self.agents.clear();
                 self.unavailable = Some(message.clone());

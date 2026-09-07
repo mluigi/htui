@@ -330,11 +330,15 @@ impl AgentRuntime {
         model: Option<String>,
         prompt: String,
     ) -> Result<Served, StoreError> {
-        // Milestone 4 owns the offline session path (`append_pending`); until then a chat that
-        // cannot record is refused rather than run into memory nobody will ever read.
-        let writer = backend
-            .writer()
-            .ok_or_else(|| StoreError::Unreachable("a chat needs a writable store".to_owned()))?;
+        // Every backend hands out a writer since milestone 4 — the offline one is
+        // `Writer::Buffered`, which records to `<cache_dir>/pending/` and is uploaded on the next
+        // connection (plan D34). The `ok_or_else` stays because the signature is still `Option`: a
+        // later backend that genuinely cannot record must refuse a chat rather than run one into
+        // memory nobody will ever read.
+        let writer = backend.writer().ok_or_else(|| {
+            StoreError::Unreachable("this backend hands out no writer".to_owned())
+        })?;
+        let writer_label = writer.label();
         let box_id = backend
             .box_info()
             .await?
@@ -416,6 +420,7 @@ impl AgentRuntime {
         let args = ChatArgs {
             driver,
             writer,
+            writer_label,
             chat,
             spec,
             prompt,
@@ -439,6 +444,9 @@ impl AgentRuntime {
 pub struct ChatArgs {
     driver: Box<dyn AgentDriver>,
     writer: Writer,
+    /// [`Writer::label`], taken before the writer moves: what the tab's header says about where
+    /// this conversation is being kept (plan D42).
+    writer_label: &'static str,
     chat: ChatRunSpec,
     spec: SessionSpec,
     prompt: String,
@@ -537,6 +545,7 @@ pub async fn run_chat(args: ChatArgs) {
     let ChatArgs {
         driver,
         writer,
+        writer_label,
         chat,
         spec,
         prompt,
@@ -574,6 +583,7 @@ pub async fn run_chat(args: ChatArgs) {
             step_id,
             session_ref: session.session_ref().cloned(),
             caps,
+            writer_label,
         },
     );
 
@@ -1196,8 +1206,12 @@ mod tests {
         );
     }
 
+    /// An offline backend is no longer refused for *being* offline (milestone 4, D34): it hands
+    /// out `Writer::Buffered` and a chat records to `<cache_dir>/pending/`. What still refuses it
+    /// is a mirror that has nothing in it — a box that has never synced cannot name
+    /// `run.target_box_id`, and the refusal says which row is missing rather than "offline".
     #[tokio::test]
-    async fn an_offline_backend_refuses_to_start_a_chat() {
+    async fn an_offline_backend_with_an_empty_mirror_refuses_and_names_what_is_missing() {
         let root = tempfile::tempdir().expect("temp root");
         let cache = htui_store::CacheStore::open(root.path(), "chat-test", 1)
             .await
@@ -1206,6 +1220,11 @@ mod tests {
             cache: cache.clone(),
             since: None,
         };
+        assert!(
+            backend.writer().is_some(),
+            "the offline write path is the buffer, not a refusal"
+        );
+
         let mut runtime = AgentRuntime::new(DriverFactory::new());
         let (tx, _rx) = mpsc::unbounded_channel();
         let served = runtime
@@ -1214,9 +1233,12 @@ mod tests {
         match served {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "chat_start");
-                assert!(message.contains("writable"), "{message}");
+                assert!(
+                    message.contains("box") && message.contains("not registered"),
+                    "the refusal names the row this box has never synced: {message}"
+                );
             }
-            other => panic!("an offline chat must be refused: {other:?}"),
+            other => panic!("a chat with no box row must be refused: {other:?}"),
         }
         cache.close().await;
     }

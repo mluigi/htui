@@ -35,6 +35,9 @@ use crate::ui::tabs::{BacklogTab, ChatTab, SettingsTab, SkillsTab};
 /// 4. The migration prompt's factory goes in and it is named as the migration overlay. It has no
 ///    key binding on purpose: it is opened by the shell when a `StoreState` reply reports a
 ///    pending schema, never by the user (`R-STO-5`, plan D11).
+/// 5. The Chat tab is named as the replay tab and the Backlog tab's `Enter` is bound to the
+///    refusal that says how to reach a replay (MOD-2 D39). Both name a concrete view, so both
+///    belong here for the same reason the `w` binding does.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -60,4 +63,17 @@ pub fn register_all(app: &mut App) {
     app.overlay_factories
         .register(MigrationPrompt::ID, || Box::new(MigrationPrompt::new()));
     app.migration_overlay = Some(MigrationPrompt::ID);
+
+    app.replay_tab = Some(ChatTab::ID);
+    // The Runs pane consumes `Enter` when it has a step under the cursor and emits
+    // `Action::Replay` with it; the payload is the selection, which a static binding cannot
+    // carry. This row is therefore the *miss*: it fires only when no pane took the key, and then
+    // it says what to press instead. It also puts `Enter replay step` on the Backlog tab's help
+    // line, which is the other half of what a binding is for.
+    app.keymap.bind(Binding {
+        scope: KeyScope::Tab(BacklogTab::ID),
+        key: KeyChord::new(KeyCode::Enter, KeyModifiers::NONE),
+        action: Action::Error("select a step in the Runs pane (J/K) to replay it".to_owned()),
+        help: "replay step",
+    });
 }

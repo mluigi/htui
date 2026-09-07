@@ -5,6 +5,18 @@
 //! one [`StoreReply::Chat`] frame per recorded event until the session ends. Everything it renders
 //! comes out of those frames, which are the recorder's **scrubbed** copies — the screen is never
 //! less masked than the row (`R-SEC-3`).
+//!
+//! Since milestone 4 the tab has a second mode: a [`ReplayState`] holds one **past** step, opened
+//! by a [`StoreReply::StepEvents`] the shell addressed here on the Runs pane's behalf (D39). It
+//! is a read of persisted rows and nothing more — the rows are decoded into the same envelopes a
+//! live session sends and rendered by the same [`Transcript`] (`R-HIS-2`, `R-TUI-6`), and while
+//! it is open the tab sends nothing at all (D40). A live session underneath keeps receiving its
+//! frames the whole time and is exactly where it was when `Esc` closes the replay.
+//!
+//! Milestone 4 also lets a chat start with the store unreachable, in which case its rows go to the
+//! offline buffer instead of to Postgres. The header says so (D42), from the `writer_label` the
+//! acceptance carried — never from a guess about which backend the worker is holding, which is a
+//! thing this tab is not allowed to know (`R-NF-3`).
 
 pub mod composer;
 pub mod permission;
@@ -30,6 +42,31 @@ pub use composer::ComposerOutcome as ChatComposerOutcome;
 /// What replaces a value the session does not have yet.
 const NONE: &str = "\u{2014}";
 
+/// How much of a [`StepId`] the replay header shows — the **last** eight hex digits, never the
+/// first.
+///
+/// A `StepId` is a UUIDv7, so its head is a timestamp: two steps of one run share it, and the
+/// demo fixture's ids share their first ten characters by construction. The tail is the part that
+/// differs, which is the only part worth eight columns of a header that has to name *which* step
+/// this is.
+const STEP_TAIL: usize = 8;
+
+/// The last line while a replay is open: the three keys that do anything, and the way out.
+const REPLAY_HINT: &str = "Esc leave replay · t thoughts · j/k scroll";
+
+/// [`crate::store_worker::StoreReply::ChatAccepted::writer_label`] of the offline sink.
+///
+/// Compared rather than matched on a backend: the tab is told where its rows went and does not
+/// deduce it (`R-NF-3`).
+const BUFFERED_LABEL: &str = "buffered";
+
+/// What the header adds when the conversation is only on this disk (D42).
+///
+/// An offline chat is in no `run` table until it is uploaded, so `active_runs` does not count it
+/// and the Runs pane cannot list it: this line is the only place it is visible, and the maintainer
+/// has to be able to tell it apart from a conversation the server already holds.
+const BUFFERED_NOTE: &str = " · buffered · uploads when the store returns";
+
 /// The live chat, once one has been accepted.
 #[derive(Debug, Clone)]
 pub struct ChatSessionState {
@@ -39,8 +76,42 @@ pub struct ChatSessionState {
     pub session_ref: Option<AgentSessionRef>,
     /// What this transport can do.
     pub caps: DriverCaps,
+    /// The chat records into the offline buffer, not into a store anyone else can read (D42).
+    pub buffered: bool,
     /// How the session ended, once it has.
     pub ended: Option<htui_agent::event::StopReason>,
+}
+
+/// A past step, reopened read-only (D40, `R-HIS-2`).
+///
+/// "Read-only" is a property of what the tab can **send**, not of what it draws greyed out: while
+/// this is `Some` the whole key path is `ChatTab::on_key_replay`, which is handed no [`Ctx`] and
+/// so cannot issue a request even by mistake. The live session underneath is untouched and comes
+/// back exactly as it was when `Esc` closes this.
+#[derive(Debug)]
+pub struct ReplayState {
+    /// The step whose log is on screen.
+    pub step_id: StepId,
+    /// Its rows, decoded and rendered through the live path (D37, `R-TUI-6`).
+    pub transcript: Transcript,
+    /// The reply carried `None`: this box has no rows for the step (D38). Distinct from a step
+    /// that recorded nothing, which is a conversation that happened and said nothing.
+    pub missing: bool,
+}
+
+/// The one line a replay shows instead of a transcript, or `None` when it has rows to show.
+///
+/// The two messages are two different facts and must not read as one (D38): a step this box never
+/// synced is *unknown*, and rendering it as an empty conversation is the one reading `R-HIS-1`
+/// forbids.
+fn replay_body(replay: &ReplayState) -> Option<&'static str> {
+    if replay.missing {
+        Some("this step is not on this box")
+    } else if replay.transcript.is_empty() {
+        Some("this step recorded nothing")
+    } else {
+        None
+    }
 }
 
 /// The tab.
@@ -58,9 +129,16 @@ pub struct ChatTab {
     composer: Composer,
     /// `Esc` once arms the cancel; `Esc` again ends the session. Any other key disarms it, so an
     /// `Esc` typed to leave the composer cannot end a conversation by itself.
+    ///
+    /// Opening a replay disarms it too. The pair is a sequence over the *live* view, and the `Esc`
+    /// that leaves a replay is navigation: reading it as the second half would end the
+    /// conversation the user opened the replay over, which is the one thing `Esc Esc` exists to
+    /// make deliberate.
     cancel_armed: bool,
     /// The last refusal, shown in place of the transcript.
     refusal: Option<String>,
+    /// A past step open over the top of all of it, or `None` for the live view (D40).
+    replay: Option<ReplayState>,
 }
 
 impl Default for ChatTab {
@@ -85,6 +163,7 @@ impl ChatTab {
             composer: Composer::default(),
             cancel_armed: false,
             refusal: None,
+            replay: None,
         }
     }
 
@@ -98,6 +177,55 @@ impl ChatTab {
     #[must_use]
     pub const fn session(&self) -> Option<&ChatSessionState> {
         self.session.as_ref()
+    }
+
+    /// The past step on screen, for assertions.
+    #[must_use]
+    pub const fn replay(&self) -> Option<&ReplayState> {
+        self.replay.as_ref()
+    }
+
+    /// Every key while a replay is open — the whole of D40's read-only guarantee.
+    ///
+    /// It takes no [`Ctx`], which is the point: a mode that *cannot* reach the request sink is
+    /// one a reviewer can check by looking at this signature, rather than by trusting that no
+    /// arm below grew a `ctx.request` later. `Esc` leaves; the keys the live tab would act on
+    /// (`i`, `Enter`, a digit, `a`) are consumed and do nothing, because a finished step takes no
+    /// prompt and answers no permission request (D41); everything else is the transcript's, so
+    /// scrolling and `t` work exactly as they do live.
+    ///
+    /// The digits are *consumed* rather than passed on for the same reason the live tab consumes
+    /// them: a `2` typed at a permission row must not fall through to the global tab-select
+    /// binding and move the user off the conversation they are reading.
+    fn on_key_replay(&mut self, key: KeyEvent) -> Handled {
+        if key.code == KeyCode::Esc {
+            // Nothing else is touched: the session, its transcript and the composer's text are
+            // all exactly as replay found them. The cancel is disarmed rather than restored, and
+            // deliberately so - it was disarmed when the replay opened, precisely so that *this*
+            // key cannot be the second half of an `Esc Esc` that ends the live chat.
+            self.replay = None;
+            return Handled::Consumed;
+        }
+        match key.code {
+            KeyCode::Char('1'..='9' | 'i' | 'a') | KeyCode::Enter => Handled::Consumed,
+            _ => self
+                .replay
+                .as_mut()
+                .map_or(Handled::Pass, |replay| replay.transcript.on_key(key)),
+        }
+    }
+
+    /// The replay header: which step is on screen, how much of it there is, and that it is over.
+    fn replay_header(replay: &ReplayState, ctx: &Ctx<'_>) -> Line<'static> {
+        let id = replay.step_id.to_string();
+        let step = id.get(id.len().saturating_sub(STEP_TAIL)..).unwrap_or(&id);
+        Line::from(vec![
+            Span::styled(
+                format!("replay · step …{step} · {} rows", replay.transcript.len()),
+                ctx.theme.accent,
+            ),
+            Span::styled(" · read-only · Esc leave", ctx.theme.dim),
+        ])
     }
 
     /// Sends what the composer submitted: the first text starts a chat, later ones are follow-ups.
@@ -173,10 +301,15 @@ impl ChatTab {
             .as_ref()
             .and_then(|state| state.session_ref.as_ref())
             .map_or(NONE.to_owned(), |reference| reference.as_str().to_owned());
+        let buffered = if self.session.as_ref().is_some_and(|state| state.buffered) {
+            BUFFERED_NOTE
+        } else {
+            ""
+        };
         Line::from(vec![
             Span::styled(agent, ctx.theme.accent),
             Span::styled(
-                format!(" · {model} · {project} · session {session}"),
+                format!(" · {model} · {project} · session {session}{buffered}"),
                 ctx.theme.dim,
             ),
         ])
@@ -207,6 +340,10 @@ impl ChatTab {
     /// A refusal takes this line while there is a live conversation to keep on screen, and is
     /// cleared by the next key or the next frame.
     fn hint(&self) -> String {
+        // A replay offers three keys and no refusal can apply to it: nothing it can do fails.
+        if self.replay.is_some() {
+            return REPLAY_HINT.to_owned();
+        }
         if let Some(refusal) = &self.refusal
             && self.session.is_some()
         {
@@ -253,6 +390,13 @@ impl Tab for ChatTab {
         // A refusal is transient: it says what the last key could not do, and the next one clears
         // it whatever it was.
         self.refusal = None;
+        // Before the composer, before the digits, before anything that could send: a replay is a
+        // mode with no command path at all (D40), and `on_key_replay` is handed no `ctx` to prove
+        // it. An open composer underneath keeps its text — it simply cannot be typed into until
+        // `Esc` puts the live view back.
+        if self.replay.is_some() {
+            return self.on_key_replay(key);
+        }
         // The composer owns every key while it is open, so the tab's own single letters stay
         // single letters everywhere else.
         match self.composer.on_key(key) {
@@ -323,6 +467,7 @@ impl Tab for ChatTab {
                 step_id,
                 session_ref,
                 caps,
+                writer_label,
             } => {
                 self.pending_start = false;
                 self.refusal = None;
@@ -330,7 +475,24 @@ impl Tab for ChatTab {
                     step_id: *step_id,
                     session_ref: session_ref.clone(),
                     caps: *caps,
+                    buffered: *writer_label == BUFFERED_LABEL,
                     ended: None,
+                });
+            }
+            // The reply is addressed to this tab even though the Runs pane pressed the key
+            // (D39): the shell stamped the request with the Chat tab's origin, so replay arrives
+            // through the ordinary read path and the tab needs no store handle for it (`R-NF-3`).
+            // Decoding runs here, on the UI task — it is serde over rows the reply already
+            // carries, with no I/O.
+            StoreReply::StepEvents { step_id, events } => {
+                // An `Esc` armed before the replay opened is not the first half of the pair that
+                // leaves it: disarming here is what stops the *next* `Esc` after the replay closes
+                // from cancelling the live chat outright.
+                self.cancel_armed = false;
+                self.replay = Some(ReplayState {
+                    step_id: *step_id,
+                    transcript: Transcript::from_rows(events.as_deref().unwrap_or_default()),
+                    missing: events.is_none(),
                 });
             }
             StoreReply::Chat(ChatFrame::Event(envelope)) => {
@@ -365,8 +527,14 @@ impl Tab for ChatTab {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let banner = self.caps_banner();
-        let parked = self.transcript.parked();
+        let replay = self.replay.as_ref();
+        // A replay draws neither: the capability banner is a property of the *live* transport,
+        // and a strip offering options over a finished step would be a question nobody can
+        // answer (D41). The rows themselves still render the request, as history.
+        let (banner, parked) = match replay {
+            Some(_) => (None, None),
+            None => (self.caps_banner(), self.transcript.parked()),
+        };
         let [header, banner_area, body, strip, composer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(u16::from(banner.is_some())),
@@ -376,7 +544,11 @@ impl Tab for ChatTab {
         ])
         .areas(inner);
 
-        frame.render_widget(Paragraph::new(self.header(ctx)), header);
+        let header_line = match replay {
+            Some(replay) => Self::replay_header(replay, ctx),
+            None => self.header(ctx),
+        };
+        frame.render_widget(Paragraph::new(header_line), header);
         if let Some(text) = banner {
             frame.render_widget(
                 Paragraph::new(Line::styled(text, ctx.theme.error)),
@@ -384,10 +556,22 @@ impl Tab for ChatTab {
             );
         }
 
+        if let Some(replay) = replay {
+            // The same renderer the live view uses, over rows instead of frames (`R-TUI-6`).
+            match replay_body(replay) {
+                Some(text) => {
+                    frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), body)
+                }
+                None => {
+                    let lines = replay.transcript.lines(body.height as usize, ctx.theme);
+                    frame.render_widget(Paragraph::new(lines), body);
+                }
+            }
+        }
         // A refusal never replaces a live conversation: it is one line under it, because losing
         // the transcript to "answer the permission request first" would cost far more than the
         // message is worth. Only a chat that never started shows it in the body.
-        if self.session.is_none()
+        else if self.session.is_none()
             && let Some(refusal) = &self.refusal
         {
             frame.render_widget(
@@ -410,6 +594,360 @@ impl Tab for ChatTab {
         if let Some(row) = parked {
             PermissionStrip::render(frame, strip, row, ctx.theme);
         }
-        Composer::render(frame, composer, &self.composer, &self.hint(), ctx.theme);
+        match replay {
+            // Not `Composer::render`: the composer belongs to the live view, and a replay must
+            // not show an input line for a step that can take no input.
+            Some(_) => frame.render_widget(
+                Paragraph::new(Line::styled(self.hint(), ctx.theme.dim)),
+                composer,
+            ),
+            None => Composer::render(frame, composer, &self.composer, &self.hint(), ctx.theme),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{Action, Emit, TopBarState};
+    use crate::keymap::Keymap;
+    use crate::store_worker::Origin;
+    use crate::ui::Theme;
+    use chrono::{TimeZone as _, Utc};
+    use htui_agent::event::{DriverEnvelope, DriverEvent, TextChunk};
+    use htui_core::fixtures::ids;
+    use htui_core::model::{
+        EventKind, EventRole, ProjectRef, Scope, SessionEvent, StepId, WorkspaceId,
+    };
+    use serde_json::json;
+
+    /// Everything a [`Ctx`] borrows, kept alive for the length of a test — and the [`Emit`] that
+    /// makes "the tab sent nothing" an assertion rather than a claim.
+    struct Shell {
+        scope: Scope,
+        projects: Vec<ProjectRef>,
+        top_bar: TopBarState,
+        keymap: Keymap,
+        theme: Theme,
+        emit: Emit,
+    }
+
+    impl Shell {
+        fn new() -> Self {
+            Self {
+                scope: Scope {
+                    workspace_id: WorkspaceId::default(),
+                    project_ids: Vec::new(),
+                },
+                projects: Vec::new(),
+                top_bar: TopBarState::default(),
+                keymap: Keymap::new(),
+                theme: Theme::default(),
+                emit: Emit::default(),
+            }
+        }
+
+        fn ctx(&self) -> Ctx<'_> {
+            Ctx::new(
+                &self.scope,
+                &self.projects,
+                &self.top_bar,
+                &self.keymap,
+                &self.theme,
+                Origin::Tab(ChatTab::ID),
+                &self.emit,
+            )
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
+
+    fn row(seq: i32, kind: EventKind, payload: serde_json::Value) -> SessionEvent {
+        SessionEvent {
+            run_step_id: ids::STEP_PLAN,
+            seq,
+            turn: 0,
+            kind,
+            role: EventRole::Agent,
+            tool_call_id: None,
+            payload,
+            raw: None,
+            at: Utc.timestamp_opt(0, 0).single().expect("epoch is a time"),
+        }
+    }
+
+    /// A tab with a live, unfinished chat on screen: what a replay must leave exactly as it is.
+    fn live(shell: &Shell) -> ChatTab {
+        let mut tab = ChatTab::new();
+        tab.on_reply(
+            &StoreReply::ChatAccepted {
+                step_id: StepId::new(),
+                session_ref: Some(AgentSessionRef::new("live-1")),
+                caps: DriverCaps {
+                    permission_requests: true,
+                    edit_proposals: true,
+                    plans: true,
+                    thoughts: true,
+                    follow_up_in_session: true,
+                    resume: true,
+                    usage: true,
+                },
+                writer_label: "memory",
+            },
+            &mut shell.ctx(),
+        );
+        tab.on_reply(
+            &StoreReply::Chat(ChatFrame::Event(Box::new(DriverEnvelope {
+                event: DriverEvent::AssistantChunk(TextChunk {
+                    text: "still talking".to_owned(),
+                    message_id: Some("m1".to_owned()),
+                }),
+                raw: None,
+                at: Utc.timestamp_opt(0, 0).single().expect("epoch is a time"),
+            }))),
+            &mut shell.ctx(),
+        );
+        // Starting a chat is not what these tests are about: the queue starts empty at the key.
+        drop(shell.emit.take());
+        tab
+    }
+
+    /// Opens a replay of two rows on the tab, as the `StepEvents` reply does.
+    fn replay(tab: &mut ChatTab, shell: &Shell, events: Option<Vec<SessionEvent>>) {
+        tab.on_reply(
+            &StoreReply::StepEvents {
+                step_id: ids::STEP_PLAN,
+                events,
+            },
+            &mut shell.ctx(),
+        );
+    }
+
+    fn two_rows() -> Option<Vec<SessionEvent>> {
+        Some(vec![
+            row(
+                0,
+                EventKind::Prompt,
+                json!({ "text": "what happened here" }),
+            ),
+            row(1, EventKind::AssistantText, json!({ "text": "this did" })),
+        ])
+    }
+
+    /// D40, the property the whole mode exists for: while a replay is open the tab issues no
+    /// request at all — not a `ChatStart` from `i`/`Enter`, not a `ChatAnswer` from a digit, not
+    /// a `ChatCancel` from `Esc`. The `Emit` is empty afterwards, which is the same thing the
+    /// shell would have turned into a `StoreRequest`.
+    #[test]
+    fn every_key_the_live_tab_acts_on_sends_nothing_in_replay() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        replay(&mut tab, &shell, two_rows());
+
+        let keys = [
+            key(KeyCode::Char('i')),
+            key(KeyCode::Enter),
+            key(KeyCode::Char('1')),
+            key(KeyCode::Char('2')),
+            key(KeyCode::Char('9')),
+            key(KeyCode::Char('a')),
+        ];
+        for pressed in keys {
+            assert_eq!(
+                tab.on_key(pressed, &mut shell.ctx()),
+                Handled::Consumed,
+                "{pressed:?} must not fall through to the global table either"
+            );
+            assert!(
+                shell.emit.is_empty(),
+                "{pressed:?} sent something while a finished step was open"
+            );
+        }
+        assert!(
+            !tab.composer.is_active(),
+            "the composer never opens over a step that can take no more turns"
+        );
+        assert!(tab.replay().is_some(), "and none of them left replay");
+
+        // What replay *can* do is read: scrolling and folding are the transcript's own keys, and
+        // they reach it unchanged.
+        for pressed in [key(KeyCode::Char('t')), key(KeyCode::Char('j'))] {
+            assert_eq!(
+                tab.on_key(pressed, &mut shell.ctx()),
+                Handled::Consumed,
+                "{pressed:?} is the transcript's, and a replay is still a transcript"
+            );
+        }
+        assert!(shell.emit.is_empty(), "reading sends nothing either");
+    }
+
+    /// A parked-looking row is history, not a question (D41): the digit that would have answered
+    /// it live answers nothing here, and the row keeps saying nobody answered.
+    #[test]
+    fn an_unanswered_permission_replays_parked_and_stays_unanswered() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        replay(
+            &mut tab,
+            &shell,
+            Some(vec![
+                row(0, EventKind::Prompt, json!({ "text": "remove the build" })),
+                row(
+                    1,
+                    EventKind::PermissionRequest,
+                    json!({ "request_id": "req-1", "tool_call_id": "call-1",
+                            "options": [{ "id": "allow", "label": "Allow once",
+                                          "kind": "allow_once" }] }),
+                ),
+            ]),
+        );
+
+        let open = tab.replay().expect("the replay is open");
+        assert!(
+            open.transcript.parked().is_some(),
+            "the log says the agent asked and nobody answered"
+        );
+
+        tab.on_key(key(KeyCode::Char('1')), &mut shell.ctx());
+        assert!(shell.emit.is_empty(), "a finished step is not answerable");
+        assert!(
+            tab.replay()
+                .expect("still open")
+                .transcript
+                .parked()
+                .is_some()
+        );
+    }
+
+    /// The live session is a state the replay reads over, never one it writes to.
+    #[test]
+    fn esc_leaves_replay_and_the_live_chat_is_exactly_as_it_was() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        let before = tab.transcript.rows().to_vec();
+        let session = tab.session().expect("a live session").step_id;
+
+        replay(&mut tab, &shell, two_rows());
+        assert_eq!(
+            tab.session().map(|state| state.step_id),
+            Some(session),
+            "entering replay does not touch the session underneath"
+        );
+        assert_eq!(tab.transcript.rows(), before.as_slice());
+
+        assert_eq!(
+            tab.on_key(key(KeyCode::Esc), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(tab.replay().is_none(), "`Esc` leaves replay");
+        assert!(
+            shell.emit.is_empty(),
+            "and does not cancel the chat on the way out"
+        );
+        assert_eq!(
+            tab.transcript.rows(),
+            before.as_slice(),
+            "the live transcript is back, unchanged"
+        );
+    }
+
+    /// An `Esc` pressed to leave a replay must not be read as the second half of `Esc Esc`.
+    ///
+    /// The arming is a two-key sequence over the *live* view, and a replay opening between the two
+    /// keys breaks the sequence: the `Esc` that closes the replay is navigation, and treating it as
+    /// a confirmation would end the conversation the user opened the replay over. Entering replay
+    /// therefore disarms.
+    #[test]
+    fn entering_replay_disarms_the_cancel() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+
+        assert_eq!(
+            tab.on_key(key(KeyCode::Esc), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(
+            shell.emit.is_empty(),
+            "the first `Esc` only arms the cancel"
+        );
+
+        replay(&mut tab, &shell, two_rows());
+        tab.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert!(tab.replay().is_none(), "`Esc` leaves the replay");
+        assert!(shell.emit.is_empty(), "and cancels nothing on the way out");
+
+        tab.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert!(
+            shell.emit.is_empty(),
+            "the next `Esc` arms afresh: it is the first of a new pair, not the second of a pair \
+             a replay interrupted",
+        );
+
+        tab.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert!(
+            matches!(
+                shell.emit.take().as_slice(),
+                [Action::Store(StoreRequest::ChatCancel { .. })]
+            ),
+            "and `Esc Esc` over the live view still ends the chat",
+        );
+    }
+
+    /// A live frame that arrives while a past step is on screen belongs to the live session and
+    /// is applied to it — the replay is a second view, not a takeover.
+    #[test]
+    fn a_live_frame_keeps_applying_under_an_open_replay() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        replay(&mut tab, &shell, two_rows());
+
+        tab.on_reply(
+            &StoreReply::Chat(ChatFrame::Event(Box::new(DriverEnvelope {
+                event: DriverEvent::AssistantChunk(TextChunk {
+                    text: " and more".to_owned(),
+                    message_id: Some("m1".to_owned()),
+                }),
+                raw: None,
+                at: Utc.timestamp_opt(0, 0).single().expect("epoch is a time"),
+            }))),
+            &mut shell.ctx(),
+        );
+
+        tab.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert_eq!(
+            tab.transcript.rows(),
+            &[TranscriptRow::Assistant {
+                text: "still talking and more".to_owned(),
+                message_id: Some("m1".to_owned()),
+            }]
+        );
+    }
+
+    /// D38's two answers are two different facts and must not read as one.
+    #[test]
+    fn a_step_not_on_this_box_does_not_read_as_a_step_that_said_nothing() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+
+        replay(&mut tab, &shell, None);
+        assert_eq!(
+            replay_body(tab.replay().expect("open")),
+            Some("this step is not on this box")
+        );
+
+        replay(&mut tab, &shell, Some(Vec::new()));
+        assert_eq!(
+            replay_body(tab.replay().expect("open")),
+            Some("this step recorded nothing")
+        );
+
+        replay(&mut tab, &shell, two_rows());
+        assert_eq!(
+            replay_body(tab.replay().expect("open")),
+            None,
+            "a step with rows shows the rows"
+        );
     }
 }

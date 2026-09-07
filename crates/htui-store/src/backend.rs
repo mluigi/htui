@@ -5,11 +5,18 @@
 //!
 //! There is no `Backend::write*` method and no `impl WriteStore for Backend`. The two ways to
 //! reach a `WriteStore` are [`Backend::writable`], which borrows a [`PgStore`] for the length of
-//! one call, and [`Backend::writer`] (MOD-2 milestone 3), which hands out an owned
-//! [`Writer`] a spawned task can hold for a whole session. **Both answer `None` on
-//! [`Backend::Offline`]**, so a write attempt against an offline store is still unreachable rather
-//! than merely refused at runtime (plan D1, MOD-2 D26). That claim is documented here and
-//! deliberately not covered by a compile-fail test: it is not worth a `trybuild` dependency.
+//! one call and answers `None` unless the server is reachable, and [`Backend::writer`] (MOD-2
+//! milestone 3), which hands out an owned [`Writer`] a spawned task can hold for a whole session.
+//!
+//! Since MOD-2 milestone 4 those two differ on [`Backend::Offline`] (plan D34): `writer()` answers
+//! `Some(Writer::Buffered(..))` there, so there **is** an offline write path — and it reaches a
+//! file under `<cache_dir>/pending/`, never the server. The invariant that survives is narrower
+//! and still true: nothing writes to Postgres unless the backend is [`Backend::Online`], which is
+//! what `writable()` still answers for. What has not changed at all is
+//! [`Backend::is_writable`]: it is still `false` offline, because the store worker's re-dial
+//! ticker keys on it and a `true` there would stop the process ever dialling Postgres again.
+//! Both claims are documented here and deliberately not covered by a compile-fail test: they are
+//! not worth a `trybuild` dependency.
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
@@ -20,7 +27,7 @@ use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 
 use crate::cache::CacheStore;
 use crate::pg::PgStore;
-use crate::writer::Writer;
+use crate::writer::{BufferedWriter, Writer};
 
 /// Seconds in a minute and minutes in an hour: the two thresholds of [`Backend::label`].
 const MINUTE: i64 = 60;
@@ -39,7 +46,8 @@ pub enum Backend {
         /// The mirror, kept warm by the refresher.
         cache: CacheStore,
     },
-    /// Postgres unreachable: reads come from the mirror, there is no write path at all.
+    /// Postgres unreachable: reads come from the mirror, and the only write path is the offline
+    /// chat buffer under `<cache_dir>/pending/` (MOD-2 milestone 4, [`Backend::writer`]).
     Offline {
         /// The mirror.
         cache: CacheStore,
@@ -82,8 +90,13 @@ impl Backend {
         }
     }
 
-    /// Whether write paths are reachable. [`Backend::Offline`] is the first backend to answer
+    /// Whether **the server** is reachable. [`Backend::Offline`] is the first backend to answer
     /// `false`.
+    ///
+    /// It stays `false` offline whatever else the mirror learns to answer: this is what the store
+    /// worker's re-dial ticker keys on, so a `true` here would stop the process ever dialling
+    /// Postgres again. "Can something be written at all" is [`Backend::writer`]'s question, and it
+    /// is a different one.
     #[must_use]
     pub const fn is_writable(&self) -> bool {
         match self {
@@ -104,19 +117,31 @@ impl Backend {
         }
     }
 
-    /// An **owned** writable handle, or `None` (MOD-2 D26).
+    /// An **owned** writable handle, or `None` (MOD-2 D26, D34).
     ///
     /// The counterpart of [`Backend::writable`] for a caller that outlives one call — the chat
     /// recorder, which is generic over `S: WriteStore` and lives inside a spawned session task.
     /// [`Backend::Memory`] answers `Some` here and `None` there, because a `MemStore` **is** a
-    /// `WriteStore` even though it is not a [`PgStore`]; [`Backend::Offline`] answers `None` to
-    /// both, which is the invariant that matters.
+    /// `WriteStore` even though it is not a [`PgStore`]. [`Backend::Offline`] answers `Some` here
+    /// since milestone 4: a chat that cannot reach Postgres records into
+    /// `<cache_dir>/pending/` through [`Writer::Buffered`] and the refresher uploads it on the
+    /// next connection, which is the difference between a chat that is recorded and no chat at
+    /// all. It still answers `None` to `writable()`, because that one is the server.
+    ///
+    /// Every call builds a **fresh** [`crate::BufferedWriter`]: its registration map belongs to
+    /// one chat, and the runtime takes exactly one writer per chat.
+    ///
+    /// The return type stays `Option` even though no variant answers `None` today: `writable()`
+    /// is the paired API and stays `Option`, and a fourth variant that cannot write should be a
+    /// one-arm change here rather than a signature change at every call site.
     #[must_use]
     pub fn writer(&self) -> Option<Writer> {
         match self {
             Self::Memory(store) => Some(Writer::Memory(store.clone())),
             Self::Online { pg, .. } => Some(Writer::Online(pg.clone())),
-            Self::Offline { .. } => None,
+            Self::Offline { cache, .. } => {
+                Some(Writer::Buffered(BufferedWriter::new(cache.clone())))
+            }
         }
     }
 
@@ -125,11 +150,15 @@ impl Backend {
     /// The render side never learns a `UserId`: the chat tab asks for a chat and the worker fills
     /// in who started it, which is what keeps `R-NF-3` a fact about ownership rather than a habit.
     ///
+    /// [`Backend::Offline`] resolves it from the mirror since MOD-2 milestone 4 (plan D33):
+    /// [`CacheStore::this_user`] looks up the OS-derived name the online seed used, so an offline
+    /// chat names the author the server already has instead of refusing outright.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] on a memory store with no `app_user` row — an empty store has no
-    /// author to attribute a run to — and [`StoreError::Unreachable`] while offline, where the
-    /// answer exists on a server this process cannot currently reach.
+    /// author to attribute a run to — and the same on a mirror that has never synced a row under
+    /// this OS user's name.
     pub async fn this_user(&self) -> Result<UserId> {
         match self {
             Self::Memory(store) => store.this_user().ok_or_else(|| StoreError::NotFound {
@@ -137,9 +166,7 @@ impl Backend {
                 id: "(none loaded)".to_owned(),
             }),
             Self::Online { pg, .. } => Ok(pg.this_user()),
-            Self::Offline { .. } => Err(StoreError::Unreachable(
-                "the user is not known while offline".to_owned(),
-            )),
+            Self::Offline { cache, .. } => cache.this_user().await,
         }
     }
 
@@ -251,26 +278,22 @@ impl Backend {
     /// The agent registry, ordered by `agent.name`, each row carrying this box's `agent_box`
     /// (MOD-2 plan D3, D14).
     ///
-    /// The one inherent read with no [`Backend::Offline`] answer: `agent` and `agent_box` are
-    /// absent from the mirrored table list (`docs/ANA-9.md` §4.4), so there is nothing in the
-    /// mirror to read and the arm refuses instead of returning a misleading empty list. The refusal
-    /// is [`StoreError::Unreachable`] rather than
-    /// [`ReadOnly`](htui_core::store::StoreError::ReadOnly) because retrying once the server is
-    /// back **does** work; it is harmless to a backend that is already `Offline`, whose
-    /// `went_offline()` returns `false` and whose store worker therefore does not re-enter the
-    /// transition (assumption A9).
+    /// This read used to refuse on [`Backend::Offline`], because neither table was mirrored. Since
+    /// MOD-2 milestone 4 `agent` **is** (plan D31), so the arm answers from the mirror with every
+    /// `on_box` set to `None`: an offline chat has to resolve a driver, and a refusal there is the
+    /// difference between a chat that records to disk and no chat at all. `agent_box` stays
+    /// server-side, so offline the Settings tab lists the rows as "not probed"
+    /// ([`AgentSummary::on_box`]) where it used to show a failed read; its failure arm stays for a
+    /// genuine server error, which this no longer is.
     ///
     /// # Errors
     ///
-    /// Whatever the arm's store reports, and [`StoreError::Unreachable`] on
-    /// [`Backend::Offline`].
+    /// Whatever the arm's store reports; offline, [`StoreError::Backend`] from the mirror decoder.
     pub async fn agents(&self) -> Result<Vec<AgentSummary>> {
         match self {
             Self::Memory(store) => store.agents().await,
             Self::Online { pg, .. } => pg.agents().await,
-            Self::Offline { .. } => Err(StoreError::Unreachable(
-                "agent registry is not mirrored".to_owned(),
-            )),
+            Self::Offline { cache, .. } => cache.agents().await,
         }
     }
 }

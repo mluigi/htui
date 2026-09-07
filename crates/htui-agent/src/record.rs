@@ -57,7 +57,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, SubsecRound, Utc};
-use htui_core::model::{EventKind, EventRole, SessionEvent, StepId};
+use htui_core::model::{EventKind, EventRole, SessionEvent, StepId, UsageTotals};
 use htui_core::scrub::{Scrubber, Unmasked};
 use htui_core::store::{StoreError, WriteStore};
 use serde::Serialize;
@@ -68,7 +68,7 @@ use tokio::sync::mpsc;
 
 use crate::driver::{AgentSession, PermissionRequestId};
 use crate::error::DriverError;
-use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, UsageEvent};
+use crate::event::{DoneEvent, DriverEnvelope, DriverEvent};
 
 /// Flush trigger 4: the accumulated text a coalesced run may reach before it is cut.
 ///
@@ -197,47 +197,6 @@ struct PendingRow {
     /// as many as it has chunks.
     raw: Vec<Value>,
     at: DateTime<Utc>,
-}
-
-/// The running sum of the step's `usage` deltas (ANA-4 §4.1: `cost_micros` is a delta, which is
-/// what makes `run_step.usage` a plain sum).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct UsageTotals {
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    cache_read_tokens: Option<i64>,
-    cache_write_tokens: Option<i64>,
-    cost_micros: Option<i64>,
-}
-
-impl UsageTotals {
-    /// Adds one delta. A key no report has ever carried stays `null` rather than becoming `0`, so
-    /// "the agent reports no token counts" and "the agent reported zero" stay distinguishable.
-    fn add(&mut self, event: &UsageEvent) {
-        add_delta(&mut self.input_tokens, event.input_tokens);
-        add_delta(&mut self.output_tokens, event.output_tokens);
-        add_delta(&mut self.cache_read_tokens, event.cache_read_tokens);
-        add_delta(&mut self.cache_write_tokens, event.cache_write_tokens);
-        add_delta(&mut self.cost_micros, event.cost_micros);
-    }
-
-    /// The `run_step.usage` document: the five ANA-9 §4.3 keys, each nullable.
-    fn to_value(self) -> Value {
-        json!({
-            "input_tokens": self.input_tokens,
-            "output_tokens": self.output_tokens,
-            "cache_read_tokens": self.cache_read_tokens,
-            "cache_write_tokens": self.cache_write_tokens,
-            "cost_micros": self.cost_micros,
-        })
-    }
-}
-
-/// `slot += delta`, saturating, leaving `slot` untouched when the report carried no value.
-fn add_delta(slot: &mut Option<i64>, delta: Option<i64>) {
-    if let Some(delta) = delta {
-        *slot = Some(slot.unwrap_or(0).saturating_add(delta));
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -590,8 +549,12 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
                 }
             }
             (event, _) => {
-                if let DriverEvent::Usage(usage) = event {
-                    self.usage.add(usage);
+                if matches!(event, DriverEvent::Usage(_)) {
+                    // The scrubbed document that is about to be persisted, not the typed event:
+                    // the uploader (`htui-store`) has only these bytes, and summing them on both
+                    // sides is what makes an uploaded step's `run_step.usage` indistinguishable
+                    // from an online one (plan D36).
+                    self.usage.add_payload(&payload);
                     self.usage_dirty = true;
                 }
                 self.push(PendingRow {
@@ -742,11 +705,18 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// the row keeps the [`EventKind`] the **unscrubbed** event already decided, and carries the
     /// masked document verbatim.
     ///
-    /// What the row loses is the things that read the typed event: it cannot be coalesced into an
-    /// open run, deduped against an earlier proposal, or summed into `run_step.usage`, so the
-    /// open run is flushed first and the row stands alone. `tool_call_id` is taken from the
-    /// masked document, which is why the column can never carry an unmasked id. No frame reaches
-    /// the chat tab, which has no scrubbed event to render; the row is there when it reloads.
+    /// What the row loses is the two things that read the typed event: it cannot be coalesced into
+    /// an open run, nor deduped against an earlier proposal, so the open run is flushed first and
+    /// the row stands alone. `tool_call_id` is taken from the masked document, which is why the
+    /// column can never carry an unmasked id. No frame reaches the chat tab, which has no scrubbed
+    /// event to render; the row is there when it reloads.
+    ///
+    /// It is **not** exempt from `run_step.usage`. A persisted `usage` row is summed from its
+    /// document, not from its typed event ([`UsageTotals::add_payload`]), so masking costs it only
+    /// the keys masking made unreadable. Skipping it here would be a real divergence rather than a
+    /// tidiness: `upload_pending` sums *every* persisted `usage` row of a chat that happened
+    /// offline (MOD-2 plan D36), so an online step and the same step uploaded from a buffer would
+    /// disagree for exactly this one row shape.
     async fn record_unreadable(
         &mut self,
         kind: EventKind,
@@ -755,6 +725,10 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         at: DateTime<Utc>,
     ) -> Result<(), RecordError> {
         self.flush().await?;
+        if kind == EventKind::Usage {
+            self.usage.add_payload(&payload);
+            self.usage_dirty = true;
+        }
         let tool_call_id = payload
             .get("tool_call_id")
             .and_then(Value::as_str)

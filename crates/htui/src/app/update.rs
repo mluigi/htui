@@ -3,7 +3,7 @@
 //! Everything else in the crate produces [`Action`]s; this file is the only consumer. Adding a
 //! feature adds an arm here and a file under `ui/`, never an arm in the event loop.
 
-use htui_core::model::{Scope, WorkspaceId, WorkspaceSummary};
+use htui_core::model::{Scope, StepId, WorkspaceId, WorkspaceSummary};
 
 use crate::app::action::{Action, OverlayAction, TabAction};
 use crate::app::state::{App, Ctx};
@@ -22,6 +22,7 @@ impl App {
             Action::Store(request) => self.dispatch(Origin::App, request),
             Action::Reply(envelope) => self.on_reply(envelope),
             Action::SetScope { workspace } => self.set_scope(workspace),
+            Action::Replay { step_id } => self.replay(step_id),
             Action::ToggleHelp => self.help_visible = !self.help_visible,
             Action::Error(message) => self.status = Some(message),
             Action::Tick => {
@@ -100,6 +101,23 @@ impl App {
         self.overlays.clear();
         self.activate_tab();
         self.dispatch(Origin::App, StoreRequest::ActiveRuns { scope });
+    }
+
+    /// Reopens a past step: focus the replay tab, then ask for its rows on that tab's behalf
+    /// (MOD-2 D39).
+    ///
+    /// The request is stamped with the *replay* tab's origin, not the origin of whoever pressed
+    /// the key, which is the whole reason [`App::dispatch`] takes one: the reply lands in that
+    /// tab's `on_reply` like every other read, so no `Tab` method and no downcast is needed to
+    /// hand a step to a view that did not ask for it. The staleness index does its ordinary work
+    /// too — a second replay supersedes the first under `(Tab(replay), StepEvents)`.
+    fn replay(&mut self, step_id: StepId) {
+        let Some(tab) = self.replay_tab else {
+            self.status = Some("no tab can replay a step".to_owned());
+            return;
+        };
+        self.update_tab(TabAction::Focus(tab));
+        self.dispatch(Origin::Tab(tab), StoreRequest::StepEvents(step_id));
     }
 
     /// A reply came back: top bar first, then the staleness gate, then the addressee.

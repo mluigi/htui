@@ -3,7 +3,7 @@
 //! A view never mutates the shell: it emits an [`Action`] through
 //! [`Ctx::emit`](crate::app::Ctx::emit) and `App::update` is the single place that applies it.
 
-use htui_core::model::WorkspaceSummary;
+use htui_core::model::{StepId, WorkspaceSummary};
 
 use crate::store_worker::{ReplyEnvelope, StoreRequest};
 use crate::ui::overlay::OverlayId;
@@ -28,6 +28,15 @@ pub enum Action {
     SetScope {
         /// The workspace to enter, with its projects in `workspace_project.position` order.
         workspace: WorkspaceSummary,
+    },
+    /// Reopen a past step read-only (MOD-2 D39, `R-HIS-2`). Emitted by the Runs pane.
+    ///
+    /// The emitting view names the step and nothing else: which tab replays it is the shell's
+    /// registration (`App::replay_tab`), so the Backlog tab never has to know that a Chat tab
+    /// exists.
+    Replay {
+        /// The step whose persisted rows are to be replayed.
+        step_id: StepId,
     },
     /// Show or hide the key help.
     ToggleHelp,

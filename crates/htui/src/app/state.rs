@@ -15,7 +15,7 @@ use crate::app::action::{Action, Handled};
 use crate::keymap::{KeyChord, KeyScope, Keymap};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
-use crate::ui::tabs::{Tab, TabRegistry};
+use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, layout, top_bar};
 use crossterm::event::{Event, KeyEvent, KeyEventKind};
 
@@ -170,6 +170,13 @@ pub struct App {
     /// Set by [`register_all`](crate::app::register_all), and an id for the same reason
     /// `startup_overlay` is one: the shell must not name a concrete view (MOD-1 blueprint D).
     pub migration_overlay: Option<crate::ui::overlay::OverlayId>,
+    /// Tab that shows a replayed step (MOD-2 D39, `R-HIS-2`).
+    ///
+    /// Set by [`register_all`](crate::app::register_all), and an id for the same reason
+    /// `migration_overlay` is one: `Action::Replay` has to focus a view and address a reply to
+    /// it, and the shell must not name a concrete one to do so. `None` means this build can
+    /// replay nothing, which the status line says rather than the shell swallowing the key.
+    pub replay_tab: Option<TabId>,
     /// Whether the migration prompt has already been offered this session.
     ///
     /// `StoreState` is re-read every fourth tick, so without this an answered `n` would re-open
@@ -207,6 +214,7 @@ impl App {
             ticks: 0,
             startup_overlay: None,
             migration_overlay: None,
+            replay_tab: None,
             migration_prompt_shown: false,
         }
     }

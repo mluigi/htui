@@ -13,7 +13,7 @@
 //! sibling worktree.
 #![cfg(feature = "demo")]
 
-mod common;
+use htui_store::testkit as common;
 
 use std::path::Path;
 
@@ -21,12 +21,12 @@ use chrono::{TimeDelta, Utc};
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
     EventKind, EventRole, ItemFilter, LinkGraph, ProjectId, RunId, Scope, SessionEvent, StepId,
-    WorkspaceSummary,
+    UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore as _, StoreError};
-use htui_store::CacheStore;
-use htui_store::cache::pending::{append_pending, upload_pending};
+use htui_store::cache::pending::{append_pending, seal_orphaned, seal_pending, upload_pending};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
+use htui_store::{Backend, CacheStore, identity};
 use serde_json::json;
 use sqlx::{Row as _, SqlitePool};
 
@@ -166,6 +166,7 @@ async fn a_pass_mirrors_the_demo_projects() {
     // Table by table, the mirror holds what Postgres holds.
     for table in [
         "app_user",
+        "agent",
         "workspace",
         "workspace_project",
         "project",
@@ -205,6 +206,11 @@ async fn a_pass_mirrors_the_demo_projects() {
 
     assert_eq!(report.tombstones, 1, "the fixture has one tombstoned link");
     assert_eq!(report.uploaded, 0, "nothing was buffered offline");
+    assert_eq!(
+        report.rows("agent"),
+        2,
+        "the unscoped registry rides the pass beside `app_user` (D32)"
+    );
     assert!(report.rows("item") > 0, "items were mirrored");
     assert!(
         cache
@@ -803,6 +809,175 @@ async fn a_running_step_is_mirrored_only_once_it_has_finished() {
 }
 
 // ------------------------------------------------------------------------------------------------
+// The mirrored `agent` registry and the offline user (MOD-2 milestone 4, plan D31-D33)
+// ------------------------------------------------------------------------------------------------
+
+/// `agent` is unscoped, so the pass replaces it whole and names no cursor (D32).
+#[tokio::test]
+async fn a_pass_mirrors_the_agent_registry() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let report = run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+    assert_eq!(report.rows("agent"), 2, "the fixture's two registry rows");
+
+    let mirrored = cache.agents().await.expect("read the mirrored registry");
+    assert_eq!(
+        mirrored
+            .iter()
+            .map(|row| row.agent.name.as_str())
+            .collect::<Vec<&str>>(),
+        vec!["agy", "claude"],
+        "ordered by agent.name, as the Postgres read is",
+    );
+    assert!(
+        mirrored.iter().all(|row| row.on_box.is_none()),
+        "`agent_box` is not mirrored, so no row claims a probe it does not have (D31)",
+    );
+    assert_eq!(
+        mirrored,
+        MemStore::demo()
+            .agents()
+            .await
+            .expect("the reference registry"),
+        "column for column, what the reference store answers",
+    );
+
+    // A full replace, not an accumulation - and still no `cache_cursor` row anywhere.
+    let second = run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("a second pass");
+    assert_eq!(second.rows("agent"), 2);
+    assert_eq!(
+        mirror_count(cache.pool(), "agent").await,
+        2,
+        "the second pass replaced the rows rather than duplicating them",
+    );
+    let cursors: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cache_cursor WHERE table_name = 'agent'")
+            .fetch_one(cache.pool())
+            .await
+            .expect("count the agent cursors");
+    assert_eq!(
+        cursors, 0,
+        "an unscoped table is a full replace and rides no cursor (D32)",
+    );
+    assert_eq!(
+        cache.agents().await.expect("read again"),
+        mirrored,
+        "and answers the same rows",
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// The registry read an offline chat resolves its driver through (D31).
+#[tokio::test]
+async fn an_offline_backend_lists_the_mirrored_registry() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let backend = Backend::Offline {
+        cache: cache.clone(),
+        since: Some(Utc::now()),
+    };
+    let listed = backend
+        .agents()
+        .await
+        .expect("an offline registry read answers from the mirror");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|row| row.agent.name.as_str())
+            .collect::<Vec<&str>>(),
+        vec!["agy", "claude"],
+    );
+    assert!(listed.iter().all(|row| row.on_box.is_none()));
+    assert!(
+        !backend.is_writable(),
+        "listing the registry did not make the server reachable: the re-dial ticker still fires",
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// `run.started_by` offline: the OS-derived name against the mirrored `app_user`, or `NotFound`
+/// (D33). Never an invented author.
+#[tokio::test]
+async fn this_user_resolves_the_synced_name_and_refuses_an_unsynced_one() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    // This box's OS user, as `PgStore::seed_if_empty` would have named it. `ON CONFLICT` because
+    // the fixture user may already carry that name on a maintainer's own machine.
+    let os_name = identity::os_user_name();
+    sqlx::query("INSERT INTO app_user (id, name) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING")
+        .bind(UserId::new().as_uuid())
+        .bind(&os_name)
+        .execute(&db.pool)
+        .await
+        .expect("seed an app_user for this OS user");
+    let expected: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM app_user WHERE name = $1 ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(&os_name)
+    .fetch_one(&db.pool)
+    .await
+    .expect("the row is there");
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let fixture_name = fixtures::demo_data().users[0].name.clone();
+    assert_eq!(
+        cache
+            .user_named(&fixture_name)
+            .await
+            .expect("the fixture user is mirrored"),
+        ids::USER,
+    );
+    assert_eq!(
+        cache.this_user().await.expect("the OS user is mirrored"),
+        UserId::from(expected),
+        "the same name the online seed derives (D33)",
+    );
+
+    let backend = Backend::Offline {
+        cache: cache.clone(),
+        since: Some(Utc::now()),
+    };
+    assert_eq!(
+        backend.this_user().await.expect("the offline arm agrees"),
+        UserId::from(expected),
+    );
+
+    assert!(
+        matches!(
+            cache.user_named("nobody-this-box-ever-synced").await,
+            Err(StoreError::NotFound {
+                entity: "app_user",
+                ..
+            })
+        ),
+        "a name this box never synced is refused, not invented",
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+// ------------------------------------------------------------------------------------------------
 // Rebuild rules (§4.4, plan D8)
 // ------------------------------------------------------------------------------------------------
 
@@ -1207,9 +1382,22 @@ fn read_pending(path: &Path) -> Vec<SessionEvent> {
         .collect()
 }
 
-/// The path `append_pending` owns, spelled out here rather than asked of the appender.
+/// The path `append_pending` owns while the chat is live, spelled out here rather than asked of
+/// the appender (`[H-1]`: the open suffix is what keeps `upload_pending` off a running chat).
+fn open_pending_path(dir: &Path, project: ProjectId, run: RunId) -> std::path::PathBuf {
+    dir.join("pending")
+        .join(format!("{project}.{run}.jsonl.open"))
+}
+
+/// The path `seal_pending` renames to, and the only one `upload_pending` looks at.
 fn pending_path(dir: &Path, project: ProjectId, run: RunId) -> std::path::PathBuf {
     dir.join("pending").join(format!("{project}.{run}.jsonl"))
+}
+
+/// `[H-1]` The `n`th sealed name of one run: what a seal renames to when [`pending_path`] is taken.
+fn numbered_pending_path(dir: &Path, project: ProjectId, run: RunId, n: u32) -> std::path::PathBuf {
+    dir.join("pending")
+        .join(format!("{project}.{run}.{n}.jsonl"))
 }
 
 /// Twenty events become twenty lines, in `seq` order, under the two-part name.
@@ -1225,10 +1413,14 @@ async fn pending_append_creates_the_file_in_seq_order() {
         .expect("append twenty events");
     assert_eq!(written, 20, "one line per event");
 
-    let path = pending_path(root.path(), ids::PROJECT_HTUI, run);
+    let path = open_pending_path(root.path(), ids::PROJECT_HTUI, run);
     assert!(
         path.exists(),
-        "the appender creates the file on first write"
+        "the appender creates the file on first write, under the open name (H-1)"
+    );
+    assert!(
+        !pending_path(root.path(), ids::PROJECT_HTUI, run).exists(),
+        "and not under the name `upload_pending` reads: this chat is still live",
     );
     let back = read_pending(&path);
     assert_eq!(
@@ -1251,7 +1443,7 @@ async fn pending_append_extends_without_rewriting() {
     append_pending(root.path(), ids::PROJECT_HTUI, run, &first)
         .await
         .expect("the first append");
-    let path = pending_path(root.path(), ids::PROJECT_HTUI, run);
+    let path = open_pending_path(root.path(), ids::PROJECT_HTUI, run);
     let after_first = std::fs::read_to_string(&path).expect("read the first twenty");
 
     let written = append_pending(root.path(), ids::PROJECT_HTUI, run, &second)
@@ -1285,7 +1477,7 @@ async fn pending_append_of_nothing_creates_no_file() {
         .expect("appending no events is not an error");
     assert_eq!(written, 0);
     assert!(
-        !pending_path(root.path(), ids::PROJECT_HTUI, run).exists(),
+        !open_pending_path(root.path(), ids::PROJECT_HTUI, run).exists(),
         "no events, no file",
     );
 }
@@ -1326,6 +1518,12 @@ async fn pending_upload_lands_a_file_the_appender_wrote() {
     append_pending(cache.dir(), ids::PROJECT_HTUI, run, &second)
         .await
         .expect("append the second turn");
+    assert!(
+        seal_pending(cache.dir(), ids::PROJECT_HTUI, run)
+            .await
+            .expect("the chat ends"),
+        "the buffer was open, so sealing it is what makes it uploadable (H-1)"
+    );
     let path = pending_path(cache.dir(), ids::PROJECT_HTUI, run);
     assert!(path.exists(), "the appender owns this name");
 
@@ -1392,6 +1590,9 @@ async fn pending_upload_of_an_appended_file_is_idempotent() {
     append_pending(cache.dir(), ids::PROJECT_HTUI, run, &events)
         .await
         .expect("the first append");
+    seal_pending(cache.dir(), ids::PROJECT_HTUI, run)
+        .await
+        .expect("the first seal");
     upload_pending(
         &db.pool,
         cache.dir(),
@@ -1409,6 +1610,9 @@ async fn pending_upload_of_an_appended_file_is_idempotent() {
     append_pending(cache.dir(), ids::PROJECT_HTUI, run, &events)
         .await
         .expect("the second append");
+    seal_pending(cache.dir(), ids::PROJECT_HTUI, run)
+        .await
+        .expect("the second seal");
     let uploaded = upload_pending(
         &db.pool,
         cache.dir(),
@@ -1425,6 +1629,356 @@ async fn pending_upload_of_an_appended_file_is_idempotent() {
         common::count(&db.pool, "session_event").await,
         session_events,
     );
+
+    teardown(db, &[&cache]).await;
+}
+
+// ------------------------------------------------------------------------------------------------
+// `[H-1]` The seal: a live buffer is invisible to the uploader until its chat ends
+// ------------------------------------------------------------------------------------------------
+
+/// Sealing renames the open buffer once, and sealing again is `false` rather than an error.
+#[tokio::test]
+async fn seal_pending_renames_once() {
+    let root = tempfile::tempdir().expect("a throwaway cache root");
+    let run = RunId::new();
+    let step = StepId::new();
+    let events: Vec<SessionEvent> = (0..3).map(|seq| pending_event(step, seq)).collect();
+
+    assert!(
+        !seal_pending(root.path(), ids::PROJECT_HTUI, run)
+            .await
+            .expect("sealing nothing is not an error"),
+        "a chat that recorded nothing has no buffer to seal",
+    );
+
+    append_pending(root.path(), ids::PROJECT_HTUI, run, &events)
+        .await
+        .expect("append");
+    assert!(
+        seal_pending(root.path(), ids::PROJECT_HTUI, run)
+            .await
+            .expect("the seal"),
+    );
+
+    let open = open_pending_path(root.path(), ids::PROJECT_HTUI, run);
+    let sealed = pending_path(root.path(), ids::PROJECT_HTUI, run);
+    assert!(!open.exists(), "the open name is gone");
+    assert_eq!(read_pending(&sealed), events, "and the lines are unchanged");
+
+    assert!(
+        !seal_pending(root.path(), ids::PROJECT_HTUI, run)
+            .await
+            .expect("a second seal is not an error"),
+        "there is nothing left open to seal",
+    );
+}
+
+/// `[H-1]` A seal whose sealed name is taken renames to a **second** sealed name and never appends:
+/// the file it found is not touched at all.
+///
+/// Appending was the earlier answer and it had two windows, both of which cost or duplicate rows.
+/// A crash between the write and the `remove_file` left the open buffer in place, so the next
+/// `seal_orphaned` appended the very same lines a second time and `UsageTotals::from_rows` counted
+/// every `usage` row twice (criterion 7). And a second `htui` process that seals this run's buffer,
+/// uploads it and deletes it while this one is still writing would take the appended tail down with
+/// it. A rename is atomic and has neither window; the extra file uploads on its own pass.
+#[tokio::test]
+async fn a_seal_onto_a_taken_name_writes_a_second_file_and_never_appends() {
+    let root = tempfile::tempdir().expect("a throwaway cache root");
+    let run = RunId::new();
+    let step = StepId::new();
+
+    let first: Vec<SessionEvent> = (0..3).map(|seq| pending_event(step, seq)).collect();
+    append_pending(root.path(), ids::PROJECT_HTUI, run, &first)
+        .await
+        .expect("the chat records");
+    seal_pending(root.path(), ids::PROJECT_HTUI, run)
+        .await
+        .expect("the chat ends");
+    let sealed = pending_path(root.path(), ids::PROJECT_HTUI, run);
+    let sealed_bytes = std::fs::read(&sealed).expect("the sealed buffer");
+
+    // A flush that landed after the seal, or a buffer a second process sealed under this one's
+    // feet: either way the sealed name is taken when the seal comes round.
+    let late: Vec<SessionEvent> = (3..5).map(|seq| pending_event(step, seq)).collect();
+    append_pending(root.path(), ids::PROJECT_HTUI, run, &late)
+        .await
+        .expect("the late flush");
+    assert!(
+        seal_pending(root.path(), ids::PROJECT_HTUI, run)
+            .await
+            .expect("the second seal"),
+    );
+
+    assert_eq!(
+        std::fs::read(&sealed).expect("the sealed buffer, again"),
+        sealed_bytes,
+        "the sealed file the seal found is byte-identical: nothing was appended to it",
+    );
+    let second = numbered_pending_path(root.path(), ids::PROJECT_HTUI, run, 1);
+    assert_eq!(
+        read_pending(&second),
+        late,
+        "the tail became a sealed file of its own",
+    );
+    assert!(
+        !open_pending_path(root.path(), ids::PROJECT_HTUI, run).exists(),
+        "and the open name is gone, because the seal was a rename",
+    );
+
+    // A third half keeps counting rather than colliding again.
+    let later: Vec<SessionEvent> = (5..6).map(|seq| pending_event(step, seq)).collect();
+    append_pending(root.path(), ids::PROJECT_HTUI, run, &later)
+        .await
+        .expect("a later flush");
+    seal_pending(root.path(), ids::PROJECT_HTUI, run)
+        .await
+        .expect("the third seal");
+    assert_eq!(
+        read_pending(&numbered_pending_path(
+            root.path(),
+            ids::PROJECT_HTUI,
+            run,
+            2
+        )),
+        later,
+    );
+}
+
+/// `[H-1]` Both halves of a collided seal upload, and the step's log is their union with no `seq`
+/// twice.
+///
+/// Two files, two passes of the same `upload_pending` call: the second finds the `run` and the
+/// `run_step` already there (`ON CONFLICT (id) DO NOTHING`) and adds only its own events.
+#[tokio::test]
+async fn both_halves_of_a_collided_seal_upload_into_one_step() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let run = RunId::new();
+    let step = StepId::new();
+    let first: Vec<SessionEvent> = (0..3).map(|seq| pending_event(step, seq)).collect();
+    let late: Vec<SessionEvent> = (3..5).map(|seq| pending_event(step, seq)).collect();
+    for half in [&first, &late] {
+        append_pending(cache.dir(), ids::PROJECT_HTUI, run, half)
+            .await
+            .expect("append a half");
+        seal_pending(cache.dir(), ids::PROJECT_HTUI, run)
+            .await
+            .expect("seal a half");
+    }
+    assert!(
+        numbered_pending_path(cache.dir(), ids::PROJECT_HTUI, run, 1).exists(),
+        "the collision made a second sealed file, which is what has to upload too",
+    );
+
+    let uploaded = upload_pending(
+        &db.pool,
+        cache.dir(),
+        db.store.this_box(),
+        db.store.this_user(),
+    )
+    .await
+    .expect("upload both halves");
+    assert_eq!(uploaded, 2, "each sealed file is a pass of its own");
+    assert!(!pending_path(cache.dir(), ids::PROJECT_HTUI, run).exists());
+    assert!(!numbered_pending_path(cache.dir(), ids::PROJECT_HTUI, run, 1).exists());
+
+    let seqs: Vec<i32> =
+        sqlx::query_scalar("SELECT seq FROM session_event WHERE run_step_id = $1 ORDER BY seq")
+            .bind(step.as_uuid())
+            .fetch_all(&db.pool)
+            .await
+            .expect("the events");
+    assert_eq!(
+        seqs,
+        (0..5).collect::<Vec<i32>>(),
+        "the union of both halves, each seq exactly once",
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// A buffer that cannot be sealed is a warning, never a failed [`CacheStore::open`] (M-2).
+///
+/// `seal_orphaned` is best-effort adoption of what a crash left behind; propagating the first
+/// `seal_one` error made one unreadable file - a permissions problem here, a sealed file another
+/// process holds open on Windows - fail `start()` and take the whole application down with it.
+/// `upload_pending` has always treated per-file trouble as warn-and-continue, and this now matches.
+#[cfg(unix)]
+#[tokio::test]
+async fn seal_orphaned_warns_on_a_buffer_it_cannot_seal_and_open_still_succeeds() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("a throwaway cache root");
+    let cache = CacheStore::open(root.path(), "degraded-seal", 1)
+        .await
+        .expect("open a throwaway mirror");
+    let step = StepId::new();
+    let runs = [RunId::new(), RunId::new()];
+    for run in runs {
+        append_pending(
+            cache.dir(),
+            ids::PROJECT_HTUI,
+            run,
+            &[pending_event(step, 0)],
+        )
+        .await
+        .expect("append");
+    }
+    let dir = cache.dir().to_path_buf();
+    let pending = dir.join("pending");
+    cache.close().await;
+    drop(cache);
+
+    // The process died here, and `pending/` is no longer writable: every rename in it will fail.
+    let restore = std::fs::metadata(&pending)
+        .expect("stat pending")
+        .permissions();
+    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o555))
+        .expect("make pending read-only");
+
+    assert_eq!(
+        seal_orphaned(&dir).expect("a sweep that can list pending is Ok even when nothing seals"),
+        0,
+        "nothing was sealed, and that is a warning rather than an error",
+    );
+    let reopened = CacheStore::open(root.path(), "degraded-seal", 1)
+        .await
+        .expect("a buffer that cannot be sealed must not fail start()");
+    for run in runs {
+        assert!(
+            open_pending_path(reopened.dir(), ids::PROJECT_HTUI, run).exists(),
+            "the buffer is left exactly where it was, for the next sweep",
+        );
+    }
+    reopened.close().await;
+
+    std::fs::set_permissions(&pending, restore).expect("restore pending");
+    assert_eq!(
+        seal_orphaned(&dir).expect("the sweep that can write"),
+        2,
+        "both buffers survived the degraded pass and are adopted by the next one",
+    );
+}
+
+/// The one thing `seal_orphaned` still refuses to shrug off: a `pending/` it cannot list.
+///
+/// A missing directory is `Ok(0)` - nothing has ever been buffered on this box - but a `pending/`
+/// that is there and unreadable is not a per-file problem, and answering `0` would claim a sweep
+/// that never happened.
+#[tokio::test]
+async fn seal_orphaned_reports_a_pending_it_cannot_list() {
+    let root = tempfile::tempdir().expect("a throwaway cache root");
+    assert_eq!(
+        seal_orphaned(root.path()).expect("no pending/ at all is not an error"),
+        0,
+    );
+
+    // A plain file where the directory has to be: portable on Windows and unix alike.
+    std::fs::write(root.path().join("pending"), b"not a directory").expect("occupy the name");
+    let err = seal_orphaned(root.path()).expect_err("pending/ cannot be listed");
+    assert!(
+        matches!(err, StoreError::Backend(_)),
+        "an unlistable pending/ is a backend error, got {err:?}",
+    );
+}
+
+/// A buffer a crashed run left open is adopted by the next `CacheStore::open`.
+#[tokio::test]
+async fn seal_orphaned_adopts_open_buffers_at_open() {
+    let root = tempfile::tempdir().expect("a throwaway cache root");
+    let cache = CacheStore::open(root.path(), "seal-test", 1)
+        .await
+        .expect("open a throwaway mirror");
+    let run = RunId::new();
+    let step = StepId::new();
+    let events: Vec<SessionEvent> = (0..3).map(|seq| pending_event(step, seq)).collect();
+    append_pending(cache.dir(), ids::PROJECT_HTUI, run, &events)
+        .await
+        .expect("append");
+    cache.close().await;
+    drop(cache);
+
+    // The process died here: the buffer is still open and no `finish_chat_run` ever ran.
+    let reopened = CacheStore::open(root.path(), "seal-test", 1)
+        .await
+        .expect("reopen the same mirror");
+    assert!(
+        !open_pending_path(reopened.dir(), ids::PROJECT_HTUI, run).exists(),
+        "no chat of this process can be live, so an open buffer is a crashed one",
+    );
+    assert_eq!(
+        read_pending(&pending_path(reopened.dir(), ids::PROJECT_HTUI, run)),
+        events,
+        "its rows are complete as far as they got, and now uploadable (R-HIS-1)",
+    );
+    assert_eq!(
+        seal_orphaned(reopened.dir()).expect("a second sweep"),
+        0,
+        "nothing is left open"
+    );
+    reopened.close().await;
+}
+
+/// The race `[H-1]` exists for: a chat still running when the refresher's pass comes round.
+#[tokio::test]
+async fn upload_pending_ignores_open_buffers() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let live_run = RunId::new();
+    let live_step = StepId::new();
+    let live: Vec<SessionEvent> = (0..3).map(|seq| pending_event(live_step, seq)).collect();
+    append_pending(cache.dir(), ids::PROJECT_HTUI, live_run, &live)
+        .await
+        .expect("the live chat appends");
+
+    let done_run = RunId::new();
+    let done_step = StepId::new();
+    let done: Vec<SessionEvent> = (0..3).map(|seq| pending_event(done_step, seq)).collect();
+    append_pending(cache.dir(), ids::PROJECT_HTUI, done_run, &done)
+        .await
+        .expect("the finished chat appends");
+    seal_pending(cache.dir(), ids::PROJECT_HTUI, done_run)
+        .await
+        .expect("the finished chat seals");
+
+    let uploaded = upload_pending(
+        &db.pool,
+        cache.dir(),
+        db.store.this_box(),
+        db.store.this_user(),
+    )
+    .await
+    .expect("upload");
+    assert_eq!(uploaded, 1, "only the sealed buffer landed");
+    assert!(
+        open_pending_path(cache.dir(), ids::PROJECT_HTUI, live_run).exists(),
+        "the live chat's buffer is still on disk, still open",
+    );
+    let live_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM session_event WHERE run_step_id = $1")
+            .bind(live_step.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count the live chat's rows");
+    assert_eq!(
+        live_rows, 0,
+        "and not one of its rows was uploaded mid-flight (H-1)"
+    );
+    let done_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM session_event WHERE run_step_id = $1")
+            .bind(done_step.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count the finished chat's rows");
+    assert_eq!(done_rows, 3, "the chat that ended landed whole");
 
     teardown(db, &[&cache]).await;
 }

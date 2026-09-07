@@ -10,6 +10,7 @@
 //! than a failing test.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use htui_core::model::StepId;
 use htui_core::store::MemStore;
@@ -31,6 +32,15 @@ const DEFAULT_SIZE: (u16, u16) = (100, 30);
 
 /// How many "serve everything queued" rounds [`Harness::settle`] may take.
 const SETTLE_ROUNDS: usize = 32;
+
+/// How long [`Harness::drive_to_end`] waits for one chat task after it has asked every session to
+/// stop.
+///
+/// Deliberately far longer than any chat the harness can produce - the fake driver answers in
+/// microseconds and the real bound is a `spawn_blocking` file write. It is not a schedule, it is
+/// the difference between a suite that **hangs** on a task that will never finish and one that
+/// fails with the step id of the task that did not.
+const CHAT_END: Duration = Duration::from_secs(30);
 
 /// A shell, a store and a `TestBackend`, wired without a spawned task.
 pub struct Harness {
@@ -91,7 +101,16 @@ impl Harness {
     /// [`Harness::demo`] cannot express.
     #[must_use]
     pub fn over(store: MemStore) -> Self {
-        let backend = Backend::memory(store);
+        Self::over_backend(Backend::memory(store))
+    }
+
+    /// Builds a harness over any [`Backend`], not only a memory one.
+    ///
+    /// The offline chat case needs a `Backend::Offline` over a seeded mirror: what it is testing is
+    /// that the *backend* the store worker holds decides where a chat's rows go, so handing the
+    /// harness a `MemStore` and pretending would test nothing (MOD-2 milestone 4, T21).
+    #[must_use]
+    pub fn over_backend(backend: Backend) -> Self {
         let (request_tx, rx) = mpsc::unbounded_channel();
         let mut app = App::new(request_tx, Keymap::default_global());
         app.top_bar.store = backend.label();
@@ -134,8 +153,14 @@ impl Harness {
     ///
     /// Three things per round: serve every queued request (chat ones through the runtime), poll
     /// every held chat future **once**, and deliver every frame the chats produced. A chat that is
-    /// `Pending` after a quiet round is a chat waiting on the user, which is exactly the state a
-    /// snapshot wants to photograph.
+    /// `Pending` after a quiet round is taken to be a chat waiting on the user, which is exactly
+    /// the state a snapshot wants to photograph.
+    ///
+    /// That reading holds for a chat whose writer never leaves the task — `MemStore`'s
+    /// `append_events` is a lock and a `Vec` push, and `PgStore`'s is served inline here too. It
+    /// does **not** hold for `Writer::Buffered`, which appends to a file through `spawn_blocking`:
+    /// such a chat is `Pending` for as long as a blocking thread takes, and polling it once more
+    /// would be a race rather than a test. [`Harness::drive_to_end`] is that case's answer.
     ///
     /// # Panics
     ///
@@ -214,6 +239,41 @@ impl Harness {
         panic!("the shell never settled: a view is issuing a request for every reply");
     }
 
+    /// [`Harness::drive`], then **awaits** every chat still held to its end, then drives again.
+    ///
+    /// For a writer that reaches the filesystem there is no honest "poll once more and hope": a
+    /// chat mid-`spawn_blocking` is indistinguishable from one waiting on the user, and a bounded
+    /// spin over the difference is exactly the flakiness snapshots are kept free of. Awaiting is
+    /// the deterministic answer, and it needs a chat that *has* an end — so every live chat is
+    /// asked to stop first, whether or not the test already pressed `Esc Esc`. A chat the user
+    /// ended ignores the second ask (its command channel is already closed), and one the user did
+    /// not is ended here rather than left to hang the suite.
+    ///
+    /// The last `drive` is what delivers the frames the finished chats produced, so a render taken
+    /// after this call is the whole conversation. The runtime holds no live chat afterwards, which
+    /// is the trade: this is the end of a chat, not a pause in one.
+    ///
+    /// # Panics
+    ///
+    /// If the shell never goes quiet, like [`Harness::settle`], or if a chat task has not ended
+    /// [`CHAT_END`] after being asked to. A task that never returns would otherwise hang the whole
+    /// suite with no output at all; the panic names the step, which is the one fact that turns
+    /// "the tests stopped" into a diagnosis.
+    pub async fn drive_to_end(&mut self) {
+        self.drive().await;
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.shutdown(Duration::ZERO).await;
+        }
+        for (step, task) in std::mem::take(&mut self.chats) {
+            assert!(
+                tokio::time::timeout(CHAT_END, task).await.is_ok(),
+                "the chat on step {step} did not end within {CHAT_END:?} of being asked to: its \
+                 session task is stuck, not slow",
+            );
+        }
+        self.drive().await;
+    }
+
     /// Answers every `StoreRequest::StoreState` with this label and pending count.
     ///
     /// The one thing a `Backend::Memory` cannot represent: `connecting`, `offline · 3m` and a
@@ -231,6 +291,17 @@ impl Harness {
     #[must_use]
     pub fn with_tab(mut self, tab: Box<dyn Tab>) -> Self {
         self.app.register_tab(tab);
+        self
+    }
+
+    /// Names the tab an `Action::Replay` focuses and addresses its rows to, as
+    /// [`register_all`](crate::app::register_all) names it.
+    ///
+    /// A test that registers its tabs by hand has to set this by hand too: without it the shell
+    /// can replay nothing, which is a state worth testing on its own.
+    #[must_use]
+    pub fn with_replay_tab(mut self, tab: crate::ui::tabs::TabId) -> Self {
+        self.app.replay_tab = Some(tab);
         self
     }
 

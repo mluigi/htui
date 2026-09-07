@@ -1,4 +1,5 @@
-//! `impl ReadStore for CacheStore` plus the four inherent reads (blueprint C.12).
+//! `impl ReadStore for CacheStore` plus the seven inherent reads (blueprint C.12; the last three
+//! are MOD-2 milestone 4's).
 //!
 //! The SQL is the Postgres text of C.7 / C.8 with three mechanical substitutions, and nothing
 //! else:
@@ -26,10 +27,11 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    BoxId, BoxInfo, DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item, ItemFilter,
-    ItemId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, Note, NoteId, OsFamily,
-    ProjectId, ProjectRef, RunId, RunKind, RunMode, RunStatus, RunStepSummary, RunSummary, Scope,
-    SessionEvent, Status, StepGraphId, StepId, StepStatus, UserId, WorkspaceId, WorkspaceSummary,
+    Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, DocumentHead, DocumentId, EventKind,
+    EventRole, GateOutcome, Item, ItemFilter, ItemId, ItemSummary, LinkEdge, LinkGraph, LinkKind,
+    LinkNode, Note, NoteId, OsFamily, ProjectId, ProjectRef, RunId, RunKind, RunMode, RunStatus,
+    RunStepSummary, RunSummary, Scope, SessionEvent, Status, StepGraphId, StepId, StepStatus,
+    Transport, UserId, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -100,14 +102,9 @@ pub(crate) fn opt_json_col(column: &str, text: Option<&str>) -> Result<Option<Va
 
 /// INTEGER 0/1 -> bool.
 ///
-/// No §6.1 projection carries a boolean yet (`RunStepSummary` drops `selected`, `BoxInfo` drops
-/// `gpu_present`, and `Repo` is not a read at all), so this one is written now and used by the
-/// first read that needs it rather than being re-derived - which is how `bool` on SQLite gets
-/// mirrored wrong, `INTEGER` having no truthiness of its own.
-#[expect(
-    dead_code,
-    reason = "written now, read by MOD-7's box probe and the Repos view"
-)]
+/// Written by MOD-6 ahead of its first reader, because `INTEGER` has no truthiness of its own and
+/// re-deriving the conversion per call site is how `bool` on SQLite gets mirrored wrong.
+/// [`CacheStore::agents`]'s `agent.enabled` is that first reader (MOD-2 milestone 4).
 #[must_use]
 pub(crate) const fn bool_col(v: i64) -> bool {
     v != 0
@@ -583,7 +580,7 @@ impl ReadStore for CacheStore {
 }
 
 // ------------------------------------------------------------------------------------------------
-// The four inherent reads
+// The seven inherent reads
 // ------------------------------------------------------------------------------------------------
 
 impl CacheStore {
@@ -716,6 +713,90 @@ impl CacheStore {
                 })
             })
             .collect()
+    }
+
+    /// The mirrored registry, ordered by `agent.name`, every row with `on_box: None` (MOD-2 plan
+    /// D31).
+    ///
+    /// `on_box` is `None` by construction rather than because a probe found nothing: `agent_box` is
+    /// not mirrored, its columns move in milestone 5, and offline "which box" is this box - so
+    /// per-box enablement offline is `agent.enabled` and nothing else. The Settings tab already
+    /// renders a `None` as "not probed", which is the honest reading here too.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`], or [`StoreError::Backend`] from a
+    /// decoding helper on a corrupt mirror.
+    pub async fn agents(&self) -> Result<Vec<AgentSummary>> {
+        let rows = sqlx::query(
+            "SELECT id, name, transport, launch, models, default_model, billing, enabled, \
+                    settings, created_at, updated_at \
+               FROM agent ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        rows.iter()
+            .map(|row| {
+                Ok(AgentSummary {
+                    agent: Agent {
+                        id: uuid_col::<AgentId>("agent.id", &text(row, "id")?)?,
+                        name: text(row, "name")?,
+                        transport: get::<Transport>(row, "transport")?,
+                        launch: json_col("agent.launch", &text(row, "launch")?)?,
+                        models: strings_col("agent.models", &text(row, "models")?)?,
+                        default_model: opt_text(row, "default_model")?,
+                        billing: get::<Billing>(row, "billing")?,
+                        enabled: bool_col(get::<i64>(row, "enabled")?),
+                        settings: json_col("agent.settings", &text(row, "settings")?)?,
+                        created_at: ts_col("agent.created_at", get(row, "created_at")?)?,
+                        updated_at: ts_col("agent.updated_at", get(row, "updated_at")?)?,
+                    },
+                    on_box: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Who this process is, for `run.started_by`, resolved against the mirror (MOD-2 plan D33).
+    ///
+    /// [`user_named`](CacheStore::user_named) under
+    /// [`identity::os_user_name`](crate::identity::os_user_name) - the *same* name
+    /// [`PgStore::seed_if_empty`](crate::PgStore::seed_if_empty) stamped the database with, which
+    /// is what makes a run recorded offline and uploaded later indistinguishable from one recorded
+    /// online.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when this box has never synced an `app_user` row under that name.
+    pub async fn this_user(&self) -> Result<UserId> {
+        self.user_named(&crate::identity::os_user_name()).await
+    }
+
+    /// The mirrored `app_user` row with this `name`: earliest `created_at`, then smallest `id`.
+    ///
+    /// The tiebreak is `MemStore::this_user`'s, so all three backends answer the same row when the
+    /// mirror happens to hold two stamped at the same instant.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no mirrored row carries that name. Refusing is the point: an
+    /// invented `UserId` would make the uploader insert a stranger as the run's author.
+    pub async fn user_named(&self, name: &str) -> Result<UserId> {
+        let row =
+            sqlx::query("SELECT id FROM app_user WHERE name = ? ORDER BY created_at, id LIMIT 1")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound {
+                entity: "app_user",
+                id: name.to_owned(),
+            });
+        };
+        uuid_col("app_user.id", &text(&row, "id")?)
     }
 }
 

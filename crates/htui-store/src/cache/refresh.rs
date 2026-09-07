@@ -213,8 +213,9 @@ const RUN_STEP_COMMIT: &str = "run_step_commit";
 ///
 /// In order (§6.2 verbatim, with the two gaps of blueprint H.3 and H.4 closed):
 ///
-/// 1. unscoped full replace of `app_user`, `workspace` and `workspace_project` - small tables, and
-///    `workspace_project` has no timestamp at all to put a cursor on (H.4);
+/// 1. unscoped full replace of `app_user`, `agent`, `workspace` and `workspace_project` - small
+///    tables, and `workspace_project` has no timestamp at all to put a cursor on (H.4). `agent`
+///    joined them in MOD-2 milestone 4 (plan D31, D32) and rides no cursor either;
 /// 2. the own `box` row, unscoped, upserted on its primary key;
 /// 3. per project, per table in foreign-key order, `ts_col > high_water - overlap`, primary-key
 ///    upsert, cursor set to `max(ts_col)` of the fetched rows - server time, so clock skew between
@@ -241,6 +242,7 @@ pub async fn run_pass(
     let sqlite = cache.pool();
 
     replace_app_user(pool, sqlite, &mut report).await?;
+    replace_agent(pool, sqlite, &mut report).await?;
     replace_workspace(pool, sqlite, &mut report).await?;
     replace_workspace_project(pool, sqlite, &mut report).await?;
     refresh_box(pool, sqlite, settings.this_box, &mut report).await?;
@@ -425,6 +427,65 @@ async fn replace_app_user(
     }
     tx.commit().await.map_err(map_sqlx)?;
     report.add("app_user", rows.len() as u64);
+    Ok(())
+}
+
+/// `agent` (§5.7), unscoped: mirrored whole on every pass (MOD-2 plan D32).
+const AGENT_COLUMNS: &[&str] = &[
+    "id",
+    "name",
+    "transport",
+    "launch",
+    "models",
+    "default_model",
+    "billing",
+    "enabled",
+    "settings",
+    "created_at",
+    "updated_at",
+];
+
+/// The registry, replaced whole beside [`replace_app_user`] (MOD-2 plan D31, D32).
+///
+/// A handful of rows and no `project_id` to scope them by, so this follows the precedent the three
+/// tables above set rather than inventing a sentinel project id for one table's `cache_cursor` row:
+/// there is no cursor for `agent` and there never will be. `agent_box` is not pulled at all - it is
+/// a probe snapshot whose shape milestone 5 moves, and offline "which box" is this box.
+async fn replace_agent(pool: &PgPool, sqlite: &SqlitePool, report: &mut PassReport) -> Result<()> {
+    let rows = sqlx::query!(
+        "SELECT id, name, transport, launch, models, default_model, billing, enabled, settings, \
+                created_at, updated_at \
+           FROM agent"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let sql = upsert_sql("agent", AGENT_COLUMNS, 1);
+    let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
+    sqlx::query("DELETE FROM agent")
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    for row in &rows {
+        sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
+            .bind(row.id.to_string())
+            .bind(&row.name)
+            .bind(&row.transport)
+            .bind(json_text(&row.launch)?)
+            .bind(strings_text(&row.models)?)
+            .bind(row.default_model.as_deref())
+            .bind(&row.billing)
+            .bind(i64::from(row.enabled))
+            .bind(json_text(&row.settings)?)
+            .bind(ts_bind(row.created_at))
+            .bind(ts_bind(row.updated_at))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+    }
+    tx.commit().await.map_err(map_sqlx)?;
+    report.add("agent", rows.len() as u64);
     Ok(())
 }
 

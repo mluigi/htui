@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/chat_offline.rs
+expression: rendered
+---
+Graphics · DESKTOP-HTUI · offline · 0s · 0 runs
+ 1 Chat
+┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│scripted · sonnet · Vulkan Tutorials · session fake-<session> · buffered · uploads when the store returns      │
+│you  what is in main.rs                                                                                                                   │
+│Reading it now.                                                                                                                           │
+│read src/main.rs  [ok]                                                                                                                    │
+│It is empty.                                                                                                                              │
+│usage                                                                                                                                     │
+│— turn ended (end_turn) —                                                                                                                 │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│this chat has ended · i compose                                                                                                           │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

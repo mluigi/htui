@@ -44,8 +44,15 @@ pub trait ReadStore: Send + Sync {
     async fn step_events(&self, step: StepId) -> Result<Option<Vec<SessionEvent>>>; // None = not cached
 }
 
-/// Everything a write path needs. Only a backend that can reach Postgres implements it, so an
-/// offline write is a compile error rather than a runtime flag.
+/// Everything a write path needs.
+///
+/// It used to be implemented only by a store that can reach Postgres. Since MOD-2 milestone 4
+/// (plan D34) `htui-store`'s offline sink implements it too, writing the `session_event` rows to
+/// a JSON-lines buffer and answering
+/// [`StoreError::Unreachable`](crate::store::StoreError::Unreachable) for everything the buffer
+/// cannot hold — so "an offline write is a compile error" is now narrower and still true where it
+/// counts: nothing reaches **Postgres** except through a store that has a connection, and the
+/// read-only mirror still does not implement this trait at all.
 #[allow(async_fn_in_trait)] // D2 / plan V3, as above.
 pub trait WriteStore: ReadStore {
     /// Mints an item: counter upsert, key assembly and revision 1 in one transaction (§7.1, §4.1).

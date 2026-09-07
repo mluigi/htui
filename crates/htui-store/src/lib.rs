@@ -17,6 +17,8 @@ pub mod error;
 pub mod identity;
 pub mod pg;
 pub mod secret;
+#[cfg(feature = "test-support")]
+pub mod testkit;
 pub mod writer;
 
 pub use backend::Backend;
@@ -25,7 +27,7 @@ pub use connect::{ConnEvent, StartOptions, Started};
 pub use error::map_sqlx;
 pub use identity::Identity;
 pub use pg::{Connected, MigrationState, PgStore};
-pub use writer::Writer;
+pub use writer::{BufferedWriter, Writer};
 
 /// The embedded Postgres schema (ANA-9 §5), applied by [`PgStore::apply_migrations`].
 ///

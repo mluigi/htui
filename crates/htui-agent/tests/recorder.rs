@@ -295,6 +295,30 @@ impl WriteStore for SpyStore {
 }
 
 // ---------------------------------------------------------------------------------------------
+// A scrubber that masks a value whatever its type
+// ---------------------------------------------------------------------------------------------
+
+/// Masks the value under one top-level key, whatever JSON type that value has.
+///
+/// [`MinimalScrubber`] rewrites strings and object keys only, so it cannot make a `usage` payload -
+/// five nullable **integers** - stop reading back as a [`UsageEvent`]: an unknown key is ignored by
+/// serde and a number is never touched. ANA-7's real rule set is not so limited (MOD-10 replaces
+/// the implementation behind this unchanged trait), and a number replaced by `[REDACTED]` is
+/// exactly the shape that sends a row down the recorder's unreadable path. This is that scrubber,
+/// one key wide, so the `usage` half of that path can be tested at all.
+#[derive(Debug)]
+struct MaskKey(&'static str);
+
+impl htui_core::scrub::Scrubber for MaskKey {
+    fn scrub(&self, value: &mut Value) -> Result<(), htui_core::scrub::Unmasked> {
+        if let Some(slot) = value.get_mut(self.0) {
+            *slot = Value::String("[REDACTED]".to_owned());
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // A scripted `AgentSession`, for `pump` only
 // ---------------------------------------------------------------------------------------------
 
@@ -720,6 +744,75 @@ async fn usage_deltas_sum_into_step_usage() {
     assert_eq!(
         last.usage, expected,
         "run_step.usage is the sum of the step's usage rows"
+    );
+}
+
+/// A `usage` row masking made unreadable is **still summed**, because it is still persisted.
+///
+/// `run_step.usage` has two writers: this recorder, online, and `upload_pending`, for a chat that
+/// happened offline. The uploader sums every persisted `usage` row through
+/// `UsageTotals::from_rows`, so a row the recorder persisted but skipped would make an online step
+/// and the same step uploaded from a buffer disagree - for exactly one row shape, which is the kind
+/// of divergence nobody finds twice (MOD-2 plan D36). The last assertion is that property stated
+/// directly: the recorder's document and the uploader's document over the very same rows.
+#[tokio::test]
+async fn an_unreadable_usage_row_is_still_summed_into_step_usage() {
+    let chat = chat_spec();
+    // A masked `output_tokens` is a string where an `Option<i64>` belongs, so the payload no longer
+    // reads back as a `UsageEvent` and the row takes the recorder's unreadable path.
+    let scrubber = MaskKey("output_tokens");
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+
+    for (input, output, cost) in [(10, 5, 100), (20, 7, 250)] {
+        recorder
+            .record(env(DriverEvent::Usage(UsageEvent {
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                cost_micros: Some(cost),
+                ..UsageEvent::default()
+            })))
+            .await
+            .expect("a masked usage key is not a recording failure");
+    }
+    let summary = recorder.finish().await.expect("close");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::Usage, EventKind::Usage],
+        "each row keeps the kind the unscrubbed event decided"
+    );
+    assert_eq!(
+        log[0].payload.get("output_tokens"),
+        Some(&json!("[REDACTED]")),
+        "and the masked document is what was persisted"
+    );
+
+    let expected = json!({
+        "input_tokens": 30,
+        "output_tokens": Value::Null,
+        "cache_read_tokens": Value::Null,
+        "cache_write_tokens": Value::Null,
+        "cost_micros": 350,
+    });
+    assert_eq!(
+        summary.usage, expected,
+        "the keys masking left readable still count; the masked one adds nothing"
+    );
+    assert_eq!(
+        store
+            .usage_calls()
+            .pop()
+            .expect("an unreadable usage row still dirties run_step.usage")
+            .usage,
+        expected,
+        "and the number reached run_step.usage"
+    );
+    assert_eq!(
+        htui_core::model::UsageTotals::from_rows(&log).to_value(),
+        summary.usage,
+        "the recorder's sum and the uploader's sum over the same persisted rows are one document"
     );
 }
 
