@@ -9,6 +9,7 @@
 //! which is `R-NF-3` by construction rather than by convention (plan D4).
 #![warn(missing_docs)]
 
+pub mod agent_worker;
 pub mod app;
 pub mod cli;
 pub mod event_loop;

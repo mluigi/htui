@@ -42,8 +42,7 @@ pub struct MemStore {
 /// Every §5 table the TUI reads, keyed the way the queries of §7 look rows up.
 #[derive(Debug, Default)]
 struct State {
-    /// `app_user`. Held for the modules that read it: no §6.1 method exposes it yet (blueprint B.8).
-    #[expect(dead_code, reason = "loaded now, read by MOD-2 / MOD-4 / MOD-15")]
+    /// `app_user`. Read by [`MemStore::this_user`], which is who a chat run is started by.
     users: HashMap<UserId, AppUser>,
     /// `box`.
     boxes: HashMap<BoxId, BoxRow>,
@@ -103,6 +102,28 @@ impl MemStore {
     #[must_use]
     pub fn demo() -> Self {
         Self::from_demo(crate::fixtures::demo_data())
+    }
+
+    /// Who this process is, as far as an in-memory store can know (MOD-2 milestone 3).
+    ///
+    /// `PgStore` learns its user by seeding or reading `app_user` on connect; a `MemStore` has no
+    /// connect step, so "this user" is the earliest-created row, with the id as the tiebreak so
+    /// two rows stamped at the same instant still answer deterministically. `None` for an empty
+    /// store, which is what makes a chat against `MemStore::new()` refuse instead of inventing an
+    /// author for a `run` row.
+    #[must_use]
+    pub fn this_user(&self) -> Option<UserId> {
+        self.read(|state| {
+            state
+                .users
+                .values()
+                .min_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+                .map(|user| user.id)
+        })
     }
 
     /// A store loaded with the given fixture and nothing else.

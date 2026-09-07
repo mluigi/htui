@@ -22,6 +22,7 @@ pub mod fs;
 pub mod map;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+#[cfg(feature = "test-support")]
 use std::sync::Mutex;
 use std::time::Duration;
 

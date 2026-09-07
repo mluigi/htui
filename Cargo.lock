@@ -1438,13 +1438,16 @@ name = "htui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "crossterm",
  "futures",
+ "htui-agent",
  "htui-core",
  "htui-store",
  "insta",
  "ratatui",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

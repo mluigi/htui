@@ -3,21 +3,24 @@
 //! [`Backend`] is an enum, not a `Box<dyn ReadStore>`: native `async fn` in traits is not object
 //! safe, and a concrete type keeps the spawned worker's futures `Send`-inferable (MOD-1 plan D2).
 //!
-//! There is no `Backend::write*` method and no `impl WriteStore for Backend`. `WriteStore` is
-//! implemented by [`PgStore`] alone and the only way to reach one is [`Backend::writable`], so a
-//! write attempt against an offline store is a **compile error** rather than a runtime flag
-//! (plan D1). That claim is documented here and deliberately not covered by a test: a compile-fail
-//! test is not worth a `trybuild` dependency.
+//! There is no `Backend::write*` method and no `impl WriteStore for Backend`. The two ways to
+//! reach a `WriteStore` are [`Backend::writable`], which borrows a [`PgStore`] for the length of
+//! one call, and [`Backend::writer`] (MOD-2 milestone 3), which hands out an owned
+//! [`Writer`](crate::Writer) a spawned task can hold for a whole session. **Both answer `None` on
+//! [`Backend::Offline`]**, so a write attempt against an offline store is still unreachable rather
+//! than merely refused at runtime (plan D1, MOD-2 D26). That claim is documented here and
+//! deliberately not covered by a compile-fail test: it is not worth a `trybuild` dependency.
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
     AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note,
-    ProjectRef, RunSummary, Scope, SessionEvent, StepId, WorkspaceSummary,
+    ProjectRef, RunSummary, Scope, SessionEvent, StepId, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 
 use crate::cache::CacheStore;
 use crate::pg::PgStore;
+use crate::writer::Writer;
 
 /// Seconds in a minute and minutes in an hour: the two thresholds of [`Backend::label`].
 const MINUTE: i64 = 60;
@@ -98,6 +101,45 @@ impl Backend {
         match self {
             Self::Online { pg, .. } => Some(pg),
             Self::Memory(_) | Self::Offline { .. } => None,
+        }
+    }
+
+    /// An **owned** writable handle, or `None` (MOD-2 D26).
+    ///
+    /// The counterpart of [`Backend::writable`] for a caller that outlives one call — the chat
+    /// recorder, which is generic over `S: WriteStore` and lives inside a spawned session task.
+    /// [`Backend::Memory`] answers `Some` here and `None` there, because a `MemStore` **is** a
+    /// `WriteStore` even though it is not a [`PgStore`]; [`Backend::Offline`] answers `None` to
+    /// both, which is the invariant that matters.
+    #[must_use]
+    pub fn writer(&self) -> Option<Writer> {
+        match self {
+            Self::Memory(store) => Some(Writer::Memory(store.clone())),
+            Self::Online { pg, .. } => Some(Writer::Online(pg.clone())),
+            Self::Offline { .. } => None,
+        }
+    }
+
+    /// Who this process is, for `run.started_by` (MOD-2 D29).
+    ///
+    /// The render side never learns a `UserId`: the chat tab asks for a chat and the worker fills
+    /// in who started it, which is what keeps `R-NF-3` a fact about ownership rather than a habit.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] on a memory store with no `app_user` row — an empty store has no
+    /// author to attribute a run to — and [`StoreError::Unreachable`] while offline, where the
+    /// answer exists on a server this process cannot currently reach.
+    pub async fn this_user(&self) -> Result<UserId> {
+        match self {
+            Self::Memory(store) => store.this_user().ok_or_else(|| StoreError::NotFound {
+                entity: "app_user",
+                id: "(none loaded)".to_owned(),
+            }),
+            Self::Online { pg, .. } => Ok(pg.this_user()),
+            Self::Offline { .. } => Err(StoreError::Unreachable(
+                "the user is not known while offline".to_owned(),
+            )),
         }
     }
 

@@ -414,9 +414,17 @@ impl AgentSession for FakeSession {
             }
             self.queue.clear();
             self.turns.clear();
-            self.pending.push_back(DriverEvent::Done(DoneEvent {
-                stop_reason: StopReason::Cancelled,
-            }));
+            // Only a turn that is **open** is owed a `done`. Cancelling between turns ends the
+            // session, not a turn, and a second `done` would be a row for a turn that never
+            // started — `docs/ANA-4.md` §4.1 says exactly one per turn. (Milestone 3: the ACP
+            // transport guards this the same way, and the two transports must not differ about
+            // what the rows say.)
+            if self.turn_open {
+                self.pending.push_back(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::Cancelled,
+                }));
+                self.turn_open = false;
+            }
             self.ended = true;
             Ok(())
         })

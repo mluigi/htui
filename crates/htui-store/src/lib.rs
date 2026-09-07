@@ -17,6 +17,7 @@ pub mod error;
 pub mod identity;
 pub mod pg;
 pub mod secret;
+pub mod writer;
 
 pub use backend::Backend;
 pub use cache::{CacheMeta, CacheStore};
@@ -24,6 +25,7 @@ pub use connect::{ConnEvent, StartOptions, Started};
 pub use error::map_sqlx;
 pub use identity::Identity;
 pub use pg::{Connected, MigrationState, PgStore};
+pub use writer::Writer;
 
 /// The embedded Postgres schema (ANA-9 §5), applied by [`PgStore::apply_migrations`].
 ///

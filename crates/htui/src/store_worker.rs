@@ -11,9 +11,11 @@
 //! deferred until `PgStore` read latency has actually been measured against a populated database;
 //! until then the queue depth is bounded in practice by the keystrokes a user can produce.
 
+use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, PermissionRequestId};
+use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_core::model::{
-    AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note,
-    ProjectId, RunSummary, Scope, WorkspaceSummary,
+    AgentId, AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph,
+    Note, ProjectId, RunSummary, Scope, StepId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result as StoreResult, StoreError};
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
@@ -21,6 +23,7 @@ use htui_store::{Backend, ConnEvent, PgStore, Started, connect};
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
+use crate::agent_worker::{AgentRuntime, Served};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
 
@@ -78,6 +81,40 @@ pub enum StoreRequest {
     ///
     /// Not scoped: `agent` is a global table, not a workspace one.
     Agents,
+    /// Start a chat: mint the `run` / `run_step` pair, open a session, send the first prompt
+    /// (MOD-2 D27). Answered by [`StoreReply::ChatAccepted`] once the handshake is through, then
+    /// by a [`StoreReply::Chat`] frame per event for the life of the session.
+    ChatStart {
+        /// The project the chat belongs to.
+        project_id: ProjectId,
+        /// Which registry row to talk to.
+        agent_id: AgentId,
+        /// `None` means the agent's `default_model`, and then the agent's own default.
+        model: Option<String>,
+        /// What the user typed.
+        prompt: String,
+    },
+    /// A follow-up turn in a live chat.
+    ChatSend {
+        /// The step the chat records against.
+        step_id: StepId,
+        /// What the user typed.
+        text: String,
+    },
+    /// An answer to a parked permission request (`R-TUI-6`).
+    ChatAnswer {
+        /// The step the chat records against.
+        step_id: StepId,
+        /// Which request is being answered.
+        request_id: PermissionRequestId,
+        /// The chosen option, or a cancellation.
+        answer: PermissionAnswer,
+    },
+    /// End a live chat.
+    ChatCancel {
+        /// The step the chat records against.
+        step_id: StepId,
+    },
     /// The top bar's store field and the pending-migration count (plan D11).
     StoreState,
     /// Apply the pending migrations (`R-STO-5`), after the user answered `y`.
@@ -99,6 +136,10 @@ impl StoreRequest {
             Self::Notes(_) => "notes",
             Self::Runs(_) => "runs",
             Self::Agents => "agents",
+            Self::ChatStart { .. } => "chat_start",
+            Self::ChatSend { .. } => "chat_send",
+            Self::ChatAnswer { .. } => "chat_answer",
+            Self::ChatCancel { .. } => "chat_cancel",
             Self::StoreState => "store_state",
             Self::ApplyMigrations => "apply_migrations",
         }
@@ -128,6 +169,20 @@ pub enum StoreReply {
     Runs(Vec<RunSummary>),
     /// Answer to [`StoreRequest::Agents`], ordered by `agent.name`.
     Agents(Vec<AgentSummary>),
+    /// One frame of a live chat's stream (MOD-2 D27).
+    ///
+    /// Many of these answer one [`StoreRequest::ChatStart`], all carrying that request's `seq`, so
+    /// `App::is_fresh` passes every one of them until the tab starts another chat.
+    Chat(ChatFrame),
+    /// The chat is open: its handshake finished and its first prompt is on the wire.
+    ChatAccepted {
+        /// The step every event of this chat is recorded against.
+        step_id: StepId,
+        /// The agent-side session id, for a later `session/load`.
+        session_ref: Option<AgentSessionRef>,
+        /// What this transport can do, for the tab's capability banner.
+        caps: DriverCaps,
+    },
     /// Answer to [`StoreRequest::StoreState`].
     StoreState {
         /// `Backend::label()`: `memory`, `connecting`, `online` or `offline · <age>`.
@@ -146,6 +201,28 @@ pub enum StoreReply {
         /// Which request failed.
         request: &'static str,
         /// The `StoreError`, rendered through `Display`.
+        message: String,
+    },
+}
+
+/// One frame of a chat stream.
+#[derive(Debug, Clone)]
+pub enum ChatFrame {
+    /// A recorded, **scrubbed** event: the copy the recorder made on its way to the store, never
+    /// the transport's own (`R-SEC-3` — the screen may not be less masked than the row).
+    ///
+    /// The three kinds `htui` authors itself — `prompt`, `follow_up`, `permission_answer` — arrive
+    /// here shaped as `other` events with those names. The recorder wrote the real row first; this
+    /// is only the copy the tab renders.
+    Event(Box<DriverEnvelope>),
+    /// The session ended; `stop_reason` is `cancelled` when a turn was cut.
+    Ended {
+        /// Why the last turn ended.
+        stop_reason: StopReason,
+    },
+    /// The session died. The run is closed `failed`.
+    Failed {
+        /// What went wrong, rendered.
         message: String,
     },
 }
@@ -211,6 +288,17 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Notes(id) => StoreReply::Notes(backend.notes(*id).await?),
         StoreRequest::Runs(id) => StoreReply::Runs(backend.runs(*id).await?),
         StoreRequest::Agents => StoreReply::Agents(backend.agents().await?),
+        // The four chat requests need the worker loop's own state (the live sessions), so they are
+        // served ahead of this function, exactly as `ApplyMigrations` is. A chat request that
+        // reaches here at all belongs to a caller with no runtime — the test harness without one —
+        // and saying so is more use than a panic.
+        StoreRequest::ChatStart { .. }
+        | StoreRequest::ChatSend { .. }
+        | StoreRequest::ChatAnswer { .. }
+        | StoreRequest::ChatCancel { .. } => StoreReply::Failed {
+            request: request.name(),
+            message: "no agent runtime in this build".to_owned(),
+        },
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,
@@ -259,8 +347,21 @@ fn failed(request: &'static str, err: &StoreError) -> StoreReply {
 /// pieces are the same, passed as the struct that already carries them).
 pub fn spawn(
     started: Started,
+    rx: mpsc::UnboundedReceiver<RequestEnvelope>,
+    tx: mpsc::UnboundedSender<ReplyEnvelope>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_with(started, rx, tx, AgentRuntime::production())
+}
+
+/// [`spawn`] over a chosen [`AgentRuntime`], so a test can install its own transport registry.
+///
+/// The runtime lives **inside** this loop: a chat needs the backend (for the writer, the box, the
+/// user and the registry row) and the reply sender, and this task is the only owner of both.
+pub fn spawn_with(
+    started: Started,
     mut rx: mpsc::UnboundedReceiver<RequestEnvelope>,
     tx: mpsc::UnboundedSender<ReplyEnvelope>,
+    mut runtime: AgentRuntime,
 ) -> tokio::task::JoinHandle<()> {
     let Started {
         mut backend,
@@ -328,6 +429,22 @@ pub fn spawn(
                                 None => StoreReply::MigrationsApplied { applied: 0 },
                             }
                         }
+                        // The chat requests need this loop's own state - the live sessions - so
+                        // they are served before `try_serve`, like `ApplyMigrations` above.
+                        StoreRequest::ChatStart { .. }
+                        | StoreRequest::ChatSend { .. }
+                        | StoreRequest::ChatAnswer { .. }
+                        | StoreRequest::ChatCancel { .. } => {
+                            match runtime.serve(&backend, &tx, &envelope).await {
+                                Served::Reply(reply) => reply,
+                                // The session task answers this request itself, once.
+                                Served::Deferred => continue,
+                                Served::Start { step_id, task } => {
+                                    runtime.attach(step_id, tokio::spawn(task));
+                                    continue;
+                                }
+                            }
+                        }
                         other => match try_serve(&backend, other).await {
                             Ok(reply) => reply,
                             Err(err) => {
@@ -389,6 +506,11 @@ pub fn spawn(
                 }
             }
         }
+
+        // The UI is gone. Every live chat is cancelled and awaited **before** this task returns:
+        // dropping a session task at its first await orphans the agent process it spawned
+        // (`docs/ANA-4.md` §11 criterion 11).
+        runtime.shutdown(crate::agent_worker::CANCEL_GRACE).await;
 
         if let Some(refresher) = refresher {
             refresher.abort();
