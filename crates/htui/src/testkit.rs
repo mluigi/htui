@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 
+use htui_core::model::StepId;
 use htui_core::store::MemStore;
 use htui_store::Backend;
 use ratatui::Terminal;
@@ -18,6 +19,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
+use crate::agent_worker::{AgentRuntime, ChatTask, Served};
 use crate::app::{Action, App};
 use crate::keymap::{KeyChord, Keymap};
 use crate::store_worker::{self, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
@@ -38,6 +40,17 @@ pub struct Harness {
     backend: Backend,
     /// What the shell sent to the (absent) worker.
     rx: UnboundedReceiver<RequestEnvelope>,
+    /// The chat runtime, when a test installed one. Without it every chat request is refused,
+    /// which is the `chat_offline` fixture.
+    runtime: Option<AgentRuntime>,
+    /// Chat futures [`Harness::drive`] polls inline: production spawns, the harness awaits, and
+    /// that is what makes a streamed turn byte-stable in a snapshot with no sleeps.
+    chats: Vec<(StepId, ChatTask)>,
+    /// The reply channel a chat writes its frames into.
+    replies: (
+        mpsc::UnboundedSender<ReplyEnvelope>,
+        UnboundedReceiver<ReplyEnvelope>,
+    ),
     /// What [`Harness::settle`] answers `StoreRequest::StoreState` with, when a test asks for
     /// something a memory backend cannot represent.
     store_state: Option<(String, Option<usize>)>,
@@ -84,14 +97,121 @@ impl Harness {
         app.top_bar.store = backend.label();
         app.start();
         let (width, height) = DEFAULT_SIZE;
+        let (reply_tx, reply_rx) = mpsc::unbounded_channel();
         Self {
             app,
             backend,
             rx,
+            runtime: None,
+            chats: Vec::new(),
+            replies: (reply_tx, reply_rx),
             store_state: None,
             term: terminal(width, height),
             pending: VecDeque::new(),
         }
+    }
+
+    /// Installs the chat runtime the chat requests are served by.
+    ///
+    /// Without one, [`Harness::drive`] answers every chat request `Failed`, exactly as a build
+    /// with no transport would.
+    #[must_use]
+    pub fn with_agent_runtime(mut self, runtime: AgentRuntime) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// The steps of the chats this harness has started, oldest first.
+    #[must_use]
+    pub fn chat_steps(&self) -> Vec<StepId> {
+        self.runtime
+            .as_ref()
+            .map(AgentRuntime::steps)
+            .unwrap_or_default()
+    }
+
+    /// [`Harness::settle`] plus the chat pump.
+    ///
+    /// Three things per round: serve every queued request (chat ones through the runtime), poll
+    /// every held chat future **once**, and deliver every frame the chats produced. A chat that is
+    /// `Pending` after a quiet round is a chat waiting on the user, which is exactly the state a
+    /// snapshot wants to photograph.
+    ///
+    /// # Panics
+    ///
+    /// If the shell never goes quiet, like [`Harness::settle`].
+    pub async fn drive(&mut self) {
+        for _ in 0..SETTLE_ROUNDS {
+            let mut progress = false;
+
+            while let Ok(envelope) = self.rx.try_recv() {
+                progress = true;
+                let reply = match (&envelope.request, &self.store_state) {
+                    (StoreRequest::StoreState, Some((label, migrations_pending))) => {
+                        StoreReply::StoreState {
+                            label: label.clone(),
+                            migrations_pending: *migrations_pending,
+                        }
+                    }
+                    (
+                        StoreRequest::ChatStart { .. }
+                        | StoreRequest::ChatSend { .. }
+                        | StoreRequest::ChatAnswer { .. }
+                        | StoreRequest::ChatCancel { .. },
+                        _,
+                    ) => match self.runtime.as_mut() {
+                        Some(runtime) => {
+                            match runtime
+                                .serve(&self.backend, &self.replies.0, &envelope)
+                                .await
+                            {
+                                Served::Reply(reply) => reply,
+                                // The chat answers this request itself, through the reply channel.
+                                Served::Deferred => continue,
+                                Served::Start { step_id, task } => {
+                                    self.chats.push((step_id, task));
+                                    continue;
+                                }
+                            }
+                        }
+                        None => StoreReply::Failed {
+                            request: envelope.request.name(),
+                            message: "no agent runtime in this harness".to_owned(),
+                        },
+                    },
+                    (request, _) => store_worker::serve(&self.backend, request).await,
+                };
+                self.app.update(Action::Reply(ReplyEnvelope {
+                    seq: envelope.seq,
+                    origin: envelope.origin,
+                    reply,
+                }));
+            }
+
+            // One poll each: a chat that is ready finishes, one that is waiting stays where it is.
+            let mut still_running = Vec::new();
+            for (step, mut task) in std::mem::take(&mut self.chats) {
+                match futures::poll!(&mut task) {
+                    std::task::Poll::Ready(()) => progress = true,
+                    std::task::Poll::Pending => still_running.push((step, task)),
+                }
+            }
+            self.chats = still_running;
+
+            while let Ok(envelope) = self.replies.1.try_recv() {
+                progress = true;
+                self.app.update(Action::Reply(envelope));
+            }
+
+            if progress {
+                continue;
+            }
+            match self.pending.pop_front() {
+                Some(overlay) => self.app.push_overlay(overlay),
+                None => return,
+            }
+        }
+        panic!("the shell never settled: a view is issuing a request for every reply");
     }
 
     /// Answers every `StoreRequest::StoreState` with this label and pending count.

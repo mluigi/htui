@@ -6,7 +6,7 @@
 //! There is no `Backend::write*` method and no `impl WriteStore for Backend`. The two ways to
 //! reach a `WriteStore` are [`Backend::writable`], which borrows a [`PgStore`] for the length of
 //! one call, and [`Backend::writer`] (MOD-2 milestone 3), which hands out an owned
-//! [`Writer`](crate::Writer) a spawned task can hold for a whole session. **Both answer `None` on
+//! [`Writer`] a spawned task can hold for a whole session. **Both answer `None` on
 //! [`Backend::Offline`]**, so a write attempt against an offline store is still unreachable rather
 //! than merely refused at runtime (plan D1, MOD-2 D26). That claim is documented here and
 //! deliberately not covered by a compile-fail test: it is not worth a `trybuild` dependency.

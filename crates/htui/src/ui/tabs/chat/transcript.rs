@@ -1,0 +1,737 @@
+//! What a chat looks like: frames in, lines out (`R-TUI-6`).
+//!
+//! The transcript keeps its **own** coalescing. The recorder's is about rows — one
+//! `assistant_text` per contiguous run, flushed on a bound — and it happens after the frame has
+//! already gone to the screen, so a tab that waited for it would render a turn only once it was
+//! over. Two coalescers with one rule (`message_id` groups a run) is the price of streaming.
+
+use htui_agent::driver::{AgentSessionRef, PermissionRequestId};
+use htui_agent::event::{
+    DriverEnvelope, DriverEvent, PermissionOption, PlanEntry, StopReason, TerminalReason, ToolKind,
+};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+
+use crate::app::Handled;
+use crate::ui::Theme;
+use crossterm::event::{KeyCode, KeyEvent};
+
+/// Where a tool call stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallStatus {
+    /// The agent has not reported an end yet.
+    Running,
+    /// It finished.
+    Completed,
+    /// It failed, was rejected, or was cancelled.
+    Failed {
+        /// Set only on a row `htui` synthesized (`docs/ANA-4.md` §4.3).
+        reason: Option<TerminalReason>,
+    },
+}
+
+/// How a permission request was answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    /// The chosen option, or `None` for a cancellation.
+    pub option_id: Option<String>,
+    /// `user` or `policy` (ANA-9 §4.3).
+    pub by: String,
+}
+
+/// One rendered thing in a chat.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranscriptRow {
+    /// The assembled prompt that opened the session.
+    Prompt {
+        /// What was sent.
+        text: String,
+    },
+    /// A follow-up the user typed.
+    FollowUp {
+        /// What was sent.
+        text: String,
+    },
+    /// Agent text, coalesced per `message_id`.
+    Assistant {
+        /// The text so far.
+        text: String,
+        /// The run's grouping key.
+        message_id: Option<String>,
+    },
+    /// Agent reasoning, coalesced the same way and foldable.
+    Thought {
+        /// The text so far.
+        text: String,
+        /// The run's grouping key.
+        message_id: Option<String>,
+    },
+    /// A tool call and how it ended.
+    ToolCall {
+        /// The transport's call id.
+        id: String,
+        /// What the agent called it.
+        title: String,
+        /// The ten-value ACP kind.
+        kind: ToolKind,
+        /// Where it stands.
+        status: CallStatus,
+    },
+    /// A proposed edit, as a diff.
+    EditProposal {
+        /// The enclosing call, when there was one.
+        id: Option<String>,
+        /// The file.
+        path: String,
+        /// The unified diff.
+        diff: String,
+        /// `true` allowed, `false` rejected, `None` while a request is parked.
+        accepted: Option<bool>,
+    },
+    /// A permission request, with its options and its answer once it has one.
+    Permission {
+        /// Correlates the request with its answer.
+        request_id: PermissionRequestId,
+        /// The call being gated.
+        tool_call_id: Option<String>,
+        /// What the agent offered.
+        options: Vec<PermissionOption>,
+        /// `None` while the user has not answered.
+        resolved: Option<Resolution>,
+    },
+    /// The agent's complete plan.
+    Plan {
+        /// Every entry, as of this update.
+        entries: Vec<PlanEntry>,
+    },
+    /// A usage report, already rendered to one line.
+    Usage {
+        /// The line.
+        line: String,
+    },
+    /// Something went wrong.
+    Error {
+        /// The machine-readable code.
+        code: String,
+        /// The message.
+        message: String,
+    },
+    /// The end of a turn.
+    Done {
+        /// Why it ended.
+        stop_reason: StopReason,
+    },
+    /// Anything else the protocol said, named but not interpreted.
+    Other {
+        /// The transport's own name for it.
+        update: String,
+    },
+}
+
+/// The rendered conversation.
+#[derive(Debug, Default)]
+pub struct Transcript {
+    rows: Vec<TranscriptRow>,
+    /// Thoughts collapse to one line each by default (`R-TUI-6`: "collapsed thoughts").
+    fold_thoughts: bool,
+    /// How many lines are scrolled off the top; `usize::MAX` means "follow the tail".
+    scroll: Scroll,
+    /// The agent-side session id, taken from the banner rather than rendered as a row.
+    session_ref: Option<AgentSessionRef>,
+}
+
+/// Where the view is.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Scroll {
+    /// Pinned to the newest line: a streaming turn stays visible without a keystroke.
+    #[default]
+    Tail,
+    /// Parked at a line the user scrolled to.
+    At(usize),
+}
+
+impl Transcript {
+    /// An empty transcript with thoughts folded.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            fold_thoughts: true,
+            ..Self::default()
+        }
+    }
+
+    /// Every row, for assertions.
+    #[must_use]
+    pub fn rows(&self) -> &[TranscriptRow] {
+        &self.rows
+    }
+
+    /// The agent-side session id the banner carried.
+    #[must_use]
+    pub fn session_ref(&self) -> Option<&AgentSessionRef> {
+        self.session_ref.as_ref()
+    }
+
+    /// The newest permission request nobody has answered.
+    #[must_use]
+    pub fn parked(&self) -> Option<&TranscriptRow> {
+        self.rows
+            .iter()
+            .rev()
+            .find(|row| matches!(row, TranscriptRow::Permission { resolved: None, .. }))
+    }
+
+    /// Applies one frame.
+    pub fn apply(&mut self, envelope: &DriverEnvelope) {
+        match &envelope.event {
+            DriverEvent::AssistantChunk(chunk) => {
+                self.append_text(&chunk.text, chunk.message_id.as_deref(), false);
+            }
+            DriverEvent::ThoughtChunk(chunk) => {
+                self.append_text(&chunk.text, chunk.message_id.as_deref(), true);
+            }
+            DriverEvent::ToolCall(call) => self.rows.push(TranscriptRow::ToolCall {
+                id: call.tool_call_id.clone(),
+                title: call.title.clone(),
+                kind: call.tool_kind,
+                status: CallStatus::Running,
+            }),
+            // A result is not its own row: it is how the call it belongs to ended, which is what
+            // makes a turn readable as "what the agent did" rather than as a protocol log.
+            DriverEvent::ToolResult(result) => {
+                if let Some(TranscriptRow::ToolCall { status, .. }) =
+                    self.rows.iter_mut().rev().find(|row| {
+                        matches!(row, TranscriptRow::ToolCall { id, .. } if id == &result.tool_call_id)
+                    })
+                {
+                    *status = match result.status {
+                        htui_agent::event::ToolResultStatus::Completed => CallStatus::Completed,
+                        htui_agent::event::ToolResultStatus::Failed => CallStatus::Failed {
+                            reason: result.terminal_reason,
+                        },
+                    };
+                }
+            }
+            DriverEvent::EditProposal(proposal) => {
+                let existing = self.rows.iter_mut().find(|row| {
+                    matches!(row, TranscriptRow::EditProposal { id, path, .. }
+                             if id == &proposal.tool_call_id && path == &proposal.path)
+                });
+                match existing {
+                    // The recorder dedups `(tool_call_id, path)` in the store; the screen shows the
+                    // same one row updated, not a second copy of the same file.
+                    Some(TranscriptRow::EditProposal { diff, accepted, .. }) => {
+                        diff.clone_from(&proposal.diff);
+                        *accepted = proposal.accepted;
+                    }
+                    _ => self.rows.push(TranscriptRow::EditProposal {
+                        id: proposal.tool_call_id.clone(),
+                        path: proposal.path.clone(),
+                        diff: proposal.diff.clone(),
+                        accepted: proposal.accepted,
+                    }),
+                }
+            }
+            DriverEvent::PermissionRequest(request) => self.rows.push(TranscriptRow::Permission {
+                request_id: request.request_id.clone(),
+                tool_call_id: request.tool_call_id.clone(),
+                options: request.options.clone(),
+                resolved: None,
+            }),
+            DriverEvent::Plan(plan) => {
+                // A plan update is always the complete list: replace the row, never append to it.
+                if let Some(TranscriptRow::Plan { entries }) = self
+                    .rows
+                    .iter_mut()
+                    .find(|row| matches!(row, TranscriptRow::Plan { .. }))
+                {
+                    entries.clone_from(&plan.entries);
+                } else {
+                    self.rows.push(TranscriptRow::Plan {
+                        entries: plan.entries.clone(),
+                    });
+                }
+            }
+            DriverEvent::Usage(usage) => self.rows.push(TranscriptRow::Usage {
+                line: usage_line(usage),
+            }),
+            DriverEvent::Error(error) => self.rows.push(TranscriptRow::Error {
+                code: error.code.clone(),
+                message: error.message.clone(),
+            }),
+            DriverEvent::Done(done) => self.rows.push(TranscriptRow::Done {
+                stop_reason: done.stop_reason,
+            }),
+            DriverEvent::Other(other) => self.apply_other(other),
+        }
+    }
+
+    /// The three rows `htui` authors itself arrive shaped as `other`; so does the banner.
+    fn apply_other(&mut self, other: &htui_agent::event::OtherEvent) {
+        let text = || {
+            other
+                .body
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        match other.update.as_str() {
+            "prompt" => self.rows.push(TranscriptRow::Prompt { text: text() }),
+            "follow_up" => self.rows.push(TranscriptRow::FollowUp { text: text() }),
+            "permission_answer" => self.resolve_permission(&other.body),
+            // The banner is the header's, not a row's: it says which session this is, which is a
+            // property of the whole conversation.
+            htui_agent::acp::SESSION_STARTED => {
+                self.session_ref = other
+                    .body
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(AgentSessionRef::new);
+            }
+            update => self.rows.push(TranscriptRow::Other {
+                update: update.to_owned(),
+            }),
+        }
+    }
+
+    /// Marks the matching permission row answered.
+    fn resolve_permission(&mut self, body: &serde_json::Value) {
+        let request_id = body
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let resolution = Resolution {
+            option_id: body
+                .get("option_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            by: body
+                .get("by")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("policy")
+                .to_owned(),
+        };
+        if let Some(TranscriptRow::Permission { resolved, .. }) =
+            self.rows.iter_mut().rev().find(|row| {
+                matches!(row, TranscriptRow::Permission { request_id: id, .. }
+                         if id.as_str() == request_id)
+            })
+        {
+            *resolved = Some(resolution);
+        }
+    }
+
+    /// Appends a chunk to the open run of the same kind and key, or starts a new one.
+    fn append_text(&mut self, text: &str, message_id: Option<&str>, thought: bool) {
+        let open = self.rows.last_mut().and_then(|row| match (row, thought) {
+            (TranscriptRow::Assistant { text, message_id }, false)
+            | (TranscriptRow::Thought { text, message_id }, true) => Some((text, message_id)),
+            _ => None,
+        });
+        if let Some((buffer, key)) = open
+            && key.as_deref() == message_id
+        {
+            buffer.push_str(text);
+            return;
+        }
+        let (text, message_id) = (text.to_owned(), message_id.map(ToOwned::to_owned));
+        self.rows.push(if thought {
+            TranscriptRow::Thought { text, message_id }
+        } else {
+            TranscriptRow::Assistant { text, message_id }
+        });
+    }
+
+    /// Scrolling and folding.
+    pub fn on_key(&mut self, key: KeyEvent) -> Handled {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.scroll = match self.scroll {
+                    Scroll::Tail => Scroll::Tail,
+                    Scroll::At(line) => Scroll::At(line + 1),
+                };
+                Handled::Consumed
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.scroll = match self.scroll {
+                    Scroll::Tail => Scroll::At(self.rows.len().saturating_sub(1)),
+                    Scroll::At(line) => Scroll::At(line.saturating_sub(1)),
+                };
+                Handled::Consumed
+            }
+            KeyCode::Char('g') => {
+                self.scroll = Scroll::At(0);
+                Handled::Consumed
+            }
+            KeyCode::Char('G') => {
+                self.scroll = Scroll::Tail;
+                Handled::Consumed
+            }
+            KeyCode::Char('t') => {
+                self.fold_thoughts = !self.fold_thoughts;
+                Handled::Consumed
+            }
+            _ => Handled::Pass,
+        }
+    }
+
+    /// The transcript as lines, tail-first when nothing has been scrolled.
+    #[must_use]
+    pub fn lines(&self, height: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for row in &self.rows {
+            lines.extend(self.render_row(row, theme));
+        }
+        let first = match self.scroll {
+            Scroll::Tail => lines.len().saturating_sub(height),
+            Scroll::At(line) => line.min(lines.len().saturating_sub(1)),
+        };
+        lines.into_iter().skip(first).take(height).collect()
+    }
+
+    /// One row's lines.
+    fn render_row(&self, row: &TranscriptRow, theme: &Theme) -> Vec<Line<'static>> {
+        match row {
+            TranscriptRow::Prompt { text } | TranscriptRow::FollowUp { text } => {
+                vec![Line::from(vec![
+                    Span::styled("you  ", theme.accent),
+                    Span::styled(text.clone(), theme.base),
+                ])]
+            }
+            TranscriptRow::Assistant { text, .. } => text
+                .lines()
+                .map(|line| Line::styled(line.to_owned(), theme.base))
+                .collect(),
+            TranscriptRow::Thought { text, .. } => {
+                if self.fold_thoughts {
+                    let summary = text.lines().next().unwrap_or_default();
+                    vec![Line::styled(
+                        format!("thought  {summary} (t to unfold)"),
+                        theme.dim,
+                    )]
+                } else {
+                    text.lines()
+                        .map(|line| Line::styled(format!("thought  {line}"), theme.dim))
+                        .collect()
+                }
+            }
+            TranscriptRow::ToolCall {
+                title,
+                kind,
+                status,
+                ..
+            } => {
+                let mark = match status {
+                    CallStatus::Running => "…",
+                    CallStatus::Completed => "ok",
+                    CallStatus::Failed { reason: None } => "failed",
+                    CallStatus::Failed {
+                        reason: Some(TerminalReason::Rejected),
+                    } => "rejected",
+                    CallStatus::Failed {
+                        reason: Some(TerminalReason::Cancelled),
+                    } => "cancelled",
+                };
+                let style = match status {
+                    CallStatus::Failed { .. } => theme.error,
+                    _ => theme.dim,
+                };
+                vec![Line::from(vec![
+                    Span::styled(format!("{} {title}", kind.as_str()), theme.base),
+                    Span::styled(format!("  [{mark}]"), style),
+                ])]
+            }
+            TranscriptRow::EditProposal {
+                path,
+                diff,
+                accepted,
+                ..
+            } => {
+                let state = match accepted {
+                    Some(true) => "accepted",
+                    Some(false) => "rejected",
+                    None => "waiting",
+                };
+                let mut lines = vec![Line::styled(
+                    format!("edit  {path}  [{state}]"),
+                    theme.title,
+                )];
+                lines.extend(diff.lines().map(|line| {
+                    let style = diff_style(line, theme);
+                    Line::styled(line.to_owned(), style)
+                }));
+                lines
+            }
+            TranscriptRow::Permission {
+                options, resolved, ..
+            } => {
+                let text = match resolved {
+                    Some(Resolution { option_id, by }) => {
+                        let chosen = option_id.as_deref().unwrap_or("cancelled");
+                        format!("permission  {chosen} (by {by})")
+                    }
+                    None => format!("permission  waiting on you ({} options)", options.len()),
+                };
+                let style = if resolved.is_some() {
+                    theme.dim
+                } else {
+                    theme.accent
+                };
+                vec![Line::styled(text, style)]
+            }
+            TranscriptRow::Plan { entries } => {
+                let mut lines = vec![Line::styled("plan".to_owned(), theme.title)];
+                lines.extend(entries.iter().map(|entry| {
+                    Line::styled(
+                        format!("  [{}] {}", entry.status.as_str(), entry.content),
+                        theme.dim,
+                    )
+                }));
+                lines
+            }
+            TranscriptRow::Usage { line } => vec![Line::styled(line.clone(), theme.dim)],
+            TranscriptRow::Error { code, message } => vec![Line::styled(
+                format!("error  {code}: {message}"),
+                theme.error,
+            )],
+            TranscriptRow::Done { stop_reason } => vec![Line::styled(
+                format!("— turn ended ({}) —", stop_reason.as_str()),
+                theme.dim,
+            )],
+            TranscriptRow::Other { update } => {
+                vec![Line::styled(format!("· {update}"), theme.dim)]
+            }
+        }
+    }
+}
+
+/// `+` accents, `-` errors, everything else is plain — the two gutters a reader looks for.
+fn diff_style(line: &str, theme: &Theme) -> Style {
+    if line.starts_with("+++") || line.starts_with("---") {
+        theme.dim
+    } else if line.starts_with('+') {
+        theme.accent
+    } else if line.starts_with('-') {
+        theme.error
+    } else {
+        theme.dim
+    }
+}
+
+/// A usage report as one line: what it cost and how full the context is.
+fn usage_line(usage: &htui_agent::event::UsageEvent) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let (Some(used), Some(size)) = (usage.context_used, usage.context_size) {
+        parts.push(format!("context {used}/{size}"));
+    }
+    if let Some(total) = usage.cost_micros_total {
+        // Labelled an estimate because both the SDK and the CLI document it as one (ANA-4 risk 13).
+        parts.push(format!("~${:.4}", total as f64 / 1_000_000.0));
+    }
+    if parts.is_empty() {
+        "usage".to_owned()
+    } else {
+        format!("usage  {}", parts.join(" · "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use htui_agent::event::{
+        DoneEvent, EditProposalEvent, OtherEvent, PermissionOptionKind, PermissionRequestEvent,
+        TextChunk, ToolCallEvent, ToolResultEvent, ToolResultStatus,
+    };
+    use serde_json::json;
+
+    fn envelope(event: DriverEvent) -> DriverEnvelope {
+        DriverEnvelope {
+            event,
+            raw: None,
+            at: Utc::now(),
+        }
+    }
+
+    fn chunk(text: &str, id: &str) -> DriverEnvelope {
+        envelope(DriverEvent::AssistantChunk(TextChunk {
+            text: text.to_owned(),
+            message_id: Some(id.to_owned()),
+        }))
+    }
+
+    #[test]
+    fn chunks_of_one_message_coalesce_and_a_new_key_starts_a_row() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&chunk("hel", "m1"));
+        transcript.apply(&chunk("lo", "m1"));
+        transcript.apply(&chunk("next", "m2"));
+        assert_eq!(
+            transcript.rows(),
+            &[
+                TranscriptRow::Assistant {
+                    text: "hello".to_owned(),
+                    message_id: Some("m1".to_owned())
+                },
+                TranscriptRow::Assistant {
+                    text: "next".to_owned(),
+                    message_id: Some("m2".to_owned())
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tool_result_folds_into_its_call_rather_than_becoming_a_row() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id: "call-1".to_owned(),
+            title: "Read main.rs".to_owned(),
+            tool_kind: ToolKind::Read,
+            input: json!({}),
+            locations: Vec::new(),
+        })));
+        transcript.apply(&envelope(DriverEvent::ToolResult(ToolResultEvent {
+            tool_call_id: "call-1".to_owned(),
+            status: ToolResultStatus::Failed,
+            output: None,
+            locations: Vec::new(),
+            terminal_reason: Some(TerminalReason::Rejected),
+        })));
+        assert_eq!(transcript.rows().len(), 1, "one call, one row");
+        assert!(matches!(
+            &transcript.rows()[0],
+            TranscriptRow::ToolCall {
+                status: CallStatus::Failed {
+                    reason: Some(TerminalReason::Rejected)
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_second_proposal_for_one_file_updates_the_row_it_already_has() {
+        let mut transcript = Transcript::new();
+        let proposal = |diff: &str, accepted: Option<bool>| {
+            envelope(DriverEvent::EditProposal(EditProposalEvent {
+                tool_call_id: Some("call-1".to_owned()),
+                path: "src/a.rs".to_owned(),
+                diff: diff.to_owned(),
+                accepted,
+            }))
+        };
+        transcript.apply(&proposal("@@ first", None));
+        transcript.apply(&proposal("@@ second", Some(true)));
+        assert_eq!(transcript.rows().len(), 1);
+        assert!(matches!(
+            &transcript.rows()[0],
+            TranscriptRow::EditProposal { diff, accepted: Some(true), .. } if diff == "@@ second"
+        ));
+    }
+
+    #[test]
+    fn a_permission_request_is_parked_until_its_answer_arrives() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::PermissionRequest(
+            PermissionRequestEvent {
+                request_id: PermissionRequestId::new("req-1"),
+                tool_call_id: Some("call-1".to_owned()),
+                options: vec![PermissionOption {
+                    id: "allow".to_owned(),
+                    label: "Allow".to_owned(),
+                    kind: PermissionOptionKind::AllowOnce,
+                }],
+            },
+        )));
+        assert!(transcript.parked().is_some(), "nobody has answered yet");
+
+        transcript.apply(&envelope(DriverEvent::Other(OtherEvent {
+            update: "permission_answer".to_owned(),
+            body: json!({ "request_id": "req-1", "option_id": "allow", "by": "user" }),
+        })));
+        assert!(
+            transcript.parked().is_none(),
+            "an answered request is no longer waiting on the user"
+        );
+    }
+
+    #[test]
+    fn the_banner_becomes_the_session_id_and_not_a_row() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::Other(OtherEvent {
+            update: htui_agent::acp::SESSION_STARTED.to_owned(),
+            body: json!({ "session_id": "abc-123", "protocol_version": 1 }),
+        })));
+        assert!(transcript.rows().is_empty(), "the header shows it");
+        assert_eq!(
+            transcript.session_ref().map(AgentSessionRef::as_str),
+            Some("abc-123")
+        );
+    }
+
+    #[test]
+    fn a_plan_update_replaces_the_plan_rather_than_appending_one() {
+        let mut transcript = Transcript::new();
+        let plan = |entries: Vec<PlanEntry>| {
+            envelope(DriverEvent::Plan(htui_agent::event::PlanEvent { entries }))
+        };
+        let entry = |content: &str| PlanEntry {
+            content: content.to_owned(),
+            status: htui_agent::event::PlanEntryStatus::Pending,
+            priority: htui_agent::event::PlanEntryPriority::High,
+        };
+        transcript.apply(&plan(vec![entry("one")]));
+        transcript.apply(&plan(vec![entry("one"), entry("two")]));
+        assert_eq!(transcript.rows().len(), 1, "one plan, replaced in place");
+        assert!(matches!(
+            &transcript.rows()[0],
+            TranscriptRow::Plan { entries } if entries.len() == 2
+        ));
+    }
+
+    #[test]
+    fn thoughts_fold_to_one_line_until_t_unfolds_them() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::ThoughtChunk(TextChunk {
+            text: "first\nsecond\nthird".to_owned(),
+            message_id: None,
+        })));
+        let theme = Theme::default();
+        assert_eq!(transcript.lines(20, &theme).len(), 1, "folded");
+
+        transcript.on_key(KeyEvent::from(KeyCode::Char('t')));
+        assert_eq!(transcript.lines(20, &theme).len(), 3, "unfolded");
+    }
+
+    #[test]
+    fn the_view_follows_the_tail_until_it_is_scrolled() {
+        let mut transcript = Transcript::new();
+        for n in 0..10 {
+            transcript.apply(&envelope(DriverEvent::Done(DoneEvent {
+                stop_reason: if n % 2 == 0 {
+                    StopReason::EndTurn
+                } else {
+                    StopReason::Cancelled
+                },
+            })));
+        }
+        let theme = Theme::default();
+        let tail = transcript.lines(3, &theme);
+        assert_eq!(tail.len(), 3);
+        assert!(
+            tail[2].to_string().contains("cancelled"),
+            "the newest line is visible: {:?}",
+            tail[2].to_string()
+        );
+
+        transcript.on_key(KeyEvent::from(KeyCode::Char('g')));
+        let top = transcript.lines(3, &theme);
+        assert!(
+            top[0].to_string().contains("end_turn"),
+            "`g` goes to the first line: {:?}",
+            top[0].to_string()
+        );
+    }
+}

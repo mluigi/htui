@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/chat.rs
+expression: harness.render()
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Chat
+┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
+│scripted · sonnet · Vulkan Tutorials · session fake-<session>          │
+│you  fix it                                                                                       │
+│edit  src/lib.rs  [accepted]                                                                      │
+│--- a/src/lib.rs                                                                                  │
+│+++ b/src/lib.rs                                                                                  │
+│@@ -1 +1 @@                                                                                       │
+│-old line                                                                                         │
+│+new line                                                                                         │
+│— turn ended (end_turn) —                                                                         │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│i compose · Esc Esc end · t thoughts · j/k scroll                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

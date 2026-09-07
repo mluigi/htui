@@ -34,8 +34,8 @@ async fn the_demo_shell_starts_inside_the_first_workspace_on_the_backlog_tab() {
     );
     assert_eq!(
         harness.app().tabs.len(),
-        3,
-        "Backlog, Skills and Settings, in that order"
+        4,
+        "Backlog, Skills, Settings and Chat, in that order (MOD-2 milestone 3 registered the last)"
     );
     assert!(
         harness.app().overlays.is_empty(),

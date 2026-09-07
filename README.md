@@ -184,7 +184,37 @@ pending migrations, and never by the user.
 | `PageDown` / `PageUp` | Scroll the detail pane ten rows |
 
 The five detail sub-tabs are **Body**, **Runs**, **Graph**, **Documents** and **Notes**
-(`R-TUI-3`). The Skills and Settings tabs are placeholders in this milestone.
+(`R-TUI-3`). The Skills tab is still a placeholder; the Settings tab lists the agent registry.
+
+### Chat tab
+
+A live conversation with an agent (`R-TUI-6`). The first prompt starts a session, records it
+against a `chat` run, and streams what the agent does back into the transcript.
+
+| Key | Action |
+|---|---|
+| `i` / `Enter` | Compose; `Enter` sends, `Esc` leaves the composer |
+| `a` | Next enabled agent, before the first prompt |
+| `1`..`9` | Answer the permission request the agent is waiting on |
+| `Esc` `Esc` | End the session (the first `Esc` arms it, any other key disarms) |
+| `t` | Fold or unfold the agent's thoughts |
+| `j` / `k` / `g` / `G` | Scroll the transcript |
+
+The header names the agent, the model, the project and the agent-side session id. A banner under
+it lists what the session **cannot** do — permission requests, edit proposals, plans — whenever
+the transport reports less than the full profile; it is computed from the driver's own
+capabilities, not from `agent.transport`.
+
+A chat needs a writable store: while the shell is offline it refuses to start one, because the
+offline event buffer arrives in a later milestone. Ending the app cancels every live session and
+waits for its process tree to die before the process exits.
+
+Two environment knobs, both off by default:
+
+| Variable | Effect |
+|---|---|
+| `HTUI_KEEP_RAW_EVENTS=1` | Keep the verbatim wire message on every recorded row. `project.settings.keep_raw_events` replaces this once the project editor exists |
+| `HTUI_TOOL_<NAME>` | Override one `${name}` placeholder of `agent.launch` — `HTUI_TOOL_NODE`, `HTUI_TOOL_CLAUDE_AGENT_ACP`, … — for a box whose layout the built-in resolver does not understand |
 
 ## Platforms
 

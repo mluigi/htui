@@ -21,6 +21,12 @@ pub mod ui;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
+/// How long the shell waits for the store worker to end every live chat before giving up.
+///
+/// Long enough for a cancel's grace window plus a process-tree kill, short enough that a wedged
+/// agent cannot hold the terminal hostage after `q`.
+const SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
 use std::io::BufRead as _;
 use std::path::Path;
 
@@ -85,7 +91,17 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     let mut term = terminal::init();
     let outcome = event_loop::run(&mut term, &mut app, reply_rx).await;
     term.restore();
-    worker.abort();
+
+    // Quit order, and it matters (MOD-2 milestone 3). Dropping the shell closes the request
+    // channel; the worker sees that, cancels every live chat and waits for each session task to
+    // kill its process tree, and only then returns. Aborting it here instead — which is what this
+    // did before there were sessions — drops every task at its first await and orphans the agent
+    // processes they spawned (`docs/ANA-4.md` §11 criterion 11). The abort stays as the backstop
+    // for a worker that will not stop.
+    drop(app);
+    if tokio::time::timeout(SHUTDOWN, worker).await.is_err() {
+        tracing::warn!("the store worker did not stop within the shutdown window");
+    }
 
     outcome.map_err(anyhow::Error::from)
 }

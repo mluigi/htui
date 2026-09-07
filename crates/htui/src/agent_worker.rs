@@ -3,7 +3,7 @@
 //! One [`AgentRuntime`] lives inside the store worker loop, because a chat needs two things only
 //! that loop has: the [`Backend`] (for the writer, the box, the user and the registry row) and the
 //! reply channel every view is answered through. The chat tab holds neither — it asks for a chat
-//! with [`StoreRequest::ChatStart`](crate::store_worker::StoreRequest::ChatStart) and is answered
+//! with [`StoreRequest::ChatStart`] and is answered
 //! in `on_reply`, exactly as it is for a list of items (`R-NF-3`).
 //!
 //! **The stream is one request, many replies.** Every frame a session produces is sent as a

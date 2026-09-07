@@ -40,7 +40,8 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 # The chat tab's snapshots drive the fake transport through the same registry the ACP one uses.
 htui-agent = { workspace = true, features = ["test-support"] }
-insta    = { workspace = true }
+# `filters` so a chat snapshot can substitute the session id the transport mints per run.
+insta    = { workspace = true, features = ["filters"] }
 tokio    = { workspace = true, features = ["test-util"] }
 # The store worker's swap tests open a throwaway `cache.sqlite`, never the user's.
 tempfile = "3"

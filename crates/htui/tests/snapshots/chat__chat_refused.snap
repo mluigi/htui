@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/chat.rs
+expression: harness.render()
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Chat
+┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
+│agy · default · Vulkan Tutorials · session —                                                      │
+│no agent runtime in this harness                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│i compose the first prompt · a next agent                                                         │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+chat_start: no agent runtime in this harness
