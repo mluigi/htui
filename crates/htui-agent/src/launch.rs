@@ -526,13 +526,28 @@ impl Spawned {
 /// A refused job-object assignment is a **downgrade, not a failure**: the child still runs, and
 /// [`Spawned::job_object`] says so.
 ///
+/// **Async, and the `which` lookup runs on a blocking thread.** Resolving a command walks `PATH`
+/// with a `stat` per candidate — and on Windows a `PATHEXT` product per candidate — which is
+/// filesystem I/O, not arithmetic. Milestone 3 calls this from inside `AgentDriver::start`, so it
+/// would sit on a runtime worker; `crates/htui-store/src/cache/pending.rs` already sets this
+/// crate family's precedent of pushing blocking file I/O through `spawn_blocking`, and doing it
+/// *inside* this function makes the type system enforce it rather than the caller's memory.
+///
+/// The rest of the work stays on the caller's thread on purpose: `tokio::process::Command::spawn`
+/// is non-blocking, and the stderr reader is a `tokio::spawn`ed task, so this function must be
+/// called from within a runtime.
+///
 /// # Errors
 /// [`DriverError::Spawn`] when the command cannot be found or the operating system refuses the
-/// spawn.
-pub fn spawn(launch: &ResolvedLaunch, cwd: &Path) -> Result<Spawned> {
-    let program = which::which(&launch.command).map_err(|error| {
-        DriverError::Spawn(format!("`{}` is not executable: {error}", launch.command))
-    })?;
+/// spawn; [`DriverError::Transport`] when the blocking lookup task itself fails to run.
+pub async fn spawn(launch: &ResolvedLaunch, cwd: &Path) -> Result<Spawned> {
+    let command = launch.command.clone();
+    let program = tokio::task::spawn_blocking(move || which::which(&command))
+        .await
+        .map_err(|error| DriverError::Transport(format!("resolving the command: {error}")))?
+        .map_err(|error| {
+            DriverError::Spawn(format!("`{}` is not executable: {error}", launch.command))
+        })?;
 
     let (mut child, job_object) = spawn_supervised(&program, launch, cwd)?;
 

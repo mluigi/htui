@@ -355,6 +355,7 @@ async fn spawn_runs_the_resolved_command_under_supervision() {
 
     let mut spawned =
         htui_agent::launch::spawn(&resolved, std::env::current_dir().unwrap().as_path())
+            .await
             .expect("cargo --version spawns");
 
     let stdout = spawned.read_stdout_to_end().await.expect("stdout reads");

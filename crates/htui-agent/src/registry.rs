@@ -81,12 +81,16 @@ impl DriverFactory {
         agent: &Agent,
         on_box: Option<&AgentBox>,
     ) -> Result<Box<dyn AgentDriver>> {
-        let id = adapter_id(agent);
+        // Parsed once and shared by both derivations: `adapter_id` and `caps_for` each read the
+        // same `settings` document, and calling the public pair here would deserialise (and clone)
+        // it twice per session start.
+        let settings = settings(agent);
+        let id = adapter_id_from(agent, &settings);
         let builder = self
             .adapters
             .get(&id)
             .ok_or(DriverError::UnknownAdapter(id))?;
-        builder.build(agent, on_box, caps_for(agent))
+        builder.build(agent, on_box, caps_from(agent, &settings))
     }
 }
 
@@ -97,9 +101,14 @@ impl DriverFactory {
 /// serde error would be.
 #[must_use]
 pub fn adapter_id(agent: &Agent) -> String {
+    adapter_id_from(agent, &settings(agent))
+}
+
+/// [`adapter_id`] over settings the caller has already parsed.
+fn adapter_id_from(agent: &Agent, settings: &AgentSettings) -> String {
     match agent.transport {
         Transport::Acp => "acp".to_owned(),
-        Transport::Cli => match settings(agent).cli {
+        Transport::Cli => match settings.cli.as_ref() {
             Some(cli) if !cli.stream.is_empty() => format!("cli/{}", cli.stream),
             _ => "cli".to_owned(),
         },
@@ -112,7 +121,11 @@ pub fn adapter_id(agent: &Agent) -> String {
 /// orchestrator's gate check read one profile per row, whoever built the driver.
 #[must_use]
 pub fn caps_for(agent: &Agent) -> DriverCaps {
-    let settings = settings(agent);
+    caps_from(agent, &settings(agent))
+}
+
+/// [`caps_for`] over settings the caller has already parsed.
+fn caps_from(agent: &Agent, settings: &AgentSettings) -> DriverCaps {
     match agent.transport {
         Transport::Acp => DriverCaps {
             permission_requests: true,

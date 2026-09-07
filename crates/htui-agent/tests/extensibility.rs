@@ -12,14 +12,18 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use htui_agent::conformance::{self, CaseHarness, Script};
-use htui_agent::driver::AgentDriver;
+use htui_agent::conformance::{self, CaseHarness, Script, ScriptEvent};
+use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
 use htui_agent::error::DriverError;
+use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk, ToolKind};
+use htui_agent::event::{ToolCallEvent, ToolResultEvent, ToolResultStatus};
 use htui_agent::fake::FakeAdapter;
 use htui_agent::launch::{AgentLaunch, ToolMap, resolve};
+use htui_agent::record::{Recorder, pump};
 use htui_agent::registry::DriverFactory;
-use htui_core::model::{Agent, AgentId, agent::seed_rows};
-use htui_core::store::{MemStore, WriteStore};
+use htui_core::model::{Agent, AgentId, ChatRunSpec, agent::seed_rows};
+use htui_core::scrub::MinimalScrubber;
+use htui_core::store::{MemStore, ReadStore, WriteStore};
 
 /// The unknown agent's `agent` row, exactly as the Settings tab would write it: JSON, no Rust
 /// constructor, no entry anywhere in the codebase.
@@ -275,4 +279,143 @@ async fn the_unknown_agent_passes_every_conformance_case() {
         adapter,
     };
     conformance::run_all(&harness, || async { MemStore::demo() }).await;
+}
+
+/// The sweep plan T9 item 6 promised, and the one this file was missing: the zeta row's **real**
+/// resolved token goes through a whole session — factory, driver, recorder, scrubber, store — and
+/// no persisted row may carry it.
+///
+/// The conformance run above proves masking generically, but against `conformance`'s own
+/// `FAKE_TOKEN`, never against the value this row actually resolves. That gap is exactly where a
+/// scrubber wired to the wrong map would survive a green suite.
+#[tokio::test]
+async fn the_resolved_token_reaches_no_persisted_row() {
+    let store = MemStore::demo();
+    let zeta = zeta_row();
+    store.upsert_agent(&zeta).await.expect("the row saves");
+
+    // The env the session runs with is the *resolved* launch env, not a literal: this is the
+    // value a probed box would really hand the child process.
+    let launch: AgentLaunch =
+        serde_json::from_value(zeta.launch.clone()).expect("the launch row is an AgentLaunch");
+    let tools: ToolMap = BTreeMap::from([
+        ("zeta".to_owned(), "/opt/zeta/bin/zeta".to_owned()),
+        ("zeta_token".to_owned(), ZETA_TOKEN.to_owned()),
+    ]);
+    let resolved = resolve(&launch, &tools).expect("both placeholders resolve");
+    assert!(
+        resolved.env.values().any(|value| value == ZETA_TOKEN),
+        "the session env carries the resolved token, or this test proves nothing"
+    );
+
+    let chat = ChatRunSpec::mint(
+        htui_core::fixtures::ids::PROJECT_HTUI,
+        htui_core::fixtures::ids::BOX,
+        htui_core::fixtures::ids::USER,
+        Some(zeta.id),
+        None,
+    );
+    store
+        .start_chat_run(&chat)
+        .await
+        .expect("the chat rows mint");
+
+    let adapter = FakeAdapter::new();
+    // The agent echoes the token back in three shapes a real one plausibly would: assistant text,
+    // a tool call's arguments, and a tool result's output.
+    adapter.load(Script::one_turn(vec![
+        ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+            message_id: Some("m-1".to_owned()),
+            text: format!("I will use ZETA_TOKEN={ZETA_TOKEN} for this call."),
+        })),
+        ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id: "call-1".to_owned(),
+            title: "bash".to_owned(),
+            tool_kind: ToolKind::Execute,
+            input: serde_json::json!({ "command": format!("curl -H 'auth: {ZETA_TOKEN}'") }),
+            locations: Vec::new(),
+        })),
+        ScriptEvent::Emit(DriverEvent::ToolResult(ToolResultEvent {
+            tool_call_id: "call-1".to_owned(),
+            status: ToolResultStatus::Completed,
+            output: Some(serde_json::json!({ "text": format!("echoed {ZETA_TOKEN}") })),
+            locations: Vec::new(),
+            terminal_reason: None,
+        })),
+        ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        })),
+    ]));
+    let mut factory = DriverFactory::new();
+    factory.register("cli/fake", Box::new(adapter));
+
+    let stored = store
+        .agents()
+        .await
+        .expect("the registry reads")
+        .into_iter()
+        .find(|summary| summary.agent.name == "zeta")
+        .expect("zeta is in the registry")
+        .agent;
+    let driver = factory
+        .driver_for(&stored, None)
+        .expect("the row names a registered adapter");
+
+    let spec = SessionSpec {
+        agent_id: stored.id,
+        step_id: chat.step_id,
+        cwd: PathBuf::from("."),
+        extra_dirs: Vec::new(),
+        env: resolved.env.clone(),
+        model: None,
+        tools: ToolExposure::default(),
+        mcp: Vec::new(),
+        permission: PermissionPolicy::default(),
+        // `raw` retained on purpose: an unscrubbed verbatim blob is the likeliest place for a
+        // secret to survive, so the sweep is weaker without it.
+        retain_raw: true,
+        resume: None,
+    };
+
+    // The scrubber is built from the same resolved env the session runs with, which is the wiring
+    // milestone 3 has to reproduce.
+    let scrubber = MinimalScrubber::new(resolved.env.values().cloned());
+    let mut session = driver
+        .start(spec, "use the token".to_owned())
+        .await
+        .expect("the session starts");
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, true, None);
+    recorder
+        .record_prompt(
+            &format!("use ZETA_TOKEN={ZETA_TOKEN}"),
+            serde_json::json!({}),
+            conformance::epoch(),
+        )
+        .await
+        .expect("the prompt records");
+    pump(session.as_mut(), &mut recorder)
+        .await
+        .expect("the turn runs to done");
+    recorder.finish().await.expect("the session closes clean");
+
+    let rows = store
+        .step_events(chat.step_id)
+        .await
+        .expect("reading the log must not fail")
+        .expect("the chat step has a log");
+    assert!(
+        rows.len() >= 4,
+        "prompt, banner, text, call and result all persist: {}",
+        rows.len()
+    );
+
+    let rendered = serde_json::to_string(&rows).expect("the rows serialise");
+    assert!(
+        !rendered.contains(ZETA_TOKEN),
+        "the resolved token survived into a persisted row: {rendered}"
+    );
+    assert!(
+        rendered.contains("[REDACTED]"),
+        "it is masked in place, not silently dropped: {rendered}"
+    );
 }
