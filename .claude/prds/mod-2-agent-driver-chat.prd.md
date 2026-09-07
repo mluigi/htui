@@ -148,7 +148,7 @@ Concretely in scope:
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Driver seam + conformance | Any transport, real or fake, is provably interchangeable: one `CASES` list all of them pass, with events recorded, scrubbed and persisted through the fake alone. No process is spawned yet. | complete | [plan](../plans/mod-2-driver-seam-registry.plan.md) |
-| 2 | Registry, launch and extensibility proof | The maintainer sees registered agents in Settings; an agent the codebase has never heard of reaches a working session from a registry row alone. `R-AGT-5` becomes a passing test rather than a claim. | pending | [plan](../plans/mod-2-driver-seam-registry.plan.md) |
+| 2 | Registry, launch and extensibility proof | The maintainer sees registered agents in Settings; an agent the codebase has never heard of reaches a working session from a registry row alone. `R-AGT-5` becomes a passing test rather than a claim. | complete | [plan](../plans/mod-2-driver-seam-registry.plan.md) |
 | 3 | Live `claude` over ACP | The maintainer holds a real streamed conversation with `claude` inside `htui` — text, thoughts, tool calls, edit proposals as diffs, permissions answered inline. | pending | — |
 | 4 | Durable history and replay | Nothing about a session exists only in memory: events persist scrubbed, an offline session buffers and uploads idempotently, and any past step reopens read-only and replays. | pending | — |
 | 5 | Autodiscovery and box probe | The maintainer learns what this box can actually run without configuring anything: probes find agents and adapters, record versions, and mark per-box enablement. Migration `0002` lands here. | pending | — |

@@ -14,7 +14,10 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-06):** ANA-5 concluded (`docs/ANA-5.md`,
+**Current status (2026-09-07):** MOD-2 milestone 2 landed (`5c717d0`..`1e7de4d`, review gate still
+open): the agent registry now seeds itself, an agent named nowhere in the tree reaches a working
+session from its row alone (`R-AGT-5`), and the Settings tab lists the registry. ANA-5 concluded
+(`docs/ANA-5.md`,
 `docs/decisions/ana/ana-5.md`): plain `{{name}}` templates over a closed per-role placeholder set
 with no templating crate, ten `<section>` names, ANA-9 §7.3 amended at query level (`MIN(depth)`,
 `in_scope`), kept-first trim order with a `chars-v1` estimator and `trim_record` already in
@@ -72,10 +75,24 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   replaces), six `WriteStore` methods incl. `start_chat_run`/`finish_chat_run`, inherent `agents()`
   over three `Backend` arms, `append_pending`, `conformance::CASES` 15 -> 20. `rust-reviewer` ran
   over the whole change set: 23 findings adjudicated by an adversarial pass (12 real, 5 partly,
-  6 refuted), 10 fixed with bite-proven tests, 7 deferred (see the plan's amendments). MSRV stays
-  1.85 until milestone 2, which raises it to **1.98** per maintainer override of ANA-4 §4.2's 1.88
-  (`sqlx-core 0.9.0` already floors at 1.94; plan X9). Milestone 2 (T7-T10: MSRV + dependency set,
-  launch/spawn, seed rows, `DriverFactory` + the `R-AGT-5` proof, Settings agent section) is next.
+  6 refuted), 10 fixed with bite-proven tests, 7 deferred (see the plan's amendments).
+  **Phase 2 landed (2026-09-07, `5c717d0`..`1e7de4d`):** workspace MSRV 1.85 -> **1.98** with
+  `clippy.toml` moved with it (maintainer override of ANA-4 §4.2's 1.88; `sqlx-core 0.9.0` already
+  floors at 1.94, plan X9); the milestone-2 dependency set (`agent-client-protocol =2.1.0`,
+  `tokio-util`, `process-wrap` incl. the `process-group` feature the plan omitted, `which`,
+  `similar` declared only, and `windows` on Windows targets for `CREATE_NO_WINDOW`);
+  `htui-agent::launch` (`AgentLaunch`/`AgentSettings` serde types, `${tool}` resolution,
+  `to_acp_config` through the SDK builder, supervised `spawn` with a job object on Windows and a
+  process group on unix); `htui_core::model::agent::seed_rows` from `crates/htui-core/seeds/*.json`
+  with `PgStore::seed_if_empty_as` inserting them and the demo fixture derived from the same
+  source; `DriverFactory` keyed by transport (`acp`, `cli/<stream>`) with the `R-AGT-5` proof in
+  `crates/htui-agent/tests/extensibility.rs`; and the Settings tab's `SettingsRegistry` plus its
+  agent section (`StoreRequest::Agents`, `Harness::over` made public). Nine findings, all fixed
+  (plan "Milestone 2 close-out"). Verified on **Linux** with Postgres live (243 tests, no skipped
+  Postgres case, `USERNAME=htui-ci` per TOOL-2); the Windows spawn path is unverified here and
+  milestone 3 is the first to run it. **Not yet reviewed**: the `rust-reviewer` gate for milestone 2
+  is outstanding - the configured reviewer agent was unavailable in the landing session. Milestone 3
+  (live `claude` over ACP: the transport, the chat tab, `htui` -> `htui-agent`) is next.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and

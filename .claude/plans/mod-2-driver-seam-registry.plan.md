@@ -136,6 +136,37 @@ E = {T9} serial (needs T7's `launch`, T8's `seed_rows`, T6's fake). Four agents 
 Opus, worktrees; the reviewer runs once per milestone. TDD per task: the tests named under
 **Tests first** are written and failing before the implementation.
 
+> **Milestone 2 execution amendment, 2026-09-07 (main thread, at launch).** Four corrections; the
+> first three were accepted by the maintainer at the routing gate, the fourth is their instruction
+> at launch.
+>
+> 1. **Dev Postgres moved from port 5433 to 5439** (`compose.yaml`, `README.md`, and `HANDOFF.md`'s
+>    live coordinates). Every `HTUI_TEST_DATABASE_URL` in this plan reads
+>    `postgres://postgres:htui@localhost:5439/postgres`; the Validation block and the Prerequisite
+>    line are corrected in place. The wave-A note's "port 5433 refused" stays as written — it is a
+>    record of what happened on 2026-09-06, not an instruction.
+> 2. **T10 is `serial-after: T8`, not independent — the same defect the wave-A note names.**
+>    File sets stay disjoint (V11 holds), but T10's `settings_agents_demo` snapshot renders
+>    `transport` and `billing` for the demo agents, and T8 rewrites exactly those fixture values
+>    (`agy`: `cli`/`per_token` → `acp`/`subscription`, `models` → `[]`, `default_model` → `None`,
+>    per ANA-4 §5.3 and `crates/htui-core/src/fixtures.rs:383-412`). A snapshot written against the
+>    pre-T8 fixture is stale the moment T8 lands. This is a *data* dependency with no shared file:
+>    the stricter rule needs one more clause — a task is independent only when its file set is
+>    disjoint **and** every type, trait, function **and fixture value** it reads already exists in
+>    its final form or is produced by the same task.
+> 3. **No Workflow tool is available in this session**, so the accepted ultracode recommendation
+>    could not run as a script.
+> 4. **The implementer fan-out was declined by the maintainer at launch**; milestone 2 runs
+>    serially on the main thread, T7 → T8 → T10 → T9. TDD, the `rust-reviewer` gate and the
+>    close-out validator are unchanged — the fan-out was the optimization, never the contract.
+>    Worktrees are dropped with it (they existed to isolate parallel agents).
+>
+> **Every Postgres run in this wave is prefixed `USERNAME=htui-ci`** (TOOL-2): the demo fixture
+> seeds `app_user.name = "luigi"` and `PgStore::seed_if_empty` derives the same name from the OS
+> user, so `demo_db()` fails with a duplicate-key `Constraint` on this box. The suites' skip guard
+> returns `ok` when `HTUI_TEST_DATABASE_URL` is unset, so a task reporting "green" without the
+> variable set has proved nothing — T8's validate step must quote real assertions, never a skip.
+
 Every implementer prompt carries: ANA-4 has priority over this plan where they disagree (MOD-1 /
 MOD-6 precedent) except where §"Where the ANA docs and the tree disagree" below rules otherwise;
 graphify-first for codebase questions (`graphify-out/` exists); `.sqlx` regenerated and committed
@@ -224,7 +255,7 @@ with any `PgStore` query change; no lock or pool connection across a UI await; n
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features                       # Postgres tests skip without the env var
-HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5433/postgres cargo test -p htui-store --all-features
+USERNAME=htui-ci HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres cargo test -p htui-store --all-features
 cargo doc --workspace --no-deps
 cargo tree -i tokio -e normal --workspace                    # criterion 13: no agent-client-protocol edge
 cargo run -p htui -- --demo                                  # Settings tab lists claude and agy
@@ -234,7 +265,7 @@ ANA-4 §11 mapping: 1 → T6 + T9 (one `CASES` list, two harnesses, zero transpo
 (fake only; the ACP half is M3); 13 → T7 validate step; 12's first half → T5. Criteria 6–11 are
 milestones 3–7 and are not claimed here.
 
-**Prerequisite (met)**: dev Postgres via `compose.yaml` on port 5433 (`HANDOFF.md` live
+**Prerequisite (met)**: dev Postgres via `compose.yaml` on port 5439 (`HANDOFF.md` live
 coordinates), needed for T2, T5 and T8.
 
 ## Verified claims (§3.5 fact-check)
@@ -328,9 +359,46 @@ Design authority is ANA-4 / ANA-5; fact authority is the tree. Each item says wh
 | Session limit mid-milestone | High (PRD) | Each task is a commit; `HANDOFF.md` phase notes per milestone; the workflow script replays cached agents on resume |
 
 ## Acceptance
-- [ ] All ten tasks complete, tests-first, on Opus, reviewed once per milestone by `rust-reviewer`
-- [ ] Validation block passes on Windows; `HTUI_TEST_DATABASE_URL` run green; `cargo tree -i tokio` shows no SDK edge
-- [ ] ANA-4 §11 criteria 1–4 and 13 mapped to passing tests / validate steps; 5 and 12 (fake halves) noted
-- [ ] `R-AGT-5` test (`tests/extensibility.rs`) passes and its absence sweep finds `zeta` nowhere
-- [ ] Patterns mirrored, not reinvented (ANA-4 §4.1 / §5 verbatim; reviewer verifies)
-- [ ] PRD milestone rows 1 and 2 → `complete`; `HANDOFF.md` phase note per `.claude/rules/workflow-docs.md` lifecycle 4
+- [x] All ten tasks complete, tests-first. Milestone 1 ran as six agents; milestone 2 ran serially
+      on the main thread after the maintainer declined the fan-out (execution amendment 4). The
+      `rust-reviewer` pass is milestone 2's one open gate — see the close-out note below.
+- [x] Validation block passes on **Linux** (this box); `HTUI_TEST_DATABASE_URL` run green with
+      `USERNAME=htui-ci` and **no skips**; `cargo tree -i tokio` shows no SDK edge. Windows is
+      unverified for milestone 2: the `CREATE_NO_WINDOW` + job-object spawn path compiles nowhere
+      on this box and is asserted only by the `cfg(windows)` arm of `tests/launch.rs`.
+- [x] ANA-4 §11 criteria 1–4 and 13 mapped to passing tests / validate steps; 5 and 12 (fake
+      halves) noted. Criterion 13 verified: `htui`, `htui-agent`, `htui-store`, `process-wrap`,
+      `sqlx-core`, `tokio-stream`, `tokio-util`, and no `agent-client-protocol` edge (the SDK
+      reaches `tokio` zero times, running on the smol family).
+- [x] `R-AGT-5` test (`tests/extensibility.rs`) passes and its absence sweep finds `zeta` nowhere.
+      The sweep earned its place: it failed first on a doc comment in `fake.rs` that used the name
+      as an example, which would have made the proof circular.
+- [x] Patterns mirrored, not reinvented (ANA-4 §4.1 / §5 verbatim). Reviewer verification pending
+      with the gate above.
+- [x] PRD milestone rows 1 and 2 → `complete`; `HANDOFF.md` phase note per
+      `.claude/rules/workflow-docs.md` lifecycle 4.
+
+## Milestone 2 close-out (2026-09-07)
+
+Commits: `5c717d0` (port), `5863dff` (T7), `e6e44fd` (T8 core), `2bed6a6` (T9), `b70390b` (T8
+store), `1e7de4d` (T10). Workspace suite green with Postgres live: 243 tests, no skipped Postgres
+case.
+
+**Findings the tasks produced, each fixed rather than worked around:**
+
+| # | Finding | Where |
+|---|---|---|
+| F1 | `process-wrap`'s `ProcessGroup` is behind the `process-group` feature, which the plan's list omitted — the unix spawn would have had no supervision at all | T7 |
+| F2 | `process-wrap` 10 renamed `TokioCommandWrap` / `TokioChildWrapper` to `CommandWrap` / `ChildWrapper`; D11 used the 8.x names | T7 |
+| F3 | `CreationFlags` wraps the `windows` crate's `PROCESS_CREATION_FLAGS` and exposes no constructor, so ANA-4 §4.6's mandatory `CREATE_NO_WINDOW` needs `windows` as a `cfg(windows)` dependency the plan did not list | T7 |
+| F4 | `clippy.toml` carries its own `msrv`; the plan's T7 file set missed it, and clippy warns while silently linting against the older number | T7 |
+| F5 | Raising that number surfaced `clippy::manual_is_multiple_of` in pre-existing code (`App::on_tick`) — the lint only fires at MSRV ≥ 1.87 | T10 |
+| F6 | A per-statement `WHERE NOT EXISTS (SELECT 1 FROM agent)` in the seed loop reads false for the second row: the registry would have come up holding `claude` alone. Emptiness is read once, before the loop | T8 |
+| F7 | The seed broke `load_demo`'s stated invariant ("a conflict is a bug"): the fixture carries the same two names under its own ids, so loading it hit `agent_name_key`. The fixture owns the registry and deletes the seeded rows by name | T8 |
+| F8 | `load_demo_round_trips_a_count_per_table` measured a per-table delta, which is now zero for `agent`; it asserts the absolute count instead of being weakened | T8 |
+| F9 | `FakeAdapter::build` refusing an empty script slot is correct (a real adapter whose process will not start behaves the same), so the T9 test loads a script rather than the adapter substituting one silently | T9 |
+
+**Deferred, with owners:** the Windows spawn path is unverified on this box (milestone 3 runs it
+first on Windows); `similar 3.2.0` is workspace-declared with no consumer until milestone 3 (A3);
+`DriverFactory::with_test_support`'s adapter is unreachable from outside, so a caller that needs to
+drive a session registers its own `FakeAdapter` — documented on the method.
