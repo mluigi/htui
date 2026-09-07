@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod model;
+pub mod scrub;
 pub mod store;
 
 #[cfg(feature = "demo")]
