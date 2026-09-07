@@ -51,6 +51,9 @@ async fn the_seeded_claude_row_reaches_a_v1_handshake() {
     let mut spawned = htui_agent::launch::spawn(&resolved, &cwd)
         .await
         .expect("the adapter starts");
+    // Only the unix assertion below reads it, and an unconditional binding is an unused variable
+    // on Windows — which `cargo clippy --target x86_64-pc-windows-msvc` is what catches.
+    #[cfg(unix)]
     let pid = spawned.pid().expect("the child reports a pid");
     let writer = spawned.take_stdin().expect("stdin is piped");
     let reader = spawned.take_stdout().expect("stdout is piped");

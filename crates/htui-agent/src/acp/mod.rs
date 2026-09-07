@@ -173,8 +173,13 @@ enum IoSource {
         launch: Box<AgentLaunch>,
     },
     /// A pre-built pair, taken once — a real process starts once too.
+    ///
+    /// Boxed: `AcpIo` carries a `Spawned`, which is materially larger on Windows (the job-object
+    /// handle), and an unboxed variant makes every `IoSource` pay for the test-support one there.
+    /// Caught by `cargo clippy --target x86_64-pc-windows-msvc`, which is the only way this box
+    /// compiles the Windows-side code at all.
     #[cfg(feature = "test-support")]
-    Prepared(Mutex<Option<AcpIo>>),
+    Prepared(Mutex<Option<Box<AcpIo>>>),
 }
 
 /// The driver for `agent.transport = 'acp'`: one per row, holding no process.
@@ -227,7 +232,7 @@ impl AcpDriver {
             name: agent.name.clone(),
             settings: serde_json::from_value(agent.settings.clone()).unwrap_or_default(),
             caps,
-            io: IoSource::Prepared(Mutex::new(Some(io))),
+            io: IoSource::Prepared(Mutex::new(Some(Box::new(io)))),
             stamp,
         }
     }
@@ -262,6 +267,7 @@ impl AcpDriver {
                     DriverError::Transport("the prepared transport is poisoned".to_owned())
                 })?
                 .take()
+                .map(|io| *io)
                 .ok_or_else(|| {
                     DriverError::Transport("this driver's transport was already used".to_owned())
                 }),

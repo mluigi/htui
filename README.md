@@ -231,6 +231,27 @@ terminal layer is `crossterm` and the drawing layer is `ratatui`.
   (this box has only the Windows target installed); the crate uses only `crossterm` and
   `ratatui`, so nothing is expected to be platform-specific, but it is unverified.
 
+### Checking the Windows-only code from Linux
+
+`htui-agent` is the only crate with `#[cfg(windows)]` code — the job object, `CREATE_NO_WINDOW`
+and the `PATHEXT`-aware command lookup of `launch.rs`. On a Linux box that code is never
+compiled by an ordinary build, so it is checked against the Windows target instead:
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo clippy --target x86_64-pc-windows-msvc -p htui-agent --all-targets --all-features -- -D warnings
+```
+
+No linker is involved, so this needs nothing but the target's standard library. It compiles and
+lints every Windows branch, and it has already caught two things a Linux build cannot see (an
+enum whose variants are lopsided only on Windows, and a binding used only under `cfg(unix)`).
+
+**It proves the code builds, not that it behaves.** The job object's kill-on-close guarantee, the
+`.cmd` shim that `CreateProcess` refuses, and `CREATE_NO_WINDOW` are runtime facts about Windows
+and are verified by running the suite there — `cargo test -p htui-agent` plus the `#[ignore]` live
+tests. The rest of the workspace does not cross-check from Linux: `sqlx`'s `ring` dependency
+builds C code and wants an MSVC-compatible compiler.
+
 The terminal is restored on every exit path, panics included: a panic hook runs `ratatui::restore()`
 before the default hook prints, and the terminal guard restores again on drop.
 

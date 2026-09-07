@@ -123,9 +123,12 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   `682a423`: the SDK drops the foreground future when a connection actor fails, which orphaned the
   agent process; a stream ending before its `done` was recorded as a finished turn; the path guard
   admitted everything when a root was relative; and `edit_proposal.accepted` defaulted to `true`
-  before the user had seen the request. Verified on **Linux** with Postgres live; **Windows is
-  unverified** (job object, `PATHEXT`, `CREATE_NO_WINDOW`) and milestone 5 is the next to touch that
-  path. Milestone 4 (durable history and replay: `StepEvents`, the offline buffer, read-only
+  before the user had seen the request. Verified on **Linux** with Postgres live. **Windows is compile- and
+  lint-checked but not run**: `cargo clippy --target x86_64-pc-windows-msvc -p htui-agent
+  --all-targets --all-features` is green (README "Checking the Windows-only code from Linux") and
+  caught two defects a Linux build cannot see, but the job object's kill-on-close guarantee, the
+  `.cmd` shim `CreateProcess` refuses and `CREATE_NO_WINDOW` are runtime facts that need a Windows
+  box; milestone 5 is the next to touch that path. Milestone 4 (durable history and replay: `StepEvents`, the offline buffer, read-only
   replay) is next.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
