@@ -456,6 +456,16 @@ impl Spawned {
         self.stdout.take()
     }
 
+    /// The child's operating-system process id, while it is running.
+    ///
+    /// The one identifier a caller can check a kill against that nothing else can accidentally
+    /// answer to: a `pgrep` pattern matches any command line that merely *contains* the text,
+    /// including the shell that launched the check.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// The last stderr lines the child wrote, oldest first.
     ///
     /// Bounded to the last 64 lines; this is what milestone 5's probe records as

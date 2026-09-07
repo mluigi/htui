@@ -344,6 +344,9 @@ impl AgentRuntime {
             })?
             .box_id;
         let user = backend.this_user().await?;
+        let cwd = std::env::current_dir().map_err(|err| {
+            StoreError::Backend(format!("this process has no working directory: {err}"))
+        })?;
 
         let summary = backend
             .agents()
@@ -380,7 +383,11 @@ impl AgentRuntime {
             // The chat's working directory is this process's own until MOD-13 and MOD-7 give a
             // project a repo path per box (`docs/ANA-2.md` §4.7); the header shows the project's
             // name, never a path it does not have.
-            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            //
+            // A failure here **refuses the chat**: the path guard admits a file only under an
+            // absolute session directory, and `"."` as a fallback would be a session with no scope
+            // at all rather than a session scoped to somewhere unexpected.
+            cwd,
             extra_dirs: Vec::new(),
             // MOD-10 fills this from the secret provider; until then a session carries none, and
             // the scrubber below therefore masks the credential prefixes only.
@@ -642,7 +649,14 @@ pub async fn run_chat(args: ChatArgs) {
                 if let Err(err) = recorder.record_follow_up(&text, at).await {
                     tracing::error!(%err, "the follow-up row could not be written");
                 }
-                frames.local("follow_up", json!({ "text": text }), at);
+                // **Once**, at the request's own address: the frame passes `App::is_fresh` from
+                // either address, so sending it to the stream as well would render the same
+                // follow-up twice. Every request is answered exactly once, including the ones that
+                // succeed (`ChatCommand`'s contract).
+                frames.reply(
+                    &reply,
+                    StoreReply::Chat(ChatFrame::Event(Box::new(follow_up_frame(&text, at)))),
+                );
             }
             Some(ChatCommand::Answer { reply, .. }) => {
                 frames.reply(
@@ -719,17 +733,34 @@ async fn run_turn(
                     answer,
                     reply,
                 }) => {
+                    // A second tap on the same digit, or an answer that raced the frame saying it
+                    // was already answered, is a stale request — **not** a reason to end the
+                    // conversation. It is refused at its own address and the turn goes on.
+                    if parked.as_ref() != Some(&request_id) {
+                        frames.reply(
+                            &reply,
+                            StoreReply::Failed {
+                                request: "chat_answer",
+                                message: format!("no permission request `{request_id}` is waiting"),
+                            },
+                        );
+                        continue;
+                    }
                     session
                         .answer_permission(request_id.clone(), answer.clone())
                         .await?;
-                    record_answer(recorder, &request_id, &answer, AnsweredBy::User, frames).await;
-                    frames.reply(
-                        &reply,
-                        StoreReply::Chat(ChatFrame::Event(Box::new(answered_frame(
-                            &request_id,
-                            &answer,
-                        )))),
-                    );
+                    // **One** frame, addressed to the request that caused it: it passes
+                    // `App::is_fresh` either way, and a second copy at the stream's address would
+                    // render the same answer twice.
+                    record_answer(
+                        recorder,
+                        &request_id,
+                        &answer,
+                        AnsweredBy::User,
+                        frames,
+                        Some(&reply),
+                    )
+                    .await;
                     parked = None;
                 }
                 Some(ChatCommand::Cancel { reply }) => {
@@ -741,6 +772,7 @@ async fn run_turn(
                             &PermissionAnswer::Cancelled,
                             AnsweredBy::Policy,
                             frames,
+                            None,
                         )
                         .await;
                     }
@@ -770,7 +802,10 @@ async fn run_turn(
         }
 
         let Some(envelope) = session.next_event().await? else {
-            return Ok(TurnEnd::Done(StopReason::EndTurn));
+            // The stream ended without a `done`. That is a transport that died mid-turn, not a
+            // turn that finished: reporting it as `EndTurn` would close the run `done`, leave no
+            // `done` row in the log, and tell the tab nothing.
+            return Err(DriverError::Closed);
         };
         let event = envelope.event.clone();
         record(recorder, envelope, ui, frames).await;
@@ -800,6 +835,7 @@ async fn run_turn(
                             &answer,
                             AnsweredBy::Policy,
                             frames,
+                            None,
                         )
                         .await;
                     }
@@ -853,6 +889,9 @@ async fn record_answer(
     answer: &PermissionAnswer,
     by: AnsweredBy,
     frames: &Frames,
+    // Where the frame goes: the request that asked, when a user's answer caused it, else the
+    // stream's own address (a policy answer nobody asked for).
+    to: Option<&ReplyAddr>,
 ) {
     let (option_id, cancelled) = match answer {
         PermissionAnswer::Selected(option_id) => (Some(option_id.clone()), false),
@@ -865,36 +904,34 @@ async fn record_answer(
     {
         tracing::error!(%err, "the permission answer row could not be written");
     }
-    frames.local(
-        "permission_answer",
-        json!({
-            "request_id": request_id.as_str(),
-            "option_id": option_id,
-            "by": by.as_str(),
-            "cancelled": cancelled,
-        }),
-        at,
-    );
-}
-
-/// The frame a user's answer produces, for the reply that answers the request itself.
-fn answered_frame(request_id: &PermissionRequestId, answer: &PermissionAnswer) -> DriverEnvelope {
-    let (option_id, cancelled) = match answer {
-        PermissionAnswer::Selected(option_id) => (Some(option_id.clone()), false),
-        PermissionAnswer::Cancelled => (None, true),
-    };
-    DriverEnvelope {
+    let frame = DriverEnvelope {
         event: DriverEvent::Other(htui_agent::event::OtherEvent {
             update: "permission_answer".to_owned(),
             body: json!({
                 "request_id": request_id.as_str(),
                 "option_id": option_id,
-                "by": "user",
+                "by": by.as_str(),
                 "cancelled": cancelled,
             }),
         }),
         raw: None,
-        at: Utc::now(),
+        at,
+    };
+    match to {
+        Some(addr) => frames.reply(addr, StoreReply::Chat(ChatFrame::Event(Box::new(frame)))),
+        None => frames.event(frame),
+    }
+}
+
+/// The frame a follow-up produces, shaped as the `other` row the tab renders.
+fn follow_up_frame(text: &str, at: DateTime<Utc>) -> DriverEnvelope {
+    DriverEnvelope {
+        event: DriverEvent::Other(htui_agent::event::OtherEvent {
+            update: "follow_up".to_owned(),
+            body: json!({ "text": text }),
+        }),
+        raw: None,
+        at,
     }
 }
 

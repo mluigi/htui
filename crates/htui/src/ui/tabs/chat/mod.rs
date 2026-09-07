@@ -102,7 +102,13 @@ impl ChatTab {
 
     /// Sends what the composer submitted: the first text starts a chat, later ones are follow-ups.
     fn submit(&mut self, text: String, ctx: &mut Ctx<'_>) {
-        match &self.session {
+        // A session that has **ended** is history: its step accepts no more turns, so the next
+        // prompt opens a new chat rather than being refused by a step nobody is listening on.
+        let live = self
+            .session
+            .as_ref()
+            .filter(|session| session.ended.is_none());
+        match live {
             Some(session) => ctx.request(StoreRequest::ChatSend {
                 step_id: session.step_id,
                 text,
@@ -118,6 +124,8 @@ impl ChatTab {
                 };
                 self.pending_start = true;
                 self.refusal = None;
+                // The transcript of the finished chat stays on screen until the new one is
+                // accepted, which is when it is replaced (`on_reply`).
                 ctx.request(StoreRequest::ChatStart {
                     project_id,
                     agent_id,
@@ -195,7 +203,15 @@ impl ChatTab {
     }
 
     /// The hint under the transcript.
+    ///
+    /// A refusal takes this line while there is a live conversation to keep on screen, and is
+    /// cleared by the next key or the next frame.
     fn hint(&self) -> String {
+        if let Some(refusal) = &self.refusal
+            && self.session.is_some()
+        {
+            return refusal.clone();
+        }
         if self.composer.is_active() {
             return "Enter send · Esc leave".to_owned();
         }
@@ -234,6 +250,9 @@ impl Tab for ChatTab {
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        // A refusal is transient: it says what the last key could not do, and the next one clears
+        // it whatever it was.
+        self.refusal = None;
         // The composer owns every key while it is open, so the tab's own single letters stay
         // single letters everywhere else.
         match self.composer.on_key(key) {
@@ -246,12 +265,13 @@ impl Tab for ChatTab {
             ComposerOutcome::Pass => {}
         }
 
-        // A digit answers the parked request. Consuming it is what keeps `1`..`9` from reaching
-        // the global tab-select bindings while the agent is waiting on an answer.
+        // A digit answers the parked request, and **every** digit is consumed while one is
+        // waiting: a `4` with three options on screen must not fall through to the global
+        // tab-select binding and move the user off the conversation the agent is blocked on.
         if let KeyCode::Char(digit @ '1'..='9') = key.code
             && self.transcript.parked().is_some()
-            && self.answer(digit, ctx) == Handled::Consumed
         {
+            self.answer(digit, ctx);
             self.cancel_armed = false;
             return Handled::Consumed;
         }
@@ -364,7 +384,12 @@ impl Tab for ChatTab {
             );
         }
 
-        if let Some(refusal) = &self.refusal {
+        // A refusal never replaces a live conversation: it is one line under it, because losing
+        // the transcript to "answer the permission request first" would cost far more than the
+        // message is worth. Only a chat that never started shows it in the body.
+        if self.session.is_none()
+            && let Some(refusal) = &self.refusal
+        {
             frame.render_widget(
                 Paragraph::new(Line::styled(refusal.clone(), ctx.theme.error))
                     .wrap(Wrap { trim: true }),

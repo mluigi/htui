@@ -318,16 +318,27 @@ fn wire_update(event: &DriverEvent, cost_micros_total: &mut i64) -> Value {
         }),
         // ACP carries old/new full text, never a diff (§3): the script's marker travels as the new
         // text and the client synthesizes the unified diff that contains it.
-        DriverEvent::EditProposal(proposal) => json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": proposal.tool_call_id,
-            "content": [ {
-                "type": "diff",
-                "path": proposal.path,
-                "oldText": Value::Null,
-                "newText": proposal.diff,
-            } ],
-        }),
+        //
+        // A proposal the script marks `accepted` rides a **terminal** update, because that is what
+        // an accepted edit is on the wire: the call that made it completed. The client's rule is
+        // the same one from the other side — `accepted` stays `null` until the call settles (§4.3),
+        // and an agent that has not finished the call has not made the edit.
+        DriverEvent::EditProposal(proposal) => {
+            let mut update = json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": proposal.tool_call_id,
+                "content": [ {
+                    "type": "diff",
+                    "path": proposal.path,
+                    "oldText": Value::Null,
+                    "newText": proposal.diff,
+                } ],
+            });
+            if proposal.accepted == Some(true) {
+                update["status"] = json!("completed");
+            }
+            update
+        }
         DriverEvent::Plan(plan) => json!({
             "sessionUpdate": "plan",
             "entries": plan

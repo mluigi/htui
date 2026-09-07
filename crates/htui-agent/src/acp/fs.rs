@@ -31,25 +31,40 @@ pub struct PathOutside {
 /// not a filesystem the agent could already reach through its own tools. Resolving links would
 /// mean canonicalising a path that does not exist yet, which is the common case for a new file.
 ///
+/// **Every root must be absolute.** A relative root normalises to a path that `starts_with`
+/// answers `true` for on *everything* — `"."` normalises to the empty path — so a session whose
+/// `cwd` is relative would admit `/etc/passwd`. A caller with no absolute directory has no session
+/// scope to enforce, and this refuses rather than pretending to.
+///
 /// # Errors
 ///
-/// [`PathOutside`] when the normalised path is under none of the session's directories.
+/// [`PathOutside`] when the normalised path is under none of the session's directories, and when
+/// no absolute root was supplied at all.
 pub fn guard(path: &Path, cwd: &Path, extra_dirs: &[PathBuf]) -> Result<PathBuf, PathOutside> {
+    let refused = || PathOutside {
+        path: path.to_string_lossy().into_owned(),
+    };
+    let roots: Vec<PathBuf> = std::iter::once(cwd)
+        .chain(extra_dirs.iter().map(PathBuf::as_path))
+        .filter(|root| root.is_absolute())
+        .map(normalise)
+        .filter(|root| root.components().next().is_some())
+        .collect();
+    if roots.is_empty() {
+        tracing::warn!("no absolute session directory to admit a path against; refusing");
+        return Err(refused());
+    }
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
     };
     let normalised = normalise(&joined);
-    let admitted = std::iter::once(cwd)
-        .chain(extra_dirs.iter().map(PathBuf::as_path))
-        .any(|root| normalised.starts_with(normalise(root)));
+    let admitted = roots.iter().any(|root| normalised.starts_with(root));
     if admitted {
         Ok(normalised)
     } else {
-        Err(PathOutside {
-            path: path.to_string_lossy().into_owned(),
-        })
+        Err(refused())
     }
 }
 
@@ -128,17 +143,9 @@ pub fn slice_lines(text: &str, line: Option<u32>, limit: Option<u32>) -> String 
     }
     let skip = line.map_or(0, |one_based| one_based.saturating_sub(1) as usize);
     let take = limit.map_or(usize::MAX, |limit| limit as usize);
-    let mut out: String = text
-        .split_inclusive('\n')
-        .skip(skip)
-        .take(take)
-        .collect::<String>();
-    // `split_inclusive` keeps the newline of every line that had one, so a window that ends at the
-    // file's last line reproduces it exactly; nothing is appended.
-    if out.is_empty() {
-        out = String::new();
-    }
-    out
+    // `split_inclusive` keeps the newline of every line that had one, so a window ending at the
+    // file's last line reproduces it exactly and nothing is appended.
+    text.split_inclusive('\n').skip(skip).take(take).collect()
 }
 
 #[cfg(test)]
@@ -167,6 +174,19 @@ mod tests {
         let diff = unified_diff("a.txt", "one\ntwo\n", "one\ntwo point five\n");
         assert!(diff.contains("-two"), "{diff}");
         assert!(diff.contains("+two point five"), "{diff}");
+    }
+
+    /// A relative root — `"."` is the one production nearly used — cannot scope anything: it
+    /// normalises to the empty path, which is a prefix of every path there is.
+    #[test]
+    fn a_relative_root_admits_nothing_rather_than_everything() {
+        assert_eq!(
+            guard(Path::new("/etc/passwd"), Path::new("."), &[]),
+            Err(PathOutside {
+                path: "/etc/passwd".to_owned()
+            })
+        );
+        assert!(guard(Path::new("src/main.rs"), Path::new("repo"), &[]).is_err());
     }
 
     #[test]

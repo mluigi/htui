@@ -22,8 +22,7 @@ pub mod fs;
 pub mod map;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-#[cfg(feature = "test-support")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
@@ -79,6 +78,18 @@ pub const EVENTS_CAPACITY: usize = 256;
 
 /// The adapter id this transport registers under (plan D12).
 pub const ADAPTER_ID: &str = "acp";
+
+/// The grace window a session gets when its **handle** is dropped rather than cancelled.
+///
+/// Nobody is waiting for the rows, but the agent is still owed the `session/cancel` it would have
+/// had from an explicit cancel, and a turn that ends on its own within the window ends cleanly.
+pub const DROP_GRACE: Duration = Duration::from_secs(1);
+
+/// How long the handshake may take before [`open_session`] gives up.
+///
+/// An agent that never answers `initialize` would otherwise hold the `ChatStart` request — and the
+/// tab that issued it — forever.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------------------------
 // Clock
@@ -333,6 +344,11 @@ pub struct AcpSession {
     parked: Vec<PermissionRequestId>,
     /// `false` between a handed-out `done` and the next accepted follow-up.
     turn_open: bool,
+    /// The session is being cancelled: the task has answered every outstanding request itself, so
+    /// a `permission_request` still in the buffer is history rather than an obligation. Without
+    /// this, draining a cancel re-parks it and the very next pull refuses — leaving the
+    /// synthesized results and the `done { cancelled }` unrecorded.
+    cancelling: bool,
     /// The task has ended: `next_event` answers `Ok(None)`, everything else [`DriverError::Closed`].
     ended: bool,
     task: Option<JoinHandle<()>>,
@@ -427,6 +443,7 @@ impl AgentSession for AcpSession {
             if self.ended {
                 return Ok(());
             }
+            self.cancelling = true;
             let (done, mut ack) = oneshot::channel();
             if self.send(SessionCommand::Cancel { grace, done }).is_err() {
                 self.ended = true;
@@ -472,7 +489,7 @@ impl AcpSession {
     /// what the caller has *seen* is what decides whether a follow-up or a pull is legal.
     fn note(&mut self, envelope: &DriverEnvelope) {
         match &envelope.event {
-            DriverEvent::PermissionRequest(request) => {
+            DriverEvent::PermissionRequest(request) if !self.cancelling => {
                 self.parked.push(request.request_id.clone());
             }
             DriverEvent::Done(_) => self.turn_open = false,
@@ -525,19 +542,33 @@ pub async fn open_session(
         commands_rx,
     ));
 
-    match ready_rx.await {
-        Ok(Ok(ready)) => Ok(AcpSession {
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, ready_rx).await {
+        Err(_) => {
+            task.abort();
+            Err(DriverError::Transport(format!(
+                "the agent did not complete its handshake within {}s",
+                HANDSHAKE_TIMEOUT.as_secs()
+            )))
+        }
+        Ok(Ok(Ok(ready))) => Ok(AcpSession {
             session_ref: ready.session_ref,
             events: events_rx,
             commands: commands_tx,
             pending: VecDeque::new(),
             parked: Vec::new(),
             turn_open: true,
+            cancelling: false,
             ended: false,
             task: Some(task),
         }),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(DriverError::Transport(
+        // The task is killing the child on its way out; waiting for it means `start` returning an
+        // error also means the process is gone, rather than leaving one behind for the caller to
+        // wonder about.
+        Ok(Ok(Err(err))) => {
+            let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, task).await;
+            Err(err)
+        }
+        Ok(Err(_)) => Err(DriverError::Transport(
             "the session task ended before the handshake".to_owned(),
         )),
     }
@@ -559,6 +590,14 @@ async fn run_session(
         child,
     } = io;
     let transport = ByteStreams::new(writer.compat_write(), reader.compat());
+
+    // **The child is owned here, not by the foreground future.** `connect_with` runs the
+    // connection actors and the foreground future under `future::select`, and an actor that fails
+    // first returns early and **drops** the foreground future (`SDK/jsonrpc.rs:3555-3560`) — which
+    // is exactly what a JSON-RPC error answering `session/prompt` causes. A `session_main` that
+    // owned the process would be dropped mid-await and leave it running, so ownership sits on this
+    // side of that boundary and the kill below happens whatever became of the future.
+    let child = Arc::new(Mutex::new(child));
 
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Inbound>();
     let permission_tx: InboundTx = inbound_tx.clone();
@@ -590,18 +629,23 @@ async fn run_session(
             },
             agent_client_protocol::on_receive_request!(),
         )
-        .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
-            session_main(
-                cx, spec, prompt, options, ready, events, commands, inbound_rx, child,
-            )
-            .await;
-            Ok(())
+        .connect_with(transport, {
+            let child = Arc::clone(&child);
+            async move |cx: ConnectionTo<Agent>| {
+                session_main(
+                    cx, spec, prompt, options, ready, events, commands, inbound_rx, &child,
+                )
+                .await;
+                Ok(())
+            }
         })
         .await;
 
     if let Err(err) = connected {
         tracing::warn!(%err, "the ACP connection ended with an error");
     }
+    // Unconditional: the foreground future may never have reached its own kill.
+    kill(&child).await;
 }
 
 /// Task-side state, one per session.
@@ -687,24 +731,23 @@ async fn emit(
     raw: Option<Value>,
 ) -> bool {
     // §4.3's rule for `edit_proposal.accepted`, which the mapper cannot apply because it is a fact
-    // about *this session's* outstanding requests rather than about the update: the row is `null`
-    // **only** while a permission request for its call is parked; otherwise the edit is one the
-    // agent has already been allowed to make, and the proposal records that.
+    // about *this session* rather than about the update: a proposal whose call has already reached
+    // a terminal state is an edit the agent was allowed to make, and the row says so.
     //
-    // The one case this does not cover is a proposal whose request is answered with a rejection
-    // afterwards: the row keeps `null`, because the recorder has no update path for a row it has
-    // already flushed. Replay stays total — the rejection also synthesizes a
-    // `tool_result { failed, terminal_reason: rejected }` for the same call — and filling it
-    // retroactively is left to the milestone that gives the recorder that path.
+    // **Only** a settled call, never merely an un-gated one. The `claude` adapter sends the
+    // `tool_call` carrying the diff *before* the `session/request_permission` that gates it, so
+    // "no request is parked yet" is the normal state of an edit that is about to be asked about —
+    // defaulting to `true` there would record almost every gated edit as accepted before the user
+    // had seen it. `null` until the call settles is §4.3's own rule ("stays null only while a
+    // request is parked"), read the safe way round. A rejection answered *after* the row was
+    // flushed leaves it `null`, because the recorder has no update path for a flushed row; replay
+    // stays total, since the rejection also synthesizes a `tool_result { failed, rejected }`.
     if let DriverEvent::EditProposal(proposal) = &mut event
         && proposal.accepted.is_none()
+        && let Some(call) = proposal.tool_call_id.as_ref()
+        && state.settled_calls.contains(call)
     {
-        let gated = state.parked.values().any(|parked| {
-            parked.tool_call_id.is_some() && parked.tool_call_id == proposal.tool_call_id
-        });
-        if !gated {
-            proposal.accepted = Some(true);
-        }
+        proposal.accepted = Some(true);
     }
     // A `tool_result` for a call a rejection or a cancel already settled is the protocol's own
     // late report: `htui` wrote the synthesized row, and a second one would be two results for one
@@ -742,7 +785,7 @@ async fn session_main(
     events: mpsc::Sender<DriverEnvelope>,
     mut commands: mpsc::UnboundedReceiver<SessionCommand>,
     mut inbound: mpsc::UnboundedReceiver<Inbound>,
-    mut child: Option<Spawned>,
+    child: &Mutex<Option<Spawned>>,
 ) {
     let mut state = TaskState::new(options.stamp, spec.retain_raw);
 
@@ -755,8 +798,8 @@ async fn session_main(
     let init = match cx.send_request(initialize).block_task().await {
         Ok(response) => response,
         Err(err) => {
-            let _ = ready.send(Err(handshake_error("initialize", &err, child.as_ref())));
-            kill(&mut child).await;
+            let _ = ready.send(Err(handshake_error("initialize", &err, child)));
+            kill(child).await;
             return;
         }
     };
@@ -772,8 +815,8 @@ async fn session_main(
     {
         Ok(session) => session,
         Err(err) => {
-            let _ = ready.send(Err(handshake_error("session/new", &err, child.as_ref())));
-            kill(&mut child).await;
+            let _ = ready.send(Err(handshake_error("session/new", &err, child)));
+            kill(child).await;
             return;
         }
     };
@@ -800,7 +843,7 @@ async fn session_main(
     });
     let raw = serde_json::to_value(&init).ok();
     if !emit(&mut state, &events, banner, raw).await {
-        kill(&mut child).await;
+        kill(child).await;
         return;
     }
 
@@ -828,7 +871,7 @@ async fn session_main(
                     body: json!({ "requested": model }),
                 });
                 if !emit(&mut state, &events, unavailable, None).await {
-                    kill(&mut child).await;
+                    kill(child).await;
                     return;
                 }
             }
@@ -837,18 +880,21 @@ async fn session_main(
 
     // 5. The handle may exist now: everything above is what `start` promised to have done.
     if ready.send(Ok(Ready { session_ref })).is_err() {
-        kill(&mut child).await;
+        kill(child).await;
         return;
     }
 
-    // 6. The first prompt opens turn 0.
+    // 6. The first prompt opens turn 0. A send that fails still owes the turn a `done`: the
+    //    handle has already been told the turn is open, and a caller pulling for one would wait
+    //    forever.
     if let Err(err) = session.send_prompt(prompt) {
         let event = DriverEvent::Error(ErrorEvent {
             code: TRANSPORT_CLOSED.to_owned(),
             message: err.to_string(),
         });
         emit(&mut state, &events, event, None).await;
-        kill(&mut child).await;
+        close_turn(&mut state, &events, StopReason::Cancelled).await;
+        kill(child).await;
         return;
     }
 
@@ -878,15 +924,18 @@ async fn session_main(
                 break;
             }
             Step::Command(Some(SessionCommand::FollowUp(text))) => {
+                // Open the turn **before** the send: the handle already counts it as open, and a
+                // failure has to be able to close it (`close_turn` is a no-op on a closed turn).
+                state.turn_open = true;
                 if let Err(err) = session.send_prompt(text) {
                     let event = DriverEvent::Error(ErrorEvent {
                         code: TRANSPORT_CLOSED.to_owned(),
                         message: err.to_string(),
                     });
                     emit(&mut state, &events, event, None).await;
+                    close_turn(&mut state, &events, StopReason::Cancelled).await;
                     break;
                 }
-                state.turn_open = true;
             }
             Step::Command(Some(SessionCommand::AnswerPermission(id, answer))) => {
                 if !answer_permission(&mut state, &events, id, answer).await {
@@ -895,7 +944,7 @@ async fn session_main(
             }
             Step::Command(Some(SessionCommand::Cancel { grace, done })) => {
                 cancel_session(&mut state, &events, &cx, &mut session, &session_id, grace).await;
-                kill(&mut child).await;
+                kill(child).await;
                 let _ = done.send(());
                 return;
             }
@@ -908,7 +957,7 @@ async fn session_main(
                     &cx,
                     &mut session,
                     &session_id,
-                    Duration::from_secs(0),
+                    DROP_GRACE,
                 )
                 .await;
                 break;
@@ -918,12 +967,12 @@ async fn session_main(
                     break;
                 }
             }
-            Step::Inbound(None) => {}
+            // The handlers own the senders for the connection's life, so this is unreachable
+            // today; treating it as a close rather than as a no-op keeps it from becoming a busy
+            // loop if that ever changes.
+            Step::Inbound(None) => break,
             Step::Closed => {
-                let message = child
-                    .as_ref()
-                    .map(|child| child.stderr_tail().join("\n"))
-                    .unwrap_or_default();
+                let message = stderr_tail(child);
                 let event = DriverEvent::Error(ErrorEvent {
                     code: TRANSPORT_CLOSED.to_owned(),
                     message,
@@ -938,7 +987,7 @@ async fn session_main(
         }
     }
 
-    kill(&mut child).await;
+    kill(child).await;
 }
 
 /// Handles one ordered message from the session channel.
@@ -1056,7 +1105,9 @@ async fn answer_permission(
         tracing::warn!(request = %id, "an answer arrived for a request that is not parked");
         return true;
     };
-    let rejected = match &answer {
+    // §4.3 distinguishes the two terminal reasons: a call the user said no to is `rejected`, a
+    // call that ended because the session did is `cancelled`.
+    let terminal = match &answer {
         PermissionAnswer::Selected(option_id) => parked
             .options
             .iter()
@@ -1066,8 +1117,9 @@ async fn answer_permission(
                     option.kind,
                     PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways
                 )
-            }),
-        PermissionAnswer::Cancelled => true,
+            })
+            .then_some(TerminalReason::Rejected),
+        PermissionAnswer::Cancelled => Some(TerminalReason::Cancelled),
     };
     let outcome = match answer {
         PermissionAnswer::Selected(option_id) => {
@@ -1083,13 +1135,15 @@ async fn answer_permission(
     }
     // §4.3 "Tool-call terminal states": a denied call gets no `tool_result` on the wire, and a
     // replay that never sees one leaves the call spinning forever.
-    if rejected && let Some(tool_call_id) = parked.tool_call_id {
+    if let Some(reason) = terminal
+        && let Some(tool_call_id) = parked.tool_call_id
+    {
         let event = DriverEvent::ToolResult(ToolResultEvent {
             tool_call_id,
             status: ToolResultStatus::Failed,
             output: None,
             locations: Vec::new(),
-            terminal_reason: Some(TerminalReason::Rejected),
+            terminal_reason: Some(reason),
         });
         return emit(state, events, event, None).await;
     }
@@ -1273,9 +1327,13 @@ fn answer_parked_cancelled(state: &mut TaskState) {
     }
 }
 
-/// Kills the process tree and reaps it, if there is one.
-async fn kill(child: &mut Option<Spawned>) {
-    let Some(child) = child.as_mut() else { return };
+/// Kills the process tree and reaps it, if there is one and nobody has yet.
+///
+/// The child is **taken out** of the mutex before anything is awaited, so no lock is ever held
+/// across an `.await`, and a second call is a no-op.
+async fn kill(child: &Mutex<Option<Spawned>>) {
+    let taken = child.lock().unwrap_or_else(PoisonError::into_inner).take();
+    let Some(mut child) = taken else { return };
     if let Err(err) = child.kill_tree().await {
         tracing::warn!(%err, "the agent's process tree did not die cleanly");
     }
@@ -1284,15 +1342,23 @@ async fn kill(child: &mut Option<Spawned>) {
     }
 }
 
+/// What the child last wrote to stderr, for an error message.
+fn stderr_tail(child: &Mutex<Option<Spawned>>) -> String {
+    child
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|child| child.stderr_tail().join("\n"))
+        .unwrap_or_default()
+}
+
 /// A handshake failure, with the child's captured stderr appended when there is one.
 fn handshake_error(
     step: &str,
     err: &agent_client_protocol::Error,
-    child: Option<&Spawned>,
+    child: &Mutex<Option<Spawned>>,
 ) -> DriverError {
-    let stderr = child
-        .map(|child| child.stderr_tail().join("\n"))
-        .unwrap_or_default();
+    let stderr = stderr_tail(child);
     if stderr.is_empty() {
         DriverError::Transport(format!("{step} failed: {err}"))
     } else {

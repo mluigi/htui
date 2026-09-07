@@ -51,6 +51,7 @@ async fn the_seeded_claude_row_reaches_a_v1_handshake() {
     let mut spawned = htui_agent::launch::spawn(&resolved, &cwd)
         .await
         .expect("the adapter starts");
+    let pid = spawned.pid().expect("the child reports a pid");
     let writer = spawned.take_stdin().expect("stdin is piped");
     let reader = spawned.take_stdout().expect("stdout is piped");
 
@@ -104,17 +105,16 @@ async fn the_seeded_claude_row_reaches_a_v1_handshake() {
 
     // Criterion 11, the process-group half: the wrapper (`node`) must not outlive the kill. The
     // job-object half is Windows's and is not verified on this box (plan D31).
+    //
+    // Checked by **pid**, not by a `pgrep` pattern: `pgrep -f` matches any command line that
+    // contains the text, including the shell that launched the test, which makes a pattern check
+    // fail for reasons that have nothing to do with the code.
     #[cfg(unix)]
     {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let survivors = std::process::Command::new("pgrep")
-            .args(["-f", "claude-agent-acp"])
-            .output()
-            .expect("pgrep runs");
-        let listed = String::from_utf8_lossy(&survivors.stdout);
         assert!(
-            listed.trim().is_empty(),
-            "killing the tree left processes behind: {listed}"
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the agent process {pid} outlived the kill"
         );
     }
 }

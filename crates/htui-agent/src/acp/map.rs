@@ -86,8 +86,12 @@ impl Mapper {
             .and_then(Value::as_str);
         match (amount, currency) {
             (Some(amount), Some("USD") | None) => {
-                let total = (amount * MICROS_PER_UNIT).round() as i64;
-                event.cost_micros = Some(total - self.last_cost_micros_total.unwrap_or(0));
+                // Saturating throughout: the cast clamps, and the subtraction would otherwise
+                // overflow on a pair of absurd amounts (`1e300` then `-1e300`) — a panic under the
+                // test profile's overflow checks, on input `htui` does not control.
+                let total = saturating_micros(amount);
+                event.cost_micros =
+                    Some(total.saturating_sub(self.last_cost_micros_total.unwrap_or(0)));
                 event.cost_micros_total = Some(total);
                 self.last_cost_micros_total = Some(total);
             }
@@ -101,6 +105,19 @@ impl Mapper {
         }
         event
     }
+}
+
+/// A currency amount in whole units as micros, clamping rather than wrapping or panicking.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the cast saturates at the i64 bounds, which is the clamp this function is for"
+)]
+fn saturating_micros(amount: f64) -> i64 {
+    let micros = (amount * MICROS_PER_UNIT).round();
+    if micros.is_nan() {
+        return 0;
+    }
+    micros as i64
 }
 
 /// The `sessionUpdate` tag of an update object, or `"<missing>"`.
@@ -156,8 +173,17 @@ pub fn terminal_status(status: Option<&str>) -> Option<ToolResultStatus> {
 /// ACP carries old and new full text, never a diff (§3), so the unified text ANA-9 §4.3 asks for
 /// is synthesized here — the same function the `fs/write_text_file` interception uses, so both
 /// sources of an `edit_proposal` produce the same shape.
+///
+/// `settled` is the call's terminal status **in the same update**, when it has one: a diff that
+/// arrives together with `completed` is an edit the agent has made (`accepted: true`), one that
+/// arrives with `failed` is one it did not (`false`), and a diff on a call that is still running
+/// is `null` until it settles — §4.3's rule, applied where the fact is known.
 #[must_use]
-pub fn diffs_of(tool_call_id: &str, content: Option<&Value>) -> Vec<EditProposalEvent> {
+pub fn diffs_of(
+    tool_call_id: &str,
+    content: Option<&Value>,
+    settled: Option<ToolResultStatus>,
+) -> Vec<EditProposalEvent> {
     let Some(entries) = content.and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -178,9 +204,7 @@ pub fn diffs_of(tool_call_id: &str, content: Option<&Value>) -> Vec<EditProposal
                 tool_call_id: Some(tool_call_id.to_owned()),
                 path: path.to_owned(),
                 diff: unified_diff(path, old, new),
-                // Filled from the paired permission answer, or defaulted by the recorder for a
-                // write that reached the filesystem with no request attached (§4.3).
-                accepted: None,
+                accepted: settled.map(|status| status == ToolResultStatus::Completed),
             })
         })
         .collect()
@@ -276,6 +300,7 @@ fn tool_call(update: &Value) -> Vec<DriverEvent> {
     let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
         return vec![other(update_kind(update), body_of(update))];
     };
+    let settled = terminal_status(update.get("status").and_then(Value::as_str));
     let mut events = vec![DriverEvent::ToolCall(ToolCallEvent {
         tool_call_id: id.to_owned(),
         title: update
@@ -288,11 +313,11 @@ fn tool_call(update: &Value) -> Vec<DriverEvent> {
         locations: locations_of(update.get("locations")),
     })];
     events.extend(
-        diffs_of(id, update.get("content"))
+        diffs_of(id, update.get("content"), settled)
             .into_iter()
             .map(DriverEvent::EditProposal),
     );
-    if let Some(status) = terminal_status(update.get("status").and_then(Value::as_str)) {
+    if let Some(status) = settled {
         events.push(DriverEvent::ToolResult(result_of(update, id, status)));
     }
     events
@@ -306,11 +331,12 @@ fn tool_call_update(update: &Value) -> Vec<DriverEvent> {
     let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
         return vec![other(update_kind(update), body_of(update))];
     };
-    let mut events: Vec<DriverEvent> = diffs_of(id, update.get("content"))
+    let settled = terminal_status(update.get("status").and_then(Value::as_str));
+    let mut events: Vec<DriverEvent> = diffs_of(id, update.get("content"), settled)
         .into_iter()
         .map(DriverEvent::EditProposal)
         .collect();
-    if let Some(status) = terminal_status(update.get("status").and_then(Value::as_str)) {
+    if let Some(status) = settled {
         events.push(DriverEvent::ToolResult(result_of(update, id, status)));
     }
     events
@@ -570,7 +596,11 @@ mod tests {
                 assert_eq!(edit.path, "src/a.rs");
                 assert!(edit.diff.contains("-one"), "{}", edit.diff);
                 assert!(edit.diff.contains("+two"), "{}", edit.diff);
-                assert_eq!(edit.accepted, None, "no answer is paired with it yet");
+                assert_eq!(
+                    edit.accepted,
+                    Some(true),
+                    "the diff arrived with `completed`: the edit was made (§4.3)"
+                );
                 assert_eq!(result.status, ToolResultStatus::Completed);
             }
             other => panic!("expected a proposal then a result: {other:?}"),
@@ -585,6 +615,7 @@ mod tests {
             Some(&json!([
                 { "type": "diff", "path": "new.rs", "oldText": null, "newText": "fresh\n" }
             ])),
+            None,
         );
         assert_eq!(edits.len(), 1);
         assert!(edits[0].diff.contains("+fresh"), "{}", edits[0].diff);
@@ -656,6 +687,25 @@ mod tests {
         };
         assert_eq!(third.cost_micros, Some(1));
         assert_eq!(third.cost_micros_total, Some(351));
+    }
+
+    /// Two absurd amounts in sequence: the delta must clamp rather than overflow (the test
+    /// profile has overflow checks on, so a wrapping subtraction would panic here).
+    #[test]
+    fn an_absurd_cost_pair_clamps_instead_of_overflowing() {
+        let mut mapper = Mapper::new();
+        let update = |amount: f64| {
+            json!({
+                "sessionUpdate": "usage_update",
+                "cost": { "amount": amount, "currency": "USD" }
+            })
+        };
+        mapper.map(&update(1e300));
+        let events = mapper.map(&update(-1e300));
+        let DriverEvent::Usage(usage) = &events[0] else {
+            panic!("expected usage")
+        };
+        assert_eq!(usage.cost_micros, Some(i64::MIN));
     }
 
     #[test]

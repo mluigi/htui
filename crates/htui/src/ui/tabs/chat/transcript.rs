@@ -134,8 +134,13 @@ pub struct Transcript {
     rows: Vec<TranscriptRow>,
     /// Thoughts collapse to one line each by default (`R-TUI-6`: "collapsed thoughts").
     fold_thoughts: bool,
-    /// How many lines are scrolled off the top; `usize::MAX` means "follow the tail".
+    /// Where the view is.
     scroll: Scroll,
+    /// Lines the last render produced, so `k` from the tail can step back one **line** rather
+    /// than mistaking the row count for a line index (a row can render many lines).
+    rendered: std::cell::Cell<usize>,
+    /// Height the last render was given, for the same reason.
+    height: std::cell::Cell<usize>,
     /// The agent-side session id, taken from the banner rather than rendered as a row.
     session_ref: Option<AgentSessionRef>,
 }
@@ -355,7 +360,14 @@ impl Transcript {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.scroll = match self.scroll {
-                    Scroll::Tail => Scroll::At(self.rows.len().saturating_sub(1)),
+                    // The tail shows the last `height` lines, so stepping back from it means the
+                    // line just above that window — not `rows.len()`, which counts rows.
+                    Scroll::Tail => Scroll::At(
+                        self.rendered
+                            .get()
+                            .saturating_sub(self.height.get())
+                            .saturating_sub(1),
+                    ),
                     Scroll::At(line) => Scroll::At(line.saturating_sub(1)),
                 };
                 Handled::Consumed
@@ -383,6 +395,8 @@ impl Transcript {
         for row in &self.rows {
             lines.extend(self.render_row(row, theme));
         }
+        self.rendered.set(lines.len());
+        self.height.set(height);
         let first = match self.scroll {
             Scroll::Tail => lines.len().saturating_sub(height),
             Scroll::At(line) => line.min(lines.len().saturating_sub(1)),

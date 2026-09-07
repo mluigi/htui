@@ -43,6 +43,11 @@ async fn a_real_claude_session_streams_into_the_store_and_then_ends() {
         .agent
         .id;
 
+    // Processes matching before the chat, so the assertion at the end is about **new** survivors.
+    // `pgrep -f` matches any command line containing the text — including the shell that ran the
+    // test — so an absolute count would fail for reasons unrelated to the code.
+    let before = matching_processes();
+
     let backend = Backend::memory(store.clone());
     let mut runtime = AgentRuntime::production().with_grace(Duration::from_secs(1));
     let (tx, mut rx) = mpsc::unbounded_channel::<ReplyEnvelope>();
@@ -138,17 +143,25 @@ async fn a_real_claude_session_streams_into_the_store_and_then_ends() {
         "the adapter's version is recorded per session (risk 6: version skew per box)"
     );
 
-    // Criterion 11, the process-group half: nothing of the session outlives it.
+    // Criterion 11, the process-group half: nothing this session started outlives it.
     #[cfg(unix)]
     {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let survivors = std::process::Command::new("pgrep")
-            .args(["-f", "claude-agent-acp"])
-            .output()
-            .expect("pgrep runs");
-        assert!(
-            String::from_utf8_lossy(&survivors.stdout).trim().is_empty(),
-            "the agent's process tree outlived its session"
-        );
+        let after = matching_processes();
+        let new: Vec<&String> = after.iter().filter(|pid| !before.contains(*pid)).collect();
+        assert!(new.is_empty(), "the session left processes behind: {new:?}");
     }
+}
+
+/// The pids whose command line mentions the adapter, as a set.
+#[cfg(unix)]
+fn matching_processes() -> std::collections::BTreeSet<String> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-f", "claude-agent-acp"])
+        .output()
+        .expect("pgrep runs");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
