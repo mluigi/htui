@@ -1,0 +1,102 @@
+---
+source: crates/htui-agent/tests/acp_map.rs
+expression: events
+---
+[
+    Other(
+        OtherEvent {
+            update: "available_commands_update",
+            body: Object {
+                "availableCommands": Array [
+                    Object {
+                        "name": String("find-skills"),
+                        "description": String("Helps users discover and install agent skills when they ask "),
+                        "input": Null,
+                    },
+                    Object {
+                        "name": String("deep-research"),
+                        "description": String("Deep research harness — fan-out web searches, fetch sources,"),
+                        "input": Null,
+                    },
+                ],
+            },
+        },
+    ),
+    Usage(
+        UsageEvent {
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_micros: None,
+            context_used: Some(
+                22913,
+            ),
+            context_size: Some(
+                1000000,
+            ),
+            cost_micros_total: None,
+            cost_amount: None,
+            cost_currency: None,
+            usage_scope: None,
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "",
+            message_id: Some(
+                "msg_011Cep6rRmJ2QW9eUVmofhYG",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "ok",
+            message_id: Some(
+                "msg_011Cep6rRmJ2QW9eUVmofhYG",
+            ),
+        },
+    ),
+    Usage(
+        UsageEvent {
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_micros: None,
+            context_used: Some(
+                22913,
+            ),
+            context_size: Some(
+                1000000,
+            ),
+            cost_micros_total: None,
+            cost_amount: None,
+            cost_currency: None,
+            usage_scope: None,
+        },
+    ),
+    Usage(
+        UsageEvent {
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_micros: Some(
+                133715,
+            ),
+            context_used: Some(
+                22913,
+            ),
+            context_size: Some(
+                1000000,
+            ),
+            cost_micros_total: Some(
+                133715,
+            ),
+            cost_amount: None,
+            cost_currency: None,
+            usage_scope: None,
+        },
+    ),
+]

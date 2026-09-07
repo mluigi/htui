@@ -1458,6 +1458,7 @@ dependencies = [
  "agent-client-protocol",
  "chrono",
  "htui-core",
+ "insta",
  "process-wrap",
  "serde",
  "serde_json",

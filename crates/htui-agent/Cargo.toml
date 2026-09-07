@@ -42,6 +42,9 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test
 # The tool resolver's `NodePackage` tier is tested against a `node_modules` tree in a throwaway
 # directory, never the developer's own (T11 step 2).
 tempfile = "3"
+# Recorded transcripts are pinned as snapshots, so adapter drift shows up as a reviewable diff
+# rather than as a decode that quietly lands in `other` (ANA-4 §8 test strategy 3).
+insta = { workspace = true }
 
 [lints]
 workspace = true

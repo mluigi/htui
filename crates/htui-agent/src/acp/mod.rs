@@ -447,7 +447,10 @@ impl AgentSession for AcpSession {
                 }
             }
             self.parked.clear();
-            self.ended = true;
+            // **Not** `ended = true`: the cancel's own rows — the synthesized `tool_result`s and
+            // the `done { cancelled }` — are ordinary events, and some of them may still be in the
+            // channel when the acknowledgement wins the `select!` above. The caller pulls them
+            // exactly as it pulls any other event, and the session ends when the channel does.
             // The task acknowledges *after* it has killed the process tree, and it returns
             // immediately afterwards; joining it here is what makes "cancel returned" mean "the
             // tree is gone and nothing of this session is still running" — which is exactly what
@@ -636,14 +639,26 @@ impl TaskState {
     }
 
     /// Wraps an event in its envelope, stamping the capture time.
+    ///
+    /// With `retain_raw` set, a row that has **no** wire message still carries a `raw` naming what
+    /// produced it: the banner, the synthesized `tool_result` of a rejection or a cancel, and
+    /// every `error` `htui` authored itself are all rows a replay has to explain, and ANA-4 §11
+    /// criterion 4 asks that `keep_raw_events` populate `raw` on every row the driver authored,
+    /// not only on the ones that happen to have arrived as a notification.
     fn envelope(&mut self, event: DriverEvent, raw: Option<Value>) -> DriverEnvelope {
         let at = self.stamp.at(self.n);
         self.n += 1;
-        DriverEnvelope {
-            event,
-            raw: if self.retain_raw { raw } else { None },
-            at,
-        }
+        let raw = if self.retain_raw {
+            Some(raw.unwrap_or_else(|| {
+                json!({
+                    "htui_synthesized": htui_core::model::EventKind::from(&event).as_str(),
+                    "n": self.n - 1,
+                })
+            }))
+        } else {
+            None
+        };
+        DriverEnvelope { event, raw, at }
     }
 
     /// Notes what an outgoing event means for the call bookkeeping of §4.3.
@@ -667,9 +682,29 @@ impl TaskState {
 async fn emit(
     state: &mut TaskState,
     events: &mpsc::Sender<DriverEnvelope>,
-    event: DriverEvent,
+    mut event: DriverEvent,
     raw: Option<Value>,
 ) -> bool {
+    // §4.3's rule for `edit_proposal.accepted`, which the mapper cannot apply because it is a fact
+    // about *this session's* outstanding requests rather than about the update: the row is `null`
+    // **only** while a permission request for its call is parked; otherwise the edit is one the
+    // agent has already been allowed to make, and the proposal records that.
+    //
+    // The one case this does not cover is a proposal whose request is answered with a rejection
+    // afterwards: the row keeps `null`, because the recorder has no update path for a row it has
+    // already flushed. Replay stays total — the rejection also synthesizes a
+    // `tool_result { failed, terminal_reason: rejected }` for the same call — and filling it
+    // retroactively is left to the milestone that gives the recorder that path.
+    if let DriverEvent::EditProposal(proposal) = &mut event
+        && proposal.accepted.is_none()
+    {
+        let gated = state.parked.values().any(|parked| {
+            parked.tool_call_id.is_some() && parked.tool_call_id == proposal.tool_call_id
+        });
+        if !gated {
+            proposal.accepted = Some(true);
+        }
+    }
     // A `tool_result` for a call a rejection or a cancel already settled is the protocol's own
     // late report: `htui` wrote the synthesized row, and a second one would be two results for one
     // call (§4.3 "Tool-call terminal states").
@@ -994,11 +1029,17 @@ async fn close_turn(
         }
     }
     state.turn_open = false;
+    // The turn's `done` comes from the `session/prompt` response, not from a notification, so its
+    // `raw` is that response as the SDK delivered it.
+    let raw = json!({
+        "method": "session/prompt",
+        "result": { "stopReason": stop_reason.as_str() },
+    });
     emit(
         state,
         events,
         DriverEvent::Done(DoneEvent { stop_reason }),
-        None,
+        Some(raw),
     )
     .await
 }

@@ -1090,18 +1090,24 @@ async fn done_precedes_next_follow_up<H: CaseHarness, S: WriteStore>(harness: &H
 /// asserts on `step_events` rows; this exception is deliberate, and weakening it to something
 /// `step_events` happens to expose would assert nothing about `run_step`.
 async fn usage_deltas_sum_to_step_usage<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
-    let usage = |input: i64, output: i64, cost: i64| {
+    // **The script reports no token counts, on purpose** (amended in milestone 3). ANA-4 §7 is
+    // explicit that ACP carries no per-turn token fields — `usage_update` has `used`, `size` and
+    // `cost`, and nothing else — so a script asking for `input_tokens` would be asking one
+    // transport to invent a number the protocol does not have, and criterion 1 ("adding a
+    // transport adds no case") would be bought by making the case untrue. The recorder's token
+    // summing is still covered, by `tests/recorder.rs`, where the events are authored directly.
+    let usage = |used: i64, cost: i64| {
         ScriptEvent::Emit(DriverEvent::Usage(UsageEvent {
-            input_tokens: Some(input),
-            output_tokens: Some(output),
             cost_micros: Some(cost),
+            context_used: Some(used),
+            context_size: Some(200_000),
             ..UsageEvent::default()
         }))
     };
     let script = Script::one_turn(vec![
-        usage(10, 5, 100),
-        usage(20, 7, 250),
-        usage(0, 3, 1),
+        usage(1_000, 100),
+        usage(2_000, 250),
+        usage(2_100, 1),
         done(StopReason::EndTurn),
     ]);
     let scrubber = scrubber();
@@ -1130,8 +1136,8 @@ async fn usage_deltas_sum_to_step_usage<H: CaseHarness, S: WriteStore>(harness: 
     );
 
     let expected = json!({
-        "input_tokens": 30,
-        "output_tokens": 15,
+        "input_tokens": Value::Null,
+        "output_tokens": Value::Null,
         "cache_read_tokens": Value::Null,
         "cache_write_tokens": Value::Null,
         "cost_micros": 351,
@@ -1259,10 +1265,16 @@ async fn edit_proposal_deduped_per_call_and_path<H: CaseHarness, S: WriteStore>(
          proposal"
     );
     assert_eq!(str_at(edits[0], "path"), Some("src/a.rs"));
-    assert_eq!(
-        str_at(edits[0], "diff"),
-        Some("@@ second"),
-        "edit_proposal_deduped_per_call_and_path: the buffered row is updated in place"
+    // `contains`, not `==` (amended in milestone 3). ANA-4 §4.3: no ACP shape carries a diff, so a
+    // transport that speaks the protocol synthesizes the unified text from `oldText`/`newText` and
+    // the script's marker survives *inside* it. Demanding equality would demand that a transport
+    // put the script's string on the wire verbatim, which is a fact about the fake and not about
+    // the contract. What the case is for — one row per `(tool_call_id, path)`, updated in place,
+    // carrying the last proposal's content and its `accepted` — is unchanged.
+    assert!(
+        str_at(edits[0], "diff").is_some_and(|diff| diff.contains("@@ second")),
+        "edit_proposal_deduped_per_call_and_path: the buffered row is updated in place: {:?}",
+        str_at(edits[0], "diff")
     );
     assert_eq!(
         edits[0].payload.get("accepted").and_then(Value::as_bool),
