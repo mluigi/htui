@@ -3,7 +3,9 @@
 //! Every case takes a `demo_db()` and a cache directory **under that database's throwaway config
 //! root**, so nothing under `%APPDATA%\htui` (or `~/.config/htui`) is ever created by
 //! `cargo test`; `TestDb::drop_db` removes both. With `HTUI_TEST_DATABASE_URL` unset `demo_db()`
-//! prints `common::SKIP` and answers `None`, and every case here returns green (plan D13).
+//! prints `common::SKIP` and answers `None`, and every case here returns green (plan D13). The
+//! `append_pending` cases that reach no server are the exception: they are file I/O only, so they
+//! take a plain `tempfile::tempdir()` and run everywhere.
 //!
 //! `MemStore` is the reference implementation - it is what `store::conformance` pins - so the
 //! §11.4 equality criterion is written as `cache.items(..) == mem.items(..)` and friends rather
@@ -21,9 +23,9 @@ use htui_core::model::{
     EventKind, EventRole, ItemFilter, LinkGraph, ProjectId, RunId, Scope, SessionEvent, StepId,
     WorkspaceSummary,
 };
-use htui_core::store::{MemStore, ReadStore as _};
+use htui_core::store::{MemStore, ReadStore as _, StoreError};
 use htui_store::CacheStore;
-use htui_store::cache::pending::upload_pending;
+use htui_store::cache::pending::{append_pending, upload_pending};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
 use serde_json::json;
 use sqlx::{Row as _, SqlitePool};
@@ -1187,6 +1189,241 @@ async fn a_malformed_pending_file_is_left_alone() {
         common::count(&db.pool, "session_event").await,
         events,
         "not one line of it was inserted",
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+// ------------------------------------------------------------------------------------------------
+// §11.7, the appender half: `append_pending` writes the name `upload_pending` reads
+// ------------------------------------------------------------------------------------------------
+
+/// Reads a buffer file back as one [`SessionEvent`] per line.
+fn read_pending(path: &Path) -> Vec<SessionEvent> {
+    let text = std::fs::read_to_string(path).expect("read the pending buffer");
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("every line is a session_event"))
+        .collect()
+}
+
+/// The path `append_pending` owns, spelled out here rather than asked of the appender.
+fn pending_path(dir: &Path, project: ProjectId, run: RunId) -> std::path::PathBuf {
+    dir.join("pending").join(format!("{project}.{run}.jsonl"))
+}
+
+/// Twenty events become twenty lines, in `seq` order, under the two-part name.
+#[tokio::test]
+async fn pending_append_creates_the_file_in_seq_order() {
+    let root = tempfile::tempdir().expect("a throwaway cache root");
+    let run = RunId::new();
+    let step = StepId::new();
+    let events: Vec<SessionEvent> = (0..20).map(|seq| pending_event(step, seq)).collect();
+
+    let written = append_pending(root.path(), ids::PROJECT_HTUI, run, &events)
+        .await
+        .expect("append twenty events");
+    assert_eq!(written, 20, "one line per event");
+
+    let path = pending_path(root.path(), ids::PROJECT_HTUI, run);
+    assert!(
+        path.exists(),
+        "the appender creates the file on first write"
+    );
+    let back = read_pending(&path);
+    assert_eq!(
+        back.iter().map(|e| e.seq).collect::<Vec<i32>>(),
+        (0..20).collect::<Vec<i32>>(),
+        "the lines are in seq order",
+    );
+    assert_eq!(back, events, "each line is the serde form of its event");
+}
+
+/// A second call extends the file; it never rewrites what the first call wrote.
+#[tokio::test]
+async fn pending_append_extends_without_rewriting() {
+    let root = tempfile::tempdir().expect("a throwaway cache root");
+    let run = RunId::new();
+    let step = StepId::new();
+    let first: Vec<SessionEvent> = (0..20).map(|seq| pending_event(step, seq)).collect();
+    let second: Vec<SessionEvent> = (20..30).map(|seq| pending_event(step, seq)).collect();
+
+    append_pending(root.path(), ids::PROJECT_HTUI, run, &first)
+        .await
+        .expect("the first append");
+    let path = pending_path(root.path(), ids::PROJECT_HTUI, run);
+    let after_first = std::fs::read_to_string(&path).expect("read the first twenty");
+
+    let written = append_pending(root.path(), ids::PROJECT_HTUI, run, &second)
+        .await
+        .expect("the second append");
+    assert_eq!(written, 10, "only the new events are counted");
+
+    let after_second = std::fs::read_to_string(&path).expect("read all thirty");
+    assert!(
+        after_second.starts_with(&after_first),
+        "the first twenty lines are byte-identical after the second call",
+    );
+    assert_eq!(
+        read_pending(&path)
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<i32>>(),
+        (0..30).collect::<Vec<i32>>(),
+        "thirty lines, still in seq order",
+    );
+}
+
+/// An empty slice writes nothing at all: an empty file is one `upload_pending` would only warn at.
+#[tokio::test]
+async fn pending_append_of_nothing_creates_no_file() {
+    let root = tempfile::tempdir().expect("a throwaway cache root");
+    let run = RunId::new();
+
+    let written = append_pending(root.path(), ids::PROJECT_HTUI, run, &[])
+        .await
+        .expect("appending no events is not an error");
+    assert_eq!(written, 0);
+    assert!(
+        !pending_path(root.path(), ids::PROJECT_HTUI, run).exists(),
+        "no events, no file",
+    );
+}
+
+/// A `pending/` that cannot be written is [`StoreError::Backend`], not a panic.
+#[tokio::test]
+async fn pending_append_reports_an_unwritable_parent() {
+    let root = tempfile::tempdir().expect("a throwaway cache root");
+    // A plain file where the directory has to be: portable on Windows and unix alike.
+    std::fs::write(root.path().join("pending"), b"not a directory").expect("occupy the name");
+
+    let step = StepId::new();
+    let events = vec![pending_event(step, 0)];
+    let err = append_pending(root.path(), ids::PROJECT_HTUI, RunId::new(), &events)
+        .await
+        .expect_err("the appender cannot create its file");
+    assert!(
+        matches!(err, StoreError::Backend(_)),
+        "an unwritable parent is a backend error, got {err:?}",
+    );
+}
+
+/// Criterion 12's first half: what the appender writes, the uploader reads.
+#[tokio::test]
+async fn pending_upload_lands_a_file_the_appender_wrote() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let run = RunId::new();
+    let step = StepId::new();
+    let first: Vec<SessionEvent> = (0..20).map(|seq| pending_event(step, seq)).collect();
+    let second: Vec<SessionEvent> = (20..30).map(|seq| pending_event(step, seq)).collect();
+    append_pending(cache.dir(), ids::PROJECT_HTUI, run, &first)
+        .await
+        .expect("append the first turn");
+    append_pending(cache.dir(), ids::PROJECT_HTUI, run, &second)
+        .await
+        .expect("append the second turn");
+    let path = pending_path(cache.dir(), ids::PROJECT_HTUI, run);
+    assert!(path.exists(), "the appender owns this name");
+
+    let uploaded = upload_pending(
+        &db.pool,
+        cache.dir(),
+        db.store.this_box(),
+        db.store.this_user(),
+    )
+    .await
+    .expect("upload the appended buffer");
+    assert_eq!(uploaded, 1);
+    assert!(
+        !path.exists(),
+        "the file is removed after the commit (11.7)"
+    );
+
+    let run_row = sqlx::query("SELECT kind, mode, status, project_id FROM run WHERE id = $1")
+        .bind(run.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("the synthesised run");
+    assert_eq!(run_row.get::<String, _>("kind"), "chat");
+    assert_eq!(run_row.get::<String, _>("mode"), "manual");
+    assert_eq!(run_row.get::<String, _>("status"), "done");
+    assert_eq!(
+        run_row.get::<uuid::Uuid, _>("project_id"),
+        ids::PROJECT_HTUI.as_uuid()
+    );
+
+    let phase: String = sqlx::query_scalar("SELECT phase_name FROM run_step WHERE id = $1")
+        .bind(step.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("the synthesised step");
+    assert_eq!(phase, "chat");
+
+    let seqs: Vec<i32> =
+        sqlx::query_scalar("SELECT seq FROM session_event WHERE run_step_id = $1 ORDER BY seq")
+            .bind(step.as_uuid())
+            .fetch_all(&db.pool)
+            .await
+            .expect("the events");
+    assert_eq!(
+        seqs,
+        (0..30).collect::<Vec<i32>>(),
+        "both appends landed, in seq order",
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// Uploading an appended buffer twice is still the three `ON CONFLICT DO NOTHING` clauses.
+#[tokio::test]
+async fn pending_upload_of_an_appended_file_is_idempotent() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let run = RunId::new();
+    let step = StepId::new();
+    let events: Vec<SessionEvent> = (0..20).map(|seq| pending_event(step, seq)).collect();
+    append_pending(cache.dir(), ids::PROJECT_HTUI, run, &events)
+        .await
+        .expect("the first append");
+    upload_pending(
+        &db.pool,
+        cache.dir(),
+        db.store.this_box(),
+        db.store.this_user(),
+    )
+    .await
+    .expect("the first upload");
+
+    let runs = common::count(&db.pool, "run").await;
+    let steps = common::count(&db.pool, "run_step").await;
+    let session_events = common::count(&db.pool, "session_event").await;
+
+    // The upload deleted the file, so the appender writes the same buffer again from scratch.
+    append_pending(cache.dir(), ids::PROJECT_HTUI, run, &events)
+        .await
+        .expect("the second append");
+    let uploaded = upload_pending(
+        &db.pool,
+        cache.dir(),
+        db.store.this_box(),
+        db.store.this_user(),
+    )
+    .await
+    .expect("the second upload");
+    assert_eq!(uploaded, 1);
+    assert!(!pending_path(cache.dir(), ids::PROJECT_HTUI, run).exists());
+    assert_eq!(common::count(&db.pool, "run").await, runs);
+    assert_eq!(common::count(&db.pool, "run_step").await, steps);
+    assert_eq!(
+        common::count(&db.pool, "session_event").await,
+        session_events,
     );
 
     teardown(db, &[&cache]).await;

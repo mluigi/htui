@@ -6,12 +6,18 @@
 //! form of [`SessionEvent`]. On the next successful connection [`upload_pending`] inserts the
 //! `run`, its `run_step`s and every event in one transaction and then deletes the file.
 //!
+//! [`append_pending`] is the only writer of that name and [`upload_pending`] the only reader, so
+//! the naming contract has exactly one owner on each side (MOD-2 plan D8). The appender **trusts
+//! its input**: every event is expected to have been scrubbed by the recorder before it reaches
+//! this function, because the `Scrubber` seam lives there - `htui-store` never inspects a payload.
+//!
 //! **The file name carries the project id**, which ANA-9 §4.3 does not: `run.project_id`,
 //! `run.target_box_id` and `run.started_by` are all `NOT NULL` and the line format holds only
 //! `session_event` columns, so the run could not otherwise be reconstructed. The box and the user
 //! come from [`upload_pending`]'s arguments (blueprint H.5).
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -24,6 +30,69 @@ use crate::error::map_sqlx;
 
 /// The extension every buffer file carries.
 const EXTENSION: &str = "jsonl";
+
+/// Appends `events` to this run's buffer file and returns how many lines were written.
+///
+/// The file is `<dir>/pending/<project>.<run>.jsonl`, the two-part name [`upload_pending`] parses
+/// back; this is its only writer. It is opened with `append(true).create(true)`, so the first call
+/// creates it and every later call extends it without touching a byte already on disk - which is
+/// what makes a chat that outlives several process restarts one buffer rather than several. The
+/// `pending/` directory is created when missing, exactly as `CacheStore::open` creates it.
+///
+/// One `serde_json::to_string` line per event, in the order given, each closed by `\n`. The caller
+/// owns `seq`: this function neither assigns nor checks it, and the loader sorts by `seq` anyway.
+/// An empty slice writes nothing and creates no file, because an event-less buffer is one
+/// [`upload_pending`] would only warn at.
+///
+/// The events are written verbatim. **Scrubbing is the recorder's job** and has already happened
+/// by the time they get here; `htui-store` does not look inside a payload.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] when the directory cannot be created, the file cannot be opened or the
+/// write fails - the path is in the message.
+pub async fn append_pending(
+    dir: &Path,
+    project: ProjectId,
+    run: RunId,
+    events: &[SessionEvent],
+) -> Result<usize> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    // Serialising is cheap and happens on the caller's thread; only the file write is blocking
+    // work, so only it goes to the blocking pool.
+    let mut lines = String::new();
+    for event in events {
+        let line = serde_json::to_string(event).map_err(|e| {
+            StoreError::Backend(format!("cannot serialise a pending session_event: {e}"))
+        })?;
+        lines.push_str(&line);
+        lines.push('\n');
+    }
+
+    let pending = dir.join(PENDING_DIR);
+    let path = pending.join(format!("{project}.{run}.{EXTENSION}"));
+    let written = events.len();
+
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&pending).map_err(|e| {
+            StoreError::Backend(format!("cannot create {}: {e}", pending.display()))
+        })?;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .map_err(|e| StoreError::Backend(format!("cannot open {}: {e}", path.display())))?;
+        file.write_all(lines.as_bytes()).map_err(|e| {
+            StoreError::Backend(format!("cannot append to {}: {e}", path.display()))
+        })?;
+        Ok(written)
+    })
+    .await
+    .map_err(|e| StoreError::Backend(format!("the pending append task failed: {e}")))?
+}
 
 /// Uploads every `pending/*.jsonl` chat buffer and returns how many files landed.
 ///
