@@ -32,11 +32,11 @@
 //! would silently cost that criterion.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::TimeDelta;
-use htui_core::model::EventKind;
+use htui_core::model::{Agent, AgentBox, EventKind};
 use serde_json::{Value, json};
 
 use crate::conformance::{Script, ScriptEvent, Turn, epoch};
@@ -49,6 +49,7 @@ use crate::event::{
     DoneEvent, DriverEnvelope, DriverEvent, OtherEvent, PermissionOptionKind,
     PermissionRequestEvent, StopReason, TerminalReason, ToolResultEvent, ToolResultStatus,
 };
+use crate::registry::{DriverFactory, TransportBuilder};
 
 /// `other.update` of the session banner (`docs/ANA-4.md` §4.4, `docs/ANA-2.md` §4.8).
 pub const SESSION_STARTED: &str = "session_started";
@@ -443,4 +444,81 @@ fn payload_of(event: &DriverEvent) -> Value {
         DriverEvent::Other(inner) => serde_json::to_value(inner),
     };
     encoded.unwrap_or(Value::Null)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The registry adapter (plan D12, assumption A2)
+// ---------------------------------------------------------------------------------------------
+
+/// The fake reached through the **production** factory, as adapter id `cli/fake`.
+///
+/// A registry row asks for it the same way it would ask for a real stream adapter — by naming
+/// `settings.cli.stream` — which is what makes milestone 2's `R-AGT-5` proof structural rather
+/// than decorative: the unknown agent's row travels the production path, and only the last hop
+/// differs. `fake` extends `docs/ANA-4.md` §5.2's `cli.stream` vocabulary under `test-support`
+/// alone, so no shipped build can be pointed at it (assumption A2).
+///
+/// The script lives in a shared slot: the harness loads one, [`TransportBuilder::build`] hands it
+/// to a fresh [`FakeDriver`], and the driver drains it on `start`.
+#[derive(Debug, Clone, Default)]
+pub struct FakeAdapter {
+    script: Arc<Mutex<Option<Script>>>,
+}
+
+impl FakeAdapter {
+    /// An adapter with no script loaded.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Loads the script the next [`TransportBuilder::build`] will hand to its driver.
+    ///
+    /// # Panics
+    /// If the slot's lock is poisoned, which in a test means an earlier case panicked while
+    /// holding it — reporting that here beats reporting an empty script three assertions later.
+    pub fn load(&self, script: Script) {
+        *self.script.lock().expect("the script slot is not poisoned") = Some(script);
+    }
+}
+
+impl TransportBuilder for FakeAdapter {
+    fn build(
+        &self,
+        agent: &Agent,
+        _on_box: Option<&AgentBox>,
+        caps: DriverCaps,
+    ) -> Result<Box<dyn AgentDriver>, DriverError> {
+        let script = self
+            .script
+            .lock()
+            .map_err(|_| DriverError::Transport("the fake's script slot is poisoned".to_owned()))?
+            .take()
+            .ok_or_else(|| {
+                DriverError::Transport("no script was loaded for this session".to_owned())
+            })?;
+        // The driver takes its name and capabilities from the **row**, not from the fake, so a
+        // test asserting on `driver.name()` is asserting about the registry rather than about a
+        // constant in this file. (This comment deliberately does not name the agent that test
+        // uses: `tests/extensibility.rs` sweeps the tree for it, and a mention here would make the
+        // proof circular.)
+        Ok(Box::new(FakeDriver::new(agent.name.clone(), caps, script)))
+    }
+}
+
+impl DriverFactory {
+    /// A factory with the test-only adapters registered: `cli/fake`, and nothing else.
+    ///
+    /// The production registrations are milestone 3's `acp` and milestone 8's
+    /// `cli/claude_stream_json`.
+    ///
+    /// Its adapter is unreachable from outside, so this is the factory for asserting *routing* —
+    /// which ids exist, which row is refused. A caller that needs to drive a session registers its
+    /// own [`FakeAdapter`] so it can [`load`](FakeAdapter::load) a script into it.
+    #[must_use]
+    pub fn with_test_support() -> Self {
+        let mut factory = Self::new();
+        factory.register("cli/fake", Box::new(FakeAdapter::new()));
+        factory
+    }
 }

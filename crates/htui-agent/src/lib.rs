@@ -72,6 +72,7 @@ pub mod event;
 pub mod fake;
 pub mod launch;
 pub mod record;
+pub mod registry;
 
 pub use driver::{
     AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, McpServerSpec,
@@ -91,8 +92,9 @@ pub use launch::{
     Spawned, ToolMap, ToolProbe, UsageScope, UsageSettings, VersionProbe, resolve, spawn,
 };
 pub use record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, RecorderSummary, pump};
+pub use registry::{DriverFactory, TransportBuilder, adapter_id, caps_for};
 
 #[cfg(feature = "test-support")]
 pub use conformance::{CASES, CaseHarness, Script, ScriptEvent, Turn, run_all, run_case};
 #[cfg(feature = "test-support")]
-pub use fake::{FAKE_AGENT_NAME, FakeDriver, FakeSession, SESSION_STARTED};
+pub use fake::{FAKE_AGENT_NAME, FakeAdapter, FakeDriver, FakeSession, SESSION_STARTED};
