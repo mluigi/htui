@@ -602,7 +602,10 @@ async fn load_demo_round_trips_a_count_per_table() {
             // `seed_if_empty_as` has already put `claude` and `agy` there, and the fixture carries
             // the same two names under its own ids, so `load_demo` deletes them by name first. The
             // delta is therefore zero and the absolute count is what carries meaning.
-            assert_eq!(before[i], expected_rows, "the seed put the two §5.3 rows in");
+            assert_eq!(
+                before[i], expected_rows,
+                "the seed put the two §5.3 rows in"
+            );
             assert_eq!(
                 after, expected_rows,
                 "`agent` holds the fixture's rows, not the seed's plus the fixture's"

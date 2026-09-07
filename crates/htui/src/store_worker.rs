@@ -12,8 +12,8 @@
 //! until then the queue depth is bounded in practice by the keystrokes a user can produce.
 
 use htui_core::model::{
-    BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note, ProjectId,
-    RunSummary, Scope, WorkspaceSummary,
+    AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note,
+    ProjectId, RunSummary, Scope, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result as StoreResult, StoreError};
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
@@ -74,6 +74,10 @@ pub enum StoreRequest {
     Notes(ItemId),
     /// The item's runs with their steps.
     Runs(ItemId),
+    /// The agent registry with this box's `agent_box` row, for the Settings tab (MOD-2 D14).
+    ///
+    /// Not scoped: `agent` is a global table, not a workspace one.
+    Agents,
     /// The top bar's store field and the pending-migration count (plan D11).
     StoreState,
     /// Apply the pending migrations (`R-STO-5`), after the user answered `y`.
@@ -94,6 +98,7 @@ impl StoreRequest {
             Self::Documents(_) => "documents",
             Self::Notes(_) => "notes",
             Self::Runs(_) => "runs",
+            Self::Agents => "agents",
             Self::StoreState => "store_state",
             Self::ApplyMigrations => "apply_migrations",
         }
@@ -121,6 +126,8 @@ pub enum StoreReply {
     Notes(Vec<Note>),
     /// Answer to [`StoreRequest::Runs`].
     Runs(Vec<RunSummary>),
+    /// Answer to [`StoreRequest::Agents`], ordered by `agent.name`.
+    Agents(Vec<AgentSummary>),
     /// Answer to [`StoreRequest::StoreState`].
     StoreState {
         /// `Backend::label()`: `memory`, `connecting`, `online` or `offline · <age>`.
@@ -203,6 +210,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Documents(id) => StoreReply::Documents(backend.documents(*id).await?),
         StoreRequest::Notes(id) => StoreReply::Notes(backend.notes(*id).await?),
         StoreRequest::Runs(id) => StoreReply::Runs(backend.runs(*id).await?),
+        StoreRequest::Agents => StoreReply::Agents(backend.agents().await?),
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,

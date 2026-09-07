@@ -75,7 +75,7 @@ impl App {
     /// workspace, which is exactly the shell a first launch shows (blueprint D.5).
     fn on_tick(&mut self) {
         self.ticks += 1;
-        if self.ticks % TICKS_PER_REFRESH == 0 {
+        if self.ticks.is_multiple_of(TICKS_PER_REFRESH) {
             self.dispatch(Origin::App, StoreRequest::StoreState);
             if !self.scope.is_empty() {
                 let scope = self.scope.clone();

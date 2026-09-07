@@ -72,7 +72,12 @@ impl Harness {
     }
 
     /// Builds a harness over a store.
-    fn over(store: MemStore) -> Self {
+    ///
+    /// Public so a test can hand in a store it has *already* written to — the Settings tab's
+    /// agent section is tested against a registry row that no fixture contains, which
+    /// [`Harness::demo`] cannot express.
+    #[must_use]
+    pub fn over(store: MemStore) -> Self {
         let backend = Backend::memory(store);
         let (request_tx, rx) = mpsc::unbounded_channel();
         let mut app = App::new(request_tx, Keymap::default_global());
