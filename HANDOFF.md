@@ -14,9 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-07):** MOD-2 milestone 2 landed and is reviewed (`5c717d0`..`34d5f04`):
-the agent registry now seeds itself, an agent named nowhere in the tree reaches a working session
-from its row alone (`R-AGT-5`), and the Settings tab lists the registry. ANA-5 concluded
+**Current status (2026-09-07):** MOD-2 milestone 3 landed and is reviewed (`a142fbf`..`682a423`):
+`htui` holds a **live streamed conversation with `claude` over ACP** in a new Chat tab — the
+transport passes the same thirteen conformance cases as the fake with no case added, permissions
+are answered inline, edits arrive as diffs, and a real session was driven end to end on this box
+against adapter 0.48.0. Milestone 2 landed before it (`5c717d0`..`34d5f04`): the agent registry
+seeds itself, an agent named nowhere in the tree reaches a working session from its row alone
+(`R-AGT-5`), and the Settings tab lists the registry. ANA-5 concluded
 (`docs/ANA-5.md`,
 `docs/decisions/ana/ana-5.md`): plain `{{name}}` templates over a closed per-role placeholder set
 with no templating crate, ten `<section>` names, ANA-9 §7.3 amended at query level (`MIN(depth)`,
@@ -94,8 +98,35 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   resolved its command with a blocking `which` inside async code - plus three MEDIUM; three are
   fixed in `34d5f04` (`spawn` is now `async` over `spawn_blocking`, the registry parses
   `agent.settings` once, and the `R-AGT-5` token sweep T9 promised now exists and is bite-proven),
-  the fourth accepted with its reason (plan "Review gate"). Milestone 3 (live `claude` over ACP:
-  the transport, the chat tab, `htui` -> `htui-agent`) is next.
+  the fourth accepted with its reason (plan "Review gate").
+  **Phase 3 landed (2026-09-07, `a142fbf`..`682a423`):** live `claude` over ACP and the chat tab,
+  planned in `.claude/plans/mod-2-live-acp-chat.plan.md` with the `code-architect` blueprint beside
+  it. `htui-agent` gained its first real transport (`acp/{mod,map,client,fs}.rs`): one task per
+  session owning the whole `connect_with` future, the §6.1 mapper over raw JSON (the adapter ships
+  five update kinds the schema does not know), `fs/write_text_file` intercepted into an
+  `edit_proposal` with a `similar` unified diff, model selection by config-option **id**, the
+  session banner, and the three-stage permission pipeline with `permission.rs` deciding stages 1-2
+  where the recorder is. `htui-store` gained `Writer` (an owned `WriteStore` handle; `Offline` still
+  hands out none) and `Backend::{writer, this_user}`; `htui` gained `agent_worker.rs`
+  (`AgentRuntime`, `run_chat`), the four chat `StoreRequest` variants with `StoreReply::Chat`
+  frames, and the Chat tab (`R-TUI-6`: streamed text, folded thoughts, tool calls, diffs, inline
+  permission answers, capability banner). **The thirteen `conformance::CASES` now pass over a real
+  ACP wire and no case was added** (§11 criterion 1); two case *scripts* were amended because ACP
+  reports no per-turn tokens (§7) and carries no verbatim diff (§4.3). Recorded transcript fixtures
+  come from a live turn against adapter **0.48.0**, and they close two §11.14 items: the rate-limit
+  blob does arrive under `_meta["_claude/rateLimit"]`, on a later `usage_update` than the first, and
+  `cost` appears only once the turn has produced output. Live on this box: the seeded row resolves,
+  spawns the adapter, completes a `protocolVersion 1` handshake and dies with its process tree
+  (`tests/acp_live.rs`), and a whole chat streams into the store through the production runtime
+  (`crates/htui/tests/chat_live.rs`) — §11 criterion 9's first half and criterion 11's
+  process-group half. `rust-reviewer` blocked on one CRITICAL and seven HIGH findings, all fixed in
+  `682a423`: the SDK drops the foreground future when a connection actor fails, which orphaned the
+  agent process; a stream ending before its `done` was recorded as a finished turn; the path guard
+  admitted everything when a root was relative; and `edit_proposal.accepted` defaulted to `true`
+  before the user had seen the request. Verified on **Linux** with Postgres live; **Windows is
+  unverified** (job object, `PATHEXT`, `CREATE_NO_WINDOW`) and milestone 5 is the next to touch that
+  path. Milestone 4 (durable history and replay: `StepEvents`, the offline buffer, read-only
+  replay) is next.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and

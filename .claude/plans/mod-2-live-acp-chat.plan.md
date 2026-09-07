@@ -345,6 +345,48 @@ against `title`, and says so).
    milestone-3 phase note?
 
 ---
-*Status: APPROVED — fact-checked (V16–V32, one falsified claim corrected by compile probe) and
-confirmed by the maintainer on 2026-09-07. Implementation follows: `code-architect` blueprint, then
-T11 → {T12, T13} → T14 under TDD, then the `rust-reviewer` gate.*
+## Close-out (2026-09-07)
+
+Landed as `a142fbf`..`682a423`: `2684c78` (T11, the ACP transport), `3018b7a` (T12, conformance
+over a duplex plus recorded fixtures and the live smoke test), `1f49b71` (T13, `Writer`,
+`AgentRuntime` and the four chat requests), `5e1bdaa` (T14, the chat tab), `682a423` (the review
+gate's findings).
+
+**Criteria closed.** §11 criterion 1 (one `CASES` list, a second binding, **no case added**);
+criterion 5 on a real transport; criterion 6 (`fs/write_text_file` → one `edit_proposal` whose diff
+applies to an empty file); criterion 9's first half and criterion 11's process-group half, both by
+live run on this box; criterion 13 re-checked (`cargo tree -i tokio` still shows no SDK edge).
+Criteria 2, 3, 4 and 12 are milestone 1's and were re-run unchanged.
+
+**§11.14 items closed by the live captures.** The model config option is keyed `model` and its value
+vocabulary is per installation (`default`, `opus[1m]`, `sonnet`, `sonnet[1m]`, `haiku` on this box),
+which is why the row stores an option **id**; the Claude rate-limit blob is real and arrives under
+`_meta["_claude/rateLimit"]`, on a **later** `usage_update` than the first, and `cost` appears only
+once the turn has produced output. The remaining nine items belong to milestones 5–8 and MOD-11.
+
+**Two case scripts were amended** (blueprint H-2), each because ANA-4 says the value is not the
+transport's to produce: ACP reports no per-turn tokens on `usage_update` (§7, confirmed by the
+capture) and carries no verbatim diff (§4.3). `CASES` and its length did not change.
+
+**Review gate.** `rust-reviewer` (`claude-fable-5-1`, one pass over the whole change set) **blocked**
+on one CRITICAL and seven HIGH findings; all are fixed in `682a423`, with eleven MEDIUMs. The
+CRITICAL was real and no test in this milestone would have caught it: `connect_with` drops the
+foreground future when a connection actor fails first, so a JSON-RPC error answering
+`session/prompt` orphaned the agent process. Three more were genuine defects — a stream ending
+before its `done` recorded as a finished turn, a path guard that admitted everything when a root was
+relative, and `edit_proposal.accepted` defaulting to `true` before the user had seen the request
+(the `claude` adapter sends the diff *before* the permission request, so that default was the
+common case, not the rare one). Nothing was deferred.
+
+**Carried into milestone 4 and beyond.** Windows is unverified here (job object, `PATHEXT`,
+`CREATE_NO_WINDOW`); `_always` permission grants are recorded but not persisted to
+`agent.settings.remembered[]`; `retain_raw` defaults to `false` behind `HTUI_KEEP_RAW_EVENTS` until
+MOD-15 gives `project.settings` a reader; a chat runs in the `htui` process's own working directory
+until MOD-13 and MOD-7 give a project a repo path per box; a proposal whose rejection arrives after
+its row was flushed keeps `accepted: null`, because the recorder has no update path for a flushed
+row.
+
+---
+*Status: DONE — milestone 3 landed, reviewed and validated. The plan's open questions were all
+answered at CONFIRM; the blueprint's nine corrections and the reviewer's nineteen findings are
+applied.*
