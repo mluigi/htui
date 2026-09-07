@@ -18,6 +18,14 @@ in a local SQLite file, so `htui` starts and renders with the server unreachable
 Requires **rustc 1.98+** (edition 2024; `rust-toolchain.toml` pins 1.98.1 exactly, so `rustup` will
 fetch it on first build).
 
+`workspace.package.rust-version` says `1.98` too, and the two numbers are deliberately the same.
+The declared MSRV had been `1.85`, which was never true: the locked `sqlx-core 0.9.0` declares
+`rust-version = "1.94.0"` and `ratatui 0.30.2` declares `1.88.0`, so nothing below 1.94 has been
+able to build this workspace for some time. `docs/ANA-4.md` §4.2 proposed `1.88` (the ACP SDK's own
+floor); MOD-2 raised it to the toolchain pin instead, on the reasoning that with an *exact* pin the
+only MSRV that is simultaneously true and checkable is the one everyone actually runs. `clippy.toml`
+carries the same number, or clippy silently lints against the older one.
+
 ```
 cargo build --release
 ```
@@ -59,7 +67,7 @@ htui --clear-dsn      # removes the entry again
 Both flags exit before the TUI starts. The DSN is read from stdin, so it can also be piped in:
 
 ```
-echo postgres://postgres:htui@localhost:5433/htui | htui --set-dsn
+echo postgres://postgres:htui@localhost:5439/htui | htui --set-dsn
 ```
 
 TLS is whatever the DSN asks for (`?sslmode=require`, …); nothing overrides it (`R-STO-2`).
@@ -67,11 +75,11 @@ TLS is whatever the DSN asks for (`?sslmode=require`, …); nothing overrides it
 ### A development server
 
 `compose.yaml` at the repo root runs the minimum supported server, `postgres:16`, on host port
-**5433**, so a locally installed Postgres on 5432 never collides:
+**5439**, so a locally installed Postgres on 5432 never collides:
 
 ```
 docker compose up -d
-echo postgres://postgres:htui@localhost:5433/htui | htui --set-dsn
+echo postgres://postgres:htui@localhost:5439/htui | htui --set-dsn
 ```
 
 The container's `htui` database is the one to point the TUI at; `postgres` is the maintenance
@@ -213,7 +221,7 @@ and passes, so the command above stays green on a box without a server.
 
 ```
 docker compose up -d
-HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5433/postgres cargo test --workspace --all-features
+HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres cargo test --workspace --all-features
 ```
 
 Nothing under `%APPDATA%\htui` is touched by the suite: every test mints its `box.toml` and opens
@@ -230,11 +238,11 @@ need a server. After adding or changing a `query!`, regenerate it **from inside 
 
 ```
 cargo install sqlx-cli --no-default-features --features postgres,sqlite   # once
-psql postgres://postgres:htui@localhost:5433/postgres -c "CREATE DATABASE htui_sqlx;"
-DATABASE_URL=postgres://postgres:htui@localhost:5433/htui_sqlx cargo sqlx migrate run --source crates/htui-store/migrations
+psql postgres://postgres:htui@localhost:5439/postgres -c "CREATE DATABASE htui_sqlx;"
+DATABASE_URL=postgres://postgres:htui@localhost:5439/htui_sqlx cargo sqlx migrate run --source crates/htui-store/migrations
 
 cd crates/htui-store
-DATABASE_URL=postgres://postgres:htui@localhost:5433/htui_sqlx cargo sqlx prepare -- --all-targets --all-features
+DATABASE_URL=postgres://postgres:htui@localhost:5439/htui_sqlx cargo sqlx prepare -- --all-targets --all-features
 ```
 
 `--all-targets --all-features` is not optional: without it the queries inside `#[cfg(test)]`,
@@ -258,6 +266,14 @@ worker seam and read-only views over an in-memory store loaded with demo fixture
 backend (`PgStore`), the per-box SQLite mirror (`CacheStore`) with the background cursor refresh,
 the box identity, the keyring DSN and the `Backend` enum the store worker holds. Item editing is
 still MOD-13's: the write paths exist on `PgStore` and no view calls them yet.
+
+**MOD-2** is landing `crates/htui-agent`: the `AgentDriver` / `AgentSession` seam of
+`docs/ANA-4.md` §4.1, the driver event model, the session recorder (coalescing, `seq`/`turn`,
+scrub-before-persist), a `FakeDriver` and one transport-neutral conformance list every transport
+must pass. Milestone 2 adds the launch recipe — `agent.launch` / `agent.settings` as types,
+`${tool}` resolution against a per-box tool map, and a supervised spawn (job object on Windows,
+process group on unix) — plus the agent registry section of the Settings tab. No wire protocol
+yet: `claude` over ACP is milestone 3, so the crate holds the SDK but starts no session.
 
 The rest is tracked as its own item and lands as an additive module — a file plus one registration
 line, with no change to the event loop:

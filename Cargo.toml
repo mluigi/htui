@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 edition      = "2024"
-rust-version = "1.85"          # MSRV = edition 2024 floor (T1); toolchain pin is separate
+rust-version = "1.98"          # MSRV = the exact toolchain pin (T7/X9); see README "Toolchain"
 license      = "MIT"
 publish      = false
 
@@ -17,7 +17,8 @@ chrono             = { version = "0.4", features = ["serde"] }
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 thiserror          = "2"
-tokio              = { version = "1.53", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio              = { version = "1.53", features = ["rt-multi-thread", "sync", "macros", "time",
+                       "process", "io-util"] }
 ratatui            = "0.30.2"
 crossterm          = { version = "0.29", features = ["event-stream"] }
 futures            = "0.3"     # StreamExt for crossterm::event::EventStream (V4)
@@ -35,6 +36,18 @@ dirs               = "6"
 gethostname        = "1.1"
 sha2               = "0.10"
 toml               = "1.1"
+# MOD-2 milestone 2 (ANA-4 §4.2, §8). The SDK version is exact-pinned: the protocol is the
+# contract, and a patch bump to it is a wire change until proven otherwise.
+agent-client-protocol = "=2.1.0"
+tokio-util            = { version = "0.7.19", features = ["compat"] }
+process-wrap          = { version = "10.0.0", features = ["tokio1", "creation-flags",
+                          "job-object", "process-group"] }
+# Windows only, and only to name `CREATE_NO_WINDOW`: `process-wrap`'s `CreationFlags` wraps the
+# `windows` crate's `PROCESS_CREATION_FLAGS` and exposes no constructor of its own. Same version as
+# `process-wrap`'s own dependency, so the tree holds one copy.
+windows               = { version = "0.62.2", features = ["Win32_System_Threading"] }
+similar               = "3.2.0"   # milestone 3 diff synthesis; no crate consumes it yet (A3)
+which                 = "8.0.6"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"

@@ -292,7 +292,10 @@ impl core::fmt::Debug for SessionSpec {
 
 /// Prints an environment map with every **value** replaced by `[REDACTED]`; keys stay visible so a
 /// log still says which variables were set.
-struct RedactedEnv<'a>(&'a BTreeMap<String, String>);
+///
+/// `pub(crate)` so [`crate::launch`]'s `AgentLaunch` and `ResolvedLaunch` redact the same way from
+/// the same code: two copies of this would be two places for the invariant to rot.
+pub(crate) struct RedactedEnv<'a>(pub(crate) &'a BTreeMap<String, String>);
 
 impl core::fmt::Debug for RedactedEnv<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

@@ -70,6 +70,7 @@ pub mod error;
 pub mod event;
 #[cfg(feature = "test-support")]
 pub mod fake;
+pub mod launch;
 pub mod record;
 
 pub use driver::{
@@ -83,6 +84,11 @@ pub use event::{
     PermissionOption, PermissionOptionKind, PermissionRequestEvent, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, PlanEvent, StopReason, TerminalReason, TextChunk, ToolCallEvent, ToolKind,
     ToolLocation, ToolResultEvent, ToolResultStatus, UsageEvent,
+};
+pub use launch::{
+    AcpSettings, AgentLaunch, AgentSettings, CliSettings, ClientCapabilities, Discovery,
+    FallbackCommand, PlatformGlob, QuotaSettings, QuotaSource, ResolvedLaunch, SessionSettings,
+    Spawned, ToolMap, ToolProbe, UsageScope, UsageSettings, VersionProbe, resolve, spawn,
 };
 pub use record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, RecorderSummary, pump};
 
