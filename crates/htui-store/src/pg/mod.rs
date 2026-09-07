@@ -12,6 +12,8 @@ mod write;
 use std::str::FromStr as _;
 use std::time::Duration;
 
+use chrono::Utc;
+use htui_core::model::agent::seed_rows;
 use htui_core::model::{BoxId, OsFamily, UserId};
 use htui_core::store::{Result, StoreError};
 use sqlx::migrate::Migrate as _;
@@ -210,10 +212,18 @@ impl PgStore {
     /// [`seed_if_empty`](PgStore::seed_if_empty) under a caller-supplied `app_user.name`.
     ///
     /// Idempotent: every insert is conditional. Seeds one `app_user`, the ten `capability_tag`
-    /// rows with `seeded = true` and the `app_setting` defaults `cache_refresh_seconds` = 30 and
-    /// `cache_overlap_seconds` = 300. **No `agent` rows**: `agent.launch` is `JSONB NOT NULL` and
-    /// its shape is ANA-4's, so seeding one would be a guess ANA-4 then has to migrate away
-    /// (plan D5, blueprint H.2).
+    /// rows with `seeded = true`, the `app_setting` defaults `cache_refresh_seconds` = 30 and
+    /// `cache_overlap_seconds` = 300, and the two `agent` rows of `docs/ANA-4.md` §5.3.
+    ///
+    /// MOD-6 deliberately seeded **no** agent, because `agent.launch` is `JSONB NOT NULL` and its
+    /// shape was still ANA-4's to settle, so a guess would have needed migrating away (MOD-6 plan
+    /// D5, blueprint H.2). ANA-4 settled it and assigned the seed to MOD-2, which is this: the
+    /// rows come from [`seed_rows`], one source shared with the demo fixture.
+    ///
+    /// The agent insert is guarded on the table being **empty**, not on `ON CONFLICT (name)`: a
+    /// maintainer who deletes `agy` in the Settings tab has decided something, and a later seed
+    /// pass must not undo it. `ON CONFLICT (name) DO NOTHING` remains as a backstop for the race
+    /// where two connects seed at once.
     ///
     /// **`R-USR-2`, one row, whatever the OS user is called.** The `app_user` insert is guarded by
     /// `WHERE NOT EXISTS (SELECT 1 FROM app_user)` rather than by `ON CONFLICT (name)`: a second
@@ -269,6 +279,38 @@ impl PgStore {
                  ON CONFLICT (key) DO NOTHING",
                 key,
                 value,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        // Emptiness is read **once**, before the loop: a per-statement `WHERE NOT EXISTS` would be
+        // false by the time the second row ran, and the registry would come up holding `claude`
+        // alone. The read is inside the transaction that holds the `app_user` lock, so a
+        // concurrent seed cannot slip a row in between the check and the inserts.
+        let empty = sqlx::query_scalar!(r#"SELECT NOT EXISTS(SELECT 1 FROM agent) AS "empty!""#)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+
+        for agent in seed_rows(Utc::now()).into_iter().filter(|_| empty) {
+            sqlx::query!(
+                "INSERT INTO agent (id, name, transport, launch, models, default_model, billing, \
+                                    enabled, settings, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (name) DO NOTHING",
+                agent.id.as_uuid(),
+                agent.name,
+                agent.transport.as_str(),
+                &agent.launch,
+                &agent.models[..],
+                agent.default_model.as_deref(),
+                agent.billing.as_str(),
+                agent.enabled,
+                &agent.settings,
+                agent.created_at,
+                agent.updated_at,
             )
             .execute(&mut *tx)
             .await

@@ -5,7 +5,10 @@
 //! the `BEFORE UPDATE` trigger of the migration does not touch an `INSERT`.
 //!
 //! No `ON CONFLICT DO NOTHING` anywhere: `load_demo` runs against a database created seconds
-//! earlier, so a conflict is a bug that must surface.
+//! earlier, so a conflict is a bug that must surface. The single exception is `agent`, which
+//! `seed_if_empty_as` has filled since MOD-2: the fixture deletes those two rows by name before
+//! inserting its own, because it brings a whole world rather than rows to merge (see the comment
+//! at the `agent` loop).
 
 use htui_core::fixtures::DemoData;
 use htui_core::model::{
@@ -133,6 +136,23 @@ impl PgStore {
             .await
             .map_err(map_sqlx)?;
         }
+
+        // The one exception to this module's "a conflict is a bug" rule, and it is about *names*,
+        // not rows. Since MOD-2, `seed_if_empty_as` seeds `claude` and `agy` from
+        // `docs/ANA-4.md` §5.3, so a freshly migrated database is no longer empty of agents, and
+        // the fixture carries those same two names under its own deterministic ids. The fixture is
+        // a whole world - it brings its own `app_user` and `box` for the same reason - so it owns
+        // the registry too: the seeded rows go, and the fixture's take their place. Nothing
+        // references them yet (the fixture's own `run_step` rows are inserted further down), and
+        // `agent_box` would cascade if anything did.
+        let fixture_agents: Vec<String> = data.agents.iter().map(|row| row.name.clone()).collect();
+        sqlx::query!(
+            "DELETE FROM agent WHERE name = ANY($1)",
+            &fixture_agents[..]
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
 
         for row in &data.agents {
             sqlx::query!(

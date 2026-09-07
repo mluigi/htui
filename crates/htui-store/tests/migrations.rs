@@ -302,11 +302,34 @@ async fn seed_is_idempotent() {
         2,
         "cache_refresh_seconds and cache_overlap_seconds"
     );
+    // MOD-6 left this at zero because `agent.launch`'s shape was still ANA-4's to settle. It is
+    // settled (§5.1, §5.3), so MOD-2 seeds the two rows and this asserts they arrive exactly once.
     assert_eq!(
         common::count(&db.pool, "agent").await,
-        0,
-        "no agent rows: agent.launch is ANA-4's shape (plan D5, blueprint H.2)"
+        2,
+        "the two ANA-4 §5.3 agent rows, and no third from the second and third seed passes"
     );
+
+    let agents = db.store.agents().await.expect("the registry reads");
+    let names: Vec<&str> = agents
+        .iter()
+        .map(|summary| summary.agent.name.as_str())
+        .collect();
+    assert_eq!(names, ["agy", "claude"], "both seeds, ordered by name");
+    for summary in &agents {
+        assert!(
+            summary.on_box.is_none(),
+            "{}: nothing is probed until milestone 5",
+            summary.agent.name
+        );
+        assert!(summary.agent.enabled, "{}", summary.agent.name);
+        assert_eq!(
+            summary.agent.launch["command"].as_str().map(str::is_empty),
+            Some(false),
+            "{}: the launch row survives the JSONB round trip",
+            summary.agent.name
+        );
+    }
 
     let seeded: bool = sqlx::query_scalar("SELECT bool_and(seeded) FROM capability_tag")
         .fetch_one(&db.pool)
@@ -572,9 +595,24 @@ async fn load_demo_round_trips_a_count_per_table() {
 
     for (i, (table, len)) in expected.iter().enumerate() {
         let after = common::count(&db.pool, table).await;
+        let expected_rows = i64::try_from(*len).expect("a fixture vector fits in i64");
+
+        if *table == "agent" {
+            // `agent` is the one table the fixture *replaces* rather than adds to: since MOD-2,
+            // `seed_if_empty_as` has already put `claude` and `agy` there, and the fixture carries
+            // the same two names under its own ids, so `load_demo` deletes them by name first. The
+            // delta is therefore zero and the absolute count is what carries meaning.
+            assert_eq!(before[i], expected_rows, "the seed put the two §5.3 rows in");
+            assert_eq!(
+                after, expected_rows,
+                "`agent` holds the fixture's rows, not the seed's plus the fixture's"
+            );
+            continue;
+        }
+
         assert_eq!(
             after - before[i],
-            i64::try_from(*len).expect("a fixture vector fits in i64"),
+            expected_rows,
             "`{table}` holds one row per DemoData entry"
         );
     }
