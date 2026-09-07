@@ -360,8 +360,8 @@ Design authority is ANA-4 / ANA-5; fact authority is the tree. Each item says wh
 
 ## Acceptance
 - [x] All ten tasks complete, tests-first. Milestone 1 ran as six agents; milestone 2 ran serially
-      on the main thread after the maintainer declined the fan-out (execution amendment 4). The
-      `rust-reviewer` pass is milestone 2's one open gate — see the close-out note below.
+      on the main thread after the maintainer declined the fan-out (execution amendment 4).
+      `rust-reviewer` ran over `3b90d1d..1e7de4d` and its findings are applied (`34d5f04`).
 - [x] Validation block passes on **Linux** (this box); `HTUI_TEST_DATABASE_URL` run green with
       `USERNAME=htui-ci` and **no skips**; `cargo tree -i tokio` shows no SDK edge. Windows is
       unverified for milestone 2: the `CREATE_NO_WINDOW` + job-object spawn path compiles nowhere
@@ -373,8 +373,9 @@ Design authority is ANA-4 / ANA-5; fact authority is the tree. Each item says wh
 - [x] `R-AGT-5` test (`tests/extensibility.rs`) passes and its absence sweep finds `zeta` nowhere.
       The sweep earned its place: it failed first on a doc comment in `fake.rs` that used the name
       as an example, which would have made the proof circular.
-- [x] Patterns mirrored, not reinvented (ANA-4 §4.1 / §5 verbatim). Reviewer verification pending
-      with the gate above.
+- [x] Patterns mirrored, not reinvented (ANA-4 §4.1 / §5 verbatim); the reviewer confirmed no lock
+      held across an `.await` in `launch.rs`, `fake.rs` or `registry.rs`, no secret reaching
+      `Debug`, and no `unsafe`.
 - [x] PRD milestone rows 1 and 2 → `complete`; `HANDOFF.md` phase note per
       `.claude/rules/workflow-docs.md` lifecycle 4.
 
@@ -402,3 +403,27 @@ case.
 first on Windows); `similar 3.2.0` is workspace-declared with no consumer until milestone 3 (A3);
 `DriverFactory::with_test_support`'s adapter is unreachable from outside, so a caller that needs to
 drive a session registers its own `FakeAdapter` — documented on the method.
+
+### Review gate (`rust-reviewer`, 2026-09-07, applied in `34d5f04`)
+
+Ran over `3b90d1d..1e7de4d` with `USERNAME=htui-ci` and `HTUI_TEST_DATABASE_URL` set, so the
+Postgres suites executed rather than taking the early-return skip that reports `ok`. Verdict:
+**Block** on one HIGH, since resolved.
+
+**Dispatch caveat, recorded because it changes what the gate means.** The `ecc` plugin was
+installed but disabled in the landing session, so the agent *type* `ecc:rust-reviewer` would not
+resolve. The gate was run by inlining that agent's own definition file
+(`~/.claude/plugins/cache/ecc/ecc/2.2.1/agents/rust-reviewer.md`) verbatim into a `general-purpose`
+agent on `sonnet`, the model its frontmatter names — same instructions, same model, different
+dispatch path. A future session with the plugin enabled may prefer to re-run it natively.
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| R1 | HIGH | `spawn` resolved the command with a blocking `which::which` while being, by construction, async-context code (it `tokio::spawn`s the stderr reader). Inconsistent with `pending.rs`, which already pushes blocking file I/O through `spawn_blocking`. | Fixed: `spawn` is `async` and the lookup runs on a blocking thread. Enforced by the type system rather than by a doc note the caller has to remember. |
+| R2 | MEDIUM | `driver_for` deserialised and cloned `agent.settings` twice, once via `adapter_id` and once via `caps_for`. | Fixed: parsed once, passed to private `_from` helpers; the public pair delegates. |
+| R3 | MEDIUM | The token sweep T9 item 6 promised was never written — masking was proven against `conformance`'s `FAKE_TOKEN`, never against the value the zeta row resolves. | Fixed: `the_resolved_token_reaches_no_persisted_row` drives the resolved env through factory → driver → recorder → scrubber → store with `retain_raw`, and is bite-proven (blinding the scrubber fails it, printing the token in five rows across payload and `raw`). |
+| R4 | MEDIUM | `expect` on the compiled-in seed documents sits on a production path (`seed_if_empty_as`). | **Accepted, not changed.** The input is an `include_str!` constant and cannot vary at run time; `seed_rows_match_ana4_5_3` fails first on a malformed document. Threading a `Result` would add a `?` at every call site for an error unreachable by construction. The reviewer left this to the caller's judgement. |
+
+The reviewer also noted two functions over the 50-line guideline (`seed_if_empty_as`,
+`AgentsSection::render`) and explicitly did not count them: both are flat, match the existing
+`runs.rs` renderer and seed-transaction patterns, and are test-covered. Left as they are.
