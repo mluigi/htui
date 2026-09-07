@@ -16,11 +16,11 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AppUser, Billing, BoxRow, CommandQueue, Document, EventKind, EventRole, Gate,
-    GateOutcome, Item, ItemKind, ItemKindId, ItemLink, ItemRevision, LinkKind, Note, NoteId,
-    OsFamily, PhaseId, Project, ProjectId, PromptTemplate, PromptTemplateId, Run, RunKind, RunMode,
-    RunStatus, RunStep, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPhase, StepId,
-    StepStatus, Transport, Workspace, WorkspaceProject,
+    Agent, AppUser, BoxRow, CommandQueue, Document, EventKind, EventRole, Gate, GateOutcome, Item,
+    ItemKind, ItemKindId, ItemLink, ItemRevision, LinkKind, Note, NoteId, OsFamily, PhaseId,
+    Project, ProjectId, PromptTemplate, PromptTemplateId, Run, RunKind, RunMode, RunStatus,
+    RunStep, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus,
+    Workspace, WorkspaceProject,
 };
 
 /// Milliseconds of `2026-09-03T00:00:00Z`, the timestamp field of every [`demo_uuid`].
@@ -117,7 +117,8 @@ pub mod ids {
         BOX: BoxId = (class::BOX, 0),
         /// `agent` `claude` (`acp`, `subscription`).
         AGENT_CLAUDE: AgentId = (class::AGENT, 0),
-        /// `agent` `agy` (`cli`, `per_token`).
+        /// `agent` `agy` (`acp`, `subscription` — ANA-4 §5.3; it was `cli`/`per_token` before
+        /// MOD-2 corrected the fixture to the seed).
         AGENT_AGY: AgentId = (class::AGENT, 1),
         /// `workspace` `Platform`.
         WORKSPACE_PLATFORM: WorkspaceId = (class::WORKSPACE, 0),
@@ -381,35 +382,21 @@ fn boxes() -> Vec<BoxRow> {
 }
 
 /// `agent` (§5.7, §5.10): the two agents the seed installs.
+///
+/// **The real seed rows, re-stamped** — [`seed_rows`](crate::model::agent::seed_rows) with the
+/// fixture's deterministic ids and epoch in place of the minted id and wall clock. The fixture
+/// used to carry its own hand-written pair (`claude` with `["claude","--acp"]`, `agy` as
+/// `cli`/`per_token`/`["agy","run"]`), which was wrong in every field ANA-4 §5.3 settles: the
+/// argv shape predates §5.1, and `claude-agent-acp` is the one artifact `htui` must never spawn by
+/// name. A demo agent that cannot launch is a trap for MOD-2's own tests, so the fixture is
+/// derived from the seed rather than kept beside it.
 fn agents() -> Vec<Agent> {
-    vec![
-        Agent {
-            id: ids::AGENT_CLAUDE,
-            name: "claude".to_owned(),
-            transport: Transport::Acp,
-            launch: json!({ "argv": ["claude", "--acp"], "env": {} }),
-            models: strings(&["opus", "sonnet"]),
-            default_model: Some("sonnet".to_owned()),
-            billing: Billing::Subscription,
-            enabled: true,
-            settings: json!({}),
-            created_at: epoch(),
-            updated_at: epoch(),
-        },
-        Agent {
-            id: ids::AGENT_AGY,
-            name: "agy".to_owned(),
-            transport: Transport::Cli,
-            launch: json!({ "argv": ["agy", "run"], "env": {} }),
-            models: strings(&["default"]),
-            default_model: Some("default".to_owned()),
-            billing: Billing::PerToken,
-            enabled: true,
-            settings: json!({}),
-            created_at: epoch(),
-            updated_at: epoch(),
-        },
-    ]
+    let ids = [ids::AGENT_CLAUDE, ids::AGENT_AGY];
+    crate::model::agent::seed_rows(epoch())
+        .into_iter()
+        .zip(ids)
+        .map(|(agent, id)| Agent { id, ..agent })
+        .collect()
 }
 
 /// `workspace` (§5.3).

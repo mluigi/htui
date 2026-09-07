@@ -1,0 +1,44 @@
+{
+  "name": "claude",
+  "transport": "acp",
+  "billing": "subscription",
+  "models": [],
+  "default_model": null,
+  "launch": {
+    "command": "${node}",
+    "args": ["${claude_agent_acp}"],
+    "env": { "CLAUDE_CODE_EXECUTABLE": "${claude}" },
+    "discovery": {
+      "tools": {
+        "node":   { "kind": "path", "names": ["node"],
+                    "version": { "args": ["--version"], "pattern": "^v(\\d+\\.\\d+\\.\\d+)$",
+                                 "min": "22.0.0" } },
+        "claude": { "kind": "path", "names": ["claude"],
+                    "version": { "args": ["--version"],
+                                 "pattern": "^(\\d+\\.\\d+\\.\\d+) \\(Claude Code\\)$" } },
+        "npx":    { "kind": "path", "names": ["npx"],
+                    "version": { "args": ["--version"], "pattern": "^(\\d+\\.\\d+\\.\\d+)$" } },
+        "claude_agent_acp": { "kind": "node_package",
+                              "package": "@agentclientprotocol/claude-agent-acp",
+                              "entry": "dist/index.js",
+                              "pinned": "0.75.0",
+                              "fallback": { "command": "${npx}",
+                                            "args": ["-y",
+                                              "@agentclientprotocol/claude-agent-acp@0.75.0"] } }
+      },
+      "handshake": true
+    }
+  },
+  "settings": {
+    "acp": { "protocol_version": 1,
+             "client_capabilities": { "fs_read": true, "fs_write": true, "terminal": false,
+                                      "elicitation": false },
+             "model_config_id": null,
+             "session": { "load": true, "resume": true } },
+    "cli": { "stream": "claude_stream_json", "permission_mode": "acceptEdits",
+             "extra_args": ["--bare"] },
+    "permission": { "default": "ask", "rules": [], "remembered": [] },
+    "quota": { "source": "acp_meta_rate_limit" },
+    "usage": { "scope": "model_usage" }
+  }
+}
