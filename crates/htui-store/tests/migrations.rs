@@ -66,6 +66,11 @@ async fn migrations_apply_on_a_clean_database() {
         .map(|m| m.version)
         .collect();
     assert_eq!(applied, embedded, "every embedded migration is applied");
+    assert_eq!(
+        applied,
+        vec![1, 2],
+        "0001_init.sql and MOD-2 milestone 5's 0002_agent_probe.sql, in ordinal order"
+    );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
         "SELECT table_name::text FROM information_schema.tables \
@@ -102,13 +107,226 @@ async fn a_second_run_is_a_no_op() {
     };
 
     let before: i64 = common::count(&db.pool, "_sqlx_migrations").await;
+    let settings_before: i64 = common::count(&db.pool, "app_setting").await;
     db.store
         .apply_migrations()
         .await
         .expect("a second apply_migrations succeeds");
     let after: i64 = common::count(&db.pool, "_sqlx_migrations").await;
+    let settings_after: i64 = common::count(&db.pool, "app_setting").await;
 
     assert_eq!(before, after, "re-running the migrator applies nothing new");
+    assert_eq!(
+        settings_before, settings_after,
+        "0002's `ON CONFLICT (key) DO NOTHING` keeps a re-run row-neutral"
+    );
+    db.drop_db().await;
+}
+
+/// MOD-2 milestone 5 (plan D43), section 1 of `0002_agent_probe.sql`: the ANA-4 §4.6 snapshot
+/// column. Nullable, because a box that has never probed a row has nothing to say about it.
+#[tokio::test]
+async fn agent_box_gains_a_jsonb_probe_column() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    let column = sqlx::query(
+        "SELECT data_type::text, is_nullable::text FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'agent_box' AND column_name = 'probe'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("agent_box.probe exists after 0002");
+
+    let data_type: String = column.get("data_type");
+    let is_nullable: String = column.get("is_nullable");
+    assert_eq!(data_type, "jsonb", "the snapshot is a JSONB document (D44)");
+    assert_eq!(
+        is_nullable, "YES",
+        "a row that has never been probed carries NULL, not an empty document"
+    );
+
+    db.drop_db().await;
+}
+
+/// The six `COMMENT ON COLUMN` texts of `0002_agent_probe.sql`, verbatim.
+///
+/// `agent.name` is ANA-4 §9 as amended by plan D43 (its `COMMENT ... IS NULL` would have cleared a
+/// comment `0001_init.sql` never wrote); the other five are ANA-5 §9 copied from
+/// `docs/ANA-5.md:2153-2181`. They live here as literals on purpose: this test is the guard
+/// against a paraphrase drifting into a forward-only migration that cannot be edited afterwards.
+const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "agent",
+        "name",
+        "unique registry name, e.g. claude or agy. Rows are seeded by htui, not by 0001_init.sql: \
+         htui_core::model::agent::seed_rows (crates/htui-core/seeds/*.json) inserted by \
+         PgStore::seed_if_empty_as when the table is empty. The inline comment in 0001_init.sql \
+         predates that and is stale (ANA-4 9 as amended by MOD-2 plan D43).",
+    ),
+    (
+        "prompt_template",
+        "body",
+        "ANA-5 4.1: {{name}} placeholders over a closed per-role set; {{{{ escapes a literal {{; \
+         no conditionals and no loops, because a section whose data is absent renders empty. Role \
+         is derived from name: judge and handoff are reserved, everything else is a phase \
+         template.",
+    ),
+    (
+        "prompt_template",
+        "name",
+        "phase name, or one of the reserved names judge and handoff (ANA-5 4.6); defaults are \
+         copied into each new project by the ANA-9 5.10 seed as amended by ANA-5",
+    ),
+    (
+        "run_step",
+        "prompt_digest",
+        "ANA-5 4.7: sha256, lowercase hex, over the canonical assembled prompt TEXT as sent - LF \
+         normalised, BOM stripped, one trailing LF, scrubbed before hashing. Not over the payload \
+         and not over sections[]. An audit field, never a replay key (ANA-2 4.9).",
+    ),
+    (
+        "run_step",
+        "trim_record",
+        "ANA-5 5.1: {v, template, budget, budget_source, reserve, target, estimator, \
+         estimated_before, estimated_after, sections[], excerpts, notes}. Canonical; the prompt \
+         payload sections[] array is its abridged projection. Written at stage 3 by \
+         set_step_prompt, before the session starts.",
+    ),
+    (
+        "step_graph_phase",
+        "token_budget",
+        "ANA-5 4.4: phase, then project.settings.token_budget, then app_setting.token_budget; the \
+         assembler targets budget * (1 - app_setting.prompt_reserve_fraction)",
+    ),
+];
+
+#[tokio::test]
+async fn the_six_ana_comments_are_present_and_verbatim() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    for (table, column, expected) in ANA_COLUMN_COMMENTS {
+        let actual: Option<String> = sqlx::query_scalar(
+            "SELECT pg_catalog.col_description(c.oid, a.attnum) \
+             FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
+             WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' \
+               AND c.relname = $1 AND a.attname = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap_or_else(|err| panic!("read col_description for {table}.{column}: {err}"));
+
+        assert_eq!(
+            actual.as_deref(),
+            Some(*expected),
+            "{table}.{column}'s comment is the ANA text byte for byte"
+        );
+    }
+
+    // And nothing else in those four tables carries one, so a reader of `\d+` sees exactly the
+    // six contracts the two ANAs wrote and no half-finished seventh.
+    let commented: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, a.attname::text FROM pg_class c \
+         JOIN pg_attribute a ON a.attrelid = c.oid \
+         WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' \
+           AND c.relname = ANY($1) AND a.attnum > 0 \
+           AND pg_catalog.col_description(c.oid, a.attnum) IS NOT NULL \
+         ORDER BY 1, 2",
+    )
+    .bind(
+        ANA_COLUMN_COMMENTS
+            .iter()
+            .map(|(table, _, _)| (*table).to_owned())
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect::<Vec<String>>(),
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("list the commented columns of the four tables");
+
+    let mut expected: Vec<(String, String)> = ANA_COLUMN_COMMENTS
+        .iter()
+        .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        commented, expected,
+        "exactly the six commented columns, and no others"
+    );
+
+    db.drop_db().await;
+}
+
+/// ANA-5 §5.3's ten defaults, folded into `0002` as section 3 (`docs/ANA-5.md:2183-2189`).
+/// `prompt_reserve_fraction` is the one non-integer and is checked beside this table.
+const ANA5_INTEGER_DEFAULTS: &[(&str, i64)] = &[
+    ("excerpt_file_line_cap", 400),
+    ("excerpt_head_lines", 200),
+    ("excerpt_max_file_bytes", 524_288),
+    ("excerpt_max_files", 12),
+    ("excerpt_max_scan_files", 20_000),
+    ("excerpt_provider_deadline_ms", 1_500),
+    ("max_skill_tokens", 20_000),
+    ("prompt_upstream_hops", 2),
+    ("token_budget", 120_000),
+];
+
+#[tokio::test]
+async fn the_ten_ana5_defaults_land_with_their_values() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    let mut keys: Vec<String> = ANA5_INTEGER_DEFAULTS
+        .iter()
+        .map(|(key, _)| (*key).to_owned())
+        .collect();
+    keys.push("prompt_reserve_fraction".to_owned());
+    keys.sort();
+
+    let rows: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT key, value FROM app_setting WHERE key = ANY($1) ORDER BY key")
+            .bind(&keys)
+            .fetch_all(&db.pool)
+            .await
+            .expect("read the ANA-5 defaults");
+
+    assert_eq!(
+        rows.len(),
+        10,
+        "all ten ANA-5 §5.3 keys landed, got {rows:?}"
+    );
+
+    for (key, expected) in ANA5_INTEGER_DEFAULTS {
+        let value = &rows
+            .iter()
+            .find(|(k, _)| k == key)
+            .unwrap_or_else(|| panic!("app_setting.{key} exists"))
+            .1;
+        assert_eq!(
+            value.as_i64(),
+            Some(*expected),
+            "app_setting.{key} carries ANA-5's value"
+        );
+    }
+
+    let fraction = &rows
+        .iter()
+        .find(|(k, _)| k == "prompt_reserve_fraction")
+        .expect("app_setting.prompt_reserve_fraction exists")
+        .1;
+    assert_eq!(
+        fraction.as_f64(),
+        Some(0.10),
+        "the one fractional default decodes as a JSON number"
+    );
+
     db.drop_db().await;
 }
 
@@ -134,8 +352,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(1),
-        "one embedded migration, none applied"
+        MigrationState::Pending(2),
+        "two embedded migrations, none applied"
     );
 
     db.drop_db().await;
@@ -299,8 +517,8 @@ async fn seed_is_idempotent() {
     );
     assert_eq!(
         common::count(&db.pool, "app_setting").await,
-        2,
-        "cache_refresh_seconds and cache_overlap_seconds"
+        12,
+        "cache_refresh_seconds, cache_overlap_seconds and ANA-5's ten"
     );
     // MOD-6 left this at zero because `agent.launch`'s shape was still ANA-4's to settle. It is
     // settled (§5.1, §5.3), so MOD-2 seeds the two rows and this asserts they arrive exactly once.

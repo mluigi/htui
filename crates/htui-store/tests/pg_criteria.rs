@@ -18,8 +18,8 @@ use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentId, Billing, ItemFilter, ItemId, ItemKindId, ItemPatch, NewItem, ProjectId, Status,
-    StepId, Transport,
+    Agent, AgentBox, AgentId, Billing, ItemFilter, ItemId, ItemKindId, ItemPatch, NewItem,
+    ProjectId, Status, StepId, Transport,
 };
 use htui_core::store::{ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_store::PgStore;
@@ -1493,6 +1493,110 @@ async fn inherent_reads_answer_the_fixture() {
             "`{wildcard}` is a literal needle, and no fixture key or title contains it"
         );
     }
+
+    db.drop_db().await;
+}
+
+/// MOD-2 D44: the ANA-4 §4.6 snapshot survives `agent_box.probe` unchanged, and MOD-4's skip
+/// predicate can read `probe->>'status'` straight out of SQL (`docs/ANA-2.md` §7).
+///
+/// `htui-store` cannot name `htui_agent::probe::ProbeSnapshot` - the dependency runs the other way
+/// (D44) - so the document is hand-written here in the shape that type serialises to. That is the
+/// point of the case: the column is opaque to this crate, and anything the driver writes has to
+/// come back byte for byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_probe_snapshot_round_trips_through_agent_box() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let snapshot = serde_json::json!({
+        "transport": "acp",
+        "resolved": {
+            "command": "/usr/bin/node",
+            "args": ["/opt/claude-code-acp/dist/index.js"],
+            "env": { "CLAUDE_CODE_EXECUTABLE": "/usr/bin/claude" },
+        },
+        "tools": { "claude": "2.1.263", "claude_agent_acp": null, "node": "22.19.0" },
+        "handshake": {
+            "at": "2026-09-08T12:00:00Z",
+            "protocol_version": 1,
+            "agent_name": "claude-code-acp",
+            "agent_version": "0.7.1",
+            "capabilities": { "loadSession": false },
+            "auth_methods": [],
+        },
+        "status": "ready",
+        "stderr_tail": null,
+        "source": "probe",
+    });
+    let row = AgentBox {
+        agent_id: ids::AGENT_CLAUDE,
+        box_id: db.store.this_box(),
+        enabled: true,
+        version: Some("0.7.1".to_owned()),
+        path: Some("/usr/bin/node".to_owned()),
+        probed_at: Some(Utc::now()),
+        quota: None,
+        quota_at: None,
+        updated_at: Utc::now(),
+        probe: Some(snapshot.clone()),
+    };
+    db.store
+        .upsert_agent_box(&row)
+        .await
+        .expect("the probe row lands");
+
+    let on_box = db
+        .store
+        .agents()
+        .await
+        .expect("agents must not fail")
+        .into_iter()
+        .find(|summary| summary.agent.id == ids::AGENT_CLAUDE)
+        .expect("claude is registered")
+        .on_box
+        .expect("this box now has an agent_box row");
+    assert_eq!(
+        on_box.probe.as_ref(),
+        Some(&snapshot),
+        "the JSONB document comes back exactly as it went in"
+    );
+
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT probe->>'status' FROM agent_box WHERE agent_id = $1")
+            .bind(ids::AGENT_CLAUDE.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read probe->>'status'");
+    assert_eq!(
+        status.as_deref(),
+        Some("ready"),
+        "MOD-4's skip condition reads the status out of SQL, not out of Rust"
+    );
+
+    db.store
+        .upsert_agent_box(&AgentBox { probe: None, ..row })
+        .await
+        .expect("the cleared row lands");
+    let cleared: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT probe FROM agent_box WHERE agent_id = $1")
+            .bind(ids::AGENT_CLAUDE.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read probe");
+    assert_eq!(cleared, None, "a `None` probe writes SQL NULL, not `null`");
+    assert_eq!(
+        db.store
+            .agents()
+            .await
+            .expect("agents must not fail")
+            .into_iter()
+            .find(|summary| summary.agent.id == ids::AGENT_CLAUDE)
+            .and_then(|summary| summary.on_box)
+            .and_then(|on_box| on_box.probe),
+        None,
+        "and the read comes back `None`"
+    );
 
     db.drop_db().await;
 }

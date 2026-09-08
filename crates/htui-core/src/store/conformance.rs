@@ -1252,6 +1252,11 @@ async fn upsert_agent_by_id_name_unique<S: WriteStore>(store: &S) {
 
 /// `upsert_agent_box` keys on the composite primary key `(agent_id, box_id)` and needs both
 /// referents to exist (§5.7).
+///
+/// The `probe` snapshot (`docs/ANA-4.md` §4.6, MOD-2 D44) rides the same three writes: it lands on
+/// the insert, a second upsert replaces it, and a third clears it with `None`. Only the writes are
+/// asserted here - [`WriteStore`] has no registry read, so the read-back lives where a concrete
+/// store can be named (`MemStore`'s `agents_join_this_box_only` and `pg_criteria.rs`).
 async fn upsert_agent_box_by_pk<S: WriteStore>(store: &S) {
     let row = AgentBox {
         agent_id: ids::AGENT_CLAUDE,
@@ -1263,6 +1268,7 @@ async fn upsert_agent_box_by_pk<S: WriteStore>(store: &S) {
         quota: Some(json!({ "remaining": 100 })),
         quota_at: Some(Utc::now()),
         updated_at: Utc::now(),
+        probe: Some(json!({ "status": "ready", "source": "probe" })),
     };
     store
         .upsert_agent_box(&row)
@@ -1275,10 +1281,19 @@ async fn upsert_agent_box_by_pk<S: WriteStore>(store: &S) {
             version: Some("1.3.0".to_owned()),
             quota: None,
             quota_at: None,
+            probe: Some(json!({ "status": "unauthenticated", "source": "probe" })),
             ..row.clone()
         })
         .await
         .expect("upsert_agent_box_by_pk: the same primary key is an update, not a duplicate");
+
+    store
+        .upsert_agent_box(&AgentBox {
+            probe: None,
+            ..row.clone()
+        })
+        .await
+        .expect("upsert_agent_box_by_pk: a `None` probe clears the column, it does not refuse");
 
     let orphan = store
         .upsert_agent_box(&AgentBox {

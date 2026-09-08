@@ -19,6 +19,7 @@
 
 pub mod client;
 pub mod fs;
+pub mod handshake;
 pub mod map;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -40,6 +41,7 @@ use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::acp::client::{Inbound, InboundTx};
+pub use crate::acp::handshake::{Handshake, handshake};
 use crate::driver::{
     AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, PermissionAnswer,
     PermissionRequestId, SessionSpec,
@@ -140,6 +142,31 @@ pub struct AcpIo {
     pub writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     /// `Some` when [`AcpDriver::start`] spawned the process; `None` for an in-process pair.
     pub child: Option<Spawned>,
+}
+
+impl AcpIo {
+    /// The streams of a child this crate spawned, with the child carried along.
+    ///
+    /// Factored out of [`AcpDriver::start`]'s own spawn so the probe's tier 2 reaches the agent
+    /// exactly the way a session does — one place decides what "piped stdio" means, and a probe
+    /// that resolved a launch differently from the chat would be measuring the wrong box.
+    ///
+    /// # Errors
+    /// [`DriverError::Spawn`] when stdin or stdout was not piped (already taken, or a spawn that
+    /// did not request them).
+    pub fn from_spawned(mut spawned: Spawned) -> Result<Self> {
+        let writer = spawned
+            .take_stdin()
+            .ok_or_else(|| DriverError::Spawn("the agent's stdin was not piped".to_owned()))?;
+        let reader = spawned
+            .take_stdout()
+            .ok_or_else(|| DriverError::Spawn("the agent's stdout was not piped".to_owned()))?;
+        Ok(Self {
+            reader: Box::new(reader.into_inner()),
+            writer: Box::new(writer.into_inner()),
+            child: Some(spawned),
+        })
+    }
 }
 
 impl core::fmt::Debug for AcpIo {
@@ -247,18 +274,8 @@ impl AcpDriver {
                 // row's own environment: the row holds placeholders and defaults, the spec holds
                 // what the secret provider produced for this run.
                 resolved.env.extend(spec.env.clone());
-                let mut spawned = crate::launch::spawn(&resolved, &spec.cwd).await?;
-                let writer = spawned.take_stdin().ok_or_else(|| {
-                    DriverError::Spawn("the agent's stdin was not piped".to_owned())
-                })?;
-                let reader = spawned.take_stdout().ok_or_else(|| {
-                    DriverError::Spawn("the agent's stdout was not piped".to_owned())
-                })?;
-                Ok(AcpIo {
-                    reader: Box::new(reader.into_inner()),
-                    writer: Box::new(writer.into_inner()),
-                    child: Some(spawned),
-                })
+                let spawned = crate::launch::spawn(&resolved, &spec.cwd).await?;
+                AcpIo::from_spawned(spawned)
             }
             #[cfg(feature = "test-support")]
             IoSource::Prepared(slot) => slot

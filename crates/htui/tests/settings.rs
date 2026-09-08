@@ -10,12 +10,13 @@ use htui::store_worker::{Origin, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{AgentsSection, SectionId, SettingsSection, SettingsTab, message};
-use htui_core::model::{Agent, AgentId, Scope};
+use htui_core::model::{Agent, AgentBox, AgentId, AgentSummary, Billing, BoxId, Scope, Transport};
 use htui_core::store::{MemStore, WriteStore};
 use ratatui::Frame;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use serde_json::{Value, json};
 
 use crossterm::event::KeyEvent;
 
@@ -75,7 +76,7 @@ async fn the_demo_registry_lists_both_agents() {
     assert!(frame.contains("agy"), "the second seeded agent");
     assert!(
         frame.contains("not probed"),
-        "nothing is probed until milestone 5"
+        "no probe has run in the fixture"
     );
     // Both seeds are `acp`/`subscription` since ANA-4 §5.3; the fixture is derived from them.
     assert!(frame.contains("acp"), "the transport column");
@@ -179,6 +180,124 @@ async fn the_section_asks_for_the_registry_once_and_unscoped() {
         matches!(requests[0], StoreRequest::Agents),
         "the agent registry is a global table, so the read carries no scope"
     );
+}
+
+/// One registry row whose `agent_box` carries `probe`, for the column's own table (MOD-2 D54).
+fn probed_row(
+    name: &str,
+    enabled: bool,
+    version: Option<&str>,
+    probe: Option<Value>,
+) -> AgentSummary {
+    let mut summary = AgentSummary {
+        agent: Agent {
+            id: AgentId::new(),
+            name: name.to_owned(),
+            transport: Transport::Acp,
+            billing: Billing::Subscription,
+            models: Vec::new(),
+            default_model: None,
+            launch: json!({}),
+            settings: json!({}),
+            enabled: true,
+            created_at: htui_core::fixtures::demo_at(0, 0),
+            updated_at: htui_core::fixtures::demo_at(0, 0),
+        },
+        on_box: None,
+    };
+    summary.on_box = Some(AgentBox {
+        agent_id: summary.agent.id,
+        box_id: BoxId::new(),
+        enabled,
+        version: version.map(str::to_owned),
+        path: None,
+        probed_at: Some(htui_core::fixtures::demo_at(0, 0)),
+        quota: None,
+        quota_at: None,
+        updated_at: htui_core::fixtures::demo_at(0, 0),
+        probe,
+    });
+    summary
+}
+
+/// The `on this box` column, one row per outcome of plan D50.
+#[tokio::test]
+async fn the_status_column_renders_each_probe_outcome() {
+    let scope = demo_scope().await;
+    let projects = Vec::new();
+    let top_bar = TopBarState::default();
+    let keymap = Keymap::default_global();
+    let theme = Theme::default();
+    let emit = Emit::default();
+    let mut ctx = Ctx::new(
+        &scope,
+        &projects,
+        &top_bar,
+        &keymap,
+        &theme,
+        Origin::Tab(SettingsTab::ID),
+        &emit,
+    );
+
+    let rows = vec![
+        probed_row(
+            "ready-on",
+            true,
+            Some("0.48.0"),
+            Some(json!({ "status": "ready", "source": "probe" })),
+        ),
+        probed_row(
+            "ready-off",
+            false,
+            Some("0.48.0"),
+            Some(json!({ "status": "ready", "source": "probe" })),
+        ),
+        probed_row(
+            "gone",
+            false,
+            None,
+            Some(json!({ "status": "missing", "source": "probe" })),
+        ),
+        probed_row(
+            "needs-auth",
+            false,
+            Some("1.1.26"),
+            Some(json!({ "status": "unauthenticated", "source": "probe" })),
+        ),
+        probed_row(
+            "broke",
+            false,
+            None,
+            Some(json!({ "status": "failed", "source": "probe" })),
+        ),
+        // A row written before `0002` existed: no `probe` document at all, so the pre-probe rule
+        // still decides what the column says.
+        probed_row("legacy", true, Some("9.9.9"), None),
+    ];
+
+    let mut section = AgentsSection::new();
+    section.on_reply(&StoreReply::Agents(rows), &mut ctx);
+    let rendered = render_section(&section, &ctx);
+
+    for (row, expected) in [
+        ("ready-on", "0.48.0"),
+        ("ready-off", "0.48.0 (off)"),
+        ("gone", "missing"),
+        ("needs-auth", "unauthenticated"),
+        ("broke", "failed"),
+        ("legacy", "9.9.9"),
+    ] {
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with(row))
+            .unwrap_or_else(|| panic!("the `{row}` row is rendered:\n{rendered}"));
+        assert!(
+            line.ends_with(expected),
+            "the `on this box` column of `{row}` reads `{expected}`: {line}"
+        );
+    }
+
+    insta::assert_snapshot!("agents_probed", rendered);
 }
 
 /// A second section, so the strip has something to cycle between before MOD-7 and MOD-15 land.

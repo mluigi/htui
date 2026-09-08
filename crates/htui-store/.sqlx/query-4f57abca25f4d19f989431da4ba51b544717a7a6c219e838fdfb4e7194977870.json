@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT a.id            AS \"id: AgentId\",\n                   a.name,\n                   a.transport     AS \"transport: htui_core::model::Transport\",\n                   a.launch,\n                   a.models,\n                   a.default_model,\n                   a.billing       AS \"billing: htui_core::model::Billing\",\n                   a.enabled,\n                   a.settings,\n                   a.created_at,\n                   a.updated_at,\n                   ab.box_id       AS \"box_id?: htui_core::model::BoxId\",\n                   ab.enabled      AS \"box_enabled?\",\n                   ab.version      AS \"box_version?\",\n                   ab.path         AS \"box_path?\",\n                   ab.probed_at    AS \"box_probed_at?\",\n                   ab.quota        AS \"box_quota?\",\n                   ab.quota_at     AS \"box_quota_at?\",\n                   ab.updated_at   AS \"box_updated_at?\"\n              FROM agent a\n              LEFT JOIN agent_box ab ON ab.agent_id = a.id AND ab.box_id = $1\n             ORDER BY a.name\n            ",
+  "query": "\n            SELECT a.id            AS \"id: AgentId\",\n                   a.name,\n                   a.transport     AS \"transport: htui_core::model::Transport\",\n                   a.launch,\n                   a.models,\n                   a.default_model,\n                   a.billing       AS \"billing: htui_core::model::Billing\",\n                   a.enabled,\n                   a.settings,\n                   a.created_at,\n                   a.updated_at,\n                   ab.box_id       AS \"box_id?: htui_core::model::BoxId\",\n                   ab.enabled      AS \"box_enabled?\",\n                   ab.version      AS \"box_version?\",\n                   ab.path         AS \"box_path?\",\n                   ab.probed_at    AS \"box_probed_at?\",\n                   ab.quota        AS \"box_quota?\",\n                   ab.quota_at     AS \"box_quota_at?\",\n                   ab.updated_at   AS \"box_updated_at?\",\n                   ab.probe        AS \"box_probe?\"\n              FROM agent a\n              LEFT JOIN agent_box ab ON ab.agent_id = a.id AND ab.box_id = $1\n             ORDER BY a.name\n            ",
   "describe": {
     "columns": [
       {
@@ -211,6 +211,17 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 19,
+        "name": "box_probe?",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "probe"
+          }
+        }
       }
     ],
     "parameters": {
@@ -237,8 +248,9 @@
       true,
       true,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "0b3a941d81d8af526e5197876896739cabe377527a3c4debf2f51ae9687dd655"
+  "hash": "4f57abca25f4d19f989431da4ba51b544717a7a6c219e838fdfb4e7194977870"
 }

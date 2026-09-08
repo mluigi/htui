@@ -21,8 +21,6 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-// Only the Windows spawn path has a degraded mode to report; on unix the import would be unused.
-#[cfg(windows)]
 use tracing::warn;
 
 use crate::driver::{PermissionPolicy, RedactedEnv};
@@ -31,6 +29,14 @@ use crate::error::{DriverError, Result};
 /// How many stderr lines a [`Spawned`] keeps. Enough to explain a failed handshake, bounded so a
 /// chatty agent cannot grow the buffer without limit.
 const STDERR_TAIL_LINES: usize = 64;
+
+/// How much stdout [`Spawned::read_stdout_to_end`] will read before it stops and kills the child.
+///
+/// The reader is for one-shot children — `--version`, `npm root -g` — whose *entire* useful output
+/// is one line a regex matches. A tool that streams instead would otherwise be bounded only by the
+/// probe's 15 s timeout times its throughput, which is hundreds of megabytes buffered for a value
+/// that was on the first line. 64 KiB is thousands of banner lines.
+pub const STDOUT_LIMIT: usize = 64 * 1024;
 
 /// `CREATE_NO_WINDOW`: a TUI must not flash a console window when it spawns an agent
 /// (ANA-4 §4.6). Named here rather than imported so the constant reads the same on every platform.
@@ -337,7 +343,11 @@ fn default_true() -> bool {
 // ---------------------------------------------------------------------------------------------
 
 /// An [`AgentLaunch`] with every `${tool}` placeholder replaced: what a transport spawns.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Serialisable because it is, by definition, "what `AgentDriver::start` actually spawns" — which
+/// is what `agent_box.probe.resolved` records (ANA-4 §4.6, plan D45) and what milestone 6 reads
+/// back rather than resolving a second time.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedLaunch {
     /// The executable, as a concrete path or a name `which` can find.
     pub command: String,
@@ -478,10 +488,15 @@ impl Spawned {
             .unwrap_or_default()
     }
 
-    /// Reads the child's stdout to end-of-stream as UTF-8, lossily.
+    /// Reads the child's stdout as UTF-8, lossily, to end-of-stream **or [`STDOUT_LIMIT`]**.
     ///
-    /// For a one-shot child (`--version`, a probe). A streaming transport takes the handle with
-    /// [`take_stdout`](Self::take_stdout) instead.
+    /// For a one-shot child (`--version`, `npm root -g`). A streaming transport takes the handle
+    /// with [`take_stdout`](Self::take_stdout) instead.
+    ///
+    /// A child still writing at the cap is **killed** and what was read is answered: a tool that
+    /// streams on `--version` has already said whatever its version pattern was going to match, and
+    /// leaving it running would keep the pipe — and the caller — alive for nothing. Hitting the cap
+    /// is therefore an answer, not an error; the `warn!` names the command.
     ///
     /// # Errors
     /// [`DriverError::Transport`] when the read fails, or when stdout was already taken.
@@ -492,10 +507,24 @@ impl Spawned {
             .ok_or_else(|| DriverError::Transport("stdout was already taken".to_owned()))?
             .into_inner();
         let mut buffer = Vec::new();
-        stdout
+        // One byte past the cap, so "the child had more to say" is distinguishable from "the child
+        // said exactly this much and stopped".
+        (&mut stdout)
+            .take(STDOUT_LIMIT as u64 + 1)
             .read_to_end(&mut buffer)
             .await
             .map_err(|error| DriverError::Transport(format!("reading stdout: {error}")))?;
+        if buffer.len() > STDOUT_LIMIT {
+            buffer.truncate(STDOUT_LIMIT);
+            warn!(
+                pid = ?self.pid(),
+                limit = STDOUT_LIMIT,
+                "a one-shot child wrote past the stdout cap; killing it and answering what it said"
+            );
+            if let Err(error) = self.kill_tree().await {
+                warn!(%error, "the child that outran the stdout cap did not die cleanly");
+            }
+        }
         Ok(String::from_utf8_lossy(&buffer).into_owned())
     }
 
@@ -523,6 +552,107 @@ impl Spawned {
         Box::into_pin(self.child.kill())
             .await
             .map_err(|error| DriverError::Transport(format!("killing the agent: {error}")))
+    }
+
+    /// Signals the tree without waiting for it: the **synchronous** half of
+    /// [`kill_tree`](Self::kill_tree), for a `Drop`.
+    ///
+    /// `kill_tree` is `start_kill` followed by `wait`, and a `Drop` cannot await the second half.
+    /// Blocking on it there is not an option either — a `Drop` running inside the runtime would be
+    /// blocking a worker thread — so the child is signalled and left for the reaper. The probe's
+    /// handshake calls this from a guard's `Drop` and `kill_tree` on every path it can await
+    /// (`acp::handshake`), which is what makes an **aborted** probe task leave no live agent behind
+    /// (the milestone-3 CRITICAL, `682a423`).
+    ///
+    /// # Errors
+    /// [`DriverError::Transport`] when the signal is refused.
+    pub fn start_kill(&mut self) -> Result<()> {
+        self.child
+            .start_kill()
+            .map_err(|error| DriverError::Transport(format!("killing the agent: {error}")))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The child guard
+// ---------------------------------------------------------------------------------------------
+
+/// A [`Spawned`] owned by the **caller's frame**, killed by its `Drop`.
+///
+/// The guard, not `Spawned`, is what makes a dropped or aborted future leave no running process.
+/// `Spawned` deliberately has no killing `Drop` of its own: [`open_session`] hands its child to a
+/// task that must outlive the call which started it, and a `Drop` here would change that path's
+/// semantics silently — its own orphan is a separate, deferred fix.
+///
+/// Two callers hold one. [`acp::handshake`] does, because `connect_with` runs the connection actors
+/// and the foreground future under a `select` and an actor that fails first **drops** the
+/// foreground future (the milestone-3 CRITICAL, `682a423`). The probe's one-shot children
+/// (`--version`, `npm root -g`) do, because `AgentRuntime::shutdown` and the background limit both
+/// `abort()` the probe task, and an aborted task drops its future mid-await.
+///
+/// [`open_session`]: crate::acp::open_session
+/// [`acp::handshake`]: crate::acp::handshake
+pub(crate) struct ChildGuard {
+    child: Option<Spawned>,
+}
+
+impl ChildGuard {
+    /// A guard over `child`. `None` is a guard over nothing — an [`AcpIo`] built from an in-process
+    /// duplex has no process to kill.
+    ///
+    /// [`AcpIo`]: crate::acp::AcpIo
+    pub(crate) fn new(child: Option<Spawned>) -> Self {
+        Self { child }
+    }
+
+    /// The child, while the guard still holds one.
+    pub(crate) fn child_mut(&mut self) -> Option<&mut Spawned> {
+        self.child.as_mut()
+    }
+
+    /// What the child last wrote to stderr, for an error message.
+    pub(crate) fn stderr_tail(&self) -> Vec<String> {
+        self.child
+            .as_ref()
+            .map(Spawned::stderr_tail)
+            .unwrap_or_default()
+    }
+
+    /// Kills the tree **and reaps it**, so a caller that got an answer knows there is nothing left
+    /// running. A second call is a no-op, and so is the `Drop` that follows it.
+    pub(crate) async fn kill_and_reap(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Err(err) = child.kill_tree().await {
+            warn!(%err, "the guarded process tree did not die cleanly");
+        }
+        if let Err(err) = child.wait().await {
+            warn!(%err, "the guarded process could not be reaped");
+        }
+    }
+
+    /// Releases a child that has **already exited and been reaped**, so the `Drop` below does not
+    /// signal it.
+    ///
+    /// On unix `start_kill` is a `killpg` at the group, which answers `ESRCH` once the group is
+    /// gone: without this, every successful one-shot child would log a spurious warning about
+    /// "surviving" its guard.
+    pub(crate) fn release(&mut self) {
+        self.child = None;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        // Signal only: a `Drop` cannot await the reap, and blocking for it here would block a
+        // runtime worker. The orphan this leaves is a zombie, not a running process.
+        if let Err(err) = child.start_kill() {
+            warn!(%err, "the guarded process survived its guard");
+        }
     }
 }
 

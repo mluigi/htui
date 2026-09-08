@@ -14,8 +14,13 @@
 //! transcript. Milestone 4's offline sink is a `WriteStore` arm in `htui-store`, so this crate
 //! still records through the trait and knows nothing about where the rows land (plan D34).
 //!
-//! Deliberately absent in milestones 1–2 (plan D16): any wire protocol (`acp/`, `cli/`), probes,
-//! the chat tab, and quota. Each is a named seam, not a plan.
+//! [`probe`] is milestone 5's answer to "what can *this box* run" (plan D45–D51): the tiered
+//! resolver `tools` delegates to, the glob walker and the version capture that fill
+//! `agent_box.probe`, and — over [`acp::handshake()`] — the tier-2 `initialize` that is the only
+//! proof the resolved binary actually runs.
+//!
+//! Deliberately absent in milestones 1–2 (plan D16): any wire protocol (`acp/`, `cli/`), the chat
+//! tab, and quota. Each is a named seam, not a plan.
 #![warn(missing_docs)]
 
 /// Declares a closed JSON vocabulary of `docs/ANA-4.md` §5 / §6 as an enum.
@@ -78,13 +83,15 @@ pub mod event;
 pub mod fake;
 pub mod launch;
 pub mod permission;
+pub mod probe;
 pub mod record;
 pub mod registry;
 pub mod replay;
 pub mod tools;
 
 pub use acp::{
-    AcpAdapter, AcpDriver, AcpIo, AcpSession, SessionCommand, SessionOptions, Stamp, open_session,
+    AcpAdapter, AcpDriver, AcpIo, AcpSession, Handshake, SessionCommand, SessionOptions, Stamp,
+    handshake, open_session,
 };
 pub use driver::{
     AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, McpServerSpec,
@@ -104,6 +111,10 @@ pub use launch::{
     Spawned, ToolMap, ToolProbe, UsageScope, UsageSettings, VersionProbe, resolve, spawn,
 };
 pub use permission::{PolicyAnswer, PolicyStage, evaluate as evaluate_permission};
+pub use probe::{
+    ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeSource, ProbeStatus, SpawnTier2,
+    Tier2, ToolReport, ToolResolution, platform_key, probe_agent, probe_tools,
+};
 pub use record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, RecorderSummary, pump};
 pub use registry::{DriverFactory, TransportBuilder, adapter_id, caps_for};
 // `replay_envelopes`, not `envelopes`: at the crate root the bare name says nothing about which

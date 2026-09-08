@@ -29,9 +29,10 @@ use htui_agent::driver::{
 use htui_agent::error::DriverError;
 use htui_agent::event::{DriverEnvelope, DriverEvent, StopReason, ToolCallEvent};
 use htui_agent::launch::AgentSettings;
+use htui_agent::probe::{ProbeContext, ProbeEnv, ProbeOutcome, SpawnTier2, probe_agent};
 use htui_agent::record::{AnsweredBy, Recorder};
 use htui_agent::registry::DriverFactory;
-use htui_core::model::{ChatRunSpec, RunStatus, StepId};
+use htui_core::model::{Agent, AgentBox, BoxId, ChatRunSpec, RunStatus, StepId, Transport};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{StoreError, WriteStore};
 use htui_store::{Backend, Writer};
@@ -51,6 +52,13 @@ pub const CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// Drained by the same task after every `record`, so a full channel is structurally impossible
 /// here; the bound exists so a bug cannot buffer a turn without limit.
 pub const UI_FRAMES: usize = 256;
+
+/// How old an `agent_box` row may be before a chat starting on it triggers a re-probe.
+///
+/// `docs/ANA-4.md`:791-793 splits the probe's triggers three ways, and this is the lazy one:
+/// "before the first session of the day", because `agy` self-updates in place and a row written
+/// yesterday may describe a binary that no longer exists. 24 hours (MOD-2 plan D55).
+pub const PROBE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// `HTUI_KEEP_RAW_EVENTS=1` keeps the verbatim wire message on every row (plan D29).
 ///
@@ -121,7 +129,8 @@ pub type ChatTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub enum Served {
     /// Answer with this reply, now.
     Reply(StoreReply),
-    /// The session task will answer this request itself.
+    /// A task the runtime owns answers this request itself, exactly once — the session task for a
+    /// chat command, the probe task for [`StoreRequest::ProbeAgents`].
     Deferred,
     /// A chat is starting; the caller spawns (or polls) the future and attaches the handle.
     Start {
@@ -150,6 +159,14 @@ pub struct AgentRuntime {
     live: HashMap<StepId, LiveChat>,
     started: Vec<StepId>,
     grace: Duration,
+    /// Tasks this runtime spawned that answer a request of their own: today the probe's (MOD-2
+    /// D53). Swept when finished, awaited by [`finish_background`](Self::finish_background),
+    /// aborted by [`shutdown`](Self::shutdown).
+    ///
+    /// The runtime owns the handle for the same reason it owns a chat's: a bare `tokio::spawn`
+    /// inside the worker loop would leave a probe with a 60-second handshake running after the UI
+    /// is gone, with nobody able to name it.
+    background: Vec<JoinHandle<()>>,
 }
 
 impl core::fmt::Debug for AgentRuntime {
@@ -170,6 +187,7 @@ impl AgentRuntime {
             live: HashMap::new(),
             started: Vec::new(),
             grace: CANCEL_GRACE,
+            background: Vec::new(),
         }
     }
 
@@ -190,6 +208,30 @@ impl AgentRuntime {
     #[must_use]
     pub fn steps(&self) -> Vec<StepId> {
         self.started.clone()
+    }
+
+    /// How many background tasks this runtime still owns.
+    ///
+    /// The one fact a test needs to prove D52: a refused probe spawned **nothing**, rather than
+    /// spawning and then discarding.
+    #[must_use]
+    pub fn background_len(&self) -> usize {
+        self.background.len()
+    }
+
+    /// Awaits every background task, each under `limit`; one past it is aborted and named.
+    ///
+    /// The deterministic end the test harness needs: a probe answers through the reply channel
+    /// from its own task, so a harness that rendered before this returned would photograph a probe
+    /// that had not finished.
+    pub async fn finish_background(&mut self, limit: Duration) {
+        for handle in std::mem::take(&mut self.background) {
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(limit, handle).await.is_err() {
+                abort.abort();
+                tracing::warn!(?limit, "a background task did not finish and was aborted");
+            }
+        }
     }
 
     /// Records the task handle of a chat the caller spawned.
@@ -221,6 +263,9 @@ impl AgentRuntime {
         // A finished chat leaves its entry behind; sweep before anything looks one up, so a second
         // chat on a finished step is a start and not a "no live chat".
         self.live.retain(|_, chat| !chat.commands.is_closed());
+        // The same sweep for the tasks that answer their own request: a probe that has answered is
+        // not a probe still running, and `background_len` is what a test reads.
+        self.background.retain(|task| !task.is_finished());
 
         let addr = ReplyAddr {
             seq: envelope.seq,
@@ -275,6 +320,10 @@ impl AgentRuntime {
                 "chat_cancel",
                 ChatCommand::Cancel { reply: Some(addr) },
             ),
+            StoreRequest::ProbeAgents => match self.probe(backend, replies, addr).await {
+                Ok(served) => served,
+                Err(err) => Served::Reply(failed("probe_agents", &err)),
+            },
             other => Served::Reply(StoreReply::Failed {
                 request: other.name(),
                 message: "not a chat request".to_owned(),
@@ -286,6 +335,10 @@ impl AgentRuntime {
     ///
     /// Called when the UI is gone. Without it the runtime drops every session task at its first
     /// await and the agent processes are orphaned (`docs/ANA-4.md` §11 criterion 11).
+    ///
+    /// Background tasks are aborted rather than awaited, after the chats are down: a probe's child
+    /// dies with the guard the handshake holds it in, and reaping it at process exit buys nothing
+    /// but a wait on a handshake nobody will read.
     pub async fn shutdown(&mut self, grace: Duration) {
         for (step, chat) in self.live.drain() {
             let _ = chat.commands.send(ChatCommand::Cancel { reply: None });
@@ -294,6 +347,59 @@ impl AgentRuntime {
                 tracing::warn!(%step, "a chat did not end within the grace window");
             }
         }
+        for task in std::mem::take(&mut self.background) {
+            task.abort();
+        }
+    }
+
+    /// The [`StoreRequest::ProbeAgents`] path (MOD-2 D52, D53).
+    ///
+    /// In this order, and **before anything is spawned**: the writer, because probing costs
+    /// process spawns and a probe with nowhere to write its result would pay them to throw the
+    /// answer away; then the box, because `agent_box` has no primary key without one; then the
+    /// registry and the working directory the probe resolves relative to. Only then does the task
+    /// start, and from that point on it answers the request itself.
+    async fn probe(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+    ) -> Result<Served, StoreError> {
+        let writer = backend.writer().ok_or_else(|| {
+            StoreError::Unreachable("this backend hands out no writer".to_owned())
+        })?;
+        // `Writer::Buffered` refuses `upsert_agent_box` with this same sentence (plan D52). It is
+        // checked here rather than discovered on the write, because by then the spawns have
+        // happened.
+        if matches!(writer, Writer::Buffered(_)) {
+            return Err(StoreError::Unreachable(
+                htui_store::REGISTRY_ON_SERVER_ONLY.to_owned(),
+            ));
+        }
+        let box_id = backend
+            .box_info()
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "box",
+                id: "this box is not registered".to_owned(),
+            })?
+            .box_id;
+        let agents = backend.agents().await?;
+        let cwd = std::env::current_dir().map_err(|err| {
+            StoreError::Backend(format!("this process has no working directory: {err}"))
+        })?;
+
+        self.background.push(tokio::spawn(run_probe(ProbeArgs {
+            writer,
+            box_id,
+            agents,
+            cwd,
+            frames: Frames {
+                tx: replies.clone(),
+                addr,
+            },
+        })));
+        Ok(Served::Deferred)
     }
 
     /// Forwards a command to a live chat.
@@ -416,6 +522,29 @@ impl AgentRuntime {
         );
         self.started.push(chat.step_id);
 
+        // Plan D55, and everything about it is in what this is *not*: the chat is already
+        // started, the future below is already decided, and the re-probe shares no channel with
+        // either. It refreshes the row for the next chat; this one proceeds on what
+        // `tools::resolve` gave it, because coupling a chat's start to a 60-second handshake
+        // timeout would make a stale row a minute of waiting.
+        //
+        // Three conditions, each for its own reason. `acp`, because tier 2 *is* `initialize` and
+        // a `cli` row has none (milestone 8's problem). Not `Writer::Buffered`, because it
+        // refuses `upsert_agent_box` (plan D52) and a probe with nowhere to write its answer
+        // would spawn an adapter to throw it away. And stale, or there is nothing to learn.
+        if summary.agent.transport == Transport::Acp
+            && !matches!(writer, Writer::Buffered(_))
+            && needs_reprobe(summary.on_box.as_ref(), Utc::now())
+        {
+            self.background.push(tokio::spawn(run_reprobe(
+                writer.clone(),
+                box_id,
+                summary.agent.clone(),
+                summary.on_box.clone(),
+                spec.cwd.clone(),
+            )));
+        }
+
         let step_id = chat.step_id;
         let args = ChatArgs {
             driver,
@@ -464,6 +593,156 @@ impl core::fmt::Debug for ChatArgs {
             .field("step", &self.chat.step_id)
             .field("spec", &self.spec)
             .finish()
+    }
+}
+
+/// Everything the probe task owns (MOD-2 D53).
+///
+/// A [`Writer`] and not a [`Backend`]: the loop owns the one `Backend` and replaces it wholesale
+/// when the server comes or goes, so a task holding a copy would keep writing to a server the loop
+/// has already declared gone. `Writer` is the owned handle built for exactly this.
+struct ProbeArgs {
+    writer: Writer,
+    box_id: BoxId,
+    agents: Vec<htui_core::model::AgentSummary>,
+    cwd: std::path::PathBuf,
+    frames: Frames,
+}
+
+impl core::fmt::Debug for ProbeArgs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ProbeArgs")
+            .field("writer", &self.writer.label())
+            .field("box_id", &self.box_id)
+            .field("agents", &self.agents.len())
+            .finish()
+    }
+}
+
+/// One probe of every enabled registry row on this box, start to finish.
+///
+/// **One agent at a time**: two adapters spawning at once on a laptop buys nothing and blurs whose
+/// stderr belongs to whom. A disabled registry row is skipped and its `on_box` left as it was
+/// read — the probe answers what the box can run, and a row the user has turned off is not a
+/// question about the box.
+///
+/// The reply is assembled from what this task itself wrote rather than re-read from the store, so
+/// it states exactly what this probe did. Exactly one goes back, at the request's own address: the
+/// row writes that fail end the run with a `Failed` at that same address, which is what clears the
+/// section's in-flight state.
+async fn run_probe(args: ProbeArgs) {
+    let ProbeArgs {
+        writer,
+        box_id,
+        mut agents,
+        cwd,
+        frames,
+    } = args;
+    let env = ProbeEnv::host(cwd);
+    let tier2 = SpawnTier2::default();
+
+    for summary in &mut agents {
+        if !summary.agent.enabled {
+            continue;
+        }
+        let ctx = ProbeContext {
+            env: env.clone(),
+            now: Utc::now(),
+        };
+        match probe_agent(
+            &summary.agent,
+            box_id,
+            summary.on_box.as_ref(),
+            &ctx,
+            &tier2,
+        )
+        .await
+        {
+            ProbeOutcome::Row(row) => {
+                if let Err(err) = writer.upsert_agent_box(&row).await {
+                    frames.reply(
+                        &frames.addr,
+                        StoreReply::Failed {
+                            request: "probe_agents",
+                            message: err.to_string(),
+                        },
+                    );
+                    return;
+                }
+                summary.on_box = Some(row);
+            }
+            // Plan D51: a hand-written row the probe could not confirm is left exactly as it is,
+            // `probed_at` included.
+            ProbeOutcome::Kept { reason } => {
+                tracing::info!(agent = %summary.agent.name, reason, "the probe left a row alone");
+            }
+        }
+    }
+
+    frames.reply(&frames.addr, StoreReply::Agents(agents));
+}
+
+/// Whether this box's row for an agent is old enough to be worth re-probing (plan D55).
+///
+/// Three ways to be stale and one way to be fresh: no row at all, a row no probe ever stamped,
+/// or a stamp further back than [`PROBE_TTL`]. A stamp in the *future* — a clock that stepped
+/// backwards under an NTP correction or a suspended laptop — is not stale: `to_std` refuses a
+/// negative age, and treating one as "very old" would re-probe on every chat until the clock
+/// caught up.
+#[must_use]
+pub fn needs_reprobe(on_box: Option<&AgentBox>, now: DateTime<Utc>) -> bool {
+    let Some(probed_at) = on_box.and_then(|row| row.probed_at) else {
+        return true;
+    };
+    now.signed_duration_since(probed_at)
+        .to_std()
+        .is_ok_and(|age| age > PROBE_TTL)
+}
+
+/// The `ChatStart` re-probe: tier 2 over one row, in its own task, answering nobody (plan D55).
+///
+/// **Tier 2 only.** Resolution is unavoidable — tier 2 has nothing to spawn without it — but the
+/// `--version` children are skipped ([`ProbeEnv::without_versions`]), because what a lazy
+/// re-probe is checking is whether the launch still *runs*, and three extra processes per chat to
+/// re-read version strings that only the Settings tab renders is a cost with no reader.
+///
+/// Nothing here can fail the chat: it holds no chat channel, sends no reply, and a write that
+/// fails is a `warn!` and nothing else. A `failed` verdict writes `enabled = false` and the
+/// running conversation is untouched — the row it wrote is for the *next* chat.
+async fn run_reprobe(
+    writer: Writer,
+    box_id: BoxId,
+    agent: Agent,
+    existing: Option<AgentBox>,
+    cwd: std::path::PathBuf,
+) {
+    let ctx = ProbeContext {
+        env: ProbeEnv::host(cwd).without_versions(),
+        now: Utc::now(),
+    };
+    match probe_agent(
+        &agent,
+        box_id,
+        existing.as_ref(),
+        &ctx,
+        &SpawnTier2::default(),
+    )
+    .await
+    {
+        ProbeOutcome::Row(row) => {
+            if let Err(err) = writer.upsert_agent_box(&row).await {
+                tracing::warn!(
+                    agent = %agent.name,
+                    %err,
+                    "a stale agent_box row could not be refreshed"
+                );
+            }
+        }
+        // Plan D51 again, from the other trigger: a hand-written row the probe could not confirm
+        // is left exactly as it is. `debug!`, not `info!` — nobody asked for this probe.
+        ProbeOutcome::Kept { reason } => {
+            tracing::debug!(agent = %agent.name, reason, "the re-probe left a row alone");
+        }
     }
 }
 
@@ -983,7 +1262,7 @@ fn failed(request: &'static str, err: &StoreError) -> StoreReply {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use htui_agent::conformance::{Script, ScriptEvent};
     use htui_agent::event::{
@@ -1043,7 +1322,7 @@ mod tests {
         fn build(
             &self,
             agent: &Agent,
-            on_box: Option<&htui_core::model::AgentBox>,
+            on_box: Option<&AgentBox>,
             caps: DriverCaps,
         ) -> Result<Box<dyn AgentDriver>, DriverError> {
             self.0.build(agent, on_box, caps)
@@ -1241,6 +1520,472 @@ mod tests {
             other => panic!("a chat with no box row must be refused: {other:?}"),
         }
         cache.close().await;
+    }
+
+    /// An `acp` registry row the fake transport answers for, whose `launch` names a command that
+    /// does not exist.
+    ///
+    /// The re-probe cases need a row that is **`acp`** (so tier 2 is in scope) and whose launch
+    /// resolves without ever reaching a real binary: `command: "unused"` has no `${placeholder}`,
+    /// so tier 1 is trivially complete, and `launch::spawn`'s lookup then fails — `failed`, with
+    /// no process anywhere near this test (blueprint H-7).
+    fn acp_fake_row(id: AgentId) -> Agent {
+        Agent {
+            // A name of its own: `agent.name` is unique, and one test registers this row beside
+            // `fake_row`'s.
+            name: "scripted-acp".to_owned(),
+            transport: Transport::Acp,
+            ..fake_row(id)
+        }
+    }
+
+    /// A factory whose `acp` transport is the scripted fake.
+    fn acp_factory(script: Script) -> DriverFactory {
+        let adapter = Arc::new(FakeAdapter::new());
+        adapter.load(script);
+        let mut factory = DriverFactory::new();
+        factory.register("acp", Box::new(FakeBuilder(Arc::clone(&adapter))));
+        factory
+    }
+
+    /// An `agent_box` row for `agent_id` last probed at `probed_at`.
+    fn probed_row(agent_id: AgentId, probed_at: Option<DateTime<Utc>>) -> AgentBox {
+        AgentBox {
+            agent_id,
+            box_id: ids::BOX,
+            enabled: true,
+            version: Some("0.48.0".to_owned()),
+            path: None,
+            probed_at,
+            quota: None,
+            quota_at: None,
+            updated_at: probed_at.unwrap_or_else(Utc::now),
+            probe: Some(json!({ "status": "ready", "source": "probe" })),
+        }
+    }
+
+    /// Plan D55: a row nobody has probed, or one probed longer ago than [`PROBE_TTL`], is stale.
+    #[test]
+    fn needs_reprobe_is_absent_or_older_than_the_ttl() {
+        let now = Utc::now();
+        let agent_id = AgentId::new();
+        assert!(
+            needs_reprobe(None, now),
+            "an unprobed box has nothing to go on"
+        );
+        assert!(
+            needs_reprobe(Some(&probed_row(agent_id, None)), now),
+            "a row with no `probed_at` is a row no probe ever wrote"
+        );
+        assert!(
+            needs_reprobe(
+                Some(&probed_row(
+                    agent_id,
+                    Some(now - chrono::TimeDelta::hours(25))
+                )),
+                now
+            ),
+            "25 hours is past the 24-hour window"
+        );
+        assert!(
+            !needs_reprobe(
+                Some(&probed_row(
+                    agent_id,
+                    Some(now - chrono::TimeDelta::hours(23))
+                )),
+                now
+            ),
+            "23 hours is inside it: `agy` self-updates in place, not every hour"
+        );
+        // A clock that went backwards (an NTP step, a suspended laptop) must not read as stale
+        // for the next 24 hours' worth of drift.
+        assert!(
+            !needs_reprobe(
+                Some(&probed_row(
+                    agent_id,
+                    Some(now + chrono::TimeDelta::hours(1))
+                )),
+                now
+            ),
+            "a future `probed_at` is not stale"
+        );
+    }
+
+    /// Plan D55, the whole shape in one: a stale `acp` row starts its chat **and** gets a tier-2
+    /// re-probe in the background, and the re-probe's failure never reaches the chat.
+    #[tokio::test]
+    async fn a_chat_start_on_a_stale_acp_row_re_probes_in_the_background() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&acp_fake_row(agent_id))
+            .await
+            .expect("the acp row lands");
+        let backend = Backend::memory(store.clone());
+        let mut runtime =
+            AgentRuntime::new(acp_factory(Script::one_turn(vec![ScriptEvent::Emit(
+                DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            )])))
+            .with_grace(Duration::from_millis(0));
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+            .await;
+        assert!(
+            matches!(served, Served::Start { .. }),
+            "the chat starts on what resolution already gave it: {served:?}"
+        );
+        assert_eq!(
+            runtime.background_len(),
+            1,
+            "an unprobed row is re-probed beside the chat, never in front of it"
+        );
+
+        runtime.finish_background(Duration::from_secs(5)).await;
+        let on_box = store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|summary| summary.agent.id == agent_id)
+            .expect("the row is still there")
+            .on_box
+            .expect("the re-probe wrote agent_box");
+        assert_eq!(
+            on_box
+                .probe
+                .as_ref()
+                .and_then(|probe| probe.get("status"))
+                .and_then(Value::as_str),
+            Some("failed"),
+            "`command: unused` spawns nothing: {:?}",
+            on_box.probe
+        );
+        assert!(
+            !on_box.enabled,
+            "a launch that will not spawn is not enabled"
+        );
+        assert!(on_box.probed_at.is_some());
+    }
+
+    /// The re-probe hands `probe_agent` the row it found, and that argument is load-bearing:
+    /// `probe::agent_box_row` carries `quota`/`quota_at` over from it (the probe owns neither —
+    /// milestone 7 does), and `probe_agent` reads its `probe.source` for the manual-entry rule.
+    /// Without this case, passing `None` there wipes a box's quota on every stale-row chat start
+    /// and no test notices.
+    #[tokio::test]
+    async fn a_stale_row_keeps_the_quota_the_probe_does_not_own() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&acp_fake_row(agent_id))
+            .await
+            .expect("the acp row lands");
+        let quota_at = Utc::now() - chrono::TimeDelta::hours(30);
+        let mut stale = probed_row(agent_id, Some(Utc::now() - chrono::TimeDelta::hours(25)));
+        stale.quota = Some(json!({ "remaining": 1 }));
+        stale.quota_at = Some(quota_at);
+        store
+            .upsert_agent_box(&stale)
+            .await
+            .expect("the stale agent_box lands");
+        let backend = Backend::memory(store.clone());
+        let mut runtime =
+            AgentRuntime::new(acp_factory(Script::one_turn(vec![ScriptEvent::Emit(
+                DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            )])))
+            .with_grace(Duration::from_millis(0));
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(&backend, &tx, &envelope(9, start(agent_id, "hello")))
+            .await;
+        assert!(matches!(served, Served::Start { .. }), "{served:?}");
+        assert_eq!(runtime.background_len(), 1, "a 25 h old row is stale");
+        runtime.finish_background(Duration::from_secs(5)).await;
+
+        let on_box = store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|summary| summary.agent.id == agent_id)
+            .expect("the row is still there")
+            .on_box
+            .expect("the re-probe wrote agent_box");
+        assert_eq!(
+            on_box.quota,
+            Some(json!({ "remaining": 1 })),
+            "the probe carries the quota it does not own"
+        );
+        assert_eq!(on_box.quota_at, Some(quota_at), "and its timestamp with it");
+        assert_ne!(
+            on_box.probed_at, stale.probed_at,
+            "the row was re-probed, so this assertion is over a row the probe actually rewrote"
+        );
+    }
+
+    /// The three rows that are **not** re-probed: a `cli` one (no `initialize` to complete), a
+    /// fresh one, and one whose writer cannot hold the answer.
+    #[tokio::test]
+    async fn a_cli_row_and_a_fresh_row_are_not_re_probed() {
+        let (store, backend, mut runtime, cli_agent) =
+            fixture(Script::one_turn(vec![ScriptEvent::Emit(
+                DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            )]))
+            .await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let served = runtime
+            .serve(&backend, &tx, &envelope(1, start(cli_agent, "hello")))
+            .await;
+        assert!(matches!(served, Served::Start { .. }), "{served:?}");
+        assert_eq!(
+            runtime.background_len(),
+            0,
+            "a `cli` row has no handshake to re-run (plan D55 is tier 2 only)"
+        );
+
+        // The same box, an `acp` row, probed a minute ago: inside the TTL. The runtime is a
+        // second one because `fixture`'s factory knows only `cli/fake`, and this half has to
+        // reach the re-probe decision rather than be refused before it.
+        let acp_agent = AgentId::new();
+        store
+            .upsert_agent(&acp_fake_row(acp_agent))
+            .await
+            .expect("the acp row lands");
+        store
+            .upsert_agent_box(&probed_row(
+                acp_agent,
+                Some(Utc::now() - chrono::TimeDelta::minutes(1)),
+            ))
+            .await
+            .expect("the fresh agent_box lands");
+        let mut runtime =
+            AgentRuntime::new(acp_factory(Script::one_turn(vec![ScriptEvent::Emit(
+                DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            )])))
+            .with_grace(Duration::from_millis(0));
+        let served = runtime
+            .serve(&backend, &tx, &envelope(2, start(acp_agent, "hello")))
+            .await;
+        assert!(
+            matches!(served, Served::Start { .. }),
+            "the chat starts, which is what puts the TTL on the path: {served:?}"
+        );
+        assert_eq!(
+            runtime.background_len(),
+            0,
+            "a row probed a minute ago is not re-probed"
+        );
+    }
+
+    /// Plan D52 for the chat path: a `Writer::Buffered` refuses `upsert_agent_box`, so a re-probe
+    /// against one would spawn an adapter to throw its answer away.
+    #[tokio::test]
+    async fn a_buffered_writer_never_re_probes() {
+        let root = tempfile::tempdir().expect("a throwaway config root");
+        let cache = htui_store::CacheStore::open(root.path(), "reprobe-test", 1)
+            .await
+            .expect("a fresh mirror");
+        let agent_id = AgentId::new();
+        let mut demo = htui_core::fixtures::demo_data();
+        for user in &mut demo.users {
+            user.name = htui_store::identity::os_user_name();
+        }
+        demo.agents = vec![acp_fake_row(agent_id)];
+        htui_store::testkit::seed_mirror(&cache, &demo)
+            .await
+            .expect("the mirror is seeded");
+
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: None,
+        };
+        let mut runtime =
+            AgentRuntime::new(acp_factory(Script::one_turn(vec![ScriptEvent::Emit(
+                DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            )])))
+            .with_grace(Duration::from_millis(0));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let served = runtime
+            .serve(&backend, &tx, &envelope(1, start(agent_id, "hello")))
+            .await;
+        assert!(
+            matches!(served, Served::Start { .. }),
+            "an offline chat still starts: {served:?}"
+        );
+        assert_eq!(
+            runtime.background_len(),
+            0,
+            "probing costs process spawns; a writer that refuses the row is refused first"
+        );
+        drop(served);
+        runtime.shutdown(Duration::ZERO).await;
+        cache.close().await;
+    }
+
+    /// A registry whose every row resolves nowhere — the probe fixture rule (blueprint H-7).
+    ///
+    /// This box has `node`, `claude` and the ACP adapter installed, so a test that probed an
+    /// unmodified seed row would spawn the real adapter inside `cargo test` and wait up to
+    /// `HANDSHAKE_TIMEOUT` on it. Every probe test outside `htui-agent`'s `probe_live.rs` runs
+    /// against this registry instead: the `discovery` names one tool that cannot exist, so tier 1
+    /// reports `missing` and **nothing is spawned**.
+    pub(crate) async fn unresolvable_registry() -> MemStore {
+        let store = MemStore::demo();
+        for summary in store.agents().await.expect("the memory store never fails") {
+            let mut agent = summary.agent;
+            agent.launch = json!({
+                "command": "${gone}",
+                "args": [],
+                "env": {},
+                "discovery": {
+                    "tools": {
+                        "gone": { "kind": "path", "names": ["htui-no-such-binary-2f8e"] }
+                    },
+                    "handshake": true
+                }
+            });
+            store.upsert_agent(&agent).await.expect("the row updates");
+        }
+        store
+    }
+
+    /// Plan D52: with no writable registry the request is refused **before** anything is spawned.
+    #[tokio::test]
+    async fn an_offline_backend_refuses_the_probe_before_spawning_anything() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "probe-test", 1)
+            .await
+            .expect("mirror");
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: None,
+        };
+        let mut runtime = AgentRuntime::new(DriverFactory::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let served = runtime
+            .serve(&backend, &tx, &envelope(1, StoreRequest::ProbeAgents))
+            .await;
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "probe_agents");
+                assert!(
+                    message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
+                    "the buffered writer's own sentence, not a second one: {message}"
+                );
+            }
+            other => panic!("a buffered writer refuses the probe: {other:?}"),
+        }
+        assert_eq!(
+            runtime.background_len(),
+            0,
+            "probing costs process spawns; a probe with nowhere to write is refused before any"
+        );
+        cache.close().await;
+
+        // The other refusal, for the same reason: a box that is not registered has no `agent_box`
+        // primary key to write against.
+        let backend = Backend::memory(MemStore::new());
+        let served = runtime
+            .serve(&backend, &tx, &envelope(2, StoreRequest::ProbeAgents))
+            .await;
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "probe_agents");
+                assert!(message.contains("not registered"), "{message}");
+            }
+            other => panic!("an unregistered box refuses the probe: {other:?}"),
+        }
+        assert_eq!(runtime.background_len(), 0);
+    }
+
+    /// Plan D53: the task the runtime owns answers the request itself, exactly once, at the
+    /// request's own address, and with the reply the Settings section already renders.
+    #[tokio::test]
+    async fn the_probe_task_answers_once_at_the_requests_address_with_agents() {
+        let store = unresolvable_registry().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = AgentRuntime::new(DriverFactory::new());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request = RequestEnvelope {
+            seq: 7,
+            origin: Origin::Tab(crate::ui::tabs::TabId("settings")),
+            request: StoreRequest::ProbeAgents,
+        };
+
+        let served = runtime.serve(&backend, &tx, &request).await;
+        assert!(
+            matches!(served, Served::Deferred),
+            "the probe is deferred to the runtime's own task: {served:?}"
+        );
+        assert_eq!(runtime.background_len(), 1);
+
+        runtime.finish_background(Duration::from_secs(5)).await;
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            replies.push(reply);
+        }
+
+        assert_eq!(replies.len(), 1, "exactly one reply: {replies:?}");
+        assert_eq!(replies[0].seq, 7);
+        assert!(
+            matches!(&replies[0].origin, Origin::Tab(id) if id.0 == "settings"),
+            "{:?}",
+            replies[0].origin
+        );
+        let StoreReply::Agents(rows) = &replies[0].reply else {
+            panic!(
+                "the probe answers with the registry: {:?}",
+                replies[0].reply
+            )
+        };
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let on_box = row
+                .on_box
+                .as_ref()
+                .expect("every enabled row was probed and written");
+            assert_eq!(
+                on_box
+                    .probe
+                    .as_ref()
+                    .and_then(|probe| probe.get("status"))
+                    .and_then(Value::as_str),
+                Some("missing"),
+                "a tool that resolves nowhere is `missing`: {:?}",
+                on_box.probe
+            );
+            assert!(
+                !on_box.enabled,
+                "a missing agent is not enabled on this box"
+            );
+        }
+
+        let stored = store.agents().await.expect("the memory store never fails");
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|summary| summary.on_box.is_some())
+                .count(),
+            2,
+            "the reply states what the task itself wrote"
+        );
     }
 
     /// A policy rule answers stages 1–2 of ANA-4 §4.3 without ever reaching the user.

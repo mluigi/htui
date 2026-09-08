@@ -10,6 +10,7 @@
 //!
 //! The Postgres half is gated on `HTUI_TEST_DATABASE_URL` and prints `testkit::SKIP` without it,
 //! like every other Postgres-backed suite (plan D13). The offline half needs no server at all.
+#![cfg(feature = "testkit")]
 
 use std::sync::Arc;
 use std::time::Duration;

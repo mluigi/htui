@@ -556,7 +556,8 @@ impl PgStore {
                    ab.probed_at    AS "box_probed_at?",
                    ab.quota        AS "box_quota?",
                    ab.quota_at     AS "box_quota_at?",
-                   ab.updated_at   AS "box_updated_at?"
+                   ab.updated_at   AS "box_updated_at?",
+                   ab.probe        AS "box_probe?"
               FROM agent a
               LEFT JOIN agent_box ab ON ab.agent_id = a.id AND ab.box_id = $1
              ORDER BY a.name
@@ -594,6 +595,7 @@ impl PgStore {
                         quota: row.box_quota,
                         quota_at: row.box_quota_at,
                         updated_at,
+                        probe: row.box_probe,
                     }),
                     _ => None,
                 };

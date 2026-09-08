@@ -122,6 +122,13 @@ pub enum StoreRequest {
         /// The step the chat records against.
         step_id: StepId,
     },
+    /// Probe every enabled registry row on this box and write `agent_box` (MOD-2 D53, `R-AGT-6`).
+    ///
+    /// Served by the agent runtime's own task, never inside the loop: a probe spawns processes and
+    /// may wait `HANDSHAKE_TIMEOUT` on each of them (`R-NF-3`). Answered exactly once, with
+    /// [`StoreReply::Agents`] — the reply the Settings section already renders, so the probe needs
+    /// no second arm there — or with [`StoreReply::Failed`].
+    ProbeAgents,
     /// The top bar's store field and the pending-migration count (plan D11).
     StoreState,
     /// Apply the pending migrations (`R-STO-5`), after the user answered `y`.
@@ -148,6 +155,7 @@ impl StoreRequest {
             Self::ChatSend { .. } => "chat_send",
             Self::ChatAnswer { .. } => "chat_answer",
             Self::ChatCancel { .. } => "chat_cancel",
+            Self::ProbeAgents => "probe_agents",
             Self::StoreState => "store_state",
             Self::ApplyMigrations => "apply_migrations",
         }
@@ -327,14 +335,16 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             step_id: *step,
             events: backend.step_events(*step).await?,
         },
-        // The four chat requests need the worker loop's own state (the live sessions), so they are
-        // served ahead of this function, exactly as `ApplyMigrations` is. A chat request that
-        // reaches here at all belongs to a caller with no runtime — the test harness without one —
-        // and saying so is more use than a panic.
+        // The four chat requests need the worker loop's own state (the live sessions), and the
+        // probe needs the runtime that owns its task, so all five are served ahead of this
+        // function, exactly as `ApplyMigrations` is. One of them that reaches here at all belongs
+        // to a caller with no runtime — the test harness without one — and saying so is more use
+        // than a panic.
         StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
         | StoreRequest::ChatAnswer { .. }
-        | StoreRequest::ChatCancel { .. } => StoreReply::Failed {
+        | StoreRequest::ChatCancel { .. }
+        | StoreRequest::ProbeAgents => StoreReply::Failed {
             request: request.name(),
             message: "no agent runtime in this build".to_owned(),
         },
@@ -468,12 +478,14 @@ pub fn spawn_with(
                                 None => StoreReply::MigrationsApplied { applied: 0 },
                             }
                         }
-                        // The chat requests need this loop's own state - the live sessions - so
-                        // they are served before `try_serve`, like `ApplyMigrations` above.
+                        // The chat requests need this loop's own state - the live sessions - and
+                        // the probe needs the runtime that owns its task, so both go to the
+                        // runtime before `try_serve`, like `ApplyMigrations` above.
                         StoreRequest::ChatStart { .. }
                         | StoreRequest::ChatSend { .. }
                         | StoreRequest::ChatAnswer { .. }
-                        | StoreRequest::ChatCancel { .. } => {
+                        | StoreRequest::ChatCancel { .. }
+                        | StoreRequest::ProbeAgents => {
                             match runtime.serve(&backend, &tx, &envelope).await {
                                 Served::Reply(reply) => reply,
                                 // The session task answers this request itself, once.
@@ -1199,6 +1211,65 @@ mod tests {
         // A memory backend has no mirror, so the swap is refused.
         go_offline(&mut backend, &mut refresher, &mut seen, &err);
         assert_eq!(backend.label(), "memory");
+    }
+
+    /// The probe is named like every other request, and a build with no runtime says so rather
+    /// than dropping the reply (MOD-2 D53).
+    #[tokio::test]
+    async fn probe_agents_is_named_and_refused_without_a_runtime() {
+        assert_eq!(StoreRequest::ProbeAgents.name(), "probe_agents");
+        match serve(&demo(), &StoreRequest::ProbeAgents).await {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, "probe_agents");
+                assert_eq!(message, "no agent runtime in this build");
+            }
+            other => panic!("a probe with no runtime is refused, not served: {other:?}"),
+        }
+    }
+
+    /// `R-NF-3`, the whole reason the probe is deferred: a probe waits up to `HANDSHAKE_TIMEOUT`
+    /// per agent, and the loop must serve everything else while it does.
+    #[tokio::test]
+    async fn the_loop_answers_other_requests_while_a_probe_is_in_flight() {
+        let store = crate::agent_worker::tests::unresolvable_registry().await;
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn_with(
+            Started::detached(Backend::memory(store)),
+            req_rx,
+            rep_tx,
+            AgentRuntime::production(),
+        );
+
+        for (seq, request) in [
+            (1, StoreRequest::ProbeAgents),
+            (2, StoreRequest::Workspaces),
+        ] {
+            req_tx
+                .send(RequestEnvelope {
+                    seq,
+                    origin: Origin::App,
+                    request,
+                })
+                .expect("the worker is alive");
+        }
+
+        let first = rep_rx.recv().await.expect("the worker answers");
+        assert_eq!(
+            first.seq, 2,
+            "the loop is free the instant the probe is deferred: {:?}",
+            first.reply
+        );
+        let second = rep_rx.recv().await.expect("the probe answers itself");
+        assert_eq!(second.seq, 1);
+        assert!(
+            matches!(second.reply, StoreReply::Agents(_)),
+            "the probe answers with the registry it wrote: {:?}",
+            second.reply
+        );
+
+        drop(req_tx);
+        let _ = worker.await;
     }
 
     /// `go_offline` disarms the `lost_the_server` arm whatever the backend was.

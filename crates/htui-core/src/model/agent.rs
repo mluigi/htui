@@ -81,6 +81,17 @@ pub struct AgentBox {
     pub quota_at: Option<DateTime<Utc>>,
     /// `agent_box.updated_at`.
     pub updated_at: DateTime<Utc>,
+    /// `agent_box.probe` (`JSONB`, migration `0002`): the `docs/ANA-4.md` §4.6 snapshot of what
+    /// this box can run - `{transport, resolved, tools, handshake, status, stderr_tail, source}`
+    /// - typed by `htui_agent::probe::ProbeSnapshot` (MOD-2 D44).
+    ///
+    /// Held here as a [`Value`] for the reason [`Agent::launch`] gives: `htui-core` does not
+    /// depend on the driver crate, and neither does `htui-store`. MOD-4's skip predicate reads
+    /// `probe->>'status'` in SQL rather than matching a Rust enum (`docs/ANA-2.md` §7).
+    ///
+    /// `#[serde(default)]` so a document written before this column existed still deserialises.
+    #[serde(default)]
+    pub probe: Option<Value>,
 }
 
 /// The two `agent` rows MOD-2 seeds (`docs/ANA-4.md` §5.3), stamped with `now`.
@@ -154,7 +165,7 @@ struct AgentSeed {
 pub struct AgentSummary {
     /// The `agent` row.
     pub agent: Agent,
-    /// This box's `agent_box` row; `None` until the box is probed (MOD-2 milestone 5).
+    /// This box's `agent_box` row; `Some` when a probe has run on this box, `None` otherwise.
     pub on_box: Option<AgentBox>,
 }
 

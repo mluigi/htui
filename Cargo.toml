@@ -48,6 +48,11 @@ process-wrap          = { version = "10.0.0", features = ["tokio1", "creation-fl
 windows               = { version = "0.62.2", features = ["Win32_System_Threading"] }
 similar               = "3.2.0"   # milestone 3 diff synthesis; no crate consumes it yet (A3)
 which                 = "8.0.6"
+# MOD-2 milestone 5 (plan D47): the probe compiles `VersionProbe.pattern` and compares a captured
+# version with `VersionProbe.min`. Both were already in the graph as transitive dependencies
+# (`regex 1.13.1`, `semver 1.0.28`), so declaring them adds no compiled crate.
+regex                 = "1.13"
+semver                = "1.0"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"

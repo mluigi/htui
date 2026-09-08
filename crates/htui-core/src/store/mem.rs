@@ -1206,18 +1206,20 @@ mod tests {
         );
 
         let now = Utc::now();
+        let probed = AgentBox {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id: ids::BOX,
+            enabled: true,
+            version: Some("1.2.3".to_owned()),
+            path: Some("claude".to_owned()),
+            probed_at: Some(now),
+            quota: None,
+            quota_at: None,
+            updated_at: now,
+            probe: Some(serde_json::json!({ "status": "missing" })),
+        };
         store
-            .upsert_agent_box(&AgentBox {
-                agent_id: ids::AGENT_CLAUDE,
-                box_id: ids::BOX,
-                enabled: true,
-                version: Some("1.2.3".to_owned()),
-                path: Some("claude".to_owned()),
-                probed_at: Some(now),
-                quota: None,
-                quota_at: None,
-                updated_at: now,
-            })
+            .upsert_agent_box(&probed)
             .await
             .expect("the probe row lands");
 
@@ -1234,6 +1236,15 @@ mod tests {
             Some("1.2.3"),
             "this box's agent_box is joined in"
         );
+        assert_eq!(
+            claude
+                .on_box
+                .as_ref()
+                .and_then(|row| row.probe.as_ref())
+                .and_then(|probe| probe["status"].as_str()),
+            Some("missing"),
+            "the ANA-4 §4.6 snapshot rides the join as an opaque document (MOD-2 D44)"
+        );
         assert!(
             joined
                 .iter()
@@ -1242,6 +1253,26 @@ mod tests {
                 .on_box
                 .is_none(),
             "an agent with no row for this box stays None"
+        );
+
+        store
+            .upsert_agent_box(&AgentBox {
+                probe: None,
+                ..probed
+            })
+            .await
+            .expect("the cleared row lands");
+        assert_eq!(
+            store
+                .agents()
+                .await
+                .expect("agents must not fail")
+                .iter()
+                .find(|row| row.agent.name == "claude")
+                .and_then(|row| row.on_box.as_ref())
+                .and_then(|row| row.probe.as_ref()),
+            None,
+            "a second upsert with `probe: None` clears the snapshot"
         );
     }
 }

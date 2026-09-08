@@ -1,25 +1,31 @@
-//! Resolving `agent.launch`'s `${tool}` placeholders on this box (plan MOD-2 D25).
+//! Resolving `agent.launch`'s `${tool}` placeholders on this box (plan MOD-2 D25, D46).
 //!
-//! This is **not** the probe. `docs/ANA-4.md` §4.6's tiered probe writes `agent_box.probe` and
-//! belongs to milestone 5; a chat session, however, cannot start before `${node}`,
-//! `${claude_agent_acp}` and `${claude}` are strings, so milestone 3 ships the smallest resolver
-//! that turns the seeded rows into a working launch and **stores nothing**.
+//! This is the **chat-start caller of the probe's resolver**, not a second copy of it. A session
+//! cannot start before `${node}`, `${claude_agent_acp}` and `${claude}` are strings, and it must
+//! not pay for a full probe to get them: this module answers that one question and **stores
+//! nothing**. [`crate::probe::resolve_tool`] owns the tier walk itself — one resolver, two
+//! callers, so the `PATH`/`node_modules`/glob rules cannot drift apart (plan D46).
 //!
-//! Three tiers per tool, in order:
+//! Two tiers per tool, in order:
 //!
-//! 1. `HTUI_TOOL_<NAME>` in the environment, which is also the escape hatch for a box whose layout
-//!    neither of the other two tiers understands;
-//! 2. [`ToolProbe::Path`] through `which`, which is `PATH`/`PATHEXT`-correct where a bare
-//!    `Command::new` is not (§4.4's Windows finding);
-//! 3. [`ToolProbe::NodePackage`] as a path to the package's entry point — the local
-//!    `node_modules` first, then the global root `npm root -g` reports — never the shim on `PATH`,
-//!    which §4.4 measured to be unspawnable on Windows.
+//! 1. `HTUI_TOOL_<NAME>` in the environment, taken **on trust**: it is the escape hatch for a box
+//!    whose layout no tier understands, and refusing a path the user named would close it. (The
+//!    probe checks the same override *does* exist, because a snapshot that claimed a nonexistent
+//!    path was `ready` would be a lie the Settings tab repeats.)
+//! 2. [`crate::probe::resolve_tool`]: [`ToolProbe::Path`] through `which`, which is
+//!    `PATH`/`PATHEXT`-correct where a bare `Command::new` is not (§4.4's Windows finding);
+//!    [`ToolProbe::NodePackage`] as a path to the package's entry point, never the shim on `PATH`;
+//!    [`ToolProbe::Glob`] through the probe's walker.
 //!
-//! [`ToolProbe::Glob`] resolves nowhere here: it is `agy`'s tier (milestone 6) and its patterns are
-//! per platform, which is exactly the part of §4.6 milestone 5 owns. The error says so rather than
-//! guessing a path.
+//! Version capture is deliberately off here ([`crate::probe::ProbeEnv::without_versions`]): a chat
+//! start would otherwise spawn a `--version` child per tool before its first token.
+//!
+//! **Known limit** (blueprint H-3): a [`ToolMap`] value is one string, so a glob tool's
+//! per-platform `args` — `agy`'s Linux-only `--uid=` — are *not* applied on this path. Milestone 6
+//! builds the driver from `agent_box.probe.resolved` instead of resolving again, which is where
+//! those arguments live.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::error::{DriverError, Result};
 use crate::launch::{Discovery, ToolMap, ToolProbe};
@@ -53,10 +59,9 @@ pub fn env_override_key(name: &str) -> String {
 ///
 /// # Errors
 ///
-/// [`DriverError::Unresolved`] naming the first tool that resolves nowhere — including every
-/// [`ToolProbe::Glob`], whose message names milestone 5. [`DriverError::Transport`] when the
-/// resolution machinery itself fails: a `which` lookup that could not be scheduled, or an `npm`
-/// that could not be run.
+/// [`DriverError::Unresolved`] naming the first tool that resolves nowhere.
+/// [`DriverError::Transport`] when the resolution machinery itself fails: a `which` lookup or a
+/// glob walk that could not be scheduled.
 pub async fn resolve(discovery: Option<&Discovery>, cwd: &Path) -> Result<ToolMap> {
     resolve_with(discovery, cwd, &env_override).await
 }
@@ -82,102 +87,22 @@ async fn resolve_with(
     let Some(discovery) = discovery else {
         return Ok(map);
     };
+    // Built once, outside the loop: it snapshots the whole process environment, and every tool of
+    // one row resolves against the same box.
+    let env = crate::probe::ProbeEnv::host(cwd.to_path_buf()).without_versions();
     for (name, probe) in &discovery.tools {
         if let Some(value) = overrides(name) {
             map.insert(name.clone(), value);
             continue;
         }
-        let resolved = match probe {
-            ToolProbe::Path { names, .. } => on_path(names).await?,
-            ToolProbe::NodePackage { package, entry, .. } => {
-                node_package(package, entry, cwd).await?
-            }
-            // Milestone 6's `agy` row is the only one that uses this tier, and its patterns are
-            // per `<os>-<arch>`: guessing one here would be the probe, badly.
-            ToolProbe::Glob { .. } => None,
-        };
-        match resolved {
-            Some(path) => {
-                map.insert(name.clone(), path);
+        match crate::probe::resolve_tool(probe, &env).await? {
+            Some(found) => {
+                map.insert(name.clone(), found.path.to_string_lossy().into_owned());
             }
             None => return Err(unresolved(name, probe)),
         }
     }
     Ok(map)
-}
-
-/// The first of `names` that `which` finds, or `None`.
-///
-/// `which` is synchronous and touches the filesystem, so it runs on `spawn_blocking` rather than
-/// on the runtime's worker (the rule `crate::launch::spawn` already follows).
-async fn on_path(names: &[String]) -> Result<Option<String>> {
-    let names = names.to_vec();
-    tokio::task::spawn_blocking(move || {
-        names
-            .iter()
-            .find_map(|name| which::which(name).ok())
-            .map(|path| path.to_string_lossy().into_owned())
-    })
-    .await
-    .map_err(|err| DriverError::Transport(format!("tool lookup did not run: {err}")))
-}
-
-/// `<cwd>/node_modules/<package>/<entry>`, else `<npm root -g>/<package>/<entry>`, else `None`.
-///
-/// The package's declared `fallback` (`npx -y <package>@<pinned>`) is deliberately **not** used
-/// here: it is a command with arguments, and a [`ToolMap`] entry is one string that lands in
-/// `command` or inside a single `args[i]`. Milestone 5's probe owns that tier, where the whole
-/// `AgentLaunch` can be rewritten rather than one placeholder substituted.
-async fn node_package(package: &str, entry: &str, cwd: &Path) -> Result<Option<String>> {
-    let suffix = PathBuf::from(package).join(entry);
-
-    let local = cwd.join("node_modules").join(&suffix);
-    if exists(&local).await {
-        return Ok(Some(local.to_string_lossy().into_owned()));
-    }
-
-    let Some(root) = npm_root_global().await? else {
-        return Ok(None);
-    };
-    let global = root.join(&suffix);
-    if exists(&global).await {
-        return Ok(Some(global.to_string_lossy().into_owned()));
-    }
-    Ok(None)
-}
-
-/// The directory `npm root -g` prints, or `None` when `npm` is absent or fails.
-///
-/// A missing `npm` is not an error: it means this tier found nothing, and the caller's
-/// [`DriverError::Unresolved`] is the honest report. A *broken* `npm` is treated the same way, on
-/// purpose — the resolution answer is identical and a transport error would name the wrong problem.
-async fn npm_root_global() -> Result<Option<PathBuf>> {
-    let Ok(npm) = tokio::task::spawn_blocking(|| which::which("npm"))
-        .await
-        .map_err(|err| DriverError::Transport(format!("npm lookup did not run: {err}")))?
-    else {
-        return Ok(None);
-    };
-    let output = tokio::process::Command::new(npm)
-        .args(["root", "-g"])
-        .output()
-        .await;
-    let Ok(output) = output else {
-        return Ok(None);
-    };
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if root.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(PathBuf::from(root)))
-}
-
-/// Whether `path` exists, off the runtime's worker.
-async fn exists(path: &Path) -> bool {
-    tokio::fs::metadata(path).await.is_ok()
 }
 
 /// The error a tool that resolved nowhere produces.
@@ -192,7 +117,7 @@ fn unresolved(name: &str, probe: &ToolProbe) -> DriverError {
         ToolProbe::NodePackage { package, entry, .. } => {
             format!("`{package}/{entry}` is in neither the local nor the global node_modules")
         }
-        ToolProbe::Glob { .. } => "glob probes arrive with MOD-2 milestone 5".to_owned(),
+        ToolProbe::Glob { .. } => "no file matches any glob pattern for this platform".to_owned(),
     };
     tracing::warn!(
         tool = name,
@@ -276,7 +201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_glob_probe_is_unresolved_rather_than_guessed() {
+    async fn a_glob_probe_that_matches_nothing_is_unresolved() {
         let probe = discovery(
             "agy_acp_server",
             ToolProbe::Glob {
@@ -286,7 +211,7 @@ mod tests {
         );
         let err = resolve(Some(&probe), Path::new("."))
             .await
-            .expect_err("glob resolves nowhere in milestone 3");
+            .expect_err("no such file exists under this pattern's root");
         assert_eq!(err, DriverError::Unresolved("agy_acp_server".to_owned()));
     }
 

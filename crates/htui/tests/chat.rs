@@ -8,6 +8,7 @@
 //!
 //! The transport is milestone 2's fake, reached through the same registry the ACP one uses, so no
 //! snapshot here depends on a process being installed.
+#![cfg(feature = "testkit")]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -371,6 +372,158 @@ async fn a_degraded_transport_banners_what_it_cannot_do() {
     compose(&mut harness, "hello");
     harness.drive().await;
     stable().bind(|| insta::assert_snapshot!("chat_capability_banner", harness.render()));
+}
+
+// -------------------------------------------------------------------------------------------
+// The staleness re-probe (MOD-2 milestone 5, D55): a chat on a stale `agent_box` row refreshes
+// it in the background and is never blocked, delayed or failed by it.
+// -------------------------------------------------------------------------------------------
+
+/// The scripted row's `agent_box`, as the store holds it now.
+async fn on_box(store: &MemStore) -> Option<AgentBox> {
+    store
+        .agents()
+        .await
+        .expect("the memory store never fails")
+        .into_iter()
+        .find(|summary| summary.agent.name == "scripted")
+        .expect("the scripted row is registered")
+        .on_box
+}
+
+/// The scripted row's id.
+async fn scripted_id(store: &MemStore) -> AgentId {
+    store
+        .agents()
+        .await
+        .expect("the memory store never fails")
+        .into_iter()
+        .find(|summary| summary.agent.name == "scripted")
+        .expect("the scripted row is registered")
+        .agent
+        .id
+}
+
+/// An `agent_box` row for the scripted agent, last probed at `probed_at`.
+fn probed(agent_id: AgentId, probed_at: chrono::DateTime<chrono::Utc>) -> AgentBox {
+    AgentBox {
+        agent_id,
+        box_id: htui_core::fixtures::ids::BOX,
+        enabled: true,
+        version: Some("0.48.0".to_owned()),
+        path: None,
+        probed_at: Some(probed_at),
+        quota: None,
+        quota_at: None,
+        updated_at: probed_at,
+        probe: Some(json!({ "status": "ready", "source": "probe" })),
+    }
+}
+
+/// D55: the row nobody has probed is refreshed behind the chat, and the probe's **failure** —
+/// `command: "unused"` will never spawn — leaves the conversation untouched.
+#[tokio::test]
+async fn a_chat_on_an_unprobed_row_refreshes_agent_box_in_the_background() {
+    let (mut harness, store) = harness(Script::one_turn(vec![chunk("It is empty."), done()])).await;
+    assert!(
+        on_box(&store).await.is_none(),
+        "the fixture probes nothing; this is the row the chat makes stale"
+    );
+
+    compose(&mut harness, "what is in main.rs");
+    harness.drive_to_end().await;
+
+    let row = on_box(&store)
+        .await
+        .expect("the background re-probe wrote agent_box");
+    assert_eq!(
+        row.probe
+            .as_ref()
+            .and_then(|probe| probe.get("status"))
+            .and_then(serde_json::Value::as_str),
+        Some("failed"),
+        "the scripted launch spawns nothing, and the chat ran anyway: {:?}",
+        row.probe
+    );
+    assert!(!row.enabled, "a launch that will not spawn is not enabled");
+    let probed_at = row.probed_at.expect("a probe stamps the row it wrote");
+    assert!(
+        (chrono::Utc::now() - probed_at) < chrono::TimeDelta::minutes(1),
+        "the stamp is this run's, not a fixture's: {probed_at}"
+    );
+
+    // And the chat itself is whole: the same log the un-probed run wrote.
+    let step = harness.chat_steps()[0];
+    let kinds: Vec<EventKind> = store
+        .step_events(step)
+        .await
+        .expect("the log reads")
+        .expect("the chat step has a log")
+        .iter()
+        .map(|row| row.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            EventKind::Prompt,
+            EventKind::Other,
+            EventKind::AssistantText,
+            EventKind::Done,
+        ],
+        "a failed re-probe never fails the chat"
+    );
+}
+
+/// The TTL, through the whole shell: a row probed a minute ago is left exactly as it is, and the
+/// same row aged past 24 hours is rewritten.
+#[tokio::test]
+async fn a_fresh_row_is_not_re_probed_and_a_stale_one_is() {
+    let (mut shell, store) = harness(Script::one_turn(vec![chunk("hi"), done()])).await;
+    let agent_id = scripted_id(&store).await;
+    let fresh = chrono::Utc::now() - chrono::TimeDelta::minutes(1);
+    store
+        .upsert_agent_box(&probed(agent_id, fresh))
+        .await
+        .expect("the fresh row lands");
+
+    compose(&mut shell, "one");
+    shell.drive_to_end().await;
+
+    let row = on_box(&store).await.expect("the row is still there");
+    assert_eq!(
+        row.probed_at,
+        Some(fresh),
+        "a row inside the TTL is not touched"
+    );
+    assert!(row.enabled, "and its verdict is not rewritten");
+
+    // The same row, aged past the window.
+    let (mut shell, store) = harness(Script::one_turn(vec![chunk("hi"), done()])).await;
+    let agent_id = scripted_id(&store).await;
+    let stale = chrono::Utc::now() - chrono::TimeDelta::hours(25);
+    store
+        .upsert_agent_box(&probed(agent_id, stale))
+        .await
+        .expect("the stale row lands");
+
+    compose(&mut shell, "one");
+    shell.drive_to_end().await;
+
+    let row = on_box(&store).await.expect("the row is still there");
+    assert!(
+        row.probed_at.is_some_and(|at| at > stale),
+        "a stale row is re-probed: {:?}",
+        row.probed_at
+    );
+    assert_eq!(
+        row.probe
+            .as_ref()
+            .and_then(|probe| probe.get("status"))
+            .and_then(serde_json::Value::as_str),
+        Some("failed"),
+        "and the fresh verdict replaces the stale one: {:?}",
+        row.probe
+    );
 }
 
 // -------------------------------------------------------------------------------------------

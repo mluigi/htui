@@ -182,7 +182,8 @@ impl Harness {
                         StoreRequest::ChatStart { .. }
                         | StoreRequest::ChatSend { .. }
                         | StoreRequest::ChatAnswer { .. }
-                        | StoreRequest::ChatCancel { .. },
+                        | StoreRequest::ChatCancel { .. }
+                        | StoreRequest::ProbeAgents,
                         _,
                     ) => match self.runtime.as_mut() {
                         Some(runtime) => {
@@ -262,6 +263,10 @@ impl Harness {
     pub async fn drive_to_end(&mut self) {
         self.drive().await;
         if let Some(runtime) = self.runtime.as_mut() {
+            // Before the shutdown, not after: a probe answers from a task the runtime owns, and
+            // `shutdown` aborts those. Awaiting them here is what makes a probe's reply part of
+            // the frame this call is taken for.
+            runtime.finish_background(CHAT_END).await;
             runtime.shutdown(Duration::ZERO).await;
         }
         for (step, task) in std::mem::take(&mut self.chats) {

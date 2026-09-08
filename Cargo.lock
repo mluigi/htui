@@ -1460,9 +1460,12 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "chrono",
+ "dirs",
  "htui-core",
  "insta",
  "process-wrap",
+ "regex",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",

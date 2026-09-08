@@ -416,15 +416,16 @@ impl WriteStore for PgStore {
     async fn upsert_agent_box(&self, row: &AgentBox) -> Result<()> {
         sqlx::query!(
             "INSERT INTO agent_box (agent_id, box_id, enabled, version, path, probed_at, quota, \
-                                    quota_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                                    quota_at, updated_at, probe) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
              ON CONFLICT (agent_id, box_id) DO UPDATE SET \
                  enabled   = EXCLUDED.enabled, \
                  version   = EXCLUDED.version, \
                  path      = EXCLUDED.path, \
                  probed_at = EXCLUDED.probed_at, \
                  quota     = EXCLUDED.quota, \
-                 quota_at  = EXCLUDED.quota_at",
+                 quota_at  = EXCLUDED.quota_at, \
+                 probe     = EXCLUDED.probe",
             row.agent_id.as_uuid(),
             row.box_id.as_uuid(),
             row.enabled,
@@ -434,6 +435,7 @@ impl WriteStore for PgStore {
             row.quota.as_ref(),
             row.quota_at,
             row.updated_at,
+            row.probe.as_ref(),
         )
         .execute(&self.pool)
         .await

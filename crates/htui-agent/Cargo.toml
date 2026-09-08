@@ -33,6 +33,12 @@ which                 = { workspace = true }
 # Milestone 3 (T11): `edit_proposal.diff` is a unified diff synthesized from the old/new full text
 # ACP carries (`docs/ANA-4.md` §4.3); this is the first consumer of the workspace declaration.
 similar               = { workspace = true }
+# Milestone 5 (T24): the probe's version tier compiles `VersionProbe.pattern` (`regex`) and
+# compares the capture with `VersionProbe.min` (`semver`), and its glob walker expands a leading
+# `~` through `dirs::home_dir` (plan D47, D48).
+regex                 = { workspace = true }
+semver                = { workspace = true }
+dirs                  = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

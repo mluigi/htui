@@ -325,9 +325,17 @@ fn item_writes_need_the_server() -> StoreError {
     )
 }
 
+/// D35's refusal for the two registry writes, and MOD-2 D52's for a probe that has no server to
+/// write its snapshot to: the same sentence in both places, on purpose.
+///
+/// A probe costs process spawns, so the caller checks this **before** it spawns anything rather
+/// than discovering the refusal on the write. Writing a probe result somewhere local is the
+/// local-only store's job (MOD-17), not this seam's.
+pub const REGISTRY_ON_SERVER_ONLY: &str = "the agent registry is written on the server only";
+
 /// D35's refusal for the two registry writes.
 fn registry_writes_need_the_server() -> StoreError {
-    StoreError::Unreachable("the agent registry is written on the server only".to_owned())
+    StoreError::Unreachable(REGISTRY_ON_SERVER_ONLY.to_owned())
 }
 
 /// Plain delegation: a `Writer` decides *which* store, never *what* a read means.

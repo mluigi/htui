@@ -268,6 +268,7 @@ async fn item_and_registry_writes_are_unreachable() {
                 quota: None,
                 quota_at: None,
                 updated_at: fixtures::demo_at(3, 0),
+                probe: None,
             })
             .await
             .expect_err("no probe write offline"),
