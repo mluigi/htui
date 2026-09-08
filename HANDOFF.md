@@ -14,13 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-07):** MOD-2 milestone 3 landed and is reviewed (`a142fbf`..`682a423`):
-`htui` holds a **live streamed conversation with `claude` over ACP** in a new Chat tab — the
-transport passes the same thirteen conformance cases as the fake with no case added, permissions
-are answered inline, edits arrive as diffs, and a real session was driven end to end on this box
-against adapter 0.48.0. Milestone 2 landed before it (`5c717d0`..`34d5f04`): the agent registry
-seeds itself, an agent named nowhere in the tree reaches a working session from its row alone
-(`R-AGT-5`), and the Settings tab lists the registry. ANA-10 concluded
+**Current status (2026-09-08):** MOD-2 milestone 5 landed and is reviewed (`fb626a8`): a box
+**answers for itself** — `Settings > r` probes what is installed, records versions and per-box
+enablement in a new `agent_box.probe` snapshot, and ANA-4 §11 criterion 9 was proven live here.
+**Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql` is no longer held**
+(`docs/ANA-2.md` §9), and it carries ANA-5 §9's ten `app_setting` defaults with it. Milestone 4
+landed before it (`81d247b`): durable history, an offline chat buffered to
+`<cache_dir>/pending/` and uploaded on the next connection, and read-only replay of any past step.
+Milestone 3 (`a142fbf`..`682a423`) holds the **live streamed conversation with `claude` over ACP**
+in the Chat tab, against adapter 0.48.0. ANA-10 concluded
 (`docs/ANA-10.md`, `docs/decisions/ana/ana-10.md`), with its gating decisions taken the same day:
 a box with no DSN becomes a **complete** box, not a read-only shell — a fourth `Backend::Local` arm
 over a **separate** `<config_root>/local/local.sqlite` (never `cache.sqlite`, which is
@@ -166,15 +168,52 @@ now.
   HIGH, and its two MEDIUM findings (both in the `[H-1]` sealing fallback) are fixed in this commit.
   Known and accepted: an uploaded offline chat has `run_step.agent_id` and `model` NULL, the line
   format carrying `session_event` columns only. **Windows verification of every phase is MOD-16**,
-  which owns the runtime facts a Linux box cannot answer. Milestone 5 (autodiscovery and box probe,
-  migration `0002_agent_probe.sql`) is next.
+  which owns the runtime facts a Linux box cannot answer.
+  **Phase 5 landed (2026-09-08, `fb626a8`):** autodiscovery and the box probe, planned in
+  `.claude/plans/mod-2-probe-autodiscovery.plan.md` with the `code-architect` blueprint beside it.
+  **`migrations/0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql` is no longer
+  held** (`docs/ANA-2.md` §9): it carries ANA-4 §9's `agent_box.probe JSONB` plus ANA-5 §9's five
+  `COMMENT ON COLUMN` contracts and ten `app_setting` defaults. Two **ANA amendments** were needed
+  and are recorded here rather than in the ANAs (maintainer-only): ANA-4 §9's
+  `COMMENT ON COLUMN agent.name IS NULL` is a **no-op** — `0001_init.sql` carries no database
+  comment at all and its stale text is a source comment (`0001_init.sql:96`) the forward-only rule
+  forbids editing — so `0002` writes a real comment naming `seed_rows`/`seed_if_empty_as` (plan
+  D43); and ANA-4 §4.6's snapshot gains one key, `source` (`probe` | `manual`), because "a manual
+  entry is never overwritten by a probe that finds nothing" (§4.6) needs a recorded origin (plan
+  D45). `htui-agent` gained `probe.rs` (tier 1: one resolver `tools::resolve` now shares, `glob`
+  through a hand-rolled `*`-per-segment walker with no new crate, versions from the seeds' own
+  regexes and semver floors) and `acp/handshake.rs` (tier 2: `initialize` and nothing else, the
+  child owned by a `ChildGuard` so timeout, actor failure, garbage, success and a dropped future
+  all kill it). `htui` gained `StoreRequest::ProbeAgents`, served through `AgentRuntime::serve` as
+  `Served::Deferred` with an owned `Writer` — never in the worker's `select!` arm, never on the UI
+  task (`R-NF-3`) — `Settings > r` with its `probing…` column, and a 24 h `PROBE_TTL` re-probe at
+  `ChatStart` that cannot block or fail the chat. **§11 criterion 9 is proven live on this box**
+  (`crates/htui-agent/tests/probe_live.rs`: `status: ready`, `protocol_version: 1`, no surviving
+  children); **criterion 10's live half is milestone 6's** — there is no `agy` on this box, so the
+  glob resolution, its `--uid=` platform append and the `unauthenticated` mapping are proven by
+  fixtures only. 463 tests green on **Linux** with Postgres live. `rust-reviewer` **blocked** on two
+  HIGH findings, both in the orphan-process class this milestone was gated on: `npm root -g` ran
+  through a bare `Command::output()` with no timeout and no process group, and an aborted
+  `capture_version` left its child running. Both are fixed by one bounded-spawn path (`run_bounded`)
+  and the lifted `ChildGuard`; five MEDIUM and four LOW followed, and the gate then cleared.
+  Known and accepted: `open_session`'s own timeout arm still orphans its adapter the same way
+  (blueprint H-2) and is **milestone 6's**; `unauthenticated` is auth-methods-only until milestone 6
+  can check a credential; on the probe's *success* path the process group is not swept, because the
+  leader has just been reaped and a late `killpg` could land on a reused pgid, so a tool that
+  daemonises a helper can outlive its probe (none in the seeds does). Also landed:
+  `crates/htui-store/build.rs`, because `sqlx::migrate!` registers rerun-if-changed **per file**,
+  so adding `0002` did not invalidate a warm `target/` and the suite failed against a schema the
+  binary did not know it had — the same trap awaits MOD-4's `0003`. **First launch after this lands
+  rebuilds every box's mirror**: `PgStore::schema_version()` is now 2 and `CacheStore::open` treats
+  a mismatch as a rebuild (MOD-6 plan D8). Milestone 6 (`agy` over ACP) is next.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
   close-out (summary document, status, commit hashes). The `run` and `close` actions of `R-TUI-2`.
   Design concluded in `docs/ANA-2.md` (ANA-2, `docs/decisions/ana/ana-2.md`): new crate
   `htui-orch` plus `crates/htui/src/run_worker.rs` (§8), migration `0003_orchestration.sql` and
-  `cache_migrations/0003_orchestration.sql` (§9; never applied before MOD-2's `0002`. **The cache
+  `cache_migrations/0003_orchestration.sql` (§9; never applied before MOD-2's `0002`, **which
+  landed 2026-09-08 in `fb626a8`, so this constraint is now satisfied**. **The cache
   migration is `0003`, not the `0002` ANA-2 §9 reserved:** MOD-2 milestone 4 spent
   `cache_migrations/0002_agent_mirror.sql` mirroring the registry so an offline chat can start), plus
   **`local_migrations/0002_orchestration_local.sql` in the same commit** (ANA-10 §5.3's Set B — a

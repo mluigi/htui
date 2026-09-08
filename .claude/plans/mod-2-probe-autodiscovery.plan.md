@@ -299,19 +299,58 @@ plan was amended before the maintainer saw it (D43, and the Scope finding above)
 
 ## Acceptance
 
-- [ ] All tasks complete — T22–T28
-- [ ] Validation passes, Postgres line included, `cargo sqlx prepare --check` clean
-- [ ] `docs/ANA-4.md` §11 criterion 9 demonstrated live on this box; criterion 10's non-live half
-      demonstrated by fixtures, its live half recorded as milestone 6's (D56)
-- [ ] `R-AGT-6` holds: a box answers what it can run without configuration, and a manual entry
+- [x] All tasks complete — T22–T28, landed `fb626a8`
+- [x] Validation passes, Postgres line included — 463 tests, 0 failed, 5 ignored;
+      `cargo sqlx prepare --check` clean; `x86_64-pc-windows-msvc` clippy clean
+- [x] `docs/ANA-4.md` §11 criterion 9 demonstrated live on this box
+      (`crates/htui-agent/tests/probe_live.rs`: `status: ready`, `protocol_version: 1`, no surviving
+      children); criterion 10's non-live half demonstrated by fixtures, its live half recorded as
+      milestone 6's (D56)
+- [x] `R-AGT-6` holds: a box answers what it can run without configuration, and a manual entry
       survives a probe that finds nothing
-- [ ] `rust-reviewer` gate run over the whole change set (Fable 5.1), findings applied or explicitly
-      deferred with the maintainer
-- [ ] ANA-4 §9 amendment (D43) and §4.6 amendment (D45's `source` key) recorded in the HANDOFF phase
+- [x] `rust-reviewer` gate run over the whole change set (Fable 5.1) — **blocked** on two HIGH, both
+      orphan-process; fixed, re-reviewed, gate cleared with two LOWs recorded below
+- [x] ANA-4 §9 amendment (D43) and §4.6 amendment (D45's `source` key) recorded in the HANDOFF phase
       note at close-out
-- [ ] Patterns mirrored, not reinvented
+- [x] Patterns mirrored, not reinvented
 
 ## Close-out
 
-_(filled at close-out: commits, amendments made during implementation with their reasons, and what
-was left to milestone 6 / MOD-16.)_
+Landed `fb626a8` on 2026-09-08, one commit, bookkeeping in the next. Implementation ran as one
+Workflow-tool script (ultracode, maintainer-accepted at routing): seven implementer agents on
+Opus 5 in two parallel chains, each followed by an adversarial verifier that re-ran its task's
+commands. All seven reported green and all seven verdicts held; the verifiers' six MEDIUM findings
+were applied before the review gate.
+
+**Amendments made during implementation**, each with its reason:
+
+| # | Amendment | Why |
+|---|---|---|
+| A1 | `0002` writes a **real** `COMMENT ON COLUMN agent.name`, not ANA-4 §9's `IS NULL`. | `0001_init.sql` carries no database comment at all, so `IS NULL` clears nothing; the stale text is a source comment (`0001_init.sql:96`) forward-only forbids editing. ANA-4 §9 amendment (D43). |
+| A2 | `ProbeSnapshot` gains `source` (`probe` \| `manual`) beyond ANA-4 §4.6's example. | §4.6's "a manual entry is never overwritten by a probe that finds nothing" needs a recorded origin; without one the rule is a guess about who wrote a row. ANA-4 §4.6 amendment (D45). |
+| A3 | D51's `Kept` is keyed on `snapshot.resolved.is_none()`, not `status == Missing`. | Review gate MEDIUM-3: an unparsable `agent.launch` and a `probe_tools` transport fault also learn nothing about the box, and both were clobbering a hand-written row. ANA-4:795-798's wording is the authority; the blueprint's step 7 was the narrower one. |
+| A4 | The probe is served through `AgentRuntime::serve` → `Served::Deferred`, not a raw `tokio::spawn` in the worker loop (blueprint P-3). | Every long operation the loop already defers goes through the runtime, and the test harness polls those futures inline; a second spawning site would have needed a second harness path. |
+| A5 | `acp::handshake` lives in its own file with the child owned by a `ChildGuard` in the caller's frame (blueprint P-5, P-9). | Milestone 3's CRITICAL was an orphaned adapter. A probe spawns more children than a chat does, so the fix is structural: timeout, actor failure, garbage, success and a dropped future all reach the same kill. |
+| A6 | `crates/htui-store/build.rs` with `rerun-if-changed` on both migration directories. | `sqlx::migrate!` registers rerun-if-changed **per file**, so adding `0002` did not invalidate a warm `target/`: the suite failed against a schema the binary did not know it had. MOD-4's `0003` would have hit the same trap. |
+| A7 | `#![cfg(feature = "testkit")]` on `crates/htui/tests/chat.rs` and `chat_offline.rs`; an `ETXTBSY` retry (`spawn_fixture`) in `crates/htui-agent/tests/probe.rs`. | Pre-existing: a bare `cargo test -p htui` did not compile, and the fixture-script tests flaked when another test's `fork` held a write fd to the script being `exec`'d. |
+| A8 | T23's validate line is `cargo test -p htui-core --all-features`; T26's "no process is spawned" became "tier 2 is never reached". | Both were plan defects found by verification: the bare line compiles neither the conformance suite nor the `agents` join, and tier 1 does spawn `--version` children even when tier 2 never runs. |
+
+**Known and accepted:**
+
+- `open_session`'s timeout arm still orphans its adapter exactly as `handshake` no longer does
+  (blueprint H-2). Deliberately out of this milestone's file set; the guard that fixes it now
+  exists in `launch.rs`, so milestone 6 inherits a four-line change.
+- On the probe's **success** path the process group is not swept. `wait()` has just reaped the
+  leader, so its pgid is free for reuse and a late `killpg` could land on an unrelated group; a
+  sound sweep must happen before the reap, which `ChildWrapper::wait` does not expose. A tool that
+  daemonises a helper can therefore outlive its probe. No tool in the seeds does.
+- `unauthenticated` is "non-empty `authMethods`", full stop (blueprint P-11): nothing in the tree
+  can check a credential until MOD-10, so an authenticated `agy` box would read `unauthenticated`.
+  Milestone 6 owns the check.
+- `agent_box.version` holds the **handshake** value by ANA-4:765, so the Settings column shows the
+  adapter's version (`0.48.0`) rather than the agent CLI's (`2.1.263`, which is in `probe.tools`).
+- A `probe_tools` transport fault has no direct test: it needs a `spawn_blocking` join failure,
+  which no test can induce deterministically. It shares an arm with the unparsable-launch case,
+  which is tested.
+- First launch after this lands **rebuilds every box's mirror** (`schema_version` 2 vs the stored
+  1, MOD-6 plan D8). Expected, not a defect; recorded in the HANDOFF note.
