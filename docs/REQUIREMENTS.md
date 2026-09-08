@@ -1,7 +1,9 @@
 # htui - Requirements
 
 **Owner:** Luigi Marrandino
-**Status:** approved draft, 2026-09-03
+**Status:** approved draft, 2026-09-03; amended 2026-09-08 by maintainer decision on ANA-10
+(`docs/ANA-10.md` §6.1, `docs/decisions/ana/ana-10.md`) — R-STO-7 added; R-ID-3, R-ENT-7, R-STO-1,
+R-STO-4, R-STO-5, R-HIS-1, R-AGT-4, R-PRM-4, R-SKL-1, R-TUI-1 and R-TUI-8 amended in place
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -28,8 +30,10 @@ conflict. Their verdicts survive only where restated here.
   graphs across projects, repositories and machines.
 - **R-ID-2 (must).** `htui` is not an IDE, not a code editor, not a terminal multiplexer, and not a
   cloud-hosted service. It is a local-first, developer-guided harness.
-- **R-ID-3 (must).** Postgres is the single source of truth. Everything `htui` knows lives there:
-  items, documents, runs, transcripts, skills, templates, box profiles, agent registry, settings.
+- **R-ID-3 (must).** Wherever a server is configured, Postgres is the single source of truth.
+  Everything `htui` knows lives there: items, documents, runs, transcripts, skills, templates, box
+  profiles, agent registry, settings. A box with no server configured is the exception R-STO-7
+  defines, and is the only one. Amended by ANA-10 (`docs/ANA-10.md` §6.1), 2026-09-08.
 - **R-ID-4 (must).** `htui` writes no files into managed repositories. The only changes to a
   working tree are made by agents doing the item's work. Rationale: keeps repos clean and avoids
   merge conflicts on generated state.
@@ -86,8 +90,14 @@ conflict. Their verdicts survive only where restated here.
   | `CLEAN` | refactor  | plan, implement, review              |
   | `TOOL`  | tooling   | plan, implement, review              |
 
-- **R-ENT-7 (must).** Item keys are minted online from a per-project, per-prefix sequence. Never
-  reused. Offline creation is not supported (see R-STO-4).
+- **R-ENT-7 (must).** Item keys are minted from a per-project, per-prefix sequence held by the store
+  that owns the project: Postgres for a project that exists on a server, the local store for a
+  project created on a box with no server configured (R-STO-7). Never reused: a project has exactly
+  one counter and exactly one writer of it, and adoption seals a project's local counter in the same
+  transaction that fast-forwards the server's. Creating an item in a project mirrored from a server,
+  while that server is unreachable, is not supported (see R-STO-4). Amended by ANA-10
+  (`docs/ANA-10.md` §4.3, §6.1), 2026-09-08: the "never reused" guarantee is a one-writer-per-counter
+  property, and a project that exists on no server satisfies it by construction.
 - **R-ENT-8 (must).** Item status is one of `open`, `queued`, `in_progress`, `awaiting_approval`,
   `blocked`, `done`, `failed`, `closed`. Transitions are driven by the orchestrator and by close-out,
   not edited by hand.
@@ -108,21 +118,47 @@ conflict. Their verdicts survive only where restated here.
 
 ## 4. Storage, cache and offline (R-STO)
 
-- **R-STO-1 (must).** Postgres is the only writable store. Connection string and provider
-  identities live in the OS keyring (Windows Credential Manager, macOS Keychain, Linux secret
-  service), never in a file.
+- **R-STO-1 (must).** Postgres is the only writable **shared** store: a box with a server configured
+  writes nothing anywhere else. A box with no server configured writes to a local store on that box
+  alone, whose rows reach a server only through an explicit, confirmed adoption (R-STO-7). Connection
+  string and provider identities live in the OS keyring (Windows Credential Manager, macOS Keychain,
+  Linux secret service), never in a file — including when the connection string is typed into the
+  TUI rather than passed to `htui --set-dsn`. Sentence 1 amended by ANA-10 (`docs/ANA-10.md` §6.1),
+  2026-09-08; the keyring sentence is unchanged and now binds two entry paths.
 - **R-STO-2 (must).** TLS to Postgres is supported and optional.
 - **R-STO-3 (must).** Each box keeps a read-only cache of the projects it has opened under the
   user's config directory, refreshed on every successful connection. Contents: items, links,
   documents, notes, run and step summaries, and transcripts of the last N steps (N configurable).
-- **R-STO-4 (must).** When Postgres is unreachable, the TUI opens in offline read-only mode from the
-  cache: browse items, graph, documents and cached transcripts. No item creation, no runs. A
-  free-standing chat session against a repo (R-TUI-6) remains allowed; its events are buffered
-  locally, scrubbed, and persisted on the next successful connection so R-HIS-1 still holds.
+- **R-STO-4 (must).** When a **configured** Postgres is unreachable, the TUI opens in offline
+  read-only mode from the cache: browse items, graph, documents and cached transcripts. No item
+  creation, no runs. A free-standing chat session against a repo (R-TUI-6) remains allowed; its
+  events are buffered locally, scrubbed, and persisted on the next successful connection so R-HIS-1
+  still holds. This requirement covers "server known, unreachable" only; "no server configured" is
+  R-STO-7. One word added by ANA-10 (`docs/ANA-10.md` §6.1), 2026-09-08; the state it describes is
+  otherwise unchanged, and every document that cites it for the offline case still cites it
+  correctly.
 - **R-STO-5 (must).** Schema migrations are versioned, forward-only in version one, applied by
-  `htui` on connect after confirmation.
+  `htui` on connect after confirmation. The per-box SQLite schemas are versioned and forward-only on
+  the same rule but are applied without confirmation when the local file is opened: the read-only
+  cache (R-STO-3) answers a version mismatch by rebuilding, and the local store (R-STO-7), which
+  holds rows that exist nowhere else, migrates its data forward and is never rebuilt. Extended by
+  ANA-10 (`docs/ANA-10.md` §6.1), 2026-09-08: "on connect after confirmation" was already false of
+  the cache's own migrations, and the extension makes an existing gap explicit rather than changing
+  the Postgres rule.
 - **R-STO-6 (must).** Startup with a warm cache and reachable Postgres is under one second on the
-  reference workstation. Cache refresh runs in the background and never blocks input.
+  reference workstation. Cache refresh runs in the background and never blocks input. Unchanged by
+  ANA-10, and a decision is owed: as written the budget is conditioned on a reachable server and
+  binds no local-only start (R-STO-7). `docs/ANA-10.md` §10.4 asks whether to extend it; §12
+  criterion 13 takes the measurement either way.
+- **R-STO-7 (must).** A box that has never been given a DSN opens in **local-only** mode against a
+  local store held separately from the read-only cache of R-STO-3. It is a complete box: it may
+  create the hierarchy, items and free-standing chats, and may run step graphs against its own
+  projects under the full orchestration contract of R-ORCH. Its rows stay local when a DSN is later
+  configured — they are never uploaded as a side effect of connecting, and a project that is still
+  local is not runnable while a DSN is configured. Adoption into a server is an explicit, confirmed
+  action, recorded against the server adopted into, and refused for any second or different server
+  without a further explicit confirmation. Added by ANA-10 (`docs/ANA-10.md`,
+  `docs/decisions/ana/ana-10.md`), 2026-09-08; implemented as MOD-17, with adoption as MOD-18.
 
 ## 5. Agent driver (R-AGT)
 
@@ -135,10 +171,12 @@ conflict. Their verdicts survive only where restated here.
   permissions, presents edit proposals, and receives usage.
 - **R-AGT-3 (must).** Fallback implementation: CLI stream adapter for agents without ACP, parsing
   the agent's headless streaming output into the same event kinds.
-- **R-AGT-4 (must).** Agent registry in Postgres: name, transport (`acp` or `cli`), launch command,
-  model list, billing mode (`subscription` or `per_token`), default model, enabled per box. Version
-  one entries: `claude` and `agy`. Support for `agy` over ACP is unverified and must be settled by
-  ANA-4.
+- **R-AGT-4 (must).** Agent registry in the store that owns the box — Postgres for a box with a
+  server configured, the local store for a box with none (R-STO-7): name, transport (`acp` or
+  `cli`), launch command, model list, billing mode (`subscription` or `per_token`), default model,
+  enabled per box. Version one entries: `claude` and `agy`. Support for `agy` over ACP is unverified
+  and must be settled by ANA-4. Amended by ANA-10 (`docs/ANA-10.md` §6.1), 2026-09-08: a box that
+  never connects never reaches the first-connect seed, so its registry has no other home.
 - **R-AGT-5 (must).** Adding an agent requires a registry row and, at most, one stream adapter. No
   orchestrator or prompt code changes.
 - **R-AGT-6 (must).** Autodiscovery: on box registration and on demand, probe `PATH` for known
@@ -193,7 +231,10 @@ conflict. Their verdicts survive only where restated here.
 
 - **R-HIS-1 (must).** Every session event from R-AGT-1, plus the assembled prompt, every follow-up
   and every permission answer, is stored as an ordered row per run step, after scrubbing. Nothing
-  about a run exists only on one box.
+  about a run exists only on one box once that box has a server configured. On a box that has never
+  been given a DSN (R-STO-7) the local store is the only copy — of a graph run as much as of a chat
+  — and the TUI says so. Sentence 2 bounded by ANA-10 (`docs/ANA-10.md` §6.1), 2026-09-08; sentence 1
+  is unchanged and binds the local store exactly as it binds Postgres.
 - **R-HIS-2 (must).** The chat view can reopen any past step read-only and replay it.
 - **R-HIS-3 (must).** Retention is configurable per project; default keeps everything.
 
@@ -208,9 +249,13 @@ conflict. Their verdicts survive only where restated here.
 - **R-PRM-3 (must).** Per-step token budget; oversize inputs are trimmed by a fixed priority order
   (template and skills first, then item body, then prior documents, then upstream summaries, then
   excerpts) and the trim is recorded on the step.
-- **R-PRM-4 (must).** Prompt templates per phase are versioned rows in Postgres with a documented
-  placeholder contract, editable in the TUI.
-- **R-SKL-1 (must).** Skill library in Postgres: name, description, versioned markdown body.
+- **R-PRM-4 (must).** Prompt templates per phase are versioned rows in the store that owns the
+  project, with a documented placeholder contract, editable in the TUI. Amended by ANA-10
+  (`docs/ANA-10.md` §6.1), 2026-09-08: a local run resolves its template at prompt assembly, so a
+  local-only project (R-STO-7) carries its own rows.
+- **R-SKL-1 (must).** Skill library in the store that owns the project: name, description, versioned
+  markdown body. Amended by ANA-10 (`docs/ANA-10.md` §6.1), 2026-09-08, for the same reason as
+  R-PRM-4 — R-PRM-1 puts bound skill text in every step prompt.
 - **R-SKL-2 (must).** Bindings at project level and at phase level; a phase binding overrides a
   project binding of the same skill. A binding pins a version or follows latest.
 - **R-SKL-3 (must).** TUI supports create, edit, view version diff, bind and unbind.
@@ -244,9 +289,11 @@ conflict. Their verdicts survive only where restated here.
 
 ## 11. TUI (R-TUI)
 
-- **R-TUI-1 (must).** Keyboard driven, mouse optional. Top bar: workspace or project, box,
-  Postgres state, active run count. Tabs: Backlog, Chat (one per session), Skills, Settings.
-  Workspace switcher overlay. Queue overlay for auto mode with reorder and pause.
+- **R-TUI-1 (must).** Keyboard driven, mouse optional. Top bar: workspace or project, box, store
+  state — distinguishing online, connecting, offline since T, and local-only (no server configured)
+  — active run count. Tabs: Backlog, Chat (one per session), Skills, Settings. Workspace switcher
+  overlay. Queue overlay for auto mode with reorder and pause. "Postgres state" replaced by ANA-10
+  (`docs/ANA-10.md` §6.1), 2026-09-08: three distinct states rendered one string.
 - **R-TUI-2 (must).** Backlog left pane: items grouped by project, filters by status, project,
   capability and readiness. Actions: new, edit, run, queue, close, open graph.
 - **R-TUI-3 (must).** Backlog right pane is tabbed per selected item: **Body**, **Runs**, **Graph**,
@@ -262,7 +309,14 @@ conflict. Their verdicts survive only where restated here.
 - **R-TUI-7 (must).** Skills tab: library, editor, version diff, bindings matrix by project and
   phase.
 - **R-TUI-8 (must).** Settings tab: agent registry with quota, box profile with capability edits,
-  item kinds and step graphs per project, secret provider, caps, scheduler window.
+  item kinds and step graphs per project, secret provider, caps, scheduler window, and the Postgres
+  connection: whether a DSN is stored, a masked field to enter or replace it, an action to clear it,
+  and the state of the last attempt. What is typed goes to the OS keyring and nowhere else
+  (R-STO-1); it is not echoed, not logged, and not written to any file. Connection section added by
+  ANA-10 (`docs/ANA-10.md` §4.9, §6.1), 2026-09-08 — recorded as an **extension** of this
+  requirement rather than a reading of it, since the original list named no connection section and
+  its "secret provider" is R-SEC-1/R-SEC-2's agent provider config, from which R-SEC-2 explicitly
+  excludes `htui`'s own credentials.
 - **R-TUI-9 (must).** Close-out writes the final summary document, sets status, records commit
   hashes from the run. No markdown files are produced.
 
