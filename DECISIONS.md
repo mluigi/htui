@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[ANA-10](docs/decisions/ana/ana-10.md)** - Local-only mode: SQLite as a primary writable store (done, 2026-09-08)
 - **[ANA-5](docs/decisions/ana/ana-5.md)** - Prompt assembly: template contract, section model, upstream walk, trim order, file excerpts (done, 2026-09-06)
 - **[ANA-2](docs/decisions/ana/ana-2.md)** - Orchestration design: step graphs, phase contract, status machines, fan-out, isolation, resume (done, 2026-09-06)
 - **[ANA-4](docs/decisions/ana/ana-4.md)** - Agent protocol: ACP client and CLI fallback (done, 2026-09-05)

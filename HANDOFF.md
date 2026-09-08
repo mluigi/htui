@@ -20,8 +20,19 @@ transport passes the same thirteen conformance cases as the fake with no case ad
 are answered inline, edits arrive as diffs, and a real session was driven end to end on this box
 against adapter 0.48.0. Milestone 2 landed before it (`5c717d0`..`34d5f04`): the agent registry
 seeds itself, an agent named nowhere in the tree reaches a working session from its row alone
-(`R-AGT-5`), and the Settings tab lists the registry. ANA-5 concluded
-(`docs/ANA-5.md`,
+(`R-AGT-5`), and the Settings tab lists the registry. ANA-10 concluded
+(`docs/ANA-10.md`, `docs/decisions/ana/ana-10.md`), with its gating decisions taken the same day:
+a box with no DSN becomes a **complete** box, not a read-only shell — a fourth `Backend::Local` arm
+over a **separate** `<config_root>/local/local.sqlite` (never `cache.sqlite`, which is
+delete-on-mismatch), a `LocalStore: WriteStore` with its own forward-only `local_migrations/` set,
+local item minting through a project-origin-scoped key counter, **graph runs at parity** with a
+server-backed box, an **in-app masked DSN field** (the item's stated objective), a once-only
+first-run overlay, `box.toml` holding three facts and **no `local_only` mode flag**, and adoption
+kept explicit and deferred. Spawns MOD-17 (implementation, M0-M6 + M2b), MOD-18 (adoption, M7) and
+MOD-19 (in-process transition, M9); MOD-4 gains M8 and is now blocked on MOD-17's M3.
+**`docs/REQUIREMENTS.md` amendments are proposed in `docs/ANA-10.md` §6.1 and not yet applied** —
+`R-STO-1` s.1, a split of `R-STO-4`, `R-ENT-7`, `R-ID-3`, `R-HIS-1`, `R-STO-5`, `R-TUI-1`,
+`R-TUI-8`, `R-AGT-4`, `R-PRM-4`, `R-SKL-1`. ANA-5 concluded (`docs/ANA-5.md`,
 `docs/decisions/ana/ana-5.md`): plain `{{name}}` templates over a closed per-role placeholder set
 with no templating crate, ten `<section>` names, ANA-9 §7.3 amended at query level (`MIN(depth)`,
 `in_scope`), kept-first trim order with a `chars-v1` estimator and `trim_record` already in
@@ -31,12 +42,11 @@ crate (`htui-core::prompt` + `htui-agent::excerpt`), no new migration (folds int
 MOD-2 is now unblocked. ANA-2 concluded (`docs/ANA-2.md`, `docs/decisions/ana/ana-2.md`): graph
 shape kept, three compare-and-set status tables, review loop at the same `position`, judge at
 `fanout_index = -1`, per-repo `run_step_tree`, lease-based resume, migration
-`0003_orchestration.sql` (after `0002`), new crate `htui-orch`; MOD-4 waits on MOD-2 only. ANA-4
-concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`AgentSession`,
-`agent-client-protocol =2.1.0` (MSRV 1.88 in MOD-2), new `htui-agent` crate, migration
-`0002_agent_probe.sql`. Live coordinates: dev Postgres via `compose.yaml` (port 5439), tests need
+`0003_orchestration.sql` (after `0002`), new crate `htui-orch`. Live coordinates: dev Postgres via
+`compose.yaml` (port 5439), tests need
 `HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres`
-(`docs/decisions/mod/mod-6.md`). MOD-2, MOD-7, MOD-9, MOD-13, MOD-14 and MOD-15 can start now.
+(`docs/decisions/mod/mod-6.md`). MOD-2, MOD-7, MOD-9, MOD-13, MOD-14, MOD-15 and MOD-17 can start
+now.
 
 ---
 
@@ -53,7 +63,6 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   `docs/decisions/ana/ana-5.md`): `ExcerptProvider` in `htui-core::prompt::excerpt`, propose-only,
   fail-open with a deadline, read-only (`R-ID-4`), non-LLM (`R-ID-6`); Serena's default `.serena/`
   directory must be configured outside every `repo_box_path`. Output: `docs/ANA-3.md`.
-
 ### Next features
 
 - [ ] **MOD-2 - Agent driver + chat tab** (from ANA-4). `R-AGT-1..8`, `R-PRM-1..3`, `R-TUI-6`,
@@ -152,8 +161,9 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   no-op. 410 tests green on **Linux** with Postgres live; `rust-reviewer` returned no CRITICAL and no
   HIGH, and its two MEDIUM findings (both in the `[H-1]` sealing fallback) are fixed in this commit.
   Known and accepted: an uploaded offline chat has `run_step.agent_id` and `model` NULL, the line
-  format carrying `session_event` columns only. Milestone 5 (autodiscovery and box probe, migration
-  `0002_agent_probe.sql`) is next.
+  format carrying `session_event` columns only. **Windows verification of every phase is MOD-16**,
+  which owns the runtime facts a Linux box cannot answer. Milestone 5 (autodiscovery and box probe,
+  migration `0002_agent_probe.sql`) is next.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
@@ -162,16 +172,30 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   `htui-orch` plus `crates/htui/src/run_worker.rs` (§8), migration `0003_orchestration.sql` and
   `cache_migrations/0003_orchestration.sql` (§9; never applied before MOD-2's `0002`. **The cache
   migration is `0003`, not the `0002` ANA-2 §9 reserved:** MOD-2 milestone 4 spent
-  `cache_migrations/0002_agent_mirror.sql` mirroring the registry so an offline chat can start), sixteen
-  `WriteStore` methods and the `PgStore` reads of §8 with conformance cases, `can_move_to` on the
+  `cache_migrations/0002_agent_mirror.sql` mirroring the registry so an offline chat can start), plus
+  **`local_migrations/0002_orchestration_local.sql` in the same commit** (ANA-10 §5.3's Set B — a
+  `0003` landing alone leaves the local schema a generation behind, and SQLite makes catching up
+  expensive), **eighteen** `WriteStore` methods (ANA-2 §8's table is 17 rows and `docs/ANA-2.md:1744`
+  names two; §1760's "sixteen" undercounts its own table) plus the six `ReadStore` reads of
+  `:1730-1733` and the fifteen new inherent reads of `:1711-1724`, each now obliging **three** stores
+  — `MemStore`, `PgStore` and ANA-10's `LocalStore` — with conformance cases, `can_move_to` on the
   three status enums (§4.3), typed `BoxSettings`/`ProjectSettings` (§4.7), projection additions
   (§6.2), fixture corrections (`attempt` 1-based, non-NULL `graph_snapshot`, `review` in
   `implement.input_kinds`, `gate_hard` seed), `gix` as the git dependency; build order in §9,
   steps 1 to 4 need nothing from MOD-2. Per ANA-5 (`docs/ANA-5.md` §4.6, §8): calls `assemble()`
   for the judge and handoff prompts, supplies `verify_failure`/`previous_diff` for the review loop,
   `RunStepSummary` gains `prompt_tokens` and `trimmed`; the pre-flight digest write is MOD-2's
-  `set_step_prompt`, not `finish_step`. Blocked on MOD-2 (MOD-6 landed,
-  `docs/decisions/mod/mod-6.md`).
+  `set_step_prompt`, not `finish_step`. Per ANA-10 (`docs/ANA-10.md` §4.8, §9.1): **local-only mode
+  runs graphs at parity**, so this item also owns M8 — `LocalStore` implementations of the seam above
+  and the four SQL ports (`shared_serialized`'s advisory lock becomes an in-process lock sound only
+  under ANA-10 §7.1's file lock, `FOR UPDATE` becomes `BEGIN IMMEDIATE`, `&&` over `repo_scope` and
+  `<@` over tag arrays become Rust predicates shared with Postgres through `htui-core`). The
+  `PgStore`-inherent reads of ANA-2 §8 become `Backend`-inherent with a four-arm `match self`
+  (`agents()` precedent, `backend.rs:292-298`); §8's split rule itself is unchanged. Two
+  prohibitions: never `CHECK (fanout_index >= 0)` on any of the three schemas (ANA-2 risk 12), and
+  no local `shared_serialized` before ANA-10 §10.17 is answered. Blocked on MOD-2 **and on MOD-17's
+  M3** (ANA-10 §9.1's ordering rule: `LocalStore` must exist before build step 1, or this item
+  inherits eighteen unbudgeted methods) (MOD-6 landed, `docs/decisions/mod/mod-6.md`).
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
   per-box paths, agent autodiscovery hook. Not blocked (MOD-6 landed,
@@ -206,7 +230,10 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   `docs/ANA-2.md` (§4.10, §9): `ready_items` per ANA-9 §7.4 in full, the same `claim_run`
   admission as MOD-4, batch caps as `SUM(run_step.usage)`, escalations in the queue overlay, the
   `scheduler_window` key stored but not enforced; a graph with a `gate_hard` phase is never fully
-  unattended, so `FIX`/`CLEAN`/`TOOL` are the first targets. Blocked on MOD-4.
+  unattended, so `FIX`/`CLEAN`/`TOOL` are the first targets. Per ANA-10 (`docs/ANA-10.md` §4.8):
+  `ready_items` must be **rewritten** for SQLite as well as implemented for Postgres — `<@` and
+  `= ANY($projects)` have no SQLite spelling — which is why auto mode is not part of MOD-4's M8.
+  Blocked on MOD-4.
 - [ ] **MOD-13 - Backlog filters and item editing** (from MOD-1). `R-TUI-2`, `R-ENT-5`,
   `R-ENT-10..12`. Filters by status, project, capability and readiness; `new` and `edit` actions
   with the compare-and-set on `version` and the three-way divergence view (`docs/ANA-9.md` §4.2,
@@ -215,7 +242,13 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   the `DetailRegistry` and overlay registry; `PgStore` (MOD-6, `docs/decisions/mod/mod-6.md`)
   supplies the real mint and revisions. The `touched_paths` edit path accepts and validates the
   `repo_name:glob` qualification of `docs/ANA-2.md` §4.7 (bare glob = primary repo);
-  `touched_paths` is tier 1 of ANA-5's excerpt ranking (`docs/ANA-5.md` §4.5).
+  `touched_paths` is tier 1 of ANA-5's excerpt ranking (`docs/ANA-5.md` §4.5). Editing on a box
+  with no server is **MOD-17's** (ANA-10 concluded; `docs/ANA-10.md` §9.3): this item must not ship
+  a `new`/`edit` action reachable while the backend is `Local` or `Offline`, any local `mint_item`
+  or `item_key_counter` (that is MOD-17's M6, gated on the `R-ENT-7` amendment), a compare-and-set
+  view backed by anything but `PgStore`/`MemStore`, or a second copy of the local-only status word.
+  **The scope line "mint per §7.1" above means ANA-9 §7.1's Postgres statement**; on a box with no
+  server the mint is ANA-10 §7.3's three-statement local form, which MOD-17 owns.
 - [ ] **MOD-14 - Graph tab** (from MOD-1). `R-TUI-5`, `R-ENT-9`. Item neighbourhood one to N hops
   across projects through `ReadStore::links` (`docs/ANA-9.md` §6.1), status and link kind per
   edge, keyboard navigation that re-roots the Backlog selection; the `open graph` action of
@@ -230,7 +263,70 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
   `is_override = false`); whichever of MOD-15 and MOD-4 lands second owns the seed amendment. Per
   ANA-5 (`docs/ANA-5.md` §5.3, §5.4, §9): seed ten `prompt_template` rows per project (eight phase
   names plus reserved `judge` and `handoff`, amending `docs/ANA-9.md` §5.10), the phase editor
-  refuses the two reserved names, and the Settings tab exposes the ten `app_setting` keys.
+  refuses the two reserved names, and the Settings tab exposes the ten `app_setting` keys. Creating
+  a workspace on a box with no server is **MOD-17's** (ANA-10 concluded; `docs/ANA-10.md` §9.3,
+  §9.4): "Not blocked" above holds for the server-backed paths only — the create paths for a
+  server-less box depend on MOD-17. This item builds and registers the Settings connection
+  **section** (`SectionId("connection")`, named by ANA-10 M0 so neither item has to guess);
+  **MOD-17 owns the masked DSN field inside it** and must not have a second one built here. Also:
+  no ad-hoc focus mechanism instead of M0's `TabAction::FocusSection` /
+  `SettingsSection::captures_input` / `MaskedField` names; no second persistence location for a
+  "shown once" marker or for local settings (ANA-10 §5.4's `local_setting` exists for that); and
+  `Settings > Rebuild cache` stays as written — it is safe because the local store is a different
+  file that `MIRRORED_TABLES` never names, so it must not be "helpfully" extended to clear local
+  data, and its confirmation copy should say what it does and does not delete.
+
+- [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
+  `R-NF-3`, `R-HIS-1`. Every Windows-only path MOD-2 compile- and lint-checked from Linux but
+  never ran. `cargo clippy --target x86_64-pc-windows-msvc -p htui-agent` is green and has already
+  caught two defects a Linux build cannot see (`c4d65ba`), but four facts are runtime facts:
+  the job object's kill-on-close guarantee leaves no `node`/`claude` process behind (`docs/ANA-4.md`
+  §11 criterion 11's Windows half); `CreateProcess` refuses a `.cmd` shim, so `${claude}` resolving
+  to one must fail with a message naming the shim rather than a bare `os error 193`;
+  `CREATE_NO_WINDOW` actually suppresses the console; and milestone 4's `[H-1]` buffer sealing
+  behaves under Windows rename semantics, where a sealed file held open by another process makes
+  the rename fail rather than silently succeed (`seal_orphaned` must warn and carry on, and
+  `seal_one`'s numbered fallback must not lose a tail). Also run the Postgres suites there: the
+  cache is SQLite on a different filesystem, and `append_pending`'s `OpenOptions::append` and the
+  `.jsonl.open` sealing have never met a Windows file lock. Needs a Windows box with `node` and
+  `claude-agent-acp` installed; milestone 5 is the first milestone whose own work touches the
+  spawn path, so this can run before or beside it. Not blocked.
+
+- [ ] **MOD-17 - Local-only mode: a writable local store** (from ANA-10). `R-STO-1`, `R-STO-3..6`,
+  `R-ENT-7`, `R-TUI-1`, `R-TUI-8`, `R-NF-3`, `R-ID-3`, `R-ID-7`, `R-HIS-1`, `R-USR-2`, `R-BOX-1`.
+  A box that has never been given a DSN becomes a complete box rather than an empty read-only
+  shell. Design concluded in `docs/ANA-10.md` (ANA-10, `docs/decisions/ana/ana-10.md`): a fourth
+  `Backend::Local` arm over a **separate** file `<config_root>/local/local.sqlite` (never
+  `cache.sqlite`, which is delete-on-mismatch), a new `LocalStore: WriteStore` with its own
+  forward-only `local_migrations/` set, local id minting through a project-origin-scoped key
+  counter, `box.toml` carrying three `#[serde(default)]` facts (no `local_only` mode flag), a
+  once-only first-run overlay, and an in-app masked DSN field. Milestones **M0-M6 plus M2b** of
+  `docs/ANA-10.md` §9.1; **M2b is the milestone that satisfies the item's stated objective** and
+  M0+M1+M2+M2b is a complete shippable answer on its own (§9.2). Blocked on nothing, but **M3 must
+  land before MOD-4's build step 1** (§9.1's ordering rule), and M6 is gated on the `R-ENT-7`
+  amendment (`docs/ANA-10.md` §6.1, §10.3). MOD-13's and MOD-15's create/edit paths for a
+  server-less box depend on it; MOD-15 owns the Settings connection *section*, this item owns the
+  credential *field* inside it (§9.4). The requirement amendments of §6.1 are proposed, not
+  applied — `docs/REQUIREMENTS.md` is maintainer-only.
+- [ ] **MOD-18 - Adoption of local rows into a server** (from ANA-10, deferred). `R-STO-1`,
+  `R-ENT-7`, `R-USR-2`, `R-HIS-1`. `docs/ANA-10.md` §9.1's M7, funded separately so the deferral is
+  visible rather than implied (§10.5): explicit, confirmed, resumable; one transaction per project
+  subtree; `MAX`/`GREATEST` counter fast-forward and the `sealed_at` write inside that transaction;
+  `created_by`/`author_id`/`box_id` and `agent_id` remaps (§10.33); pre-adoption file copy;
+  second-server refusal keyed on `system_identifier`; a UI-visible per-row status, never
+  `pending.rs`'s log-only quarantine. Its unit is a project subtree including `run`, `run_step`,
+  `session_event`, `document` and `command_run` rows, not only items. Blocked on MOD-17 (M6). Until
+  it lands, local rows stay local and a local project is not runnable while a DSN is configured
+  (`docs/ANA-10.md` §11 risk 22) — MOD-17's M3 export path is the floor. The `GREATEST` importer
+  statement now has two consumers, MOD-8 and this item (`item.rs:145-148` reserves it to MOD-8).
+- [ ] **MOD-19 - In-process transition out of local-only** (from ANA-10, deferred). `R-TUI-8`,
+  `R-NF-3`. `docs/ANA-10.md` §9.1's M9 and §10.13: `connect::reconnect_for` as a public factory
+  (the DSN stays inside `connect.rs`, which is `connect.rs:66-70`'s real property — the existing
+  `Reconnect` closure already captures a DSN by move), `let mut reconnect` at
+  `store_worker.rs:411`, and the expensive half, `go_online` learning to **open** a mirror rather
+  than move one (`store_worker.rs:572-575`) while a `Backend::Local` and its open `local.sqlite`
+  are still in hand. Buys one avoided restart and nothing else; MOD-17's M2b delivers the objective
+  without it. Blocked on MOD-17 (M3).
 
 ### Deferred backlog
 
@@ -268,7 +364,7 @@ concluded (`docs/ANA-4.md`, `docs/decisions/ana/ana-4.md`): `AgentDriver`/`Agent
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 2 (ANA-3 context tools, ANA-7 secrets)                                              |
-| MOD-N   | 13 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 2 (ANA-3 context tools, ANA-7 secrets)                                                    |
+| MOD-N   | 17 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 2 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision)              |
