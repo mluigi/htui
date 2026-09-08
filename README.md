@@ -231,6 +231,48 @@ Two environment knobs, both off by default:
 | `HTUI_KEEP_RAW_EVENTS=1` | Keep the verbatim wire message on every recorded row. `project.settings.keep_raw_events` replaces this once the project editor exists |
 | `HTUI_TOOL_<NAME>` | Override one `${name}` placeholder of `agent.launch` — `HTUI_TOOL_NODE`, `HTUI_TOOL_CLAUDE_AGENT_ACP`, … — for a box whose layout the built-in resolver does not understand |
 
+## Installing the `agy` ACP adapter
+
+`claude` reaches ACP through an npm adapter the probe can find on its own. `agy` does not: Google
+ships a separate first-party server, `agy_acp_server`, that is not on `PATH` and not installed by
+the `agy` CLI. `htui` does not download it — it is a proprietary binary with its own release
+cadence, and MOD-2 is not a package manager — so the seed row resolves it through a glob and this
+is the directory that glob expects.
+
+Take the archive for your platform from the ACP registry
+(`https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`, agent id
+`antigravity-acp`). For Linux x86-64 at version 1.1.1 that is:
+
+```bash
+curl -fL -o /tmp/agy-acp.zip \
+  https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_1.1.1-linux-x86_64.zip
+mkdir -p ~/.local/share/htui/agents/antigravity-acp/1.1.1
+unzip -o /tmp/agy-acp.zip -d ~/.local/share/htui/agents/antigravity-acp/1.1.1/
+chmod +x ~/.local/share/htui/agents/antigravity-acp/1.1.1/agy_acp_server.par
+```
+
+Unpack the **whole** archive rather than the server alone: `localharness_external` ships beside it.
+The handshake does not need it (verified), but a live turn may. The registry publishes no checksum
+for any Antigravity platform. macOS uses `agy_acp_server.par` under
+`~/Library/Application Support/htui/agents/antigravity-acp/<version>/`; Windows uses
+`agy_acp_server.exe` under `%LOCALAPPDATA%\htui\agents\antigravity-acp\<version>\`, and also finds
+the copy JetBrains IDEs install under `%LOCALAPPDATA%\JetBrains\*\acp-agents\`. A box whose layout
+none of those patterns describes sets `HTUI_TOOL_AGY_ACP_SERVER` to the binary's full path.
+
+**The executable bit matters** and **the Linux argument is mandatory.** `agent.launch` appends
+`--uid=` on Linux, with its value deliberately empty; without it the server's startup path tries to
+drop privileges to a `nobody` group and aborts (`Check failed: LookupGIDByGroupName(…)`) before it
+reads a byte of stdin. The probe applies the append, which is why `Settings > r` is what makes a
+chat launch a working `agy`.
+
+**Authentication is the vendor's, not `htui`'s.** The server keeps its own configuration under
+`$GEMINI_HOME/antigravity-acp/` (default `~/.gemini/antigravity-acp/`) — a *sibling of, and
+separate from*, the `agy` CLI's own directory, so being logged into the CLI does not log in the
+adapter. Until it holds a credential the probe records `unauthenticated` and leaves the agent
+disabled on this box; a chat started anyway now reports the server's own message, which names the
+methods it accepts (`oauth-personal`, `gemini-api-key`, `agent-platform`, `oauth-business`) and the
+`settings.json` that selects one. `htui` never sees the credential and cannot perform the login.
+
 ## Platforms
 
 `R-NF-1` is Windows 10+, Linux and macOS, and nothing in the crate is platform-specific: the

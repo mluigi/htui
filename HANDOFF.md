@@ -14,9 +14,16 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-08):** MOD-2 milestone 5 landed and is reviewed (`fb626a8`): a box
-**answers for itself** — `Settings > r` probes what is installed, records versions and per-box
-enablement in a new `agent_box.probe` snapshot, and ANA-4 §11 criterion 9 was proven live here.
+**Current status (2026-09-09):** MOD-2 milestone 6 landed and is reviewed (`acf16f7`), one task
+short: **`agy` works over ACP**, Google's `agy_acp_server` is installed on this box, and ANA-4 §11
+criterion 10 is proven live. The driver now spawns what the probe recorded, which is the only path
+carrying `agy`'s Linux-only `--uid=` — an argument the live run proved is **mandatory**, not
+cosmetic. Outstanding: the live `agy` **chat** needs the maintainer to authenticate
+`agy_acp_server` through the vendor's own flow (`$GEMINI_HOME/antigravity-acp/`, separate from the
+`agy` CLI's login), and three ANA-4 §11.14 items wait on it. Milestone 5 landed before it
+(`fb626a8`): a box **answers for itself** — `Settings > r` probes what is installed, records
+versions and per-box enablement in a new `agent_box.probe` snapshot, and ANA-4 §11 criterion 9 was
+proven live here.
 **Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql` is no longer held**
 (`docs/ANA-2.md` §9), and it carries ANA-5 §9's ten `app_setting` defaults with it. Milestone 4
 landed before it (`81d247b`): durable history, an offline chat buffered to
@@ -205,7 +212,51 @@ now.
   so adding `0002` did not invalidate a warm `target/` and the suite failed against a schema the
   binary did not know it had — the same trap awaits MOD-4's `0003`. **First launch after this lands
   rebuilds every box's mirror**: `PgStore::schema_version()` is now 2 and `CacheStore::open` treats
-  a mismatch as a rebuild (MOD-6 plan D8). Milestone 6 (`agy` over ACP) is next.
+  a mismatch as a rebuild (MOD-6 plan D8).
+  **Phase 6 landed (2026-09-09, `acf16f7`), one task short:** `agy` over ACP, planned in
+  `.claude/plans/mod-2-agy-acp.plan.md` with the `code-architect` blueprint beside it. Google's
+  first-party `agy_acp_server` **1.1.1 is installed on this box** (plan D57; `htui` does not
+  download it, the README now carries the steps) and **§11 criterion 10 is proven live**
+  (`crates/htui-agent/tests/agy_live.rs`): the unmodified seed row resolves the server through the
+  glob, appends `--uid=`, completes `initialize` at `protocolVersion 1` in ~1.2 s against a 60 s
+  timeout, records `unauthenticated`, and leaves no surviving process. Four decisions landed with
+  it. **D58** makes the driver spawn `agent_box.probe.resolved` rather than resolving a second time
+  (`AcpAdapter::build` stops ignoring `on_box`), which is the only path that carries a glob tool's
+  per-platform `args`; milestone 5's H-3 was therefore not cosmetic — **`--uid=` is mandatory**, and
+  without it the server aborts in `ChangeRootAndUser` (`Check failed: LookupGIDByGroupName(…) Group
+  nobody not found`) before reading stdin. **D59** gives `unauthenticated` a declarative
+  `discovery.credential { env, files }` block resolved by the probe (files through the existing glob
+  expander, then variables) feeding `status_for`, so an authenticated box reads `ready`; nothing is
+  keyed on an agent name (`R-AGT-5`), the probe never opens the file and records only the tier.
+  **D60** re-probes the row when a chat fails to *spawn*, inline from that chat's own task and under
+  a runtime-wide claim so two chats cannot probe one row at once; there is **no transport fallback**
+  — by maintainer decision a CLI agent is its own registry row, so milestone 8 builds a row, not a
+  degraded mode. **D61** stops `open_session`'s handshake timeout orphaning the adapter (the session
+  task holds a `ChildGuard`; `SessionOptions` carries an injectable timeout). Beyond the plan, the
+  review gate found and this commit fixes a message the SDK swallows: `start_session` sends from an
+  actor whose failure **drops the foreground future**, so `session_main`'s error arm is unreachable
+  for a JSON-RPC error and the vendor's `Authentication required` — the first thing an `agy` user on
+  a fresh box meets — was replaced by "the session task ended before the handshake". `rust-reviewer`
+  returned no CRITICAL and no HIGH; its three MEDIUM and five LOW are all applied. 485 tests green
+  on **Linux** with Postgres live.
+  **Two ANA-4 amendments are needed and are recorded here rather than in the ANA** (maintainer-only,
+  the milestone-5 precedent): §4.5's and §4.6's premise that `agentInfo.version` is a build tag
+  *disagreeing* with the registry semver is **false on the Linux 1.1.1 build**, which reports
+  `agy_acp_server_1.1.1` — D57's "the registry value is a download coordinate only" still holds, its
+  stated reason does not; and §4.5's protocol-echo warning is **confirmed live** (the server echoed
+  `protocolVersion 99` when sent 99, so the echo is no evidence of support).
+  **What milestone 6 still owes** (`T34`, blocked on a maintainer action, not on code): the live
+  `agy` chat. `agy_acp_server` keeps its credentials in `$GEMINI_HOME/antigravity-acp/`, a sibling
+  of and separate from the `agy` CLI's own directory, so the CLI's login does not count and `htui`
+  cannot log in non-interactively; until the maintainer authenticates the server itself, `session/new`
+  is refused and **three ANA-4 §11.14 items stay open** — whether `agy_acp_server` emits
+  `usage_update` and in what field, whether it issues `session/request_permission` in `default` mode
+  and with what option ids, and whether its edits arrive as a standard `tool_call` + `diff` or in a
+  vendor shape. Two of the six closed here: the `.par` mechanics (the `--uid=` finding above;
+  `localharness_external` ships beside the server on Linux too and the handshake does **not** need
+  it, checked by moving it aside) and the `session/new` model list, which is **not learnable while
+  unauthenticated**, so D64 leaves `models: []` and `model_config_id: null` as seeded. Milestone 7
+  (quota and caps) can start without any of this.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
