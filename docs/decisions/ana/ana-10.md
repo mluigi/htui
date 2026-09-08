@@ -60,7 +60,9 @@ and `Backend::Offline` gain `local: Option<LocalStore>`, without which "keep loc
 | # | Question | Decision |
 |---|---|---|
 | §10.3 | May local-only create items at all? | **Yes.** `R-ENT-7` is amended; the origin-scoped counter ships. |
-| §10.5 | Is adoption funded, deferred or declared never? | **Deferred**, with its id minted (MOD-18) so the deferral is visible. |
+| §1.3 | What is local-only *for*? | A **temporary, lite mode**. The full product is `htui` against Postgres; the path to online usage must exist. Parity is over features, not over server-shaped infrastructure (no mirror, no refresh cursor, no warm-cache budget). |
+| §10.5 | Is adoption funded, deferred or declared never? | **Funded** as MOD-18 — answered "deferred" first, then superseded the same day by the framing above: it is the exit the mode promises. **MOD-17 must not ship copy promising migration before MOD-18 exists.** |
+| §10.4 | Does `R-STO-6`'s sub-second budget bind a local-only start? | **No** — it is one of the guarantees that means nothing without a server. `R-STO-6` left unamended; §12 criterion 13 kept as a recorded figure rather than a limit. |
 | §10.8 | Does local-only cover graph runs? | **Yes — full parity** with a server-backed box. Overrides the document's own recommendation. |
 | §10.14 | Is an in-app DSN field permitted? | **Required, not optional** — it is the item's stated objective. |
 | §10.13 | Must leaving local-only be in-process? | Restart boundary retained for the first MOD; the in-process path is MOD-19. |
@@ -113,17 +115,24 @@ are milestone-scoped: §10.17 (multi-process guard on `local.sqlite` — it gate
 one-way doors under SQLite), §10.7 (may adoption rewrite authorship), §10.33 (how adoption remaps
 `agent`), and the requirement-amendment shape questions §10.1, §10.19, §10.20.
 
-**`docs/REQUIREMENTS.md` is not edited by this item.** §6.1 proposes exact replacement wording for
-`R-STO-1` s.1, a split of `R-STO-4`, `R-ENT-7`, `R-ID-3`, `R-HIS-1`, `R-STO-5`, `R-TUI-1`, `R-TUI-8`,
-`R-AGT-4`, `R-PRM-4` and `R-SKL-1`, and records `R-STO-1` s.2, `R-STO-2`, `R-STO-3`, `R-SEC-1..4`,
-`R-ID-7`, `R-ORCH-1..13` and `R-HIS-2` as unaffected. Applying them is a deliberate maintainer act,
-per `.claude/rules/workflow-docs.md`.
+**`docs/REQUIREMENTS.md` was amended on 2026-09-08**, by explicit maintainer decision taken after
+this analysis concluded and applied as its own commit rather than as close-out bookkeeping, per
+`.claude/rules/workflow-docs.md`. `R-STO-7` was added (local-only mode as a complete box) and
+eleven statements amended in place on §6.1's wording: `R-STO-1` s.1, `R-STO-4` (one word, so every
+document citing it for "server known, unreachable" still cites it correctly), `R-ENT-7`, `R-ID-3`,
+`R-HIS-1`, `R-STO-5`, `R-AGT-4`, `R-PRM-4`, `R-SKL-1`, `R-TUI-1` and `R-TUI-8`. `R-STO-1` s.2,
+`R-STO-2`, `R-STO-3`, `R-SEC-1..4`, `R-ID-7`, `R-ORCH-1..13` and `R-HIS-2` are unaffected and are
+recorded as such. `R-STO-6` was deliberately left unamended (§10.4): its sub-second budget is
+conditioned on a reachable server, and a lite mode users are meant to leave does not carry the full
+product's performance contract — the measurement is kept as a recorded figure so a regression stays
+visible.
 
 ## Downstream items
 
 - **MOD-17** - the implementation (M0-M6 plus M2b). Not blocked. M6 gated on the `R-ENT-7`
   amendment; M3 must precede MOD-4's build step 1.
-- **MOD-18** - adoption (M7), deferred by decision. Blocked on MOD-17's M6.
+- **MOD-18** - adoption (M7), **funded**: it is the exit a temporary mode promises. Blocked on
+  MOD-17's M6, and MOD-17's first-run copy may not promise the move until it ships.
 - **MOD-19** - in-process transition out of local-only (M9), deferred. Blocked on MOD-17's M3.
 - **MOD-4** - gains M8 (local graph runs) and is now blocked on MOD-2 **and** MOD-17's M3; its
   migration list gains `local_migrations/0002_orchestration_local.sql` in the same commit.

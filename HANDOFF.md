@@ -30,9 +30,13 @@ server-backed box, an **in-app masked DSN field** (the item's stated objective),
 first-run overlay, `box.toml` holding three facts and **no `local_only` mode flag**, and adoption
 kept explicit and deferred. Spawns MOD-17 (implementation, M0-M6 + M2b), MOD-18 (adoption, M7) and
 MOD-19 (in-process transition, M9); MOD-4 gains M8 and is now blocked on MOD-17's M3.
-**`docs/REQUIREMENTS.md` amendments are proposed in `docs/ANA-10.md` §6.1 and not yet applied** —
-`R-STO-1` s.1, a split of `R-STO-4`, `R-ENT-7`, `R-ID-3`, `R-HIS-1`, `R-STO-5`, `R-TUI-1`,
-`R-TUI-8`, `R-AGT-4`, `R-PRM-4`, `R-SKL-1`. ANA-5 concluded (`docs/ANA-5.md`,
+Local-only is a **temporary, lite mode**: the full product is `htui` against Postgres, the path to
+online usage must exist (so MOD-18 is funded, not optional), and parity is over features rather than
+over server-shaped infrastructure — no mirror, no refresh cursor, no warm-cache budget.
+**`docs/REQUIREMENTS.md` was amended for it on 2026-09-08** by maintainer decision: new `R-STO-7`
+(local-only mode), and `R-STO-1` s.1, `R-STO-4` (one word), `R-ENT-7`, `R-ID-3`, `R-HIS-1`,
+`R-STO-5`, `R-TUI-1`, `R-TUI-8`, `R-AGT-4`, `R-PRM-4` and `R-SKL-1` amended in place; `R-STO-6`
+deliberately left alone. ANA-5 concluded (`docs/ANA-5.md`,
 `docs/decisions/ana/ana-5.md`): plain `{{name}}` templates over a closed per-role placeholder set
 with no templating crate, ten `<section>` names, ANA-9 §7.3 amended at query level (`MIN(depth)`,
 `in_scope`), kept-first trim order with a `chars-v1` estimator and `trim_record` already in
@@ -300,7 +304,12 @@ now.
   `cache.sqlite`, which is delete-on-mismatch), a new `LocalStore: WriteStore` with its own
   forward-only `local_migrations/` set, local id minting through a project-origin-scoped key
   counter, `box.toml` carrying three `#[serde(default)]` facts (no `local_only` mode flag), a
-  once-only first-run overlay, and an in-app masked DSN field. Milestones **M0-M6 plus M2b** of
+  once-only first-run overlay, and an in-app masked DSN field. **Local-only is a temporary, lite
+  mode** (`docs/ANA-10.md` §1.3): parity is over *features* — hierarchy, items, chat, graph runs —
+  not over server-shaped infrastructure, so there is no mirror, no refresh cursor, no
+  `db_fingerprint`, no `offline · <age>` and no warm-cache startup budget on this path. Its
+  first-run copy must not promise migration to a server before MOD-18 ships (§4.5's copy rule).
+  Milestones **M0-M6 plus M2b** of
   `docs/ANA-10.md` §9.1; **M2b is the milestone that satisfies the item's stated objective** and
   M0+M1+M2+M2b is a complete shippable answer on its own (§9.2). Blocked on nothing, but **M3 must
   land before MOD-4's build step 1** (§9.1's ordering rule), and M6 is gated on the `R-ENT-7`
@@ -308,9 +317,13 @@ now.
   server-less box depend on it; MOD-15 owns the Settings connection *section*, this item owns the
   credential *field* inside it (§9.4). The requirement amendments of §6.1 are proposed, not
   applied — `docs/REQUIREMENTS.md` is maintainer-only.
-- [ ] **MOD-18 - Adoption of local rows into a server** (from ANA-10, deferred). `R-STO-1`,
-  `R-ENT-7`, `R-USR-2`, `R-HIS-1`. `docs/ANA-10.md` §9.1's M7, funded separately so the deferral is
-  visible rather than implied (§10.5): explicit, confirmed, resumable; one transaction per project
+- [ ] **MOD-18 - Adoption of local rows into a server** (from ANA-10). `R-STO-1`, `R-STO-7`,
+  `R-ENT-7`, `R-USR-2`, `R-HIS-1`. `docs/ANA-10.md` §9.1's M7. **Funded, not deferred** (§10.5, on
+  §1.3's framing): local-only is a temporary lite mode and Postgres is the full product, so this is
+  the exit the mode promises rather than an optional extra. **MOD-17 must not ship first-run copy
+  promising migration before this item exists** — until then the overlay says configuring a server
+  does not move existing local work; when this lands, the copy gains the move. Explicit, confirmed,
+  resumable; one transaction per project
   subtree; `MAX`/`GREATEST` counter fast-forward and the `sealed_at` write inside that transaction;
   `created_by`/`author_id`/`box_id` and `agent_id` remaps (§10.33); pre-adoption file copy;
   second-server refusal keyed on `system_identifier`; a UI-visible per-row status, never
