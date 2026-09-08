@@ -3,8 +3,10 @@
 //! One task owns the whole `connect_with` future, `block_task()` is called exactly once, and the
 //! child is owned by the **caller's** frame — not by the task — so a timeout, a connection-actor
 //! failure, a success and a caller that drops this future mid-await all reach the same kill.
-//! [`run_session`] keeps its child inside the task (`acp/mod.rs`) because a session has commands to
-//! serve after the handshake and the task outlives the call that started it; a probe has neither.
+//! [`run_session`] keeps its child inside the task (`acp/mod.rs`) — in a `ChildGuard` of its own
+//! since milestone 6 (plan D61) — because a session has commands to serve after the handshake and
+//! the task outlives the call that started it; a probe has neither. What differs between the two is
+//! only where the guard lives: a caller's frame here, the abandoned task there.
 //!
 //! Deliberately absent: `session/new`, a prompt, the mapper, the recorder and every `Inbound`
 //! handler. A probe that opened a session would have to invent a `cwd` and a prompt it has no
@@ -76,7 +78,7 @@ impl Handshake {
 
 /// Completes `initialize` over `io` and kills `io.child` on **every** exit path.
 ///
-/// The child is taken out before the task is spawned and held in a [`ChildGuard`] whose `Drop`
+/// The child is taken out before the task is spawned and held in a `ChildGuard` whose `Drop`
 /// signals it, so even a caller that drops this future mid-await (an aborted probe task at
 /// shutdown) leaves no running process behind. The reader and the writer move into the task with
 /// the request built

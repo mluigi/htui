@@ -97,6 +97,46 @@ pub struct Discovery {
     /// Whether to run the tier-2 `initialize` handshake after the cheap `--version` tier.
     #[serde(default = "default_true")]
     pub handshake: bool,
+    /// Where a credential the agent's **own** auth flow leaves on this box may be found (plan D59).
+    /// Names and paths only, never values; a row without it keeps milestone 5's rule (a non-empty
+    /// `authMethods` is `unauthenticated`, full stop).
+    ///
+    /// `skip_serializing_if` as well as `default`, so a row that declares no block re-serialises
+    /// without a `"credential": null` key: a registry document written before milestone 6 round
+    /// trips byte for byte through this type (blueprint P-10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<CredentialProbe>,
+}
+
+/// `agent.launch.discovery.credential` (plan D59): how to tell an *installed* agent from an
+/// installed-and-logged-in one, declared by the row rather than decided by the probe.
+///
+/// The Antigravity ACP server advertises its four auth methods whether or not this box has logged
+/// in (ANA-4 §4.5), so "a non-empty `authMethods` means unauthenticated" reads an authenticated
+/// box as unusable and the orchestrator skips it. The fix has to be data: `R-AGT-5` costs a new
+/// agent one registry row and at most one adapter, and a `match agent.name` in the probe would be
+/// exactly the second hard-coded agent that rule exists to forbid.
+///
+/// `htui` never handles the credential itself (`R-SEC-2`, D63): the vendor's own login writes it,
+/// the probe answers *whether* one of these candidates is there, and [`SessionSpec::env`] — not
+/// this — is where a resolved secret would ever live.
+///
+/// [`SessionSpec::env`]: crate::driver::SessionSpec::env
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CredentialProbe {
+    /// Environment variables whose presence — set and non-empty — counts, as the shell names them.
+    ///
+    /// An exported-but-empty variable does not count: that is how a shell profile *unsets* a key,
+    /// and a probe that read it as a credential would report a box ready that cannot authenticate.
+    pub env: Vec<String>,
+    /// File candidates in the glob tier's expander grammar (`probe::expand`): `%VAR%` anywhere, a
+    /// leading `~`, and an unset variable skips the candidate rather than failing the probe — which
+    /// is what lets one row carry a Windows `%VAR%` path and a unix `~` one side by side.
+    ///
+    /// In order; the first that exists wins. Checked **before** [`env`](Self::env) (plan D63: on a
+    /// subscription box the token file is the tier that fires, and it is the more specific fact).
+    pub files: Vec<String>,
 }
 
 /// How to find one tool (§5.1). The `kind` tag is the JSON discriminant.
@@ -559,10 +599,17 @@ impl Spawned {
     ///
     /// `kill_tree` is `start_kill` followed by `wait`, and a `Drop` cannot await the second half.
     /// Blocking on it there is not an option either — a `Drop` running inside the runtime would be
-    /// blocking a worker thread — so the child is signalled and left for the reaper. The probe's
-    /// handshake calls this from a guard's `Drop` and `kill_tree` on every path it can await
-    /// (`acp::handshake`), which is what makes an **aborted** probe task leave no live agent behind
-    /// (the milestone-3 CRITICAL, `682a423`).
+    /// blocking a worker thread — so the child is signalled and left for the reaper.
+    ///
+    /// **Two callers reach it the same way**: through a [`ChildGuard`]'s `Drop`, each with a
+    /// `kill_tree` on every path it can await instead. The probe's handshake (`acp::handshake`) is
+    /// what makes an **aborted** probe task leave no live agent behind (the milestone-3 CRITICAL,
+    /// `682a423`); since milestone 6 (plan D61) [`acp::open_session`]'s session task is the other,
+    /// and the abort there is the handshake timeout giving up on an adapter that never answered.
+    /// The two have the same shape because the problem does: a future that may be dropped
+    /// mid-await, owning a process no other frame can name.
+    ///
+    /// [`acp::open_session`]: crate::acp::open_session
     ///
     /// # Errors
     /// [`DriverError::Transport`] when the signal is refused.
@@ -577,18 +624,24 @@ impl Spawned {
 // The child guard
 // ---------------------------------------------------------------------------------------------
 
-/// A [`Spawned`] owned by the **caller's frame**, killed by its `Drop`.
+/// A [`Spawned`] owned by the frame or task that started it, killed by its `Drop`.
 ///
 /// The guard, not `Spawned`, is what makes a dropped or aborted future leave no running process.
-/// `Spawned` deliberately has no killing `Drop` of its own: [`open_session`] hands its child to a
-/// task that must outlive the call which started it, and a `Drop` here would change that path's
-/// semantics silently — its own orphan is a separate, deferred fix.
+/// `Spawned` deliberately has no killing `Drop` of its own, and that is the policy rather than an
+/// omission: a process type that signalled itself whenever it went out of scope could not be moved
+/// into a task, parked in a `Mutex` or returned from a builder without each of those moves needing
+/// a `mem::forget` to mean what it says. The guard carries the policy, so each caller states once
+/// where the kill belongs.
 ///
-/// Two callers hold one. [`acp::handshake`] does, because `connect_with` runs the connection actors
-/// and the foreground future under a `select` and an actor that fails first **drops** the
-/// foreground future (the milestone-3 CRITICAL, `682a423`). The probe's one-shot children
-/// (`--version`, `npm root -g`) do, because `AgentRuntime::shutdown` and the background limit both
-/// `abort()` the probe task, and an aborted task drops its future mid-await.
+/// Three holders, all of them futures that can be dropped before they finish. [`acp::handshake`]
+/// holds one because `connect_with` runs the connection actors and the foreground future under a
+/// `select` and an actor that fails first **drops** the foreground future (the milestone-3
+/// CRITICAL, `682a423`). The probe's one-shot children (`--version`, `npm root -g`) hold one
+/// because `AgentRuntime::shutdown` and the background limit both `abort()` the probe task, and an
+/// aborted task drops its future mid-await. Since milestone 6 (plan D61) [`open_session`]'s session
+/// task holds one too: it hands its child to a task that outlives the call which started it, so no
+/// caller's frame can kill it, and the handshake timeout that abandons that task leaves the kill to
+/// the guard the abort drops. What differs between the three is only *where* the guard lives.
 ///
 /// [`open_session`]: crate::acp::open_session
 /// [`acp::handshake`]: crate::acp::handshake
@@ -649,7 +702,12 @@ impl Drop for ChildGuard {
             return;
         };
         // Signal only: a `Drop` cannot await the reap, and blocking for it here would block a
-        // runtime worker. The orphan this leaves is a zombie, not a running process.
+        // runtime worker. What that leaves is a *signalled* process, not a running one, and not a
+        // zombie for the life of the program either: dropping the `tokio::process::Child` inside
+        // hands it to tokio's global orphan queue (1.53's `process/unix/reap.rs` `Reaper::drop`,
+        // or `pidfd_reaper.rs` on the pidfd path), which the process driver drains on every park
+        // once `SIGCHLD` has arrived (`runtime/process.rs:33`). Windows has no zombie state at
+        // all. `htui` therefore owes this no reaper task of its own.
         if let Err(err) = child.start_kill() {
             warn!(%err, "the guarded process survived its guard");
         }

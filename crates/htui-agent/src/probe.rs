@@ -31,8 +31,8 @@ use crate::acp::{AcpIo, HANDSHAKE_TIMEOUT, Handshake};
 use crate::driver::DriverFuture;
 use crate::error::{DriverError, Result};
 use crate::launch::{
-    AcpSettings, AgentLaunch, AgentSettings, ChildGuard, Discovery, ResolvedLaunch, ToolMap,
-    ToolProbe, VersionProbe,
+    AcpSettings, AgentLaunch, AgentSettings, ChildGuard, CredentialProbe, Discovery,
+    ResolvedLaunch, ToolMap, ToolProbe, VersionProbe,
 };
 use crate::tools::env_override_key;
 
@@ -235,6 +235,24 @@ wire_enum!(
         Missing => "missing",
         /// The launch resolved but did not spawn, or `initialize` did not complete.
         Failed => "failed",
+    }
+);
+
+wire_enum!(
+    /// `probe.credential` (plan D59): which tier of `discovery.credential` answered.
+    ///
+    /// The *value* — a token's text, a variable's contents — is never read into memory by the probe
+    /// and never recorded: the file tier is a `stat` and the variable tier asks only whether the
+    /// name is set. What the column holds is which of the row's declared tiers said yes, which is
+    /// everything the status mapping needs and nothing a `JSONB` column rendered verbatim by the
+    /// Settings tab should not hold (`R-SEC-2`).
+    CredentialTier {
+        /// A declared file exists.
+        File => "file",
+        /// A declared variable is set and non-empty.
+        Env => "env",
+        /// The row declares candidates and none answered.
+        Absent => "absent",
     }
 );
 
@@ -482,8 +500,37 @@ async fn npm_root_global(env: &ProbeEnv) -> Result<Option<PathBuf>> {
 }
 
 /// Whether `path` exists, off the runtime's worker.
+///
+/// The two tiers that name a path outright: the `HTUI_TOOL_*` override, whose whole job is to say
+/// "the tool is *this*", and the `node_package` tier, whose entry point is a path it composed from
+/// the package layout. Both are asking whether the thing they were told about is there at all, and
+/// neither has a reason to be pickier than the box's own author. The **glob** tier does not come
+/// through here: its leaf filter is [`walk`]'s own `is_file`, applied to every candidate the walk
+/// produced rather than to one path a caller had in mind.
+///
+/// Async `metadata` rather than a blocking `Path::exists`: this runs on the probe's task, which
+/// shares a runtime with the UI (`R-NF-3`).
 async fn exists(path: &Path) -> bool {
     tokio::fs::metadata(path).await.is_ok()
+}
+
+/// Whether `path` is a **file**, off the runtime's worker.
+///
+/// [`exists`]'s stricter sibling, `pub(crate)` for [`crate::acp::AcpDriver::launch_for`], which
+/// applies D58's fourth rule — the recorded command is still on disk — and is asking a narrower
+/// question than the tiers above. It is about to hand the path to `execve`, and the self-update
+/// ANA-4 §4.6 describes rearranges version-numbered *directories*: a recorded path that has become
+/// one exists, is not a launch, and would fail the chat with a `Spawn` error and earn the row a
+/// D60 re-probe it does not need. One `is_file` on the same `metadata` call turns that into the
+/// fallback the rule already has.
+///
+/// A path that cannot be `stat`ed at all — gone, or a directory this process may not traverse — is
+/// `false` for the same reason: the answer to "can this be spawned" is no either way, and
+/// resolution is the honest second attempt.
+pub(crate) async fn is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|meta| meta.is_file())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -697,6 +744,52 @@ pub async fn glob_first(patterns: &[String], env: &ProbeEnv) -> Result<Option<Pa
 }
 
 // ---------------------------------------------------------------------------------------------
+// The credential tier (plan D59, D63)
+// ---------------------------------------------------------------------------------------------
+
+/// Which of `probe`'s declared tiers says this box holds a credential: files first, then variables.
+///
+/// Files go through [`glob_first`], so the grammar, the `spawn_blocking` walk, the "an unset
+/// variable skips the candidate" rule and the `is_file` leaf filter are the walker's own — a
+/// literal path is a pattern with no `*`, and the walk of it is one `stat`. That is deliberate:
+/// the probe answers *whether* a credential is there and never opens it, so no token's text can
+/// reach a log line, a `Debug`, or the `JSONB` column (`R-SEC-2`).
+///
+/// Files before variables per plan D63: the agent's own login flow writes the file, so on the box
+/// this was written for it is the tier that fires, and an API key left over in the environment
+/// should not mask the fact that the vendor's own credential is present.
+///
+/// Spawns nothing, reads nothing. `Ok(None)` when `probe` is `None` — a row that declares no block
+/// is a row the milestone-5 rule still governs, which is a different answer from
+/// [`CredentialTier::Absent`] ("declared, and none of them answered").
+///
+/// # Errors
+/// [`DriverError::Transport`] when the file walk could not be scheduled, propagated rather than
+/// swallowed for [`probe_tools`]'s reason: a runtime fault must not read as "no credential" and
+/// turn a healthy authenticated box into an `unauthenticated` one.
+pub async fn resolve_credential(
+    probe: Option<&CredentialProbe>,
+    env: &ProbeEnv,
+) -> Result<Option<CredentialTier>> {
+    let Some(probe) = probe else {
+        return Ok(None);
+    };
+
+    if glob_first(&probe.files, env).await?.is_some() {
+        return Ok(Some(CredentialTier::File));
+    }
+    // Set *and* non-empty: an exported-but-empty variable is how a shell profile unsets a key.
+    if probe
+        .env
+        .iter()
+        .any(|name| env.var(name).is_some_and(|value| !value.is_empty()))
+    {
+        return Ok(Some(CredentialTier::Env));
+    }
+    Ok(Some(CredentialTier::Absent))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Version capture (plan D47)
 // ---------------------------------------------------------------------------------------------
 
@@ -823,7 +916,7 @@ async fn run_bounded(what: &str, launch: &ResolvedLaunch, env: &ProbeEnv) -> Opt
 
 /// Runs `<path> <probe.args>` and extracts its version.
 ///
-/// Through [`run_bounded`]: a `--version` child is supervised, capped and killed on timeout like
+/// Through `run_bounded`: a `--version` child is supervised, capped and killed on timeout like
 /// any other. On timeout the tree is killed and the version is unknown; the tool stays *found*,
 /// because a hung `--version` says nothing about whether the binary is there.
 ///
@@ -877,6 +970,14 @@ pub struct ProbeSnapshot {
     pub tools: BTreeMap<String, Option<String>>,
     /// Tier 2's answer; `None` when tier 2 did not run.
     pub handshake: Option<Handshake>,
+    /// Plan D59: which tier of `discovery.credential` answered, never the value. `None` when the
+    /// row declares no block, or when the probe ended before `agent.launch` parsed.
+    ///
+    /// Absent in a pre-milestone-6 document reads as `None`, which *is* the milestone-5 rule that
+    /// row was written under — so an old row keeps its old meaning rather than acquiring a new one
+    /// (blueprint H-6).
+    #[serde(default)]
+    pub credential: Option<CredentialTier>,
     /// Plan D50.
     pub status: ProbeStatus,
     /// On [`ProbeStatus::Failed`]: the failure text, line by line. The handshake's own error
@@ -908,19 +1009,74 @@ impl ProbeSnapshot {
     pub fn to_value(&self) -> Value {
         serde_json::to_value(self).expect("a probe snapshot serialises")
     }
+
+    /// What a session should spawn instead of resolving the row again, or `None` (plan D58).
+    ///
+    /// This is the *only* place a glob tool's per-platform `args` survive: a [`ToolMap`] value is
+    /// one string, so `tools::resolve` cannot carry `agy`'s `--uid=` and a chat that resolves for
+    /// itself launches the adapter without it (blueprint H-3). The recording does carry them,
+    /// because [`resolve_tool`] appended them when it walked the glob.
+    ///
+    /// Three rules, all readable from the document:
+    ///
+    /// - `source` is `probe`. A [`ProbeSource::Manual`] row is a human's path, and
+    ///   `launch::resolve` already honours it through `agent.launch` itself — spawning the note
+    ///   instead of the row would make the two disagree silently (blueprint H-5).
+    /// - `status` is `ready` **or** `unauthenticated`. The `unauthenticated` half is not a
+    ///   tolerance, it is the point: that status certifies the recording *is* the right binary —
+    ///   it resolved, it spawned, it completed `initialize` — and that the only thing wrong with
+    ///   this box is that nobody has logged in. Falling back to a second resolution there would
+    ///   not produce a worse message, it would produce a **dead adapter**: on Linux the recording
+    ///   is the only launch carrying `agy`'s `--uid=`, and without it the server exits in
+    ///   `ChangeRootAndUser` before it ever reads stdin (blueprint H-4, and the live suite's
+    ///   case 2 measured it). Spawning it is what lets the vendor's own `Authentication required`
+    ///   reach the user, which since milestone 6 it does — `session/new` refuses, the connection
+    ///   future carries the refusal home and `open_session` reports it verbatim
+    ///   ([`crate::acp::open_session`]). `missing` resolved nothing, and `failed` recorded a
+    ///   launch that did not answer — resolving again is the honest second attempt.
+    /// - `resolved` is `Some`, which the first two do not imply on a hand-edited column.
+    ///
+    /// The fourth rule D58 states — the recorded `command` still exists — is filesystem I/O and is
+    /// deliberately **not** here: this stays a pure read of the row, and the caller applies the
+    /// check per session, where a task that may block already is ([`AcpDriver::launch_for`]).
+    ///
+    /// [`ToolMap`]: crate::launch::ToolMap
+    /// [`AcpDriver::launch_for`]: crate::acp::AcpDriver::launch_for
+    #[must_use]
+    pub fn recorded_launch(&self) -> Option<&ResolvedLaunch> {
+        if self.source != ProbeSource::Probe {
+            return None;
+        }
+        if !matches!(
+            self.status,
+            ProbeStatus::Ready | ProbeStatus::Unauthenticated
+        ) {
+            return None;
+        }
+        self.resolved.as_ref()
+    }
 }
 
-/// Tier 2's outcome mapped onto plan D50: an empty `auth_methods` is [`ProbeStatus::Ready`],
-/// anything else is [`ProbeStatus::Unauthenticated`].
+/// Tier 2's outcome mapped onto plan D50 as amended by D59: an empty `auth_methods` is
+/// [`ProbeStatus::Ready`] whatever `credential` says; a non-empty one is `Ready` on
+/// [`CredentialTier::File`] or [`CredentialTier::Env`], and [`ProbeStatus::Unauthenticated`] on
+/// `None` (the row declared no block, so milestone 5's rule stands) or [`CredentialTier::Absent`].
 ///
 /// The vendor's own auth flow is not `htui`'s to drive (ANA-4 §4.6), so a box that would have to
-/// log in first is recorded as such rather than as a box that can run the agent.
+/// log in first is recorded as such rather than as a box that can run the agent. What D59 adds is
+/// that some agents advertise their auth methods unconditionally — Antigravity lists four whether
+/// or not you are logged in (ANA-4 §4.5) — so on those rows the list is an *offer*, not a demand,
+/// and the credential the row points at is what settles it. Which rows those are is the registry's
+/// business: this function is told the tier and never asks which agent it is looking at
+/// (`R-AGT-5`).
 #[must_use]
-pub fn status_for(handshake: &Handshake) -> ProbeStatus {
+pub fn status_for(handshake: &Handshake, credential: Option<CredentialTier>) -> ProbeStatus {
     if handshake.auth_methods.is_empty() {
-        ProbeStatus::Ready
-    } else {
-        ProbeStatus::Unauthenticated
+        return ProbeStatus::Ready;
+    }
+    match credential {
+        Some(CredentialTier::File | CredentialTier::Env) => ProbeStatus::Ready,
+        None | Some(CredentialTier::Absent) => ProbeStatus::Unauthenticated,
     }
 }
 
@@ -1022,23 +1178,28 @@ const MANUAL_KEPT: &str = "manual entry kept: the probe resolved nothing";
 ///
 /// 1. `agent.launch` parses, or the row is `failed` with the serde text and **nothing is spawned**;
 ///    `agent.settings` falls back to the documented defaults, as the registry's own rule has it.
-/// 2. [`probe_tools`]. A transport fault is `failed`, not `missing`: a box whose lookup could not
+/// 2. [`resolve_credential`] over `launch.discovery.credential` (plan D59). First, because it needs
+///    only the parsed launch and `ctx.env` and costs a `stat` and a map lookup: running it here
+///    means **every** snapshot with a parsed launch records the tier, so a `missing` box still says
+///    whether it holds a token. A transport fault is `failed`, as step 3's is.
+/// 3. [`probe_tools`]. A transport fault is `failed`, not `missing`: a box whose lookup could not
 ///    run has not been shown to be missing anything.
-/// 3. An incomplete report is `missing`, `resolved: None`, and **nothing is spawned**.
-/// 4. [`launch::resolve`](crate::launch::resolve) over the report's tool map; an unresolved
+/// 4. An incomplete report is `missing`, `resolved: None`, and **nothing is spawned**.
+/// 5. [`launch::resolve`](crate::launch::resolve) over the report's tool map; an unresolved
 ///    placeholder — a row that names a `${tool}` its `discovery` never declared — is `missing`
 ///    too. The found tools' platform `args` are then appended (ANA-4 §4.6's `--uid=` rule).
-/// 5. Tier 2 runs only for an `acp` row whose `discovery` asks for a handshake. A `cli` row has no
+/// 6. Tier 2 runs only for an `acp` row whose `discovery` asks for a handshake. A `cli` row has no
 ///    `initialize` to complete, so resolution is the whole probe and the status is `ready`.
-/// 6. The handshake's answer maps through [`status_for`]; its failure is `failed` with the error
-///    text line by line.
-/// 7. A snapshot with **no `resolved`** over a stored `source: manual` row is
+/// 7. The handshake's answer and step 2's tier map through [`status_for`]; a handshake failure is
+///    `failed` with the error text line by line.
+/// 8. A snapshot with **no `resolved`** over a stored `source: manual` row is
 ///    [`ProbeOutcome::Kept`]. ANA-4 §4.6 says "a probe that finds nothing", which is `missing` *and*
-///    the two `failed`s that never got as far as a launch — an `agent.launch` that does not parse
-///    (step 1) and a `probe_tools` transport fault (step 2). Anything the probe *did* resolve
-///    refreshes a manual row like any other, including a `failed` handshake: that one found the
-///    binary and is a fact about this box. A refreshed row says `source: probe`.
-/// 8. Otherwise [`agent_box_row`].
+///    the three `failed`s that never got as far as a launch — an `agent.launch` that does not parse
+///    (step 1), a credential fault (step 2) and a `probe_tools` transport fault (step 3). Anything
+///    the probe *did* resolve refreshes a manual row like any other, including a `failed`
+///    handshake: that one found the binary and is a fact about this box. A refreshed row says
+///    `source: probe`.
+/// 9. Otherwise [`agent_box_row`].
 ///
 /// Nothing here writes a store row: the caller owns the `Writer`, and `R-NF-3` keeps that caller
 /// off the UI task.
@@ -1067,19 +1228,23 @@ pub async fn probe_agent(
     ProbeOutcome::Row(agent_box_row(agent, box_id, existing, &snapshot, ctx.now))
 }
 
-/// Steps 1–6 of [`probe_agent`]: everything that decides the snapshot, with no knowledge of what
+/// Steps 1–7 of [`probe_agent`]: everything that decides the snapshot, with no knowledge of what
 /// was stored before.
 async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> ProbeSnapshot {
-    let blank =
-        |status: ProbeStatus, tools: BTreeMap<String, Option<String>>, tail| ProbeSnapshot {
+    // `credential` is a parameter rather than a capture: the step-1 failure below happens before
+    // there is a launch to read one from, and that snapshot has to say `None` rather than guess.
+    let blank = |status: ProbeStatus, tools: BTreeMap<String, Option<String>>, credential, tail| {
+        ProbeSnapshot {
             transport: agent.transport,
             resolved: None,
             tools,
             handshake: None,
+            credential,
             status,
             stderr_tail: tail,
             source: ProbeSource::Probe,
-        };
+        }
+    };
 
     let launch: AgentLaunch = match serde_json::from_value(agent.launch.clone()) {
         Ok(launch) => launch,
@@ -1088,6 +1253,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             return blank(
                 ProbeStatus::Failed,
                 BTreeMap::new(),
+                None,
                 Some(lines(&format!("agent.launch does not parse: {error}"))),
             );
         }
@@ -1095,12 +1261,38 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
     let settings: AgentSettings =
         serde_json::from_value(agent.settings.clone()).unwrap_or_default();
 
+    let credential = match resolve_credential(
+        launch
+            .discovery
+            .as_ref()
+            .and_then(|discovery| discovery.credential.as_ref()),
+        &ctx.env,
+    )
+    .await
+    {
+        Ok(credential) => credential,
+        Err(error) => {
+            return blank(
+                ProbeStatus::Failed,
+                BTreeMap::new(),
+                None,
+                Some(lines(&error.to_string())),
+            );
+        }
+    };
+    if let Some(tier) = credential {
+        // The tier, never the path and never the value: this line lands in the same log file the
+        // maintainer pastes into an issue.
+        debug!(agent = agent.name, tier = %tier, "a credential tier answered");
+    }
+
     let report = match probe_tools(launch.discovery.as_ref(), &ctx.env).await {
         Ok(report) => report,
         Err(error) => {
             return blank(
                 ProbeStatus::Failed,
                 BTreeMap::new(),
+                credential,
                 Some(lines(&error.to_string())),
             );
         }
@@ -1111,7 +1303,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             missing = ?report.missing,
             "a required tool resolved nowhere; nothing is spawned"
         );
-        return blank(ProbeStatus::Missing, report.versions(), None);
+        return blank(ProbeStatus::Missing, report.versions(), credential, None);
     }
 
     let mut resolved = match crate::launch::resolve(&launch, &report.tool_map()) {
@@ -1120,7 +1312,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             // A placeholder with no `discovery` entry: the row names a tool it never told the
             // probe how to find, which from this box's side is the same fact as "not installed".
             debug!(agent = agent.name, %error, "the launch names a tool the discovery does not");
-            return blank(ProbeStatus::Missing, report.versions(), None);
+            return blank(ProbeStatus::Missing, report.versions(), credential, None);
         }
     };
     resolved.args.extend(report.extra_args());
@@ -1136,6 +1328,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             resolved: Some(resolved),
             tools: report.versions(),
             handshake: None,
+            credential,
             status: ProbeStatus::Ready,
             stderr_tail: None,
             source: ProbeSource::Probe,
@@ -1147,8 +1340,9 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             transport: agent.transport,
             resolved: Some(resolved),
             tools: report.versions(),
-            status: status_for(&handshake),
+            status: status_for(&handshake, credential),
             handshake: Some(handshake),
+            credential,
             stderr_tail: None,
             source: ProbeSource::Probe,
         },
@@ -1157,6 +1351,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             resolved: Some(resolved),
             tools: report.versions(),
             handshake: None,
+            credential,
             status: ProbeStatus::Failed,
             // `DriverError`'s `Display` prefixes its variant ("agent transport error: …"), and
             // this field is documented as what the child said. `handshake` returns exactly one

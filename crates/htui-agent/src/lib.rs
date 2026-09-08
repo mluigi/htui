@@ -106,14 +106,16 @@ pub use event::{
     ToolLocation, ToolResultEvent, ToolResultStatus, UsageEvent,
 };
 pub use launch::{
-    AcpSettings, AgentLaunch, AgentSettings, CliSettings, ClientCapabilities, Discovery,
-    FallbackCommand, PlatformGlob, QuotaSettings, QuotaSource, ResolvedLaunch, SessionSettings,
-    Spawned, ToolMap, ToolProbe, UsageScope, UsageSettings, VersionProbe, resolve, spawn,
+    AcpSettings, AgentLaunch, AgentSettings, CliSettings, ClientCapabilities, CredentialProbe,
+    Discovery, FallbackCommand, PlatformGlob, QuotaSettings, QuotaSource, ResolvedLaunch,
+    SessionSettings, Spawned, ToolMap, ToolProbe, UsageScope, UsageSettings, VersionProbe, resolve,
+    spawn,
 };
 pub use permission::{PolicyAnswer, PolicyStage, evaluate as evaluate_permission};
 pub use probe::{
-    ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeSource, ProbeStatus, SpawnTier2,
-    Tier2, ToolReport, ToolResolution, platform_key, probe_agent, probe_tools,
+    CredentialTier, ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeSource, ProbeStatus,
+    SpawnTier2, Tier2, ToolReport, ToolResolution, platform_key, probe_agent, probe_tools,
+    resolve_credential,
 };
 pub use record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, RecorderSummary, pump};
 pub use registry::{DriverFactory, TransportBuilder, adapter_id, caps_for};

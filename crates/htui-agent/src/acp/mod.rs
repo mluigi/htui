@@ -23,6 +23,7 @@ pub mod handshake;
 pub mod map;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -51,7 +52,7 @@ use crate::event::{
     DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, ErrorEvent, OtherEvent,
     PermissionOptionKind, StopReason, TerminalReason, ToolResultEvent, ToolResultStatus,
 };
-use crate::launch::{AgentLaunch, AgentSettings, Spawned};
+use crate::launch::{AgentLaunch, AgentSettings, ChildGuard, ResolvedLaunch, Spawned};
 use crate::registry::TransportBuilder;
 
 /// `other.update` of the row written when the agent offers no option for the requested model.
@@ -186,6 +187,13 @@ pub struct SessionOptions {
     pub settings: AgentSettings,
     /// How capture times are stamped.
     pub stamp: Stamp,
+    /// How long `initialize` + `session/new` may take before [`open_session`] gives up.
+    ///
+    /// [`HANDSHAKE_TIMEOUT`] in production, filled in by [`AcpDriver::start`]. It is a field rather
+    /// than the constant read at the point of use because the arm that matters — the one that has
+    /// to kill the child it gave up on (D61) — is otherwise a minute-long test, and a minute-long
+    /// test is one nobody runs.
+    pub handshake_timeout: Duration,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -194,10 +202,18 @@ pub struct SessionOptions {
 
 /// Where a session's byte streams come from.
 enum IoSource {
-    /// Resolve the row's tools, substitute them, and spawn the child at `start`.
+    /// Spawn a child at `start`: what the probe recorded when there is a usable recording,
+    /// otherwise the row's tools resolved and substituted.
     Spawn {
         /// The row's `launch` document.
         launch: Box<AgentLaunch>,
+        /// `agent_box.probe.resolved`, when the snapshot passed D58's three row-side rules
+        /// ([`ProbeSnapshot::recorded_launch`]). The fourth rule — the command still exists on
+        /// disk — is I/O and is applied per session by [`AcpDriver::launch_for`], because a driver
+        /// is built on the worker loop and a `stat` does not belong there.
+        ///
+        /// [`ProbeSnapshot::recorded_launch`]: crate::probe::ProbeSnapshot::recorded_launch
+        recorded: Option<ResolvedLaunch>,
     },
     /// A pre-built pair, taken once — a real process starts once too.
     ///
@@ -224,8 +240,34 @@ impl core::fmt::Debug for AcpDriver {
             .field("name", &self.name)
             .field("caps", &self.caps)
             .field("stamp", &self.stamp)
+            // Whether, not what: a `ResolvedLaunch` carries an environment, and the fact worth
+            // reading in a log line is which of D58's two paths this driver is on.
+            .field(
+                "recorded",
+                &matches!(
+                    self.io,
+                    IoSource::Spawn {
+                        recorded: Some(_),
+                        ..
+                    }
+                ),
+            )
             .finish()
     }
+}
+
+/// `tools::resolve` then `launch::resolve`: the pre-milestone-6 path, and D58's fallback.
+///
+/// Its own function rather than two lines inside [`AcpDriver::launch_for`] because it is reached
+/// from three conditions there — no recording, a stale recording, and a snapshot D58 refuses — and
+/// a reader should be able to see that all three land on the same code.
+///
+/// # Errors
+/// [`DriverError::Unresolved`] naming the first tool that resolves nowhere or the first placeholder
+/// with no entry; [`DriverError::Transport`] when the resolution machinery itself failed.
+async fn resolve_now(launch: &AgentLaunch, cwd: &Path) -> Result<ResolvedLaunch> {
+    let tools = crate::tools::resolve(launch.discovery.as_ref(), cwd).await?;
+    crate::launch::resolve(launch, &tools)
 }
 
 impl AcpDriver {
@@ -238,17 +280,109 @@ impl AcpDriver {
     /// exactly as `crate::registry` does, because the column is hand-editable and a session that
     /// cannot read it can still run.
     pub fn from_row(agent: &AgentRow, caps: DriverCaps) -> Result<Self> {
+        Self::from_row_with_probe(agent, None, caps)
+    }
+
+    /// [`from_row`](Self::from_row) plus this box's `agent_box` row (plan D58).
+    ///
+    /// A usable snapshot is what `start` spawns, `--uid=` and all: the per-platform `args` a glob
+    /// tool declares survive the probe and nothing else, because a `ToolMap` value is one string
+    /// (blueprint H-3). What "usable" means is
+    /// [`ProbeSnapshot::recorded_launch`](crate::probe::ProbeSnapshot::recorded_launch)'s three
+    /// rules, plus the transport agreement below, plus a disk check
+    /// [`launch_for`](Self::launch_for) applies per session.
+    ///
+    /// `on_box` is read here, once, rather than at every `start`: the snapshot is a document that
+    /// does not change under a running driver, and parsing it on the worker loop that builds the
+    /// driver keeps the parse off the session's critical path. A `probe` column that is `NULL` or
+    /// does not parse is `None` and resolves exactly as before — the same tolerance
+    /// [`ProbeSnapshot::from_row`](crate::probe::ProbeSnapshot::from_row) grants the Settings tab
+    /// for the same hand-editable column.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_row`](Self::from_row): [`DriverError::Transport`] when `agent.launch` does not
+    /// parse. An unreadable `agent_box.probe` is never an error.
+    pub fn from_row_with_probe(
+        agent: &AgentRow,
+        on_box: Option<&AgentBox>,
+        caps: DriverCaps,
+    ) -> Result<Self> {
         let launch: AgentLaunch = serde_json::from_value(agent.launch.clone())
             .map_err(|err| DriverError::Transport(format!("agent.launch does not parse: {err}")))?;
+        // The transport check is this side of `recorded_launch` rather than inside it because it
+        // is the only one of D58's rules that compares the snapshot to something *outside* the
+        // document — the row it was made from. `agent.transport` is hand-editable, and flipping it
+        // to `acp` leaves a recording whose argv was resolved for a command-line agent: not stale,
+        // wrong, and the row's own `launch` is what the edit was asking to be run.
+        let recorded = on_box
+            .and_then(crate::probe::ProbeSnapshot::from_row)
+            .filter(|snapshot| snapshot.transport == agent.transport)
+            .and_then(|snapshot| snapshot.recorded_launch().cloned());
         Ok(Self {
             name: agent.name.clone(),
             settings: serde_json::from_value(agent.settings.clone()).unwrap_or_default(),
             caps,
             io: IoSource::Spawn {
                 launch: Box::new(launch),
+                recorded,
             },
             stamp: Stamp::Wall,
         })
+    }
+
+    /// What this session would spawn, before spawning it.
+    ///
+    /// The recorded launch when there is one **and** its `command` is still a file on disk;
+    /// otherwise the row's tools are resolved now (`tools::resolve` → `launch::resolve`), which is
+    /// the pre-milestone-6 path and carries no platform `args`. The disk check is not belt and
+    /// braces: ANA-4 §4.6 records that `agy` self-updates in place, so a recorded path can name a
+    /// version-numbered directory that is gone, and a chat must degrade *into* resolution rather
+    /// than fail the request. A *file* and not merely an entry, because the same self-update can
+    /// leave a directory where the binary used to be, and everything that is not spawnable belongs
+    /// on the same side of this branch ([`crate::probe::is_file`]).
+    ///
+    /// It runs here, on the session's own task, for the same reason `tools::resolve` does: this is
+    /// filesystem I/O, and `AgentRuntime`'s worker loop must not do any (`R-NF-3`). The command is
+    /// checked exactly as recorded, so a bare name — an `HTUI_TOOL_*` override the probe took on
+    /// trust — is resolved against this process's own directory and almost always falls back. That
+    /// costs nothing: the fallback's first tier is that same override, so both paths answer with
+    /// the same string (blueprint H-3).
+    ///
+    /// Either way `spec.env` is applied **last** and wins (`R-SEC-2`): the row's environment holds
+    /// paths, the spec's holds what the secret provider produced for this run.
+    ///
+    /// # Errors
+    /// [`DriverError::Unresolved`] and [`DriverError::Transport`] exactly as `tools::resolve` and
+    /// `launch::resolve` return them. [`DriverError::Transport`] for a prepared transport, which
+    /// spawns nothing and so has no launch to describe (blueprint H-16).
+    pub async fn launch_for(&self, spec: &SessionSpec) -> Result<ResolvedLaunch> {
+        // A `match` rather than a `let`-else: without `test-support` there is one variant, and an
+        // irrefutable `let`-else is a hard error rather than a dead branch the compiler forgives.
+        let (launch, recorded) = match &self.io {
+            IoSource::Spawn { launch, recorded } => (launch, recorded),
+            #[cfg(feature = "test-support")]
+            IoSource::Prepared(_) => {
+                return Err(DriverError::Transport(
+                    "a prepared transport spawns nothing".to_owned(),
+                ));
+            }
+        };
+        let mut resolved = match recorded {
+            Some(recorded) if crate::probe::is_file(Path::new(&recorded.command)).await => {
+                recorded.clone()
+            }
+            Some(recorded) => {
+                tracing::info!(
+                    command = %recorded.command,
+                    "the probe's recorded command is gone or is not a file; resolving again"
+                );
+                resolve_now(launch, &spec.cwd).await?
+            }
+            None => resolve_now(launch, &spec.cwd).await?,
+        };
+        resolved.env.extend(spec.env.clone());
+        Ok(resolved)
     }
 
     /// A driver over an in-process transport with a deterministic clock: the conformance harness.
@@ -267,13 +401,8 @@ impl AcpDriver {
     /// The streams this session runs over.
     async fn io(&self, spec: &SessionSpec) -> Result<AcpIo> {
         match &self.io {
-            IoSource::Spawn { launch } => {
-                let tools = crate::tools::resolve(launch.discovery.as_ref(), &spec.cwd).await?;
-                let mut resolved = crate::launch::resolve(launch, &tools)?;
-                // `SessionSpec.env` is the resolved-secret channel (`R-SEC-2`) and wins over the
-                // row's own environment: the row holds placeholders and defaults, the spec holds
-                // what the secret provider produced for this run.
-                resolved.env.extend(spec.env.clone());
+            IoSource::Spawn { .. } => {
+                let resolved = self.launch_for(spec).await?;
                 let spawned = crate::launch::spawn(&resolved, &spec.cwd).await?;
                 AcpIo::from_spawned(spawned)
             }
@@ -312,6 +441,7 @@ impl AgentDriver for AcpDriver {
                 agent_name: self.name.clone(),
                 settings: self.settings.clone(),
                 stamp: self.stamp,
+                handshake_timeout: HANDSHAKE_TIMEOUT,
             };
             let session = open_session(io, spec, prompt, options).await?;
             Ok(Box::new(session) as Box<dyn AgentSession>)
@@ -327,10 +457,12 @@ impl TransportBuilder for AcpAdapter {
     fn build(
         &self,
         agent: &AgentRow,
-        _on_box: Option<&AgentBox>,
+        on_box: Option<&AgentBox>,
         caps: DriverCaps,
     ) -> Result<Box<dyn AgentDriver>> {
-        Ok(Box::new(AcpDriver::from_row(agent, caps)?))
+        Ok(Box::new(AcpDriver::from_row_with_probe(
+            agent, on_box, caps,
+        )?))
     }
 }
 
@@ -539,12 +671,112 @@ struct Ready {
     session_ref: AgentSessionRef,
 }
 
+/// The handshake's one reply, and how far the handshake had got when it was owed.
+///
+/// **Shared rather than owned by the foreground future, and that is the whole point.**
+/// `SessionBuilder::start_session` does not send `session/new` from the future that awaits it: it
+/// issues the request from a task it spawns *on the connection* (`SDK/session.rs:885-905`). A
+/// JSON-RPC error there fails a connection actor, and `run_until_connection_close` does
+/// `background_result?` while still holding the foreground (`SDK/jsonrpc.rs:3556-3560`) — so the
+/// foreground is **dropped**, [`session_main`]'s `session/new` error arm never runs, and a sender
+/// owned by that future would be dropped with it. The caller then saw "nobody ever answered" for
+/// what was in fact a perfectly clear refusal; on an unauthenticated box that refusal is the one
+/// message worth reading. Holding the sender here lets [`run_session`] — which outlives the
+/// foreground, because it owns it — answer on its behalf out of the connection's own error.
+///
+/// `step` is what makes that answer name the right thing. `initialize` travels on the foreground
+/// and its errors come back to their own arm, so a connection error while `step` is still
+/// `initialize` is a transport that died mid-handshake, not a refusal — and saying "session/new"
+/// there would be pointing at a request that was never sent.
+struct ReadyCell {
+    /// `None` once somebody has answered: the handshake is answered exactly once, and a second
+    /// answer would be a second `start` outcome for one call.
+    sender: Option<oneshot::Sender<Result<Ready>>>,
+    step: &'static str,
+}
+
+impl ReadyCell {
+    /// A cell over `sender`, on the first step of the handshake.
+    fn new(sender: oneshot::Sender<Result<Ready>>) -> Self {
+        Self {
+            sender: Some(sender),
+            step: "initialize",
+        }
+    }
+}
+
+/// Answers the handshake, if nobody has yet.
+///
+/// `false` when there was nobody left to tell — either the handshake is already answered or
+/// [`open_session`] has stopped listening — which is [`session_main`]'s cue that its handle will
+/// never exist and there is nothing left to run for.
+fn answer(ready: &Mutex<ReadyCell>, result: Result<Ready>) -> bool {
+    let sender = ready
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .sender
+        .take();
+    sender.is_some_and(|sender| sender.send(result).is_ok())
+}
+
+/// Records the handshake step the foreground future is on, for an answer it may not get to make.
+fn at_step(ready: &Mutex<ReadyCell>, step: &'static str) {
+    ready.lock().unwrap_or_else(PoisonError::into_inner).step = step;
+}
+
+/// Answers an unanswered handshake out of the **connection future's** error, and says whether it
+/// did.
+///
+/// This is the arm the vendor's `Authentication required` comes home on: the request that earned
+/// it was sent from a connection actor, and an actor that fails first takes the foreground future
+/// down with it before its own error arm can run ([`ReadyCell`]). The step is the one the
+/// foreground had reached, so the message names the request that was actually refused, and the
+/// child's stderr is appended exactly as the foreground's own arms append it — the guard still
+/// holds the child here, because [`run_session`] kills only after this has read it.
+fn answer_from_connection(
+    ready: &Mutex<ReadyCell>,
+    err: &agent_client_protocol::Error,
+    child: &Mutex<ChildGuard>,
+) -> bool {
+    let (sender, step) = {
+        let mut cell = ready.lock().unwrap_or_else(PoisonError::into_inner);
+        (cell.sender.take(), cell.step)
+    };
+    let Some(sender) = sender else {
+        return false;
+    };
+    sender.send(Err(handshake_error(step, err, child))).is_ok()
+}
+
 /// Opens a session: spawns the task, waits for the handshake, returns the handle.
 ///
 /// # Errors
 ///
 /// [`DriverError::Transport`] carrying whatever the handshake failed with, with the child's
 /// captured stderr appended when there was a child.
+///
+/// **Three failing exits, and what each guarantees about the child** (D61). Every one of them
+/// returns with the kill already sent, so a caller reporting the error is reporting the whole
+/// outcome rather than leaving an adapter on the box for it to wonder about — but they differ in
+/// how far past the signal they get, and the difference is worth naming because only one of them
+/// is a compromise:
+///
+/// 1. **The agent never answered.** The task is aborted and awaited, which resolves as soon as the
+///    runtime has dropped the future; the `ChildGuard`'s `Drop` has then signalled the tree.
+///    Signalled but not *reaped* by us, because a `Drop` cannot await — the only exit that runs no
+///    code of ours, and the only one that leaves the reap to `tokio::process`'s orphan queue
+///    (blueprint H-1, and the arm's own comment for why that is enough).
+/// 2. **The agent answered, and its answer was no.** The failure is composed on the task's own
+///    timeline — by the foreground future for `initialize`, by [`answer_from_connection`] for the
+///    `session/new` a connection actor refused — and the task is awaited afterwards, so the tree
+///    is killed *and* reaped before this returns.
+/// 3. **Nobody answered at all**, the sender dropped with the task: the handshake got as far as an
+///    event the consumer was no longer there to receive. Awaited exactly as (2) is, because the
+///    task is on its way to its own `kill` and returning before it arrives would make this the one
+///    error that does not mean what the other two mean.
+///
+/// (2) and (3) bound the wait by the handshake timeout: a task that will not finish must not turn
+/// a failed `start` into a hang.
 pub async fn open_session(
     io: AcpIo,
     spec: SessionSpec,
@@ -555,22 +787,40 @@ pub async fn open_session(
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = oneshot::channel();
 
+    let timeout = options.handshake_timeout;
     let task = tokio::spawn(run_session(
         io,
         spec,
         prompt,
         options,
-        ready_tx,
+        Arc::new(Mutex::new(ReadyCell::new(ready_tx))),
         events_tx,
         commands_rx,
     ));
 
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, ready_rx).await {
+    match tokio::time::timeout(timeout, ready_rx).await {
         Err(_) => {
             task.abort();
+            // D61. The aborted task drops its `ChildGuard`, whose `Drop` signals the kill;
+            // awaiting the cancelled handle is **not** waiting for the adapter — it resolves as
+            // soon as the runtime has dropped the future — and it is what makes this `Err` mean
+            // "the kill has been sent" rather than "the kill will be sent shortly". A caller that
+            // saw the error and went looking for the process would otherwise be racing the
+            // scheduler.
+            //
+            // The reap is skipped — a `Drop` cannot await — and skipping it costs less than the
+            // comment here used to claim. `tokio::process`'s own `Drop` (1.53's
+            // `process/unix/reap.rs` `Reaper::drop`, and `pidfd_reaper.rs` for the pidfd path)
+            // `try_wait`s the child and, failing that, pushes it onto the **global orphan queue**;
+            // the process driver drains that queue on every park once `SIGCHLD` has arrived
+            // (`runtime/process.rs:33`). So the exited child is reaped while the runtime is still
+            // alive, not held until this process exits, and on Windows there is no zombie state
+            // for it to be held in at all. Nobody should build the reaper task blueprint H-1
+            // speculates about: tokio already is one.
+            let _ = task.await;
             Err(DriverError::Transport(format!(
                 "the agent did not complete its handshake within {}s",
-                HANDSHAKE_TIMEOUT.as_secs()
+                timeout.as_secs()
             )))
         }
         Ok(Ok(Ok(ready))) => Ok(AcpSession {
@@ -588,12 +838,21 @@ pub async fn open_session(
         // error also means the process is gone, rather than leaving one behind for the caller to
         // wonder about.
         Ok(Ok(Err(err))) => {
-            let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, task).await;
+            let _ = tokio::time::timeout(timeout, task).await;
             Err(err)
         }
-        Ok(Err(_)) => Err(DriverError::Transport(
-            "the session task ended before the handshake".to_owned(),
-        )),
+        // Exit (3), and now genuinely the fallback its message claims to be: since the sender is
+        // shared, a refusal the foreground future never got to report is reported by `run_session`
+        // instead, and reaching here means nothing on the task's side had an answer to give. It
+        // waits for the same reason exit (2) does — the task is between "the handshake is over"
+        // and `kill`, and returning first would make this the one error that leaves a process
+        // behind.
+        Ok(Err(_)) => {
+            let _ = tokio::time::timeout(timeout, task).await;
+            Err(DriverError::Transport(
+                "the session task ended before the handshake".to_owned(),
+            ))
+        }
     }
 }
 
@@ -603,7 +862,7 @@ async fn run_session(
     spec: SessionSpec,
     prompt: String,
     options: SessionOptions,
-    ready: oneshot::Sender<Result<Ready>>,
+    ready: Arc<Mutex<ReadyCell>>,
     events: mpsc::Sender<DriverEnvelope>,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
 ) {
@@ -619,8 +878,11 @@ async fn run_session(
     // first returns early and **drops** the foreground future (`SDK/jsonrpc.rs:3555-3560`) — which
     // is exactly what a JSON-RPC error answering `session/prompt` causes. A `session_main` that
     // owned the process would be dropped mid-await and leave it running, so ownership sits on this
-    // side of that boundary and the kill below happens whatever became of the future.
-    let child = Arc::new(Mutex::new(child));
+    // side of that boundary and the kill below happens whatever became of the future. It is a
+    // `ChildGuard` and not a bare `Option<Spawned>` because ownership alone is not enough for the
+    // one exit that runs no code of ours: an **aborted** task drops the guard, whose `Drop`
+    // signals the kill (D61), which is what `open_session`'s handshake timeout relies on.
+    let child = Arc::new(Mutex::new(ChildGuard::new(child)));
 
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Inbound>();
     let permission_tx: InboundTx = inbound_tx.clone();
@@ -654,9 +916,10 @@ async fn run_session(
         )
         .connect_with(transport, {
             let child = Arc::clone(&child);
+            let ready = Arc::clone(&ready);
             async move |cx: ConnectionTo<Agent>| {
                 session_main(
-                    cx, spec, prompt, options, ready, events, commands, inbound_rx, &child,
+                    cx, spec, prompt, options, &ready, events, commands, inbound_rx, &child,
                 )
                 .await;
                 Ok(())
@@ -665,7 +928,19 @@ async fn run_session(
         .await;
 
     if let Err(err) = connected {
-        tracing::warn!(%err, "the ACP connection ended with an error");
+        // **Before the kill, and this is the whole of the headline fix.** A `session/new` the
+        // agent refused fails a connection actor, which drops the foreground future before its own
+        // error arm runs ([`ReadyCell`]); the error surfaces *here* instead, as the connection
+        // future's value. Until this line it died in the `warn!` below and the caller was told
+        // "the session task ended before the handshake" — the fallback for a handshake nobody
+        // answered — for what an unauthenticated box answers very clearly indeed. Reading the
+        // stderr tail also has to happen before `kill`, while the guard still holds the child.
+        if answer_from_connection(&ready, &err, &child) {
+            tracing::debug!(%err, "the ACP connection ended with the error `start` reported");
+        } else {
+            // Already answered, or nobody is listening: the log is the only reader left.
+            tracing::warn!(%err, "the ACP connection ended with an error");
+        }
     }
     // Unconditional: the foreground future may never have reached its own kill.
     kill(&child).await;
@@ -804,11 +1079,11 @@ async fn session_main(
     spec: SessionSpec,
     prompt: String,
     options: SessionOptions,
-    ready: oneshot::Sender<Result<Ready>>,
+    ready: &Mutex<ReadyCell>,
     events: mpsc::Sender<DriverEnvelope>,
     mut commands: mpsc::UnboundedReceiver<SessionCommand>,
     mut inbound: mpsc::UnboundedReceiver<Inbound>,
-    child: &Mutex<Option<Spawned>>,
+    child: &Mutex<ChildGuard>,
 ) {
     let mut state = TaskState::new(options.stamp, spec.retain_raw);
 
@@ -821,13 +1096,19 @@ async fn session_main(
     let init = match cx.send_request(initialize).block_task().await {
         Ok(response) => response,
         Err(err) => {
-            let _ = ready.send(Err(handshake_error("initialize", &err, child)));
+            answer(ready, Err(handshake_error("initialize", &err, child)));
             kill(child).await;
             return;
         }
     };
 
     // 2. session/new. ANA-4 risk 11: `block_task` only here.
+    //
+    // The step is recorded before the request goes out because this arm is the one that may not
+    // run: `start_session` sends from a connection actor, and a refusal drops this future rather
+    // than returning to it ([`ReadyCell`]). `run_session` then answers from the connection's own
+    // error, and what it reads here is how it knows to call the failure `session/new`.
+    at_step(ready, "session/new");
     let new_session =
         NewSessionRequest::new(spec.cwd.clone()).additional_directories(spec.extra_dirs.clone());
     let mut session = match cx
@@ -837,8 +1118,10 @@ async fn session_main(
         .await
     {
         Ok(session) => session,
+        // Still reachable, and not dead code: a local `ensure_v1_session_protocol` refusal and an
+        // internal error both return here without ever failing an actor.
         Err(err) => {
-            let _ = ready.send(Err(handshake_error("session/new", &err, child)));
+            answer(ready, Err(handshake_error("session/new", &err, child)));
             kill(child).await;
             return;
         }
@@ -901,8 +1184,10 @@ async fn session_main(
         }
     }
 
-    // 5. The handle may exist now: everything above is what `start` promised to have done.
-    if ready.send(Ok(Ready { session_ref })).is_err() {
+    // 5. The handle may exist now: everything above is what `start` promised to have done. This is
+    //    also where the sender leaves the cell on the happy path, so a connection error after it —
+    //    a turn that dies on the wire — is the session's business and not `start`'s.
+    if !answer(ready, Ok(Ready { session_ref })) {
         kill(child).await;
         return;
     }
@@ -1352,34 +1637,32 @@ fn answer_parked_cancelled(state: &mut TaskState) {
 
 /// Kills the process tree and reaps it, if there is one and nobody has yet.
 ///
-/// The child is **taken out** of the mutex before anything is awaited, so no lock is ever held
-/// across an `.await`, and a second call is a no-op.
-async fn kill(child: &Mutex<Option<Spawned>>) {
-    let taken = child.lock().unwrap_or_else(PoisonError::into_inner).take();
-    let Some(mut child) = taken else { return };
-    if let Err(err) = child.kill_tree().await {
-        tracing::warn!(%err, "the agent's process tree did not die cleanly");
-    }
-    if let Err(err) = child.wait().await {
-        tracing::warn!(%err, "the agent process could not be reaped");
-    }
+/// `ChildGuard::kill_and_reap` takes `&mut self` and awaits, so the guard is **swapped out** for an
+/// empty one under the lock and awaited outside it: no lock is ever held across an `.await`, and
+/// the emptied guard left in the mutex makes a second call — and the `Drop` that eventually runs —
+/// a no-op rather than a second signal at a pid the operating system may already have reissued.
+async fn kill(child: &Mutex<ChildGuard>) {
+    let mut taken = std::mem::replace(
+        &mut *child.lock().unwrap_or_else(PoisonError::into_inner),
+        ChildGuard::new(None),
+    );
+    taken.kill_and_reap().await;
 }
 
 /// What the child last wrote to stderr, for an error message.
-fn stderr_tail(child: &Mutex<Option<Spawned>>) -> String {
+fn stderr_tail(child: &Mutex<ChildGuard>) -> String {
     child
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .as_ref()
-        .map(|child| child.stderr_tail().join("\n"))
-        .unwrap_or_default()
+        .stderr_tail()
+        .join("\n")
 }
 
 /// A handshake failure, with the child's captured stderr appended when there is one.
 fn handshake_error(
     step: &str,
     err: &agent_client_protocol::Error,
-    child: &Mutex<Option<Spawned>>,
+    child: &Mutex<ChildGuard>,
 ) -> DriverError {
     let stderr = stderr_tail(child);
     if stderr.is_empty() {

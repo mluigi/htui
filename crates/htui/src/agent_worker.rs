@@ -15,9 +15,10 @@
 //! harness awaits it inline, which is what keeps chat-tab snapshots byte-stable with no sleeps —
 //! the same trade `Harness::settle` makes for store requests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -32,7 +33,9 @@ use htui_agent::launch::AgentSettings;
 use htui_agent::probe::{ProbeContext, ProbeEnv, ProbeOutcome, SpawnTier2, probe_agent};
 use htui_agent::record::{AnsweredBy, Recorder};
 use htui_agent::registry::DriverFactory;
-use htui_core::model::{Agent, AgentBox, BoxId, ChatRunSpec, RunStatus, StepId, Transport};
+use htui_core::model::{
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, RunStatus, StepId, Transport,
+};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{StoreError, WriteStore};
 use htui_store::{Backend, Writer};
@@ -167,6 +170,13 @@ pub struct AgentRuntime {
     /// inside the worker loop would leave a probe with a 60-second handshake running after the UI
     /// is gone, with nobody able to name it.
     background: Vec<JoinHandle<()>>,
+    /// The rows a `ChatStart` re-probe is running for, so two overlapping chats do not each start
+    /// one for the same `(agent_id, box_id)` (blueprint H-9).
+    ///
+    /// On the runtime because that is the only thing both triggers outlive: the staleness re-probe
+    /// is a task this struct owns, the D60 one runs inside a chat task, and neither can see the
+    /// other from where it lives.
+    reprobe_claims: ReprobeClaims,
 }
 
 impl core::fmt::Debug for AgentRuntime {
@@ -188,6 +198,7 @@ impl AgentRuntime {
             started: Vec::new(),
             grace: CANCEL_GRACE,
             background: Vec::new(),
+            reprobe_claims: ReprobeClaims::default(),
         }
     }
 
@@ -432,7 +443,7 @@ impl AgentRuntime {
         replies: &mpsc::UnboundedSender<ReplyEnvelope>,
         addr: ReplyAddr,
         project_id: htui_core::model::ProjectId,
-        agent_id: htui_core::model::AgentId,
+        agent_id: AgentId,
         model: Option<String>,
         prompt: String,
     ) -> Result<Served, StoreError> {
@@ -532,18 +543,33 @@ impl AgentRuntime {
         // a `cli` row has none (milestone 8's problem). Not `Writer::Buffered`, because it
         // refuses `upsert_agent_box` (plan D52) and a probe with nowhere to write its answer
         // would spawn an adapter to throw it away. And stale, or there is nothing to learn.
-        if summary.agent.transport == Transport::Acp
-            && !matches!(writer, Writer::Buffered(_))
-            && needs_reprobe(summary.on_box.as_ref(), Utc::now())
-        {
-            self.background.push(tokio::spawn(run_reprobe(
-                writer.clone(),
-                box_id,
-                summary.agent.clone(),
-                summary.on_box.clone(),
-                spec.cwd.clone(),
-            )));
-        }
+        //
+        // The first two are properties of the *row and the writer* and hold for D60's trigger
+        // too, so they are what builds the arguments; staleness is the third trigger's own
+        // condition and is applied to the spawn alone.
+        let reprobe = (summary.agent.transport == Transport::Acp
+            && !matches!(writer, Writer::Buffered(_)))
+        .then(|| ReprobeArgs {
+            writer: writer.clone(),
+            box_id,
+            agent: summary.agent.clone(),
+            existing: summary.on_box.clone(),
+            cwd: spec.cwd.clone(),
+            claims: self.reprobe_claims.clone(),
+        });
+        // A chat whose row is already being re-probed carries none: two re-probes for one
+        // `(agent_id, box_id)` would race each other for the same row (blueprint H-9). The
+        // arguments **move** into whichever trigger gets them — the staleness one consumes them
+        // here, and D60's arm below is the only other place they can go, so neither path clones
+        // what the other threw away.
+        let stale = needs_reprobe(&summary.agent, summary.on_box.as_ref(), Utc::now());
+        let reprobe = match (stale, reprobe) {
+            (true, Some(args)) => {
+                self.background.push(tokio::spawn(run_reprobe(args)));
+                None
+            }
+            (_, held) => held,
+        };
 
         let step_id = chat.step_id;
         let args = ChatArgs {
@@ -561,6 +587,7 @@ impl AgentRuntime {
                 addr,
             },
             grace: self.grace,
+            reprobe,
         };
         Ok(Served::Start {
             step_id,
@@ -584,6 +611,11 @@ pub struct ChatArgs {
     commands: mpsc::UnboundedReceiver<ChatCommand>,
     frames: Frames,
     grace: Duration,
+    /// Plan D60: `Some` when a spawn failure should refresh this box's row for this agent. `None`
+    /// for a `cli` row (tier 2 is `initialize`, which a `cli` row has none of), for a buffered
+    /// writer (`upsert_agent_box` is refused, plan D52), and for a chat whose staleness re-probe
+    /// is already running — a second one would race it for the same row.
+    reprobe: Option<ReprobeArgs>,
 }
 
 impl core::fmt::Debug for ChatArgs {
@@ -682,24 +714,128 @@ async fn run_probe(args: ProbeArgs) {
     frames.reply(&frames.addr, StoreReply::Agents(agents));
 }
 
-/// Whether this box's row for an agent is old enough to be worth re-probing (plan D55).
+/// Whether this box's row for an agent is worth re-probing (plan D55).
 ///
-/// Three ways to be stale and one way to be fresh: no row at all, a row no probe ever stamped,
-/// or a stamp further back than [`PROBE_TTL`]. A stamp in the *future* — a clock that stepped
-/// backwards under an NTP correction or a suspended laptop — is not stale: `to_std` refuses a
-/// negative age, and treating one as "very old" would re-probe on every chat until the clock
-/// caught up.
+/// Four ways to be stale and one way to be fresh: no row at all, a row no probe ever stamped, a
+/// stamp further back than [`PROBE_TTL`], or a registry row **edited since** the probe read it. A
+/// stamp in the *future* — a clock that stepped backwards under an NTP correction or a suspended
+/// laptop — is not stale: `to_std` refuses a negative age, and treating one as "very old" would
+/// re-probe on every chat until the clock caught up.
+///
+/// The fourth is age's blind spot and D58 is what opened it. Since the driver spawns
+/// `probe.resolved` whenever its rules pass, the recording is no longer a hint the chat may
+/// improve on — it *is* the launch. A hand-edited `agent.launch` (different args, a new
+/// `HTUI_TOOL_*`, another binary entirely) would then be ignored for up to a day while every chat
+/// kept spawning what was recorded from the row as it used to be. The store stamps that edit in
+/// `agent.updated_at`, and a probe never writes `agents`, so the comparison has no way to see its
+/// own work: the two stamps meeting is the steady state, and only `agents` moving past
+/// `agent_box` is an edit. Nothing is compared *inside* the two documents — a byte-for-byte
+/// launch comparison would re-probe on a whitespace change and still miss a `PATH` that moved.
+///
+/// A re-probe is cheap and asynchronous (D55 spawns it beside the chat, never in front of it), so
+/// the failure this errs towards is one extra tier-2 handshake, not a delayed conversation.
 #[must_use]
-pub fn needs_reprobe(on_box: Option<&AgentBox>, now: DateTime<Utc>) -> bool {
+pub fn needs_reprobe(agent: &Agent, on_box: Option<&AgentBox>, now: DateTime<Utc>) -> bool {
     let Some(probed_at) = on_box.and_then(|row| row.probed_at) else {
         return true;
     };
+    if agent.updated_at > probed_at {
+        return true;
+    }
     now.signed_duration_since(probed_at)
         .to_std()
         .is_ok_and(|age| age > PROBE_TTL)
 }
 
-/// The `ChatStart` re-probe: tier 2 over one row, in its own task, answering nobody (plan D55).
+/// Which `(agent_id, box_id)` rows a re-probe is running for right now (blueprint H-9).
+///
+/// **One per [`AgentRuntime`], not one per chat**, which is the whole of the widening. The
+/// per-chat guard — `ChatArgs.reprobe = None` when the staleness trigger already fired — stops one
+/// chat asking twice, and two chats can still overlap: a second `ChatStart` arriving while the
+/// first chat's re-probe is in flight sees a `probed_at` that has not moved yet, calls the row
+/// fresh, spawns the same recording, fails the same way, and starts a second `probe_agent` for the
+/// same row. Two tier-2 children and a last-write-wins on one `agent_box` row, bounded only by how
+/// fast the user can click.
+///
+/// Benign — both writes carry the same verdict — but two adapters spawned to answer one question
+/// is a cost with no reader, and the exclusion is cheaper than the second handshake. Held by value
+/// so both triggers get the same set: the staleness one spawns into the runtime's `background`,
+/// the D60 one runs inside a chat task that outlives the arm that built it.
+#[derive(Clone, Default)]
+struct ReprobeClaims(Arc<Mutex<HashSet<(AgentId, BoxId)>>>);
+
+impl ReprobeClaims {
+    /// Claims `key` for the caller, or `None` when a re-probe already holds it.
+    fn claim(&self, key: (AgentId, BoxId)) -> Option<ReprobeClaim> {
+        let claimed = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key);
+        claimed.then(|| ReprobeClaim {
+            claims: self.clone(),
+            key,
+        })
+    }
+}
+
+/// A held [`ReprobeClaims`] entry, released by its `Drop`.
+///
+/// RAII rather than a release call at the end of `run_reprobe`, because the re-probe has an exit
+/// that runs none of its own code: `AgentRuntime::shutdown` aborts the background tasks, and an
+/// aborted task drops its future mid-await. A claim released only on the normal path would leak on
+/// that one, and the leak would outlive the process's next chat rather than the process.
+struct ReprobeClaim {
+    claims: ReprobeClaims,
+    key: (AgentId, BoxId),
+}
+
+impl Drop for ReprobeClaim {
+    fn drop(&mut self) {
+        self.claims
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
+/// What a re-probe needs, whichever trigger asks for it.
+///
+/// Two triggers, one argument set: the staleness check at `AgentRuntime::start` (plan D55) and a
+/// spawn failure inside [`run_chat`] (plan D60). They differ in *when* they fire and in nothing
+/// else, so the struct is what keeps them from drifting into two slightly different re-probes.
+///
+/// A [`Writer`] and not a [`Backend`], for `ProbeArgs`'s reason: the loop replaces its `Backend`
+/// wholesale when the server comes or goes, and this outlives the arm that built it.
+/// The `Agent` and the `Option<AgentBox>` are cloned once per ACP chat start, whether or not a
+/// re-probe ever runs: both triggers need them and neither knows at build time which will fire.
+/// Two rows with a `JSONB` column each, on the arm that is already building a `SessionSpec` and a
+/// driver — the loop is not what makes a chat start feel slow, and a lazier shape would mean
+/// keeping the `Backend` alive to re-read the rows later, which is what `ProbeArgs`'s doc explains
+/// this type exists to avoid.
+#[derive(Clone)]
+struct ReprobeArgs {
+    writer: Writer,
+    box_id: BoxId,
+    agent: Agent,
+    existing: Option<AgentBox>,
+    cwd: std::path::PathBuf,
+    /// Whose turn it is to probe this row (blueprint H-9): the runtime's set, not this chat's.
+    claims: ReprobeClaims,
+}
+
+impl core::fmt::Debug for ReprobeArgs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReprobeArgs")
+            .field("writer", &self.writer.label())
+            .field("agent", &self.agent.name)
+            .field("existing", &self.existing.is_some())
+            .finish()
+    }
+}
+
+/// The `ChatStart` re-probe: tier 2 over one row, answering nobody (plan D55, plan D60).
 ///
 /// **Tier 2 only.** Resolution is unavoidable — tier 2 has nothing to spawn without it — but the
 /// `--version` children are skipped ([`ProbeEnv::without_versions`]), because what a lazy
@@ -709,13 +845,32 @@ pub fn needs_reprobe(on_box: Option<&AgentBox>, now: DateTime<Utc>) -> bool {
 /// Nothing here can fail the chat: it holds no chat channel, sends no reply, and a write that
 /// fails is a `warn!` and nothing else. A `failed` verdict writes `enabled = false` and the
 /// running conversation is untouched — the row it wrote is for the *next* chat.
-async fn run_reprobe(
-    writer: Writer,
-    box_id: BoxId,
-    agent: Agent,
-    existing: Option<AgentBox>,
-    cwd: std::path::PathBuf,
-) {
+///
+/// **Not a task of its own.** The staleness trigger spawns it into the runtime's `background`
+/// because the chat it belongs to is still going; the D60 trigger awaits it inline, because by
+/// then the chat is over and its task has nothing left to do (blueprint P-7).
+///
+/// **One at a time per row** ([`ReprobeClaims`]). Both triggers arrive here, so this is the one
+/// place that can see the overlap two chats create, and refusing is right for either of them: the
+/// re-probe already in flight is asking the same question of the same box and will write the same
+/// answer.
+async fn run_reprobe(args: ReprobeArgs) {
+    let ReprobeArgs {
+        writer,
+        box_id,
+        agent,
+        existing,
+        cwd,
+        claims,
+    } = args;
+    // Held for the whole probe and dropped with this future, aborted or not.
+    let Some(_claim) = claims.claim((agent.id, box_id)) else {
+        tracing::debug!(
+            agent = %agent.name,
+            "a re-probe for this row is already running; leaving it to that one"
+        );
+        return;
+    };
     let ctx = ProbeContext {
         env: ProbeEnv::host(cwd).without_versions(),
         now: Utc::now(),
@@ -833,6 +988,7 @@ pub async fn run_chat(args: ChatArgs) {
         mut commands,
         frames,
         grace,
+        reprobe,
     } = args;
 
     let scrubber = MinimalScrubber::new(spec.env.values().cloned());
@@ -852,6 +1008,21 @@ pub async fn run_chat(args: ChatArgs) {
             );
             close_run(&writer, &chat, RunStatus::Failed).await;
             frames.failed(message);
+            // Plan D60. A failure to *spawn* is a fact about this box's row, not about the
+            // conversation: the adapter it names is gone, moved by a self-update, or no longer
+            // executable, and the row still says otherwise. It is refreshed here, in what is left
+            // of this task's life — `run_chat` is spawned in production and awaited inline by the
+            // harness, so this is off the worker's `select!` arm either way (`R-NF-3`) and
+            // deterministic in a test. The command receiver goes first, so a command that arrives
+            // meanwhile is refused as "this chat has ended" rather than queued for nobody.
+            //
+            // `Spawn` alone (blueprint H-8): `Unresolved` names the tool in its own message and
+            // `Transport` is about the wire, not the row. And no transport fallback of any kind —
+            // a CLI agent is its own registry row, never a degraded mode of an ACP one.
+            if let (DriverError::Spawn(_), Some(reprobe)) = (&err, reprobe) {
+                drop(commands);
+                run_reprobe(reprobe).await;
+            }
             return;
         }
     };
@@ -1564,21 +1735,38 @@ pub(crate) mod tests {
         }
     }
 
+    /// A registry row last edited at `updated_at`.
+    ///
+    /// The staleness cases pin `agent.updated_at` rather than taking [`fake_row`]'s demo timestamp
+    /// as given: that constant is fixed in the calendar and these cases are relative to `now`, so
+    /// a row whose edit time is stated in the case is the only one that cannot start reading as
+    /// hand-edited on some future afternoon.
+    fn edited_row(agent_id: AgentId, updated_at: DateTime<Utc>) -> Agent {
+        Agent {
+            updated_at,
+            ..fake_row(agent_id)
+        }
+    }
+
     /// Plan D55: a row nobody has probed, or one probed longer ago than [`PROBE_TTL`], is stale.
     #[test]
     fn needs_reprobe_is_absent_or_older_than_the_ttl() {
         let now = Utc::now();
         let agent_id = AgentId::new();
+        // Edited a month ago: older than every `probed_at` below, so age is the only thing any of
+        // these assertions is measuring.
+        let agent = edited_row(agent_id, now - chrono::TimeDelta::days(30));
         assert!(
-            needs_reprobe(None, now),
+            needs_reprobe(&agent, None, now),
             "an unprobed box has nothing to go on"
         );
         assert!(
-            needs_reprobe(Some(&probed_row(agent_id, None)), now),
+            needs_reprobe(&agent, Some(&probed_row(agent_id, None)), now),
             "a row with no `probed_at` is a row no probe ever wrote"
         );
         assert!(
             needs_reprobe(
+                &agent,
                 Some(&probed_row(
                     agent_id,
                     Some(now - chrono::TimeDelta::hours(25))
@@ -1589,6 +1777,7 @@ pub(crate) mod tests {
         );
         assert!(
             !needs_reprobe(
+                &agent,
                 Some(&probed_row(
                     agent_id,
                     Some(now - chrono::TimeDelta::hours(23))
@@ -1601,6 +1790,7 @@ pub(crate) mod tests {
         // for the next 24 hours' worth of drift.
         assert!(
             !needs_reprobe(
+                &agent,
                 Some(&probed_row(
                     agent_id,
                     Some(now + chrono::TimeDelta::hours(1))
@@ -1608,6 +1798,81 @@ pub(crate) mod tests {
                 now
             ),
             "a future `probed_at` is not stale"
+        );
+    }
+
+    /// Blueprint H-9 widened from one chat to the runtime: a re-probe for a
+    /// `(agent_id, box_id)` excludes every other re-probe for that pair, whichever trigger asked
+    /// for it, and stops excluding them the moment it is done.
+    ///
+    /// The unit under test is the claim itself rather than a pair of overlapping chats, and
+    /// deliberately: `run_reprobe` hard-wires [`SpawnTier2`], so "how many tier-2 handshakes ran"
+    /// is not observable from the store — both re-probes of an overlap write the same verdict for
+    /// the same row, which is exactly why the race was benign enough to survive review. What is
+    /// observable is the exclusion, and the wiring that uses it is one `let`-`else`.
+    #[test]
+    fn a_reprobe_claim_excludes_the_same_row_until_it_is_dropped() {
+        let claims = ReprobeClaims::default();
+        let agent_id = AgentId::new();
+        let key = (agent_id, ids::BOX);
+
+        let held = claims.claim(key).expect("nobody is probing this row");
+        assert!(
+            claims.claim(key).is_none(),
+            "a second re-probe for one row is the race H-9 is about"
+        );
+        assert!(
+            claims.claim((AgentId::new(), ids::BOX)).is_some(),
+            "another agent on this box is a different row and is not excluded"
+        );
+        assert!(
+            claims.claim((agent_id, BoxId::new())).is_some(),
+            "the same agent on another box is a different row too"
+        );
+
+        drop(held);
+        assert!(
+            claims.claim(key).is_some(),
+            "the claim is released when the re-probe ends — including when its task is aborted, \
+             which is the only way `AgentRuntime::shutdown` ends one"
+        );
+    }
+
+    /// The other way to be stale, and the one age alone cannot see: the recording is older than
+    /// the row it was made from.
+    ///
+    /// D58 spawns `probe.resolved` whenever its rules pass, so a hand-edited `agent.launch` — new
+    /// args, a new `HTUI_TOOL_*`, a different binary — would be ignored for up to
+    /// [`PROBE_TTL`] while every chat kept spawning the recording made from the *old* row. The
+    /// edit is the event; `agent.updated_at` is where the store records it.
+    #[test]
+    fn needs_reprobe_when_the_row_was_edited_after_it_was_probed() {
+        let now = Utc::now();
+        let agent_id = AgentId::new();
+        let probed_at = now - chrono::TimeDelta::hours(2);
+        let on_box = probed_row(agent_id, Some(probed_at));
+
+        assert!(
+            needs_reprobe(
+                &edited_row(agent_id, probed_at + chrono::TimeDelta::minutes(1)),
+                Some(&on_box),
+                now
+            ),
+            "a row edited after the probe read it is stale however recently it was probed"
+        );
+        assert!(
+            !needs_reprobe(
+                &edited_row(agent_id, probed_at - chrono::TimeDelta::minutes(1)),
+                Some(&on_box),
+                now
+            ),
+            "a row the probe read *after* its last edit is what the recording was made from"
+        );
+        // The probe writes `agent_box`, never `agents`, so a re-probe cannot move `updated_at` and
+        // the two stamps meeting exactly is the ordinary steady state, not an edit.
+        assert!(
+            !needs_reprobe(&edited_row(agent_id, probed_at), Some(&on_box), now),
+            "the same instant is not an edit the probe missed"
         );
     }
 
@@ -1835,6 +2100,266 @@ pub(crate) mod tests {
         drop(served);
         runtime.shutdown(Duration::ZERO).await;
         cache.close().await;
+    }
+
+    /// An `acp` registry row whose command exists nowhere.
+    ///
+    /// No `discovery`, so tier 1 has no placeholder to resolve and nothing is searched for: the
+    /// first thing that can fail is `launch::spawn`'s own lookup, which is [`DriverError::Spawn`]
+    /// — the one error D60 acts on. Nothing is started anywhere near this test (blueprint H-7).
+    fn unspawnable_row(id: AgentId) -> Agent {
+        Agent {
+            name: "unspawnable-acp".to_owned(),
+            transport: Transport::Acp,
+            launch: json!({ "command": "/nonexistent/htui-d60/agent" }),
+            settings: json!({}),
+            ..fake_row(id)
+        }
+    }
+
+    /// This box's `agent_box` row for `agent_id`, read back through the store.
+    async fn stored_box(store: &MemStore, agent_id: AgentId) -> AgentBox {
+        store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|summary| summary.agent.id == agent_id)
+            .expect("the registry row is still there")
+            .on_box
+            .expect("this box has a row for that agent")
+    }
+
+    /// `probe.status`, the one key every re-probe case reads.
+    fn probe_status(row: &AgentBox) -> Option<&str> {
+        row.probe
+            .as_ref()
+            .and_then(|probe| probe.get("status"))
+            .and_then(Value::as_str)
+    }
+
+    /// Plan D60: a chat that cannot **spawn** its adapter refreshes this box's row for that agent,
+    /// in the failed chat's own task.
+    ///
+    /// The pre-inserted row is deliberately *fresh*, which takes the staleness trigger (D55) off
+    /// the path and leaves D60 as the only re-probe that can run. `background_len() == 0` with the
+    /// row untouched **before the task is polled** is `R-NF-3` in the runtime's own terms: the
+    /// worker's `select!` arm returned having spawned nothing and written nothing.
+    #[tokio::test]
+    async fn a_spawn_failure_reports_the_adapters_message_and_reprobes_the_row_off_the_arm() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&unspawnable_row(agent_id))
+            .await
+            .expect("the acp row lands");
+        let fresh = probed_row(agent_id, Some(Utc::now()));
+        store
+            .upsert_agent_box(&fresh)
+            .await
+            .expect("the fresh agent_box lands");
+        let backend = Backend::memory(store.clone());
+        // The real ACP builder, because the fact under test is what `launch::spawn` does with a
+        // command that is not there; a scripted adapter cannot fail to spawn.
+        let mut runtime = AgentRuntime::production().with_grace(Duration::from_millis(0));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+            .await;
+        let Served::Start { task, .. } = served else {
+            panic!("a chat start opens a session: {served:?}")
+        };
+        assert_eq!(
+            runtime.background_len(),
+            0,
+            "a fresh row is not stale, so nothing was spawned on the arm"
+        );
+        let before = stored_box(&store, agent_id).await;
+        assert_eq!(
+            probe_status(&before),
+            Some("ready"),
+            "nothing has run yet: {:?}",
+            before.probe
+        );
+        assert_eq!(
+            before.probed_at, fresh.probed_at,
+            "and the arm wrote nothing"
+        );
+
+        task.await;
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            replies.push(reply);
+        }
+
+        let message = replies
+            .iter()
+            .find_map(|reply| match &reply.reply {
+                StoreReply::Failed {
+                    request: "chat_start",
+                    message,
+                } => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the request that asked is answered: {replies:?}"));
+        assert!(
+            message.contains("is not executable"),
+            "the adapter's own message, not a rewrite of it: {message}"
+        );
+        assert!(
+            replies
+                .iter()
+                .any(|reply| matches!(reply.reply, StoreReply::Chat(ChatFrame::Failed { .. }))),
+            "the stream is failed as well as the request: {replies:?}"
+        );
+
+        let after = stored_box(&store, agent_id).await;
+        assert_eq!(
+            probe_status(&after),
+            Some("failed"),
+            "the spawn failure is a fact about the row: {:?}",
+            after.probe
+        );
+        assert!(
+            after
+                .probe
+                .as_ref()
+                .and_then(|probe| probe.pointer("/stderr_tail/0"))
+                .and_then(Value::as_str)
+                .is_some_and(|line| line.contains("not executable")),
+            "the re-probe recorded why: {:?}",
+            after.probe
+        );
+        assert!(
+            !after.enabled,
+            "a launch that will not spawn is not enabled"
+        );
+        assert_ne!(
+            after.probed_at, before.probed_at,
+            "the row was re-probed, not merely rewritten"
+        );
+    }
+
+    /// Blueprint H-8: D60 names `Spawn` and nothing else.
+    ///
+    /// A placeholder that resolves nowhere is [`DriverError::Unresolved`], which the 24-hour
+    /// staleness path already covers and whose message already names the tool. Re-probing here
+    /// would spawn an adapter to re-learn what the error just said.
+    #[tokio::test]
+    async fn an_unresolved_placeholder_does_not_reprobe() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        let mut agent = unspawnable_row(agent_id);
+        agent.launch = json!({
+            "command": "${gone}",
+            "args": [],
+            "env": {},
+            "discovery": {
+                "tools": {
+                    "gone": { "kind": "path", "names": ["htui-no-such-binary-2f8e"] }
+                },
+                "handshake": true
+            }
+        });
+        store.upsert_agent(&agent).await.expect("the acp row lands");
+        let fresh = probed_row(agent_id, Some(Utc::now()));
+        store
+            .upsert_agent_box(&fresh)
+            .await
+            .expect("the fresh agent_box lands");
+        let backend = Backend::memory(store.clone());
+        let mut runtime = AgentRuntime::production().with_grace(Duration::from_millis(0));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+            .await;
+        let Served::Start { task, .. } = served else {
+            panic!("a chat start opens a session: {served:?}")
+        };
+        task.await;
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            replies.push(reply);
+        }
+
+        let message = replies
+            .iter()
+            .find_map(|reply| match &reply.reply {
+                StoreReply::Failed {
+                    request: "chat_start",
+                    message,
+                } => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the request that asked is answered: {replies:?}"));
+        assert!(
+            message.contains("gone"),
+            "the message names the placeholder: {message}"
+        );
+
+        let after = stored_box(&store, agent_id).await;
+        assert_eq!(
+            probe_status(&after),
+            Some("ready"),
+            "an `Unresolved` chat start leaves the row alone: {:?}",
+            after.probe
+        );
+        assert_eq!(after.probed_at, fresh.probed_at);
+        assert_eq!(runtime.background_len(), 0);
+    }
+
+    /// Blueprint H-9: a stale row and a spawn failure on the same chat are **one** re-probe.
+    ///
+    /// `ChatArgs.reprobe` is `None` once the staleness path has spawned one, so the two triggers
+    /// cannot race each other for the same primary key. `MemStore` exposes no write counter, so
+    /// the count is read off the row itself: `upsert_agent_box` stamps `updated_at` per write, and
+    /// a second re-probe would necessarily move it.
+    #[tokio::test]
+    async fn a_stale_row_reprobes_once_not_twice() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&unspawnable_row(agent_id))
+            .await
+            .expect("the acp row lands");
+        store
+            .upsert_agent_box(&probed_row(
+                agent_id,
+                Some(Utc::now() - chrono::TimeDelta::hours(25)),
+            ))
+            .await
+            .expect("the stale agent_box lands");
+        let backend = Backend::memory(store.clone());
+        let mut runtime = AgentRuntime::production().with_grace(Duration::from_millis(0));
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+            .await;
+        let Served::Start { task, .. } = served else {
+            panic!("a chat start opens a session: {served:?}")
+        };
+        assert_eq!(runtime.background_len(), 1, "a 25 h old row is stale");
+        runtime.finish_background(Duration::from_secs(5)).await;
+        let after_staleness = stored_box(&store, agent_id).await;
+        assert_eq!(
+            probe_status(&after_staleness),
+            Some("failed"),
+            "the staleness re-probe is the one that wrote: {:?}",
+            after_staleness.probe
+        );
+
+        task.await;
+        let after_chat = stored_box(&store, agent_id).await;
+        assert_eq!(
+            after_chat.updated_at, after_staleness.updated_at,
+            "the spawn failure found a re-probe already running and started no second one"
+        );
+        assert_eq!(after_chat.probed_at, after_staleness.probed_at);
     }
 
     /// A registry whose every row resolves nowhere — the probe fixture rule (blueprint H-7).

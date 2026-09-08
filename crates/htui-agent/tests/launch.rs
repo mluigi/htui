@@ -64,7 +64,12 @@ const AGY_LAUNCH: &str = r#"{
         }
       }
     },
-    "handshake": true
+    "handshake": true,
+    "credential": {
+      "env":   ["GEMINI_API_KEY"],
+      "files": ["%GEMINI_HOME%/antigravity-acp/acp_token.json",
+                "~/.gemini/antigravity-acp/acp_token.json"]
+    }
   }
 }"#;
 
@@ -142,10 +147,20 @@ fn claude_launch_round_trips() {
         other => panic!("claude_agent_acp is a node_package probe, got {other:?}"),
     }
 
+    assert_eq!(
+        discovery.credential, None,
+        "the claude adapter demands no auth, so its row declares no credential block and keeps \
+         milestone 5's rule (plan D59)"
+    );
+
     // Round trip: the value we serialise back is the value we parsed, field for field.
-    let reparsed: AgentLaunch =
-        serde_json::from_str(&serde_json::to_string(&launch).expect("launch serialises"))
-            .expect("serialised launch parses");
+    let text = serde_json::to_string(&launch).expect("launch serialises");
+    assert!(
+        !text.contains("credential"),
+        "a row without the block re-serialises without a `\"credential\": null` key, so a probe \
+         does not rewrite every milestone-5 registry row it touches: {text}"
+    );
+    let reparsed: AgentLaunch = serde_json::from_str(&text).expect("serialised launch parses");
     assert_eq!(reparsed, launch);
 }
 
@@ -187,6 +202,25 @@ fn agy_launch_round_trips_with_per_platform_args() {
         }
         other => panic!("agy_acp_server is a glob probe, got {other:?}"),
     }
+
+    // Plan D59/D63: `agy`'s ACP server advertises four auth methods whether or not this box has
+    // logged in, so the row says where its own login leaves a credential. Two file candidates in
+    // the glob tier's grammar — a `%VAR%` one for a box that sets `GEMINI_HOME`, a `~` one for the
+    // default — then the API-key variable.
+    let credential = discovery
+        .credential
+        .as_ref()
+        .expect("agy declares a credential block");
+    assert_eq!(credential.env, ["GEMINI_API_KEY"]);
+    assert_eq!(credential.files.len(), 2);
+    assert_eq!(
+        credential.files[0],
+        "%GEMINI_HOME%/antigravity-acp/acp_token.json"
+    );
+    assert_eq!(
+        credential.files[1],
+        "~/.gemini/antigravity-acp/acp_token.json"
+    );
 
     let reparsed: AgentLaunch =
         serde_json::from_str(&serde_json::to_string(&launch).expect("launch serialises"))

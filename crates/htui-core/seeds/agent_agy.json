@@ -29,7 +29,12 @@
           }
         }
       },
-      "handshake": true
+      "handshake": true,
+      "credential": {
+        "env":   ["GEMINI_API_KEY"],
+        "files": ["%GEMINI_HOME%/antigravity-acp/acp_token.json",
+                  "~/.gemini/antigravity-acp/acp_token.json"]
+      }
     }
   },
   "settings": {

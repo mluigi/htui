@@ -21,9 +21,12 @@
 //! start would otherwise spawn a `--version` child per tool before its first token.
 //!
 //! **Known limit** (blueprint H-3): a [`ToolMap`] value is one string, so a glob tool's
-//! per-platform `args` — `agy`'s Linux-only `--uid=` — are *not* applied on this path. Milestone 6
-//! builds the driver from `agent_box.probe.resolved` instead of resolving again, which is where
-//! those arguments live.
+//! per-platform `args` — `agy`'s Linux-only `--uid=` — are *not* applied on this path. Since
+//! milestone 6 (plan D58) this path is the **fallback** of `AcpDriver::launch_for`: a usable
+//! `agent_box.probe.resolved` is spawned as recorded, arguments and all, and only a row with no
+//! usable snapshot — or one whose recorded command is gone from disk — resolves here, without the
+//! append. A row whose tools carry no per-platform arguments, which is every seed row but `agy`,
+//! resolves to the same launch either way.
 
 use std::path::Path;
 
@@ -140,6 +143,9 @@ mod tests {
         Discovery {
             tools,
             handshake: false,
+            // Resolution never reads it: the credential tier is the probe's (plan D59), and
+            // `tools::resolve` answers the same for a row that declares one and a row that does not.
+            credential: None,
         }
     }
 

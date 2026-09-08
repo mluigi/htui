@@ -16,12 +16,12 @@ use htui_agent::acp::{AcpIo, Handshake, handshake};
 use htui_agent::driver::DriverFuture;
 use htui_agent::error::DriverError;
 use htui_agent::launch::{
-    AcpSettings, AgentLaunch, Discovery, ResolvedLaunch, ToolProbe, VersionProbe,
+    AcpSettings, AgentLaunch, CredentialProbe, Discovery, ResolvedLaunch, ToolProbe, VersionProbe,
 };
 use htui_agent::probe::{
-    ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeSource, ProbeStatus, Tier2,
-    below_min, capture_version, expand, extract_version, glob_first, platform_key, probe_agent,
-    probe_tools, resolve_tool, segment_matches, status_for, walk,
+    CredentialTier, ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeSource, ProbeStatus,
+    Tier2, below_min, capture_version, expand, extract_version, glob_first, platform_key,
+    probe_agent, probe_tools, resolve_credential, resolve_tool, segment_matches, status_for, walk,
 };
 use htui_core::model::{Agent, AgentBox, AgentId, Billing, BoxId, Transport};
 use serde_json::{Value, json};
@@ -140,6 +140,7 @@ fn discovery(name: &str, probe: ToolProbe) -> Discovery {
     Discovery {
         tools,
         handshake: false,
+        credential: None,
     }
 }
 
@@ -1053,7 +1054,7 @@ async fn handshake_completes_initialize_and_reports_the_response() {
         found.auth_methods.is_empty(),
         "the claude adapter demands no auth"
     );
-    assert_eq!(status_for(&found), ProbeStatus::Ready);
+    assert_eq!(status_for(&found, None), ProbeStatus::Ready);
 }
 
 #[tokio::test]
@@ -1090,9 +1091,10 @@ async fn handshake_reports_auth_methods_by_id() {
         "the ids, in the order the agent listed them"
     );
     assert_eq!(
-        status_for(&found),
+        status_for(&found, None),
         ProbeStatus::Unauthenticated,
-        "an agent that offers a login is not ready to run (ANA-4 §11 criterion 10)"
+        "an agent that offers a login is not ready to run (ANA-4 §11 criterion 10), and a row \
+         that declares no credential block is judged by that rule alone"
     );
 }
 
@@ -1564,6 +1566,9 @@ async fn a_probe_carries_quota_over_and_orders_keys_as_ana4_does() {
         "\"resolved\":",
         "\"tools\":",
         "\"handshake\":",
+        // D59's key sits between the handshake that raised the question and the status that
+        // answers it: a reader in `psql` sees "four auth methods, a token file, ready" in order.
+        "\"credential\":",
         "\"status\":",
         "\"stderr_tail\":",
         "\"source\":",
@@ -1601,6 +1606,11 @@ async fn a_snapshot_round_trips_and_defaults_source_to_probe() {
 
     let snapshot = ProbeSnapshot::from_row(&row).expect("the snapshot parses");
     assert_eq!(snapshot.source, ProbeSource::Probe);
+    assert_eq!(
+        snapshot.credential, None,
+        "a milestone-5 document has no `credential` key, and its absence reads as the rule that \
+         row was written under: the block was never declared"
+    );
     assert_eq!(snapshot.status, ProbeStatus::Ready);
     assert_eq!(snapshot.transport, Transport::Acp);
     assert_eq!(
@@ -1625,5 +1635,435 @@ async fn a_snapshot_round_trips_and_defaults_source_to_probe() {
     assert_eq!(
         ProbeSnapshot::from_row(&AgentBox { probe: None, ..row }),
         None
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 14–19. The credential tier (plan D59/D63, T32)
+// ---------------------------------------------------------------------------------------------
+
+/// The token text the fixture file holds. Asserted **absent** from the serialised snapshot: the
+/// file tier is a `stat` and the probe has no reason to ever open the file.
+const FIXTURE_TOKEN: &str = "secret-9f8e";
+
+/// A credential block no seed row declares, in the expander grammar the glob tier already speaks:
+/// a `%VAR%` candidate whose variable this box does not set, a `~` candidate, and one variable.
+///
+/// Synthetic on purpose (blueprint H-18, and `R-AGT-5`): the rule under test is "a row that
+/// declares candidates is judged by them", and a case built on `agy`'s own block would prove the
+/// seed instead. Case 6 below is the one that reads the seed, and it reads it as *data*.
+fn fake_credential() -> CredentialProbe {
+    CredentialProbe {
+        env: vec!["HTUI_FAKE_KEY".to_owned()],
+        files: vec![
+            "%HTUI_CRED_HOME%/token.json".to_owned(),
+            "~/.htui-fake/token.json".to_owned(),
+        ],
+    }
+}
+
+/// A [`Handshake`] that demands `ids` — the tier-2 answer [`status_for`] maps. Built by hand rather
+/// than driven over a duplex: the mapping is a pure function and this file already proves the
+/// duplex path twice.
+fn demanding(ids: &[&str]) -> Handshake {
+    Handshake {
+        at: Utc::now(),
+        protocol_version: 1,
+        agent_name: None,
+        agent_version: None,
+        capabilities: json!({}),
+        auth_methods: ids.iter().map(|id| (*id).to_owned()).collect(),
+    }
+}
+
+/// The `initialize` result of an agent that advertises a login whether or not one has happened —
+/// the Antigravity shape ANA-4 §4.5 records, which is the whole reason D59 exists.
+fn four_methods() -> Value {
+    json!({
+        "protocolVersion": 1,
+        "agentCapabilities": {},
+        "authMethods": [
+            { "id": "oauth-personal", "name": "Log in with Google" },
+            { "id": "oauth-business", "name": "Log in with a workspace account" },
+            { "id": "gemini-api-key", "name": "Use a Gemini API key" },
+            { "id": "agent-platform", "name": "Agent platform" },
+        ],
+    })
+}
+
+/// A row whose `discovery` carries [`fake_credential`] and `tools`, with a literal command.
+fn credential_row(command: &str, tools: Value) -> Agent {
+    Agent {
+        launch: json!({
+            "command": command,
+            "args": [],
+            "env": {},
+            "discovery": {
+                "tools": tools,
+                "handshake": true,
+                "credential": {
+                    "env": ["HTUI_FAKE_KEY"],
+                    "files": ["%HTUI_CRED_HOME%/token.json", "~/.htui-fake/token.json"],
+                },
+            },
+        }),
+        ..synthetic_row("probed", command, Transport::Acp)
+    }
+}
+
+/// Writes the fixture token at `path`. Its *contents* exist so a later assertion can prove the
+/// probe never read them.
+fn write_token(path: &Path) {
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+    std::fs::write(path, FIXTURE_TOKEN).expect("write");
+}
+
+#[tokio::test]
+async fn no_candidate_is_absent_and_a_demanding_handshake_stays_unauthenticated() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+
+    assert_eq!(
+        resolve_credential(Some(&fake_credential()), &env)
+            .await
+            .expect("the walk ran"),
+        Some(CredentialTier::Absent),
+        "the row declared candidates and none of them answered — which is a different fact from \
+         `None`, where the row declared nothing at all"
+    );
+    assert_eq!(
+        status_for(
+            &demanding(&["oauth-personal"]),
+            Some(CredentialTier::Absent)
+        ),
+        ProbeStatus::Unauthenticated
+    );
+}
+
+#[tokio::test]
+async fn a_declared_file_makes_it_ready_and_the_home_candidate_answers_when_the_var_is_unset() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let mut env = env(tmp.path());
+    let probe = fake_credential();
+    let home_token = tmp.path().join("home/.htui-fake/token.json");
+    write_token(&home_token);
+
+    // `%HTUI_CRED_HOME%` is unset, so `expand` skips that candidate and the walk never sees it —
+    // the same rule that lets one row carry a Windows `%LOCALAPPDATA%` pattern and a unix `~` one.
+    assert_eq!(
+        resolve_credential(Some(&probe), &env)
+            .await
+            .expect("the walk ran"),
+        Some(CredentialTier::File)
+    );
+    assert_eq!(
+        status_for(
+            &demanding(&["oauth-personal", "gemini-api-key"]),
+            Some(CredentialTier::File)
+        ),
+        ProbeStatus::Ready,
+        "the box holds what the agent's own login flow leaves; the advertised methods are an \
+         offer, not a demand (D59)"
+    );
+
+    let cred_home = tmp.path().join("cred");
+    write_token(&cred_home.join("token.json"));
+    env.vars.insert(
+        "HTUI_CRED_HOME".to_owned(),
+        cred_home.to_string_lossy().into_owned(),
+    );
+    assert_eq!(
+        resolve_credential(Some(&probe), &env)
+            .await
+            .expect("the walk ran"),
+        Some(CredentialTier::File),
+        "both candidates exist; the answer is still `file` and the order is the row's"
+    );
+
+    std::fs::remove_file(&home_token).expect("remove the home candidate");
+    assert_eq!(
+        resolve_credential(Some(&probe), &env)
+            .await
+            .expect("the walk ran"),
+        Some(CredentialTier::File),
+        "the first pattern answers on its own once the second has nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_declared_variable_counts_only_when_set_and_non_empty() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let mut env = env(tmp.path());
+    let probe = fake_credential();
+
+    env.vars.insert("HTUI_FAKE_KEY".to_owned(), String::new());
+    assert_eq!(
+        resolve_credential(Some(&probe), &env)
+            .await
+            .expect("the walk ran"),
+        Some(CredentialTier::Absent),
+        "an exported-but-empty variable is how a shell profile unsets a key; it is not a credential"
+    );
+
+    env.vars.insert("HTUI_FAKE_KEY".to_owned(), "x".to_owned());
+    assert_eq!(
+        resolve_credential(Some(&probe), &env)
+            .await
+            .expect("the walk ran"),
+        Some(CredentialTier::Env)
+    );
+    assert_eq!(
+        status_for(&demanding(&["gemini-api-key"]), Some(CredentialTier::Env)),
+        ProbeStatus::Ready
+    );
+
+    write_token(&tmp.path().join("home/.htui-fake/token.json"));
+    assert_eq!(
+        resolve_credential(Some(&probe), &env)
+            .await
+            .expect("the walk ran"),
+        Some(CredentialTier::File),
+        "files are checked first (D63): on a subscription box the token file is the tier that fires"
+    );
+}
+
+#[tokio::test]
+async fn a_row_without_a_credential_block_keeps_the_milestone_5_rule() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+    // Even with a credential *on the box*, a row that never declared one cannot see it.
+    write_token(&tmp.path().join("home/.htui-fake/token.json"));
+
+    assert_eq!(
+        resolve_credential(None, &env).await.expect("nothing to do"),
+        None
+    );
+    assert_eq!(
+        status_for(&demanding(&["oauth-personal"]), None),
+        ProbeStatus::Unauthenticated,
+        "milestone 5's rule verbatim: a non-empty `authMethods` is `unauthenticated`, full stop"
+    );
+    assert_eq!(status_for(&demanding(&[]), None), ProbeStatus::Ready);
+    assert_eq!(
+        status_for(&demanding(&[]), Some(CredentialTier::Absent)),
+        ProbeStatus::Ready,
+        "an agent that demands nothing is ready whatever the credential tier says: the block \
+         explains an auth list, it does not add a requirement"
+    );
+}
+
+#[tokio::test]
+async fn probe_agent_records_the_tier_and_never_the_value() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let ctx = context(env(tmp.path()));
+    let tool = tmp.path().join("bin").join(tool_name("htui-fake-tool"));
+    executable(&tool, "#!/bin/sh\nexit 0\n");
+    let agent = credential_row(&tool.to_string_lossy(), json!({}));
+    let token = tmp.path().join("home/.htui-fake/token.json");
+    write_token(&token);
+
+    let row = row_of(
+        probe_agent(
+            &agent,
+            BoxId::new(),
+            None,
+            &ctx,
+            &DuplexTier2(four_methods()),
+        )
+        .await,
+    );
+    let probe = row
+        .probe
+        .clone()
+        .expect("a probed row carries its snapshot");
+    assert_eq!(probe["credential"], json!("file"));
+    assert_eq!(
+        probe["status"],
+        json!("ready"),
+        "four advertised methods and a token on disk is a box that can run the agent: {probe}"
+    );
+    assert!(row.enabled, "and the orchestrator will not skip it");
+    assert_eq!(
+        probe["handshake"]["auth_methods"].as_array().map(Vec::len),
+        Some(4)
+    );
+
+    // The whole point of recording a *tier*: the column is rendered verbatim by the Settings tab
+    // and read by hand in `psql`, so neither the secret nor the path to it may reach it.
+    let text = serde_json::to_string(&probe).expect("the snapshot serialises");
+    assert!(
+        !text.contains(FIXTURE_TOKEN),
+        "the token's own text reached the snapshot: {text}"
+    );
+    assert!(
+        !text.contains("token.json"),
+        "the path of the credential reached the snapshot: {text}"
+    );
+
+    std::fs::remove_file(&token).expect("remove the token");
+    let row = row_of(
+        probe_agent(
+            &agent,
+            BoxId::new(),
+            None,
+            &ctx,
+            &DuplexTier2(four_methods()),
+        )
+        .await,
+    );
+    let probe = row
+        .probe
+        .clone()
+        .expect("a probed row carries its snapshot");
+    assert_eq!(probe["credential"], json!("absent"));
+    assert_eq!(probe["status"], json!("unauthenticated"));
+    assert!(!row.enabled);
+
+    // Step 2 placement: the credential is resolved as soon as `agent.launch` parses, so a box that
+    // never got as far as spawning anything still says whether it holds a token.
+    write_token(&token);
+    let absent_tool = credential_row(
+        &tool.to_string_lossy(),
+        json!({ "nope": { "kind": "path", "names": ["htui-no-such-binary-2f8e"] } }),
+    );
+    let row = row_of(
+        probe_agent(
+            &absent_tool,
+            BoxId::new(),
+            None,
+            &ctx,
+            &CannedTier2(Canned::Never),
+        )
+        .await,
+    );
+    let probe = row
+        .probe
+        .clone()
+        .expect("a probed row carries its snapshot");
+    assert_eq!(probe["status"], json!("missing"));
+    assert_eq!(
+        probe["credential"],
+        json!("file"),
+        "a `missing` box still reports its credential state: {probe}"
+    );
+}
+
+/// The seed row is **data**: `R-AGT-5` says a new agent costs one registry row and at most one
+/// adapter, so this reads `agent_agy.json`'s own block the way `probe_live.rs` reads `claude`'s.
+/// Nothing in production branches on the name.
+#[test]
+fn the_seeded_agy_row_declares_the_token_candidates_and_the_api_key_variable() {
+    let credential = agy_discovery()
+        .credential
+        .expect("the agy seed declares a credential block");
+    assert_eq!(
+        credential,
+        CredentialProbe {
+            env: vec!["GEMINI_API_KEY".to_owned()],
+            files: vec![
+                "%GEMINI_HOME%/antigravity-acp/acp_token.json".to_owned(),
+                "~/.gemini/antigravity-acp/acp_token.json".to_owned(),
+            ],
+        },
+        "the token file `agy_acp_server`'s own login writes (ANA-4 §4.5), then the API key"
+    );
+
+    let claude: AgentLaunch = serde_json::from_value(claude_row().launch).expect("it parses");
+    assert_eq!(
+        claude
+            .discovery
+            .expect("claude declares a discovery block")
+            .credential,
+        None,
+        "the adapter that demands no auth declares no block, and keeps milestone 5's rule"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 20. `recorded_launch`: D58's three row-side rules (T31)
+// ---------------------------------------------------------------------------------------------
+
+/// A snapshot carrying only what D58 reads. Everything else is what a probe that got no further
+/// would have left, so a case here cannot pass for a reason it did not name.
+fn snapshot(
+    source: ProbeSource,
+    status: ProbeStatus,
+    resolved: Option<ResolvedLaunch>,
+) -> ProbeSnapshot {
+    ProbeSnapshot {
+        transport: Transport::Acp,
+        resolved,
+        tools: BTreeMap::new(),
+        handshake: None,
+        credential: None,
+        status,
+        stderr_tail: None,
+        source,
+    }
+}
+
+/// A launch whose `args` no resolution can reproduce: `tools::resolve` yields one string per tool
+/// and `launch::resolve` substitutes it, so a per-platform argument exists in a snapshot and
+/// nowhere else (blueprint H-3).
+fn recorded() -> ResolvedLaunch {
+    ResolvedLaunch {
+        command: "/opt/antigravity/agy_acp_server.par".to_owned(),
+        args: vec!["--uid=".to_owned()],
+        env: BTreeMap::new(),
+    }
+}
+
+/// The pure half of D58: which snapshots may be spawned as recorded, decided from the document
+/// alone. The fourth rule — the command still exists — is I/O and belongs to
+/// `AcpDriver::launch_for`, which is why this case can be a `#[test]` and stay one.
+#[test]
+fn recorded_launch_applies_d58s_three_row_side_rules() {
+    let ready = snapshot(ProbeSource::Probe, ProbeStatus::Ready, Some(recorded()));
+    assert_eq!(
+        ready.recorded_launch(),
+        Some(&recorded()),
+        "a probed, ready row is exactly the case D58 exists for"
+    );
+
+    let unauthenticated = snapshot(
+        ProbeSource::Probe,
+        ProbeStatus::Unauthenticated,
+        Some(recorded()),
+    );
+    assert_eq!(
+        unauthenticated.recorded_launch(),
+        Some(&recorded()),
+        "an unauthenticated box recorded the right launch; spawning it and letting the vendor say \
+         `log in first` is more use than resolving a second time (blueprint H-4)"
+    );
+
+    let missing = snapshot(ProbeSource::Probe, ProbeStatus::Missing, None);
+    assert_eq!(
+        missing.recorded_launch(),
+        None,
+        "a `missing` probe resolved nothing, so there is nothing to spawn"
+    );
+
+    let failed = snapshot(ProbeSource::Probe, ProbeStatus::Failed, Some(recorded()));
+    assert_eq!(
+        failed.recorded_launch(),
+        None,
+        "a `failed` probe recorded a launch that did not answer; resolving again is the honest \
+         second attempt"
+    );
+
+    let manual = snapshot(ProbeSource::Manual, ProbeStatus::Ready, Some(recorded()));
+    assert_eq!(
+        manual.recorded_launch(),
+        None,
+        "a `manual` row is a human's path, and `launch::resolve` already honours it through the \
+         row itself (blueprint H-5)"
+    );
+
+    let empty = snapshot(ProbeSource::Probe, ProbeStatus::Ready, None);
+    assert_eq!(
+        empty.recorded_launch(),
+        None,
+        "`ready` with nothing resolved is not a launch, whatever the status says"
     );
 }
