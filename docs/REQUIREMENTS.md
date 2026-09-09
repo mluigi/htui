@@ -3,7 +3,9 @@
 **Owner:** Luigi Marrandino
 **Status:** approved draft, 2026-09-03; amended 2026-09-08 by maintainer decision on ANA-10
 (`docs/ANA-10.md` §6.1, `docs/decisions/ana/ana-10.md`) — R-STO-7 added; R-ID-3, R-ENT-7, R-STO-1,
-R-STO-4, R-STO-5, R-HIS-1, R-AGT-4, R-PRM-4, R-SKL-1, R-TUI-1 and R-TUI-8 amended in place
+R-STO-4, R-STO-5, R-HIS-1, R-AGT-4, R-PRM-4, R-SKL-1, R-TUI-1 and R-TUI-8 amended in place;
+amended 2026-09-09 by maintainer decision during MOD-2 milestone 6 — R-AGT-9 added (in-app agent
+authentication, reversing `docs/ANA-4.md` §4.5; implemented as MOD-21)
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -186,6 +188,14 @@ conflict. Their verdicts survive only where restated here.
   configurable cap per run and per batch, enforced by cancelling the session when exceeded.
 - **R-AGT-8 (must).** When a phase lists several candidate agents, the orchestrator picks the first
   in priority order whose quota is not exhausted and whose billing cap is not reached.
+- **R-AGT-9 (must).** An agent that reports itself installed but unauthenticated is authenticated
+  **from the app**, through the agent's own protocol, without leaving `htui` for a vendor CLI. The
+  method is chosen from the ones that agent advertises; logging out is offered where the agent
+  advertises it. `htui` triggers the flow and observes its outcome: it does not read, hold, transmit
+  or store the credential, which stays wherever the agent keeps it (R-ID-7, R-SEC-2). Authentication
+  is a fact about a box, not about a registry row. Added by maintainer decision, 2026-09-09,
+  reversing `docs/ANA-4.md` §4.5's conclusion that `htui` cannot log an agent in; implemented as
+  MOD-21.
 
 ## 6. Orchestration (R-ORCH)
 

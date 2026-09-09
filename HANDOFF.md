@@ -505,10 +505,11 @@ now.
   must call that seam rather than grow a second environment mechanism; authentication is a fact
   about a *box*, not about the registry row, so nothing here may write `agent`; and a failed or
   abandoned flow must leave the row exactly as it found it.
-  **Proposed requirement amendment, not applied** (`docs/REQUIREMENTS.md` is maintainer-only): a new
-  `R-AGT-9` stating that an agent reporting `unauthenticated` can be authenticated from the app,
-  through the agent's own protocol, without `htui` handling the credential. `R-AGT-6` currently
-  stops at "record version, mark enabled on that box".
+  **`R-AGT-9` was added to `docs/REQUIREMENTS.md` on 2026-09-09 by maintainer decision**, so this
+  item is requirement-backed rather than proposing one: an agent reporting itself installed but
+  unauthenticated is authenticated from the app, through the agent's own protocol, with `htui`
+  triggering the flow and never reading, holding or storing the credential, and authentication a
+  fact about a box rather than a registry row.
   Not blocked, and **MOD-2 is not blocked on it** - milestone 6's T34 needs only a logged-in server,
   by any means. Cross-links: **MOD-2** owns the probe, the credential tier and the status this acts
   on; **MOD-10** owns every credential *value*; **MOD-20** is the other half of the same story
