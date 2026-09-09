@@ -430,10 +430,13 @@ now.
   than move one (`store_worker.rs:572-575`) while a `Backend::Local` and its open `local.sqlite`
   are still in hand. Buys one avoided restart and nothing else; MOD-17's M2b delivers the objective
   without it. Blocked on MOD-17 (M3).
-- [ ] **MOD-20 - Registry-driven adapter install** (from MOD-2 milestone 6). `R-AGT-4..6`,
-  `R-TUI-8`, `R-NF-3`. `htui` installs an ACP agent's adapter itself, from the ACP registry, for
-  **any** agent that declares how — never one code path per vendor. **This reverses a deferral by
-  maintainer decision (2026-09-09):** `docs/ANA-4.md` §4.6 rejected "download every agent from the
+- [ ] **MOD-20 - Registry-driven adapter install** (from MOD-2 milestone 6). **`R-AGT-10`**,
+  `R-AGT-4..6`, `R-TUI-8`, `R-NF-3`. `htui` installs an ACP agent's adapter itself, from the ACP
+  registry, for **any** agent that declares how — never one code path per vendor. `R-AGT-10` was
+  added to `docs/REQUIREMENTS.md` on 2026-09-09 by maintainer decision, and carries the digest rule
+  (verify where the source publishes one, say so plainly where it does not) and the licence rule
+  (surface a proprietary adapter's terms before fetching it) that this item's open questions raised.
+  **It reverses a deferral by the same decision:** `docs/ANA-4.md` §4.6 rejected "download every agent from the
   ACP registry and manage the install (Zed's approach)" with "MOD-2 should not become a package
   manager", reserving the shape in `agent.launch.discovery` for "MOD-7 or a later MOD"; MOD-2's
   plan D57 restated it, and the README's hand-written `curl` for `agy_acp_server` is the cost of
@@ -468,8 +471,8 @@ now.
   box registration and probe hook are the natural trigger; **MOD-2** owns the glob, `newest()` and
   the `agent_box.probe` snapshot this writes into, and its README section is what this item
   replaces; **MOD-16** owns every Windows runtime fact.
-- [ ] **MOD-21 - In-app agent authentication** (from MOD-2 milestone 6). `R-AGT-1`, `R-AGT-4..6`,
-  `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent that reports `unauthenticated` is logged in
+- [ ] **MOD-21 - In-app agent authentication** (from MOD-2 milestone 6). **`R-AGT-9`**, `R-AGT-1`,
+  `R-AGT-4..6`, `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent that reports `unauthenticated` is logged in
   **from inside `htui`**, not by leaving the app for a vendor CLI. **This reverses a design
   statement by maintainer decision (2026-09-09):** `docs/ANA-4.md` §4.5 concluded "`htui` cannot log
   in non-interactively; a probe that gets a valid `initialize` with a non-empty `authMethods` and no

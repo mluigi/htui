@@ -5,7 +5,9 @@
 (`docs/ANA-10.md` §6.1, `docs/decisions/ana/ana-10.md`) — R-STO-7 added; R-ID-3, R-ENT-7, R-STO-1,
 R-STO-4, R-STO-5, R-HIS-1, R-AGT-4, R-PRM-4, R-SKL-1, R-TUI-1 and R-TUI-8 amended in place;
 amended 2026-09-09 by maintainer decision during MOD-2 milestone 6 — R-AGT-9 added (in-app agent
-authentication, reversing `docs/ANA-4.md` §4.5; implemented as MOD-21)
+authentication, reversing `docs/ANA-4.md` §4.5; implemented as MOD-21), R-AGT-10 added
+(in-app adapter installation, reversing `docs/ANA-4.md` §4.6; implemented as MOD-20), and R-AGT-4's
+"`agy` over ACP is unverified" clause withdrawn as settled by ANA-4 and proven by MOD-2 milestone 6
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -176,9 +178,12 @@ conflict. Their verdicts survive only where restated here.
 - **R-AGT-4 (must).** Agent registry in the store that owns the box — Postgres for a box with a
   server configured, the local store for a box with none (R-STO-7): name, transport (`acp` or
   `cli`), launch command, model list, billing mode (`subscription` or `per_token`), default model,
-  enabled per box. Version one entries: `claude` and `agy`. Support for `agy` over ACP is unverified
-  and must be settled by ANA-4. Amended by ANA-10 (`docs/ANA-10.md` §6.1), 2026-09-08: a box that
-  never connects never reaches the first-connect seed, so its registry has no other home.
+  enabled per box. Version one entries: `claude` and `agy`. Amended by ANA-10
+  (`docs/ANA-10.md` §6.1), 2026-09-08: a box that never connects never reaches the first-connect
+  seed, so its registry has no other home. Amended 2026-09-09: `agy` over ACP is **settled and
+  proven** — ANA-4 §4.5 adopted Google's first-party `agy_acp_server` with `transport: 'acp'`, and
+  MOD-2 milestone 6 ran it live on Linux (`docs/ANA-4.md` §11 criterion 10); the clause requiring
+  ANA-4 to settle it is withdrawn.
 - **R-AGT-5 (must).** Adding an agent requires a registry row and, at most, one stream adapter. No
   orchestrator or prompt code changes.
 - **R-AGT-6 (must).** Autodiscovery: on box registration and on demand, probe `PATH` for known
@@ -196,6 +201,14 @@ conflict. Their verdicts survive only where restated here.
   is a fact about a box, not about a registry row. Added by maintainer decision, 2026-09-09,
   reversing `docs/ANA-4.md` §4.5's conclusion that `htui` cannot log an agent in; implemented as
   MOD-21.
+- **R-AGT-10 (must).** An agent whose adapter is not installed on a box can be installed **from the
+  app**, from a source declared in its own registry row, with no code path per agent (R-AGT-5). The
+  app re-probes after installing, so what the box can run is always the probe's answer rather than
+  the installer's claim (R-AGT-6). Where the source publishes an integrity digest it is verified;
+  where it does not, the user is told that before the download, not after. Where the adapter is
+  proprietary, its licence and account-type consequences are surfaced before `htui` fetches it on
+  the user's behalf. Added by maintainer decision, 2026-09-09, reversing `docs/ANA-4.md` §4.6's
+  deferral of registry-driven installation; implemented as MOD-20.
 
 ## 6. Orchestration (R-ORCH)
 
