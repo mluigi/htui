@@ -24,6 +24,11 @@
 //! requested. It knows no agent's name (`R-AGT-5`) — the row supplies an entry id, the registry
 //! supplies everything else, and [`probe`] supplies the root and, afterwards, the verdict.
 //!
+//! [`auth`] is MOD-21's transport-neutral half of "and what if this box is not logged in": the
+//! flow a caller hands [`AgentDriver::authenticate`], the events it gets back, and how one ends.
+//! It names no agent, no method id and no host (`R-AGT-5`) — the method list is whatever the agent
+//! answered `initialize` with, and the verdict afterwards is [`probe`]'s.
+//!
 //! Deliberately absent in milestones 1–2 (plan D16): any wire protocol (`acp/`, `cli/`), the chat
 //! tab, and quota. Each is a named seam, not a plan.
 #![warn(missing_docs)]
@@ -79,6 +84,7 @@ macro_rules! wire_enum {
 }
 
 pub mod acp;
+pub mod auth;
 #[cfg(feature = "test-support")]
 pub mod conformance;
 pub mod driver;
@@ -98,6 +104,13 @@ pub mod tools;
 pub use acp::{
     AcpAdapter, AcpDriver, AcpIo, AcpSession, Handshake, SessionCommand, SessionOptions, Stamp,
     handshake, open_session,
+};
+// `authenticate_acp`, not `authenticate`: at the crate root the bare name reads as the trait
+// method every transport has, and this one is the ACP driver's whole operation. The
+// `plan_install`/`resolve_tools` precedent below.
+pub use auth::{
+    AUTH_IDLE_CAP, AuthCall, AuthChoice, AuthEvent, AuthFlow, AuthMethodInfo, AuthOutcome,
+    BrowserPolicy, OpenerCommand, authenticate as authenticate_acp,
 };
 pub use driver::{
     AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, McpServerSpec,

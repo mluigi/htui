@@ -21,6 +21,7 @@ use chrono::{DateTime, Utc};
 use htui_core::model::{AgentId, StepId};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::{AuthFlow, AuthOutcome};
 use crate::error::DriverError;
 use crate::event::{DriverEnvelope, PermissionOptionKind};
 
@@ -31,8 +32,8 @@ const REDACTED: &str = "[REDACTED]";
 ///
 /// Every operation of [`AgentDriver`] and [`AgentSession`] returns exactly
 /// `Pin<Box<dyn Future<Output = Result<T, DriverError>> + Send + 'a>>`. The alias **is** that
-/// type, so an implementor may write either form; it exists so the seam reads as five operations
-/// rather than as five copies of one type.
+/// type, so an implementor may write either form; it exists so the seam reads as six operations
+/// rather than as six copies of one type.
 pub type DriverFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DriverError>> + Send + 'a>>;
 
 // ---------------------------------------------------------------------------------------------
@@ -330,6 +331,11 @@ pub struct DriverCaps {
     pub resume: bool,
     /// The transport reports usage at all.
     pub usage: bool,
+    /// The transport can log the agent in through its own protocol (plan MOD-21 D10, `R-AGT-9`):
+    /// [`AgentDriver::authenticate`] answers something other than [`DriverError::Unsupported`].
+    /// The Settings section refuses `a` on a row whose profile says `false` before a request is
+    /// spent.
+    pub authenticate: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -359,6 +365,24 @@ pub trait AgentDriver: Send + Sync + core::fmt::Debug {
         spec: SessionSpec,
         prompt: String,
     ) -> DriverFuture<'a, Box<dyn AgentSession>>;
+
+    /// Logs the agent in (or out) through its own protocol, off any session (plan MOD-21 D10,
+    /// D11).
+    ///
+    /// One spawn serves the method list and the call: the flow's `events` carries the agent's own
+    /// method names, the caller answers on `choice`, and the child is killed on every exit. The
+    /// **default body refuses**: a transport that says nothing about authentication has none,
+    /// which is the same structural reading [`DriverCaps::default`] gives every other predicate.
+    ///
+    /// # Errors
+    /// [`DriverError::Unsupported`]`("authenticate")` from the default body;
+    /// [`DriverError::Spawn`] / [`DriverError::Transport`] from a transport that has one.
+    fn authenticate<'a>(&'a self, flow: AuthFlow) -> DriverFuture<'a, AuthOutcome> {
+        // Dropping `flow` drops its `events` sender: a caller's forwarding loop ends cleanly
+        // rather than parking on a channel nothing will ever write to.
+        drop(flow);
+        Box::pin(async { Err(DriverError::Unsupported("authenticate")) })
+    }
 }
 
 /// One per live session. Owns nothing but channel endpoints; the transport runs in its own task.

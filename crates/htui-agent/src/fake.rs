@@ -97,8 +97,8 @@ impl FakeDriver {
         }
     }
 
-    /// Every predicate true: the fake is the reference transport, so a case is never skipped for
-    /// want of a capability.
+    /// Every session predicate true: the fake is the reference transport, so a case is never
+    /// skipped for want of a capability.
     #[must_use]
     pub const fn full_caps() -> DriverCaps {
         DriverCaps {
@@ -109,6 +109,11 @@ impl FakeDriver {
             follow_up_in_session: true,
             resume: true,
             usage: true,
+            // The one exception: the fake is the reference transport for *sessions*, and
+            // `authenticate` is proven through the refusing default body instead (plan MOD-21
+            // D10). A fake that claimed a login it does not perform would make the contract
+            // case that compares predicate against operation pass for the wrong reason.
+            authenticate: false,
         }
     }
 }

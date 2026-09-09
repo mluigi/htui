@@ -11,14 +11,18 @@
 //!    (ANA-4 §4.1's mechanical enforcement of invariant 4).
 //! 4. `DriverCaps` is `Copy` and defaults to all-false, so a transport that forgets to answer a
 //!    predicate advertises nothing rather than everything.
+//! 5. `AgentDriver::authenticate` **refuses by default** (plan MOD-21 D10): a transport that says
+//!    nothing about authentication has none, and every registered adapter's predicate agrees with
+//!    what its operation actually answers.
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::Utc;
+use htui_agent::auth::{AUTH_IDLE_CAP, AuthFlow, BrowserPolicy};
 use htui_agent::driver::{
     AgentDriver, AgentSession, AgentSessionRef, DriverCaps, McpServerSpec, PermissionAnswer,
     PermissionDefault, PermissionPolicy, PermissionRequestId, SessionSpec, ToolExposure,
@@ -30,8 +34,11 @@ use htui_agent::event::{
     PlanEntryStatus, PlanEvent, StopReason, TerminalReason, TextChunk, ToolCallEvent, ToolKind,
     ToolLocation, ToolResultEvent, ToolResultStatus, UsageEvent,
 };
-use htui_core::model::{AgentId, EventKind, StepId};
+use htui_agent::registry::{DriverFactory, caps_for};
+use htui_core::model::{Agent, AgentId, Billing, EventKind, StepId, Transport};
 use serde_json::json;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------------------------
 // A stub transport. It exists only to be reached through `&dyn` / `Box<dyn>`; nothing about its
@@ -353,6 +360,167 @@ fn driver_caps_is_copy_and_defaults_to_all_false() {
     assert!(!caps.follow_up_in_session);
     assert!(!caps.resume);
     assert!(!caps.usage);
+    assert!(!caps.authenticate);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 5. `authenticate`: the refusing default body and the predicate that agrees with it
+//    (plan MOD-21 D10, D11)
+// ---------------------------------------------------------------------------------------------
+
+/// A flow a case can hand to an operation: a throwaway working directory, fresh channels, the
+/// production idle cap and the production browser policy.
+///
+/// Both far ends are dropped with this frame on purpose. A transport that refuses never touches
+/// either, and one that does not gets exactly what a caller who walked away would give it: a
+/// closed `events` receiver and a `choice` sender that will never fire.
+fn flow(cwd: &Path) -> AuthFlow {
+    let (events, _events_rx) = mpsc::unbounded_channel();
+    let (_choice_tx, choice) = oneshot::channel();
+    AuthFlow {
+        cwd: cwd.to_path_buf(),
+        events,
+        choice,
+        cancel: CancellationToken::new(),
+        idle: AUTH_IDLE_CAP,
+        browser: BrowserPolicy::Neutralised,
+    }
+}
+
+/// A registry row whose transport is the one this adapter id serves, built from the id alone.
+///
+/// The id is the factory's key, so the row is derived from it and never from an agent's name
+/// (`R-AGT-5`): `acp` is an ACP row, `cli/<stream>` is a CLI row whose `settings.cli.stream` is
+/// that stream, which is exactly what `registry::adapter_id` reads back.
+fn row_for_adapter(adapter_id: &str, command: &str) -> Agent {
+    let (transport, settings) = match adapter_id.split_once('/') {
+        Some(("cli", stream)) => (
+            Transport::Cli,
+            json!({ "cli": { "stream": stream, "permission_mode": "ask", "extra_args": [] } }),
+        ),
+        _ => (Transport::Acp, json!({})),
+    };
+    let now = Utc::now();
+    Agent {
+        id: AgentId::new(),
+        name: "under-test".to_owned(),
+        transport,
+        launch: json!({ "command": command, "args": [], "env": {} }),
+        models: Vec::new(),
+        default_model: None,
+        billing: Billing::PerToken,
+        enabled: true,
+        settings,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// The production factory plus, where the feature is on, the fake — every adapter this build can
+/// reach, keyed the way `DriverFactory::adapter_ids` reports them.
+#[cfg(feature = "test-support")]
+fn every_adapter() -> DriverFactory {
+    use htui_agent::conformance::Script;
+    use htui_agent::fake::FakeAdapter;
+
+    let mut factory = DriverFactory::with_acp();
+    // The fake takes its script at `build`, so a factory whose slot is empty cannot answer
+    // `driver_for` at all; the script is never pulled here.
+    let adapter = FakeAdapter::new();
+    adapter.load(Script::one_turn(Vec::new()));
+    factory.register("cli/fake", Box::new(adapter));
+    factory
+}
+
+/// The production factory alone.
+#[cfg(not(feature = "test-support"))]
+fn every_adapter() -> DriverFactory {
+    DriverFactory::with_acp()
+}
+
+#[tokio::test]
+async fn a_driver_that_says_nothing_about_authenticate_refuses_it() {
+    let driver: Box<dyn AgentDriver> = Box::new(StubDriver);
+    assert!(
+        !driver.caps().authenticate,
+        "the stub answers `DriverCaps::default()`, which claims nothing"
+    );
+
+    let cwd = tempfile::tempdir().expect("a temporary working directory");
+    match driver.authenticate(flow(cwd.path())).await {
+        Err(DriverError::Unsupported(operation)) => assert_eq!(
+            operation, "authenticate",
+            "the refusal names the trait method"
+        ),
+        other => panic!("a transport that overrides nothing refuses, got {other:?}"),
+    }
+}
+
+#[test]
+fn caps_for_an_acp_row_advertises_authenticate_and_a_cli_row_does_not() {
+    let acp = row_for_adapter("acp", "/bin/false");
+    let cli = row_for_adapter("cli/fake", "/bin/false");
+
+    assert!(
+        caps_for(&acp).authenticate,
+        "an ACP row's protocol carries the call"
+    );
+    assert!(
+        !caps_for(&cli).authenticate,
+        "no CLI transport has a login verb of its own"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn the_fake_transport_neither_claims_nor_answers_authenticate() {
+    use htui_agent::conformance::Script;
+    use htui_agent::fake::FakeDriver;
+
+    assert!(
+        !FakeDriver::full_caps().authenticate,
+        "the fake is the reference transport for *sessions* only"
+    );
+
+    let driver = FakeDriver::scripted(Script::one_turn(Vec::new()));
+    assert!(!driver.caps().authenticate);
+
+    let cwd = tempfile::tempdir().expect("a temporary working directory");
+    match driver.authenticate(flow(cwd.path())).await {
+        Err(DriverError::Unsupported(operation)) => assert_eq!(operation, "authenticate"),
+        other => panic!("the fake inherits the refusing default body, got {other:?}"),
+    }
+}
+
+/// Every adapter this build registers, asked both questions: what it claims, and what it does.
+///
+/// Red on purpose from T1 until T3, which is where `AcpDriver` stopped inheriting the refusing
+/// default body. The assertion asks only about `Unsupported`, so what the `/bin/false` row then
+/// fails at — it spawns, it speaks no ACP, the handshake dies — is beside the point: a transport
+/// that *has* the operation fails at the operation, and one that has not refuses before trying.
+#[tokio::test]
+async fn every_registered_adapter_agrees_with_its_predicate() {
+    let factory = every_adapter();
+
+    for adapter_id in factory.adapter_ids() {
+        let row = row_for_adapter(adapter_id, "/bin/false");
+        let driver = factory
+            .driver_for(&row, None)
+            .expect("the row was built from a registered adapter id");
+
+        let cwd = tempfile::tempdir().expect("a temporary working directory");
+        let refused = matches!(
+            driver.authenticate(flow(cwd.path())).await,
+            Err(DriverError::Unsupported(_))
+        );
+
+        assert_eq!(
+            driver.caps().authenticate,
+            !refused,
+            "`{adapter_id}` advertises `authenticate: {}` and its operation says otherwise",
+            driver.caps().authenticate
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

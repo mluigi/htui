@@ -194,6 +194,45 @@ mod tests {
         assert!(!none.fs.write_text_file);
     }
 
+    /// Plan MOD-21 D21: the two capabilities a login must **not** claim, pinned rather than
+    /// changed.
+    ///
+    /// `auth.terminal` is what makes an agent allowed to advertise a `terminal`-typed auth method
+    /// at all, and `htui` runs no interactive child, so a flow that saw one could only hide it
+    /// (`acp::auth`'s `hidden`). `elicitation` is what makes an agent allowed to ask a structured
+    /// question mid-`authenticate`; unadvertised, the SDK answers such a request "method not
+    /// found" by itself, so the agent hears a refusal instead of the flow hanging on a request
+    /// this build has no handler for.
+    ///
+    /// Asserted on the **serialised** document rather than on the fields, so the case pins what
+    /// goes on the wire and not the schema type's shape: a field that is absent and a field that
+    /// is `false` are the same claim to an agent (§3, an omitted capability is unsupported), and
+    /// this test must not have to be rewritten when the schema chooses between them.
+    #[test]
+    fn the_advertised_capabilities_claim_neither_terminal_auth_nor_elicitation() {
+        let value = serde_json::to_value(client_capabilities(&ClientCapabilities {
+            fs_read: true,
+            fs_write: true,
+            terminal: true,
+            elicitation: true,
+        }))
+        .expect("the capability document serialises");
+
+        let terminal_auth = value.pointer("/auth/terminal");
+        assert!(
+            matches!(
+                terminal_auth,
+                None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false))
+            ),
+            "a terminal auth method would need an interactive child this build never runs: {value}"
+        );
+        let elicitation = value.get("elicitation");
+        assert!(
+            matches!(elicitation, None | Some(serde_json::Value::Null)),
+            "an elicitation `htui` cannot answer turns a login into a hung one: {value}"
+        );
+    }
+
     #[test]
     fn the_client_info_names_this_binary() {
         let info = client_info();

@@ -17,6 +17,7 @@
 //! awaits a store write or file I/O — the three inbound handlers forward into an unbounded channel
 //! and return.
 
+pub mod auth;
 pub mod client;
 pub mod fs;
 pub mod handshake;
@@ -41,8 +42,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+// `run_auth`, not `run`: at this level the bare name says nothing about what is being run, and
+// `handshake` beside it sets the precedent of a re-export that reads as a sentence.
+pub use crate::acp::auth::{WireFlow, run as run_auth};
 use crate::acp::client::{Inbound, InboundTx};
 pub use crate::acp::handshake::{Handshake, handshake};
+use crate::auth::{AuthFlow, AuthOutcome};
 use crate::driver::{
     AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, PermissionAnswer,
     PermissionRequestId, SessionSpec,
@@ -52,7 +57,7 @@ use crate::event::{
     DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, ErrorEvent, OtherEvent,
     PermissionOptionKind, StopReason, TerminalReason, ToolResultEvent, ToolResultStatus,
 };
-use crate::launch::{AgentLaunch, AgentSettings, ChildGuard, ResolvedLaunch, Spawned};
+use crate::launch::{AcpSettings, AgentLaunch, AgentSettings, ChildGuard, ResolvedLaunch, Spawned};
 use crate::registry::TransportBuilder;
 
 /// `other.update` of the row written when the agent offers no option for the requested model.
@@ -225,6 +230,34 @@ enum IoSource {
     Prepared(Mutex<Option<Box<AcpIo>>>),
 }
 
+/// Where a **login's** bytes come from (blueprint MOD-21 P-1).
+///
+/// [`IoSource`] is private to this module and cannot leave it: a login is driven from
+/// `crate::auth::run`, which has to know whether it is spawning a child or was handed a pair — and
+/// nothing else about how this driver was built. So the fork is answered once, here, as a value.
+pub(crate) enum AuthSource {
+    /// The row's launch, resolved for the login's directory. The caller owns it: whatever it
+    /// writes into the environment reaches that one child and is never recorded (plan D16, H-11).
+    Launch(ResolvedLaunch),
+    /// A prepared pair, taken exactly as [`AcpDriver::io`] takes it. No process, so no policy to
+    /// apply and no stderr to tap.
+    #[cfg(feature = "test-support")]
+    Prepared(AcpIo),
+}
+
+impl core::fmt::Debug for AuthSource {
+    /// Which of the two, and nothing else: a [`ResolvedLaunch`] carries an environment, and the
+    /// fact worth reading in a log line is which side of the fork a login is on (`R-SEC-2`).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let variant = match self {
+            Self::Launch(_) => "Launch",
+            #[cfg(feature = "test-support")]
+            Self::Prepared(_) => "Prepared",
+        };
+        f.debug_tuple(variant).finish()
+    }
+}
+
 /// The driver for `agent.transport = 'acp'`: one per row, holding no process.
 pub struct AcpDriver {
     name: String,
@@ -331,7 +364,7 @@ impl AcpDriver {
         })
     }
 
-    /// What this session would spawn, before spawning it.
+    /// What a spawn in `cwd` would launch, before launching it.
     ///
     /// The recorded launch when there is one **and** its `command` is still a file on disk;
     /// otherwise the row's tools are resolved now (`tools::resolve` → `launch::resolve`), which is
@@ -349,14 +382,16 @@ impl AcpDriver {
     /// costs nothing: the fallback's first tier is that same override, so both paths answer with
     /// the same string (blueprint H-3).
     ///
-    /// Either way `spec.env` is applied **last** and wins (`R-SEC-2`): the row's environment holds
-    /// paths, the spec's holds what the secret provider produced for this run.
+    /// The environment is the row's, exactly as it resolved: a directory is all this takes,
+    /// because the two callers that have more to add — a session's `spec.env`
+    /// ([`launch_for`](Self::launch_for)) and a login's browser policy — add it to the value they
+    /// are handed, on their own side of this call.
     ///
     /// # Errors
     /// [`DriverError::Unresolved`] and [`DriverError::Transport`] exactly as `tools::resolve` and
     /// `launch::resolve` return them. [`DriverError::Transport`] for a prepared transport, which
     /// spawns nothing and so has no launch to describe (blueprint H-16).
-    pub async fn launch_for(&self, spec: &SessionSpec) -> Result<ResolvedLaunch> {
+    pub async fn launch_in(&self, cwd: &Path) -> Result<ResolvedLaunch> {
         // A `match` rather than a `let`-else: without `test-support` there is one variant, and an
         // irrefutable `let`-else is a hard error rather than a dead branch the compiler forgives.
         let (launch, recorded) = match &self.io {
@@ -368,21 +403,69 @@ impl AcpDriver {
                 ));
             }
         };
-        let mut resolved = match recorded {
+        match recorded {
             Some(recorded) if crate::probe::is_file(Path::new(&recorded.command)).await => {
-                recorded.clone()
+                Ok(recorded.clone())
             }
             Some(recorded) => {
                 tracing::info!(
                     command = %recorded.command,
                     "the probe's recorded command is gone or is not a file; resolving again"
                 );
-                resolve_now(launch, &spec.cwd).await?
+                resolve_now(launch, cwd).await
             }
-            None => resolve_now(launch, &spec.cwd).await?,
-        };
+            None => resolve_now(launch, cwd).await,
+        }
+    }
+
+    /// What this session would spawn, before spawning it: [`launch_in`](Self::launch_in) for the
+    /// spec's `cwd`, with the spec's own environment applied over it.
+    ///
+    /// `spec.env` is applied **last** and wins (`R-SEC-2`): the row's environment holds paths, the
+    /// spec's holds what the secret provider produced for this run.
+    ///
+    /// # Errors
+    /// [`launch_in`](Self::launch_in)'s, unchanged.
+    pub async fn launch_for(&self, spec: &SessionSpec) -> Result<ResolvedLaunch> {
+        let mut resolved = self.launch_in(&spec.cwd).await?;
         resolved.env.extend(spec.env.clone());
         Ok(resolved)
+    }
+
+    /// Where a login's bytes come from, having spawned nothing (blueprint MOD-21 P-1).
+    ///
+    /// The one thing outside this module that needs to know [`IoSource`] exists, and it learns no
+    /// more than which of the two it got. A session reaches the same fork through
+    /// [`io`](Self::io), which spawns on the spot; a login cannot, because between resolving the
+    /// launch and spawning it there is a browser policy to write into the value and a stderr tap
+    /// to take off the child, and both belong to `auth::run` rather than here (plan D9, D16).
+    ///
+    /// # Errors
+    /// [`launch_in`](Self::launch_in)'s for a row; [`DriverError::Transport`] for a prepared
+    /// transport already used, or one whose slot a panic poisoned.
+    pub(crate) async fn auth_source(&self, cwd: &Path) -> Result<AuthSource> {
+        match &self.io {
+            IoSource::Spawn { .. } => Ok(AuthSource::Launch(self.launch_in(cwd).await?)),
+            #[cfg(feature = "test-support")]
+            IoSource::Prepared(slot) => slot
+                .lock()
+                .map_err(|_| {
+                    DriverError::Transport("the prepared transport is poisoned".to_owned())
+                })?
+                .take()
+                .map(|io| AuthSource::Prepared(*io))
+                .ok_or_else(|| {
+                    DriverError::Transport("this driver's transport was already used".to_owned())
+                }),
+        }
+    }
+
+    /// This row's ACP settings, for a caller that has to speak the wire on its own.
+    ///
+    /// `auth::run` builds a [`WireFlow`] rather than a [`SessionOptions`], and the one thing the
+    /// login's handshake reads out of the row is `client_capabilities` (plan D21).
+    pub(crate) fn acp_settings(&self) -> &AcpSettings {
+        &self.settings.acp
     }
 
     /// A driver over an in-process transport with a deterministic clock: the conformance harness.
@@ -446,6 +529,15 @@ impl AgentDriver for AcpDriver {
             let session = open_session(io, spec, prompt, options).await?;
             Ok(Box::new(session) as Box<dyn AgentSession>)
         })
+    }
+
+    // The protocol carries the call, so this transport answers it (plan MOD-21 D10): `caps_from`
+    // says `authenticate: true` for every `acp` row, and the contract test holds the two to each
+    // other. The operation itself is `auth::run`'s, because everything between resolving the launch
+    // and reading the outcome — the browser policy, the stderr tap, the idle clock — is
+    // transport-neutral and belongs beside the types the caller sees (D9).
+    fn authenticate<'a>(&'a self, flow: AuthFlow) -> DriverFuture<'a, AuthOutcome> {
+        Box::pin(crate::auth::run::authenticate(self, flow))
     }
 }
 

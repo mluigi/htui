@@ -149,6 +149,7 @@ fn caps_from(agent: &Agent, settings: &AgentSettings) -> DriverCaps {
             follow_up_in_session: true,
             resume: settings.acp.session.resume,
             usage: true,
+            authenticate: true,
         },
         // §4.3 verbatim: "the CLI transport reports `DriverCaps { permission_requests: false,
         // edit_proposals: false, plans: false }`". The other four are not stated there and are
@@ -163,6 +164,9 @@ fn caps_from(agent: &Agent, settings: &AgentSettings) -> DriverCaps {
             follow_up_in_session: true,
             resume: true,
             usage: true,
+            // Plan MOD-21 D10: no CLI transport has a login verb; the vendor CLI's own is not
+            // ours to drive, and a stream adapter has nowhere to put a method list.
+            authenticate: false,
         },
     }
 }

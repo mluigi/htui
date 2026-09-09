@@ -33,6 +33,11 @@ pub enum DriverError {
     /// what the *other* four operations return once that has happened.
     #[error("agent session is closed")]
     Closed,
+    /// This transport has no such operation (plan MOD-21 D10). The name is the trait method's, so
+    /// the Settings section and the runtime can branch on the variant and print the sentence
+    /// rather than matching on a message.
+    #[error("this transport has no `{0}` operation")]
+    Unsupported(&'static str),
     /// A store write the driver had to make failed.
     #[error(transparent)]
     Store(#[from] StoreError),

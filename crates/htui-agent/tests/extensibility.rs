@@ -301,6 +301,54 @@ fn the_installer_names_no_vendor() {
     );
 }
 
+/// The `src/` half of `R-AGT-5` for MOD-21's login (plan T1): the method ids an agent advertises,
+/// the host its link points at, the directory its adapter unpacks into and the variables its own
+/// error text names are the agent's words, carried through as data. A `match` on any of them is
+/// the hard-coded second agent the rule exists to forbid.
+///
+/// Vacuous the day it was written — nothing under `crates/*/src` has ever spelled one of these —
+/// and load-bearing from T2, when `acp/auth.rs` becomes the first file that could be tempted to.
+/// Written now for the same reason [`the_installer_names_no_vendor`] was: the sweep is already
+/// green when the first file that could break it is created.
+#[test]
+fn the_auth_flow_names_no_vendor_or_method() {
+    /// The eight strings an in-app login is tempted to hard-code: the four method ids the seeded
+    /// ACP agent advertises, the host its authorisation link points at, its adapter's directory,
+    /// and the two environment variables it names in its own refusals.
+    const VOCABULARY: [&str; 8] = [
+        "oauth-personal",
+        "oauth-business",
+        "gemini-api-key",
+        "agent-platform",
+        "accounts.google.com",
+        "antigravity-acp",
+        "GEMINI_HOME",
+        "GEMINI_API_KEY",
+    ];
+
+    let mut offenders = Vec::new();
+    for path in tree_files() {
+        if !path.components().any(|part| part.as_os_str() == "src") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for name in VOCABULARY {
+            if production_half(&text).contains(name) {
+                offenders.push(format!("{}: {name}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "`R-AGT-9` says the method list is the agent's own `initialize` and the outcome is the \
+         probe's, so a login that spells a method id, a host or a vendor variable has stopped \
+         being data-driven: {offenders:?}"
+    );
+}
+
 /// A source file minus its trailing in-module test block.
 ///
 /// In-module tests are tests, and `R-AGT-5` scopes the vendor names to the seeds and to test code
