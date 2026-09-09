@@ -14,52 +14,37 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-09):** MOD-2 milestone 6 landed and is reviewed (`acf16f7`), one task
-short: **`agy` works over ACP**, Google's `agy_acp_server` is installed on this box, and ANA-4 §11
-criterion 10 is proven live. The driver now spawns what the probe recorded, which is the only path
-carrying `agy`'s Linux-only `--uid=` — an argument the live run proved is **mandatory**, not
-cosmetic. Outstanding: the live `agy` **chat** needs the maintainer to authenticate
-`agy_acp_server` through the vendor's own flow (`$GEMINI_HOME/antigravity-acp/`, separate from the
-`agy` CLI's login), and three ANA-4 §11.14 items wait on it. Milestone 5 landed before it
-(`fb626a8`): a box **answers for itself** — `Settings > r` probes what is installed, records
-versions and per-box enablement in a new `agent_box.probe` snapshot, and ANA-4 §11 criterion 9 was
-proven live here.
-**Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql` is no longer held**
-(`docs/ANA-2.md` §9), and it carries ANA-5 §9's ten `app_setting` defaults with it. Milestone 4
-landed before it (`81d247b`): durable history, an offline chat buffered to
-`<cache_dir>/pending/` and uploaded on the next connection, and read-only replay of any past step.
-Milestone 3 (`a142fbf`..`682a423`) holds the **live streamed conversation with `claude` over ACP**
-in the Chat tab, against adapter 0.48.0. ANA-10 concluded
-(`docs/ANA-10.md`, `docs/decisions/ana/ana-10.md`), with its gating decisions taken the same day:
-a box with no DSN becomes a **complete** box, not a read-only shell — a fourth `Backend::Local` arm
-over a **separate** `<config_root>/local/local.sqlite` (never `cache.sqlite`, which is
-delete-on-mismatch), a `LocalStore: WriteStore` with its own forward-only `local_migrations/` set,
-local item minting through a project-origin-scoped key counter, **graph runs at parity** with a
-server-backed box, an **in-app masked DSN field** (the item's stated objective), a once-only
-first-run overlay, `box.toml` holding three facts and **no `local_only` mode flag**, and adoption
-kept explicit and deferred. Spawns MOD-17 (implementation, M0-M6 + M2b), MOD-18 (adoption, M7) and
-MOD-19 (in-process transition, M9); MOD-4 gains M8 and is now blocked on MOD-17's M3.
-Local-only is a **temporary, lite mode**: the full product is `htui` against Postgres, the path to
-online usage must exist (so MOD-18 is funded, not optional), and parity is over features rather than
-over server-shaped infrastructure — no mirror, no refresh cursor, no warm-cache budget.
-**`docs/REQUIREMENTS.md` was amended for it on 2026-09-08** by maintainer decision: new `R-STO-7`
-(local-only mode), and `R-STO-1` s.1, `R-STO-4` (one word), `R-ENT-7`, `R-ID-3`, `R-HIS-1`,
-`R-STO-5`, `R-TUI-1`, `R-TUI-8`, `R-AGT-4`, `R-PRM-4` and `R-SKL-1` amended in place; `R-STO-6`
-deliberately left alone. ANA-5 concluded (`docs/ANA-5.md`,
-`docs/decisions/ana/ana-5.md`): plain `{{name}}` templates over a closed per-role placeholder set
-with no templating crate, ten `<section>` names, ANA-9 §7.3 amended at query level (`MIN(depth)`,
-`in_scope`), kept-first trim order with a `chars-v1` estimator and `trim_record` already in
-`0001`, five-tier deterministic excerpt ranking behind an `ExcerptProvider` seam, `judge` and
-`handoff` as reserved template rows, text-only sha256 digest with the scrubber before it, no new
-crate (`htui-core::prompt` + `htui-agent::excerpt`), no new migration (folds into MOD-2's `0002`);
-MOD-2 is now unblocked. ANA-2 concluded (`docs/ANA-2.md`, `docs/decisions/ana/ana-2.md`): graph
-shape kept, three compare-and-set status tables, review loop at the same `position`, judge at
-`fanout_index = -1`, per-repo `run_step_tree`, lease-based resume, migration
-`0003_orchestration.sql` (after `0002`), new crate `htui-orch`. Live coordinates: dev Postgres via
-`compose.yaml` (port 5439), tests need
-`HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres`
-(`docs/decisions/mod/mod-6.md`). MOD-2, MOD-7, MOD-9, MOD-13, MOD-14, MOD-15 and MOD-17 can start
-now.
+**Current status (2026-09-09):** **MOD-20 landed** (`docs/decisions/mod/mod-20.md`): `htui`
+installs an ACP agent's adapter itself, from the ACP registry, for any agent that declares how —
+`Settings > Agents`, `j`/`k`, **`i`**, a consent pane naming the licence, the size and whether a
+digest can be verified, then `y`. Nothing is fetched before consent, and the row's status afterwards
+is the **probe's** answer, never the installer's. `R-AGT-10` is met and `docs/ANA-4.md` §4.6's
+"MOD-2 should not become a package manager" deferral is reversed; the README's hand-written `curl`
+is gone. Its `R-AGT-5` proof is live: **`amp-acp`** — a vendor no seed, no source file and no code
+path knows — installed from a registry row the test itself writes. It also **amended MOD-2 plan
+D48**: `newest()` is version-aware now, because `unzip` gives a tree the vendor's build date and the
+old path tie-break ranked `1.9.0` above `1.10.0`. 589 tests green on **Linux** with Postgres live.
+**Its Windows-conditional code could not be lint-checked at all — see TOOL-3, which is a maintainer
+decision**, and MOD-16 inherits the runtime half either way.
+Before it, MOD-2 milestone 6 landed and is reviewed (`acf16f7`), one task short: **`agy` works over
+ACP**, `agy_acp_server` is installed here, and ANA-4 §11 criterion 10 is proven live. The driver
+spawns what the probe recorded, the only path carrying `agy`'s Linux-only `--uid=` — an argument the
+live run proved **mandatory**. Outstanding: the live `agy` **chat** needs the maintainer to
+authenticate `agy_acp_server` through the vendor's own flow (`$GEMINI_HOME/antigravity-acp/`,
+separate from the `agy` CLI's login), and three ANA-4 §11.14 items wait on it. Logging an agent in
+**from the app** is MOD-21 (`R-AGT-9`); MOD-20 is its other half and the shape to follow.
+**Live coordinates.** Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql`
+is no longer held (`docs/ANA-2.md` §9) and is **still the next migration** — MOD-20 deliberately
+added none. Adapters install under `HTUI_AGENTS_ROOT`, default `dirs::data_local_dir()/htui/agents`;
+`HTUI_TOOL_<NAME>` still overrides everything. Dev Postgres via `compose.yaml` (port 5439); tests
+need `HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres` and the
+`USERNAME=htui-ci` prefix of TOOL-2 (`docs/decisions/mod/mod-6.md`).
+**Concluded analyses the open items lean on:** ANA-10 (`docs/decisions/ana/ana-10.md`) — a box with
+no DSN becomes a *complete* box over a separate `local.sqlite`, spawning MOD-17, MOD-18 and MOD-19,
+and `docs/REQUIREMENTS.md` was amended for it on 2026-09-08 (new `R-STO-7`, eleven amended in
+place); ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration;
+ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
+`htui-orch`. MOD-2, MOD-7, MOD-9, MOD-13, MOD-14, MOD-15 and MOD-17 can start now.
 
 ---
 
@@ -297,7 +282,12 @@ now.
   MOD-4 and MOD-12 need `probed_tags`/`declared_tags` from a real probe, `repo_box_path` rows for
   every isolation mode, and `agent_box.probe.status` (`docs/ANA-2.md` §4.10, §7). `repo_box_path`
   rows and a real probe turn ANA-5's excerpt fallback root and box profile projection
-  (`docs/ANA-5.md` §4.2, §4.5) from degraded into complete.
+  (`docs/ANA-5.md` §4.2, §4.5) from degraded into complete. **MOD-20 landed**
+  (`docs/decisions/mod/mod-20.md`): `docs/ANA-4.md` §4.6 named this item as the possible owner of
+  registry-driven installation, and it is now built and `R-AGT-10`-backed - so this item *calls*
+  `htui_agent::install` from its box registration and probe hook rather than growing one, and that
+  hook is the natural second caller of the action `Settings > i` already exposes (MOD-20 D7 kept
+  the MVP to Settings deliberately).
 - [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
   project and phase bindings, template rows, Skills tab editor with version diff, import of
   existing skill markdown files. Per ANA-5 (`docs/ANA-5.md` §4.1, §5.4): template save validation
@@ -385,6 +375,16 @@ now.
   `.jsonl.open` sealing have never met a Windows file lock. Needs a Windows box with `node` and
   `claude-agent-acp` installed; milestone 5 is the first milestone whose own work touches the
   spawn path, so this can run before or beside it. Not blocked.
+  **MOD-20 added a second body of Windows-only code** (`docs/decisions/mod/mod-20.md`), and it is
+  the first that could not be lint-checked from Linux at all (**TOOL-3**), so it was reviewed by eye
+  only. The runtime facts it defers here, by name: that `Layout::promote`'s three-attempt
+  `PermissionDenied` backoff actually clears a Defender lock on a freshly written `.exe`; long-path
+  behaviour past 260 characters under `<install root>\<id>\<version>\`; that `create_link`'s
+  Windows fallback (a small file naming the target, since a real symlink needs a privilege an
+  ordinary user lacks) is never mistaken for the adapter; `fs4::available_space` on a junction;
+  `reqwest`'s `system-proxy` reading the OS proxy configuration; and whether a partial
+  `.staging/` entry can be removed while its file handle is open, which `fetch.rs`'s abandon path
+  was restructured for but which no Linux test can distinguish.
 
 - [ ] **MOD-17 - Local-only mode: a writable local store** (from ANA-10). `R-STO-1`, `R-STO-3..6`,
   `R-ENT-7`, `R-TUI-1`, `R-TUI-8`, `R-NF-3`, `R-ID-3`, `R-ID-7`, `R-HIS-1`, `R-USR-2`, `R-BOX-1`.
@@ -430,47 +430,6 @@ now.
   than move one (`store_worker.rs:572-575`) while a `Backend::Local` and its open `local.sqlite`
   are still in hand. Buys one avoided restart and nothing else; MOD-17's M2b delivers the objective
   without it. Blocked on MOD-17 (M3).
-- [ ] **MOD-20 - Registry-driven adapter install** (from MOD-2 milestone 6). **`R-AGT-10`**,
-  `R-AGT-4..6`, `R-TUI-8`, `R-NF-3`. `htui` installs an ACP agent's adapter itself, from the ACP
-  registry, for **any** agent that declares how — never one code path per vendor. `R-AGT-10` was
-  added to `docs/REQUIREMENTS.md` on 2026-09-09 by maintainer decision, and carries the digest rule
-  (verify where the source publishes one, say so plainly where it does not) and the licence rule
-  (surface a proprietary adapter's terms before fetching it) that this item's open questions raised.
-  **It reverses a deferral by the same decision:** `docs/ANA-4.md` §4.6 rejected "download every agent from the
-  ACP registry and manage the install (Zed's approach)" with "MOD-2 should not become a package
-  manager", reserving the shape in `agent.launch.discovery` for "MOD-7 or a later MOD"; MOD-2's
-  plan D57 restated it, and the README's hand-written `curl` for `agy_acp_server` is the cost of
-  that deferral — a documented URL pinning **one** version (`1.1.1`) and **one** platform, which
-  goes stale silently. The seam it fills is already shaped: `agent.launch.discovery` is a per-agent
-  recipe, the glob tier resolves `…/agents/<id>/*/…` with the version segment already a wildcard,
-  and the probe already records what `initialize` reports rather than what anyone assumed - so an
-  installer adds a *source* for the file the glob finds, and changes no resolution rule.
-  Scope: an `install` block in `discovery` naming the registry id and this platform's archive; a
-  reader for `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`; download,
-  unpack and executable-bit into the per-platform install root the seeds already glob; a
-  Settings-tab action beside `r` (`R-TUI-8`) that never runs on the UI task (`R-NF-3`); and a
-  re-probe of the row it just filled. Extensibility is the point, so nothing may be keyed on an
-  agent's name (`R-AGT-5`): a new agent stays one registry row plus, now, a declared install
-  source.
-  **Open questions this item must settle before it writes code** - it is unrouted, and the count
-  alone argues for the PRD path: the registry publishes **no checksum for every agent** (`amp-acp`
-  carries `sha256` per platform, `antigravity-acp` carries none), so the trust policy for an
-  unverifiable 682 MB download is undecided; these artifacts are large (`agy_acp_server.par` is
-  1.88 GB unpacked, 2.0 GB with its sibling), so an install root needs a disk budget and a policy
-  for old versions rather than unbounded accumulation; update policy has to agree with the 24 h
-  `PROBE_TTL` and with MOD-2's `newest()`, which orders matches by **mtime** and therefore by the
-  *archive's build date* (an `unzip` preserves it), so re-downloading an older version after a
-  newer one selects the wrong install; `HTUI_TOOL_<NAME>` must keep winning over anything installed;
-  Windows needs its own unpack path (long paths, Defender, the `.cmd` shim rule of ANA-4 §4.6) and
-  its runtime half is **MOD-16's**; a partial or interrupted unpack must not leave a directory the
-  glob will happily resolve; a box behind a proxy or with no network must degrade to today's
-  manual instructions; and — the one that is not technical — `antigravity-acp` is **proprietary**
-  with its own terms (`docs/ANA-4.md` §10 risk 8), so `htui` fetching it on the user's behalf must
-  surface licence and account-type consequences *before* the download, not after.
-  Not blocked. Cross-links: **MOD-7** was ANA-4's candidate owner and instead *calls* this - its
-  box registration and probe hook are the natural trigger; **MOD-2** owns the glob, `newest()` and
-  the `agent_box.probe` snapshot this writes into, and its README section is what this item
-  replaces; **MOD-16** owns every Windows runtime fact.
 - [ ] **MOD-21 - In-app agent authentication** (from MOD-2 milestone 6). **`R-AGT-9`**, `R-AGT-1`,
   `R-AGT-4..6`, `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent that reports `unauthenticated` is logged in
   **from inside `htui`**, not by leaving the app for a vendor CLI. **This reverses a design
@@ -515,8 +474,12 @@ now.
   fact about a box rather than a registry row.
   Not blocked, and **MOD-2 is not blocked on it** - milestone 6's T34 needs only a logged-in server,
   by any means. Cross-links: **MOD-2** owns the probe, the credential tier and the status this acts
-  on; **MOD-10** owns every credential *value*; **MOD-20** is the other half of the same story
-  (install the adapter, then log it in - one "make this box ready" flow); **MOD-7** owns the
+  on; **MOD-10** owns every credential *value*; **MOD-20 landed**
+  (`docs/decisions/mod/mod-20.md`) and is the other half of the same story - the adapter installs
+  from the app, and this item logs it in, one "make this box ready" flow. Its `Settings > i` action,
+  its consent pane and its per-box `manifest.json` are the shapes to follow rather than re-invent,
+  and the live proof recorded `amp-acp` reporting `authMethods: ["setup"]` on a box with no
+  credential - a second agent whose `unauthenticated` this item must answer. **MOD-7** owns the
   Settings box profile the action sits in; **MOD-16** owns the Windows runtime facts.
 
 ### Deferred backlog
@@ -538,6 +501,26 @@ now.
   after the phrase, join across a line wrap), add a fixture with a two-ID and a wrapped case, keep
   the `WORKFLOW_ALLOW_SH_ON_WINDOWS=1` parity check green. Found during `/handoff-run next` on
   2026-09-04.
+- [ ] **TOOL-3 - The Windows lint target cannot be built on this box, and MOD-20 made that bite.**
+  `R-NF-3`, `R-AGT-1`. `cargo clippy --target x86_64-pc-windows-msvc` dies in `ring`'s build script
+  with `error occurred in cc-rs: failed to find tool "lib.exe"`: cross-compiling `ring`'s C needs an
+  MSVC-capable compiler, and this box has `gcc` only (`cc-rs` reports *"GNU compiler is not
+  supported for this target"*; `AR_x86_64_pc_windows_msvc=llvm-lib` gets one step further and dies
+  on *"not a COFF object"*). No `clang`, no `clang-cl`, no `cargo-xwin`, no `zig`, no `sudo`.
+  **Pre-existing for `-p htui`** — `ring` reaches it as `ring ← rustls ← sqlx-core ← sqlx ←
+  htui-core ← htui-store`, a path that predates MOD-20 — but MOD-20's `reqwest`/`rustls` brought it
+  into `htui-agent`'s graph too, which is the crate the README's own command names
+  (`README.md` "Checking the Windows-only code from Linux"). That command is the safety net MOD-2
+  milestone 3 credited with catching two defects a Linux build cannot see, and it is now green on
+  neither crate, so MOD-20's Windows-conditional code (`archive.rs`'s `cfg(unix)`/`cfg(not(unix))`
+  arms, `Layout::promote`'s retry, the `canonicalize` on both sides of the post-promote check) was
+  reviewed by eye rather than linted. Three ways out, none taken: install a C toolchain that can
+  target MSVC without `sudo` (`cargo install cargo-zigbuild` + `pip install ziglang` is the
+  sudo-free one; `cargo-xwin` needs `clang`); scope the lint line to a feature set that excludes
+  TLS, which lints most code but not `install/http.rs`; or accept the loss and let **MOD-16** be the
+  only Windows check. **This is a maintainer decision, and MOD-16 inherits the runtime half
+  either way.** MOD-20's plan D21 and its Validation block both name lint lines that currently
+  cannot run — whichever way this goes, they need amending. Found during MOD-20 T2 on 2026-09-09.
 - [ ] **TOOL-2 - Demo fixture's `app_user.name` collides with the OS username, failing every
   Postgres test.** `R-NF-3`. `crates/htui-core/src/fixtures.rs:351` seeds `app_user.name =
   "luigi"`, and `PgStore::seed_if_empty` derives the same name from the OS `USERNAME`, so
@@ -556,6 +539,6 @@ now.
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-3 context tools, ANA-7 secrets)                                                    |
-| MOD-N   | 19 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-20 adapter install, MOD-21 in-app auth; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 18 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-21 in-app auth; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                         |
-| TOOL-N  | 2 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision)              |
+| TOOL-N  | 3 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable) |

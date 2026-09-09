@@ -231,39 +231,45 @@ Two environment knobs, both off by default:
 | `HTUI_KEEP_RAW_EVENTS=1` | Keep the verbatim wire message on every recorded row. `project.settings.keep_raw_events` replaces this once the project editor exists |
 | `HTUI_TOOL_<NAME>` | Override one `${name}` placeholder of `agent.launch` — `HTUI_TOOL_NODE`, `HTUI_TOOL_CLAUDE_AGENT_ACP`, … — for a box whose layout the built-in resolver does not understand |
 
-## Installing the `agy` ACP adapter
+## Installing an agent's adapter
 
 `claude` reaches ACP through an npm adapter the probe can find on its own. `agy` does not: Google
 ships a separate first-party server, `agy_acp_server`, that is not on `PATH` and not installed by
-the `agy` CLI. `htui` does not download it — it is a proprietary binary with its own release
-cadence, and MOD-2 is not a package manager — so the seed row resolves it through a glob and this
-is the directory that glob expects.
+the `agy` CLI. Since `R-AGT-10` `htui` installs it for you. In **Settings > Agents**, `j`/`k` pick
+a row and `i` installs it. There is no code path per agent: the source is the row's own
+`agent.launch.discovery.install`, which names an ACP registry id, and the installer writes where
+that row's glob already looks (`R-AGT-5`). A row that declares no source says so instead.
 
-Take the archive for your platform from the ACP registry
-(`https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`, agent id
-`antigravity-acp`). For Linux x86-64 at version 1.1.1 that is:
+`i` spends one registry read and one `HEAD`, then draws a consent pane — the agent and the version,
+the archive's URL and its size, the directory it unpacks into, the licence and its terms URL,
+whether the digest will be verified or cannot be, whether the disk holds it, and which installed
+versions this one replaces. `y` accepts, `n` / `Esc` declines, `x` stops a running install.
+**Nothing is downloaded before `y`.** Where the registry publishes a `sha256` it is checked before
+anything is unpacked and a mismatch refuses the install; `antigravity-acp` publishes none, which
+the pane says before the download, so `htui` records the digest of what it actually received and a
+later re-install of the same version that differs is detectable. `agy_acp_server` is proprietary,
+which is why the terms are on screen before a byte is fetched; consent is remembered per box in
+`<install root>/<id>/manifest.json`.
 
-```bash
-curl -fL -o /tmp/agy-acp.zip \
-  https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_1.1.1-linux-x86_64.zip
-mkdir -p ~/.local/share/htui/agents/antigravity-acp/1.1.1
-unzip -o /tmp/agy-acp.zip -d ~/.local/share/htui/agents/antigravity-acp/1.1.1/
-chmod +x ~/.local/share/htui/agents/antigravity-acp/1.1.1/agy_acp_server.par
-```
+The install root is `HTUI_AGENTS_ROOT`, seeded from this platform's local data directory:
+`~/.local/share/htui/agents` on Linux (`$XDG_DATA_HOME` when it is set),
+`~/Library/Application Support/htui/agents` on macOS, `%LOCALAPPDATA%\htui\agents` on Windows.
+Setting the variable moves the tree, which is the knob for a box that wants 1.9 GB per version
+somewhere else; `HTUI_TOOL_<NAME>` still wins over anything installed, for a layout no pattern
+describes. Afterwards `htui` **re-probes**, and the `on this box` cell is the probe's answer rather
+than the installer's claim: a tree that unpacked perfectly but cannot handshake reads `failed`.
 
-Unpack the **whole** archive rather than the server alone: `localharness_external` ships beside it.
-The handshake does not need it (verified), but a live turn may. The registry publishes no checksum
-for any Antigravity platform. macOS uses `agy_acp_server.par` under
-`~/Library/Application Support/htui/agents/antigravity-acp/<version>/`; Windows uses
-`agy_acp_server.exe` under `%LOCALAPPDATA%\htui\agents\antigravity-acp\<version>\`, and also finds
-the copy JetBrains IDEs install under `%LOCALAPPDATA%\JetBrains\*\acp-agents\`. A box whose layout
-none of those patterns describes sets `HTUI_TOOL_AGY_ACP_SERVER` to the binary's full path.
-
-**The executable bit matters** and **the Linux argument is mandatory.** `agent.launch` appends
-`--uid=` on Linux, with its value deliberately empty; without it the server's startup path tries to
-drop privileges to a `nobody` group and aborts (`Check failed: LookupGIDByGroupName(…)`) before it
-reads a byte of stdin. The probe applies the append, which is why `Settings > r` is what makes a
-chat launch a working `agy`.
+Offline, behind a proxy that refuses, or against a registry that will not answer, the action
+degrades to manual steps derived from the same row — the registry URL, the entry id, this box's
+platform key, the directory to unpack the whole archive into, the file to make executable, and the
+`HTUI_TOOL_<NAME>` override. Three things hold whichever way the adapter arrives. Unpack the
+**whole** archive rather than the server alone: `localharness_external` ships beside it, and though
+the handshake does not need it (verified) a live turn may. **The executable bit matters** —
+`launch::spawn` runs `which` even on an absolute path, which rejects a file without it. And **the
+Linux argument is mandatory**: `agent.launch` appends `--uid=` on Linux with its value deliberately
+empty; without it the server's startup path tries to drop privileges to a `nobody` group and aborts
+(`Check failed: LookupGIDByGroupName(…)`) before it reads a byte of stdin. The probe applies the
+append, which is why `Settings > r` is what makes a chat launch a working `agy`.
 
 **Authentication is the vendor's, not `htui`'s.** The server keeps its own configuration under
 `$GEMINI_HOME/antigravity-acp/` (default `~/.gemini/antigravity-acp/`) — a *sibling of, and
