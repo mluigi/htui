@@ -29,6 +29,6 @@ no workspace · no box · memory · 0 runs
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│j/k select · r probe · i install                                                                  │
+│j/k select · r probe · i install · a authenticate                                                 │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

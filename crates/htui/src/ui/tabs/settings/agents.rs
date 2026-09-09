@@ -1,4 +1,5 @@
-//! The agent registry section of the Settings tab (`R-TUI-8`, MOD-2 D14, D54, MOD-20 D19, D20).
+//! The agent registry section of the Settings tab (`R-TUI-8`, MOD-2 D14, D54, MOD-20 D19, D20,
+//! MOD-21 D20).
 //!
 //! It lists what `agent` and this box's `agent_box` hold, and it is where a probe is asked for:
 //! `r` sends [`StoreRequest::ProbeAgents`] and the `on this box` column then says what this box
@@ -11,15 +12,26 @@
 //! overlay factory takes no argument and so cannot be told which row, and because replies to a
 //! popped overlay are dropped — the section is the one view that outlives a whole install.
 //!
+//! Since MOD-21 it is also where an agent is **logged in**: `a` on the highlighted row starts one
+//! flow, the method list the adapter's own `initialize` answered is drawn as a chooser under the
+//! table, and what the flow then prints to its stderr — the link included — is drawn there too
+//! (MOD-21 D20). The verdict at the end is the **probe's**: `Done` clears the pane and re-reads the
+//! registry, and there is no state in this file that means "logged in" (`R-AGT-6`).
+//!
 //! Two costs of answering the probe with the reply this section already reads. One: **any**
 //! [`StoreReply::Agents`] clears the in-flight *probe* state, so a re-activation or a scope change
 //! while a probe is running puts the pre-probe rows back for a moment. The probe's own reply
 //! supersedes them when it lands, and the alternative was a second reply variant nothing else
-//! would ever use. Two: the install state deliberately does **not** join it (hazard H-17) — a
-//! probe that loses its flag re-renders one column, an install that lost its state would leave a
-//! running download with nothing on screen to cancel it with.
+//! would ever use. Two: neither the install state nor the login state joins it (hazard H-17, and
+//! MOD-21's H-7) — a probe that loses its flag re-renders one column, an install that lost its
+//! state would leave a running download with nothing on screen to cancel it with, and a login that
+//! lost its state would leave a spawned adapter, an open loopback listener and a human half-way
+//! through a browser page with no key on screen to stop any of it.
 
+use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::PlanError;
+use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
+use htui_agent::registry::caps_for;
 use htui_agent::{AgentLaunch, InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
 use htui_core::model::{AgentId, AgentSummary, Scope};
 use ratatui::Frame;
@@ -27,10 +39,11 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::path::Path;
 
 use crate::app::{Action, Ctx, Handled};
-use crate::store_worker::{InstallFrame, StoreReply, StoreRequest};
+use crate::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::tabs::settings::{SectionId, SettingsSection, message};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -50,7 +63,7 @@ const NONE: &str = "\u{2014}";
 /// The hint line with nothing in flight. It stands in for a help entry: a Settings section has no
 /// [`KeyScope`](crate::keymap::KeyScope) of its own (MOD-20 D19), so the keys are written where
 /// they are pressed.
-const HINT_IDLE: &str = "j/k select \u{b7} r probe \u{b7} i install";
+const HINT_IDLE: &str = "j/k select \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
 
 /// The hint line while a plan waits for an answer.
 const HINT_PENDING: &str = "y install \u{b7} n cancel";
@@ -60,6 +73,43 @@ const HINT_RUNNING: &str = "x cancel install";
 
 /// The hint line while the manual steps are up.
 const HINT_MANUAL: &str = "Esc close";
+
+/// The hint line while the login chooser is waiting for a method (MOD-21 D20).
+const HINT_CHOOSING: &str = "j/k choose \u{b7} Enter select \u{b7} Esc cancel";
+
+/// The hint line while a login is spawning or running.
+const HINT_AUTH_RUNNING: &str = "o open link \u{b7} x cancel";
+
+/// What the `on this box` column reads between `a` and the flow's own method list.
+const STARTING: &str = "starting\u{2026}";
+
+/// What it reads while the chooser is up.
+const CHOOSE: &str = "choose a method";
+
+/// What it reads while an `authenticate` call is in flight.
+const LOGGING_IN: &str = "logging in\u{2026}";
+
+/// What it reads while a `logout` call is in flight.
+const LOGGING_OUT: &str = "logging out\u{2026}";
+
+/// The chooser's last row when the agent advertised a logout verb.
+const LOGOUT_ROW: &str = "log out";
+
+/// What `o` says before the adapter has printed a link.
+const NO_LINK: &str = "no link yet";
+
+/// What the section says of a login that was stopped.
+const AUTH_CANCELLED: &str = "login cancelled";
+
+/// What the section says of an opener that was spawned. Never "the browser opened", which `htui`
+/// does not own and cannot know (MOD-21 D17).
+const OPENED: &str = "link opened";
+
+/// MOD-21 D20: how many of the adapter's stderr lines the stream pane keeps.
+///
+/// Six, because the pane is drawn under a table that has to stay readable on a 24-row terminal and
+/// a live flow's useful stderr is one line — the link — with a handful of noise around it.
+const AUTH_PANE_LINES: usize = 6;
 
 /// What the section says of an install the user turned down.
 const DECLINED: &str = "install declined";
@@ -113,8 +163,56 @@ enum InstallState {
     },
 }
 
+/// How far a login this section asked for has got (MOD-21 D20).
+///
+/// [`InstallState`]'s shape and its reason: the runtime allows one login at a time (D19), the
+/// states are exclusive by construction, and every key the section binds means something different
+/// in each of them. What is *not* here is a "logged in" state — the flow does not decide that, the
+/// probe does (`R-AGT-6`), and the cell reads the row the flow's own re-probe wrote.
+#[derive(Debug, Default)]
+enum AuthState {
+    /// No login is running.
+    #[default]
+    Idle,
+    /// `a` was pressed and the agent has not answered `initialize` yet.
+    Starting {
+        /// The row it was pressed on.
+        agent_id: AgentId,
+    },
+    /// The agent's own method list is on screen, waiting for `Enter`.
+    ///
+    /// Held whole rather than summarised, and taken from the live frame rather than from the
+    /// stored snapshot (MOD-21 D7): the snapshot decides whether `a` is *offered*, the flow
+    /// decides what is offered *in* it.
+    Choosing {
+        /// Whose row the pane belongs to.
+        agent_id: AgentId,
+        /// Every method the agent advertised, in its own order.
+        methods: Vec<AuthMethodInfo>,
+        /// The agent advertised a logout verb, so the last row is one.
+        logout: bool,
+        /// How many `terminal`-typed methods were withheld (MOD-21 D4).
+        hidden: usize,
+        /// Which row `Enter` sends.
+        cursor: usize,
+    },
+    /// A call is in flight and its stream is on screen.
+    Running {
+        /// Whose row the progress cell belongs to.
+        agent_id: AgentId,
+        /// Which call, so the cell can say `logging in…` or `logging out…`.
+        call: AuthCall,
+        /// The last [`AUTH_PANE_LINES`] stderr lines, oldest first.
+        lines: VecDeque<String>,
+        /// The newest link the adapter printed, which is the one `o` opens.
+        url: Option<String>,
+        /// `x` was pressed, or the runtime acknowledged one.
+        cancelling: bool,
+    },
+}
+
 /// The registry as a table of name, transport, billing, models, default, enabled and per-box
-/// state, with a row cursor and the install one row at a time.
+/// state, with a row cursor, the install one row at a time and the login one row at a time.
 #[derive(Debug, Default)]
 pub struct AgentsSection {
     /// The registry, ordered by name.
@@ -134,6 +232,8 @@ pub struct AgentsSection {
     cursor: TableState,
     /// The install this section is waiting on.
     install: InstallState,
+    /// The login this section is waiting on (MOD-21 D20).
+    auth: AuthState,
     /// The last outcome, one line on the hint row.
     notice: Option<String>,
 }
@@ -197,6 +297,390 @@ impl AgentsSection {
         )
     }
 
+    /// Whether a login this section asked for holds the runtime's claim (MOD-21 D19).
+    ///
+    /// Every state but [`AuthState::Idle`] counts, including the one that is only waiting for the
+    /// user to choose: the adapter is already spawned by then, and the claim covers it.
+    fn auth_in_flight(&self) -> bool {
+        !matches!(self.auth, AuthState::Idle)
+    }
+
+    /// Which row the running login belongs to, or `None` when none is running.
+    fn auth_agent(&self) -> Option<AgentId> {
+        match &self.auth {
+            AuthState::Idle => None,
+            AuthState::Starting { agent_id }
+            | AuthState::Choosing { agent_id, .. }
+            | AuthState::Running { agent_id, .. } => Some(*agent_id),
+        }
+    }
+
+    /// `a`: log the highlighted row in, or say why not (MOD-21 D20, `R-AGT-9`).
+    ///
+    /// [`begin_install`](Self::begin_install)'s rule, for the same reason: every refusal is a
+    /// sentence with the row's own name in it and every one of them is reached from the documents
+    /// this section is already holding, before a request is spent. The runtime refuses the same
+    /// cases in the same order (`agent_worker::auth_start`) — but a login that reached it would
+    /// have cost a spawn, a handshake and a human's attention to be told what the table on screen
+    /// already says.
+    fn begin_auth(&mut self, ctx: &mut Ctx<'_>) {
+        if self.auth_in_flight() {
+            ctx.emit(Action::Error("a login is already running".to_owned()));
+            return;
+        }
+        if self.install_in_flight() {
+            ctx.emit(Action::Error("an install is running".to_owned()));
+            return;
+        }
+        if self.probing {
+            ctx.emit(Action::Error("a probe is running".to_owned()));
+            return;
+        }
+        let Some(summary) = self.selected() else {
+            ctx.emit(Action::Error("no agent row is selected".to_owned()));
+            return;
+        };
+        // MOD-21 D10's predicate: a transport with no `authenticate` call has none for any row,
+        // and the seam's own sentence is the one to print.
+        if !caps_for(&summary.agent).authenticate {
+            ctx.emit(Action::Error(format!(
+                "`{}` is a `{}` agent; it has no `authenticate` call",
+                summary.agent.name,
+                summary.agent.transport.as_str()
+            )));
+            return;
+        }
+        // MOD-21 D7's stated cost: the *snapshot* decides whether a login is offered at all. A box
+        // nobody has probed, and a box whose probe could not run the adapter, are the same answer —
+        // a spawn would only say again what the last one said.
+        let snapshot = summary.on_box.as_ref().and_then(ProbeSnapshot::from_row);
+        let Some(snapshot) = snapshot.filter(|snapshot| {
+            matches!(
+                snapshot.status,
+                ProbeStatus::Unauthenticated | ProbeStatus::Ready
+            )
+        }) else {
+            ctx.emit(Action::Error(format!(
+                "probe `{}` first",
+                summary.agent.name
+            )));
+            return;
+        };
+        if snapshot
+            .handshake
+            .is_none_or(|handshake| handshake.auth_methods.is_empty())
+        {
+            ctx.emit(Action::Error(format!(
+                "`{}` advertises no authentication methods",
+                summary.agent.name
+            )));
+            return;
+        }
+        let agent_id = summary.agent.id;
+        self.auth = AuthState::Starting { agent_id };
+        self.notice = None;
+        ctx.request(StoreRequest::AuthStart { agent_id });
+    }
+
+    /// The keys the method chooser answers, and the ones it swallows (MOD-21 D20).
+    ///
+    /// [`answer_consent`](Self::answer_consent)'s modality and its warning: **only this section's
+    /// own keys** are consumed. `App::on_key` offers the active tab a key before the `Tab` and
+    /// `Global` keymaps, so a blanket `_ => Consumed` here would make `q`, `?`, `Tab` and the digit
+    /// tab-switches dead for as long as a human is reading a method list — which is why the choice
+    /// is `Enter` and not a digit in the first place.
+    fn answer_chooser(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        match key.code {
+            KeyCode::Char('j') => {
+                self.move_choice(true);
+                Handled::Consumed
+            }
+            KeyCode::Char('k') => {
+                self.move_choice(false);
+                Handled::Consumed
+            }
+            KeyCode::Enter => {
+                self.send_choice(ctx);
+                Handled::Consumed
+            }
+            // Not "close the pane": the adapter is spawned and waiting on this answer, and only the
+            // runtime can kill it. The cell reads `cancelling…` until the flow's own last frame.
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.begin_auth_cancel(ctx);
+                Handled::Consumed
+            }
+            KeyCode::Char('r' | 'i') => {
+                self.refuse_during_login(key, ctx);
+                Handled::Consumed
+            }
+            // The section's own keys, swallowed so a cursor move cannot change the row under a
+            // choice the user has not made yet.
+            KeyCode::Char('a' | 'x') => Handled::Consumed,
+            _ => Handled::Pass,
+        }
+    }
+
+    /// Moves the chooser's cursor one row and stops at the end it reaches.
+    ///
+    /// No wrap, for [`move_cursor`](Self::move_cursor)'s reason: `Enter` sends whatever the cursor
+    /// is on, and a held `j` that wrapped would send a call the user never aimed at.
+    fn move_choice(&mut self, down: bool) {
+        if let AuthState::Choosing {
+            methods,
+            logout,
+            cursor,
+            ..
+        } = &mut self.auth
+        {
+            let last = methods.len().saturating_add(usize::from(*logout)).max(1) - 1;
+            *cursor = if down {
+                cursor.saturating_add(1).min(last)
+            } else {
+                cursor.saturating_sub(1)
+            };
+        }
+    }
+
+    /// `Enter`: send the row the cursor is on and move to the stream pane.
+    fn send_choice(&mut self, ctx: &mut Ctx<'_>) {
+        let AuthState::Choosing {
+            agent_id,
+            methods,
+            logout,
+            cursor,
+            ..
+        } = &self.auth
+        else {
+            return;
+        };
+        let choice = match methods.get(*cursor) {
+            Some(method) => AuthChoice::Method(method.id.clone()),
+            // Past the last method with a logout advertised: the logout row. Without one there is
+            // nothing under the cursor and nothing to send.
+            None if *logout => AuthChoice::Logout,
+            None => return,
+        };
+        let call = match &choice {
+            AuthChoice::Method(id) => AuthCall::Authenticate(id.clone()),
+            AuthChoice::Logout => AuthCall::Logout,
+        };
+        self.auth = AuthState::Running {
+            agent_id: *agent_id,
+            call,
+            lines: VecDeque::new(),
+            url: None,
+            cancelling: false,
+        };
+        self.notice = None;
+        ctx.request(StoreRequest::AuthChoose { choice });
+    }
+
+    /// `x`, `n` and `Esc`: ask the runtime to stop the flow, and say so in the cell.
+    ///
+    /// A chooser that is cancelled becomes a `Running` with the flag set rather than a state of its
+    /// own: what is on screen from here until the flow's own last frame is the same in both, and
+    /// one state carrying the flag is one place to clear it.
+    fn begin_auth_cancel(&mut self, ctx: &mut Ctx<'_>) {
+        match &mut self.auth {
+            AuthState::Idle => return,
+            AuthState::Running { cancelling, .. } => *cancelling = true,
+            AuthState::Starting { agent_id } | AuthState::Choosing { agent_id, .. } => {
+                self.auth = AuthState::Running {
+                    agent_id: *agent_id,
+                    call: AuthCall::Authenticate(String::new()),
+                    lines: VecDeque::new(),
+                    url: None,
+                    cancelling: true,
+                };
+            }
+        }
+        ctx.request(StoreRequest::AuthCancel);
+    }
+
+    /// `r` and `i` while a login runs: the flow ends by re-probing and writing the row, and either
+    /// of the other two would be racing it for that row (MOD-21 D19).
+    fn refuse_during_login(&self, key: KeyEvent, ctx: &mut Ctx<'_>) {
+        let what = if key.code == KeyCode::Char('r') {
+            "probe"
+        } else {
+            "install"
+        };
+        ctx.emit(Action::Error(format!(
+            "a login is running; {what} afterwards"
+        )));
+    }
+
+    /// `o`: open the link the pane is showing, through `htui`'s own opener (MOD-21 D17).
+    fn open_link(&self, ctx: &mut Ctx<'_>) {
+        match &self.auth {
+            AuthState::Running { url: Some(url), .. } => {
+                ctx.request(StoreRequest::AuthOpen { url: url.clone() });
+            }
+            _ => ctx.emit(Action::Error(NO_LINK.to_owned())),
+        }
+    }
+
+    /// One frame of a login stream (MOD-21 D18, D20).
+    ///
+    /// Every terminal frame lands on [`AuthState::Idle`] with a notice, and exactly one of them —
+    /// [`AuthFrame::Done`] — re-reads the registry: the flow wrote the row through its own
+    /// re-probe, and what the cell then says is that row (`R-AGT-6`). There is no state here that
+    /// means "logged in".
+    fn on_auth_frame(&mut self, frame: &AuthFrame, ctx: &mut Ctx<'_>) {
+        match frame {
+            AuthFrame::Methods {
+                methods,
+                logout,
+                hidden,
+            } => {
+                // The list belongs to the flow that is running; a frame with no flow behind it is
+                // a stale one the shell's own freshness check let through (blueprint H-26).
+                if let Some(agent_id) = self.auth_agent() {
+                    self.auth = AuthState::Choosing {
+                        agent_id,
+                        methods: methods.clone(),
+                        logout: *logout,
+                        hidden: hidden.len(),
+                        cursor: 0,
+                    };
+                    self.notice = None;
+                }
+            }
+            AuthFrame::Line(line) => {
+                if let AuthState::Running { lines, .. } = &mut self.auth {
+                    lines.push_back(line.clone());
+                    while lines.len() > AUTH_PANE_LINES {
+                        lines.pop_front();
+                    }
+                }
+            }
+            AuthFrame::Url(url) => {
+                if let AuthState::Running { url: shown, .. } = &mut self.auth {
+                    *shown = Some(url.clone());
+                }
+            }
+            // The opener was spawned. Not the end of anything: the flow is still waiting on the
+            // human this link was for.
+            AuthFrame::Opened => self.notice = Some(OPENED.to_owned()),
+            AuthFrame::Done { call, status } => {
+                let what = match call {
+                    AuthCall::Authenticate(_) => "logged in",
+                    AuthCall::Logout => "logged out",
+                };
+                self.auth = AuthState::Idle;
+                self.notice = Some(format!("{what}: {status}"));
+                ctx.request(StoreRequest::Agents);
+            }
+            // The agent's own sentence, verbatim (MOD-21 D5): the live refusal names the variable
+            // the user has to set, and nothing this section could write would say it better.
+            AuthFrame::Refused { message } => {
+                self.auth = AuthState::Idle;
+                self.notice = Some(message.clone());
+            }
+            AuthFrame::Cancelling => {
+                if let AuthState::Running { cancelling, .. } = &mut self.auth {
+                    *cancelling = true;
+                }
+            }
+            AuthFrame::Cancelled => {
+                self.auth = AuthState::Idle;
+                self.notice = Some(AUTH_CANCELLED.to_owned());
+            }
+            // Its own frame rather than a `Cancelled`, so the notice says what happened instead of
+            // implying the user did it (MOD-21 D13).
+            AuthFrame::Idle { after } => {
+                self.auth = AuthState::Idle;
+                self.notice = Some(format!("no activity for {after:?}; login cancelled"));
+            }
+            AuthFrame::Failed { message } => {
+                self.auth = AuthState::Idle;
+                self.notice = Some(message.clone());
+            }
+        }
+    }
+
+    /// The login cell of the row a flow is running on, or `None` for every other row.
+    fn auth_cell(&self, agent_id: AgentId) -> Option<String> {
+        match &self.auth {
+            AuthState::Starting { agent_id: running } if *running == agent_id => {
+                Some(STARTING.to_owned())
+            }
+            AuthState::Choosing {
+                agent_id: running, ..
+            } if *running == agent_id => Some(CHOOSE.to_owned()),
+            AuthState::Running {
+                agent_id: running,
+                cancelling: true,
+                ..
+            } if *running == agent_id => Some(CANCELLING.to_owned()),
+            AuthState::Running {
+                agent_id: running,
+                call,
+                ..
+            } if *running == agent_id => Some(
+                match call {
+                    AuthCall::Authenticate(_) => LOGGING_IN,
+                    AuthCall::Logout => LOGGING_OUT,
+                }
+                .to_owned(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The login half of the pane: the chooser, or the stream (MOD-21 D20).
+    fn auth_pane(&self, theme: &Theme) -> Vec<Line<'static>> {
+        match &self.auth {
+            AuthState::Choosing {
+                methods,
+                logout,
+                hidden,
+                cursor,
+                ..
+            } => {
+                let style = |row: usize| {
+                    if row == *cursor {
+                        theme.accent
+                    } else {
+                        theme.base
+                    }
+                };
+                let mut lines = vec![Line::default()];
+                // The agent's own words, in the agent's own order. The **id** is what `Enter`
+                // sends and is deliberately never drawn: it is a wire value, not a label.
+                for (row, method) in methods.iter().enumerate() {
+                    let text = match &method.description {
+                        Some(description) => format!("{} \u{2014} {description}", method.name),
+                        None => method.name.clone(),
+                    };
+                    lines.push(Line::styled(text, style(row)));
+                }
+                if *logout {
+                    lines.push(Line::styled(LOGOUT_ROW, style(methods.len())));
+                }
+                // Named rather than offered (MOD-21 D4, D21): the spec forbids handing a
+                // `terminal` method to `authenticate`, and a user who cannot see the one they were
+                // told to use would otherwise think the list was broken.
+                if *hidden > 0 {
+                    lines.push(Line::styled(
+                        format!("{hidden} method(s) need a terminal htui does not provide"),
+                        theme.dim,
+                    ));
+                }
+                lines
+            }
+            AuthState::Running { lines, url, .. } => lines
+                .iter()
+                .map(|line| Line::styled(line.clone(), theme.dim))
+                .chain(
+                    url.iter()
+                        .map(|url| Line::styled(format!("link: {url}"), theme.base)),
+                )
+                .collect(),
+            AuthState::Idle | AuthState::Starting { .. } => Vec::new(),
+        }
+    }
+
     /// `i`: pre-flight the highlighted row, or say why not.
     ///
     /// Every refusal is a sentence with the row's own name in it, and every one of them is reached
@@ -206,6 +690,15 @@ impl AgentsSection {
     fn begin_install(&mut self, ctx: &mut Ctx<'_>) {
         if self.install_in_flight() {
             ctx.emit(Action::Error("an install is already running".to_owned()));
+            return;
+        }
+        // Before the probe check and for the probe check's reason: a login ends by re-probing and
+        // writing the same `agent_box` row, and an install beside it would race it for that row
+        // (MOD-21 D19).
+        if self.auth_in_flight() {
+            ctx.emit(Action::Error(
+                "a login is running; install afterwards".to_owned(),
+            ));
             return;
         }
         if self.probing {
@@ -335,6 +828,11 @@ impl AgentsSection {
         if let Some(cell) = self.install_cell(summary.agent.id) {
             return cell;
         }
+        // Beside the install and for its reason: a login this section is running is the one thing
+        // on screen the user is waiting on, and it outlasts every other answer here.
+        if let Some(cell) = self.auth_cell(summary.agent.id) {
+            return cell;
+        }
         if self.probing {
             return PROBING.to_owned();
         }
@@ -384,6 +882,9 @@ impl AgentsSection {
     /// One line longer than what it is a pane *of*, in both cases that have one: a blank line
     /// separates a consent from the table it covers, and a failure's own sentence heads the steps
     /// it made necessary.
+    /// An install pane wins over a login one: the two cannot be *in flight* together (each refuses
+    /// while the other is), and the one state that can outlive its action — `Manual` — is a failure
+    /// the user still has to read and dismiss.
     fn pane(&self, theme: &Theme) -> Vec<Line<'static>> {
         match &self.install {
             InstallState::Pending { plan } => core::iter::once(Line::default())
@@ -403,14 +904,20 @@ impl AgentsSection {
                     )
                     .collect()
             }
-            _ => Vec::new(),
+            _ => self.auth_pane(theme),
         }
     }
 
     /// The one line under the pane: which keys mean something here, and the last outcome.
     fn hint(&self) -> String {
         let keys = match &self.install {
-            InstallState::Idle => HINT_IDLE,
+            // With no install in flight the login owns the line, because it is the only other
+            // thing here that binds keys of its own.
+            InstallState::Idle => match &self.auth {
+                AuthState::Idle => HINT_IDLE,
+                AuthState::Choosing { .. } => HINT_CHOOSING,
+                AuthState::Starting { .. } | AuthState::Running { .. } => HINT_AUTH_RUNNING,
+            },
             // A pre-flight is one registry read and one `HEAD`, so this is usually gone before it
             // is read — but `x` is offered here too, because a plan task that ends without a frame
             // would otherwise leave no way out of this state (review finding, MOD-20 T8).
@@ -509,9 +1016,15 @@ impl SettingsSection for AgentsSection {
         if matches!(self.install, InstallState::Pending { .. }) {
             return self.answer_consent(key, ctx);
         }
-        // `i`, `j`, `k`, `x` and `r` are free: the global table binds `q`, `?`, the digits,
-        // `ctrl-c` and `-`, and the tab itself consumes `h`/`l`/`[`/`]`/arrows before a section is
-        // offered the key.
+        // Then a method list, for the same reason and with the same limit (MOD-21 D20): the
+        // adapter is spawned and waiting on an answer, and `j`/`k` mean the list rather than the
+        // table for as long as it is up.
+        if matches!(self.auth, AuthState::Choosing { .. }) {
+            return self.answer_chooser(key, ctx);
+        }
+        // `a`, `i`, `j`, `k`, `o`, `x` and `r` are free: the global table binds `q`, `?`, the
+        // digits, `ctrl-c` and `-`, and the tab itself consumes `h`/`l`/`[`/`]`/arrows before a
+        // section is offered the key.
         match key.code {
             KeyCode::Char('j') => {
                 self.move_cursor(true);
@@ -523,6 +1036,16 @@ impl SettingsSection for AgentsSection {
             }
             KeyCode::Char('i') => {
                 self.begin_install(ctx);
+                Handled::Consumed
+            }
+            KeyCode::Char('a') => {
+                self.begin_auth(ctx);
+                Handled::Consumed
+            }
+            // `o` is bound only while a flow is running: it is otherwise a free letter, and a
+            // section that swallowed it everywhere would be claiming a key it does nothing with.
+            KeyCode::Char('o') if self.auth_in_flight() => {
+                self.open_link(ctx);
                 Handled::Consumed
             }
             // `x` cancels a running install **and** a pre-flight. Planning is one `GET` and one
@@ -543,6 +1066,12 @@ impl SettingsSection for AgentsSection {
                 ctx.request(StoreRequest::InstallCancel);
                 Handled::Consumed
             }
+            // The same key for the other stream: `x` stops a login wherever it has got to, and the
+            // cell reads `cancelling…` until the flow's own last frame says it stopped.
+            KeyCode::Char('x') if self.auth_in_flight() => {
+                self.begin_auth_cancel(ctx);
+                Handled::Consumed
+            }
             KeyCode::Esc if matches!(self.install, InstallState::Manual { .. }) => {
                 self.install = InstallState::Idle;
                 Handled::Consumed
@@ -554,6 +1083,11 @@ impl SettingsSection for AgentsSection {
                 ctx.emit(Action::Error(
                     "an install is running; probe afterwards".to_owned(),
                 ));
+                Handled::Consumed
+            }
+            // And the same for a login, which ends by re-probing the very row `r` would re-probe.
+            KeyCode::Char('r') if self.auth_in_flight() => {
+                self.refuse_during_login(key, ctx);
                 Handled::Consumed
             }
             KeyCode::Char('r') if !self.probing => {
@@ -581,6 +1115,7 @@ impl SettingsSection for AgentsSection {
                 self.clamp_cursor();
             }
             StoreReply::Install(frame) => self.on_install_frame(frame, ctx),
+            StoreReply::Auth(frame) => self.on_auth_frame(frame, ctx),
             // The shell has already put the message on the status line (`App::update`), so the
             // section's whole job here is to stop saying a probe is running.
             StoreReply::Failed { request, .. } if *request == "probe_agents" => {
@@ -596,6 +1131,18 @@ impl SettingsSection for AgentsSection {
             {
                 self.install = InstallState::Idle;
             }
+            // Hazard H-22, the first of the two `Failed`s: a **request** of the flow was refused,
+            // so the flow this section thought it had is not there. The shell owns the sentence;
+            // all this section owes is a state a second `a` can start from.
+            StoreReply::Failed { request, .. }
+                if matches!(*request, "auth_start" | "auth_choose" | "auth_cancel") =>
+            {
+                self.auth = AuthState::Idle;
+            }
+            // And the exception that makes the rule worth writing: a refused `auth_open` is one
+            // request answered no, not the end of a login. The pane stays exactly as it was, and
+            // the link is still there to try again with.
+            StoreReply::Failed { request, .. } if *request == "auth_open" => {}
             // `agent` is mirrored since MOD-2 milestone 4 (plan D31), so an offline backend
             // answers this read from the mirror; `agent_box` is not, which is why every offline
             // row's `on this box` column reads `not probed`. A refusal is therefore a store that
@@ -706,7 +1253,7 @@ fn entry_id(dir: &Path) -> String {
 }
 
 /// The first line of a probe's failure text, or the status when it produced none.
-fn first_line(tail: Option<&[String]>, status: htui_agent::probe::ProbeStatus) -> String {
+fn first_line(tail: Option<&[String]>, status: ProbeStatus) -> String {
     tail.and_then(<[String]>::first)
         .cloned()
         .unwrap_or_else(|| status.to_string())

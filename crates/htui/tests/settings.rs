@@ -6,12 +6,14 @@
 
 use htui::app::{Action, Ctx, Emit, Handled, TopBarState};
 use htui::keymap::{KeyChord, Keymap};
-use htui::store_worker::{InstallFrame, Origin, StoreReply, StoreRequest};
+use htui::store_worker::{AuthFrame, InstallFrame, Origin, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{AgentsSection, SectionId, SettingsSection, SettingsTab, message};
+use htui_agent::acp::Handshake;
+use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::InstallRecord;
-use htui_agent::probe::ProbeStatus;
+use htui_agent::probe::{CredentialTier, ProbeSnapshot, ProbeSource, ProbeStatus};
 use htui_agent::{ArchiveFormat, InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
 use htui_core::model::{
     Agent, AgentBox, AgentId, AgentSummary, Billing, BoxId, ProjectRef, Scope, Transport,
@@ -994,6 +996,11 @@ async fn a_failed_install_with_manual_steps_renders_them_under_the_table() {
 }
 
 /// A failure the user cannot route around is one sentence on the hint line, not a pane.
+///
+/// The sentence is shorter than MOD-20 wrote it: the idle hint gained `a authenticate` (MOD-21
+/// D20) and the hint row is one line of the 100-column frame, so a notice and the keys share it.
+/// What this case is about is that a failure with no steps *is* a notice, and a fixture long enough
+/// to be clipped at the frame's edge would be asserting the width rather than the routing.
 #[tokio::test]
 async fn a_failure_without_manual_steps_is_a_notice() {
     let bench = Bench::new().await;
@@ -1012,13 +1019,13 @@ async fn a_failure_without_manual_steps_is_a_notice() {
     bench.reply(
         &mut section,
         &StoreReply::Install(InstallFrame::Failed {
-            message: "the archive is refused: an entry escapes the tree".to_owned(),
+            message: "the archive is refused: an entry escapes".to_owned(),
             manual: None,
         }),
     );
     let rendered = render_section(&section, &bench.ctx());
     assert!(
-        rendered.contains("the archive is refused: an entry escapes the tree"),
+        rendered.contains("the archive is refused: an entry escapes"),
         "{rendered}"
     );
     assert!(
@@ -1177,4 +1184,805 @@ fn probed_box(agent_id: AgentId) -> AgentBox {
         updated_at: htui_core::fixtures::demo_at(0, 0),
         probe: Some(json!({ "status": "ready", "source": "probe" })),
     }
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-21 T7: `a`, the chooser and the login stream (plan D20, blueprint B.10)
+// -------------------------------------------------------------------------------------------
+
+/// The method id the chooser is fed with, and the one `Enter` sends back.
+///
+/// Made up, like every other id in this file (`R-AGT-5`): the chooser is fed by the agent's own
+/// live `initialize` answer, so a case only ever needs *an* id and never a real one.
+const METHOD: &str = "m-one";
+
+/// A second one, so `j` has somewhere to go.
+const OTHER_METHOD: &str = "m-two";
+
+/// A registry row a login may be offered on: `acp`, probed, and advertising `auth_methods`.
+///
+/// Built through [`ProbeSnapshot`] rather than as hand-written JSON because the section reads it
+/// back through `ProbeSnapshot::from_row`: a case that spelled the document by hand would pass on
+/// a section that read a field the probe does not write.
+fn login_row(name: &str, status: ProbeStatus, auth_methods: &[&str]) -> AgentSummary {
+    let snapshot = ProbeSnapshot {
+        transport: Transport::Acp,
+        resolved: None,
+        tools: BTreeMap::new(),
+        handshake: Some(Handshake {
+            at: htui_core::fixtures::demo_at(0, 0),
+            protocol_version: 1,
+            agent_name: Some(name.to_owned()),
+            agent_version: Some("0.0.0".to_owned()),
+            capabilities: json!({}),
+            auth_methods: auth_methods.iter().map(|id| (*id).to_owned()).collect(),
+        }),
+        credential: Some(CredentialTier::Absent),
+        status,
+        stderr_tail: None,
+        source: ProbeSource::Probe,
+    };
+    probed_row(name, true, Some("1.1.1"), Some(snapshot.to_value()))
+}
+
+/// The error texts of one drain, without emptying the queue a second time.
+fn errors_of(emitted: &[Action]) -> Vec<String> {
+    emitted
+        .iter()
+        .filter_map(|action| match action {
+            Action::Error(message) => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a drain asked the store for anything at all.
+fn asked_anything(emitted: &[Action]) -> bool {
+    emitted
+        .iter()
+        .any(|action| matches!(action, Action::Store(_)))
+}
+
+/// The method list a live flow answers `AuthStart` with.
+fn methods_frame(logout: bool, hidden: usize) -> StoreReply {
+    StoreReply::Auth(AuthFrame::Methods {
+        methods: vec![
+            AuthMethodInfo {
+                id: METHOD.to_owned(),
+                name: "One".to_owned(),
+                description: Some("the first way in".to_owned()),
+            },
+            AuthMethodInfo {
+                id: OTHER_METHOD.to_owned(),
+                name: "Two".to_owned(),
+                description: None,
+            },
+        ],
+        logout,
+        hidden: (0..hidden)
+            .map(|n| AuthMethodInfo {
+                id: format!("t-{n}"),
+                name: format!("Terminal {n}"),
+                description: None,
+            })
+            .collect(),
+    })
+}
+
+/// A section with one row a login is offered on, already past `a` and past the method list.
+fn chooser_over(bench: &Bench, logout: bool, hidden: usize) -> AgentsSection {
+    let mut section = section_over(
+        bench,
+        vec![login_row(
+            "loginable",
+            ProbeStatus::Unauthenticated,
+            &[METHOD, OTHER_METHOD],
+        )],
+    );
+    bench.key(&mut section, "a");
+    bench.reply(&mut section, &methods_frame(logout, hidden));
+    let _ = bench.drained();
+    section
+}
+
+/// D10's predicate, read off the row before a request is spent: a `cli` row has no `authenticate`
+/// call at all, and the refusal names the row and its transport.
+#[tokio::test]
+async fn a_on_a_cli_row_is_refused_by_name_and_sends_nothing() {
+    let bench = Bench::new().await;
+    let mut row = login_row("cli-row", ProbeStatus::Unauthenticated, &[METHOD]);
+    row.agent.transport = Transport::Cli;
+    let mut section = section_over(&bench, vec![row]);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "a"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["`cli-row` is a `cli` agent; it has no `authenticate` call".to_owned()]
+    );
+    assert!(
+        !asked_anything(&emitted),
+        "the predicate is read from the row in hand: {emitted:?}"
+    );
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "cli-row"),
+        "unauthenticated",
+        "and the row is exactly where it was"
+    );
+}
+
+/// D7's stated cost: the *snapshot* decides whether `a` is offered, so a row nobody has probed has
+/// nothing to offer it from.
+#[tokio::test]
+async fn a_on_an_unprobed_row_says_probe_first() {
+    let bench = Bench::new().await;
+    let unprobed = probed_row("never-probed", true, None, None);
+    let mut section = section_over(&bench, vec![unprobed]);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "a"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["probe `never-probed` first".to_owned()]
+    );
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+}
+
+/// The same sentence for a row whose probe said something a login cannot start from: `missing` and
+/// `failed` are boxes that could not run the adapter at all, and a spawn would only say so again.
+#[tokio::test]
+async fn a_on_a_row_the_probe_could_not_run_says_probe_first() {
+    let bench = Bench::new().await;
+    let mut section = section_over(
+        &bench,
+        vec![login_row("broke", ProbeStatus::Failed, &[METHOD])],
+    );
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "a"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec!["probe `broke` first".to_owned()]);
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+}
+
+/// A probed row whose agent demands nothing is a row with no method to choose from, and the
+/// refusal says so in the row's own name rather than spawning to find out.
+#[tokio::test]
+async fn a_on_a_row_with_no_auth_methods_is_refused_by_name() {
+    let bench = Bench::new().await;
+    let mut section = section_over(
+        &bench,
+        vec![login_row("open-door", ProbeStatus::Ready, &[])],
+    );
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "a"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["`open-door` advertises no authentication methods".to_owned()]
+    );
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+}
+
+/// The three in-flight refusals and the empty table, each by its own sentence and each before a
+/// request is spent.
+#[tokio::test]
+async fn a_while_something_else_is_in_flight_is_refused_and_sends_nothing() {
+    let bench = Bench::new().await;
+    let mut empty = AgentsSection::new();
+    assert_eq!(bench.key(&mut empty, "a"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["no agent row is selected".to_owned()]
+    );
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+
+    // A probe in flight: the rows on screen do not answer the question the user just asked.
+    let mut probing = section_over(
+        &bench,
+        vec![login_row(
+            "loginable",
+            ProbeStatus::Unauthenticated,
+            &[METHOD],
+        )],
+    );
+    bench.key(&mut probing, "r");
+    let _ = bench.drained();
+    bench.key(&mut probing, "a");
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec!["a probe is running".to_owned()]);
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+
+    // An install in flight: both end by writing the same `agent_box` row (D19).
+    let mut installing = section_over(&bench, vec![registry_row("declared", true)]);
+    bench.key(&mut installing, "i");
+    let _ = bench.drained();
+    bench.key(&mut installing, "a");
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["an install is running".to_owned()]
+    );
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+
+    // A login in flight: the runtime allows one, and a second `a` is refused here rather than
+    // there so the first flow's pane is never replaced by a refusal.
+    let mut logging_in = section_over(
+        &bench,
+        vec![login_row(
+            "loginable",
+            ProbeStatus::Unauthenticated,
+            &[METHOD],
+        )],
+    );
+    bench.key(&mut logging_in, "a");
+    let _ = bench.drained();
+    bench.key(&mut logging_in, "a");
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["a login is already running".to_owned()]
+    );
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+}
+
+/// `a` on a row the probe left `unauthenticated` asks for the flow and says so in the cell.
+#[tokio::test]
+async fn a_on_an_unauthenticated_row_sends_auth_start_and_the_cell_reads_starting() {
+    let bench = Bench::new().await;
+    let row = login_row("loginable", ProbeStatus::Unauthenticated, &[METHOD]);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "a"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(emitted.len(), 1, "one request, no status line: {emitted:?}");
+    assert!(
+        matches!(
+            &emitted[0],
+            Action::Store(StoreRequest::AuthStart { agent_id: asked }) if *asked == agent_id
+        ),
+        "`a` logs the highlighted row in: {emitted:?}"
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(on_box_cell(&rendered, "loginable"), "starting\u{2026}");
+    assert!(
+        rendered.contains("o open link \u{b7} x cancel"),
+        "and the hint offers the keys a live flow binds: {rendered}"
+    );
+}
+
+/// `a` is offered on a `ready` row too: a box that is logged in is exactly the box that can only
+/// log *out*, and the chooser is where a logout lives (D20).
+#[tokio::test]
+async fn a_on_a_ready_row_that_advertises_methods_is_offered() {
+    let bench = Bench::new().await;
+    let mut section = section_over(
+        &bench,
+        vec![login_row("logged-in", ProbeStatus::Ready, &[METHOD])],
+    );
+    let _ = bench.drained();
+
+    bench.key(&mut section, "a");
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            &emitted[..],
+            [Action::Store(StoreRequest::AuthStart { .. })]
+        ),
+        "{emitted:?}"
+    );
+}
+
+/// The chooser is the agent's own words: every method's name and description, a logout row when it
+/// advertised one, and one dim line for what `htui` cannot offer (D4, D7).
+#[tokio::test]
+async fn a_methods_frame_renders_the_chooser_with_names_descriptions_logout_and_the_hidden_count() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, true, 2);
+
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("One \u{2014} the first way in"),
+        "a method with a description reads as one line: {rendered}"
+    );
+    assert!(
+        rendered.contains("Two"),
+        "and one without still reads as its name: {rendered}"
+    );
+    assert!(
+        !rendered.contains(METHOD),
+        "the id is what is sent, never what is shown: {rendered}"
+    );
+    assert!(
+        rendered.contains("log out"),
+        "the agent advertised a logout verb: {rendered}"
+    );
+    assert!(
+        rendered.contains("2 method(s) need a terminal htui does not provide"),
+        "and the terminal-typed ones are named as missing, not offered: {rendered}"
+    );
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        "choose a method",
+        "the cell says what the pane is waiting for"
+    );
+    assert!(
+        rendered.contains("j/k choose \u{b7} Enter select \u{b7} Esc cancel"),
+        "and the hint says which keys answer it: {rendered}"
+    );
+
+    // Nothing was advertised, nothing is offered: no logout row and no hidden line.
+    let bare = chooser_over(&bench, false, 0);
+    let rendered = render_section(&bare, &bench.ctx());
+    assert!(!rendered.contains("log out"), "{rendered}");
+    assert!(!rendered.contains("need a terminal"), "{rendered}");
+    let _ = &mut section;
+}
+
+/// `j`/`k` move over the methods and the logout row, and `Enter` sends what the cursor is on.
+///
+/// `Enter` rather than a digit: the digits are the shell's tab switches (MOD-20's review finding),
+/// and a pane that bound them would take the user's way out of the section with it.
+#[tokio::test]
+async fn j_k_and_enter_choose_and_send_the_choice() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, true, 0);
+
+    assert!(
+        accented_lines(&section, &bench.ctx())
+            .iter()
+            .any(|line| line.starts_with("One")),
+        "the cursor starts on the agent's first method"
+    );
+    assert_eq!(bench.key(&mut section, "j"), Handled::Consumed);
+    assert!(
+        accented_lines(&section, &bench.ctx())
+            .iter()
+            .any(|line| line.starts_with("Two")),
+        "`j` moves down the live list"
+    );
+    assert_eq!(bench.key(&mut section, "k"), Handled::Consumed);
+    assert!(
+        accented_lines(&section, &bench.ctx())
+            .iter()
+            .any(|line| line.starts_with("One")),
+        "`k` moves back"
+    );
+
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            &emitted[..],
+            [Action::Store(StoreRequest::AuthChoose {
+                choice: AuthChoice::Method(id)
+            })] if id == METHOD
+        ),
+        "`Enter` sends the id the agent gave, for the row the cursor is on: {emitted:?}"
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(on_box_cell(&rendered, "loginable"), "logging in\u{2026}");
+    assert!(
+        !rendered.contains("the first way in"),
+        "the chooser is gone: {rendered}"
+    );
+
+    // The last row is the logout the agent advertised, and it is a different call.
+    let mut section = chooser_over(&bench, true, 0);
+    for _ in 0..5 {
+        bench.key(&mut section, "j");
+    }
+    assert!(
+        accented_lines(&section, &bench.ctx())
+            .iter()
+            .any(|line| line.starts_with("log out")),
+        "the cursor stops on the last row rather than wrapping"
+    );
+    bench.key(&mut section, "Enter");
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            &emitted[..],
+            [Action::Store(StoreRequest::AuthChoose {
+                choice: AuthChoice::Logout
+            })]
+        ),
+        "{emitted:?}"
+    );
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
+        "logging out\u{2026}"
+    );
+}
+
+/// `Esc` (and `n`) in the chooser stop the flow rather than closing the pane behind its back: the
+/// adapter is already spawned and only the runtime can kill it.
+#[tokio::test]
+async fn esc_in_the_chooser_cancels() {
+    let bench = Bench::new().await;
+    for chord in ["Esc", "n"] {
+        let mut section = chooser_over(&bench, true, 0);
+        assert_eq!(bench.key(&mut section, chord), Handled::Consumed);
+        let emitted = bench.drained();
+        assert!(
+            matches!(&emitted[..], [Action::Store(StoreRequest::AuthCancel)]),
+            "`{chord}` asks the runtime to stop the flow: {emitted:?}"
+        );
+        let rendered = render_section(&section, &bench.ctx());
+        assert_eq!(
+            on_box_cell(&rendered, "loginable"),
+            "cancelling\u{2026}",
+            "and the cell says so until the flow's own last frame: {rendered}"
+        );
+        assert!(
+            !rendered.contains("the first way in"),
+            "the chooser is closed: {rendered}"
+        );
+    }
+}
+
+/// The MOD-20 review rule, applied to the second pane this section grew: the digits are tab
+/// switches and `q`/`?` are global, so a chooser that consumed them would take the user's way out
+/// of the application with it.
+#[tokio::test]
+async fn digits_and_q_pass_through_the_chooser() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, true, 1);
+
+    for chord in ["1", "2", "9", "q", "?", "g"] {
+        assert_eq!(
+            bench.key(&mut section, chord),
+            Handled::Pass,
+            "`{chord}` belongs to the global table and must still reach it"
+        );
+    }
+    assert!(
+        bench.drained().is_empty(),
+        "and none of them asks anything of the store"
+    );
+    assert!(
+        render_section(&section, &bench.ctx()).contains("the first way in"),
+        "the chooser is still up"
+    );
+}
+
+/// The stream pane: the last six stderr lines as the adapter wrote them, and the link it printed.
+#[tokio::test]
+async fn line_and_url_frames_render_the_last_six_lines_and_the_link() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, false, 0);
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+
+    for n in 0..8 {
+        bench.reply(
+            &mut section,
+            &StoreReply::Auth(AuthFrame::Line(format!("line {n}"))),
+        );
+    }
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Url("https://h.invalid/o?a=1".to_owned())),
+    );
+
+    let rendered = render_section(&section, &bench.ctx());
+    for gone in ["line 0", "line 1"] {
+        assert!(
+            !rendered.contains(gone),
+            "only the last six lines are on screen: {rendered}"
+        );
+    }
+    for kept in ["line 2", "line 3", "line 4", "line 5", "line 6", "line 7"] {
+        assert!(
+            rendered.contains(kept),
+            "{kept} is one of the last six: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("link: https://h.invalid/o?a=1"),
+        "and the link the adapter printed is on screen to open: {rendered}"
+    );
+}
+
+/// `o` opens the link the pane is showing, and says so when there is none: `htui` never invents a
+/// URL, it forwards the one the adapter wrote.
+#[tokio::test]
+async fn o_sends_auth_open_with_the_last_url_and_is_refused_without_one() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, false, 0);
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "o"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec!["no link yet".to_owned()]);
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Url("https://h.invalid/first".to_owned())),
+    );
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Url("https://h.invalid/second".to_owned())),
+    );
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "o"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            &emitted[..],
+            [Action::Store(StoreRequest::AuthOpen { url })] if url == "https://h.invalid/second"
+        ),
+        "the newest link is the one the pane is showing: {emitted:?}"
+    );
+
+    // The opener answers at its own `seq` and says only that it was spawned (D17).
+    bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Opened));
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains("link opened"), "{rendered}");
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        "logging in\u{2026}",
+        "and the flow is untouched by it"
+    );
+}
+
+/// `x` stops a live login, and a refused `auth_open` does **not** stop it (hazard H-22): the two
+/// `Failed`s in this codebase mean different things and the section renders them differently.
+#[tokio::test]
+async fn x_sends_auth_cancel_and_the_cell_reads_cancelling() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, false, 0);
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "x"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert!(
+        matches!(&emitted[..], [Action::Store(StoreRequest::AuthCancel)]),
+        "{emitted:?}"
+    );
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
+        "cancelling\u{2026}"
+    );
+
+    bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelled));
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains("login cancelled"), "{rendered}");
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        "unauthenticated",
+        "and the row goes back to what the probe last said about it: {rendered}"
+    );
+}
+
+/// A refused `auth_open` leaves the running flow exactly where it was (hazard H-22).
+#[tokio::test]
+async fn a_refused_open_keeps_the_pane_and_a_refused_start_clears_it() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, false, 0);
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "auth_open",
+            message: "only http and https links are opened".to_owned(),
+        },
+    );
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
+        "logging in\u{2026}",
+        "a refused open is one request, not the end of the flow"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "auth_choose",
+            message: "no login is running".to_owned(),
+        },
+    );
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
+        "unauthenticated",
+        "a refused request of the flow itself leaves a state a second `a` can start from"
+    );
+}
+
+/// `R-AGT-6` at the section: `Done` is not a status, it is the cue to read the registry again.
+#[tokio::test]
+async fn done_clears_the_state_notes_the_status_and_re_reads_the_registry() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, true, 0);
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Done {
+            call: AuthCall::Authenticate(METHOD.to_owned()),
+            status: ProbeStatus::Ready,
+        }),
+    );
+    let emitted = bench.drained();
+    assert!(
+        matches!(&emitted[..], [Action::Store(StoreRequest::Agents)]),
+        "the probe is the authority, so the section re-reads what the flow wrote: {emitted:?}"
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains("logged in: ready"), "{rendered}");
+    assert!(
+        rendered.contains("a authenticate"),
+        "and the section is idle again: {rendered}"
+    );
+
+    // A logout is the same stream and the other sentence.
+    let mut section = chooser_over(&bench, true, 0);
+    for _ in 0..5 {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Done {
+            call: AuthCall::Logout,
+            status: ProbeStatus::Unauthenticated,
+        }),
+    );
+    assert!(
+        render_section(&section, &bench.ctx()).contains("logged out: unauthenticated"),
+        "a logout says which way it went"
+    );
+}
+
+/// D5: the agent's own sentence, verbatim. It is the one line that says what the user has to do.
+#[tokio::test]
+async fn refused_shows_the_agents_sentence() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, false, 0);
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Refused {
+            message: "the FIXTURE_KEY variable must be set where this server is launched from"
+                .to_owned(),
+        }),
+    );
+    let emitted = bench.drained();
+    assert!(
+        !asked_anything(&emitted),
+        "a refusal wrote nothing, so there is nothing to re-read: {emitted:?}"
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("FIXTURE_KEY variable must be set"),
+        "the agent's own words: {rendered}"
+    );
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        "unauthenticated",
+        "and the flow is over"
+    );
+}
+
+/// Hazard H-7: a `StoreReply::Agents` from a scope change mid-login must not clear the flow.
+///
+/// The one the browser round trip makes expensive: the adapter is spawned, a human is part-way
+/// through an OAuth page, and a section that reset here would leave that child with no key on
+/// screen to cancel it with.
+#[tokio::test]
+async fn an_agents_reply_during_a_login_does_not_clear_the_state() {
+    let bench = Bench::new().await;
+    let row = login_row("loginable", ProbeStatus::Unauthenticated, &[METHOD]);
+    let mut section = section_over(&bench, vec![row.clone()]);
+    bench.key(&mut section, "a");
+    bench.reply(&mut section, &methods_frame(false, 0));
+    bench.key(&mut section, "Enter");
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Url("https://h.invalid/o".to_owned())),
+    );
+    let _ = bench.drained();
+
+    bench.reply(&mut section, &StoreReply::Agents(vec![row]));
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        "logging in\u{2026}",
+        "the flow is still running and still says so: {rendered}"
+    );
+    assert!(
+        rendered.contains("link: https://h.invalid/o"),
+        "its link is still on screen: {rendered}"
+    );
+    assert!(
+        rendered.contains("o open link \u{b7} x cancel"),
+        "and it can still be stopped: {rendered}"
+    );
+}
+
+/// `r` and `i` while a login runs: the flow ends by re-probing and writing the same `agent_box`
+/// row, and either of the other two would be racing it for that row (D19).
+#[tokio::test]
+async fn r_and_i_are_refused_while_a_login_runs() {
+    let bench = Bench::new().await;
+    let mut section = section_over(
+        &bench,
+        vec![login_row(
+            "loginable",
+            ProbeStatus::Unauthenticated,
+            &[METHOD],
+        )],
+    );
+    bench.key(&mut section, "a");
+    let _ = bench.drained();
+
+    for (chord, expected) in [
+        ("r", "a login is running; probe afterwards"),
+        ("i", "a login is running; install afterwards"),
+    ] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Consumed);
+        let emitted = bench.drained();
+        assert_eq!(errors_of(&emitted), vec![expected.to_owned()]);
+        assert!(!asked_anything(&emitted), "{emitted:?}");
+    }
+
+    // And from inside the chooser, where the same two keys are the pane's to swallow.
+    bench.reply(&mut section, &methods_frame(false, 0));
+    let _ = bench.drained();
+    for (chord, expected) in [
+        ("r", "a login is running; probe afterwards"),
+        ("i", "a login is running; install afterwards"),
+    ] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Consumed);
+        assert_eq!(errors_of(&bench.drained()), vec![expected.to_owned()]);
+    }
+}
+
+/// The two frames a flow can die with, each on the hint line and each leaving the section idle.
+#[tokio::test]
+async fn a_failed_or_idle_flow_leaves_a_notice_and_an_idle_section() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, false, 0);
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Failed {
+            message: "`/bin/sh`: No such file or directory".to_owned(),
+        }),
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains("No such file or directory"), "{rendered}");
+    assert!(rendered.contains("a authenticate"), "{rendered}");
+
+    let mut section = chooser_over(&bench, false, 0);
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Idle {
+            after: std::time::Duration::from_secs(600),
+        }),
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("no activity for 600s; login cancelled"),
+        "the notice says what happened rather than implying the user did it: {rendered}"
+    );
+    assert!(rendered.contains("a authenticate"), "{rendered}");
 }
