@@ -5,14 +5,25 @@
 //! lands them as `htui_core::model::agent::seed_rows`, and task 9's `tests/extensibility.rs`
 //! asserts that *those* rows deserialise into the same types — this file pins the shape before
 //! either exists, which is what makes the seed a test subject rather than a source of truth.
+//!
+//! Since MOD-21 (plan D14) the file also carries the stderr tap's cases at the bottom: a login flow
+//! needs the child's stderr *as it happens*, and what the tap must not cost is the bounded tail two
+//! review gates hardened. Those cases are `cfg(unix)` per item, as `tests/acp_driver.rs` gates its
+//! own, because their fixture is `/bin/sh`.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use htui_agent::DriverError;
 use htui_agent::launch::{
     AgentLaunch, AgentSettings, Discovery, Install, InstallSource, QuotaSource, ToolMap, ToolProbe,
     resolve,
 };
+#[cfg(unix)]
+use htui_agent::launch::{ResolvedLaunch, Spawned};
+#[cfg(unix)]
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// `claude`'s launch row (ANA-4 §5.3), byte for byte.
 const CLAUDE_LAUNCH: &str = r#"{
@@ -499,5 +510,236 @@ async fn spawn_runs_the_resolved_command_under_supervision() {
     assert!(
         !spawned.job_object,
         "job objects are a Windows mechanism; unix supervises with a process group"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The stderr tap (plan MOD-21 D14)
+// ---------------------------------------------------------------------------------------------
+
+/// `STDERR_TAIL_LINES` as `launch.rs` sets it. Named here because the constant is private and
+/// these cases are the ones that pin it: a tap must not change what the tail keeps.
+#[cfg(unix)]
+const TAIL_LINES: usize = 64;
+
+/// How long a case waits for a line that should already be on its way.
+///
+/// Never spent — the writer is a shell one process away — it is only the distance between "the tap
+/// dropped a line" and a suite that hangs instead of saying so.
+#[cfg(unix)]
+const PATIENCE: Duration = Duration::from_secs(10);
+
+/// Starts `/bin/sh -c <script>` under [`htui_agent::launch::spawn`], with piped stdio.
+///
+/// `sh -c` rather than a fixture file: a shell script written and executed by the same test process
+/// races the `ETXTBSY` window `tests/probe.rs:70-92` documents, and the way that file's own
+/// streaming case sidesteps it is to have no file at all (`tests/probe.rs:1042`).
+#[cfg(unix)]
+async fn spawn_sh(script: &str, cwd: &std::path::Path) -> Spawned {
+    let launch = ResolvedLaunch {
+        command: "/bin/sh".to_owned(),
+        args: vec!["-c".to_owned(), script.to_owned()],
+        env: BTreeMap::new(),
+    };
+    htui_agent::launch::spawn(&launch, cwd)
+        .await
+        .expect("the shell fixture starts")
+}
+
+/// A shell condition that blocks until `path` exists, so a case is late by *fact* rather than by
+/// hoping a sleep was long enough.
+#[cfg(unix)]
+fn wait_for(path: &std::path::Path) -> String {
+    format!("while [ ! -f {} ]; do sleep 0.01; done; ", path.display())
+}
+
+/// Writes the file [`wait_for`] blocks on.
+#[cfg(unix)]
+fn go_ahead(path: &std::path::Path) {
+    std::fs::write(path, "").expect("the fixture's go-ahead is written");
+}
+
+/// Blocks until the tail holds `lines` lines, or fails.
+///
+/// The reader is a task, so "the child wrote it" and "the tail has it" are two moments; every
+/// assertion about the tail's *contents* needs the second one, and a child that has exited is not
+/// on its own evidence the task has drained the pipe.
+#[cfg(unix)]
+async fn tail_reaches(spawned: &Spawned, lines: usize) {
+    let deadline = Instant::now() + PATIENCE;
+    while spawned.stderr_tail().len() < lines {
+        assert!(
+            Instant::now() < deadline,
+            "the tail never reached {lines} lines; it holds {:?}",
+            spawned.stderr_tail()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The tap's next line, or `None` when the tap has ended — under [`PATIENCE`], so a lost line is a
+/// named failure rather than a hung suite.
+#[cfg(unix)]
+async fn next_line(tap: &mut UnboundedReceiver<String>) -> Option<String> {
+    tokio::time::timeout(PATIENCE, tap.recv())
+        .await
+        .expect("the tap answered inside the patience window")
+}
+
+/// Every line the tap yields until it ends.
+#[cfg(unix)]
+async fn drain(tap: &mut UnboundedReceiver<String>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(line) = next_line(tap).await {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Plan D14: the tap is a *stream*, and `stderr_tail()` is not — 64 lines is a bound, not a cursor,
+/// so a flow that polled it would have no way to say which lines it had already seen.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tap_receives_every_stderr_line_in_order() {
+    let tmp = tempfile::tempdir().expect("a temp working directory");
+    let mut spawned = spawn_sh(
+        "echo a >&2; sleep 0.05; echo b >&2; sleep 0.05; echo c >&2",
+        tmp.path(),
+    )
+    .await;
+
+    let mut tap = spawned.tap_stderr();
+    let lines = drain(&mut tap).await;
+    let status = spawned.wait().await.expect("the child exits");
+
+    assert!(status.success(), "the fixture exits 0, got {status:?}");
+    assert_eq!(
+        lines,
+        ["a", "b", "c"],
+        "the tap carries every line in the order the child wrote it"
+    );
+}
+
+/// Plan D14, the reason the replay happens under the reader's own lock: a URL can be printed during
+/// `initialize`, before the caller has finished wiring the flow, and a tap that started at "now"
+/// would have lost it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tap_installed_late_replays_the_tail_first_then_streams() {
+    let tmp = tempfile::tempdir().expect("a temp working directory");
+    let go = tmp.path().join("go");
+    let script = format!(
+        "echo one >&2; echo two >&2; {}echo three >&2",
+        wait_for(&go)
+    );
+    let mut spawned = spawn_sh(&script, tmp.path()).await;
+
+    // Late by fact: both lines are in the tail before the tap exists.
+    tail_reaches(&spawned, 2).await;
+    let mut tap = spawned.tap_stderr();
+    go_ahead(&go);
+
+    let lines = drain(&mut tap).await;
+    spawned.wait().await.expect("the child exits");
+
+    assert_eq!(
+        lines,
+        ["one", "two", "three"],
+        "the lines already in the tail are replayed first and the stream continues from there, \
+         each line exactly once — nothing lost to tapping late, nothing delivered twice"
+    );
+}
+
+/// The tail is what `probe.stderr_tail` records and what a failed handshake is explained with; a
+/// caller that taps must not be draining it (`launch.rs`'s two review gates).
+#[cfg(unix)]
+#[tokio::test]
+async fn the_tail_is_unchanged_by_a_tap() {
+    let tmp = tempfile::tempdir().expect("a temp working directory");
+    const SCRIPT: &str = "seq 1 70 >&2";
+    let expected: Vec<String> = (7..=70).map(|line| line.to_string()).collect();
+
+    let mut tapped = spawn_sh(SCRIPT, tmp.path()).await;
+    let mut tap = tapped.tap_stderr();
+    drop(drain(&mut tap).await);
+    tapped.wait().await.expect("the tapped child exits");
+
+    let mut untapped = spawn_sh(SCRIPT, tmp.path()).await;
+    untapped.wait().await.expect("the untapped child exits");
+    tail_reaches(&untapped, TAIL_LINES).await;
+
+    assert_eq!(
+        untapped.stderr_tail(),
+        expected,
+        "the control: 70 lines in, the last {TAIL_LINES} kept"
+    );
+    assert_eq!(
+        tapped.stderr_tail(),
+        untapped.stderr_tail(),
+        "a tap neither drains the tail nor changes its cap: the same child observed twice leaves \
+         the same tail"
+    );
+}
+
+/// The cap is the tail's, not the tap's: a login that printed more than [`TAIL_LINES`] lines before
+/// the one that mattered would otherwise lose them, which is the whole reason polling the tail is
+/// not the design.
+#[cfg(unix)]
+#[tokio::test]
+async fn past_sixty_four_lines_the_tap_has_them_all_and_the_tail_the_last_sixty_four() {
+    let tmp = tempfile::tempdir().expect("a temp working directory");
+    let go = tmp.path().join("go");
+    // The child writes nothing until the tap is installed, so "the tap has them all" is an
+    // assertion about the tap and not about how fast this box scheduled the reader task.
+    let script = format!("{}seq 1 100 >&2", wait_for(&go));
+    let mut spawned = spawn_sh(&script, tmp.path()).await;
+
+    let mut tap = spawned.tap_stderr();
+    go_ahead(&go);
+    let lines = drain(&mut tap).await;
+    spawned.wait().await.expect("the child exits");
+
+    let all: Vec<String> = (1..=100).map(|line| line.to_string()).collect();
+    assert_eq!(lines, all, "the tap drops nothing at the tail's bound");
+    assert_eq!(
+        spawned.stderr_tail(),
+        all[all.len() - TAIL_LINES..],
+        "and the tail keeps its {TAIL_LINES}-line bound whatever the tap holds"
+    );
+}
+
+/// One tap per child (plan D14). A second `tap_stderr` is the newer caller's, and the older
+/// receiver ends rather than silently going quiet.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_second_tap_replaces_the_first() {
+    let tmp = tempfile::tempdir().expect("a temp working directory");
+    let go = tmp.path().join("go");
+    let script = format!("echo first >&2; {}echo second >&2", wait_for(&go));
+    let mut spawned = spawn_sh(&script, tmp.path()).await;
+
+    let mut first = spawned.tap_stderr();
+    assert_eq!(
+        next_line(&mut first).await.as_deref(),
+        Some("first"),
+        "the first tap is a tap like any other while it is the installed one"
+    );
+
+    let mut second = spawned.tap_stderr();
+    assert_eq!(
+        next_line(&mut first).await,
+        None,
+        "installing a tap ends the one it replaced, so the displaced reader is told rather than \
+         left waiting on a channel nothing writes to"
+    );
+
+    go_ahead(&go);
+    let lines = drain(&mut second).await;
+    spawned.wait().await.expect("the child exits");
+
+    assert_eq!(
+        lines,
+        ["first", "second"],
+        "the replacement is a late tap like any other: the tail first, then the stream"
     );
 }

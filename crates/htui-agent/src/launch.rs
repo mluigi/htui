@@ -20,6 +20,7 @@ use agent_client_protocol::AcpAgentConfig;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::mpsc;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::warn;
 
@@ -40,8 +41,12 @@ pub const STDOUT_LIMIT: usize = 64 * 1024;
 
 /// `CREATE_NO_WINDOW`: a TUI must not flash a console window when it spawns an agent
 /// (ANA-4 §4.6). Named here rather than imported so the constant reads the same on every platform.
+///
+/// `pub(crate)` since MOD-21: the login flow's URL opener spawns a second Windows process
+/// (`auth::browser`, plan D17) and has the same rule to obey, and a second literal `0x0800_0000`
+/// somewhere else in the crate is a constant that can drift from this one.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Per-box tool paths, keyed by the `${name}` a launch row writes.
 ///
@@ -519,13 +524,33 @@ fn substitute(input: &str, tools: &ToolMap) -> Result<String> {
 // Spawn
 // ---------------------------------------------------------------------------------------------
 
+/// The child's stderr as [`spawn`] keeps it: a bounded tail and, when a caller asked for one, a
+/// live tap.
+///
+/// One struct behind one lock rather than a deque and an `Option<Sender>` behind two (plan MOD-21
+/// D14, blueprint P-9). Two locks would be two orders to take them in, and the *point* of the tap
+/// is that installing it and appending to the tail are one atomic step: a replay that ran outside
+/// the reader's lock would either miss a line written between the copy and the install, or deliver
+/// it twice.
+#[derive(Debug, Default)]
+struct StderrTail {
+    /// The last [`STDERR_TAIL_LINES`] lines, oldest first.
+    lines: VecDeque<String>,
+    /// Where each line also goes, while a caller holds a tap.
+    tap: Option<mpsc::UnboundedSender<String>>,
+    /// Whether the reader task has seen end-of-stream. A tap installed after that has a tail to
+    /// replay but nothing left to stream, so it is handed the replay and then closed rather than
+    /// left waiting on a sender no task still holds.
+    ended: bool,
+}
+
 /// A running agent process and the handles a transport talks to it through.
 #[derive(Debug)]
 pub struct Spawned {
     child: Box<dyn process_wrap::tokio::ChildWrapper>,
     stdin: Option<Compat<ChildStdin>>,
     stdout: Option<Compat<ChildStdout>>,
-    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    stderr_tail: Arc<Mutex<StderrTail>>,
     /// Whether the child was assigned to a Windows job object.
     ///
     /// Always `false` on unix, where the child is a process-group leader instead. On Windows a
@@ -563,8 +588,39 @@ impl Spawned {
     pub fn stderr_tail(&self) -> Vec<String> {
         self.stderr_tail
             .lock()
-            .map(|tail| tail.iter().cloned().collect())
+            .map(|tail| tail.lines.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Every stderr line from now on — and first, **replayed under the same lock the reader
+    /// holds**, every line already in the tail, so tapping after [`spawn`] loses and duplicates
+    /// nothing (plan MOD-21 D14: a login URL can be printed during `initialize`, before the caller
+    /// that wants it has finished wiring itself up). Lines only, lossy UTF-8, exactly as the tail.
+    ///
+    /// **One tap per child.** A second call replaces the first, whose receiver then ends; the
+    /// replacement replays the tail like any other late tap. A receiver dropped by its caller
+    /// uninstalls the tap on the next line, so a chatty child stops paying for it.
+    ///
+    /// The tail is untouched by any of this: it keeps its 64-line bound and its
+    /// contents whatever the tap holds, because [`stderr_tail`](Self::stderr_tail) is what a failed
+    /// handshake is explained with and a tap must not be draining it.
+    ///
+    /// The receiver ends when the child's stderr does. That is what lets a `select!` over it retire
+    /// the arm on `None` rather than poll a stream that will never speak again.
+    pub fn tap_stderr(&mut self) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        // A poisoned lock leaves the tap uninstalled and `tx` dropped here, so the caller's
+        // receiver ends at once: the same degradation `stderr_tail` answers with an empty tail.
+        if let Ok(mut tail) = self.stderr_tail.lock() {
+            for line in &tail.lines {
+                // `rx` is alive in this frame, so the send cannot fail.
+                let _ = tx.send(line.clone());
+            }
+            if !tail.ended {
+                tail.tap = Some(tx);
+            }
+        }
+        rx
     }
 
     /// Reads the child's stdout as UTF-8, lossily, to end-of-stream **or [`STDOUT_LIMIT`]**.
@@ -793,7 +849,11 @@ pub async fn spawn(launch: &ResolvedLaunch, cwd: &Path) -> Result<Spawned> {
         .take()
         .map(TokioAsyncWriteCompatExt::compat_write);
     let stdout = child.stdout().take().map(TokioAsyncReadCompatExt::compat);
-    let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+    let stderr_tail = Arc::new(Mutex::new(StderrTail {
+        lines: VecDeque::with_capacity(STDERR_TAIL_LINES),
+        tap: None,
+        ended: false,
+    }));
 
     if let Some(stderr) = child.stderr().take() {
         let tail = Arc::clone(&stderr_tail);
@@ -801,10 +861,23 @@ pub async fn spawn(launch: &ResolvedLaunch, cwd: &Path) -> Result<Spawned> {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(mut tail) = tail.lock() else { return };
-                if tail.len() == STDERR_TAIL_LINES {
-                    tail.pop_front();
+                if tail.lines.len() == STDERR_TAIL_LINES {
+                    tail.lines.pop_front();
                 }
-                tail.push_back(line);
+                tail.lines.push_back(line.clone());
+                // The tap is taken out and put back rather than borrowed: a send whose receiver is
+                // gone drops the sender here, so the next line costs nothing.
+                if let Some(tap) = tail.tap.take()
+                    && tap.send(line).is_ok()
+                {
+                    tail.tap = Some(tap);
+                }
+            }
+            // End of stream: close the tap so a caller waiting on it is told, rather than left
+            // holding a receiver whose sender no task will ever write to again.
+            if let Ok(mut tail) = tail.lock() {
+                tail.ended = true;
+                tail.tap = None;
             }
         });
     }
