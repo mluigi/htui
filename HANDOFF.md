@@ -430,6 +430,44 @@ now.
   than move one (`store_worker.rs:572-575`) while a `Backend::Local` and its open `local.sqlite`
   are still in hand. Buys one avoided restart and nothing else; MOD-17's M2b delivers the objective
   without it. Blocked on MOD-17 (M3).
+- [ ] **MOD-20 - Registry-driven adapter install** (from MOD-2 milestone 6). `R-AGT-4..6`,
+  `R-TUI-8`, `R-NF-3`. `htui` installs an ACP agent's adapter itself, from the ACP registry, for
+  **any** agent that declares how — never one code path per vendor. **This reverses a deferral by
+  maintainer decision (2026-09-09):** `docs/ANA-4.md` §4.6 rejected "download every agent from the
+  ACP registry and manage the install (Zed's approach)" with "MOD-2 should not become a package
+  manager", reserving the shape in `agent.launch.discovery` for "MOD-7 or a later MOD"; MOD-2's
+  plan D57 restated it, and the README's hand-written `curl` for `agy_acp_server` is the cost of
+  that deferral — a documented URL pinning **one** version (`1.1.1`) and **one** platform, which
+  goes stale silently. The seam it fills is already shaped: `agent.launch.discovery` is a per-agent
+  recipe, the glob tier resolves `…/agents/<id>/*/…` with the version segment already a wildcard,
+  and the probe already records what `initialize` reports rather than what anyone assumed - so an
+  installer adds a *source* for the file the glob finds, and changes no resolution rule.
+  Scope: an `install` block in `discovery` naming the registry id and this platform's archive; a
+  reader for `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`; download,
+  unpack and executable-bit into the per-platform install root the seeds already glob; a
+  Settings-tab action beside `r` (`R-TUI-8`) that never runs on the UI task (`R-NF-3`); and a
+  re-probe of the row it just filled. Extensibility is the point, so nothing may be keyed on an
+  agent's name (`R-AGT-5`): a new agent stays one registry row plus, now, a declared install
+  source.
+  **Open questions this item must settle before it writes code** - it is unrouted, and the count
+  alone argues for the PRD path: the registry publishes **no checksum for every agent** (`amp-acp`
+  carries `sha256` per platform, `antigravity-acp` carries none), so the trust policy for an
+  unverifiable 682 MB download is undecided; these artifacts are large (`agy_acp_server.par` is
+  1.88 GB unpacked, 2.0 GB with its sibling), so an install root needs a disk budget and a policy
+  for old versions rather than unbounded accumulation; update policy has to agree with the 24 h
+  `PROBE_TTL` and with MOD-2's `newest()`, which orders matches by **mtime** and therefore by the
+  *archive's build date* (an `unzip` preserves it), so re-downloading an older version after a
+  newer one selects the wrong install; `HTUI_TOOL_<NAME>` must keep winning over anything installed;
+  Windows needs its own unpack path (long paths, Defender, the `.cmd` shim rule of ANA-4 §4.6) and
+  its runtime half is **MOD-16's**; a partial or interrupted unpack must not leave a directory the
+  glob will happily resolve; a box behind a proxy or with no network must degrade to today's
+  manual instructions; and — the one that is not technical — `antigravity-acp` is **proprietary**
+  with its own terms (`docs/ANA-4.md` §10 risk 8), so `htui` fetching it on the user's behalf must
+  surface licence and account-type consequences *before* the download, not after.
+  Not blocked. Cross-links: **MOD-7** was ANA-4's candidate owner and instead *calls* this - its
+  box registration and probe hook are the natural trigger; **MOD-2** owns the glob, `newest()` and
+  the `agent_box.probe` snapshot this writes into, and its README section is what this item
+  replaces; **MOD-16** owns every Windows runtime fact.
 
 ### Deferred backlog
 
@@ -468,6 +506,6 @@ now.
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-3 context tools, ANA-7 secrets)                                                    |
-| MOD-N   | 17 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 18 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-20 adapter install; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 2 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision)              |
