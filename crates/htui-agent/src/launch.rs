@@ -106,7 +106,46 @@ pub struct Discovery {
     /// trips byte for byte through this type (blueprint P-10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<CredentialProbe>,
+    /// Where this row's adapter comes from when the box does not have it (plan MOD-20 D12,
+    /// `R-AGT-10`). Data, never code: the installer reads the registry entry `id` names and
+    /// writes where `discovery.tools[tool]`'s glob will find it. A row without it — every
+    /// `NodePackage`-served adapter — cannot be installed from the app, and `Settings > i` says so.
+    ///
+    /// `skip_serializing_if` for the same round-trip rule as [`credential`](Self::credential).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<Install>,
 }
+
+/// `agent.launch.discovery.install` (plan MOD-20 D12): the declared source of this row's adapter.
+///
+/// Three coordinates and no fourth: which registry, which entry in it, and which of the row's own
+/// tools the installed file has to satisfy. Nothing here is a URL or a file name, because a row
+/// that spelled either would be describing one box's disk and one vendor's CDN — the two things
+/// `R-AGT-5` and D5 keep out of the document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Install {
+    /// Which registry the [`id`](Self::id) is looked up in.
+    pub source: InstallSource,
+    /// The entry id in that registry — never an agent name, never a URL.
+    pub id: String,
+    /// The `${tool}` placeholder the installed `cmd` fills: the key into
+    /// [`Discovery::tools`] whose glob must resolve the file the installer wrote.
+    ///
+    /// That agreement is what the pipeline checks after it promotes, so a token typo is a refusal
+    /// with the tree rolled back rather than a row that reads `missing` beside a full install.
+    pub tool: String,
+}
+
+wire_enum!(
+    /// `install.source` (plan MOD-20 D12): one value today.
+    ///
+    /// A closed vocabulary rather than a string, so the day a second source arrives it is a
+    /// variant every `match` is forced to answer for, not a `_ =>` arm that silently declines.
+    InstallSource {
+        /// The ACP registry, `registry/v1/latest/registry.json`.
+        AcpRegistry => "acp_registry",
+    }
+);
 
 /// `agent.launch.discovery.credential` (plan D59): how to tell an *installed* agent from an
 /// installed-and-logged-in one, declared by the row rather than decided by the probe.

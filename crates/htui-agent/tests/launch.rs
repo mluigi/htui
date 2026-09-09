@@ -9,7 +9,10 @@
 use std::collections::BTreeMap;
 
 use htui_agent::DriverError;
-use htui_agent::launch::{AgentLaunch, AgentSettings, QuotaSource, ToolMap, ToolProbe, resolve};
+use htui_agent::launch::{
+    AgentLaunch, AgentSettings, Discovery, Install, InstallSource, QuotaSource, ToolMap, ToolProbe,
+    resolve,
+};
 
 /// `claude`'s launch row (ANA-4 §5.3), byte for byte.
 const CLAUDE_LAUNCH: &str = r#"{
@@ -226,6 +229,84 @@ fn agy_launch_round_trips_with_per_platform_args() {
         serde_json::from_str(&serde_json::to_string(&launch).expect("launch serialises"))
             .expect("serialised launch parses");
     assert_eq!(reparsed, launch);
+}
+
+/// A discovery block that declares where its adapter comes from (plan MOD-20 D12), anonymous on
+/// purpose: what is pinned here is the shape, and the row that carries a real registry id is
+/// `tests/extensibility.rs`'s subject.
+const INSTALLABLE_DISCOVERY: &str = r#"{
+  "tools": { "y": { "kind": "glob", "patterns": ["/opt/y/*/y"] } },
+  "handshake": true,
+  "install": { "source": "acp_registry", "id": "x", "tool": "y" }
+}"#;
+
+#[test]
+fn a_declared_install_source_round_trips() {
+    let discovery: Discovery =
+        serde_json::from_str(INSTALLABLE_DISCOVERY).expect("the discovery block parses");
+
+    assert_eq!(
+        discovery.install,
+        Some(Install {
+            source: InstallSource::AcpRegistry,
+            id: "x".to_owned(),
+            tool: "y".to_owned(),
+        })
+    );
+
+    let text = serde_json::to_string(&discovery).expect("discovery serialises");
+    assert!(
+        text.contains(r#""source":"acp_registry""#),
+        "the source is a closed vocabulary on the wire, not a free string a `match` would have to \
+         guess at: {text}"
+    );
+
+    let reparsed: Discovery = serde_json::from_str(&text).expect("serialised discovery parses");
+    assert_eq!(reparsed, discovery);
+}
+
+#[test]
+fn a_row_without_an_install_block_re_serialises_unchanged() {
+    let launch: AgentLaunch = serde_json::from_str(CLAUDE_LAUNCH).expect("claude launch parses");
+    let discovery = launch
+        .discovery
+        .as_ref()
+        .expect("claude declares discovery");
+
+    assert_eq!(
+        discovery.install, None,
+        "the claude adapter is served by a package manager of its own, so its row declares no \
+         source and there is nothing for the app to install (plan MOD-20 D12, PRD \"Not for\")"
+    );
+
+    // The `credential` rule of milestone 6, one key later: a document written before MOD-20 comes
+    // back out of this type byte for byte.
+    let text = serde_json::to_string(&launch).expect("launch serialises");
+    assert!(
+        !text.contains("install"),
+        "a row without the block re-serialises without an `\"install\": null` key, so an install \
+         does not rewrite every registry row it merely read: {text}"
+    );
+    let reparsed: AgentLaunch = serde_json::from_str(&text).expect("serialised launch parses");
+    assert_eq!(reparsed, launch);
+}
+
+#[test]
+fn an_unknown_install_source_names_the_value_it_refused() {
+    const FROM_A_LATER_HTUI: &str = r#"{
+      "tools": {},
+      "install": { "source": "github_release", "id": "x", "tool": "y" }
+    }"#;
+
+    let error = serde_json::from_str::<Discovery>(FROM_A_LATER_HTUI)
+        .expect_err("a second source is a variant of this crate, not a string a row may invent");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("github_release"),
+        "the refusal has to name the value: a row written against a newer htui otherwise reads as \
+         a parse failure with no clue which key is at fault: {message}"
+    );
 }
 
 #[test]

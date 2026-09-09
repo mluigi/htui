@@ -143,9 +143,11 @@ mod tests {
         Discovery {
             tools,
             handshake: false,
-            // Resolution never reads it: the credential tier is the probe's (plan D59), and
-            // `tools::resolve` answers the same for a row that declares one and a row that does not.
+            // Resolution never reads either: the credential tier is the probe's (plan D59), the
+            // install block is the installer's (plan MOD-20 D12), and `tools::resolve` answers the
+            // same for a row that declares them and a row that does not.
             credential: None,
+            install: None,
         }
     }
 

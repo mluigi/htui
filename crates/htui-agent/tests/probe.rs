@@ -8,7 +8,7 @@
 //! lives in `tests/probe_live.rs`, `#[ignore]`d.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use chrono::{TimeDelta, Utc};
@@ -19,8 +19,9 @@ use htui_agent::launch::{
     AcpSettings, AgentLaunch, CredentialProbe, Discovery, ResolvedLaunch, ToolProbe, VersionProbe,
 };
 use htui_agent::probe::{
-    CredentialTier, ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeSource, ProbeStatus,
-    Tier2, below_min, capture_version, expand, extract_version, glob_first, platform_key,
+    CredentialTier, GlobMatch, INSTALL_ROOT_VAR, ProbeContext, ProbeEnv, ProbeOutcome,
+    ProbeSnapshot, ProbeSource, ProbeStatus, Tier2, below_min, capture_version,
+    default_install_root, expand, extract_version, glob_first, install_root, platform_key,
     probe_agent, probe_tools, resolve_credential, resolve_tool, segment_matches, status_for, walk,
 };
 use htui_core::model::{Agent, AgentBox, AgentId, Billing, BoxId, Transport};
@@ -32,9 +33,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 // ---------------------------------------------------------------------------------------------
 
 /// A box made of directories under `tmp`: `cwd`, `bin` (the injected `PATH`), `home` (what `~`
-/// expands to) and `lad` (what `%LOCALAPPDATA%` expands to).
+/// expands to), `lad` (what `%LOCALAPPDATA%` expands to) and `agents` (what
+/// `%HTUI_AGENTS_ROOT%` expands to).
+///
+/// The install root is injected here for the reason every other variable is: `ProbeEnv::host`
+/// would seed it from the *maintainer's* `dirs::data_local_dir()`, and `std::env::set_var` is
+/// `unsafe` and forbidden, so the only way a seed-row case can stay off the real disk is to hand
+/// the tier a value (plan MOD-20 D15).
 fn env(tmp: &Path) -> ProbeEnv {
-    for dir in ["cwd", "bin", "home", "lad"] {
+    for dir in ["cwd", "bin", "home", "lad", "agents"] {
         std::fs::create_dir_all(tmp.join(dir)).expect("fixture directory");
     }
     let mut vars = BTreeMap::new();
@@ -45,6 +52,10 @@ fn env(tmp: &Path) -> ProbeEnv {
     vars.insert(
         "LOCALAPPDATA".to_owned(),
         tmp.join("lad").to_string_lossy().into_owned(),
+    );
+    vars.insert(
+        INSTALL_ROOT_VAR.to_owned(),
+        tmp.join("agents").to_string_lossy().into_owned(),
     );
     ProbeEnv {
         cwd: tmp.join("cwd"),
@@ -141,6 +152,7 @@ fn discovery(name: &str, probe: ToolProbe) -> Discovery {
         tools,
         handshake: false,
         credential: None,
+        install: None,
     }
 }
 
@@ -385,6 +397,11 @@ fn segment_matches_is_star_within_one_name_only() {
     assert!(!segment_matches("agy_acp_server.par", "agy_acp_server.exe"));
 }
 
+/// The shape `htui` never installs into, kept exactly as it shipped: a JetBrains-managed copy is
+/// laid out `<ide>/acp-agents/antigravity-acp/<build>/`, and a build number (`20260501`) is not a
+/// semver. So both captures here fail `Version::parse`, both assertions stay on D14's fallback,
+/// and this case now pins that fallback — the mtime-then-path-descending rule of MOD-2 D48 —
+/// rather than the whole of `newest()`.
 #[tokio::test]
 async fn the_jetbrains_two_star_shape_resolves_to_the_newest_install() {
     let tmp = tempfile::tempdir().expect("temp box");
@@ -442,7 +459,7 @@ async fn the_seeded_agy_row_resolves_by_glob_on_linux_with_the_uid_arg() {
     let env = env(tmp.path());
     let server = tmp
         .path()
-        .join("home/.local/share/htui/agents/antigravity-acp/1.1.1/agy_acp_server.par");
+        .join("agents/antigravity-acp/1.1.1/agy_acp_server.par");
     executable(&server, "binary");
 
     let report = probe_tools(Some(&agy_discovery()), &env)
@@ -478,9 +495,9 @@ async fn the_same_row_on_darwin_appends_no_args() {
         platform: "darwin-aarch64".to_owned(),
         ..env(tmp.path())
     };
-    let server = tmp.path().join(
-        "home/Library/Application Support/htui/agents/antigravity-acp/1.1.1/agy_acp_server.par",
-    );
+    let server = tmp
+        .path()
+        .join("agents/antigravity-acp/1.1.1/agy_acp_server.par");
     executable(&server, "binary");
 
     let report = probe_tools(Some(&agy_discovery()), &env)
@@ -496,6 +513,183 @@ async fn the_same_row_on_darwin_appends_no_args() {
         "darwin-aarch64 declares no extra args"
     );
     assert!(report.extra_args().is_empty());
+}
+
+/// The `agy` seed row's own patterns for one platform key.
+fn agy_patterns(platform: &str) -> Vec<String> {
+    match agy_discovery()
+        .tools
+        .remove("agy_acp_server")
+        .expect("the seed declares the adapter tool")
+    {
+        ToolProbe::Glob { platform: map, .. } => map
+            .get(platform)
+            .unwrap_or_else(|| panic!("the seed declares patterns for {platform}"))
+            .patterns
+            .clone(),
+        other => panic!("the adapter tool is a glob probe, not {other:?}"),
+    }
+}
+
+/// The Windows half of D15's token, split where the platform splits it.
+///
+/// Neither half can be run whole on this box: [`ProbeEnv::var`] folds case only under
+/// `cfg!(windows)`, and a `C:\…` value names no directory a Linux `read_dir` can open. So the
+/// expansion of a backslashed value — pure, and the reason `%HTUI_AGENTS_ROOT%` can replace a
+/// hand-written `%LOCALAPPDATA%/…` at all — is asserted everywhere, and the resolve is driven with
+/// the spelling the host can actually find: a deliberately mis-cased key on Windows, where the
+/// environment block really does carry one, and the canonical key elsewhere.
+#[tokio::test]
+async fn the_windows_seed_pattern_expands_the_root_token_case_insensitively() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let base = env(tmp.path());
+    let patterns = agy_patterns("windows-x86_64");
+    let managed = patterns
+        .iter()
+        .find(|pattern| pattern.contains(INSTALL_ROOT_VAR))
+        .expect("the windows-x86_64 entry reaches the install root through the token");
+
+    // 1. A Windows environment block's value: separators are backslashes, and `expand` must push
+    //    the whole thing as one segment rather than splitting it into six.
+    let backslashed = r"C:\Users\x\AppData\Local\htui\agents";
+    let mut vars = base.vars.clone();
+    vars.insert(INSTALL_ROOT_VAR.to_owned(), backslashed.to_owned());
+    let windows_box = ProbeEnv {
+        platform: "windows-x86_64".to_owned(),
+        vars,
+        ..base.clone()
+    };
+    let (root, rest) = expand(managed, &windows_box).expect("the token expands");
+    assert_eq!(
+        root,
+        PathBuf::from(backslashed).join("antigravity-acp"),
+        "a backslashed value stays one segment, so the literal root ends at the registry id"
+    );
+    assert_eq!(rest, vec!["*".to_owned(), "agy_acp_server.exe".to_owned()]);
+
+    // 2. The resolve, through the shipped row, with the key spelled the way this host looks it up.
+    let root = tmp.path().join("agents");
+    let mut vars = base.vars.clone();
+    vars.remove(INSTALL_ROOT_VAR);
+    let mis_cased = if cfg!(windows) {
+        "HtUi_AgEnTs_RoOt"
+    } else {
+        INSTALL_ROOT_VAR
+    };
+    vars.insert(mis_cased.to_owned(), root.to_string_lossy().into_owned());
+    let env = ProbeEnv {
+        platform: "windows-x86_64".to_owned(),
+        vars,
+        ..base
+    };
+    let server = root.join("antigravity-acp/1.1.1/agy_acp_server.exe");
+    executable(&server, "binary");
+
+    let report = probe_tools(Some(&agy_discovery()), &env)
+        .await
+        .expect("the tiers ran");
+    let found = report
+        .found
+        .get("agy_acp_server")
+        .expect("the windows-x86_64 patterns found the server");
+    assert_eq!(
+        found.path, server,
+        "the JetBrains pattern is tried first and matches nothing; the token pattern answers"
+    );
+}
+
+/// D15's whole point: with the root behind a token there is nothing left in the document to
+/// disagree with the installer about, on any platform. This greps the shipped files rather than
+/// the parsed rows so a root re-introduced under *any* tool, in a comment or in a pattern, is
+/// caught by the same test that pins the three spellings the seeds used to carry.
+#[test]
+fn no_seed_pattern_spells_an_install_root() {
+    let seeds = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crates directory is one level above this crate")
+        .join("htui-core/seeds");
+    let mut read = 0usize;
+
+    for name in ["agent_agy.json", "agent_claude.json"] {
+        let path = seeds.join(name);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("{} is readable: {err}", path.display()));
+        read += 1;
+        for spelling in [
+            ".local/share/htui",
+            "Application Support/htui",
+            "LOCALAPPDATA%/htui",
+        ] {
+            assert!(
+                !text.contains(spelling),
+                "{name} spells an install root (`{spelling}`); the root is \
+                 `%{INSTALL_ROOT_VAR}%`'s to say, and a document that repeats it is the copy \
+                 that goes stale"
+            );
+        }
+    }
+    assert_eq!(read, 2, "both shipped documents were read, not one");
+}
+
+/// The other end of the injection: production has no one to inject for it, so [`ProbeEnv::host`]
+/// seeds the token itself — and only when the box has not already said where its adapters live.
+///
+/// The "unless" half cannot be driven over `host`: writing the process environment needs
+/// `std::env::set_var`, which is `unsafe` and forbidden here. It is read, never written, and the
+/// override is proven one layer down, over [`install_root`] on a hand-built env — which is the
+/// same lookup `host`'s own seeding consults before it inserts anything.
+#[test]
+fn host_seeds_the_root_token_from_the_helper_unless_the_environment_sets_it() {
+    let host = ProbeEnv::host(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    match std::env::var_os(INSTALL_ROOT_VAR) {
+        None => {
+            assert_eq!(
+                host.vars.get(INSTALL_ROOT_VAR).map(PathBuf::from),
+                default_install_root(),
+                "an environment that says nothing gets the helper's answer, under the exact key"
+            );
+            assert_eq!(install_root(&host), default_install_root());
+        }
+        Some(set) => assert_eq!(
+            install_root(&host),
+            Some(PathBuf::from(set)),
+            "this box sets the variable, so the variable wins"
+        ),
+    }
+
+    let tmp = tempfile::tempdir().expect("temp box");
+    let mut env = env(tmp.path());
+    let elsewhere = tmp.path().join("a-bigger-disk/agents");
+    env.vars.insert(
+        INSTALL_ROOT_VAR.to_owned(),
+        elsewhere.to_string_lossy().into_owned(),
+    );
+    assert_eq!(install_root(&env), Some(elsewhere.clone()));
+    assert_ne!(
+        install_root(&env),
+        default_install_root(),
+        "a box that names a root is never answered from `dirs::data_local_dir()`"
+    );
+}
+
+#[test]
+fn install_root_is_none_when_the_token_is_absent() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let mut env = env(tmp.path());
+    env.vars.remove(INSTALL_ROOT_VAR);
+
+    assert_eq!(
+        install_root(&env),
+        None,
+        "there is no fallback to `default_install_root()` here: a hand-built env that did not \
+         inject the token must not be answered from the maintainer's real disk"
+    );
+    assert_eq!(
+        expand(&agy_patterns("linux-x86_64")[0], &env),
+        None,
+        "and the seed pattern that names it is skipped, not resolved somewhere else"
+    );
 }
 
 /// Review gate LOW-4: a user-authored `~/*/*/*` over a large home fans out multiplicatively on the
@@ -516,6 +710,194 @@ fn the_glob_walk_caps_its_candidate_fan_out() {
         matches.len(),
         4096,
         "the walk carries at most 4096 candidates between segments"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 8b. Version-aware selection (plan MOD-20 D14, amending MOD-2 D48)
+// ---------------------------------------------------------------------------------------------
+
+/// The install root's shape, one version directory at a time: `<root>/<id>/<version>/<file>`, so
+/// the pattern below has exactly one `*` and the version is the capture `newest()` keys on.
+fn versioned(tmp: &Path, version: &str) -> PathBuf {
+    let file = tmp
+        .join("agents/acp-adapter")
+        .join(version)
+        .join("adapter-server");
+    executable(&file, "binary");
+    file
+}
+
+/// What the row's glob answers over the tree [`versioned`] built.
+async fn resolve_versioned(env: &ProbeEnv) -> PathBuf {
+    glob_first(
+        &["%HTUI_AGENTS_ROOT%/acp-adapter/*/adapter-server".to_owned()],
+        env,
+    )
+    .await
+    .expect("the walk ran")
+    .expect("the tree holds at least one install")
+}
+
+/// D4's first failure, made a test: unpacking preserves the vendor's build date, so the version
+/// installed *last* routinely carries the *older* mtime. Keying on the mtime picked the version
+/// the user had just replaced.
+#[tokio::test]
+async fn a_semver_directory_beats_a_newer_mtime() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+    let higher = versioned(tmp.path(), "1.10.0");
+    let lower = versioned(tmp.path(), "1.9.0");
+
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    touch_at(&higher, epoch);
+    touch_at(&lower, epoch + Duration::from_secs(3_600));
+
+    assert_eq!(
+        resolve_versioned(&env).await,
+        higher,
+        "the version in the directory name decides; the mtime is only what breaks a tie between \
+         captures that are not versions at all"
+    );
+}
+
+/// D4's second failure: with the mtimes equal the old rule fell through to the path, descending.
+#[tokio::test]
+async fn semver_beats_path_order_where_the_old_rule_was_wrong() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+    let higher = versioned(tmp.path(), "1.10.0");
+    let lower = versioned(tmp.path(), "1.9.0");
+
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    touch_at(&higher, epoch);
+    touch_at(&lower, epoch);
+
+    assert_eq!(
+        resolve_versioned(&env).await,
+        higher,
+        "`1.10.0` outranks `1.9.0` as a version. The descending-path tie-break this replaces \
+         answered `1.9.0`, because `9` sorts above `1` lexicographically — the trap D4 names"
+    );
+}
+
+/// `semver`'s own rule, stated here so it is a property of `newest()` and not of a dependency:
+/// `2.0.0-rc.1` is below `2.0.0`, and no mtime lifts it back above.
+#[tokio::test]
+async fn a_prerelease_sorts_below_its_release() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+    let release = versioned(tmp.path(), "2.0.0");
+    let prerelease = versioned(tmp.path(), "2.0.0-rc.1");
+
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    touch_at(&release, epoch);
+    touch_at(&prerelease, epoch + Duration::from_secs(3_600));
+
+    assert_eq!(
+        resolve_versioned(&env).await,
+        release,
+        "a prerelease is below its release however recently it was written"
+    );
+}
+
+/// D14's `None < Some`, driven end to end: a directory named like a version *is* an install, and
+/// a sibling that is not named like one loses to it whatever its timestamp says.
+#[tokio::test]
+async fn a_version_directory_beats_a_non_version_sibling() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+    let version = versioned(tmp.path(), "1.1.1");
+    let rolling = versioned(tmp.path(), "current");
+
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    touch_at(&version, epoch);
+    touch_at(&rolling, epoch + Duration::from_secs(3_600));
+
+    assert_eq!(
+        resolve_versioned(&env).await,
+        version,
+        "a capture that parses as a version outranks every capture that does not, and `current` \
+         does not — being newer only decides among the ones that do not"
+    );
+}
+
+/// Registries and release tags spell the same version both ways; the resolver reads one thing.
+///
+/// The mtimes are what make this a test of the `v` and not of the path order: the tagged directory
+/// is the *older* file, so it can only win by parsing — an untolerated `v` would leave it
+/// unparsable, and an unparsable capture loses to a numbered sibling however old it is.
+#[tokio::test]
+async fn a_leading_v_is_tolerated() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+    let tagged = versioned(tmp.path(), "v1.10.0");
+    let plain = versioned(tmp.path(), "1.9.0");
+
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    touch_at(&tagged, epoch);
+    touch_at(&plain, epoch + Duration::from_secs(3_600));
+
+    assert_eq!(
+        resolve_versioned(&env).await,
+        tagged,
+        "the leading `v` is stripped before parsing, so `v1.10.0` is the version 1.10.0 and not an \
+         unparsable sibling that loses to every numbered one"
+    );
+}
+
+/// The capture list is what `newest()` keys on, so its shape is asserted directly: one entry per
+/// `*` segment, in pattern order, and nothing at all for a pattern that has none.
+#[test]
+fn walk_reports_one_capture_per_star() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+    for (ide, build) in [("ide-a", "20260501"), ("ide-b", "20260818")] {
+        executable(
+            &tmp.path()
+                .join("home/ides")
+                .join(ide)
+                .join("builds")
+                .join(build)
+                .join("adapter-server"),
+            "binary",
+        );
+    }
+
+    let (root, segments) = expand("~/ides/*/builds/*/adapter-server", &env).expect("`~` expands");
+    let mut found = walk(&root, &segments);
+    found.sort_by(|left, right| left.path.cmp(&right.path));
+    assert_eq!(
+        found,
+        vec![
+            GlobMatch {
+                path: tmp
+                    .path()
+                    .join("home/ides/ide-a/builds/20260501/adapter-server"),
+                captures: vec!["ide-a".to_owned(), "20260501".to_owned()],
+            },
+            GlobMatch {
+                path: tmp
+                    .path()
+                    .join("home/ides/ide-b/builds/20260818/adapter-server"),
+                captures: vec!["ide-b".to_owned(), "20260818".to_owned()],
+            },
+        ],
+        "two `*` segments, two captures each, in the order the pattern spells them — the last one \
+         is the version segment `newest()` reads"
+    );
+
+    let (root, segments) =
+        expand("~/ides/ide-a/builds/20260501/adapter-server", &env).expect("`~` expands");
+    let literal = walk(&root, &segments);
+    assert_eq!(
+        literal.len(),
+        1,
+        "a pattern with no `*` is one `stat`, and it still finds its file"
+    );
+    assert!(
+        literal[0].captures.is_empty(),
+        "a pattern with no `*` captures nothing, which is what sends it to D14's fallback"
     );
 }
 

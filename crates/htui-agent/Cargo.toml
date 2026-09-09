@@ -39,12 +39,27 @@ similar               = { workspace = true }
 regex                 = { workspace = true }
 semver                = { workspace = true }
 dirs                  = { workspace = true }
+# MOD-20 T4 (plan D9): the installer's registry read and archive `HEAD`. `install/http.rs` is the
+# only file that names `reqwest`; `rustls` is direct only so the explicit provider install has a
+# name to say (fact-check amendment to D9).
+reqwest               = { workspace = true }
+rustls                = { workspace = true }
+# MOD-20 T5 (plan D10, D11): the archive shapes the registry publishes, and free space. `bytes`
+# names the chunk type `install/http.rs` hands the fetch; `install/archive.rs` is the only file
+# that names `zip`, `tar` or `flate2`.
+bytes                 = { workspace = true }
+zip                   = { workspace = true }
+tar                   = { workspace = true }
+flate2                = { workspace = true }
+fs4                   = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+# `net` (MOD-20 T4): `tests/install.rs` serves the registry and the archive `HEAD` from a
+# hand-rolled `TcpListener` responder, so every install case runs offline.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "net"] }
 # The tool resolver's `NodePackage` tier is tested against a `node_modules` tree in a throwaway
 # directory, never the developer's own (T11 step 2).
 tempfile = "3"

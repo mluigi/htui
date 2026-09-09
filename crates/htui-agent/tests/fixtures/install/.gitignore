@@ -1,0 +1,7 @@
+# MOD-20 T5: the fixture archives are built by `tests/install.rs` at run time, from the tree in
+# `tree()`, into whichever `tempdir` the case owns. Nothing binary belongs in git: a checked-in
+# `.zip` is a blob nobody can review, and the modes it carries — the `0644` on the `cmd` that
+# hazard H-5 is about — would be invisible in a diff. This directory exists so that rule has
+# somewhere to be written down, and this line is what keeps an archive from landing beside it.
+*
+!.gitignore

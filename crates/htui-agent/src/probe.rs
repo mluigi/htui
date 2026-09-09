@@ -105,14 +105,32 @@ impl ProbeEnv {
                 )
             })
             .collect();
-        Self {
+        let mut env = Self {
             cwd,
             platform: platform_key(),
             home: dirs::home_dir(),
             vars,
             versions: true,
             version_timeout: VERSION_TIMEOUT,
+        };
+        // Plan MOD-20 D15: the seeds reach the install root through `%HTUI_AGENTS_ROOT%`, so on a
+        // box that does not set it the token has to be seeded somewhere — here, once, rather than
+        // as a fallback inside `install_root`, which no test could then keep off the real disk.
+        //
+        // The absence is decided by `var`, not by `vars.contains_key`: on Windows an environment
+        // block may carry the name in another case, `var` is what every later reader goes through,
+        // and inserting the canonical spelling beside a `htui_agents_root` the user set would
+        // shadow their value with the default — exactly the thing "unless the environment sets
+        // it" forbids.
+        if env.var(INSTALL_ROOT_VAR).is_none()
+            && let Some(root) = default_install_root()
+        {
+            env.vars.insert(
+                INSTALL_ROOT_VAR.to_owned(),
+                root.to_string_lossy().into_owned(),
+            );
         }
+        env
     }
 
     /// The same env with [`versions`](Self::versions) off: resolution without the `--version`
@@ -156,6 +174,47 @@ pub fn platform_key() -> String {
         other => other,
     };
     format!("{os}-{}", std::env::consts::ARCH)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Where an installed adapter lives (plan MOD-20 D15)
+// ---------------------------------------------------------------------------------------------
+
+/// The variable that names this box's install root.
+///
+/// [`ProbeEnv::host`] seeds it from [`default_install_root`] unless the environment already says
+/// otherwise, and the seed documents reach it as `%HTUI_AGENTS_ROOT%` — a token the glob expander
+/// already understands. That is what lets a seed carry **no** root at all: the document and the
+/// installer cannot disagree about a path neither of them spells, and a box whose adapters do not
+/// fit under the default (a version of one is gigabytes) relocates them with one variable instead
+/// of an edited registry row.
+pub const INSTALL_ROOT_VAR: &str = "HTUI_AGENTS_ROOT";
+
+/// `dirs::data_local_dir()/htui/agents`: `~/.local/share` (or `$XDG_DATA_HOME`) on Linux,
+/// `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows.
+///
+/// The three roots the seeds used to hand-write, in one place. `data_local_dir` and not
+/// `dirs::config_dir()` because this is bulk data, not settings, and on Windows the difference is
+/// `%LOCALAPPDATA%` against the roaming `%APPDATA%` — nobody wants a gigabyte adapter synchronised
+/// to a domain profile.
+///
+/// `None` on a box with no local data directory: a refusal the caller reports by name, never a
+/// path invented on its behalf.
+#[must_use]
+pub fn default_install_root() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|dir| dir.join("htui").join("agents"))
+}
+
+/// This box's install root as the injected environment states it, through [`ProbeEnv::var`] — so
+/// the Windows case-insensitive lookup applies here exactly as it does inside a `%VAR%` pattern,
+/// and a reader and the expander can never resolve the same token differently.
+///
+/// `None` when the token is absent, which is a hand-built [`ProbeEnv`] that did not inject it.
+/// Deliberately **no** fallback to [`default_install_root`]: the seeding happens once, in
+/// [`ProbeEnv::host`], so a test's env is never quietly answered from the maintainer's real disk.
+#[must_use]
+pub fn install_root(env: &ProbeEnv) -> Option<PathBuf> {
+    env.var(INSTALL_ROOT_VAR).map(PathBuf::from)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -653,8 +712,28 @@ fn star_match(pattern: &str, name: &str) -> bool {
 /// directories and a handful of builds under each — and far short of "stat this disk".
 pub const MAX_GLOB_CANDIDATES: usize = 4096;
 
+/// One leaf [`walk`] found, and what each `*` segment of the pattern matched on the way to it
+/// (plan MOD-20 D14).
+///
+/// The captures exist so [`newest`] can read the *version* out of a path without knowing which
+/// segment held it: the walker is the only code that knows which names came from a wildcard and
+/// which were spelled by the pattern, so it is the walker that says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobMatch {
+    /// The file itself — every [`walk`] result is a leaf that `is_file()`.
+    pub path: PathBuf,
+    /// One entry per segment containing `*`, in pattern order: the directory (or leaf) name that
+    /// segment matched. Empty for a pattern with no wildcard. The seeds put the version segment
+    /// last, which is the one [`newest`] keys on.
+    pub captures: Vec<String>,
+}
+
 /// From `root`, one segment at a time: a literal segment is pushed, a `*` segment reads the
 /// directory and forks on every matching entry. Every leaf that `is_file()`.
+///
+/// Each candidate carries the names its `*` segments matched, so the answer is a [`GlobMatch`]
+/// rather than a bare path: a literal segment leaves the captures alone, a `*` segment appends the
+/// name it matched.
 ///
 /// Bounded to [`MAX_GLOB_CANDIDATES`] per segment, with a `warn!` naming the pattern when the cap
 /// trips: past that point the walk is answering a pattern that was never meant to match, and the
@@ -663,25 +742,36 @@ pub const MAX_GLOB_CANDIDATES: usize = 4096;
 /// Synchronous — it is `read_dir` and `stat`. [`glob_first`] is the async wrapper that keeps it
 /// off the runtime's worker.
 #[must_use]
-pub fn walk(root: &Path, segments: &[String]) -> Vec<PathBuf> {
-    let mut current = vec![root.to_path_buf()];
+pub fn walk(root: &Path, segments: &[String]) -> Vec<GlobMatch> {
+    let mut current = vec![GlobMatch {
+        path: root.to_path_buf(),
+        captures: Vec::new(),
+    }];
     for segment in segments {
         let mut next = Vec::new();
         if segment.contains('*') {
-            for dir in &current {
-                let Ok(entries) = std::fs::read_dir(dir) else {
+            for candidate in &current {
+                let Ok(entries) = std::fs::read_dir(&candidate.path) else {
                     continue;
                 };
                 for entry in entries.flatten() {
                     let name = entry.file_name();
                     if segment_matches(segment, &name.to_string_lossy()) {
-                        next.push(dir.join(name));
+                        let mut captures = candidate.captures.clone();
+                        captures.push(name.to_string_lossy().into_owned());
+                        next.push(GlobMatch {
+                            path: candidate.path.join(name),
+                            captures,
+                        });
                     }
                 }
             }
         } else {
-            for dir in &current {
-                next.push(dir.join(segment));
+            for candidate in &current {
+                next.push(GlobMatch {
+                    path: candidate.path.join(segment),
+                    captures: candidate.captures.clone(),
+                });
             }
         }
         if next.is_empty() {
@@ -698,28 +788,62 @@ pub fn walk(root: &Path, segments: &[String]) -> Vec<PathBuf> {
         }
         current = next;
     }
-    current.retain(|path| path.is_file());
+    current.retain(|found| found.path.is_file());
     current
 }
 
-/// Newest `mtime` first, ties broken by path **descending**.
+/// The highest version first, then the newest `mtime`, then the path **descending** (plan MOD-20
+/// D14, amending MOD-2 plan D48).
 ///
-/// A JetBrains install with three versioned directories must answer the same file on every run,
-/// and "the one that was written last" is the closest a filesystem gets to "the one that was
-/// installed last". An unreadable timestamp sorts as the epoch: present but never preferred.
+/// The version is [`version_key`] of the **last** capture — the segment the seeds put the version
+/// in. `None < Some` in Rust's `Ord for Option`, so every capture that parses as a version outranks
+/// every capture that does not, which is this crate's reading of "a directory named like a version
+/// is an install". Among the ones that parse, `semver` decides, and a prerelease sits below its
+/// release.
+///
+/// Among the ones that do **not** parse — a JetBrains-managed tree whose segment is a build number,
+/// a pattern with no `*` and so no capture at all — D48's rule stands exactly as it shipped: newest
+/// `mtime`, ties broken by the descending path, an unreadable timestamp sorting as the epoch,
+/// present but never preferred. That is what keeps a box that installs nothing resolving the file
+/// it resolved before.
+///
+/// D48 keyed on the mtime alone. It had to be amended because unpacking an archive preserves the
+/// vendor's build date rather than the install date, so the version installed last routinely
+/// carries the older timestamp; and because the path tie-break it fell through to reads `1.9.0` as
+/// higher than `1.10.0`.
 #[must_use]
-pub fn newest(matches: Vec<PathBuf>) -> Option<PathBuf> {
+pub fn newest(matches: Vec<GlobMatch>) -> Option<PathBuf> {
     matches
         .into_iter()
-        .map(|path| {
-            let mtime = path
+        .map(|found| {
+            let version = found
+                .captures
+                .last()
+                .map(String::as_str)
+                .and_then(version_key);
+            let mtime = found
+                .path
                 .metadata()
                 .and_then(|meta| meta.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            (mtime, path)
+            (version, mtime, found.path)
         })
         .max()
-        .map(|(_, path)| path)
+        .map(|(_, _, path)| path)
+}
+
+/// The version a capture names, or `None` when it does not name one.
+///
+/// Strict `semver` but for a leading `v`, which registries and release tags spell both ways.
+/// Nothing else is coerced: `2026.1` is two components and stays unparsable on purpose, because a
+/// guess here silently reorders somebody's installs.
+///
+/// Visible to the installer on purpose (MOD-20): the pre-flight's downgrade refusal and the
+/// rollback's "what is the box left resolving" both have to rank version *directories* exactly as
+/// [`newest`] ranks a glob capture, and a second copy of this rule would be a pair of answers that
+/// agree until the day one of them is edited.
+pub(crate) fn version_key(capture: &str) -> Option<Version> {
+    Version::parse(capture.strip_prefix('v').unwrap_or(capture)).ok()
 }
 
 /// `patterns` in order; the first pattern with any match wins, [`newest`] of its matches.

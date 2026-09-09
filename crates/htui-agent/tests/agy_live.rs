@@ -3,7 +3,8 @@
 //!
 //! `#[ignore]` by default, exactly as `tests/probe_live.rs` and `tests/acp_live.rs` are: it spawns
 //! `agy_acp_server.par` and `agy --version`, and a box where the maintainer has not installed the
-//! adapter (plan D57 — `htui` never downloads it) is not a failing build. Run it by hand:
+//! adapter (`R-AGT-10` reversed plan D57: `htui` installs it now, but only when asked) is not a
+//! failing build. Run it by hand:
 //!
 //! ```text
 //! cargo test -p htui-agent --features test-support --test agy_live -- --ignored --nocapture
@@ -41,7 +42,7 @@
 //! - The adapter is installed (plan T29, D57): an executable
 //!   `~/.local/share/htui/agents/antigravity-acp/<version>/agy_acp_server.par` on Linux, the
 //!   platform's equivalent elsewhere. Every case resolves the seed's glob first and panics with the
-//!   download URL and the `chmod +x` line when it finds nothing.
+//!   in-app install instruction when it finds nothing.
 //! - `agy` is on `PATH`. The seed's `agy` tool is a `path` probe and `probe_tools` requires **every**
 //!   declared tool, so a box with the server but no CLI probes `missing` and never reaches tier 2
 //!   (blueprint H-11). The precondition check names that too.
@@ -98,15 +99,18 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 static ONE_AT_A_TIME: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// Where the maintainer is told to get the adapter when a precondition fails (plan D57): the ACP
-/// registry's `linux-x86_64` coordinate for `antigravity-acp` 1.1.1.
+/// Where the maintainer is told to get the adapter when a precondition fails.
+///
+/// Since `R-AGT-10` that is `htui` itself, so this names the action rather than a URL: the old
+/// wording spelled one version and one platform, and it is exactly the copy that goes stale
+/// without anything going red.
 const INSTALL_HINT: &str = "\
-install the adapter first (plan MOD-2 T29/D57 — `htui` deliberately does not download it):
-  1. https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_1.1.1-linux-x86_64.zip
-  2. unzip the WHOLE directory into ~/.local/share/htui/agents/antigravity-acp/1.1.1/
-     (keep the siblings: `localharness_external` ships beside the server)
-  3. chmod +x ~/.local/share/htui/agents/antigravity-acp/1.1.1/agy_acp_server.par
-     (`launch::spawn` runs `which` even on an absolute path, which rejects a non-executable file)
+install the adapter from inside htui (`R-AGT-10` — it installs it now, when asked):
+  1. open Settings > Agents and put the cursor on the `agy` row with `j`/`k`
+  2. press `i`, read the consent pane and answer `y`; nothing is fetched before that, and the
+     archive, its size, the licence, the install directory and the digest rule are all on it
+  3. the section re-probes when it finishes, so the row itself says whether this suite can run
+     (a box that cannot reach the registry is given manual steps derived from the same row)
 or point HTUI_TOOL_AGY_ACP_SERVER at the server this box already has";
 
 /// How long the hand-driven cases give the adapter.

@@ -53,6 +53,28 @@ which                 = "8.0.6"
 # (`regex 1.13.1`, `semver 1.0.28`), so declaring them adds no compiled crate.
 regex                 = "1.13"
 semver                = "1.0"
+# MOD-20 (plan D9): the installer's HTTP client. `default-features = false` is load-bearing
+# (`default` = default-tls + charset + http2 + system-proxy). `rustls-no-provider` keeps ring —
+# sqlx's provider — the only one in the process; `install/http.rs` installs it explicitly, because
+# reqwest does **not** infer the single enabled provider and `Client::build` panics without one.
+reqwest               = { version = "0.13", default-features = false, features = [
+                          "rustls-no-provider", "stream", "system-proxy"] }
+rustls                = { version = "0.23", default-features = false, features = [
+                          "ring", "std", "tls12", "logging"] }
+# MOD-20 T5 (blueprint B.4): naming the chunk type a body arrives in needs the crate that owns it
+# — `reqwest 0.13.5` re-exports `Bytes` nowhere. Already in the lock as reqwest's own dependency,
+# so this declaration adds a name and not a crate. The alternative, a `Vec<u8>` per chunk, copies
+# every chunk of a 682 MB body.
+bytes                 = "1"
+# MOD-20 (plan D10): deflate-only zip, plain tar, pure-Rust gzip. The default feature sets buy
+# four decompressors and an AES stack nobody has an archive for; `tar`'s default `xattr` is a
+# unix-only extra with no use here.
+zip                   = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+tar                   = { version = "0.4", default-features = false }
+flate2                = "1.1"
+# MOD-20 (plan D11): free space without `unsafe` — `rustix` on unix, `windows-sys` on Windows,
+# both already in the lock.
+fs4                   = { version = "1.1", default-features = false, features = ["sync"] }
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"

@@ -19,6 +19,11 @@
 //! `agent_box.probe`, and — over [`acp::handshake()`] — the tier-2 `initialize` that is the only
 //! proof the resolved binary actually runs.
 //!
+//! [`install`] is MOD-20's answer to "and what if this box does not have it": the registry a row
+//! *declares* a source in, read into a plan the user consents to before a single archive byte is
+//! requested. It knows no agent's name (`R-AGT-5`) — the row supplies an entry id, the registry
+//! supplies everything else, and [`probe`] supplies the root and, afterwards, the verdict.
+//!
 //! Deliberately absent in milestones 1–2 (plan D16): any wire protocol (`acp/`, `cli/`), the chat
 //! tab, and quota. Each is a named seam, not a plan.
 #![warn(missing_docs)]
@@ -81,6 +86,7 @@ pub mod error;
 pub mod event;
 #[cfg(feature = "test-support")]
 pub mod fake;
+pub mod install;
 pub mod launch;
 pub mod permission;
 pub mod probe;
@@ -105,17 +111,25 @@ pub use event::{
     PlanEntryStatus, PlanEvent, StopReason, TerminalReason, TextChunk, ToolCallEvent, ToolKind,
     ToolLocation, ToolResultEvent, ToolResultStatus, UsageEvent,
 };
+// `plan_install`, not `plan`: at the crate root the bare name says nothing about what is being
+// planned, and `resolve_tools` set the precedent.
+pub use install::{
+    ArchiveFormat, Consent, DISK_HEADROOM_FACTOR, InstallConfig, InstallError, InstallJob,
+    InstallOutcome, InstallPhase, InstallPlan, InstallProgress, InstallRecord, Installer, Layout,
+    Manifest, ManualSteps, PlanError, REGISTRY_BASE, RegistryAgent, RegistryDocument,
+    RegistrySource, STAGING_MAX_AGE, SweepReport, Throttle, install, plan as plan_install,
+};
 pub use launch::{
     AcpSettings, AgentLaunch, AgentSettings, CliSettings, ClientCapabilities, CredentialProbe,
-    Discovery, FallbackCommand, PlatformGlob, QuotaSettings, QuotaSource, ResolvedLaunch,
-    SessionSettings, Spawned, ToolMap, ToolProbe, UsageScope, UsageSettings, VersionProbe, resolve,
-    spawn,
+    Discovery, FallbackCommand, Install, InstallSource, PlatformGlob, QuotaSettings, QuotaSource,
+    ResolvedLaunch, SessionSettings, Spawned, ToolMap, ToolProbe, UsageScope, UsageSettings,
+    VersionProbe, resolve, spawn,
 };
 pub use permission::{PolicyAnswer, PolicyStage, evaluate as evaluate_permission};
 pub use probe::{
-    CredentialTier, ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeSource, ProbeStatus,
-    SpawnTier2, Tier2, ToolReport, ToolResolution, platform_key, probe_agent, probe_tools,
-    resolve_credential,
+    CredentialTier, INSTALL_ROOT_VAR, ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot,
+    ProbeSource, ProbeStatus, SpawnTier2, Tier2, ToolReport, ToolResolution, default_install_root,
+    install_root, platform_key, probe_agent, probe_tools, resolve_credential,
 };
 pub use record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, RecorderSummary, pump};
 pub use registry::{DriverFactory, TransportBuilder, adapter_id, caps_for};

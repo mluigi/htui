@@ -18,7 +18,7 @@ use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk, ToolKind};
 use htui_agent::event::{ToolCallEvent, ToolResultEvent, ToolResultStatus};
 use htui_agent::fake::FakeAdapter;
-use htui_agent::launch::{AgentLaunch, ToolMap, resolve};
+use htui_agent::launch::{AgentLaunch, InstallSource, ToolMap, ToolProbe, resolve};
 use htui_agent::record::{Recorder, pump};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{Agent, AgentId, ChatRunSpec, agent::seed_rows};
@@ -232,6 +232,85 @@ fn every_seed_row_deserialises_into_the_launch_types() {
                 panic!("{}'s settings row is AgentSettings: {error}", agent.name)
             });
         assert_eq!(settings.acp.protocol_version, 1, "{}", agent.name);
+
+        // Plan MOD-20 D12: `install.tool` names the key whose glob the installer has to satisfy
+        // once it has promoted its tree, so a row pointing at a tool its own discovery does not
+        // declare — or at one the installer cannot write into, which is any probe but a glob —
+        // would unpack a working adapter nothing resolves. The agreement is readable from the
+        // document alone, so it is checked here rather than paid for at install time.
+        let discovery = launch.discovery.as_ref();
+        let install = discovery.and_then(|discovery| discovery.install.as_ref());
+        if let Some(install) = install {
+            assert_eq!(install.source, InstallSource::AcpRegistry, "{}", agent.name);
+            let tools = &discovery
+                .expect("an install block implies a discovery block")
+                .tools;
+            match tools.get(&install.tool) {
+                Some(ToolProbe::Glob { .. }) => {}
+                other => panic!(
+                    "{}'s install names the tool `{}`, whose probe is {other:?} and not the glob \
+                     the installed file would have to satisfy",
+                    agent.name, install.tool
+                ),
+            }
+        }
+        // Which seed carries a source is the PRD's "Not for", pinned per row: an adapter served by
+        // a package manager of its own is installed by that, and the app must not offer to.
+        assert_eq!(
+            install.is_some(),
+            agent.name == "agy",
+            "{} declares an install block: {install:?}",
+            agent.name
+        );
+    }
+}
+
+/// The `src/` half of `R-AGT-5` for MOD-20's installer: the registry ids, the CDN host and the
+/// binary name belong to `crates/htui-core/seeds/*.json` and to `tests/`, and to no production
+/// source. A `match` on any of them is the hard-coded second agent the rule exists to forbid.
+///
+/// Vacuous the day it was written — `install/` lands in T4 — and load-bearing from then on, which
+/// is why it is written now: the sweep is already green when the first file that could break it is
+/// created, so breaking it is a red test rather than a review someone has to remember to do.
+#[test]
+fn the_installer_names_no_vendor() {
+    /// The four strings a registry-driven install is tempted to hard-code: the entry id the seed
+    /// names, the entry the live proof installs, the CDN a download comes from, the file a glob
+    /// resolves.
+    const VENDOR: [&str; 4] = ["antigravity", "amp-acp", "dl.google.com", "agy_acp_server"];
+
+    let mut offenders = Vec::new();
+    for path in tree_files() {
+        if !path.components().any(|part| part.as_os_str() == "src") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for name in VENDOR {
+            if production_half(&text).contains(name) {
+                offenders.push(format!("{}: {name}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "`R-AGT-5` says an agent costs a registry row and no source change, so an installer that \
+         spells one has stopped being data-driven: {offenders:?}"
+    );
+}
+
+/// A source file minus its trailing in-module test block.
+///
+/// In-module tests are tests, and `R-AGT-5` scopes the vendor names to the seeds and to test code
+/// wherever it lives; three of those names are in a `mod tests` under `src/` today (`tools.rs`'s
+/// glob fixture, `htui-core`'s seed contract), and a sweep that read them would be asserting the
+/// house layout rather than the rule.
+fn production_half(text: &str) -> &str {
+    match text.find("\n#[cfg(test)]\nmod tests {") {
+        Some(at) => &text[..at],
+        None => text,
     }
 }
 
