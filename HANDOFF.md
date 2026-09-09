@@ -468,6 +468,52 @@ now.
   box registration and probe hook are the natural trigger; **MOD-2** owns the glob, `newest()` and
   the `agent_box.probe` snapshot this writes into, and its README section is what this item
   replaces; **MOD-16** owns every Windows runtime fact.
+- [ ] **MOD-21 - In-app agent authentication** (from MOD-2 milestone 6). `R-AGT-1`, `R-AGT-4..6`,
+  `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent that reports `unauthenticated` is logged in
+  **from inside `htui`**, not by leaving the app for a vendor CLI. **This reverses a design
+  statement by maintainer decision (2026-09-09):** `docs/ANA-4.md` §4.5 concluded "`htui` cannot log
+  in non-interactively; a probe that gets a valid `initialize` with a non-empty `authMethods` and no
+  token is recorded as *installed-but-unauthenticated* and the agent is left disabled on that box
+  until the user authenticates through the vendor's own flow." Milestone 6 made that state visible
+  and honest — the probe records it, and the agent's own refusal now reaches the user instead of
+  being swallowed — but visible is not actionable, and today the only cure is a vendor login `htui`
+  neither performs nor explains.
+  The protocol already carries the call: ACP v1 has `authenticate`
+  (`agent-client-protocol-schema-1.7.0/src/v1/agent.rs:295`, `AuthenticateRequest`), which is how
+  Zed logs an agent in, and `agy_acp_server`'s own refusal names it first
+  ("call the `authenticate` method (supports `oauth-personal`, `gemini-api-key`,
+  `agent-platform`)"). The inputs are already stored: `probe.handshake.auth_methods` records the
+  ids in the order the agent listed them, and `agentCapabilities.auth.logout` says whether logging
+  *out* is offered — `agy` advertises it. So this item adds a driver call, a Settings action beside
+  `r`, and the transitions around them; it invents no vocabulary.
+  Scope: an `authenticate` on the driver seam (`R-AGT-1`), capability-gated so the CLI transport,
+  which has no such call, refuses rather than pretends; a chooser when a row offers several methods;
+  the flow's own progress surfaced in the TUI (`R-TUI-8`) without blocking the UI task (`R-NF-3`);
+  a re-probe on success so `unauthenticated` becomes `ready` by the same path that decided it; and
+  logout where the agent advertises it. **`htui` must still never read or store the credential** -
+  MOD-2's D59 rule stands (existence check only, tier name recorded, value never touched); the
+  vendor keeps its own token in its own directory, and this item only *triggers* the flow.
+  **Open questions this item must settle** - unrouted, and the list argues for the PRD path:
+  what an agent actually *does* during `authenticate` is unverified for both agents (does
+  `agy_acp_server` open a browser itself, print a URL on stderr, or block until a redirect?), and a
+  full-screen TUI has nowhere to put a URL a user must click, so the hand-off needs deciding
+  (render it, or `xdg-open`/`open`/`ShellExecute` it, with the Windows half **MOD-16's**);
+  the call has no documented timeout or cancellation semantics in v1 and an OAuth round trip is
+  human-paced, so it cannot use `HANDSHAKE_TIMEOUT`; the API-key methods are not a browser flow at
+  all (`gemini-api-key` wants `GEMINI_API_KEY`, `agent-platform` wants `GOOGLE_API_KEY` or
+  application-default credentials) and injecting those is **MOD-10's** secret provider, so this item
+  must call that seam rather than grow a second environment mechanism; authentication is a fact
+  about a *box*, not about the registry row, so nothing here may write `agent`; and a failed or
+  abandoned flow must leave the row exactly as it found it.
+  **Proposed requirement amendment, not applied** (`docs/REQUIREMENTS.md` is maintainer-only): a new
+  `R-AGT-9` stating that an agent reporting `unauthenticated` can be authenticated from the app,
+  through the agent's own protocol, without `htui` handling the credential. `R-AGT-6` currently
+  stops at "record version, mark enabled on that box".
+  Not blocked, and **MOD-2 is not blocked on it** - milestone 6's T34 needs only a logged-in server,
+  by any means. Cross-links: **MOD-2** owns the probe, the credential tier and the status this acts
+  on; **MOD-10** owns every credential *value*; **MOD-20** is the other half of the same story
+  (install the adapter, then log it in - one "make this box ready" flow); **MOD-7** owns the
+  Settings box profile the action sits in; **MOD-16** owns the Windows runtime facts.
 
 ### Deferred backlog
 
@@ -506,6 +552,6 @@ now.
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-3 context tools, ANA-7 secrets)                                                    |
-| MOD-N   | 18 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-20 adapter install; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 19 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-20 adapter install, MOD-21 in-app auth; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                         |
 | TOOL-N  | 2 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision)              |
