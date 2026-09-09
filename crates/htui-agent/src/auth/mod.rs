@@ -15,7 +15,9 @@
 //! outcome — the environment the child starts in, the lines it writes, the clock over them — is the
 //! same for any transport that ever grows a login.
 
+pub mod browser;
 pub mod run;
+pub mod url;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+pub use browser::open_url;
 pub use run::authenticate;
+pub use url::first_url;
 
 /// Plan MOD-21 D13: a flow silent for this long — no stderr line, no event, no choice — is
 /// cancelled and reported [`AuthOutcome::Idle`].

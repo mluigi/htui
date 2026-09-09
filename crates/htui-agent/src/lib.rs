@@ -110,7 +110,7 @@ pub use acp::{
 // `plan_install`/`resolve_tools` precedent below.
 pub use auth::{
     AUTH_IDLE_CAP, AuthCall, AuthChoice, AuthEvent, AuthFlow, AuthMethodInfo, AuthOutcome,
-    BrowserPolicy, OpenerCommand, authenticate as authenticate_acp,
+    BrowserPolicy, OpenerCommand, authenticate as authenticate_acp, first_url, open_url,
 };
 pub use driver::{
     AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, McpServerSpec,

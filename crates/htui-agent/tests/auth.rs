@@ -19,7 +19,7 @@
 //! a case's own assertion living in its own file is what lets one of them change without the others
 //! being re-read.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,10 +27,10 @@ use chrono::Utc;
 use htui_agent::acp::{AcpIo, WireFlow, run_auth};
 use htui_agent::auth::{
     AUTH_IDLE_CAP, AuthCall, AuthChoice, AuthEvent, AuthFlow, AuthMethodInfo, AuthOutcome,
-    BrowserPolicy,
+    BrowserPolicy, OpenerCommand, first_url, open_url,
 };
 use htui_agent::error::DriverError;
-use htui_agent::launch::AcpSettings;
+use htui_agent::launch::{AcpSettings, ResolvedLaunch};
 use htui_core::model::{Agent, AgentId, Billing, Transport};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
@@ -286,10 +286,26 @@ fn agent_row(launch: Value) -> Agent {
 /// An [`AuthFlow`] for `cwd` and the three ends its caller keeps, as [`wire_flow`] does for the
 /// wire half.
 ///
-/// `idle` is [`AUTH_IDLE_CAP`] because nothing reads it yet — the clock is T5's — and stating the
-/// production value here is what makes the day it starts being read a visible change.
+/// Production's two policies: [`AUTH_IDLE_CAP`] and [`BrowserPolicy::Neutralised`]. A case that is
+/// about one of them says so by calling [`auth_flow_with`] instead, which is what keeps "the
+/// default is what ships" readable in every case that is about something else.
 fn auth_flow(
     cwd: &Path,
+) -> (
+    AuthFlow,
+    mpsc::UnboundedReceiver<AuthEvent>,
+    oneshot::Sender<AuthChoice>,
+    CancellationToken,
+) {
+    auth_flow_with(cwd, AUTH_IDLE_CAP, BrowserPolicy::Neutralised)
+}
+
+/// [`auth_flow`] with the two policies named: the idle cap in milliseconds, and whether the
+/// adapter's own browser opener is neutralised.
+fn auth_flow_with(
+    cwd: &Path,
+    idle: Duration,
+    browser: BrowserPolicy,
 ) -> (
     AuthFlow,
     mpsc::UnboundedReceiver<AuthEvent>,
@@ -305,14 +321,30 @@ fn auth_flow(
             events,
             choice,
             cancel: cancel.clone(),
-            idle: AUTH_IDLE_CAP,
-            browser: BrowserPolicy::Neutralised,
+            idle,
+            browser,
         },
         events_rx,
         choice_tx,
         cancel,
     )
 }
+
+/// Every event a finished flow queued, in order.
+///
+/// Awaited rather than drained with `try_recv`: once [`AuthFlow::events`] has been dropped by both
+/// the operation and the wire — which is what a returned flow means — `recv` answers `None` at the
+/// end of the queue and cannot answer it early.
+async fn drained(events: &mut mpsc::UnboundedReceiver<AuthEvent>) -> Vec<AuthEvent> {
+    let mut all = Vec::new();
+    while let Some(event) = events.recv().await {
+        all.push(event);
+    }
+    all
+}
+
+/// A made-up authorisation link with the punctuation a real one carries (`R-AGT-5`).
+const FIXTURE_LINK: &str = "https://h.invalid/login?a=1&b=%2F";
 
 /// Polls `ready` until it answers, or fails after [`PATIENCE`].
 async fn until(what: &str, mut ready: impl FnMut() -> bool) {
@@ -701,6 +733,152 @@ async fn initialize_is_still_bounded_by_the_handshake_timeout() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The URL scan (plan D15)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn first_url_finds_the_scheme_anywhere_in_the_line() {
+    assert_eq!(
+        first_url("open the following link to log in: https://h.invalid/o?a=1&b=%2F#frag")
+            .as_deref(),
+        Some("https://h.invalid/o?a=1&b=%2F#frag"),
+        "the scheme is the only thing every agent's sentence shares, and the query is the link"
+    );
+    assert_eq!(
+        first_url("http://h.invalid/p is where to go").as_deref(),
+        Some("http://h.invalid/p")
+    );
+    assert_eq!(
+        first_url("https://h.invalid/one, or else http://h.invalid/two").as_deref(),
+        Some("https://h.invalid/one"),
+        "`https://` never contains a `http://` prefix, so the smaller index is simply the first"
+    );
+}
+
+#[test]
+fn first_url_stops_at_whitespace_and_brackets_and_strips_trailing_punctuation() {
+    for (line, expected) in [
+        ("<https://h.invalid/p>.", "https://h.invalid/p"),
+        ("(https://h.invalid/p),", "https://h.invalid/p"),
+        ("see \"https://h.invalid/p\" now", "https://h.invalid/p"),
+        ("`https://h.invalid/p`", "https://h.invalid/p"),
+        ("https://h.invalid/p\tand then", "https://h.invalid/p"),
+        ("https://h.invalid/p;", "https://h.invalid/p"),
+        ("https://h.invalid/p]}", "https://h.invalid/p"),
+    ] {
+        assert_eq!(
+            first_url(line).as_deref(),
+            Some(expected),
+            "a link a human wrapped or ended a sentence with is still the link: {line}"
+        );
+    }
+}
+
+#[test]
+fn first_url_ignores_non_http_schemes() {
+    for line in [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "ftp://h.invalid/p",
+        "mailto:nobody@h.invalid",
+    ] {
+        assert_eq!(
+            first_url(line),
+            None,
+            "the scan admits the two schemes the opener will accept, and no others: {line}"
+        );
+    }
+}
+
+#[test]
+fn first_url_is_none_for_a_line_without_one() {
+    assert_eq!(first_url(""), None);
+    assert_eq!(first_url("waiting for the browser to come back"), None);
+    assert_eq!(
+        first_url("nothing here but a word: shttp"),
+        None,
+        "a miss costs the `o` key and nothing else — the line itself is shown either way"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The browser policy (plan D16)
+// ---------------------------------------------------------------------------------------------
+
+/// A launch that spawns nothing, carrying `pairs` as its environment.
+fn launch_with_env(pairs: &[(&str, &str)]) -> ResolvedLaunch {
+    ResolvedLaunch {
+        command: "/nonexistent/htui-fixture-adapter".to_owned(),
+        args: Vec::new(),
+        env: pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect(),
+    }
+}
+
+/// D16's whole reason: a chain-style opener stops at a candidate that **exists and exits 0**, and
+/// falls through to the next one — a terminal browser — at anything else.
+///
+/// So the assertion is not "the variable is set" but "the value names something this box can run
+/// and that succeeds": a nonexistent command would be worse than no policy at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn neutralised_sets_browser_to_an_existing_executable_that_exits_zero() {
+    let mut launch = launch_with_env(&[]);
+    BrowserPolicy::Neutralised.apply(&mut launch);
+
+    let value = launch
+        .env
+        .get("BROWSER")
+        .expect("the policy inserts exactly one variable")
+        .clone();
+    assert!(
+        Path::new(&value).is_absolute(),
+        "resolved, never spelled: macOS keeps its copy somewhere this one is not ({value})"
+    );
+    assert!(
+        Path::new(&value).is_file(),
+        "an opener that cannot run this would fall through to the next candidate: {value}"
+    );
+    let status = tokio::process::Command::new(&value)
+        .status()
+        .await
+        .expect("the neutraliser runs");
+    assert!(
+        status.success(),
+        "and the next candidate is the hijack: {value}"
+    );
+}
+
+/// Unsetting `DISPLAY` would make the hijack *more* likely, not less: an opener with no display
+/// goes looking for a terminal browser. The policy is one variable, and this says which.
+#[test]
+fn neutralised_leaves_display_alone() {
+    let mut launch = launch_with_env(&[("DISPLAY", ":0"), ("WAYLAND_DISPLAY", "wayland-1")]);
+    BrowserPolicy::Neutralised.apply(&mut launch);
+
+    assert_eq!(launch.env.get("DISPLAY").map(String::as_str), Some(":0"));
+    assert_eq!(
+        launch.env.get("WAYLAND_DISPLAY").map(String::as_str),
+        Some("wayland-1")
+    );
+    assert_eq!(
+        launch.env.keys().collect::<Vec<_>>(),
+        vec!["BROWSER", "DISPLAY", "WAYLAND_DISPLAY"],
+        "exactly one variable is inserted and nothing else is touched"
+    );
+
+    let mut inherited = launch_with_env(&[("DISPLAY", ":0")]);
+    BrowserPolicy::Inherit.apply(&mut inherited);
+    assert_eq!(
+        inherited.env.keys().collect::<Vec<_>>(),
+        vec!["DISPLAY"],
+        "the control writes nothing at all"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // The operation: `AcpDriver::authenticate`, off any session
 // ---------------------------------------------------------------------------------------------
 
@@ -776,12 +954,20 @@ mod process {
     /// The scripted agent again, as a shell script: same protocol, a real pid.
     ///
     /// Behaviour by environment, so one script serves every process case. `FIXTURE_DIR` is where
-    /// the pid, the argv and the call log go; `FIXTURE_INIT` is the `initialize` result on one
-    /// line; `FIXTURE_KEY` unset makes `authenticate` refuse; `FIXTURE_HOLD` makes it never
-    /// answer; `FIXTURE_DIE` makes the process write to stderr and exit instead of answering.
+    /// the pid, the argv, the environment dump and the call log go; `FIXTURE_INIT` is the
+    /// `initialize` result on one line; `FIXTURE_KEY` unset makes `authenticate` refuse;
+    /// `FIXTURE_HOLD` makes it never answer; `FIXTURE_DIE` makes the process write to stderr and
+    /// exit instead of answering; `FIXTURE_URL` is a link printed to stderr before the answer,
+    /// `FIXTURE_TWICE` prints the same link a second time, `FIXTURE_TICKS` prints that many lines
+    /// a tenth of a second apart, and `FIXTURE_HIJACK` is the observed hijack — the adapter's own
+    /// browser opener, which runs `$BROWSER` when it has one and writes alt-screen sequences to
+    /// **stdout** when it does not. Those sequences carry no trailing newline, because a terminal
+    /// browser's do not and because that is what makes them fatal: they are glued to the front of
+    /// the agent's own next line.
     ///
-    /// It writes its own `$@` because at T3 stderr is not yet an event stream (that is T5's tap),
-    /// so a file is the only channel a case has for "what argv did the kernel actually start".
+    /// It writes its own `$@` and its own `env` because a file is the only channel a case has for
+    /// "what did the kernel actually start this with": argv answers which launch was spawned, and
+    /// the environment dump answers which variables reached the child.
     ///
     /// The id is echoed back **as it arrived**, quotes and all: this SDK sends a UUID *string* as
     /// its JSON-RPC id, and a fixture that re-quoted it — or that assumed a number — would answer
@@ -789,6 +975,7 @@ mod process {
     const AGENT_SH: &str = r#"
 echo $$ > "$FIXTURE_DIR/pid"
 printf '%s\n' "$@" > "$FIXTURE_DIR/argv"
+env > "$FIXTURE_DIR/env"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\("[^"]*"\|[0-9][0-9]*\).*/\1/p')
   case "$line" in
@@ -797,6 +984,23 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$FIXTURE_INIT" ;;
     *'"method":"authenticate"'*)
       echo authenticate >> "$FIXTURE_DIR/calls"
+      if [ -n "$FIXTURE_URL" ]; then echo "open the following link to log in: $FIXTURE_URL" >&2; fi
+      if [ -n "$FIXTURE_TWICE" ]; then echo "still waiting; the link again: $FIXTURE_URL" >&2; fi
+      if [ -n "$FIXTURE_HIJACK" ]; then
+        if [ -n "$BROWSER" ]; then
+          "$BROWSER" "$FIXTURE_URL"
+        else
+          printf '\033[?1049h\033[1;24r opening %s' "$FIXTURE_URL"
+        fi
+      fi
+      if [ -n "$FIXTURE_TICKS" ]; then
+        tick=0
+        while [ "$tick" -lt "$FIXTURE_TICKS" ]; do
+          sleep 0.1
+          tick=$((tick + 1))
+          echo "still waiting for the browser, $tick" >&2
+        done
+      fi
       if [ -n "$FIXTURE_DIE" ]; then echo boom >&2; exit 3; fi
       if [ -n "$FIXTURE_HOLD" ]; then sleep 3600; fi
       if [ -z "$FIXTURE_KEY" ]; then
@@ -1264,5 +1468,431 @@ done
             }
             methods_of(events.recv().await);
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The hand-off: stderr, the link, the browser and the clock (plan D13, D15, D16)
+    // -----------------------------------------------------------------------------------------
+
+    /// The one method every case below offers.
+    fn one_method() -> Value {
+        json!([{ "id": "m-one", "name": "One" }])
+    }
+
+    /// A driver over a row that *is* the fixture launch, with `extra` in its environment.
+    fn fixture_driver(dir: &Path, extra: &[(&str, &str)]) -> (Agent, AcpDriver) {
+        let agent = row_over(&fixture_launch(dir, one_method(), extra));
+        let driver = AcpDriver::from_row(&agent, caps_for(&agent))
+            .expect("the row's launch document parses");
+        (agent, driver)
+    }
+
+    /// The pid the fixture wrote for itself.
+    fn fixture_pid(dir: &Path) -> u32 {
+        std::fs::read_to_string(dir.join("pid"))
+            .expect("the fixture recorded its pid")
+            .trim()
+            .parse()
+            .expect("a pid is a number")
+    }
+
+    /// The value the fixture's own environment carried for `name`, if any.
+    fn fixture_env(dir: &Path, name: &str) -> Option<String> {
+        let prefix = format!("{name}=");
+        std::fs::read_to_string(dir.join("env"))
+            .expect("the fixture dumped its environment")
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix).map(ToOwned::to_owned))
+    }
+
+    /// Only the [`AuthEvent::Url`]s of a finished flow.
+    fn urls_of(events: &[AuthEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AuthEvent::Url(url) => Some(url.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many [`AuthEvent::Line`]s a finished flow carried.
+    fn lines_of(events: &[AuthEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, AuthEvent::Line(_)))
+            .count()
+    }
+
+    /// D15's deduplication, over a real adapter that says the same thing twice: two lines, one
+    /// link.
+    ///
+    /// An adapter that reprints its link while it waits is the normal case, not a strange one —
+    /// and a pane that grew a second "open this" row every time would be unreadable by the time
+    /// the human came back.
+    #[tokio::test]
+    async fn a_url_is_reported_once_per_flow() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let (_agent, driver) = fixture_driver(
+            tmp.path(),
+            &[
+                ("FIXTURE_KEY", "set"),
+                ("FIXTURE_URL", FIXTURE_LINK),
+                ("FIXTURE_TWICE", "1"),
+            ],
+        );
+
+        let (flow, mut events, choice_tx, _cancel) = auth_flow(tmp.path());
+        choice_tx
+            .send(AuthChoice::Method("m-one".to_owned()))
+            .expect("the flow holds the receiver");
+        let outcome = driver.authenticate(flow).await.expect("the flow ran");
+
+        assert_eq!(
+            outcome,
+            AuthOutcome::Completed {
+                call: AuthCall::Authenticate("m-one".to_owned())
+            }
+        );
+        let events = drained(&mut events).await;
+        assert_eq!(
+            lines_of(&events),
+            2,
+            "every line the adapter wrote is shown, verbatim: {events:?}"
+        );
+        assert_eq!(
+            urls_of(&events),
+            vec![FIXTURE_LINK],
+            "the same link twice is one link: {events:?}"
+        );
+    }
+
+    /// H-11: the variable reaches the login's own child and nothing else.
+    ///
+    /// A policy written into the row, or into what the probe records, would follow the agent into
+    /// every chat it ever runs — and `probe.resolved` is a document the next spawn reads back.
+    #[tokio::test]
+    async fn the_policy_touches_the_auth_launch_only() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let (_agent, driver) = fixture_driver(tmp.path(), &[("FIXTURE_KEY", "set")]);
+
+        let (flow, mut events, choice_tx, _cancel) = auth_flow(tmp.path());
+        choice_tx
+            .send(AuthChoice::Method("m-one".to_owned()))
+            .expect("the flow holds the receiver");
+        let outcome = driver.authenticate(flow).await.expect("the flow ran");
+        assert_eq!(
+            outcome,
+            AuthOutcome::Completed {
+                call: AuthCall::Authenticate("m-one".to_owned())
+            }
+        );
+        methods_of(events.recv().await);
+
+        let value = fixture_env(tmp.path(), "BROWSER")
+            .expect("the login's own child got the variable the policy inserts");
+        assert!(
+            Path::new(&value).is_file(),
+            "and it names something that exists: {value}"
+        );
+
+        let resolved = driver
+            .launch_in(tmp.path())
+            .await
+            .expect("the row resolves");
+        assert!(
+            !resolved.env.contains_key("BROWSER"),
+            "resolution is what a chat spawns and what a probe records; the policy is not in it: \
+             {:?}",
+            resolved.env.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The PRD's live finding as a pair, and the reason D16 exists.
+    ///
+    /// The fixture is the hijack: on `authenticate` it hands the link to `$BROWSER` when it has
+    /// one, and writes alt-screen sequences to **stdout** — the JSON-RPC channel — when it does
+    /// not. With the policy the stream survives and the link still reaches the pane.
+    ///
+    /// The launch is the control's, byte for byte, empty `BROWSER` included: the policy overwrites
+    /// that value, so the only thing this case has that the next one does not is the policy, and a
+    /// `BROWSER` a developer happens to have exported cannot stand in for it.
+    ///
+    /// The idle cap is [`PATIENCE`] rather than the production ten minutes for the reason that
+    /// constant exists: a login this fixture answers in milliseconds does not reach the clock, and
+    /// bounding it here is what makes a policy that stopped working a named failure in two seconds
+    /// instead of a suite that hangs for the length of the real cap.
+    #[tokio::test]
+    async fn with_the_policy_the_protocol_stream_survives_the_agents_browser() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let (_agent, driver) = fixture_driver(
+            tmp.path(),
+            &[
+                ("FIXTURE_KEY", "set"),
+                ("FIXTURE_URL", FIXTURE_LINK),
+                ("FIXTURE_HIJACK", "1"),
+                ("BROWSER", ""),
+            ],
+        );
+
+        let (flow, mut events, choice_tx, _cancel) =
+            auth_flow_with(tmp.path(), PATIENCE, BrowserPolicy::Neutralised);
+        choice_tx
+            .send(AuthChoice::Method("m-one".to_owned()))
+            .expect("the flow holds the receiver");
+        let outcome = driver
+            .authenticate(flow)
+            .await
+            .expect("the adapter's opener wrote nothing into the protocol channel");
+
+        assert_eq!(
+            outcome,
+            AuthOutcome::Completed {
+                call: AuthCall::Authenticate("m-one".to_owned())
+            }
+        );
+        let events = drained(&mut events).await;
+        assert_eq!(
+            urls_of(&events),
+            vec![FIXTURE_LINK],
+            "and the user still gets the link to open themselves: {events:?}"
+        );
+    }
+
+    /// The control, and the case that would have caught the live hijack.
+    ///
+    /// The same fixture, the same launch, one value removed. `BROWSER` is written **empty** rather
+    /// than merely left out because a child inherits this process's environment too, and a
+    /// developer with a browser configured would otherwise be running it: empty is what the
+    /// adapter reads as "no opener configured", which is the state the live box was in.
+    ///
+    /// **What the corruption costs, measured rather than assumed.** The plan expected a decode
+    /// error — `Err(Transport)`. This SDK does not fail on one: an undecodable stdout line is
+    /// *skipped*, which is the same tolerance `AGENT_SH`'s doc records for a response whose id it
+    /// re-quoted. So escape sequences that arrive on a line of their own cost nothing at all, and
+    /// the sequences that cost everything are the ones a terminal browser actually writes — no
+    /// trailing newline, so the agent's own answer is glued to the end of them and skipped with
+    /// them. The login then waits for an answer that was already thrown away, which is exactly the
+    /// abandoned flow D13's clock exists for: the two defences are one defence, and this is the
+    /// case that says so.
+    #[tokio::test]
+    async fn without_the_policy_the_same_agent_corrupts_the_stream() {
+        let cap = Duration::from_millis(400);
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let (_agent, driver) = fixture_driver(
+            tmp.path(),
+            &[
+                ("FIXTURE_KEY", "set"),
+                ("FIXTURE_URL", FIXTURE_LINK),
+                ("FIXTURE_HIJACK", "1"),
+                ("BROWSER", ""),
+            ],
+        );
+
+        let (flow, _events, choice_tx, _cancel) =
+            auth_flow_with(tmp.path(), cap, BrowserPolicy::Inherit);
+        choice_tx
+            .send(AuthChoice::Method("m-one".to_owned()))
+            .expect("the flow holds the receiver");
+
+        match driver.authenticate(flow).await {
+            Ok(AuthOutcome::Idle { after }) => assert_eq!(after, cap),
+            other => panic!(
+                "without the policy the adapter's own browser writes into the JSON-RPC channel \
+                 and the answer goes with it, so the flow cannot end any way but abandoned — but \
+                 this one answered {other:?}"
+            ),
+        }
+        assert_not_running(fixture_pid(tmp.path()), "the child of a hijacked flow").await;
+    }
+
+    /// D13: silence, not elapsed time — and the child does not outlive the clock.
+    #[tokio::test]
+    async fn an_idle_flow_is_killed_after_the_cap_and_reported_idle() {
+        let cap = Duration::from_millis(200);
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let (_agent, driver) =
+            fixture_driver(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")]);
+
+        let (flow, mut events, choice_tx, _cancel) =
+            auth_flow_with(tmp.path(), cap, BrowserPolicy::Neutralised);
+        choice_tx
+            .send(AuthChoice::Method("m-one".to_owned()))
+            .expect("the flow holds the receiver");
+        let outcome = driver
+            .authenticate(flow)
+            .await
+            .expect("giving up on a human is an outcome, not a failure");
+
+        assert_eq!(
+            outcome,
+            AuthOutcome::Idle { after: cap },
+            "a flow nobody is watching says so, rather than reporting the cancel it was killed by"
+        );
+        methods_of(events.recv().await);
+        assert_not_running(fixture_pid(tmp.path()), "the child of an idle flow").await;
+    }
+
+    /// The other half of D13: a line is a sign of life, so an adapter that keeps talking outlives
+    /// a cap shorter than the login it is running.
+    ///
+    /// Six lines a tenth of a second apart under a cap four times the gap: the claim is that each
+    /// line restarts the clock, not that the margin is tight, and a cap measured from the spawn
+    /// would have killed this flow at 400 ms.
+    #[tokio::test]
+    async fn a_stderr_line_resets_the_idle_clock() {
+        let cap = Duration::from_millis(400);
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let (_agent, driver) = fixture_driver(
+            tmp.path(),
+            &[("FIXTURE_KEY", "set"), ("FIXTURE_TICKS", "6")],
+        );
+
+        let (flow, mut events, choice_tx, _cancel) =
+            auth_flow_with(tmp.path(), cap, BrowserPolicy::Neutralised);
+        choice_tx
+            .send(AuthChoice::Method("m-one".to_owned()))
+            .expect("the flow holds the receiver");
+        let outcome = driver.authenticate(flow).await.expect("the flow ran");
+
+        assert_eq!(
+            outcome,
+            AuthOutcome::Completed {
+                call: AuthCall::Authenticate("m-one".to_owned())
+            },
+            "an adapter that is still writing is still working"
+        );
+        let events = drained(&mut events).await;
+        assert!(
+            lines_of(&events) >= 6,
+            "every one of those lines is what kept the flow alive: {events:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The opener (plan D17)
+    // -----------------------------------------------------------------------------------------
+
+    /// A `sh` script that records what it was handed and what its three streams are, then outlives
+    /// its caller by half a minute.
+    ///
+    /// The directory is baked into the text because [`open_url`] hands the opener a URL and
+    /// nothing else — no environment, no arguments — which is the whole of D17's contract.
+    ///
+    /// The three streams are read into shell variables **before** anything is redirected: `sh`
+    /// applies a command's redirection to its own descriptors first, so a `readlink` written
+    /// straight into a file reports that file as its stdout and answers a question nobody asked.
+    fn recorder(dir: &Path) -> PathBuf {
+        let path = dir.join("opener.sh");
+        let dir = dir.display();
+        executable(
+            &path,
+            &format!(
+                "#!/bin/sh\n\
+                 if [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then terminal=tty; else terminal=notty; fi\n\
+                 zero=$(readlink /proc/$$/fd/0)\n\
+                 one=$(readlink /proc/$$/fd/1)\n\
+                 two=$(readlink /proc/$$/fd/2)\n\
+                 printf '%s\\n%s\\n%s\\n%s\\n' \"$terminal\" \"$zero\" \"$one\" \"$two\" \
+                 >> \"{dir}/stdio\"\n\
+                 printf '%s\\n' \"$1\" >> \"{dir}/opened\"\n\
+                 sleep 30\n"
+            ),
+        );
+        path
+    }
+
+    /// [`open_url`], retrying the `ETXTBSY` window [`executable`] describes, and answering how
+    /// long the attempt that got through took.
+    async fn opened(
+        url: &str,
+        opener: &OpenerCommand,
+    ) -> (htui_agent::error::Result<()>, Duration) {
+        for _ in 0..20u32 {
+            let started = std::time::Instant::now();
+            match open_url(url, opener).await {
+                Err(DriverError::Spawn(message)) if message.contains("Text file busy") => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                other => return (other, started.elapsed()),
+            }
+        }
+        panic!("the opener never got past the `ETXTBSY` window");
+    }
+
+    /// The lines the recorder wrote to `name`.
+    fn recorded(dir: &Path, name: &str) -> Vec<String> {
+        std::fs::read_to_string(dir.join(name))
+            .unwrap_or_default()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    /// D17 closes the one door the scan could otherwise open, and closes it **before** a process
+    /// exists: `file:` and `javascript:` are refused, not spawned and then regretted.
+    #[tokio::test]
+    async fn open_url_refuses_a_non_http_scheme_before_spawning() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let opener = OpenerCommand::Custom(recorder(tmp.path()));
+
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "ftp://h.invalid/p",
+            "h.invalid/no-scheme-at-all",
+        ] {
+            match open_url(url, &opener).await {
+                Err(DriverError::Transport(message)) => assert!(
+                    message.contains("http"),
+                    "the refusal says which schemes are opened: {message}"
+                ),
+                other => panic!("`{url}` is not a link `htui` opens, but it answered {other:?}"),
+            }
+        }
+        assert!(
+            !tmp.path().join("opened").exists(),
+            "the refusal happened before any process did"
+        );
+    }
+
+    /// H-3 and H-4 together: the opener gets the link, gets no terminal, and is never waited on.
+    ///
+    /// The recorder sleeps for thirty seconds. A call that returns in milliseconds is the whole
+    /// claim: `htui` neither blocks on the browser nor owns the tree it starts.
+    #[tokio::test]
+    async fn open_url_spawns_with_null_stdio_and_does_not_wait() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let opener = OpenerCommand::Custom(recorder(tmp.path()));
+
+        let (result, elapsed) = opened(FIXTURE_LINK, &opener).await;
+        result.expect("the opener spawned");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the opener sleeps for thirty seconds; the call may not: {elapsed:?}"
+        );
+
+        until("the opener to record what it was handed", || {
+            !recorded(tmp.path(), "opened").is_empty()
+        })
+        .await;
+        assert_eq!(
+            recorded(tmp.path(), "opened"),
+            vec![FIXTURE_LINK.to_owned()],
+            "the URL travels as the opener's one argument, unquoted and unmangled"
+        );
+
+        let stdio = recorded(tmp.path(), "stdio");
+        assert_eq!(
+            stdio.first().map(String::as_str),
+            Some("notty"),
+            "an opener with a terminal is an opener that can seize `htui`'s screen: {stdio:?}"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            stdio[1..],
+            ["/dev/null", "/dev/null", "/dev/null"],
+            "all three streams, not just stdout"
+        );
     }
 }
