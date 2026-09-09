@@ -157,9 +157,15 @@ impl Harness {
     /// the state a snapshot wants to photograph.
     ///
     /// The runtime-served list below is written out by hand rather than derived, so every request
-    /// the runtime owns has to be added to it deliberately. The three MOD-20 install requests are
-    /// on it for that reason: without them, `Settings > i` in a harness test would be answered
-    /// "no agent runtime in this harness" by a harness that has one.
+    /// the runtime owns has to be added to it deliberately. The three MOD-20 install requests and
+    /// MOD-21's four login ones are on it for that reason: without them, `Settings > i` or
+    /// `Settings > a` in a harness test would be answered "no agent runtime in this harness" by a
+    /// harness that has one.
+    ///
+    /// A login is the one of them that can be `Pending` on a **human** rather than on work: the
+    /// flow's task makes progress only between drives, and a case that is waiting for a frame
+    /// alternates `drive()` with a short sleep rather than calling [`Harness::drive_to_end`],
+    /// which would await the flow for `CHAT_END` first (blueprint P-2).
     ///
     /// That reading holds for a chat whose writer never leaves the task — `MemStore`'s
     /// `append_events` is a lock and a `Vec` push, and `PgStore`'s is served inline here too. It
@@ -191,7 +197,11 @@ impl Harness {
                         | StoreRequest::ProbeAgents
                         | StoreRequest::InstallPlan { .. }
                         | StoreRequest::InstallConfirm { .. }
-                        | StoreRequest::InstallCancel,
+                        | StoreRequest::InstallCancel
+                        | StoreRequest::AuthStart { .. }
+                        | StoreRequest::AuthChoose { .. }
+                        | StoreRequest::AuthOpen { .. }
+                        | StoreRequest::AuthCancel,
                         _,
                     ) => match self.runtime.as_mut() {
                         Some(runtime) => {

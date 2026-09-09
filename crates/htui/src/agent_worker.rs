@@ -23,6 +23,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use htui_agent::acp::SESSION_STARTED;
+use htui_agent::auth::{
+    AUTH_IDLE_CAP, AuthChoice, AuthEvent, AuthFlow, AuthOutcome, BrowserPolicy, OpenerCommand,
+    open_url,
+};
 use htui_agent::driver::{
     AgentDriver, AgentSession, DriverCaps, PermissionAnswer, PermissionPolicy, PermissionRequestId,
     SessionSpec,
@@ -34,9 +38,11 @@ use htui_agent::install::{
     Installer, PlanError, install, plan as plan_install,
 };
 use htui_agent::launch::{AgentLaunch, AgentSettings};
-use htui_agent::probe::{ProbeContext, ProbeEnv, ProbeOutcome, SpawnTier2, probe_agent};
+use htui_agent::probe::{
+    ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeStatus, SpawnTier2, probe_agent,
+};
 use htui_agent::record::{AnsweredBy, Recorder};
-use htui_agent::registry::DriverFactory;
+use htui_agent::registry::{DriverFactory, caps_for};
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, ChatRunSpec, RunStatus, StepId, Transport,
 };
@@ -44,12 +50,13 @@ use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{StoreError, WriteStore};
 use htui_store::{Backend, Writer};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::store_worker::{
-    ChatFrame, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply, StoreRequest,
+    AuthFrame, ChatFrame, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply,
+    StoreRequest,
 };
 
 /// How long a cancelled session may take the graceful path before its tree is killed.
@@ -170,6 +177,64 @@ impl core::fmt::Debug for LiveInstall {
     }
 }
 
+/// What the worker asks a live login to do (MOD-21 D18).
+///
+/// The [`ChatCommand`] shape, and for the same reason: there are two things a running flow can be
+/// told, each answered at the address of the request that asked. A `oneshot` on the runtime would
+/// carry one of them, and the opener has to run somewhere the runtime can name — `background`
+/// would trip [`AgentRuntime::claim_is_free`]'s "a probe is running", and a bare `tokio::spawn`
+/// would be a task nobody owns.
+#[derive(Debug)]
+pub enum AuthCommand {
+    /// The user picked from the live method list.
+    Choose {
+        /// The method, or a logout.
+        choice: AuthChoice,
+        /// Who to answer, and whose `seq` every later frame of the flow carries.
+        reply: ReplyAddr,
+    },
+    /// Open the link the pane is showing.
+    Open {
+        /// The link, as the adapter printed it.
+        url: String,
+        /// Who to answer, once.
+        reply: ReplyAddr,
+    },
+}
+
+/// The one login this runtime allows at a time (MOD-21 D18, D19).
+///
+/// Cancelled through the token rather than aborted, for [`LiveInstall`]'s reason: the task owes
+/// its stream a last frame, and it owns the child that has to be killed and reaped before it can
+/// send one.
+pub struct LiveAuth {
+    /// Which registry row this login is for.
+    agent_id: AgentId,
+    /// Tripped by [`StoreRequest::AuthCancel`], by shutdown, and (as its child, inside
+    /// `htui-agent`) by the idle clock.
+    cancel: CancellationToken,
+    /// Into [`run_auth`]. Closed means the flow has ended.
+    commands: mpsc::UnboundedSender<AuthCommand>,
+    /// The task that answers the request.
+    task: JoinHandle<()>,
+    /// MOD-21 D19: the row's `(agent_id, box_id)` re-probe claim, held for the flow's **whole**
+    /// life so a chat started during the browser round trip cannot re-probe the row under it and
+    /// record `unauthenticated` seconds before the flow's own probe records `ready` (blueprint
+    /// H-16). Released by `Drop` when the runtime lets go of this value.
+    _claim: ReprobeClaim,
+}
+
+impl core::fmt::Debug for LiveAuth {
+    /// Ids and finishedness, never a line, a link or an environment (`R-SEC-2`, blueprint H-5).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LiveAuth")
+            .field("agent_id", &self.agent_id)
+            .field("finished", &self.task.is_finished())
+            .field("closed", &self.commands.is_closed())
+            .finish()
+    }
+}
+
 /// A chat's session future: production spawns it, the harness polls it inline (plan D30).
 pub type ChatTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -234,6 +299,17 @@ pub struct AgentRuntime {
     installer: Option<InstallConfig>,
     /// The install running right now, if any.
     install: Option<LiveInstall>,
+    /// The login running right now, if any (MOD-21 D18).
+    ///
+    /// One deep, and it shares [`claim_is_free`](Self::claim_is_free) with the install and the
+    /// probe: all three end by writing `agent_box`, and two of them at once are a last-write-wins
+    /// on one row (MOD-21 D19).
+    auth: Option<LiveAuth>,
+    /// What [`StoreRequest::AuthOpen`] spawns (MOD-21 D17, blueprint P-5).
+    ///
+    /// [`OpenerCommand::Platform`] in production. The injected seam a login case needs: `set_var`
+    /// is forbidden here, so a test that must not launch the maintainer's browser says so as data.
+    opener: OpenerCommand,
 }
 
 impl core::fmt::Debug for AgentRuntime {
@@ -258,6 +334,8 @@ impl AgentRuntime {
             reprobe_claims: ReprobeClaims::default(),
             installer: None,
             install: None,
+            auth: None,
+            opener: OpenerCommand::Platform,
         }
     }
 
@@ -288,6 +366,28 @@ impl AgentRuntime {
     #[must_use]
     pub fn install_running(&self) -> bool {
         self.install
+            .as_ref()
+            .is_some_and(|live| !live.task.is_finished())
+    }
+
+    /// A runtime that opens links with this command (MOD-21 D17, blueprint P-5).
+    ///
+    /// Production leaves it at [`OpenerCommand::Platform`]. A test injects a script that records
+    /// what it was handed, which is the only way `o` is provable without a browser.
+    #[must_use]
+    pub fn with_opener(mut self, opener: OpenerCommand) -> Self {
+        self.opener = opener;
+        self
+    }
+
+    /// Whether a login is running.
+    ///
+    /// The same shape as [`install_running`](Self::install_running) and for the same reason: a
+    /// flow that has answered still occupies the slot until the next [`serve`](Self::serve)
+    /// sweeps it (blueprint H-25), and what a case asks about is the *task*.
+    #[must_use]
+    pub fn auth_running(&self) -> bool {
+        self.auth
             .as_ref()
             .is_some_and(|live| !live.task.is_finished())
     }
@@ -340,6 +440,18 @@ impl AgentRuntime {
                 tracing::warn!(?limit, "an install did not finish and was aborted");
             }
         }
+        // The identical arm for a login (blueprint P-2): awaited first, cancelled and aborted only
+        // when it overruns. A flow parked on a human therefore costs a caller the whole `limit`,
+        // which is why a harness case watching a live login drives and sleeps rather than calling
+        // this.
+        if let Some(LiveAuth { cancel, task, .. }) = self.auth.take() {
+            let abort = task.abort_handle();
+            if tokio::time::timeout(limit, task).await.is_err() {
+                cancel.cancel();
+                abort.abort();
+                tracing::warn!(?limit, "a login did not finish and was aborted");
+            }
+        }
     }
 
     /// Records the task handle of a chat the caller spawned.
@@ -378,6 +490,10 @@ impl AgentRuntime {
         // And for the install claim, which is one deep: an install that has answered must not go
         // on refusing the next `i` (blueprint H-10).
         self.install.take_if(|live| live.task.is_finished());
+        // And for the login claim, which is one deep for the same reason. Dropping the value here
+        // is also what releases its `ReprobeClaim`: a finished flow must not go on excluding the
+        // chat re-probe of its own row (blueprint H-25).
+        self.auth.take_if(|live| live.task.is_finished());
 
         let addr = ReplyAddr {
             seq: envelope.seq,
@@ -452,6 +568,27 @@ impl AgentRuntime {
                 }
             }
             StoreRequest::InstallCancel => self.install_cancel(),
+            StoreRequest::AuthStart { agent_id } => {
+                match self.auth_start(backend, replies, addr, *agent_id).await {
+                    Ok(served) => served,
+                    Err(err) => Served::Reply(failed("auth_start", &err)),
+                }
+            }
+            StoreRequest::AuthChoose { choice } => self.auth_command(
+                "auth_choose",
+                AuthCommand::Choose {
+                    choice: choice.clone(),
+                    reply: addr,
+                },
+            ),
+            StoreRequest::AuthOpen { url } => self.auth_command(
+                "auth_open",
+                AuthCommand::Open {
+                    url: url.clone(),
+                    reply: addr,
+                },
+            ),
+            StoreRequest::AuthCancel => self.auth_cancel(),
             other => Served::Reply(StoreReply::Failed {
                 request: other.name(),
                 message: "not a chat request".to_owned(),
@@ -495,6 +632,18 @@ impl AgentRuntime {
                 );
             }
         }
+        if let Some(live) = self.auth.take() {
+            // The same arm, for the same reason and one more: the flow's child is an adapter with
+            // an open loopback listener waiting for an OAuth redirect, and only the task's own
+            // exit runs `ChildGuard::kill_and_reap` (MOD-21 D12). The token is what gets it there.
+            live.cancel.cancel();
+            if tokio::time::timeout(grace * 2, live.task).await.is_err() {
+                tracing::warn!(
+                    agent = %live.agent_id,
+                    "a login did not end within the grace window"
+                );
+            }
+        }
         for task in std::mem::take(&mut self.background) {
             task.abort();
         }
@@ -513,6 +662,15 @@ impl AgentRuntime {
         replies: &mpsc::UnboundedSender<ReplyEnvelope>,
         addr: ReplyAddr,
     ) -> Result<Served, StoreError> {
+        // MOD-21 D19, the third holder of one claim: a login ends by re-probing its row, and a
+        // probe writes one for every row — including that one. The sentence names the row so the
+        // status line says what to wait for.
+        if let Some(live) = &self.auth {
+            return Err(StoreError::Backend(format!(
+                "a login is running for agent {}; probe once it has finished",
+                live.agent_id
+            )));
+        }
         // The other half of `claim_is_free`'s rule: an install's re-probe writes `agent_box` for
         // its row, and a probe writes one for every row. Whichever started first, running them
         // together races on the same row, so each refuses while the other holds the box.
@@ -678,6 +836,140 @@ impl AgentRuntime {
         Served::Reply(StoreReply::Install(InstallFrame::Cancelling))
     }
 
+    /// The [`StoreRequest::AuthStart`] path (MOD-21 D18, D19).
+    ///
+    /// Every refusal is here, **before anything is spawned**, in the probe's and the install's own
+    /// order and for their own reasons. No writer, or one that refuses `agent_box`: the flow ends
+    /// by re-probing the row, and a login whose verdict could never be recorded would cost a
+    /// process spawn and a human's minutes to throw the answer away. No box row: `agent_box` has
+    /// no primary key without one. The claim held: a login, an install and a probe all write that
+    /// row (D19). The row's own re-probe claim held: a chat's staleness probe is already asking
+    /// the same question of the same box. No such row. Then two facts read off documents the loop
+    /// is already holding — the transport has no `authenticate` call at all (D10), or the stored
+    /// snapshot says the agent advertises no method to choose from.
+    ///
+    /// The [`Writer`] is **taken** rather than checked, as [`install_confirm`](Self::install_confirm)
+    /// takes it: the task is what writes the row the re-probe produces, and the loop replaces its
+    /// own `Backend` wholesale whenever the server comes or goes.
+    ///
+    /// What is **awaited** here is the whole of `R-NF-3` for this request: `box_info()` and
+    /// `agents()`, the same two the probe and the pre-flight await on their arms. The spawn, the
+    /// handshake, the human and the re-probe all happen in the task.
+    async fn auth_start(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        agent_id: AgentId,
+    ) -> Result<Served, StoreError> {
+        let writer = recording_writer(backend)?;
+        let box_id = registered_box(backend).await?;
+        self.claim_is_free()?;
+        let claim = self
+            .reprobe_claims
+            .claim((agent_id, box_id))
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "a re-probe is running for agent {agent_id}; try again in a moment"
+                ))
+            })?;
+        let summary = row_for(backend, agent_id).await?;
+        if !caps_for(&summary.agent).authenticate {
+            return Err(StoreError::Backend(
+                DriverError::Unsupported("authenticate").to_string(),
+            ));
+        }
+        // The snapshot decides whether a login is *offered*; the chooser is fed by the live
+        // `initialize` answer the flow itself gets (MOD-21 D7). A row nobody has probed and a row
+        // whose agent demands nothing are the same refusal: there is no method to choose.
+        let advertises = summary
+            .on_box
+            .as_ref()
+            .and_then(ProbeSnapshot::from_row)
+            .and_then(|snapshot| snapshot.handshake)
+            .is_some_and(|handshake| !handshake.auth_methods.is_empty());
+        if !advertises {
+            return Err(StoreError::Backend(format!(
+                "`{}` advertises no authentication methods",
+                summary.agent.name
+            )));
+        }
+        let driver = self
+            .factory
+            .driver_for(&summary.agent, summary.on_box.as_ref())
+            .map_err(|err| StoreError::Backend(err.to_string()))?;
+        let cwd = std::env::current_dir().map_err(|err| {
+            StoreError::Backend(format!("this process has no working directory: {err}"))
+        })?;
+
+        let cancel = CancellationToken::new();
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_auth(AuthArgs {
+            driver,
+            agent: summary.agent,
+            existing: summary.on_box,
+            box_id,
+            writer,
+            cwd,
+            cancel: cancel.clone(),
+            commands: commands_rx,
+            opener: self.opener.clone(),
+            frames: Frames {
+                tx: replies.clone(),
+                addr,
+            },
+        }));
+        self.auth = Some(LiveAuth {
+            agent_id,
+            cancel,
+            commands: commands_tx,
+            task,
+            _claim: claim,
+        });
+        Ok(Served::Deferred)
+    }
+
+    /// Forwards a command to the live login (MOD-21 D18).
+    ///
+    /// [`command`](Self::command)'s shape, and its two refusals: nothing running, and a channel
+    /// the task has already dropped. Both are refusals *of the request*
+    /// ([`StoreReply::Failed`]), never frames of a stream that has ended — the section keeps its
+    /// pane on the second one for `auth_open` and clears it on the flow's own terminal frame
+    /// (blueprint H-22).
+    fn auth_command(&mut self, request: &'static str, command: AuthCommand) -> Served {
+        let Some(live) = self.auth.as_ref() else {
+            return Served::Reply(StoreReply::Failed {
+                request,
+                message: "no login is running".to_owned(),
+            });
+        };
+        if live.commands.send(command).is_err() {
+            self.auth = None;
+            return Served::Reply(StoreReply::Failed {
+                request,
+                message: "this login has ended".to_owned(),
+            });
+        }
+        Served::Deferred
+    }
+
+    /// The [`StoreRequest::AuthCancel`] path (MOD-21 D3, D18).
+    ///
+    /// [`install_cancel`](Self::install_cancel)'s shape: answered at once, and the claim is **not**
+    /// released here. The task still owns a child with an open loopback listener that it has to
+    /// kill and reap, and still owes its stream a last frame; it ends itself, and the sweep at the
+    /// top of [`serve`](Self::serve) is what forgets it.
+    fn auth_cancel(&mut self) -> Served {
+        let Some(live) = self.auth.as_ref() else {
+            return Served::Reply(StoreReply::Failed {
+                request: "auth_cancel",
+                message: "no login is running".to_owned(),
+            });
+        };
+        live.cancel.cancel();
+        Served::Reply(StoreReply::Auth(AuthFrame::Cancelling))
+    }
+
     /// Where this runtime would install from, or the refusal that says it cannot.
     fn install_config(&self) -> Result<InstallConfig, StoreError> {
         self.installer
@@ -685,8 +977,17 @@ impl AgentRuntime {
             .ok_or_else(|| StoreError::Backend("this runtime has no installer".to_owned()))
     }
 
-    /// `Ok` when no install holds the claim (hazard H-10).
+    /// `Ok` when no install, probe or login holds the claim (hazard H-10, MOD-21 D19).
     fn claim_is_free(&self) -> Result<(), StoreError> {
+        // MOD-21 D19: one claim, three holders. A login writes `agent_box` for its row at the end
+        // of the flow, exactly as an install does, so the two exclude each other in both
+        // directions and a second login is refused by the same line.
+        if let Some(live) = &self.auth {
+            return Err(StoreError::Backend(format!(
+                "a login is already running for agent {}",
+                live.agent_id
+            )));
+        }
         if let Some(live) = &self.install {
             return Err(StoreError::Backend(format!(
                 "an install is already running for agent {}",
@@ -1468,6 +1769,204 @@ async fn run_install(args: InstallArgs) {
         }),
     };
     frames.reply(&addr, reply);
+}
+
+/// Everything the login task owns (MOD-21 D18).
+///
+/// A [`Writer`] and not a [`Backend`], for [`ProbeArgs`]'s reason: the loop replaces its one
+/// `Backend` wholesale when the server comes or goes, and this outlives the arm that built it by
+/// however long a human takes in a browser — the longest-lived of the three.
+struct AuthArgs {
+    driver: Box<dyn AgentDriver>,
+    agent: Agent,
+    existing: Option<AgentBox>,
+    box_id: BoxId,
+    writer: Writer,
+    cwd: std::path::PathBuf,
+    cancel: CancellationToken,
+    commands: mpsc::UnboundedReceiver<AuthCommand>,
+    opener: OpenerCommand,
+    frames: Frames,
+}
+
+impl core::fmt::Debug for AuthArgs {
+    /// The writer's label and the row's name; never the launch environment (`R-SEC-2`).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AuthArgs")
+            .field("writer", &self.writer.label())
+            .field("agent", &self.agent.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One login, in its own task: the method list, the user's choice, the stream, and the re-probe
+/// that decides what any of it meant (MOD-21 D18, D6).
+///
+/// **Two addresses, one stream.** Frames before the choice answer the `AuthStart`; from the
+/// choice onwards they answer the `AuthChoose`, because `App::is_fresh` keys on the request kind
+/// and a stale start must not out-rank the answer the user just gave (blueprint P-3: a local
+/// `addr`, since `Frames` owns its own).
+///
+/// **The probe is the sole authority** (`R-AGT-6`, D6). On [`AuthOutcome::Completed`] — and only
+/// there — the row is re-probed through `probe_agent` and **written before** the terminal frame,
+/// exactly as [`run_install`] documents: the section issues a [`StoreRequest::Agents`] the moment
+/// it sees [`AuthFrame::Done`], and a read that overtook the write would show the box as it was
+/// before the login. Tier 2 only ([`ProbeEnv::without_versions`]) because a login changes no
+/// version string. Every other outcome writes **nothing at all**, `probed_at` included: a refusal,
+/// a cancel and an abandoned flow each leave `agent_box` exactly as they found it.
+///
+/// Nothing here touches `agent`. A login is a fact about a box (`R-AGT-9`).
+async fn run_auth(args: AuthArgs) {
+    let AuthArgs {
+        driver,
+        agent,
+        existing,
+        box_id,
+        writer,
+        cwd,
+        cancel,
+        mut commands,
+        opener,
+        frames,
+    } = args;
+    // The `AuthStart`'s address until the choice arrives, and the `AuthChoose`'s afterwards.
+    let mut addr = frames.addr.clone();
+
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (choice_tx, choice_rx) = oneshot::channel();
+    // Taken by the first choice; a second one is refused rather than dropped, so the pane hears
+    // back exactly once for every request it spent.
+    let mut choice_tx = Some(choice_tx);
+
+    let running = driver.authenticate(AuthFlow {
+        cwd: cwd.clone(),
+        events: events_tx,
+        choice: choice_rx,
+        cancel,
+        idle: AUTH_IDLE_CAP,
+        browser: BrowserPolicy::Neutralised,
+    });
+    tokio::pin!(running);
+
+    let mut listening = true;
+    let mut serving = true;
+    let outcome = loop {
+        tokio::select! {
+            // Biased towards the flow: the moment it has answered there is nothing left to
+            // forward that the drain below will not pick up.
+            biased;
+            outcome = &mut running => break outcome,
+            event = events_rx.recv(), if listening => match event {
+                Some(event) => frames.reply(&addr, StoreReply::Auth(auth_frame(event))),
+                None => listening = false,
+            },
+            command = commands.recv(), if serving => match command {
+                Some(AuthCommand::Choose { choice, reply }) => match choice_tx.take() {
+                    Some(sender) => {
+                        addr = reply;
+                        let _ = sender.send(choice);
+                    }
+                    None => frames.reply(
+                        &reply,
+                        StoreReply::Failed {
+                            request: "auth_choose",
+                            message: "a method was already chosen".to_owned(),
+                        },
+                    ),
+                },
+                Some(AuthCommand::Open { url, reply }) => {
+                    // The opener is spawned and never waited on, so this arm costs the flow one
+                    // `fork`/`exec` and not a browser's lifetime (MOD-21 D17).
+                    let answer = match open_url(&url, &opener).await {
+                        Ok(()) => StoreReply::Auth(AuthFrame::Opened),
+                        Err(err) => StoreReply::Failed {
+                            request: "auth_open",
+                            message: err.to_string(),
+                        },
+                    };
+                    frames.reply(&reply, answer);
+                }
+                // The runtime let go of this login: nothing more will be asked of it.
+                None => serving = false,
+            },
+        }
+    };
+
+    // The events sender lived inside the future that has just returned, so this drains what it
+    // wrote on its way out and then ends — the last stderr line an adapter prints is often the
+    // one that says why.
+    while let Some(event) = events_rx.recv().await {
+        frames.reply(&addr, StoreReply::Auth(auth_frame(event)));
+    }
+
+    let frame = match outcome {
+        Ok(AuthOutcome::Completed { call }) => {
+            let ctx = ProbeContext {
+                env: ProbeEnv::host(cwd).without_versions(),
+                now: Utc::now(),
+            };
+            match probe_agent(
+                &agent,
+                box_id,
+                existing.as_ref(),
+                &ctx,
+                &SpawnTier2::default(),
+            )
+            .await
+            {
+                ProbeOutcome::Row(row) => match writer.upsert_agent_box(&row).await {
+                    Ok(()) => AuthFrame::Done {
+                        call,
+                        // Read back off the row this task just wrote, never decided here.
+                        status: ProbeSnapshot::from_row(&row)
+                            .map_or(ProbeStatus::Failed, |snapshot| snapshot.status),
+                    },
+                    Err(err) => AuthFrame::Failed {
+                        message: err.to_string(),
+                    },
+                },
+                // Plan D51: a hand-written row the probe could not confirm is left exactly as it
+                // is, and what the box says about itself is still what it said before.
+                ProbeOutcome::Kept { reason } => {
+                    tracing::info!(agent = %agent.name, reason, "the login left a row alone");
+                    AuthFrame::Done {
+                        call,
+                        status: existing
+                            .as_ref()
+                            .and_then(ProbeSnapshot::from_row)
+                            .map_or(ProbeStatus::Unauthenticated, |snapshot| snapshot.status),
+                    }
+                }
+            }
+        }
+        Ok(AuthOutcome::Refused { message, .. }) => AuthFrame::Refused { message },
+        // Blueprint H-23: a `Declined` is this task's own exit — the sender dropped by a shutdown
+        // mid-chooser — and reads to a user as exactly what a cancel does.
+        Ok(AuthOutcome::Cancelled | AuthOutcome::Declined) => AuthFrame::Cancelled,
+        Ok(AuthOutcome::Idle { after }) => AuthFrame::Idle { after },
+        Err(err) => AuthFrame::Failed {
+            message: err.to_string(),
+        },
+    };
+    frames.reply(&addr, StoreReply::Auth(frame));
+}
+
+/// One flow event as the frame the section renders. A total map, and deliberately dull: the two
+/// enums are the same vocabulary either side of the crate boundary.
+fn auth_frame(event: AuthEvent) -> AuthFrame {
+    match event {
+        AuthEvent::Methods {
+            methods,
+            logout,
+            hidden,
+        } => AuthFrame::Methods {
+            methods,
+            logout,
+            hidden,
+        },
+        AuthEvent::Line(line) => AuthFrame::Line(line),
+        AuthEvent::Url(url) => AuthFrame::Url(url),
+    }
 }
 
 /// The reply-channel side of one chat: one address, one sender, one place frames are shaped.
@@ -3990,5 +4489,1241 @@ pub(crate) mod tests {
             answer.payload.get("option_id").and_then(Value::as_str),
             Some("allow")
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-21: the login fixtures and cases (T6)
+    //
+    // A real child, because the subject is a runtime that spawns one: the fixture is a `sh`
+    // script that speaks just enough JSON-RPC to answer `initialize`, `authenticate` and
+    // `logout`, and writes its own pid where a case can read it. Every id, link and "credential"
+    // below is made up — `R-AGT-5` says this crate knows no agent's name, no method id and no
+    // vendor host, and a worker case that spelled one would be asserting the seeds.
+    // -----------------------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    pub(crate) mod auth {
+        use super::*;
+        use htui_agent::acp::Handshake;
+        use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo, OpenerCommand};
+        use htui_agent::probe::{CredentialTier, ProbeSource};
+        use std::path::{Path, PathBuf};
+
+        /// The one method the fixture advertises. A made-up id: the chooser is fed by the agent's
+        /// own `initialize`, so a case only ever needs *an* id, never a real one.
+        pub(crate) const METHOD: &str = "m-one";
+
+        /// What a "credential" is here: a sentinel string the fixture writes into the file its
+        /// row's `discovery.credential.files` names. No frame may ever carry it (`R-SEC-2`).
+        pub(crate) const CREDENTIAL: &str = "SECRET-SENTINEL";
+
+        /// The link the fixture prints to its own stderr, carrying a second sentinel in its query.
+        ///
+        /// The URL itself is a frame the user is meant to see; what the case pins is that the
+        /// *credential* never becomes one.
+        pub(crate) const LINK: &str = "https://h.invalid/login?state=SENTINEL-TOKEN-VALUE";
+
+        /// How long a case waits on a child before calling the flow stuck rather than slow.
+        const PATIENCE: Duration = Duration::from_secs(30);
+
+        /// How long a signalled process is given to stop being one (`tests/acp_driver.rs`'s size).
+        const KILL_WINDOW: Duration = Duration::from_secs(5);
+
+        /// The scripted agent, as a shell script: the same protocol as a duplex fixture, a real
+        /// pid, and a real environment.
+        ///
+        /// Behaviour by environment, so one script serves every case. `FIXTURE_DIR` is where the
+        /// pid and the credential go; `FIXTURE_INIT` is the `initialize` result on one line;
+        /// `FIXTURE_KEY` unset makes `authenticate` refuse the way a real adapter refuses a login
+        /// it has no variable for; `FIXTURE_HOLD` makes it never answer; `FIXTURE_URL` is a link
+        /// printed to stderr before the answer; `FIXTURE_CRED` is written into the credential file
+        /// on success and removed on `logout`.
+        ///
+        /// The id is echoed back **as it arrived**, quotes and all: this SDK sends a UUID *string*
+        /// as its JSON-RPC id, and a fixture that assumed a number would answer with a line the
+        /// client's decoder skips — a handshake timeout wearing a costume.
+        const AGENT_SH: &str = r#"
+echo $$ > "$FIXTURE_DIR/pid"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\("[^"]*"\|[0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$FIXTURE_INIT" ;;
+    *'"method":"authenticate"'*)
+      if [ -n "$FIXTURE_URL" ]; then echo "open the following link to log in: $FIXTURE_URL" >&2; fi
+      if [ -n "$FIXTURE_HOLD" ]; then sleep 3600; fi
+      if [ -z "$FIXTURE_KEY" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"the FIXTURE_KEY variable must be set where this server is launched from"}}\n' "$id"
+      else
+        if [ -n "$FIXTURE_CRED" ]; then printf '%s\n' "$FIXTURE_CRED" > "$FIXTURE_DIR/credential"; fi
+        printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      fi ;;
+    *'"method":"logout"'*)
+      rm -f "$FIXTURE_DIR/credential"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#;
+
+        /// Writes `contents` at `path` and makes it executable (`tests/probe.rs`'s helper).
+        ///
+        /// The agent script is run as `/bin/sh <path>` rather than executed, for that helper's
+        /// `ETXTBSY` reason: a `fork` in another test's spawn inherits every fd open at that
+        /// instant, and a child holding a write fd makes `execve` refuse until it execs. `sh` only
+        /// *reads* the file, so the window never opens.
+        fn executable(path: &Path, contents: &str) {
+            std::fs::write(path, contents).expect("write");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        /// The `initialize` result the fixture answers with, on one line so the script's `case`
+        /// globs cannot trip on it.
+        fn init_result() -> String {
+            serde_json::to_string(&json!({
+                "protocolVersion": 1,
+                "agentInfo": { "name": "login-fixture", "version": "0.0.0" },
+                "agentCapabilities": { "loadSession": false, "auth": { "logout": {} } },
+                "authMethods": [
+                    { "id": METHOD, "name": "One", "description": "the fixture's only method" }
+                ],
+            }))
+            .expect("one line of JSON")
+        }
+
+        /// A registry row whose adapter **is** the fixture script.
+        ///
+        /// `command: "/bin/sh"` with the script as its argument, and a `discovery` that names no
+        /// tool: tier 1 has nothing to resolve, so the row reaches tier 2 (`probe.rs:1444-1448`)
+        /// and the re-probe the flow ends with is a real handshake. `credential.files` names the
+        /// file the fixture writes, which is what turns a completed call into `ready`.
+        pub(crate) fn login_row(
+            id: AgentId,
+            transport: Transport,
+            dir: &Path,
+            extra: &[(&str, &str)],
+        ) -> Agent {
+            let script = dir.join("agent.sh");
+            executable(&script, AGENT_SH);
+            let mut env = serde_json::Map::new();
+            env.insert(
+                "FIXTURE_DIR".to_owned(),
+                json!(dir.to_string_lossy().into_owned()),
+            );
+            env.insert("FIXTURE_INIT".to_owned(), json!(init_result()));
+            for (name, value) in extra {
+                env.insert((*name).to_owned(), json!(*value));
+            }
+            Agent {
+                name: "login-fixture".to_owned(),
+                transport,
+                launch: json!({
+                    "command": "/bin/sh",
+                    "args": [script.to_string_lossy().into_owned()],
+                    "env": Value::Object(env),
+                    "discovery": {
+                        "tools": {},
+                        "handshake": true,
+                        "credential": {
+                            "env": [],
+                            "files": [dir.join("credential").to_string_lossy().into_owned()],
+                        },
+                    },
+                }),
+                settings: json!({}),
+                ..fake_row(id)
+            }
+        }
+
+        /// This box's `agent_box` for `agent_id`: probed, `unauthenticated`, advertising
+        /// `auth_methods`.
+        ///
+        /// The row a login is *for*. `resolved: None`, so the driver resolves the row's own
+        /// document rather than a recording, and nothing here is what the flow's own re-probe
+        /// will write.
+        pub(crate) fn probed_login_box(agent_id: AgentId, auth_methods: Vec<String>) -> AgentBox {
+            let now = Utc::now();
+            let snapshot = ProbeSnapshot {
+                transport: Transport::Acp,
+                resolved: None,
+                tools: std::collections::BTreeMap::new(),
+                handshake: Some(Handshake {
+                    at: now,
+                    protocol_version: 1,
+                    agent_name: Some("login-fixture".to_owned()),
+                    agent_version: Some("0.0.0".to_owned()),
+                    capabilities: json!({}),
+                    auth_methods,
+                }),
+                credential: Some(CredentialTier::Absent),
+                status: ProbeStatus::Unauthenticated,
+                stderr_tail: None,
+                source: ProbeSource::Probe,
+            };
+            AgentBox {
+                agent_id,
+                box_id: ids::BOX,
+                enabled: true,
+                version: Some("0.0.0".to_owned()),
+                path: None,
+                probed_at: Some(now),
+                quota: None,
+                quota_at: None,
+                updated_at: now,
+                probe: Some(snapshot.to_value()),
+            }
+        }
+
+        /// The demo store plus one `acp` login row and the `unauthenticated` box row for it.
+        pub(crate) async fn login_store(dir: &Path, extra: &[(&str, &str)]) -> (MemStore, AgentId) {
+            let store = MemStore::demo();
+            let agent_id = AgentId::new();
+            store
+                .upsert_agent(&login_row(agent_id, Transport::Acp, dir, extra))
+                .await
+                .expect("the login row lands");
+            store
+                .upsert_agent_box(&probed_login_box(agent_id, vec![METHOD.to_owned()]))
+                .await
+                .expect("the box row lands");
+            (store, agent_id)
+        }
+
+        /// The opener a case injects (blueprint P-5): a script that records the URL it was handed.
+        ///
+        /// It exits at once rather than sleeping — what "the opener is not waited on" costs is
+        /// `htui-agent`'s case to make, and a lingering child here would outlive the tempdir.
+        pub(crate) fn recorder(dir: &Path) -> PathBuf {
+            let path = dir.join("opener.sh");
+            executable(
+                &path,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"{}/opened\"\n",
+                    dir.display()
+                ),
+            );
+            path
+        }
+
+        /// A runtime over the **real** ACP transport, with the recording opener and no grace.
+        ///
+        /// The real transport because the subject is a login that spawns a process; a scripted
+        /// adapter would answer `Unsupported` and prove nothing.
+        pub(crate) fn login_runtime(dir: &Path) -> AgentRuntime {
+            AgentRuntime::new(DriverFactory::with_acp())
+                .with_grace(Duration::ZERO)
+                .with_opener(OpenerCommand::Custom(recorder(dir)))
+        }
+
+        /// The fixture's own pid, or `None` when it never ran at all.
+        fn fixture_pid(dir: &Path) -> Option<u32> {
+            std::fs::read_to_string(dir.join("pid"))
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+        }
+
+        /// The URLs the injected opener recorded, in order.
+        fn opened(dir: &Path) -> Vec<String> {
+            std::fs::read_to_string(dir.join("opened"))
+                .unwrap_or_default()
+                .lines()
+                .map(ToOwned::to_owned)
+                .collect()
+        }
+
+        /// Fails unless `pid` is gone — or reaped-pending — within [`KILL_WINDOW`].
+        ///
+        /// Linux-only because `/proc` is; copied from `htui-agent`'s `tests/auth.rs` rather than
+        /// shared, per the repo's per-file helper rule.
+        async fn assert_not_running(pid: u32, what: &str) {
+            #[cfg(target_os = "linux")]
+            {
+                let deadline = std::time::Instant::now() + KILL_WINDOW;
+                loop {
+                    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                        return;
+                    };
+                    let after = stat.rsplit_once(')').map_or("", |(_, rest)| rest);
+                    let state = after.trim().chars().next().unwrap_or('Z');
+                    if state == 'Z' || state == 'X' {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{what}: pid {pid} is still running (state {state})"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (pid, what);
+            }
+        }
+
+        /// The next reply, or a failure that says the login stopped talking.
+        async fn next_reply(rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>) -> ReplyEnvelope {
+            tokio::time::timeout(PATIENCE, rx.recv())
+                .await
+                .expect("a login answers inside the patience window")
+                .expect("the reply channel is open")
+        }
+
+        /// The next login frame and the `seq` it answered.
+        async fn next_frame(rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>) -> (Seq, AuthFrame) {
+            let reply = next_reply(rx).await;
+            match reply.reply {
+                StoreReply::Auth(frame) => (reply.seq, frame),
+                other => panic!("a login answers with login frames: {other:?}"),
+            }
+        }
+
+        /// Whether this frame ends the stream.
+        fn is_terminal(frame: &AuthFrame) -> bool {
+            matches!(
+                frame,
+                AuthFrame::Done { .. }
+                    | AuthFrame::Refused { .. }
+                    | AuthFrame::Cancelled
+                    | AuthFrame::Idle { .. }
+                    | AuthFrame::Failed { .. }
+            )
+        }
+
+        /// `AuthStart` at `seq`, and the method list the agent's own `initialize` advertised.
+        async fn start_login(
+            runtime: &mut AgentRuntime,
+            backend: &Backend,
+            tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+            rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>,
+            seq: Seq,
+            agent_id: AgentId,
+        ) -> Vec<AuthMethodInfo> {
+            let served = runtime
+                .serve(
+                    backend,
+                    tx,
+                    &envelope(seq, StoreRequest::AuthStart { agent_id }),
+                )
+                .await;
+            assert!(
+                matches!(served, Served::Deferred),
+                "a login answers from its own task: {served:?}"
+            );
+            let (at, frame) = next_frame(rx).await;
+            assert_eq!(at, seq, "the method list answers the request that asked");
+            match frame {
+                AuthFrame::Methods { methods, .. } => methods,
+                other => panic!("the first frame of a login is its method list: {other:?}"),
+            }
+        }
+
+        /// Sends `choice` at `seq` and collects every frame up to and including the terminal one.
+        async fn choose_and_collect(
+            runtime: &mut AgentRuntime,
+            backend: &Backend,
+            tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+            rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>,
+            seq: Seq,
+            choice: AuthChoice,
+        ) -> Vec<(Seq, AuthFrame)> {
+            let served = runtime
+                .serve(
+                    backend,
+                    tx,
+                    &envelope(seq, StoreRequest::AuthChoose { choice }),
+                )
+                .await;
+            assert!(
+                matches!(served, Served::Deferred),
+                "the choice goes into the running flow: {served:?}"
+            );
+            let mut frames = Vec::new();
+            loop {
+                let (at, frame) = next_frame(rx).await;
+                let last = is_terminal(&frame);
+                frames.push((at, frame));
+                if last {
+                    return frames;
+                }
+            }
+        }
+
+        /// The terminal frame of a collected stream.
+        fn terminal(frames: &[(Seq, AuthFrame)]) -> &AuthFrame {
+            &frames.last().expect("a stream has a terminal frame").1
+        }
+
+        // -------------------------------------------------------------------------------------
+        // Refusals, every one of them before a process exists
+        // -------------------------------------------------------------------------------------
+
+        /// D18's first refusal, in the probe's own order: a writer that cannot hold the row
+        /// refuses the login **before** an adapter is spawned to produce one.
+        #[tokio::test]
+        async fn a_start_is_refused_before_any_spawn_on_a_buffered_writer() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let cache = htui_store::CacheStore::open(tmp.path(), "login-buffered", 1)
+                .await
+                .expect("a fresh mirror");
+            let backend = Backend::Offline {
+                cache: cache.clone(),
+                since: None,
+            };
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            let served = runtime
+                .serve(
+                    &backend,
+                    &tx,
+                    &envelope(
+                        1,
+                        StoreRequest::AuthStart {
+                            agent_id: AgentId::new(),
+                        },
+                    ),
+                )
+                .await;
+            match served {
+                Served::Reply(StoreReply::Failed { request, message }) => {
+                    assert_eq!(request, "auth_start");
+                    assert!(
+                        message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
+                        "the buffered writer's own sentence, not a second one: {message}"
+                    );
+                }
+                other => panic!("a buffered writer refuses the login: {other:?}"),
+            }
+            assert!(!runtime.auth_running(), "and holds no claim afterwards");
+            assert_eq!(runtime.background_len(), 0);
+            assert_eq!(
+                fixture_pid(tmp.path()),
+                None,
+                "the fixture writes its pid the instant it starts; it never started"
+            );
+
+            cache.close().await;
+        }
+
+        /// D10's predicate, read off the row before a request is spent: a `cli` row has no
+        /// `authenticate` call and the refusal is the seam's own sentence.
+        #[tokio::test]
+        async fn a_start_on_a_cli_row_is_refused_by_the_predicate() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let store = MemStore::demo();
+            let agent_id = AgentId::new();
+            store
+                .upsert_agent(&login_row(
+                    agent_id,
+                    Transport::Cli,
+                    tmp.path(),
+                    &[("FIXTURE_KEY", "set")],
+                ))
+                .await
+                .expect("the row lands");
+            store
+                .upsert_agent_box(&probed_login_box(agent_id, vec![METHOD.to_owned()]))
+                .await
+                .expect("the box row lands");
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            match runtime
+                .serve(
+                    &backend,
+                    &tx,
+                    &envelope(1, StoreRequest::AuthStart { agent_id }),
+                )
+                .await
+            {
+                Served::Reply(StoreReply::Failed { request, message }) => {
+                    assert_eq!(request, "auth_start");
+                    assert!(
+                        message.contains("has no `authenticate` operation"),
+                        "the seam's own refusal, not a second wording: {message}"
+                    );
+                }
+                other => panic!("a transport with no login verb refuses: {other:?}"),
+            }
+            assert_eq!(fixture_pid(tmp.path()), None, "and nothing ran to find out");
+        }
+
+        /// D18's last refusal: a box whose stored snapshot advertises no method has nothing to
+        /// choose from, and the sentence names the row.
+        #[tokio::test]
+        async fn a_start_on_a_row_with_no_auth_methods_is_refused_by_name() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let store = MemStore::demo();
+            let agent_id = AgentId::new();
+            store
+                .upsert_agent(&login_row(
+                    agent_id,
+                    Transport::Acp,
+                    tmp.path(),
+                    &[("FIXTURE_KEY", "set")],
+                ))
+                .await
+                .expect("the row lands");
+            store
+                .upsert_agent_box(&probed_login_box(agent_id, Vec::new()))
+                .await
+                .expect("the box row lands");
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            match runtime
+                .serve(
+                    &backend,
+                    &tx,
+                    &envelope(1, StoreRequest::AuthStart { agent_id }),
+                )
+                .await
+            {
+                Served::Reply(StoreReply::Failed { request, message }) => {
+                    assert_eq!(request, "auth_start");
+                    assert!(
+                        message.contains("login-fixture")
+                            && message.contains("advertises no authentication methods"),
+                        "the refusal names the row it is about: {message}"
+                    );
+                }
+                other => panic!("a row with no advertised method refuses: {other:?}"),
+            }
+            assert_eq!(fixture_pid(tmp.path()), None, "and nothing ran to find out");
+        }
+
+        /// D19, side one: a login and an install both write `agent_box`, so a login refuses while
+        /// an install holds the claim.
+        #[tokio::test]
+        async fn a_start_while_an_install_runs_is_refused() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) = login_store(tmp.path(), &[("FIXTURE_KEY", "set")]).await;
+            let install_id = AgentId::new();
+            store
+                .upsert_agent(&install_row(install_id, "demo", true))
+                .await
+                .expect("the install row lands");
+            let backend = Backend::memory(store);
+            let fixture = Fixture::start().await;
+            // The registry read never answers inside this test's lifetime, so the install is
+            // provably still holding the claim when the login arrives.
+            fixture.route(
+                "/registry.json",
+                Route {
+                    status: 200,
+                    delay: Duration::from_secs(30),
+                    ..Route::default()
+                },
+            );
+            let mut runtime = login_runtime(tmp.path()).with_installer(InstallConfig::new(
+                fixture.base(),
+                Some(tmp.path().join("agents")),
+            ));
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            let planning = runtime
+                .serve(
+                    &backend,
+                    &tx,
+                    &envelope(
+                        1,
+                        StoreRequest::InstallPlan {
+                            agent_id: install_id,
+                        },
+                    ),
+                )
+                .await;
+            assert!(matches!(planning, Served::Deferred), "{planning:?}");
+
+            match runtime
+                .serve(
+                    &backend,
+                    &tx,
+                    &envelope(2, StoreRequest::AuthStart { agent_id }),
+                )
+                .await
+            {
+                Served::Reply(StoreReply::Failed { request, message }) => {
+                    assert_eq!(request, "auth_start");
+                    assert!(
+                        message.contains("an install is already running"),
+                        "the refusal says what holds the claim: {message}"
+                    );
+                }
+                other => panic!("two writers of one row would race: {other:?}"),
+            }
+            assert!(!runtime.auth_running());
+            assert_eq!(fixture_pid(tmp.path()), None, "and nothing was spawned");
+
+            runtime.shutdown(Duration::ZERO).await;
+        }
+
+        /// D19, side two: an install refuses while a login holds the claim.
+        #[tokio::test]
+        async fn an_install_plan_while_a_login_runs_is_refused() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) =
+                login_store(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")]).await;
+            let install_id = AgentId::new();
+            store
+                .upsert_agent(&install_row(install_id, "demo", true))
+                .await
+                .expect("the install row lands");
+            let backend = Backend::memory(store);
+            let fixture = Fixture::start().await;
+            let mut runtime = login_runtime(tmp.path()).with_installer(InstallConfig::new(
+                fixture.base(),
+                Some(tmp.path().join("agents")),
+            ));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+
+            match runtime
+                .serve(
+                    &backend,
+                    &tx,
+                    &envelope(
+                        2,
+                        StoreRequest::InstallPlan {
+                            agent_id: install_id,
+                        },
+                    ),
+                )
+                .await
+            {
+                Served::Reply(StoreReply::Failed { request, message }) => {
+                    assert_eq!(request, "install_plan");
+                    assert!(
+                        message.contains("a login is already running"),
+                        "the refusal says what holds the claim: {message}"
+                    );
+                }
+                other => panic!("an install may not run under a login: {other:?}"),
+            }
+            assert!(
+                fixture.lines().is_empty(),
+                "and nothing was asked of the registry: {:?}",
+                fixture.lines()
+            );
+
+            runtime.shutdown(Duration::from_millis(500)).await;
+        }
+
+        /// D19, side three: a probe writes every row, so it refuses while a login holds one.
+        #[tokio::test]
+        async fn a_probe_while_a_login_runs_is_refused() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) =
+                login_store(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")]).await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+
+            match runtime
+                .serve(&backend, &tx, &envelope(2, StoreRequest::ProbeAgents))
+                .await
+            {
+                Served::Reply(StoreReply::Failed { request, message }) => {
+                    assert_eq!(request, "probe_agents");
+                    assert!(
+                        message.contains("a login is running"),
+                        "the refusal says what to wait for: {message}"
+                    );
+                }
+                other => panic!("a probe may not run under a login: {other:?}"),
+            }
+            assert_eq!(runtime.background_len(), 0, "and it spawned nothing");
+
+            runtime.shutdown(Duration::from_millis(500)).await;
+        }
+
+        /// One login at a time: the claim is one deep, like the install's.
+        #[tokio::test]
+        async fn a_second_start_while_one_runs_is_refused() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) =
+                login_store(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")]).await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+
+            match runtime
+                .serve(
+                    &backend,
+                    &tx,
+                    &envelope(2, StoreRequest::AuthStart { agent_id }),
+                )
+                .await
+            {
+                Served::Reply(StoreReply::Failed { request, message }) => {
+                    assert_eq!(request, "auth_start");
+                    assert!(
+                        message.contains("a login is already running"),
+                        "the refusal names what holds the claim: {message}"
+                    );
+                }
+                other => panic!("two logins would be two children: {other:?}"),
+            }
+
+            runtime.shutdown(Duration::from_millis(500)).await;
+        }
+
+        /// A choice with nothing to choose for is a refusal of the *request*, not a frame of a
+        /// stream that does not exist (blueprint H-22).
+        #[tokio::test]
+        async fn a_choose_with_no_flow_pending_is_refused() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, _agent_id) = login_store(tmp.path(), &[("FIXTURE_KEY", "set")]).await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            for (request, name) in [
+                (
+                    StoreRequest::AuthChoose {
+                        choice: AuthChoice::Method(METHOD.to_owned()),
+                    },
+                    "auth_choose",
+                ),
+                (
+                    StoreRequest::AuthOpen {
+                        url: LINK.to_owned(),
+                    },
+                    "auth_open",
+                ),
+                (StoreRequest::AuthCancel, "auth_cancel"),
+            ] {
+                match runtime.serve(&backend, &tx, &envelope(1, request)).await {
+                    Served::Reply(StoreReply::Failed { request, message }) => {
+                        assert_eq!(request, name);
+                        assert_eq!(message, "no login is running");
+                    }
+                    other => panic!("`{name}` with no flow is refused by name: {other:?}"),
+                }
+            }
+            assert_eq!(fixture_pid(tmp.path()), None, "and nothing ran");
+        }
+
+        // -------------------------------------------------------------------------------------
+        // The stream
+        // -------------------------------------------------------------------------------------
+
+        /// D18's address switch: the method list answers the `AuthStart`, and every frame after
+        /// the choice answers the `AuthChoose` (`App::is_fresh` keys on request kind).
+        #[tokio::test]
+        async fn methods_arrive_at_the_start_seq_and_the_rest_at_the_choose_seq() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) =
+                login_store(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_URL", LINK)]).await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            let methods = start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            assert_eq!(
+                methods,
+                vec![AuthMethodInfo {
+                    id: METHOD.to_owned(),
+                    name: "One".to_owned(),
+                    description: Some("the fixture's only method".to_owned()),
+                }],
+                "the chooser is fed by the agent's own `initialize`"
+            );
+
+            let frames = choose_and_collect(
+                &mut runtime,
+                &backend,
+                &tx,
+                &mut rx,
+                2,
+                AuthChoice::Method(METHOD.to_owned()),
+            )
+            .await;
+            assert!(
+                frames.iter().all(|(seq, _)| *seq == 2),
+                "every frame after the choice carries the choice's own seq: {frames:?}"
+            );
+            assert!(
+                frames.iter().any(|(_, frame)| matches!(
+                    frame,
+                    AuthFrame::Url(url) if url == LINK
+                )),
+                "the link the adapter printed reaches the pane: {frames:?}"
+            );
+            assert!(
+                matches!(terminal(&frames), AuthFrame::Done { .. }),
+                "and the stream ends with the probe's verdict: {frames:?}"
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// D6 and `R-AGT-6`: the probe is the sole authority, and the row is written **before**
+        /// the terminal frame — the section reads the registry the instant it sees `Done`.
+        #[tokio::test]
+        async fn done_carries_the_probes_status_and_the_row_was_written_first() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[("FIXTURE_KEY", "set"), ("FIXTURE_CRED", CREDENTIAL)],
+            )
+            .await;
+            let backend = Backend::memory(store.clone());
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let frames = choose_and_collect(
+                &mut runtime,
+                &backend,
+                &tx,
+                &mut rx,
+                2,
+                AuthChoice::Method(METHOD.to_owned()),
+            )
+            .await;
+
+            match terminal(&frames) {
+                AuthFrame::Done { call, status } => {
+                    assert_eq!(*call, AuthCall::Authenticate(METHOD.to_owned()));
+                    assert_eq!(
+                        *status,
+                        ProbeStatus::Ready,
+                        "the credential the agent left is what the probe found: {frames:?}"
+                    );
+                }
+                other => panic!("a completed call ends with the probe's verdict: {other:?}"),
+            }
+
+            // Read the instant the terminal frame is in hand: this is what the section does.
+            let on_box = stored_box(&store, agent_id).await;
+            assert_eq!(
+                probe_status(&on_box),
+                Some("ready"),
+                "the row was written before `Done`: {:?}",
+                on_box.probe
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// The PRD's own metric: a call that succeeded and left nothing behind is still
+        /// `unauthenticated`, because the flow never decides the status.
+        #[tokio::test]
+        async fn success_into_a_box_with_no_credential_still_reads_unauthenticated() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) = login_store(tmp.path(), &[("FIXTURE_KEY", "set")]).await;
+            let backend = Backend::memory(store.clone());
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let frames = choose_and_collect(
+                &mut runtime,
+                &backend,
+                &tx,
+                &mut rx,
+                2,
+                AuthChoice::Method(METHOD.to_owned()),
+            )
+            .await;
+
+            match terminal(&frames) {
+                AuthFrame::Done { status, .. } => assert_eq!(
+                    *status,
+                    ProbeStatus::Unauthenticated,
+                    "the agent said yes and the box says otherwise: {frames:?}"
+                ),
+                other => panic!("the call returned, so the stream ends `Done`: {other:?}"),
+            }
+            assert_eq!(
+                probe_status(&stored_box(&store, agent_id).await),
+                Some("unauthenticated")
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// Hazard H-17 from the other side: `logout` is the same spawn and the same stream, and
+        /// the probe reads the box the vendor's own call left behind.
+        #[tokio::test]
+        async fn logout_reprobes_and_reads_unauthenticated() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) = login_store(tmp.path(), &[("FIXTURE_KEY", "set")]).await;
+            std::fs::write(tmp.path().join("credential"), CREDENTIAL).expect("a logged-in box");
+            let backend = Backend::memory(store.clone());
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let frames =
+                choose_and_collect(&mut runtime, &backend, &tx, &mut rx, 2, AuthChoice::Logout)
+                    .await;
+
+            match terminal(&frames) {
+                AuthFrame::Done { call, status } => {
+                    assert_eq!(*call, AuthCall::Logout);
+                    assert_eq!(*status, ProbeStatus::Unauthenticated);
+                }
+                other => panic!("a logout ends `Done` like any other call: {other:?}"),
+            }
+            assert!(
+                !tmp.path().join("credential").exists(),
+                "the agent removed its own credential; `htui` never touched it"
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// D6: a `Refused` writes **nothing**. The row before and after is the same row.
+        #[tokio::test]
+        async fn a_refusal_writes_nothing_and_keeps_probed_at() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            // No `FIXTURE_KEY`: the fixture refuses `authenticate` the way an adapter refuses a
+            // login it has no variable for, in its own words.
+            let (store, agent_id) = login_store(tmp.path(), &[]).await;
+            let backend = Backend::memory(store.clone());
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            let before = stored_box(&store, agent_id).await;
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let frames = choose_and_collect(
+                &mut runtime,
+                &backend,
+                &tx,
+                &mut rx,
+                2,
+                AuthChoice::Method(METHOD.to_owned()),
+            )
+            .await;
+
+            match terminal(&frames) {
+                AuthFrame::Refused { message } => assert!(
+                    message.contains("FIXTURE_KEY"),
+                    "the agent's own sentence, verbatim: {message}"
+                ),
+                other => panic!("a JSON-RPC error to the call is a refusal: {other:?}"),
+            }
+
+            let after = stored_box(&store, agent_id).await;
+            assert_eq!(
+                serde_json::to_value(&before).expect("a row serialises"),
+                serde_json::to_value(&after).expect("a row serialises"),
+                "a refusal re-probes nothing, so `probed_at` never moves"
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// `R-AGT-9`: a login is a fact about a **box**. Nothing here writes `agent`.
+        #[tokio::test]
+        async fn the_agent_row_is_byte_identical_before_and_after_a_login() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[("FIXTURE_KEY", "set"), ("FIXTURE_CRED", CREDENTIAL)],
+            )
+            .await;
+            let backend = Backend::memory(store.clone());
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            let row_of = async |store: &MemStore| -> Vec<u8> {
+                let summary = store
+                    .agents()
+                    .await
+                    .expect("the memory store never fails")
+                    .into_iter()
+                    .find(|summary| summary.agent.id == agent_id)
+                    .expect("the registry row is there");
+                serde_json::to_vec(&summary.agent).expect("a row serialises")
+            };
+            let before = row_of(&store).await;
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let frames = choose_and_collect(
+                &mut runtime,
+                &backend,
+                &tx,
+                &mut rx,
+                2,
+                AuthChoice::Method(METHOD.to_owned()),
+            )
+            .await;
+            assert!(
+                matches!(terminal(&frames), AuthFrame::Done { .. }),
+                "the login ran to its end: {frames:?}"
+            );
+
+            assert_eq!(
+                before,
+                row_of(&store).await,
+                "the outcome reaches `agent_box` through the probe and `agent` not at all"
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// `R-SEC-2` / `R-ID-7`: no frame, and no `Debug` of the runtime's own state, may carry a
+        /// credential value.
+        ///
+        /// The URL is allowed — the user is looking at it — and the sentinel *inside* the token
+        /// file is what is asserted absent.
+        #[tokio::test]
+        async fn no_frame_carries_anything_but_ids_text_and_status() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_URL", LINK),
+                    ("FIXTURE_CRED", CREDENTIAL),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let live = format!("{:?}", runtime.auth);
+            assert!(
+                !live.contains(CREDENTIAL) && !live.contains("SENTINEL-TOKEN-VALUE"),
+                "a live login prints ids and finishedness, never a line or a link: {live}"
+            );
+
+            let frames = choose_and_collect(
+                &mut runtime,
+                &backend,
+                &tx,
+                &mut rx,
+                2,
+                AuthChoice::Method(METHOD.to_owned()),
+            )
+            .await;
+            for (_, frame) in &frames {
+                let rendered = format!("{frame:?}");
+                assert!(
+                    !rendered.contains(CREDENTIAL),
+                    "a frame may carry ids, text and a status, never a credential: {rendered}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("credential"))
+                    .expect("the fixture wrote its credential")
+                    .trim(),
+                CREDENTIAL,
+                "and the value the assertion is about really was on this box"
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// D17 through the runtime: `o` is forwarded into the live flow and answered at **its**
+        /// own `seq`, so the pane's link stays on screen.
+        #[tokio::test]
+        async fn open_is_forwarded_to_the_live_flow_and_answered_at_its_own_seq() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_HOLD", "1"),
+                    ("FIXTURE_URL", LINK),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let served = runtime
+                .serve(
+                    &backend,
+                    &tx,
+                    &envelope(
+                        2,
+                        StoreRequest::AuthChoose {
+                            choice: AuthChoice::Method(METHOD.to_owned()),
+                        },
+                    ),
+                )
+                .await;
+            assert!(matches!(served, Served::Deferred), "{served:?}");
+
+            // The link arrives on the adapter's stderr; `o` is only offered once it has.
+            let url = loop {
+                match next_frame(&mut rx).await {
+                    (seq, AuthFrame::Url(url)) => {
+                        assert_eq!(seq, 2, "the link answers the choice, not the start");
+                        break url;
+                    }
+                    (_, other) => assert!(
+                        matches!(other, AuthFrame::Line(_)),
+                        "a held flow says nothing but lines until it is opened: {other:?}"
+                    ),
+                }
+            };
+            assert_eq!(url, LINK);
+
+            let served = runtime
+                .serve(&backend, &tx, &envelope(3, StoreRequest::AuthOpen { url }))
+                .await;
+            assert!(
+                matches!(served, Served::Deferred),
+                "the opener runs in the flow's own task: {served:?}"
+            );
+            let (seq, frame) = next_frame(&mut rx).await;
+            assert_eq!(seq, 3, "`o` is answered at its own address");
+            assert!(
+                matches!(frame, AuthFrame::Opened),
+                "the opener was spawned: {frame:?}"
+            );
+
+            // The recorder exits at once; give it the moment the kernel needs.
+            for _ in 0..200u32 {
+                if !opened(tmp.path()).is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                opened(tmp.path()),
+                vec![LINK.to_owned()],
+                "the URL travels as the opener's one argument, unmangled"
+            );
+
+            runtime.shutdown(Duration::from_millis(500)).await;
+        }
+
+        // -------------------------------------------------------------------------------------
+        // Ends
+        // -------------------------------------------------------------------------------------
+
+        /// D18's cancellation: acknowledged at its own `seq`, the stream ends itself at the
+        /// choice's, and the child is gone.
+        #[tokio::test]
+        async fn cancel_answers_cancelling_then_the_stream_ends_cancelled_and_no_child_survives() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) =
+                login_store(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")]).await;
+            let backend = Backend::memory(store.clone());
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            let before = stored_box(&store, agent_id).await;
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let pid = fixture_pid(tmp.path()).expect("the fixture wrote its pid when it started");
+
+            let served = runtime
+                .serve(
+                    &backend,
+                    &tx,
+                    &envelope(
+                        2,
+                        StoreRequest::AuthChoose {
+                            choice: AuthChoice::Method(METHOD.to_owned()),
+                        },
+                    ),
+                )
+                .await;
+            assert!(matches!(served, Served::Deferred), "{served:?}");
+
+            let cancelling = runtime
+                .serve(&backend, &tx, &envelope(3, StoreRequest::AuthCancel))
+                .await;
+            assert!(
+                matches!(
+                    cancelling,
+                    Served::Reply(StoreReply::Auth(AuthFrame::Cancelling))
+                ),
+                "a cancel is answered at once, not when the flow notices: {cancelling:?}"
+            );
+
+            let last = loop {
+                let (seq, frame) = next_frame(&mut rx).await;
+                if is_terminal(&frame) {
+                    break (seq, frame);
+                }
+            };
+            assert_eq!(last.0, 2, "the stream keeps the choice's address");
+            assert!(
+                matches!(last.1, AuthFrame::Cancelled),
+                "the task ends its own stream: {:?}",
+                last.1
+            );
+            assert_not_running(pid, "a cancelled login").await;
+            assert_eq!(
+                serde_json::to_value(&before).expect("a row serialises"),
+                serde_json::to_value(&stored_box(&store, agent_id).await)
+                    .expect("a row serialises"),
+                "and a cancelled login leaves `agent_box` exactly as it found it"
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// The shutdown path: the token first, the handle after, and no child left behind.
+        #[tokio::test]
+        async fn shutdown_cancels_then_aborts_a_running_login_and_no_child_survives() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) =
+                login_store(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")]).await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let pid = fixture_pid(tmp.path()).expect("the fixture wrote its pid when it started");
+            assert!(runtime.auth_running());
+
+            runtime.shutdown(Duration::from_millis(500)).await;
+            assert!(
+                !runtime.auth_running(),
+                "the runtime lets go of the login it just ended"
+            );
+            assert_not_running(pid, "a login the runtime shut down").await;
+        }
+
+        /// D19's second claim (hazard H-16): a login holds the row's re-probe claim for its whole
+        /// life, so a chat started during the browser round trip cannot re-probe under it.
+        #[tokio::test]
+        async fn a_flow_holds_the_reprobe_claim_for_its_row() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) =
+                login_store(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")]).await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            assert!(
+                runtime.reprobe_claims.claim((agent_id, ids::BOX)).is_none(),
+                "a staleness re-probe of this row waits for the login"
+            );
+            assert!(
+                runtime
+                    .reprobe_claims
+                    .claim((AgentId::new(), ids::BOX))
+                    .is_some(),
+                "another row on this box is not excluded"
+            );
+
+            runtime.shutdown(Duration::from_millis(500)).await;
+            assert!(
+                runtime.reprobe_claims.claim((agent_id, ids::BOX)).is_some(),
+                "and the claim goes with the flow"
+            );
+        }
     }
 }

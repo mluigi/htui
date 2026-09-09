@@ -11,8 +11,10 @@
 //! deferred until `PgStore` read latency has actually been measured against a populated database;
 //! until then the queue depth is bounded in practice by the keystrokes a user can produce.
 
+use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, PermissionRequestId};
 use htui_agent::event::{DriverEnvelope, StopReason};
+use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
     AgentId, AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph,
     Note, ProjectId, RunSummary, Scope, SessionEvent, StepId, WorkspaceSummary,
@@ -157,6 +159,43 @@ pub enum StoreRequest {
     /// through a token, so the task can sweep its staging entry and send that last frame — an
     /// `abort()` could do neither, and stays the shutdown path.
     InstallCancel,
+    /// Start a login for one registry row (MOD-21 D18, `R-AGT-9`).
+    ///
+    /// Served by the agent runtime's own task, never inside the loop: a flow spawns the adapter
+    /// and then waits on a **human** in a browser, which is minutes (`R-NF-3`). Answered with
+    /// [`StoreReply::Auth`]`(`[`AuthFrame::Methods`]`)` at this `seq` — the agent's own live method
+    /// list, not the stored snapshot's — or, before anything is spawned, with
+    /// [`StoreReply::Failed`].
+    AuthStart {
+        /// Which registry row to log in.
+        agent_id: AgentId,
+    },
+    /// The user chose from the live method list (MOD-21 D7, D18).
+    ///
+    /// Every later frame of the flow — [`AuthFrame::Line`], [`AuthFrame::Url`],
+    /// [`AuthFrame::Done`] and the rest — carries **this** request's `seq`, not the
+    /// [`AuthStart`](Self::AuthStart)'s: `App::is_fresh` keys on the request *kind*
+    /// (`app/state.rs:290-294`), so the chooser's answer is what later frames must be fresh
+    /// against. The same plan-then-confirm split [`InstallConfirm`](Self::InstallConfirm) uses.
+    AuthChoose {
+        /// The method the user picked, or a logout.
+        choice: AuthChoice,
+    },
+    /// Open the link the pane is showing, through `htui`'s own opener (MOD-21 D17).
+    ///
+    /// Answered exactly once at its own `seq`: [`AuthFrame::Opened`] when the opener was spawned —
+    /// never "the browser opened", which `htui` cannot know — or [`StoreReply::Failed`]. A
+    /// refusal here leaves the running flow and the pane exactly as they were (blueprint H-22).
+    AuthOpen {
+        /// The link, as the adapter printed it.
+        url: String,
+    },
+    /// Stop the running login (MOD-21 D3, D13).
+    ///
+    /// Answered [`AuthFrame::Cancelling`] at once, at this request's own `seq`; the flow's own
+    /// stream then ends [`AuthFrame::Cancelled`] at *its* `seq`. Cooperative, through a token, so
+    /// the task can kill its child and send that last frame.
+    AuthCancel,
     /// The top bar's store field and the pending-migration count (plan D11).
     StoreState,
     /// Apply the pending migrations (`R-STO-5`), after the user answered `y`.
@@ -187,6 +226,10 @@ impl StoreRequest {
             Self::InstallPlan { .. } => "install_plan",
             Self::InstallConfirm { .. } => "install_confirm",
             Self::InstallCancel => "install_cancel",
+            Self::AuthStart { .. } => "auth_start",
+            Self::AuthChoose { .. } => "auth_choose",
+            Self::AuthOpen { .. } => "auth_open",
+            Self::AuthCancel => "auth_cancel",
             Self::StoreState => "store_state",
             Self::ApplyMigrations => "apply_migrations",
         }
@@ -238,6 +281,13 @@ pub enum StoreReply {
     /// [`StoreRequest::InstallConfirm`] that started it, at that request's own `seq`; the
     /// acknowledgement of a cancel answers the [`StoreRequest::InstallCancel`] at *its* `seq`.
     Install(InstallFrame),
+    /// One frame of a login (MOD-21 D18).
+    ///
+    /// The method list answers the [`StoreRequest::AuthStart`] that asked for it; every frame from
+    /// the choice onwards answers the [`StoreRequest::AuthChoose`] at *that* request's `seq`; an
+    /// [`AuthFrame::Opened`] answers its own [`StoreRequest::AuthOpen`]; and an
+    /// [`AuthFrame::Cancelling`] answers the [`StoreRequest::AuthCancel`].
+    Auth(AuthFrame),
     /// One frame of a live chat's stream (MOD-2 D27).
     ///
     /// Many of these answer one [`StoreRequest::ChatStart`], all carrying that request's `seq`, so
@@ -350,6 +400,74 @@ pub enum InstallFrame {
     },
 }
 
+/// One frame of a login (MOD-21 D18).
+///
+/// The [`InstallFrame`] shape, for the same reason: a method list, a stream and a terminal frame
+/// are one request answered many times, and the section renders whichever it last received. Every
+/// terminal frame — [`Done`](Self::Done), [`Refused`](Self::Refused),
+/// [`Cancelled`](Self::Cancelled), [`Idle`](Self::Idle), [`Failed`](Self::Failed) — clears the
+/// section's in-flight state.
+///
+/// **Nothing here can hold a credential** (`R-SEC-2`, `R-ID-7`): every field is an id the agent
+/// advertised, a sentence the agent itself wrote to its own stderr, a link it printed, or a status
+/// the probe decided. `htui` never reads the credential a login leaves behind — it asks the probe
+/// whether one exists.
+#[derive(Debug, Clone)]
+pub enum AuthFrame {
+    /// The agent's own `initialize` answer, once, before the user is asked anything (MOD-21 D7).
+    Methods {
+        /// Every method the chooser may offer, in the agent's order.
+        methods: Vec<AuthMethodInfo>,
+        /// The agent advertised a logout verb, so the chooser offers one.
+        logout: bool,
+        /// `terminal`-typed methods, named so the chooser can say why they are missing. The spec
+        /// forbids passing one to `authenticate` and `htui` never does (MOD-21 D4, D21).
+        hidden: Vec<AuthMethodInfo>,
+    },
+    /// One line the adapter wrote to its own stderr, as it wrote it.
+    Line(String),
+    /// A `http(s)` link seen on that stream for the first time in this flow (MOD-21 D15).
+    Url(String),
+    /// The opener was **spawned**. Not "the browser opened": `htui` does not own that tree and
+    /// cannot say (MOD-21 D17).
+    Opened,
+    /// The call returned, the row was **re-probed and written**, and this is the probe's verdict —
+    /// never the flow's (MOD-21 D6, `R-AGT-6`).
+    Done {
+        /// Which call returned, so the notice can say "logged in" or "logged out".
+        call: AuthCall,
+        /// What `probe_agent` decided about this box afterwards.
+        status: ProbeStatus,
+    },
+    /// The agent answered the call with a JSON-RPC error, in its own words (MOD-21 D5).
+    ///
+    /// An answer, not a failure: the live `-32602` names the variable the user has to set, which
+    /// is the one sentence worth rendering verbatim. Nothing was written.
+    Refused {
+        /// The agent's own text, plus its stderr tail when there was one.
+        message: String,
+    },
+    /// A [`StoreRequest::AuthCancel`] was accepted. Not the end of the stream: the flow's own
+    /// frames end it with [`Cancelled`](Self::Cancelled).
+    Cancelling,
+    /// The flow stopped because it was asked to, leaving `agent_box` exactly as it found it.
+    Cancelled,
+    /// The flow went silent for this long — no line, no event, no choice — and was killed
+    /// (MOD-21 D13).
+    ///
+    /// Its own frame rather than a [`Cancelled`](Self::Cancelled), so the notice can say what
+    /// happened instead of implying the user did it.
+    Idle {
+        /// The cap that elapsed with no sign of life.
+        after: std::time::Duration,
+    },
+    /// The flow died: the spawn, the wire, or the row write.
+    Failed {
+        /// What went wrong, rendered.
+        message: String,
+    },
+}
+
 /// A request on its way to the worker.
 #[derive(Debug)]
 pub struct RequestEnvelope {
@@ -419,10 +537,10 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             events: backend.step_events(*step).await?,
         },
         // The four chat requests need the worker loop's own state (the live sessions), and the
-        // probe and the three install requests need the runtime that owns their tasks, so all
-        // eight are served ahead of this function, exactly as `ApplyMigrations` is. One of them
-        // that reaches here at all belongs to a caller with no runtime — the test harness without
-        // one — and saying so is more use than a panic.
+        // probe, the three install requests and MOD-21's four login ones need the runtime that
+        // owns their tasks, so all twelve are served ahead of this function, exactly as
+        // `ApplyMigrations` is. One of them that reaches here at all belongs to a caller with no
+        // runtime — the test harness without one — and saying so is more use than a panic.
         StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
         | StoreRequest::ChatAnswer { .. }
@@ -430,7 +548,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::ProbeAgents
         | StoreRequest::InstallPlan { .. }
         | StoreRequest::InstallConfirm { .. }
-        | StoreRequest::InstallCancel => StoreReply::Failed {
+        | StoreRequest::InstallCancel
+        | StoreRequest::AuthStart { .. }
+        | StoreRequest::AuthChoose { .. }
+        | StoreRequest::AuthOpen { .. }
+        | StoreRequest::AuthCancel => StoreReply::Failed {
             request: request.name(),
             message: "no agent runtime in this build".to_owned(),
         },
@@ -565,12 +687,13 @@ pub fn spawn_with(
                             }
                         }
                         // The chat requests need this loop's own state - the live sessions - and
-                        // the probe and the installs need the runtime that owns their tasks, so
-                        // all of them go to the runtime before `try_serve`, like
+                        // the probe, the installs and the logins need the runtime that owns their
+                        // tasks, so all of them go to the runtime before `try_serve`, like
                         // `ApplyMigrations` above. An install reads the registry over the network
-                        // and streams hundreds of megabytes, so `Served::Deferred => continue` is
-                        // the whole of `R-NF-3` for it: the arm returns having spawned a task and
-                        // awaited nothing longer than `box_info()` (blueprint H-9).
+                        // and streams hundreds of megabytes, and a login waits on a human in a
+                        // browser, so `Served::Deferred => continue` is the whole of `R-NF-3` for
+                        // both: the arm returns having spawned a task and awaited nothing longer
+                        // than `box_info()` (blueprint H-9).
                         StoreRequest::ChatStart { .. }
                         | StoreRequest::ChatSend { .. }
                         | StoreRequest::ChatAnswer { .. }
@@ -578,7 +701,11 @@ pub fn spawn_with(
                         | StoreRequest::ProbeAgents
                         | StoreRequest::InstallPlan { .. }
                         | StoreRequest::InstallConfirm { .. }
-                        | StoreRequest::InstallCancel => {
+                        | StoreRequest::InstallCancel
+                        | StoreRequest::AuthStart { .. }
+                        | StoreRequest::AuthChoose { .. }
+                        | StoreRequest::AuthOpen { .. }
+                        | StoreRequest::AuthCancel => {
                             match runtime.serve(&backend, &tx, &envelope).await {
                                 Served::Reply(reply) => reply,
                                 // The session task answers this request itself, once.
@@ -1482,6 +1609,133 @@ mod tests {
         drop(req_tx);
         let _ = worker.await;
         silent.abort();
+    }
+
+    /// The four login requests are named like every other, and a build with no runtime says so
+    /// rather than dropping the reply (MOD-21 D18).
+    #[test]
+    fn name_arms_are_stable() {
+        assert_eq!(
+            StoreRequest::AuthStart {
+                agent_id: AgentId::new()
+            }
+            .name(),
+            "auth_start"
+        );
+        assert_eq!(
+            StoreRequest::AuthChoose {
+                choice: AuthChoice::Logout
+            }
+            .name(),
+            "auth_choose"
+        );
+        assert_eq!(
+            StoreRequest::AuthOpen {
+                url: "https://h.invalid/login".to_owned()
+            }
+            .name(),
+            "auth_open"
+        );
+        assert_eq!(StoreRequest::AuthCancel.name(), "auth_cancel");
+    }
+
+    /// A shell with no agent runtime answers each of the four by name, exactly once, rather than
+    /// serving a login from the loop or dropping the reply (MOD-21 D18).
+    #[tokio::test]
+    async fn try_serve_without_a_runtime_refuses_all_four_by_name() {
+        for (request, name) in [
+            (
+                StoreRequest::AuthStart {
+                    agent_id: AgentId::new(),
+                },
+                "auth_start",
+            ),
+            (
+                StoreRequest::AuthChoose {
+                    choice: AuthChoice::Method("m-one".to_owned()),
+                },
+                "auth_choose",
+            ),
+            (
+                StoreRequest::AuthOpen {
+                    url: "https://h.invalid/login".to_owned(),
+                },
+                "auth_open",
+            ),
+            (StoreRequest::AuthCancel, "auth_cancel"),
+        ] {
+            match serve(&demo(), &request).await {
+                StoreReply::Failed { request, message } => {
+                    assert_eq!(request, name);
+                    assert_eq!(message, "no agent runtime in this build");
+                }
+                other => panic!("a login with no runtime is refused, not served: {other:?}"),
+            }
+        }
+    }
+
+    /// `R-NF-3` for a login, and the reason it is deferred at all: a flow waits on a **human** for
+    /// as long as the browser round trip takes, and the loop must serve everything else while it
+    /// does.
+    ///
+    /// The fixture never answers `authenticate`, so the flow is provably still running while the
+    /// assertions hold. What the arm did before deferring is the whole subject: a `box_info()` and
+    /// an `agents()`, exactly what a probe and an install already await there — no spawn on the
+    /// loop, no writer left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_loop_answers_other_requests_while_a_login_waits_for_a_human() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let (store, agent_id) = crate::agent_worker::tests::auth::login_store(
+            tmp.path(),
+            &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")],
+        )
+        .await;
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn_with(
+            Started::detached(Backend::memory(store)),
+            req_rx,
+            rep_tx,
+            crate::agent_worker::tests::auth::login_runtime(tmp.path()),
+        );
+
+        for (seq, request) in [
+            (1, StoreRequest::AuthStart { agent_id }),
+            (2, StoreRequest::Workspaces),
+        ] {
+            req_tx
+                .send(RequestEnvelope {
+                    seq,
+                    origin: Origin::App,
+                    request,
+                })
+                .expect("the worker is alive");
+        }
+
+        let first = rep_rx.recv().await.expect("the worker answers");
+        assert_eq!(
+            first.seq, 2,
+            "the loop is free the instant the login is deferred: {:?}",
+            first.reply
+        );
+        assert!(
+            matches!(first.reply, StoreReply::Workspaces(_)),
+            "and it is a real answer, not a refusal: {:?}",
+            first.reply
+        );
+
+        req_tx
+            .send(RequestEnvelope {
+                seq: 3,
+                origin: Origin::App,
+                request: StoreRequest::AuthCancel,
+            })
+            .expect("the worker is alive");
+
+        drop(req_tx);
+        let _ = worker.await;
     }
 
     /// `go_offline` disarms the `lost_the_server` arm whatever the backend was.
