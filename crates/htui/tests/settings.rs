@@ -4,19 +4,28 @@
 //! snapshot suite is pinned to.
 #![cfg(feature = "testkit")]
 
-use htui::app::{Ctx, Emit, Handled, TopBarState};
-use htui::keymap::Keymap;
-use htui::store_worker::{Origin, StoreReply, StoreRequest};
+use htui::app::{Action, Ctx, Emit, Handled, TopBarState};
+use htui::keymap::{KeyChord, Keymap};
+use htui::store_worker::{InstallFrame, Origin, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{AgentsSection, SectionId, SettingsSection, SettingsTab, message};
-use htui_core::model::{Agent, AgentBox, AgentId, AgentSummary, Billing, BoxId, Scope, Transport};
+use htui_agent::install::InstallRecord;
+use htui_agent::probe::ProbeStatus;
+use htui_agent::{ArchiveFormat, InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
+use htui_core::model::{
+    Agent, AgentBox, AgentId, AgentSummary, Billing, BoxId, ProjectRef, Scope, Transport,
+};
 use htui_core::store::{MemStore, WriteStore};
 use ratatui::Frame;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use crossterm::event::KeyEvent;
 
@@ -30,9 +39,8 @@ async fn demo_scope() -> Scope {
     Scope::from_workspace(workspaces.first().expect("the fixture has a workspace"))
 }
 
-/// Renders one section into a 100x30 buffer and returns it as text, the way `Harness::render`
-/// does for a whole frame.
-fn render_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> String {
+/// Draws one section into a 100x30 buffer, the size the whole snapshot suite is pinned to.
+fn draw_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> Buffer {
     let mut terminal = Terminal::with_options(
         TestBackend::new(100, 30),
         TerminalOptions {
@@ -43,8 +51,13 @@ fn render_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> String {
     terminal
         .draw(|frame| section.render(frame, frame.area(), ctx))
         .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
 
-    let buffer = terminal.backend().buffer();
+/// Renders one section into a 100x30 buffer and returns it as text, the way `Harness::render`
+/// does for a whole frame.
+fn render_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> String {
+    let buffer = draw_section(section, ctx);
     (0..buffer.area.height)
         .map(|y| {
             (0..buffer.area.width)
@@ -55,6 +68,97 @@ fn render_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The lines a section drew in the theme's accent colour.
+///
+/// The row cursor is a *style*, not a character: nothing in the text says which row is
+/// highlighted, so a test that only read [`render_section`] could not tell a moved cursor from a
+/// stuck one.
+fn accented_lines(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> Vec<String> {
+    let accent = Theme::default().accent.fg;
+    let buffer = draw_section(section, ctx);
+    (0..buffer.area.height)
+        .filter(|y| buffer[(0, *y)].fg == accent.unwrap_or(Color::Reset))
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Everything [`Ctx::new`] borrows, owned in one place.
+///
+/// A section is tested without a shell around it — that is what makes a key and a reply
+/// independently assertable — and every one of those tests needs the same seven values. Holding
+/// them together also holds the [`Emit`] queue, which is how a test sees what the section asked
+/// the store for without a store existing at all (`R-NF-3`).
+struct Bench {
+    scope: Scope,
+    projects: Vec<ProjectRef>,
+    top_bar: TopBarState,
+    keymap: Keymap,
+    theme: Theme,
+    emit: Emit,
+}
+
+impl Bench {
+    /// A bench in the demo fixture's first workspace.
+    async fn new() -> Self {
+        Self {
+            scope: demo_scope().await,
+            projects: Vec::new(),
+            top_bar: TopBarState::default(),
+            keymap: Keymap::default_global(),
+            theme: Theme::default(),
+            emit: Emit::default(),
+        }
+    }
+
+    /// A context addressed to the Settings tab, as the shell builds one.
+    fn ctx(&self) -> Ctx<'_> {
+        Ctx::new(
+            &self.scope,
+            &self.projects,
+            &self.top_bar,
+            &self.keymap,
+            &self.theme,
+            Origin::Tab(SettingsTab::ID),
+            &self.emit,
+        )
+    }
+
+    /// Feeds one key to a section, written the way `KeyChord::parse` reads it.
+    fn key(&self, section: &mut dyn SettingsSection, chord: &str) -> Handled {
+        let parsed = KeyChord::parse(chord).unwrap_or_else(|| panic!("`{chord}` is not a chord"));
+        let mut ctx = self.ctx();
+        section.on_key(parsed.to_event(), &mut ctx)
+    }
+
+    /// Hands one reply to a section.
+    fn reply(&self, section: &mut dyn SettingsSection, reply: &StoreReply) {
+        let mut ctx = self.ctx();
+        section.on_reply(reply, &mut ctx);
+    }
+
+    /// Everything the section emitted since this was last called, leaving the queue empty.
+    fn drained(&self) -> Vec<Action> {
+        self.emit.take()
+    }
+
+    /// The error texts the section put on the status line since this was last called.
+    fn errors(&self) -> Vec<String> {
+        self.drained()
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Error(message) => Some(message),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// A settled Settings tab over `store`, with the agent section registered.
@@ -125,41 +229,26 @@ async fn a_failed_read_says_the_registry_needs_postgres() {
     // `agent` and `agent_box` are not mirrored (`docs/ANA-9.md` §4.4), so an offline backend
     // answers `Unreachable` and the section has nothing to fall back to. The reply is injected
     // rather than provoked because a `Backend::Memory` cannot be offline.
-    let scope = demo_scope().await;
-    let projects = Vec::new();
-    let top_bar = TopBarState::default();
-    let keymap = Keymap::default_global();
-    let theme = Theme::default();
-    let emit = Emit::default();
-    let mut ctx = Ctx::new(
-        &scope,
-        &projects,
-        &top_bar,
-        &keymap,
-        &theme,
-        Origin::Tab(SettingsTab::ID),
-        &emit,
-    );
-
+    let bench = Bench::new().await;
     let mut section = AgentsSection::new();
-    section.on_reply(
+    bench.reply(
+        &mut section,
         &StoreReply::Agents(
             MemStore::demo()
                 .agents()
                 .await
                 .expect("the memory store never fails"),
         ),
-        &mut ctx,
     );
-    section.on_reply(
+    bench.reply(
+        &mut section,
         &StoreReply::Failed {
             request: "agents",
             message: "the store is unreachable: agent registry is not mirrored".to_owned(),
         },
-        &mut ctx,
     );
 
-    let rendered = render_section(&section, &ctx);
+    let rendered = render_section(&section, &bench.ctx());
     assert!(
         rendered.contains("agent registry needs Postgres"),
         "a failed read says why, and does not fall back to the rows it had: {rendered}"
@@ -223,22 +312,7 @@ fn probed_row(
 /// The `on this box` column, one row per outcome of plan D50.
 #[tokio::test]
 async fn the_status_column_renders_each_probe_outcome() {
-    let scope = demo_scope().await;
-    let projects = Vec::new();
-    let top_bar = TopBarState::default();
-    let keymap = Keymap::default_global();
-    let theme = Theme::default();
-    let emit = Emit::default();
-    let mut ctx = Ctx::new(
-        &scope,
-        &projects,
-        &top_bar,
-        &keymap,
-        &theme,
-        Origin::Tab(SettingsTab::ID),
-        &emit,
-    );
-
+    let bench = Bench::new().await;
     let rows = vec![
         probed_row(
             "ready-on",
@@ -276,8 +350,8 @@ async fn the_status_column_renders_each_probe_outcome() {
     ];
 
     let mut section = AgentsSection::new();
-    section.on_reply(&StoreReply::Agents(rows), &mut ctx);
-    let rendered = render_section(&section, &ctx);
+    bench.reply(&mut section, &StoreReply::Agents(rows));
+    let rendered = render_section(&section, &bench.ctx());
 
     for (row, expected) in [
         ("ready-on", "0.48.0"),
@@ -354,4 +428,753 @@ async fn h_and_l_move_between_sections() {
         harness.render().contains("claude"),
         "`h` comes back to Agents"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-20 T8: the row cursor, `i`, and the install pane (blueprint B.12)
+// -------------------------------------------------------------------------------------------
+
+/// One registry row, with or without a declared install source.
+///
+/// The id is made up and so is the tool: `R-AGT-5` says no vendor is named in `src/`, and a test
+/// that spelled one would be asserting the seeds rather than the section.
+fn registry_row(name: &str, declares: bool) -> AgentSummary {
+    let mut discovery = json!({
+        "tools": {
+            "demo_server": {
+                "kind": "glob",
+                "patterns": ["%HTUI_AGENTS_ROOT%/demo-acp/*/demo_server"],
+            },
+        },
+        "handshake": true,
+    });
+    if declares {
+        discovery["install"] =
+            json!({ "source": "acp_registry", "id": "demo-acp", "tool": "demo_server" });
+    }
+    let mut summary = probed_row(name, true, None, None);
+    summary.on_box = None;
+    summary.agent.launch = json!({
+        "command": "${demo_server}",
+        "args": [],
+        "env": {},
+        "discovery": discovery,
+    });
+    summary
+}
+
+/// The plan the consent pane draws, for the row `agent_id` names.
+///
+/// Hand-built rather than produced by `plan()`: this file's subject is what the section does with
+/// a plan, and a pre-flight in front of every case would put a registry read on the path of a
+/// test about rendering. It is exactly the value `StoreReply::Install(Plan)` carries.
+fn demo_plan(agent_id: AgentId, agent_name: &str, sha256: Option<&str>) -> InstallPlan {
+    InstallPlan {
+        agent_id,
+        agent_name: agent_name.to_owned(),
+        tool: "demo_server".to_owned(),
+        registry_id: "demo-acp".to_owned(),
+        registry_name: "Demo".to_owned(),
+        version: "1.2.3".to_owned(),
+        platform: "linux-x86_64".to_owned(),
+        archive_url: "http://127.0.0.1:1/archive.zip".to_owned(),
+        format: ArchiveFormat::Zip,
+        content_length: Some(4 * 1024 * 1024),
+        sha256: sha256.map(str::to_owned),
+        cmd: "./demo_server".to_owned(),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        license: Some("proprietary".to_owned()),
+        license_url: Some("http://127.0.0.1:1/terms".to_owned()),
+        root: PathBuf::from("/tmp/htui-agents"),
+        install_dir: PathBuf::from("/tmp/htui-agents/demo-acp/1.2.3"),
+        existing_versions: vec!["1.2.2".to_owned()],
+        available_bytes: Some(64 * 1024 * 1024),
+        need_bytes: Some(16 * 1024 * 1024),
+        args_differ: false,
+        consent: None,
+        recorded: None,
+        registry_cached_age_secs: None,
+        planned_at: htui_core::fixtures::demo_at(0, 0),
+    }
+}
+
+/// A section holding `rows`, with the cursor where a fresh registry read leaves it.
+/// A pre-flight is two requests and usually gone before a key lands, but a plan task that ends
+/// without a frame would strand the section in `Planning` with no way out but a restart — `i` and
+/// `r` are both refused there and `Esc` belongs to `Manual`. So `x` cancels a pre-flight too
+/// (review finding, MOD-20 T8). The runtime serves the cancel, and a task already swept answers
+/// `Failed { "install_cancel" }`, which lands on `Idle` either way.
+#[tokio::test]
+async fn x_cancels_a_pre_flight_that_has_not_answered() {
+    let bench = Bench::new().await;
+    let mut section = section_over(&bench, vec![registry_row("declared", true)]);
+
+    assert_eq!(bench.key(&mut section, "i"), Handled::Consumed);
+    let asked = bench.drained();
+    assert!(
+        asked
+            .iter()
+            .any(|action| matches!(action, Action::Store(StoreRequest::InstallPlan { .. }))),
+        "`i` asks for a plan: {asked:?}"
+    );
+
+    assert_eq!(
+        bench.key(&mut section, "x"),
+        Handled::Consumed,
+        "`x` is bound while planning, not only while downloading"
+    );
+    let asked = bench.drained();
+    assert!(
+        asked
+            .iter()
+            .any(|action| matches!(action, Action::Store(StoreRequest::InstallCancel))),
+        "and it asks the runtime to drop the pre-flight: {asked:?}"
+    );
+    assert!(
+        render_section(&section, &bench.ctx()).contains("x cancel install"),
+        "the hint offers the key it binds"
+    );
+}
+
+fn section_over(bench: &Bench, rows: Vec<AgentSummary>) -> AgentsSection {
+    let mut section = AgentsSection::new();
+    bench.reply(&mut section, &StoreReply::Agents(rows));
+    section
+}
+
+/// The `on this box` cell of one row, which is the last column of its line.
+fn on_box_cell(rendered: &str, name: &str) -> String {
+    let line = rendered
+        .lines()
+        .find(|line| line.starts_with(name))
+        .unwrap_or_else(|| panic!("the `{name}` row is rendered:\n{rendered}"));
+    line.split_whitespace()
+        .skip(6)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Plan D19's cursor: `j`/`k` only, no wrap at either end.
+///
+/// Where the cursor is, is asserted two ways because it has two jobs: it is the accented line, and
+/// it is the row `i` acts on. A test that only read the highlight would pass on a section that
+/// installs the wrong row.
+#[tokio::test]
+async fn j_and_k_move_the_row_cursor_and_stop_at_both_ends() {
+    let bench = Bench::new().await;
+    let mut section = section_over(
+        &bench,
+        vec![
+            registry_row("alpha", false),
+            registry_row("beta", false),
+            registry_row("gamma", false),
+        ],
+    );
+
+    assert!(
+        accented_lines(&section, &bench.ctx())[0].starts_with("alpha"),
+        "a fresh registry read leaves the cursor on the first row"
+    );
+
+    bench.key(&mut section, "j");
+    assert!(accented_lines(&section, &bench.ctx())[0].starts_with("beta"));
+
+    // Three more `j` on a three-row table: the cursor stops on the last row rather than wrapping
+    // round to the first, because a wrap makes `i` install a row the user did not aim at.
+    for _ in 0..3 {
+        bench.key(&mut section, "j");
+    }
+    assert!(accented_lines(&section, &bench.ctx())[0].starts_with("gamma"));
+    let _ = bench.drained();
+    bench.key(&mut section, "i");
+    assert_eq!(
+        bench.errors(),
+        vec!["nothing declares how to install `gamma`".to_owned()],
+        "`i` acts on the row the cursor is on"
+    );
+
+    for _ in 0..5 {
+        bench.key(&mut section, "k");
+    }
+    assert!(accented_lines(&section, &bench.ctx())[0].starts_with("alpha"));
+    let _ = bench.drained();
+    bench.key(&mut section, "i");
+    assert_eq!(
+        bench.errors(),
+        vec!["nothing declares how to install `alpha`".to_owned()],
+    );
+}
+
+/// `i` on a row that declares no source is refused **by the row**: the answer is in the document
+/// the section is already holding, so no request leaves and no byte is fetched.
+#[tokio::test]
+async fn i_on_a_row_without_an_install_block_is_refused_by_name_and_sends_nothing() {
+    let bench = Bench::new().await;
+    let mut section = section_over(&bench, vec![registry_row("undeclared", false)]);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "i"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(
+        emitted
+            .iter()
+            .filter_map(|action| match action {
+                Action::Error(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["nothing declares how to install `undeclared`".to_owned()],
+    );
+    assert!(
+        !emitted
+            .iter()
+            .any(|action| matches!(action, Action::Store(_))),
+        "the refusal is parsed from the row in hand, not asked of the store: {emitted:?}"
+    );
+    assert!(
+        !render_section(&section, &bench.ctx()).contains("install demo-acp"),
+        "and no consent pane opens"
+    );
+}
+
+/// `i` on a row that does declare one asks for the pre-flight and **nothing else**: `R-AGT-10`'s
+/// rule is that the user is told what will be fetched before anything is.
+#[tokio::test]
+async fn i_asks_for_a_plan_and_never_for_a_confirm() {
+    let bench = Bench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "i"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(emitted.len(), 1, "one request, no status line: {emitted:?}");
+    assert!(
+        matches!(
+            &emitted[0],
+            Action::Store(StoreRequest::InstallPlan { agent_id: asked }) if *asked == agent_id
+        ),
+        "`i` pre-flights the highlighted row: {emitted:?}"
+    );
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "declared"),
+        "planning\u{2026}",
+        "and the cell says the pre-flight is running"
+    );
+}
+
+/// `i` while a probe is running is refused by name: the rows on screen do not answer the question
+/// the user just asked, so an install planned against them would be planned against stale facts.
+#[tokio::test]
+async fn i_while_a_probe_runs_is_refused() {
+    let bench = Bench::new().await;
+    let mut section = section_over(&bench, vec![registry_row("declared", true)]);
+    bench.key(&mut section, "r");
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "i"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(
+        emitted
+            .iter()
+            .filter_map(|action| match action {
+                Action::Error(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["a probe is running".to_owned()],
+    );
+    assert!(
+        !emitted
+            .iter()
+            .any(|action| matches!(action, Action::Store(_))),
+        "and nothing is asked of the store: {emitted:?}"
+    );
+}
+
+/// Hazard H-10 at the section: a second `i` while a pre-flight or an install runs is refused, and
+/// so is `r` — a probe spawns a process per agent and the install is about to spawn one itself.
+#[tokio::test]
+async fn i_and_r_are_both_refused_while_an_install_is_in_flight() {
+    let bench = Bench::new().await;
+    let mut section = section_over(&bench, vec![registry_row("declared", true)]);
+    bench.key(&mut section, "i");
+    let _ = bench.drained();
+
+    bench.key(&mut section, "i");
+    assert_eq!(
+        bench.errors(),
+        vec!["an install is already running".to_owned()]
+    );
+    bench.key(&mut section, "r");
+    assert_eq!(
+        bench.errors(),
+        vec!["an install is running; probe afterwards".to_owned()]
+    );
+}
+
+/// Plan D19's local modality: with a plan on screen the section consumes every key it is offered,
+/// so a `j` or an `r` cannot move the ground under a consent the user has not answered yet.
+///
+/// The tab's own `h`/`l`/`[`/`]`/arrows never reach here — `SettingsTab::on_key` takes them first —
+/// which is what keeps a pending plan from trapping the user in the section.
+#[tokio::test]
+async fn a_pending_plan_swallows_every_key_but_y_n_and_esc() {
+    let bench = Bench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row, registry_row("second", true)]);
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(demo_plan(
+            agent_id, "declared", None,
+        )))),
+    );
+    let _ = bench.drained();
+
+    for chord in ["j", "k", "r", "i", "x"] {
+        assert_eq!(
+            bench.key(&mut section, chord),
+            Handled::Consumed,
+            "`{chord}` is this section's own key, so the pane swallows it"
+        );
+    }
+    // `App::on_key` offers the active tab a key **before** the `Tab` and `Global` keymaps and
+    // returns as soon as the tab says `Consumed` (`app/state.rs:380-421`). A pane that consumed
+    // everything would therefore kill `q`, `?`, `Tab` and the digit tab-switches while it is open,
+    // and the user could not even quit. The pane is modal over the table below it, not over the app.
+    for chord in ["q", "g", "?"] {
+        assert_eq!(
+            bench.key(&mut section, chord),
+            Handled::Pass,
+            "`{chord}` belongs to the global table and must still reach it"
+        );
+    }
+    assert!(
+        bench.drained().is_empty(),
+        "and none of them asks anything of the store"
+    );
+    assert!(
+        accented_lines(&section, &bench.ctx())[0].starts_with("declared"),
+        "the cursor did not move under the pane"
+    );
+
+    assert_eq!(bench.key(&mut section, "n"), Handled::Consumed);
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        !rendered.contains("install Demo 1.2.3"),
+        "`n` closes the pane: {rendered}"
+    );
+    assert!(
+        rendered.contains("install declined"),
+        "and says so on the hint line: {rendered}"
+    );
+    assert!(
+        bench.drained().is_empty(),
+        "a declined plan is not confirmed"
+    );
+}
+
+/// `y` is the only key that starts a download, and it carries the plan back unchanged: plan D12's
+/// rule that what the user said yes to is what is installed.
+#[tokio::test]
+async fn y_confirms_exactly_the_plan_that_was_shown() {
+    let bench = Bench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+    let plan = demo_plan(agent_id, "declared", Some(&"ab".repeat(32)));
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(plan.clone()))),
+    );
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "y"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    let Action::Store(StoreRequest::InstallConfirm { plan: confirmed }) = &emitted[0] else {
+        panic!("`y` confirms: {emitted:?}")
+    };
+    assert_eq!(**confirmed, plan, "byte for byte the plan that was drawn");
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "declared"),
+        "planning\u{2026}",
+        "the cell moves to the install's own first phase"
+    );
+}
+
+/// The consent pane, every line of plan D13 in order — and both wordings of the digest line, since
+/// eight of the registry's forty entries publish no `sha256` and the honest sentence for those is
+/// what the user is agreeing to.
+#[tokio::test]
+async fn the_consent_pane_renders_every_line_and_both_digest_wordings() {
+    let bench = Bench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+
+    let published = demo_plan(agent_id, "declared", Some(&"ab".repeat(32)));
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(published.clone()))),
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    for line in published.consent_lines() {
+        assert!(
+            rendered.contains(line.trim_end()),
+            "the pane draws `{line}`:\n{rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("sha256 published: verified before unpacking"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("y install \u{b7} n cancel"),
+        "the hint line stands in for a help entry: {rendered}"
+    );
+
+    let unpublished = demo_plan(agent_id, "declared", None);
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(unpublished))),
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains(
+            "none published: htui cannot verify this download and will record what it receives"
+        ),
+        "{rendered}"
+    );
+}
+
+/// The progress cell, one phase at a time (plan D19).
+///
+/// The `unpacking` case is the one a live run found: `unpack` counts *completed entries*, so a
+/// single-entry archive reports `done = 0` for the whole unpack and then jumps to `done == total`.
+/// A percentage computed from that reads `0%` for the entire phase, which is why a zero numerator
+/// renders the phase word alone.
+#[tokio::test]
+async fn the_progress_cell_renders_each_phase_and_never_a_misleading_zero() {
+    let bench = Bench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(demo_plan(
+            agent_id, "declared", None,
+        )))),
+    );
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    for (phase, done, total, expected) in [
+        (InstallPhase::Planning, 0, None, "planning\u{2026}"),
+        (
+            InstallPhase::Downloading,
+            0,
+            Some(100),
+            "downloading\u{2026}",
+        ),
+        (InstallPhase::Downloading, 42, Some(100), "downloading 42%"),
+        (
+            InstallPhase::Downloading,
+            12 * 1024 * 1024,
+            None,
+            "downloading 12.0 MB",
+        ),
+        (InstallPhase::Verifying, 0, None, "verifying\u{2026}"),
+        (InstallPhase::Unpacking, 0, Some(4096), "unpacking\u{2026}"),
+        (InstallPhase::Unpacking, 4096, Some(4096), "unpacking 100%"),
+        (InstallPhase::Probing, 0, None, "probing\u{2026}"),
+    ] {
+        bench.reply(
+            &mut section,
+            &StoreReply::Install(InstallFrame::Progress { phase, done, total }),
+        );
+        let rendered = render_section(&section, &bench.ctx());
+        assert_eq!(
+            on_box_cell(&rendered, "declared"),
+            expected,
+            "{phase} {done}/{total:?}:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("x cancel install"),
+            "the hint line offers the way out: {rendered}"
+        );
+    }
+}
+
+/// `x` asks the runtime to stop, and the cell says so at once rather than after the install
+/// notices: a cancel the user cannot see is a cancel they press twice.
+#[tokio::test]
+async fn x_while_an_install_runs_asks_for_a_cancel_and_the_cell_says_so() {
+    let bench = Bench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(demo_plan(
+            agent_id, "declared", None,
+        )))),
+    );
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "x"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert!(
+        matches!(&emitted[..], [Action::Store(StoreRequest::InstallCancel)]),
+        "{emitted:?}"
+    );
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "declared"),
+        "cancelling\u{2026}"
+    );
+
+    bench.reply(&mut section, &StoreReply::Install(InstallFrame::Cancelled));
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "declared"),
+        "not probed",
+        "a cancelled install leaves the cell where it was"
+    );
+    assert!(rendered.contains("install cancelled"), "{rendered}");
+}
+
+/// Plan D20's fallback: a failure the user can route around is rendered as the steps, derived
+/// entirely from the plan and the helper, and `Esc` puts them away.
+#[tokio::test]
+async fn a_failed_install_with_manual_steps_renders_them_under_the_table() {
+    let bench = Bench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+    let plan = demo_plan(agent_id, "declared", None);
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(plan.clone()))),
+    );
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    let steps: ManualSteps = plan.manual_steps("http://127.0.0.1:1");
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Failed {
+            message: "the registry could not be reached".to_owned(),
+            manual: Some(Box::new(steps.clone())),
+        }),
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("the registry could not be reached"),
+        "{rendered}"
+    );
+    for line in steps.lines() {
+        assert!(rendered.contains(line.trim_end()), "`{line}`:\n{rendered}");
+    }
+    assert!(rendered.contains("Esc close"), "{rendered}");
+    assert_eq!(
+        on_box_cell(&rendered, "declared"),
+        "not probed",
+        "and the row is back to what the probe last said about it"
+    );
+
+    assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
+    assert!(
+        !render_section(&section, &bench.ctx()).contains("make ./demo_server executable"),
+        "`Esc` closes the steps"
+    );
+}
+
+/// A failure the user cannot route around is one sentence on the hint line, not a pane.
+#[tokio::test]
+async fn a_failure_without_manual_steps_is_a_notice() {
+    let bench = Bench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(demo_plan(
+            agent_id, "declared", None,
+        )))),
+    );
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Failed {
+            message: "the archive is refused: an entry escapes the tree".to_owned(),
+            manual: None,
+        }),
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("the archive is refused: an entry escapes the tree"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("i install"),
+        "and the section is idle again: {rendered}"
+    );
+}
+
+/// `R-AGT-6` at the section: `Done` is not a status, it is the cue to read the registry again.
+/// There is no "installed" state anywhere in this file — the probe's row is what the cell shows.
+#[tokio::test]
+async fn a_done_frame_reads_the_registry_again_rather_than_claiming_success() {
+    let bench = Bench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row.clone()]);
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(demo_plan(
+            agent_id, "declared", None,
+        )))),
+    );
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Done(Box::new(InstallOutcome::Installed {
+            record: demo_record(),
+            version: "1.2.3".to_owned(),
+            dir: PathBuf::from("/tmp/htui-agents/demo-acp/1.2.3"),
+            row: probed_box(agent_id),
+            status: ProbeStatus::Ready,
+            removed_versions: vec!["1.2.2".to_owned()],
+            digest_changed: false,
+        }))),
+    );
+    let emitted = bench.drained();
+    assert!(
+        matches!(&emitted[..], [Action::Store(StoreRequest::Agents)]),
+        "the probe is the authority, so the section re-reads what it wrote: {emitted:?}"
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains("installed demo-acp 1.2.3"), "{rendered}");
+    assert_eq!(
+        on_box_cell(&rendered, "declared"),
+        "not probed",
+        "the cell shows the row it has, not a claim the install made"
+    );
+
+    // What the fresh read brings back is what the cell then says, whatever the verdict was.
+    let mut probed = row;
+    probed.on_box = Some(probed_box(agent_id));
+    bench.reply(&mut section, &StoreReply::Agents(vec![probed]));
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "declared"),
+        "9.9.9"
+    );
+}
+
+/// Hazard H-17: a `StoreReply::Agents` from a scope change mid-download must not close the pane.
+///
+/// The module doc's warning is about `probing`, and it stays true of `probing`. The install state
+/// deliberately does not join it: a probe that loses its in-flight flag re-renders one column, an
+/// install that loses its state leaves a running download with no way to cancel it.
+#[tokio::test]
+async fn an_agents_reply_does_not_clear_an_install_in_flight() {
+    let bench = Bench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row.clone()]);
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(demo_plan(
+            agent_id, "declared", None,
+        )))),
+    );
+    bench.key(&mut section, "y");
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Progress {
+            phase: InstallPhase::Downloading,
+            done: 42,
+            total: Some(100),
+        }),
+    );
+    let _ = bench.drained();
+
+    bench.reply(&mut section, &StoreReply::Agents(vec![row]));
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "declared"),
+        "downloading 42%",
+        "the download is still running and still says so: {rendered}"
+    );
+    assert!(
+        rendered.contains("x cancel install"),
+        "and can still be stopped: {rendered}"
+    );
+}
+
+/// A `Failed` reply naming one of the three install requests is the shell's message to render, not
+/// the section's: `App::update` has already put it on the status line, so all that is left here is
+/// to stop saying an install is running.
+#[tokio::test]
+async fn a_refused_install_request_leaves_the_section_idle() {
+    let bench = Bench::new().await;
+    let mut section = section_over(&bench, vec![registry_row("declared", true)]);
+    bench.key(&mut section, "i");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "install_plan",
+            message: "this runtime has no installer".to_owned(),
+        },
+    );
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "declared"),
+        "not probed"
+    );
+    bench.key(&mut section, "i");
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            &emitted[..],
+            [Action::Store(StoreRequest::InstallPlan { .. })]
+        ),
+        "a refused pre-flight does not lock the section out of a second try: {emitted:?}"
+    );
+}
+
+/// One manifest record, for an outcome a test hands the section.
+fn demo_record() -> InstallRecord {
+    InstallRecord {
+        sha256: "ab".repeat(32),
+        published: true,
+        archive: "http://127.0.0.1:1/archive.zip".to_owned(),
+        platform: "linux-x86_64".to_owned(),
+        installed_at: htui_core::fixtures::demo_at(0, 0),
+    }
+}
+
+/// The `agent_box` row a probe would have written for `agent_id`.
+fn probed_box(agent_id: AgentId) -> AgentBox {
+    AgentBox {
+        agent_id,
+        box_id: BoxId::new(),
+        enabled: true,
+        version: Some("9.9.9".to_owned()),
+        path: None,
+        probed_at: Some(htui_core::fixtures::demo_at(0, 0)),
+        quota: None,
+        quota_at: None,
+        updated_at: htui_core::fixtures::demo_at(0, 0),
+        probe: Some(json!({ "status": "ready", "source": "probe" })),
+    }
 }

@@ -29,7 +29,11 @@ use htui_agent::driver::{
 };
 use htui_agent::error::DriverError;
 use htui_agent::event::{DriverEnvelope, DriverEvent, StopReason, ToolCallEvent};
-use htui_agent::launch::AgentSettings;
+use htui_agent::install::{
+    InstallConfig, InstallError, InstallJob, InstallOutcome, InstallPlan, InstallProgress,
+    Installer, PlanError, install, plan as plan_install,
+};
+use htui_agent::launch::{AgentLaunch, AgentSettings};
 use htui_agent::probe::{ProbeContext, ProbeEnv, ProbeOutcome, SpawnTier2, probe_agent};
 use htui_agent::record::{AnsweredBy, Recorder};
 use htui_agent::registry::DriverFactory;
@@ -42,9 +46,10 @@ use htui_store::{Backend, Writer};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::store_worker::{
-    ChatFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply, StoreRequest,
+    ChatFrame, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply, StoreRequest,
 };
 
 /// How long a cancelled session may take the graceful path before its tree is killed.
@@ -125,6 +130,46 @@ impl core::fmt::Debug for LiveChat {
     }
 }
 
+/// Which half of an install is running (MOD-20 D18).
+///
+/// One claim covers both, because they are one action from the user's side and because two of
+/// them for the same registry id would race each other on `.staging/` (blueprint H-10). The
+/// distinction is kept anyway: what a stuck runtime is doing is the first question asked of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivePhase {
+    /// A pre-flight is reading the registry.
+    Planning,
+    /// A confirmed plan is being fetched, unpacked and probed.
+    Installing,
+}
+
+/// The one install this runtime allows at a time (MOD-20 D18).
+///
+/// The token, not the handle, is how this is stopped: `abort()` drops a future at its next await
+/// and can neither sweep the staging entry nor send the frame the section is waiting on — and it
+/// does not stop the blocking thread an unpack runs on at all (blueprint P-3, hazard H-8).
+/// `AgentRuntime::shutdown` therefore cancels **before** it aborts.
+pub struct LiveInstall {
+    /// Which registry row this install is for.
+    agent_id: AgentId,
+    /// Planning or installing; both hold the claim.
+    phase: LivePhase,
+    /// Tripped by [`StoreRequest::InstallCancel`] and by shutdown.
+    cancel: CancellationToken,
+    /// The task that answers the request.
+    task: JoinHandle<()>,
+}
+
+impl core::fmt::Debug for LiveInstall {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LiveInstall")
+            .field("agent_id", &self.agent_id)
+            .field("phase", &self.phase)
+            .field("finished", &self.task.is_finished())
+            .finish()
+    }
+}
+
 /// A chat's session future: production spawns it, the harness polls it inline (plan D30).
 pub type ChatTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -177,6 +222,18 @@ pub struct AgentRuntime {
     /// is a task this struct owns, the D60 one runs inside a chat task, and neither can see the
     /// other from where it lives.
     reprobe_claims: ReprobeClaims,
+    /// Where an install would read the registry from and write its tree to (MOD-20 D18).
+    ///
+    /// `None` until [`with_installer`](Self::with_installer) or [`production`](Self::production):
+    /// a runtime built by [`new`](Self::new) refuses `i` by saying it has no installer, so no test
+    /// can reach the real registry by forgetting to inject one.
+    ///
+    /// The **config**, not an [`Installer`]: the clients are built inside the task that uses them
+    /// (blueprint P-13), which is what keeps a client that cannot be built from panicking on the
+    /// loop and keeps `production()` from opening a socket nobody asked for.
+    installer: Option<InstallConfig>,
+    /// The install running right now, if any.
+    install: Option<LiveInstall>,
 }
 
 impl core::fmt::Debug for AgentRuntime {
@@ -199,13 +256,40 @@ impl AgentRuntime {
             grace: CANCEL_GRACE,
             background: Vec::new(),
             reprobe_claims: ReprobeClaims::default(),
+            installer: None,
+            install: None,
         }
     }
 
     /// The production runtime: the ACP transport and nothing else (milestone 8 adds the CLI one).
+    ///
+    /// It carries an installer, and carrying one costs nothing until the user presses `i`: the
+    /// value is where the registry is and where a tree may be written, and the HTTP clients it
+    /// implies are built inside the install task (blueprint P-13).
     #[must_use]
     pub fn production() -> Self {
-        Self::new(DriverFactory::with_acp())
+        Self::new(DriverFactory::with_acp()).with_installer(InstallConfig::default())
+    }
+
+    /// A runtime that installs from this registry, into this root (MOD-20 D18).
+    ///
+    /// The injected seam the item is built on: `set_var` is forbidden here, so a test that must
+    /// keep off the real registry and the maintainer's real install root says so as data.
+    #[must_use]
+    pub fn with_installer(mut self, config: InstallConfig) -> Self {
+        self.installer = Some(config);
+        self
+    }
+
+    /// Whether an install — a pre-flight or a confirmed one — is running.
+    ///
+    /// One claim for both, because they are one action and two of them for the same registry id
+    /// would race on `.staging/` (blueprint H-10).
+    #[must_use]
+    pub fn install_running(&self) -> bool {
+        self.install
+            .as_ref()
+            .is_some_and(|live| !live.task.is_finished())
     }
 
     /// A runtime whose cancels use this grace window. Tests use zero.
@@ -234,13 +318,26 @@ impl AgentRuntime {
     ///
     /// The deterministic end the test harness needs: a probe answers through the reply channel
     /// from its own task, so a harness that rendered before this returned would photograph a probe
-    /// that had not finished.
+    /// that had not finished. A live install is one of those tasks and is awaited here too
+    /// (blueprint P-2) — it is *not* in `background`, because the runtime has to be able to name
+    /// it and cancel it by itself.
+    ///
+    /// The token is tripped before the abort for the reason
+    /// [`shutdown`](Self::shutdown) does it: an abort cannot stop a blocking unpack.
     pub async fn finish_background(&mut self, limit: Duration) {
         for handle in std::mem::take(&mut self.background) {
             let abort = handle.abort_handle();
             if tokio::time::timeout(limit, handle).await.is_err() {
                 abort.abort();
                 tracing::warn!(?limit, "a background task did not finish and was aborted");
+            }
+        }
+        if let Some(LiveInstall { cancel, task, .. }) = self.install.take() {
+            let abort = task.abort_handle();
+            if tokio::time::timeout(limit, task).await.is_err() {
+                cancel.cancel();
+                abort.abort();
+                tracing::warn!(?limit, "an install did not finish and was aborted");
             }
         }
     }
@@ -258,13 +355,14 @@ impl AgentRuntime {
         self.live.get(&step_id).map(|chat| chat.caps)
     }
 
-    /// Serves one chat request.
+    /// Serves one request the agent runtime owns: the four chat variants, `ProbeAgents`, and
+    /// MOD-20's three install variants.
     ///
     /// # Panics
     ///
-    /// Never: a request that is not one of the four chat variants is answered with a `Failed`
-    /// naming it rather than by panicking, because the worker's match is the only caller and a
-    /// widened enum should not become a crash.
+    /// Never: a request this runtime does not own is answered with a `Failed` naming it rather
+    /// than by panicking, because the worker's match is the only caller and a widened enum should
+    /// not become a crash.
     pub async fn serve(
         &mut self,
         backend: &Backend,
@@ -277,6 +375,9 @@ impl AgentRuntime {
         // The same sweep for the tasks that answer their own request: a probe that has answered is
         // not a probe still running, and `background_len` is what a test reads.
         self.background.retain(|task| !task.is_finished());
+        // And for the install claim, which is one deep: an install that has answered must not go
+        // on refusing the next `i` (blueprint H-10).
+        self.install.take_if(|live| live.task.is_finished());
 
         let addr = ReplyAddr {
             seq: envelope.seq,
@@ -335,6 +436,22 @@ impl AgentRuntime {
                 Ok(served) => served,
                 Err(err) => Served::Reply(failed("probe_agents", &err)),
             },
+            StoreRequest::InstallPlan { agent_id } => {
+                match self.install_plan(backend, replies, addr, *agent_id).await {
+                    Ok(served) => served,
+                    Err(err) => Served::Reply(failed("install_plan", &err)),
+                }
+            }
+            StoreRequest::InstallConfirm { plan } => {
+                match self
+                    .install_confirm(backend, replies, addr, plan.clone())
+                    .await
+                {
+                    Ok(served) => served,
+                    Err(err) => Served::Reply(failed("install_confirm", &err)),
+                }
+            }
+            StoreRequest::InstallCancel => self.install_cancel(),
             other => Served::Reply(StoreReply::Failed {
                 request: other.name(),
                 message: "not a chat request".to_owned(),
@@ -350,12 +467,32 @@ impl AgentRuntime {
     /// Background tasks are aborted rather than awaited, after the chats are down: a probe's child
     /// dies with the guard the handshake holds it in, and reaping it at process exit buys nothing
     /// but a wait on a handshake nobody will read.
+    ///
+    /// **The install is cancelled before it is aborted**, and it is the one place shutdown does
+    /// more than `abort()` (blueprint P-3). `JoinHandle::abort` drops a future at its next await
+    /// and does nothing at all to the `spawn_blocking` thread an unpack runs on, so a shutdown
+    /// mid-unpack would leave a thread writing into `.staging/` after the runtime is gone. The
+    /// token is what that thread checks between entries (hazard H-8); the abort is what stops the
+    /// async half from waiting on it.
     pub async fn shutdown(&mut self, grace: Duration) {
         for (step, chat) in self.live.drain() {
             let _ = chat.commands.send(ChatCommand::Cancel { reply: None });
             let Some(task) = chat.task else { continue };
             if tokio::time::timeout(grace * 2, task).await.is_err() {
                 tracing::warn!(%step, "a chat did not end within the grace window");
+            }
+        }
+        if let Some(live) = self.install.take() {
+            // Cancelled, then given the same bounded window a chat gets, and only then aborted.
+            // The task's own cleanup is what removes a partial `.staging/` entry (blueprint H-6),
+            // and `abort()` cannot run it — nor can it stop the `spawn_blocking` unpack at all
+            // (P-3), so an immediate abort leaves residue for the next install's hourly sweep.
+            live.cancel.cancel();
+            if tokio::time::timeout(grace * 2, live.task).await.is_err() {
+                tracing::warn!(
+                    agent = %live.agent_id,
+                    "an install did not end within the grace window; its staging entry waits for the next sweep"
+                );
             }
         }
         for task in std::mem::take(&mut self.background) {
@@ -376,6 +513,15 @@ impl AgentRuntime {
         replies: &mpsc::UnboundedSender<ReplyEnvelope>,
         addr: ReplyAddr,
     ) -> Result<Served, StoreError> {
+        // The other half of `claim_is_free`'s rule: an install's re-probe writes `agent_box` for
+        // its row, and a probe writes one for every row. Whichever started first, running them
+        // together races on the same row, so each refuses while the other holds the box.
+        if let Some(live) = &self.install {
+            return Err(StoreError::Backend(format!(
+                "an install is running for agent {}; probe once it has finished",
+                live.agent_id
+            )));
+        }
         let writer = backend.writer().ok_or_else(|| {
             StoreError::Unreachable("this backend hands out no writer".to_owned())
         })?;
@@ -411,6 +557,154 @@ impl AgentRuntime {
             },
         })));
         Ok(Served::Deferred)
+    }
+
+    /// The [`StoreRequest::InstallPlan`] path (MOD-20 D13, D18).
+    ///
+    /// Every refusal is here, **before anything is spawned**, in the probe's own order and for the
+    /// probe's own reasons: no installer, because a runtime that was never given one must not
+    /// reach the network by accident; no writer, or one that refuses `agent_box`, because a plan
+    /// is the last free moment to notice that the install it leads to could never be recorded — a
+    /// registry read spent on it would be spent for nothing; no box row, because `agent_box` has
+    /// no primary key without one; an install already running, because two of them for one id
+    /// race on `.staging/` (hazard H-10); no such row; and a row that declares no source, which is
+    /// a fact about a document the loop is already holding.
+    ///
+    /// What is **awaited** here is the whole of `R-NF-3` for this request: `box_info()` and
+    /// `agents()`, the same two the probe awaits on this arm. The registry read, the `HEAD` and
+    /// even the construction of the HTTP client happen in the task (blueprint P-13, hazard H-9).
+    async fn install_plan(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        agent_id: AgentId,
+    ) -> Result<Served, StoreError> {
+        let config = self.install_config()?;
+        // Taken and dropped: planning writes nothing, but the install it exists to authorise
+        // does, and refusing costs nothing only while nothing has been fetched.
+        drop(recording_writer(backend)?);
+        registered_box(backend).await?;
+        self.claim_is_free()?;
+        let agent = row_for(backend, agent_id).await?.agent;
+        declares_a_source(&agent)?;
+        let cwd = std::env::current_dir().map_err(|err| {
+            StoreError::Backend(format!("this process has no working directory: {err}"))
+        })?;
+
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_plan(
+            PlanArgs {
+                config,
+                agent,
+                cwd,
+                frames: Frames {
+                    tx: replies.clone(),
+                    addr,
+                },
+            },
+            cancel.clone(),
+        ));
+        self.install = Some(LiveInstall {
+            agent_id,
+            phase: LivePhase::Planning,
+            cancel,
+            task,
+        });
+        Ok(Served::Deferred)
+    }
+
+    /// The [`StoreRequest::InstallConfirm`] path (MOD-20 D12, D18).
+    ///
+    /// [`install_plan`](Self::install_plan)'s refusals minus the last: the plan in hand is the
+    /// evidence that a source was declared, and the pipeline re-checks every path in it at run
+    /// time anyway (hazard H-16). The [`Writer`] is **taken** here rather than checked, because
+    /// the task is what writes the row the probe produces and the loop replaces its own `Backend`
+    /// wholesale whenever the server comes or goes.
+    async fn install_confirm(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        plan: Box<InstallPlan>,
+    ) -> Result<Served, StoreError> {
+        let config = self.install_config()?;
+        let writer = recording_writer(backend)?;
+        let box_id = registered_box(backend).await?;
+        self.claim_is_free()?;
+        let summary = row_for(backend, plan.agent_id).await?;
+        let cwd = std::env::current_dir().map_err(|err| {
+            StoreError::Backend(format!("this process has no working directory: {err}"))
+        })?;
+
+        let agent_id = summary.agent.id;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_install(InstallArgs {
+            config,
+            plan,
+            writer,
+            box_id,
+            agent: summary.agent,
+            existing: summary.on_box,
+            cwd,
+            cancel: cancel.clone(),
+            frames: Frames {
+                tx: replies.clone(),
+                addr,
+            },
+        }));
+        self.install = Some(LiveInstall {
+            agent_id,
+            phase: LivePhase::Installing,
+            cancel,
+            task,
+        });
+        Ok(Served::Deferred)
+    }
+
+    /// The [`StoreRequest::InstallCancel`] path (MOD-20 D18).
+    ///
+    /// Answered at once, and the claim is **not** released here: the task is still running, still
+    /// owns the staging entry it has to sweep, and still owes its stream a last frame. It ends
+    /// itself, and the sweep at the top of [`serve`](Self::serve) is what forgets it.
+    fn install_cancel(&mut self) -> Served {
+        let Some(live) = self.install.as_ref() else {
+            return Served::Reply(StoreReply::Failed {
+                request: "install_cancel",
+                message: "no install is running".to_owned(),
+            });
+        };
+        live.cancel.cancel();
+        Served::Reply(StoreReply::Install(InstallFrame::Cancelling))
+    }
+
+    /// Where this runtime would install from, or the refusal that says it cannot.
+    fn install_config(&self) -> Result<InstallConfig, StoreError> {
+        self.installer
+            .clone()
+            .ok_or_else(|| StoreError::Backend("this runtime has no installer".to_owned()))
+    }
+
+    /// `Ok` when no install holds the claim (hazard H-10).
+    fn claim_is_free(&self) -> Result<(), StoreError> {
+        if let Some(live) = &self.install {
+            return Err(StoreError::Backend(format!(
+                "an install is already running for agent {}",
+                live.agent_id
+            )));
+        }
+        // A probe writes `agent_box` for every row, and an install's re-probe writes one of them.
+        // Run together, they race on the same row and the last write wins — so the claim covers a
+        // probe in flight too. The Settings section's own `probing` flag is not enough: **any**
+        // `StoreReply::Agents` clears it (`ui/tabs/settings/agents.rs`, module doc), and
+        // `wants_requests` re-issues `Agents` on every activation, so `r` → switch tab → back → `i`
+        // reaches here with `run_probe` still running.
+        if !self.background.is_empty() {
+            return Err(StoreError::Backend(
+                "a probe is already running on this box; install once it has finished".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Forwards a command to a live chat.
@@ -899,6 +1193,281 @@ async fn run_reprobe(args: ReprobeArgs) {
             tracing::debug!(agent = %agent.name, reason, "the re-probe left a row alone");
         }
     }
+}
+
+/// The writer of a backend that can hold an `agent_box` row, or the refusal that names why not.
+///
+/// `Writer::Buffered` refuses `upsert_agent_box` with `REGISTRY_ON_SERVER_ONLY` (plan D52), and
+/// the whole point of asking here is to hear that sentence before the work rather than after it.
+fn recording_writer(backend: &Backend) -> Result<Writer, StoreError> {
+    let writer = backend
+        .writer()
+        .ok_or_else(|| StoreError::Unreachable("this backend hands out no writer".to_owned()))?;
+    if matches!(writer, Writer::Buffered(_)) {
+        return Err(StoreError::Unreachable(
+            htui_store::REGISTRY_ON_SERVER_ONLY.to_owned(),
+        ));
+    }
+    Ok(writer)
+}
+
+/// This box's id, or the refusal that says it has never been registered.
+async fn registered_box(backend: &Backend) -> Result<BoxId, StoreError> {
+    Ok(backend
+        .box_info()
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "box",
+            id: "this box is not registered".to_owned(),
+        })?
+        .box_id)
+}
+
+/// One registry row with this box's `agent_box` for it, or a `NotFound` naming the id.
+async fn row_for(
+    backend: &Backend,
+    agent_id: AgentId,
+) -> Result<htui_core::model::AgentSummary, StoreError> {
+    backend
+        .agents()
+        .await?
+        .into_iter()
+        .find(|summary| summary.agent.id == agent_id)
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "agent",
+            id: agent_id.to_string(),
+        })
+}
+
+/// `Ok` when the row says where its adapter comes from (MOD-20 D12).
+///
+/// Read off the document the loop already holds, so `Settings > i` on a `NodePackage`-served row
+/// costs no request at all. A `launch` that does not parse declares nothing, source included —
+/// the pre-flight reaches the same conclusion from the same document, and this is its sentence.
+fn declares_a_source(agent: &Agent) -> Result<(), StoreError> {
+    let declared = serde_json::from_value::<AgentLaunch>(agent.launch.clone())
+        .ok()
+        .and_then(|launch| launch.discovery)
+        .and_then(|discovery| discovery.install);
+    if declared.is_some() {
+        return Ok(());
+    }
+    Err(StoreError::Backend(
+        PlanError::NoSource {
+            agent: agent.name.clone(),
+        }
+        .to_string(),
+    ))
+}
+
+/// Everything the pre-flight task owns (MOD-20 D18).
+///
+/// The [`InstallConfig`] rather than an [`Installer`]: the clients are built inside
+/// [`run_plan`], so a client that cannot be built is a frame at this request's address rather
+/// than a panic on the worker loop (blueprint P-13).
+struct PlanArgs {
+    config: InstallConfig,
+    agent: Agent,
+    cwd: std::path::PathBuf,
+    frames: Frames,
+}
+
+impl core::fmt::Debug for PlanArgs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PlanArgs")
+            .field("registry_base", &self.config.registry_base)
+            .field("agent", &self.agent.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Everything the install task owns (MOD-20 D18).
+///
+/// A [`Writer`] and not a [`Backend`], for [`ProbeArgs`]'s reason: the loop replaces its one
+/// `Backend` wholesale when the server comes or goes, and this outlives the arm that built it.
+struct InstallArgs {
+    config: InstallConfig,
+    plan: Box<InstallPlan>,
+    writer: Writer,
+    box_id: BoxId,
+    agent: Agent,
+    existing: Option<AgentBox>,
+    cwd: std::path::PathBuf,
+    cancel: CancellationToken,
+    frames: Frames,
+}
+
+impl core::fmt::Debug for InstallArgs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InstallArgs")
+            .field("writer", &self.writer.label())
+            .field("agent", &self.agent.name)
+            .field("registry_id", &self.plan.registry_id)
+            .field("version", &self.plan.version)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The pre-flight, in its own task: one registry read, one `HEAD`, no archive byte (MOD-20 D13).
+///
+/// A plain `async fn` over an owned argument struct, like [`run_chat`]: production spawns it and a
+/// harness can poll it, and neither has to know which.
+///
+/// Three shapes of answer, because the section renders three things. A plan is a consent pane. A
+/// network failure is the by-hand steps, which is the one failure the user can route around
+/// (MOD-20 D20). Everything else is a sentence on the status line, addressed as an ordinary
+/// request failure — a refusal is not an install stream that has begun.
+async fn run_plan(args: PlanArgs, cancel: CancellationToken) {
+    let PlanArgs {
+        config,
+        agent,
+        cwd,
+        frames,
+    } = args;
+    let addr = frames.addr.clone();
+
+    // Here and not on the loop: `Client::build` can fail, and a failure inside a `select!` arm
+    // would be a panic that takes the worker with it (blueprint P-13).
+    let installer = match Installer::new(config.clone()) {
+        Ok(installer) => installer,
+        Err(err) => {
+            frames.reply(
+                &addr,
+                StoreReply::Install(InstallFrame::Failed {
+                    message: err.to_string(),
+                    manual: None,
+                }),
+            );
+            return;
+        }
+    };
+    let env = config.apply_to(ProbeEnv::host(cwd));
+
+    let planned = tokio::select! {
+        // The pre-flight has no cancellation of its own — it is one `GET` and one `HEAD`, both
+        // already bounded by the registry timeout — so `x` during it is served here, by dropping
+        // the future.
+        () = cancel.cancelled() => {
+            frames.reply(&addr, StoreReply::Install(InstallFrame::Cancelled));
+            return;
+        }
+        planned = plan_install(&installer, &agent, &env, Utc::now()) => planned,
+    };
+
+    let reply = match planned {
+        Ok(plan) => StoreReply::Install(InstallFrame::Plan(Box::new(plan))),
+        Err(PlanError::Network { message, manual }) => StoreReply::Install(InstallFrame::Failed {
+            message,
+            manual: Some(manual),
+        }),
+        Err(err) => StoreReply::Failed {
+            request: "install_plan",
+            message: err.to_string(),
+        },
+    };
+    frames.reply(&addr, reply);
+}
+
+/// The confirmed install, in its own task: fetch, verify, unpack, promote, re-probe (MOD-20 D16).
+///
+/// Every frame goes to the `InstallConfirm`'s own address, which is what makes one request many
+/// replies (plan D18) and what `App::is_fresh` passes until the section confirms another install.
+///
+/// **The row is written before the terminal frame.** The section issues a
+/// [`StoreRequest::Agents`] the moment it sees [`InstallFrame::Done`], and a read that overtook
+/// the write would show the box as it was before the install — the one ordering this task is
+/// responsible for. A write that fails is a failure *of the install*: the tree is on disk and
+/// nothing records it, which is exactly what the user needs to be told.
+///
+/// The status is never this task's. `R-AGT-6`: whatever the pipeline achieved, what the row says
+/// is what `probe_agent` decided, and the outcome carries it through unread.
+async fn run_install(args: InstallArgs) {
+    let InstallArgs {
+        config,
+        plan,
+        writer,
+        box_id,
+        agent,
+        existing,
+        cwd,
+        cancel,
+        frames,
+    } = args;
+    let addr = frames.addr.clone();
+
+    let installer = match Installer::new(config.clone()) {
+        Ok(installer) => installer,
+        Err(err) => {
+            frames.reply(
+                &addr,
+                StoreReply::Install(InstallFrame::Failed {
+                    message: err.to_string(),
+                    manual: None,
+                }),
+            );
+            return;
+        }
+    };
+    let ctx = ProbeContext {
+        env: config.apply_to(ProbeEnv::host(cwd)),
+        now: Utc::now(),
+    };
+    let tier2 = SpawnTier2::default();
+    let job = InstallJob {
+        plan: &plan,
+        agent: &agent,
+        box_id,
+        existing: existing.as_ref(),
+        ctx: &ctx,
+        tier2: &tier2,
+    };
+    let mut progress = |frame: InstallProgress| {
+        frames.reply(
+            &addr,
+            StoreReply::Install(InstallFrame::Progress {
+                phase: frame.phase,
+                done: frame.done,
+                total: frame.total,
+            }),
+        );
+    };
+
+    let reply = match install(&installer, job, &mut progress, &cancel).await {
+        Ok(outcome) => {
+            // Plan D51 travels through untouched: a `Kept` is a hand-written row the probe could
+            // not confirm, and writing anything for it would be the installer overruling the user.
+            let row = match &outcome {
+                InstallOutcome::Installed { row, .. } => Some(row.clone()),
+                InstallOutcome::Failed {
+                    probe: ProbeOutcome::Row(row),
+                    ..
+                } => Some(row.clone()),
+                InstallOutcome::Failed { .. } => None,
+            };
+            match row {
+                Some(row) => match writer.upsert_agent_box(&row).await {
+                    Ok(()) => StoreReply::Install(InstallFrame::Done(Box::new(outcome))),
+                    Err(err) => StoreReply::Install(InstallFrame::Failed {
+                        message: err.to_string(),
+                        manual: None,
+                    }),
+                },
+                None => StoreReply::Install(InstallFrame::Done(Box::new(outcome))),
+            }
+        }
+        Err(InstallError::Cancelled) => StoreReply::Install(InstallFrame::Cancelled),
+        Err(InstallError::Network { message, manual }) => {
+            StoreReply::Install(InstallFrame::Failed {
+                message,
+                manual: Some(manual),
+            })
+        }
+        Err(err) => StoreReply::Install(InstallFrame::Failed {
+            message: err.to_string(),
+            manual: None,
+        }),
+    };
+    frames.reply(&addr, reply);
 }
 
 /// The reply-channel side of one chat: one address, one sender, one place frames are shaped.
@@ -1435,6 +2004,7 @@ fn failed(request: &'static str, err: &StoreError) -> StoreReply {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use htui_agent::INSTALL_ROOT_VAR;
     use htui_agent::conformance::{Script, ScriptEvent};
     use htui_agent::event::{
         DoneEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent, TextChunk,
@@ -1446,6 +2016,317 @@ pub(crate) mod tests {
     use htui_core::store::MemStore;
     use htui_core::store::ReadStore as _;
     use std::sync::Arc;
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-20: the install fixtures
+    //
+    // The fixture server, the archive builder and the row below are this file's own, per the
+    // repo's per-file test-helper rule. Every one of them is deliberately anonymous: `R-AGT-5`
+    // says the installer knows no agent's name, and a worker test that spelled one would be
+    // asserting the seeds rather than the plumbing.
+    // -----------------------------------------------------------------------------------------
+
+    /// The registry entry id these cases install. Not an agent, not a vendor: a made-up id, which
+    /// is the whole point — the worker never learns what it is installing.
+    pub(crate) const INSTALL_ID: &str = "demo-acp";
+
+    /// The version those cases install.
+    pub(crate) const INSTALL_VERSION: &str = "1.0.0";
+
+    /// The `discovery.tools` key whose glob must resolve what the install writes, and the file
+    /// inside the archive that it resolves to.
+    pub(crate) const INSTALL_TOOL: &str = "demo_server";
+
+    /// One scripted answer: what the fixture responder sends for one path.
+    #[derive(Debug, Clone, Default)]
+    struct Route {
+        status: u16,
+        body: Vec<u8>,
+        /// How long to sit on the request before answering at all — the stall a loop-freedom or a
+        /// shutdown case needs, so the install is provably still running when it is asserted on.
+        delay: Duration,
+        /// When non-zero, the body is sent in two halves with this pause between them.
+        ///
+        /// It is what puts a cancellation inside the download's `select!` rather than at the check
+        /// that guards the next step: without a gap between chunks a body this small arrives whole
+        /// before any token could be tripped.
+        chunk_delay: Duration,
+    }
+
+    /// A loopback HTTP/1.1 responder with a scripted route table and a request recorder.
+    ///
+    /// This file's own, deliberately: the repo keeps test helpers per file, and the one in
+    /// `htui-agent`'s `tests/install.rs` answers a different set of questions (conditional
+    /// requests, `HEAD` sizes, digests) that no worker case asks.
+    #[derive(Debug, Clone)]
+    struct Fixture {
+        addr: std::net::SocketAddr,
+        log: Arc<Mutex<Vec<String>>>,
+        routes: Arc<Mutex<HashMap<String, Route>>>,
+    }
+
+    impl Fixture {
+        /// Binds an ephemeral port and starts accepting.
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("an ephemeral loopback port");
+            let addr = listener.local_addr().expect("the bound address");
+            let fixture = Self {
+                addr,
+                log: Arc::new(Mutex::new(Vec::new())),
+                routes: Arc::new(Mutex::new(HashMap::new())),
+            };
+            let serving = fixture.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let serving = serving.clone();
+                    tokio::spawn(async move { serving.answer(stream).await });
+                }
+            });
+            fixture
+        }
+
+        /// `http://127.0.0.1:<port>`, the value `InstallConfig::registry_base` takes.
+        fn base(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        /// The absolute URL of one path on this server.
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{path}", self.addr)
+        }
+
+        /// Scripts one path.
+        fn route(&self, path: &str, route: Route) {
+            self.routes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(path.to_owned(), route);
+        }
+
+        /// Every `"<METHOD> <PATH>"` the responder has seen, in order.
+        fn lines(&self) -> Vec<String> {
+            self.log
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        /// Reads one request, records it, and writes the scripted answer.
+        async fn answer(self, mut stream: tokio::net::TcpStream) {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match stream.read(&mut byte).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => head.push(byte[0]),
+                }
+                if head.ends_with(b"\r\n\r\n") || head.len() > 16 * 1024 {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let mut parts = head.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_owned();
+            let target = parts.next().unwrap_or_default();
+            let path = target.split(['?', '#']).next().unwrap_or(target).to_owned();
+            // The guard is dropped before the first `.await` below, on purpose: this file lives by
+            // the rule the worker does — no lock is ever held across a suspension point.
+            let route = {
+                let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
+                log.push(format!("{method} {path}"));
+                drop(log);
+                self.routes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&path)
+                    .cloned()
+            };
+            let Some(route) = route else {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                return;
+            };
+            if !route.delay.is_zero() {
+                tokio::time::sleep(route.delay).await;
+            }
+            let head = format!(
+                "HTTP/1.1 {} OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                route.status,
+                route.body.len()
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            if method == "HEAD" {
+                let _ = stream.flush().await;
+                return;
+            }
+            if route.chunk_delay.is_zero() {
+                let _ = stream.write_all(&route.body).await;
+            } else {
+                let (first, second) = route.body.split_at(route.body.len() / 2);
+                let _ = stream.write_all(first).await;
+                let _ = stream.flush().await;
+                tokio::time::sleep(route.chunk_delay).await;
+                let _ = stream.write_all(second).await;
+            }
+            let _ = stream.flush().await;
+        }
+    }
+
+    /// A plan for [`INSTALL_ID`] under `root`, fetched from `archive_url`.
+    ///
+    /// Hand-built rather than produced by `plan()`: T7 is about what the worker does with a plan,
+    /// and a pre-flight in front of every case would put a registry read on the path of tests
+    /// whose subject is the *confirm*. It is exactly what `InstallConfirm` carries — a value the
+    /// section round-trips — so building one is not a shortcut around anything.
+    pub(crate) fn demo_plan(
+        agent_id: AgentId,
+        root: std::path::PathBuf,
+        archive_url: String,
+    ) -> InstallPlan {
+        InstallPlan {
+            agent_id,
+            agent_name: "demo".to_owned(),
+            tool: INSTALL_TOOL.to_owned(),
+            registry_id: INSTALL_ID.to_owned(),
+            registry_name: "Demo".to_owned(),
+            version: INSTALL_VERSION.to_owned(),
+            platform: htui_agent::probe::platform_key(),
+            archive_url,
+            format: htui_agent::ArchiveFormat::Zip,
+            content_length: None,
+            sha256: None,
+            cmd: format!("./{INSTALL_TOOL}"),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            license: None,
+            license_url: None,
+            install_dir: root.join(INSTALL_ID).join(INSTALL_VERSION),
+            root,
+            existing_versions: Vec::new(),
+            available_bytes: None,
+            need_bytes: None,
+            args_differ: false,
+            consent: None,
+            recorded: None,
+            registry_cached_age_secs: None,
+            planned_at: Utc::now(),
+        }
+    }
+
+    /// A registry row whose glob looks under the install root, declaring an install or not.
+    ///
+    /// `acp`, because only an `acp` row has a tier-2 handshake for the re-probe to run, and the
+    /// re-probe's verdict is what decides the outcome the confirm case reads. The pattern is the
+    /// seeds' own shape — `%HTUI_AGENTS_ROOT%/<id>/*/<leaf>` — so the post-promote agreement the
+    /// pipeline checks is a real one and not a tautology.
+    pub(crate) fn install_row(id: AgentId, name: &str, declared: bool) -> Agent {
+        let pattern = format!("%{INSTALL_ROOT_VAR}%/{INSTALL_ID}/*/{INSTALL_TOOL}");
+        let mut discovery = json!({
+            "tools": { "demo_server": { "kind": "glob", "patterns": [pattern] } },
+            "handshake": true,
+        });
+        if declared {
+            discovery["install"] =
+                json!({ "source": "acp_registry", "id": INSTALL_ID, "tool": INSTALL_TOOL });
+        }
+        Agent {
+            name: name.to_owned(),
+            transport: Transport::Acp,
+            launch: json!({
+                "command": "${demo_server}",
+                "args": [],
+                "env": {},
+                "discovery": discovery,
+            }),
+            settings: json!({}),
+            ..fake_row(id)
+        }
+    }
+
+    /// A one-entry `.zip` holding `body` at [`INSTALL_TOOL`], **stored** rather than deflated.
+    ///
+    /// Written by hand so this crate needs no archive dependency for one fixture: `stored` is
+    /// method 0, which every zip reader supports, and the only arithmetic is the CRC the reader
+    /// checks. The entry declares no unix mode, which is deliberate — it is the archive shape
+    /// hazard H-5 is about, and the promoted file is executable only because the installer made it
+    /// so.
+    fn stored_zip(body: &[u8]) -> Vec<u8> {
+        /// The CRC-32 (IEEE) of `bytes`, which is the one number a zip reader recomputes.
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFF_u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    let carry = crc & 1;
+                    crc >>= 1;
+                    if carry == 1 {
+                        crc ^= 0xEDB8_8320;
+                    }
+                }
+            }
+            !crc
+        }
+
+        let name = INSTALL_TOOL.as_bytes();
+        let crc = crc32(body);
+        let size = u32::try_from(body.len()).expect("the fixture archive is tiny");
+        let name_len = u16::try_from(name.len()).expect("the entry name is short");
+        let mut zip = Vec::new();
+
+        // The local file header, then the bytes themselves.
+        zip.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+        zip.extend_from_slice(&20_u16.to_le_bytes()); // version needed
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // flags
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // method: stored
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // modification time
+        zip.extend_from_slice(&0x21_u16.to_le_bytes()); // modification date: 1980-01-01
+        zip.extend_from_slice(&crc.to_le_bytes());
+        zip.extend_from_slice(&size.to_le_bytes()); // compressed
+        zip.extend_from_slice(&size.to_le_bytes()); // uncompressed
+        zip.extend_from_slice(&name_len.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // extra field length
+        zip.extend_from_slice(name);
+        zip.extend_from_slice(body);
+
+        // The central directory, which is what a reader opens the archive by.
+        let directory_at = u32::try_from(zip.len()).expect("the fixture archive is tiny");
+        zip.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+        zip.extend_from_slice(&20_u16.to_le_bytes()); // version made by
+        zip.extend_from_slice(&20_u16.to_le_bytes()); // version needed
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // flags
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // method: stored
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // modification time
+        zip.extend_from_slice(&0x21_u16.to_le_bytes()); // modification date
+        zip.extend_from_slice(&crc.to_le_bytes());
+        zip.extend_from_slice(&size.to_le_bytes());
+        zip.extend_from_slice(&size.to_le_bytes());
+        zip.extend_from_slice(&name_len.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // extra field length
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // comment length
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // disk number
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // internal attributes
+        zip.extend_from_slice(&0_u32.to_le_bytes()); // external attributes: no unix mode
+        zip.extend_from_slice(&0_u32.to_le_bytes()); // offset of the local header
+        zip.extend_from_slice(name);
+
+        // The end-of-central-directory record.
+        let directory_len =
+            u32::try_from(zip.len()).expect("the fixture archive is tiny") - directory_at;
+        zip.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // this disk
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // the disk the directory starts on
+        zip.extend_from_slice(&1_u16.to_le_bytes()); // entries on this disk
+        zip.extend_from_slice(&1_u16.to_le_bytes()); // entries in total
+        zip.extend_from_slice(&directory_len.to_le_bytes());
+        zip.extend_from_slice(&directory_at.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes()); // comment length
+        zip
+    }
 
     /// A registry row for the fake transport: `cli`, stream `fake`, so the factory reaches the
     /// adapter by **row data** and not by name (`R-AGT-5`, plan D12).
@@ -2510,6 +3391,536 @@ pub(crate) mod tests {
                 .count(),
             2,
             "the reply states what the task itself wrote"
+        );
+    }
+
+    /// A runtime that installs from `fixture` into `root`, and knows no transport at all.
+    ///
+    /// `DriverFactory::new()`: an install never builds a driver, and a runtime that could would
+    /// let a case pass for the wrong reason.
+    fn installing_runtime(fixture: &Fixture, root: &std::path::Path) -> AgentRuntime {
+        AgentRuntime::new(DriverFactory::new())
+            .with_installer(InstallConfig::new(fixture.base(), Some(root.to_path_buf())))
+    }
+
+    /// Plan D18's first refusal, and the one that has to come before the network: a writer that
+    /// cannot hold the row refuses the **plan**, so no registry read is ever spent on an install
+    /// whose result could not be written.
+    #[tokio::test]
+    async fn a_plan_is_refused_before_any_request_on_a_buffered_writer() {
+        let root = tempfile::tempdir().expect("a throwaway config root");
+        let cache = htui_store::CacheStore::open(root.path(), "install-buffered", 1)
+            .await
+            .expect("a fresh mirror");
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: None,
+        };
+        let fixture = Fixture::start().await;
+        let agents = root.path().join("agents");
+        let mut runtime = installing_runtime(&fixture, &agents);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(
+                    1,
+                    StoreRequest::InstallPlan {
+                        agent_id: AgentId::new(),
+                    },
+                ),
+            )
+            .await;
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "install_plan");
+                assert!(
+                    message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
+                    "the buffered writer's own sentence, not a second one: {message}"
+                );
+            }
+            other => panic!("a buffered writer refuses the plan: {other:?}"),
+        }
+        assert!(
+            !runtime.install_running(),
+            "the refusal is before the claim, so a later plan is not locked out"
+        );
+        assert_eq!(
+            runtime.background_len(),
+            0,
+            "and before anything is spawned"
+        );
+        assert!(
+            fixture.lines().is_empty(),
+            "and before a single request: {:?}",
+            fixture.lines()
+        );
+        assert!(
+            !agents.exists(),
+            "and before the install root is so much as created"
+        );
+
+        cache.close().await;
+    }
+
+    /// Hazard H-10: the claim covers planning **and** installing, so a second `i` while a
+    /// pre-flight is still reading the registry is refused rather than racing it.
+    #[tokio::test]
+    async fn a_second_plan_while_one_runs_is_refused() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&install_row(agent_id, "demo", true))
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let fixture = Fixture::start().await;
+        // The registry read never answers inside this test's lifetime, so the first plan is
+        // provably still running when the second one arrives.
+        fixture.route(
+            "/registry.json",
+            Route {
+                status: 200,
+                delay: Duration::from_secs(30),
+                ..Route::default()
+            },
+        );
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let mut runtime = installing_runtime(&fixture, &tmp.path().join("agents"));
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let first = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(1, StoreRequest::InstallPlan { agent_id }),
+            )
+            .await;
+        assert!(
+            matches!(first, Served::Deferred),
+            "the pre-flight answers from its own task: {first:?}"
+        );
+        assert!(
+            runtime.install_running(),
+            "planning holds the claim, not only installing"
+        );
+
+        let second = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(2, StoreRequest::InstallPlan { agent_id }),
+            )
+            .await;
+        match second {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "install_plan");
+                assert!(
+                    message.contains("already running"),
+                    "the refusal says what is holding the claim: {message}"
+                );
+            }
+            other => panic!("two installs of one id would race on `.staging/`: {other:?}"),
+        }
+
+        runtime.shutdown(Duration::ZERO).await;
+        assert!(
+            !runtime.install_running(),
+            "and the claim goes with the runtime"
+        );
+    }
+
+    /// A probe and an install both write `agent_box`, so neither may run while the other does
+    /// (review finding, MOD-20 T7). The Settings section's `probing` flag cannot be the guard:
+    /// **any** `StoreReply::Agents` clears it and `wants_requests` re-issues `Agents` on every
+    /// activation, so `r` → switch tab → back → `i` arrives here with the probe still running.
+    #[tokio::test]
+    async fn a_probe_and_an_install_never_write_the_same_row_at_once() {
+        // `unresolvable_registry` and not `MemStore::demo`: this test lets a probe actually run,
+        // and the demo rows resolve real adapters — the probe would spawn a handshake child per
+        // row and wait on it. Every row here resolves nowhere, so the probe is quick and answers
+        // the same whatever is installed on the box running the suite.
+        let store = unresolvable_registry().await;
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&install_row(agent_id, "demo", true))
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let fixture = Fixture::start().await;
+        fixture.route(
+            "/registry.json",
+            Route {
+                status: 200,
+                delay: Duration::from_secs(30),
+                ..Route::default()
+            },
+        );
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let mut runtime = installing_runtime(&fixture, &tmp.path().join("agents"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // A probe first: it lands in `background`, where the install claim must see it.
+        let probing = runtime
+            .serve(&backend, &tx, &envelope(1, StoreRequest::ProbeAgents))
+            .await;
+        assert!(
+            matches!(probing, Served::Deferred),
+            "the probe answers from its own task: {probing:?}"
+        );
+        match runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(2, StoreRequest::InstallPlan { agent_id }),
+            )
+            .await
+        {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "install_plan");
+                assert!(
+                    message.contains("probe is already running"),
+                    "the refusal names what holds the box: {message}"
+                );
+            }
+            other => panic!("an install beside a probe races on `agent_box`: {other:?}"),
+        }
+        assert_eq!(
+            runtime.background_len(),
+            1,
+            "and the refusal spawned nothing of its own"
+        );
+        runtime.shutdown(Duration::ZERO).await;
+
+        // Then the other way round: an install in flight refuses a probe.
+        let mut runtime = installing_runtime(&fixture, &tmp.path().join("agents"));
+        let planning = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(3, StoreRequest::InstallPlan { agent_id }),
+            )
+            .await;
+        assert!(matches!(planning, Served::Deferred), "{planning:?}");
+        match runtime
+            .serve(&backend, &tx, &envelope(4, StoreRequest::ProbeAgents))
+            .await
+        {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "probe_agents");
+                assert!(
+                    message.contains("install is running"),
+                    "the refusal names what holds the box: {message}"
+                );
+            }
+            other => panic!("a probe beside an install races on `agent_box`: {other:?}"),
+        }
+        runtime.shutdown(Duration::ZERO).await;
+    }
+
+    /// A row whose `discovery` declares no source is refused **by the row**, with the pre-flight's
+    /// own sentence and without a request: the answer is in the document the worker already holds.
+    #[tokio::test]
+    async fn a_plan_for_a_row_without_install_is_refused_by_name() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&install_row(agent_id, "undeclared", false))
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let fixture = Fixture::start().await;
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let mut runtime = installing_runtime(&fixture, &tmp.path().join("agents"));
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(1, StoreRequest::InstallPlan { agent_id }),
+            )
+            .await;
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "install_plan");
+                assert!(
+                    message.contains("nothing declares how to install")
+                        && message.contains("undeclared"),
+                    "the refusal names the row, so the section can render it as it stands: \
+                     {message}"
+                );
+            }
+            other => panic!("a row with no declared source cannot be installed: {other:?}"),
+        }
+        assert!(!runtime.install_running());
+        assert!(
+            fixture.lines().is_empty(),
+            "and nothing was asked of the registry to find that out: {:?}",
+            fixture.lines()
+        );
+    }
+
+    /// Plan D18's stream contract: one request, many replies, every one of them at the confirm's
+    /// own `seq` — and the row written **before** the terminal frame.
+    ///
+    /// The archive's one entry is not an executable in any format, so the re-probe's spawn fails
+    /// the moment the tree is promoted. That is the point rather than a shortcut: the pipeline
+    /// runs end to end, the *probe* decides what the box can run (`R-AGT-6`), and the outcome the
+    /// worker writes is a row that says so.
+    #[tokio::test]
+    async fn confirm_streams_frames_at_the_confirm_seq() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&install_row(agent_id, "demo", true))
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store.clone());
+        let fixture = Fixture::start().await;
+        fixture.route(
+            "/archive.zip",
+            Route {
+                status: 200,
+                body: stored_zip(b"htui install fixture, not an executable\n"),
+                ..Route::default()
+            },
+        );
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let root = tmp.path().join("agents");
+        let mut runtime = installing_runtime(&fixture, &root);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let plan = demo_plan(agent_id, root.clone(), fixture.url("/archive.zip"));
+        let served = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(
+                    1,
+                    StoreRequest::InstallConfirm {
+                        plan: Box::new(plan),
+                    },
+                ),
+            )
+            .await;
+        assert!(
+            matches!(served, Served::Deferred),
+            "the install answers from its own task: {served:?}"
+        );
+
+        let mut frames = Vec::new();
+        let outcome = loop {
+            let reply = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+                .await
+                .expect("the install answers inside a minute")
+                .expect("the reply channel is open");
+            assert_eq!(
+                reply.seq, 1,
+                "every frame of a confirm carries the confirm's own seq: {:?}",
+                reply.reply
+            );
+            assert!(
+                matches!(&reply.origin, Origin::Tab(id) if id.0 == "chat"),
+                "and its origin: {:?}",
+                reply.origin
+            );
+            match reply.reply {
+                StoreReply::Install(InstallFrame::Done(outcome)) => break outcome,
+                StoreReply::Install(frame) => frames.push(frame),
+                other => panic!("an install answers with install frames: {other:?}"),
+            }
+        };
+        assert!(
+            frames
+                .iter()
+                .any(|frame| matches!(frame, InstallFrame::Progress { .. })),
+            "the stream says where it got to: {frames:?}"
+        );
+
+        // Read the instant the terminal frame is in hand and before the task is joined: this is
+        // exactly what the section does when it issues `StoreRequest::Agents` on `Done`.
+        let on_box = stored_box(&store, agent_id).await;
+        assert!(
+            on_box.probed_at.is_some(),
+            "the row the install wrote is the probe's own: {on_box:?}"
+        );
+        assert!(
+            matches!(*outcome, InstallOutcome::Failed { .. }),
+            "a tree the probe cannot handshake is a failed install, however well it downloaded: \
+             {outcome:?}"
+        );
+        assert!(
+            root.join(INSTALL_ID).join(INSTALL_VERSION).is_dir(),
+            "and D16(c) leaves the tree where it is, for the user to look at"
+        );
+
+        runtime.finish_background(Duration::from_secs(5)).await;
+        assert!(!runtime.install_running(), "the claim ends with the task");
+    }
+
+    /// Plan D18's cancellation: cooperative, through the token. The request is acknowledged at
+    /// once and the running stream ends itself.
+    ///
+    /// The acknowledgement is a `Served::Reply`, which the worker loop addresses to the
+    /// `InstallCancel`'s own `seq`; the `Cancelled` frame below is the install's, at the
+    /// confirm's. Two requests, two addresses, one token.
+    #[tokio::test]
+    async fn cancel_answers_cancelling_then_the_stream_ends_cancelled() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&install_row(agent_id, "demo", true))
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store.clone());
+        let fixture = Fixture::start().await;
+        // Half the body, then a pause: the download is inside its `select!` when the token trips,
+        // which is the arm hazard H-6 is written about.
+        fixture.route(
+            "/archive.zip",
+            Route {
+                status: 200,
+                body: stored_zip(b"htui install fixture, not an executable\n"),
+                chunk_delay: Duration::from_secs(30),
+                ..Route::default()
+            },
+        );
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let root = tmp.path().join("agents");
+        let mut runtime = installing_runtime(&fixture, &root);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let plan = demo_plan(agent_id, root.clone(), fixture.url("/archive.zip"));
+        let served = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(
+                    1,
+                    StoreRequest::InstallConfirm {
+                        plan: Box::new(plan),
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+
+        let cancelled = runtime
+            .serve(&backend, &tx, &envelope(2, StoreRequest::InstallCancel))
+            .await;
+        assert!(
+            matches!(
+                cancelled,
+                Served::Reply(StoreReply::Install(InstallFrame::Cancelling))
+            ),
+            "a cancel is answered at once, not when the install notices: {cancelled:?}"
+        );
+
+        let last = loop {
+            let reply = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("the cancelled install ends inside 30 s")
+                .expect("the reply channel is open");
+            assert_eq!(reply.seq, 1, "the stream keeps its own address: {reply:?}");
+            if !matches!(
+                reply.reply,
+                StoreReply::Install(InstallFrame::Progress { .. })
+            ) {
+                break reply.reply;
+            }
+        };
+        assert!(
+            matches!(last, StoreReply::Install(InstallFrame::Cancelled)),
+            "the task ends its own stream: {last:?}"
+        );
+        assert!(
+            !root.join(INSTALL_ID).join(INSTALL_VERSION).exists(),
+            "and a cancelled install leaves the box nothing to resolve"
+        );
+        let summary = store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|summary| summary.agent.id == agent_id)
+            .expect("the registry row is still there");
+        assert!(
+            summary.on_box.is_none(),
+            "and it writes no row: there is nothing to describe"
+        );
+
+        runtime.finish_background(Duration::from_secs(5)).await;
+    }
+
+    /// Blueprint P-3: `shutdown` trips the token **before** it aborts, because `abort()` cannot
+    /// stop the blocking thread an unpack runs on.
+    ///
+    /// What is observable from here is the half that matters to the next process: after shutdown
+    /// the runtime holds no install, nothing was promoted, and no frame was ever sent for a
+    /// request nobody is left to read.
+    #[tokio::test]
+    async fn shutdown_aborts_a_running_install_and_leaves_nothing_resolvable() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&install_row(agent_id, "demo", true))
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let fixture = Fixture::start().await;
+        fixture.route(
+            "/archive.zip",
+            Route {
+                status: 200,
+                delay: Duration::from_secs(30),
+                ..Route::default()
+            },
+        );
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let root = tmp.path().join("agents");
+        let mut runtime = installing_runtime(&fixture, &root);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let plan = demo_plan(agent_id, root.clone(), fixture.url("/archive.zip"));
+        let served = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(
+                    7,
+                    StoreRequest::InstallConfirm {
+                        plan: Box::new(plan),
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        assert!(runtime.install_running());
+
+        runtime.shutdown(Duration::ZERO).await;
+        assert!(
+            !runtime.install_running(),
+            "the runtime lets go of the install it just aborted"
+        );
+        assert!(
+            !root.join(INSTALL_ID).exists(),
+            "and nothing under the root resolves: {}",
+            root.display()
+        );
+
+        drop(tx);
+        let mut answered = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            answered.push(reply);
+        }
+        assert!(
+            !answered
+                .iter()
+                .any(|reply| matches!(reply.reply, StoreReply::Install(InstallFrame::Done(_)))),
+            "an aborted install finishes nothing: {answered:?}"
         );
     }
 

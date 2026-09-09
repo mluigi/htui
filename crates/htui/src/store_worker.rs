@@ -129,6 +129,34 @@ pub enum StoreRequest {
     /// [`StoreReply::Agents`] — the reply the Settings section already renders, so the probe needs
     /// no second arm there — or with [`StoreReply::Failed`].
     ProbeAgents,
+    /// Pre-flight an adapter install for one registry row (MOD-20 D13, D18).
+    ///
+    /// One registry read, one `HEAD`, **no archive byte**: what this box would fetch and how it
+    /// could be verified, so the user can say yes to a value rather than to a promise. Served by
+    /// the agent runtime's own task and answered exactly once, with
+    /// [`StoreReply::Install`]`(`[`InstallFrame::Plan`]`)` or with a failure.
+    InstallPlan {
+        /// Which registry row to plan for.
+        agent_id: AgentId,
+    },
+    /// The user said `y` to exactly this plan (MOD-20 D12: the plan **is** the consent evidence).
+    ///
+    /// Many replies, all at this request's own `seq`: [`InstallFrame::Progress`] as the phases go
+    /// by, then one of [`InstallFrame::Done`], [`InstallFrame::Cancelled`] or
+    /// [`InstallFrame::Failed`]. The stream shape is [`StoreRequest::ChatStart`]'s, for the same
+    /// reason: `App::is_fresh` passes every frame until the section confirms another install.
+    InstallConfirm {
+        /// The plan the consent pane rendered, unchanged. Boxed because it dwarfs every other
+        /// variant of this enum.
+        plan: Box<htui_agent::InstallPlan>,
+    },
+    /// Stop the running install (MOD-20 D18).
+    ///
+    /// Answered [`InstallFrame::Cancelling`] at once, at this request's own `seq`; the running
+    /// install's own stream then ends [`InstallFrame::Cancelled`] at *its* `seq`. Cooperative,
+    /// through a token, so the task can sweep its staging entry and send that last frame — an
+    /// `abort()` could do neither, and stays the shutdown path.
+    InstallCancel,
     /// The top bar's store field and the pending-migration count (plan D11).
     StoreState,
     /// Apply the pending migrations (`R-STO-5`), after the user answered `y`.
@@ -156,6 +184,9 @@ impl StoreRequest {
             Self::ChatAnswer { .. } => "chat_answer",
             Self::ChatCancel { .. } => "chat_cancel",
             Self::ProbeAgents => "probe_agents",
+            Self::InstallPlan { .. } => "install_plan",
+            Self::InstallConfirm { .. } => "install_confirm",
+            Self::InstallCancel => "install_cancel",
             Self::StoreState => "store_state",
             Self::ApplyMigrations => "apply_migrations",
         }
@@ -201,6 +232,12 @@ pub enum StoreReply {
         /// The step's rows, or `None` for "not on this box".
         events: Option<Vec<SessionEvent>>,
     },
+    /// One frame of an adapter install (MOD-20 D18).
+    ///
+    /// The plan answers a [`StoreRequest::InstallPlan`]; every frame of a confirm answers the
+    /// [`StoreRequest::InstallConfirm`] that started it, at that request's own `seq`; the
+    /// acknowledgement of a cancel answers the [`StoreRequest::InstallCancel`] at *its* `seq`.
+    Install(InstallFrame),
     /// One frame of a live chat's stream (MOD-2 D27).
     ///
     /// Many of these answer one [`StoreRequest::ChatStart`], all carrying that request's `seq`, so
@@ -264,6 +301,52 @@ pub enum ChatFrame {
     Failed {
         /// What went wrong, rendered.
         message: String,
+    },
+}
+
+/// One frame of an adapter install (MOD-20 D18).
+///
+/// Deliberately the [`ChatFrame`] shape: a pre-flight, a progress stream and a terminal frame are
+/// one request answered many times, and the section renders whichever it last received. Every
+/// terminal frame — [`Done`](Self::Done), [`Cancelled`](Self::Cancelled),
+/// [`Failed`](Self::Failed) — clears the section's in-flight state, so a stream that ends is a
+/// pane that closes whatever the outcome was.
+#[derive(Debug, Clone)]
+pub enum InstallFrame {
+    /// The pre-flight's answer: what this box would fetch, and what the consent pane renders.
+    ///
+    /// Boxed for the reason [`StoreReply::Item`] is: the plan carries every coordinate of an
+    /// install and would otherwise set the size of this enum for every other variant.
+    Plan(Box<htui_agent::InstallPlan>),
+    /// Where the install has got to. At most one per
+    /// [`PROGRESS_EVERY`](htui_agent::install::PROGRESS_EVERY), which is `event_loop`'s own tick:
+    /// a faster stream would only queue frames nobody ever sees.
+    Progress {
+        /// Which step is running.
+        phase: htui_agent::InstallPhase,
+        /// How far into it.
+        done: u64,
+        /// The denominator, when the archive declared one.
+        total: Option<u64>,
+    },
+    /// The pipeline finished and the probe has spoken. **The row was already written** when this
+    /// arrives, so the [`StoreRequest::Agents`] the section issues on it reads the new one.
+    Done(Box<htui_agent::InstallOutcome>),
+    /// A [`StoreRequest::InstallCancel`] was accepted. Not the end of the stream: the install's
+    /// own frames end it with [`Cancelled`](Self::Cancelled).
+    Cancelling,
+    /// The install stopped because it was asked to, leaving nothing the row's glob resolves.
+    Cancelled,
+    /// The install stopped for a reason the user may be able to act on.
+    ///
+    /// `manual` is `Some` exactly when the failure was the network, because that is the failure
+    /// the user can route around by hand (MOD-20 D20); every other failure is a sentence on the
+    /// status line.
+    Failed {
+        /// What went wrong, rendered.
+        message: String,
+        /// The by-hand steps, derived from the row and the registry helper.
+        manual: Option<Box<htui_agent::ManualSteps>>,
     },
 }
 
@@ -336,15 +419,18 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             events: backend.step_events(*step).await?,
         },
         // The four chat requests need the worker loop's own state (the live sessions), and the
-        // probe needs the runtime that owns its task, so all five are served ahead of this
-        // function, exactly as `ApplyMigrations` is. One of them that reaches here at all belongs
-        // to a caller with no runtime — the test harness without one — and saying so is more use
-        // than a panic.
+        // probe and the three install requests need the runtime that owns their tasks, so all
+        // eight are served ahead of this function, exactly as `ApplyMigrations` is. One of them
+        // that reaches here at all belongs to a caller with no runtime — the test harness without
+        // one — and saying so is more use than a panic.
         StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
         | StoreRequest::ChatAnswer { .. }
         | StoreRequest::ChatCancel { .. }
-        | StoreRequest::ProbeAgents => StoreReply::Failed {
+        | StoreRequest::ProbeAgents
+        | StoreRequest::InstallPlan { .. }
+        | StoreRequest::InstallConfirm { .. }
+        | StoreRequest::InstallCancel => StoreReply::Failed {
             request: request.name(),
             message: "no agent runtime in this build".to_owned(),
         },
@@ -479,13 +565,20 @@ pub fn spawn_with(
                             }
                         }
                         // The chat requests need this loop's own state - the live sessions - and
-                        // the probe needs the runtime that owns its task, so both go to the
-                        // runtime before `try_serve`, like `ApplyMigrations` above.
+                        // the probe and the installs need the runtime that owns their tasks, so
+                        // all of them go to the runtime before `try_serve`, like
+                        // `ApplyMigrations` above. An install reads the registry over the network
+                        // and streams hundreds of megabytes, so `Served::Deferred => continue` is
+                        // the whole of `R-NF-3` for it: the arm returns having spawned a task and
+                        // awaited nothing longer than `box_info()` (blueprint H-9).
                         StoreRequest::ChatStart { .. }
                         | StoreRequest::ChatSend { .. }
                         | StoreRequest::ChatAnswer { .. }
                         | StoreRequest::ChatCancel { .. }
-                        | StoreRequest::ProbeAgents => {
+                        | StoreRequest::ProbeAgents
+                        | StoreRequest::InstallPlan { .. }
+                        | StoreRequest::InstallConfirm { .. }
+                        | StoreRequest::InstallCancel => {
                             match runtime.serve(&backend, &tx, &envelope).await {
                                 Served::Reply(reply) => reply,
                                 // The session task answers this request itself, once.
@@ -1227,6 +1320,41 @@ mod tests {
         }
     }
 
+    /// The three install requests are named like every other, and a build with no runtime says so
+    /// rather than dropping the reply (MOD-20 D18).
+    #[tokio::test]
+    async fn the_install_requests_are_named_and_refused_without_a_runtime() {
+        let plan = crate::agent_worker::tests::demo_plan(
+            AgentId::new(),
+            std::path::PathBuf::from("/nowhere"),
+            "http://127.0.0.1:1/archive.zip".to_owned(),
+        );
+        for (request, name) in [
+            (
+                StoreRequest::InstallPlan {
+                    agent_id: AgentId::new(),
+                },
+                "install_plan",
+            ),
+            (
+                StoreRequest::InstallConfirm {
+                    plan: Box::new(plan),
+                },
+                "install_confirm",
+            ),
+            (StoreRequest::InstallCancel, "install_cancel"),
+        ] {
+            assert_eq!(request.name(), name);
+            match serve(&demo(), &request).await {
+                StoreReply::Failed { request, message } => {
+                    assert_eq!(request, name);
+                    assert_eq!(message, "no agent runtime in this build");
+                }
+                other => panic!("an install with no runtime is refused, not served: {other:?}"),
+            }
+        }
+    }
+
     /// `R-NF-3`, the whole reason the probe is deferred: a probe waits up to `HANDSHAKE_TIMEOUT`
     /// per agent, and the loop must serve everything else while it does.
     #[tokio::test]
@@ -1270,6 +1398,90 @@ mod tests {
 
         drop(req_tx);
         let _ = worker.await;
+    }
+
+    /// `R-NF-3` for the install, and the pin blueprint H-9 exists for: an install streams an
+    /// archive for minutes, and the loop must serve everything else while it does.
+    ///
+    /// The fixture accepts the connection and answers nothing, so the download is provably still
+    /// in flight while the assertions run. What the arm did before deferring is the whole subject:
+    /// a `box_info()` and an `agents()`, exactly what a probe already awaits there — no client
+    /// built, no socket opened, no registry read.
+    #[tokio::test]
+    async fn the_loop_answers_other_requests_while_an_install_is_in_flight() {
+        // A listener that accepts and never replies. Held for the life of the test, so the
+        // connection stays open rather than being refused, which is what makes the install stall
+        // rather than fail.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        let agent = crate::agent_worker::tests::install_row(agent_id, "demo", true);
+        htui_core::store::WriteStore::upsert_agent(&store, &agent)
+            .await
+            .expect("the row lands");
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let root = tmp.path().join("agents");
+        let plan = crate::agent_worker::tests::demo_plan(
+            agent_id,
+            root.clone(),
+            format!("http://{addr}/archive.zip"),
+        );
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn_with(
+            Started::detached(Backend::memory(store)),
+            req_rx,
+            rep_tx,
+            AgentRuntime::production().with_installer(htui_agent::InstallConfig::new(
+                format!("http://{addr}"),
+                Some(root),
+            )),
+        );
+
+        for (seq, request) in [
+            (
+                1,
+                StoreRequest::InstallConfirm {
+                    plan: Box::new(plan),
+                },
+            ),
+            (2, StoreRequest::Workspaces),
+        ] {
+            req_tx
+                .send(RequestEnvelope {
+                    seq,
+                    origin: Origin::App,
+                    request,
+                })
+                .expect("the worker is alive");
+        }
+
+        let first = rep_rx.recv().await.expect("the worker answers");
+        assert_eq!(
+            first.seq, 2,
+            "the loop is free the instant the install is deferred: {:?}",
+            first.reply
+        );
+        assert!(
+            matches!(first.reply, StoreReply::Workspaces(_)),
+            "and it is a real answer, not a refusal: {:?}",
+            first.reply
+        );
+
+        drop(req_tx);
+        let _ = worker.await;
+        silent.abort();
     }
 
     /// `go_offline` disarms the `lost_the_server` arm whatever the backend was.

@@ -34,6 +34,9 @@ crossterm          = { workspace = true }
 futures            = { workspace = true }
 ratatui            = { workspace = true }
 tokio              = { workspace = true }
+# MOD-20 D18: `CancellationToken` is how an install is stopped. Cooperative, because the task has
+# to sweep its staging entry and send its own last frame — neither of which an `abort()` allows.
+tokio-util         = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -45,7 +48,8 @@ htui-agent = { workspace = true, features = ["test-support"] }
 htui-store = { workspace = true, features = ["demo", "test-support"] }
 # `filters` so a chat snapshot can substitute the session id the transport mints per run.
 insta    = { workspace = true, features = ["filters"] }
-tokio    = { workspace = true, features = ["test-util"] }
+# `net` for the loopback fixture servers the MOD-20 install cases answer from (blueprint P-5).
+tokio    = { workspace = true, features = ["test-util", "net"] }
 # The store worker's swap tests open a throwaway `cache.sqlite`, never the user's.
 tempfile = "3"
 

@@ -156,6 +156,11 @@ impl Harness {
     /// `Pending` after a quiet round is taken to be a chat waiting on the user, which is exactly
     /// the state a snapshot wants to photograph.
     ///
+    /// The runtime-served list below is written out by hand rather than derived, so every request
+    /// the runtime owns has to be added to it deliberately. The three MOD-20 install requests are
+    /// on it for that reason: without them, `Settings > i` in a harness test would be answered
+    /// "no agent runtime in this harness" by a harness that has one.
+    ///
     /// That reading holds for a chat whose writer never leaves the task — `MemStore`'s
     /// `append_events` is a lock and a `Vec` push, and `PgStore`'s is served inline here too. It
     /// does **not** hold for `Writer::Buffered`, which appends to a file through `spawn_blocking`:
@@ -183,7 +188,10 @@ impl Harness {
                         | StoreRequest::ChatSend { .. }
                         | StoreRequest::ChatAnswer { .. }
                         | StoreRequest::ChatCancel { .. }
-                        | StoreRequest::ProbeAgents,
+                        | StoreRequest::ProbeAgents
+                        | StoreRequest::InstallPlan { .. }
+                        | StoreRequest::InstallConfirm { .. }
+                        | StoreRequest::InstallCancel,
                         _,
                     ) => match self.runtime.as_mut() {
                         Some(runtime) => {
@@ -263,9 +271,11 @@ impl Harness {
     pub async fn drive_to_end(&mut self) {
         self.drive().await;
         if let Some(runtime) = self.runtime.as_mut() {
-            // Before the shutdown, not after: a probe answers from a task the runtime owns, and
-            // `shutdown` aborts those. Awaiting them here is what makes a probe's reply part of
-            // the frame this call is taken for.
+            // Before the shutdown, not after: a probe and an install each answer from a task the
+            // runtime owns, and `shutdown` aborts those. Awaiting them here is what makes their
+            // replies part of the frame this call is taken for (blueprint P-2 — an install that
+            // was still downloading when the shell went quiet is finished here, not photographed
+            // half-done).
             runtime.finish_background(CHAT_END).await;
             runtime.shutdown(Duration::ZERO).await;
         }
