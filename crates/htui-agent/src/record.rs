@@ -920,7 +920,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         if let Some(raw) = payload.get("quota").filter(|raw| raw.is_object()) {
             self.last_quota_raw = Some(raw.clone());
         }
-        if self.nothing_to_say(latch.source) {
+        if self.nothing_to_say(latch.source, latch.billing) {
             return;
         }
         let quota = normalize(
@@ -971,12 +971,29 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// spend is the whole document: something to say once anything has been spent, and nothing
     /// before that. That is why such a row's quota column reads `—` until it costs something
     /// (plan D65) rather than reading a document full of nulls.
-    const fn nothing_to_say(&self, source: QuotaSource) -> bool {
-        match source {
-            QuotaSource::None => self.usage.cost_micros.is_none(),
-            QuotaSource::AcpMetaRateLimit
-            | QuotaSource::CliRateLimitEvent
-            | QuotaSource::CliStatusLine => self.last_quota_raw.is_none(),
+    ///
+    /// **`billing` is read first, and it can overrule the source** (review M-2, plan D78).
+    /// `docs/ANA-4.md` §7 gives a **per-token** agent no `windows` at all — it carries `spend`, and
+    /// that is the document — so for such a row there is nothing for the H-3 rule to protect and no
+    /// blob to wait for, whatever `settings.quota.source` declares. "Nothing to say" there means
+    /// only "nothing spent yet": [`QuotaSource::None`]'s behaviour, applied on the strength of the
+    /// billing column. The row this exists for is a `claude` row switched to API-key billing while
+    /// its `quota.source` still reads `acp_meta_rate_limit`: the blob never arrives, so the
+    /// source-based rule would wait forever and publish nothing at all — not even the spend the
+    /// recorder is holding. A **subscription** row keeps the source-based rule verbatim, because
+    /// there the allowance is exactly what the document is for.
+    ///
+    /// Both facts come off the `agent` row through [`QuotaLatch`], never from the agent's name
+    /// (`R-AGT-5`), and neither is sniffed from the blob (D66's selection rule).
+    const fn nothing_to_say(&self, source: QuotaSource, billing: Billing) -> bool {
+        match billing {
+            Billing::PerToken => self.usage.cost_micros.is_none(),
+            Billing::Subscription => match source {
+                QuotaSource::None => self.usage.cost_micros.is_none(),
+                QuotaSource::AcpMetaRateLimit
+                | QuotaSource::CliRateLimitEvent
+                | QuotaSource::CliStatusLine => self.last_quota_raw.is_none(),
+            },
         }
     }
 

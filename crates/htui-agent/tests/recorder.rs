@@ -1217,6 +1217,90 @@ async fn a_row_declaring_source_none_latches_spend_only() {
     );
 }
 
+/// Review M-2 / plan D78: a row whose **billing is per-token** publishes its spend on the first
+/// costed report, whatever its declared `quota.source` says.
+///
+/// The realistic instance is a `claude` row switched to API-key billing while
+/// `settings.quota.source` still reads `acp_meta_rate_limit`. No allowance blob ever arrives on
+/// that transport, so the source-based H-3 guard would wait for one forever and the column would
+/// read `—` while the recorder holds the exact number `docs/ANA-4.md` §7 asks it to publish. §7
+/// gives a per-token agent no `windows` at all, so there is nothing for H-3 to protect here and
+/// nothing to wait for: the document is `windows: []` plus the spend, which is the
+/// [`QuotaSource::None`] shape.
+///
+/// The subscription half of the same combination is asserted beside it, because the whole point of
+/// D78 is that only `billing` moved: a subscription row with the same declared source still says
+/// nothing until its blob arrives.
+#[tokio::test]
+async fn a_per_token_row_publishes_its_spend_without_waiting_for_an_allowance() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    probe_agent_box(&store).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None)
+        .with_quota_latch(latch(QuotaSource::AcpMetaRateLimit, Billing::PerToken));
+
+    // Context only: nothing spent yet, so nothing to say — the `QuotaSource::None` rule, which is
+    // what a per-token row now follows.
+    recorder
+        .record(usage(None, None))
+        .await
+        .expect("recording must land");
+    assert!(
+        store.quota_calls().is_empty(),
+        "a per-token row with nothing spent has nothing to publish either"
+    );
+
+    // The first costed row, still with no `_meta` of any kind: it publishes.
+    recorder
+        .record(usage(Some(100), None))
+        .await
+        .expect("recording must land");
+    recorder.finish().await.expect("close");
+
+    let calls = store.quota_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the first costed row publishes rather than waiting for a blob that never comes (D78)"
+    );
+    assert_eq!(
+        calls[0].quota,
+        json!({
+            "source": "acp_meta_rate_limit",
+            "billing": "per_token",
+            "status": Value::Null,
+            "exhausted": false,
+            "windows": [],
+            "spend": { "session_micros": 100, "currency": "USD" },
+            "observed_at": at(),
+        }),
+        "§7: a per-token agent carries `spend` and no `windows`, so the declared source costs the \
+         document nothing"
+    );
+    assert_eq!(
+        on_box(&store).await.quota,
+        Some(calls[0].quota.clone()),
+        "and it reached the column"
+    );
+
+    // The same declared source under a subscription still waits, which is the half D78 left alone.
+    let chat = chat_spec();
+    let store = open_chat(&chat).await;
+    probe_agent_box(&store).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None)
+        .with_quota_latch(latch(QuotaSource::AcpMetaRateLimit, Billing::Subscription));
+    recorder
+        .record(usage(Some(100), None))
+        .await
+        .expect("recording must land");
+    recorder.finish().await.expect("close");
+    assert!(
+        store.quota_calls().is_empty(),
+        "a subscription row that reports an allowance has said nothing until its first blob (H-3)"
+    );
+}
+
 /// Plan D68: the latch is best-effort. A store that refuses it neither fails the turn nor gets
 /// asked again — the `usage` rows are what durability rests on (`R-HIS-1`), and an advisory
 /// allowance figure must not cost a session.
