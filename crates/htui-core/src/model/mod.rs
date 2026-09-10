@@ -112,8 +112,8 @@ pub use kind::{
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode};
 pub use note::Note;
 pub use quota::{
-    CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota, QuotaSource, QuotaWindow,
-    Spend, normalize,
+    Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
+    QuotaSource, QuotaWindow, SkipReason, Spend, available, normalize,
 };
 pub use run::{
     ChatRunSpec, GateOutcome, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,

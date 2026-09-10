@@ -228,6 +228,10 @@ pub fn normalize(
 /// carried through as data like every other status.
 const REJECTED: &str = "rejected";
 
+/// The one status string §7 reads as "go ahead". Every *other* present value is a skip, including
+/// the ones that sound permissive (see [`available`] and blueprint H-7).
+const ALLOWED: &str = "allowed";
+
 /// One `unifiedWindows` entry, or `None` when it carries no numeric `utilization`.
 ///
 /// The `utilization` is the only required key: a window without one says nothing about an
@@ -331,6 +335,117 @@ fn cap_at(settings: &Value, key: &'static str) -> Result<Option<i64>, CapError> 
                 found: value.to_string(),
             }),
         },
+    }
+}
+
+/// `R-AGT-8`'s verdict for one candidate row (`docs/ANA-4.md` §7, `:1137-1141`; plan D72).
+///
+/// A verdict rather than a `bool` because the *reason* is what an orchestrator has to show: "no
+/// agent was selected" is unactionable, "`claude`'s seven-day window is full" is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Availability {
+    /// The row may be selected. Also the answer for a row whose allowance is unknown.
+    Available,
+    /// The row is skipped, for the first of §7's rules that fired.
+    Skip(SkipReason),
+}
+
+/// Why a row was skipped: §7's four rules, in the order [`available`] evaluates them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The document's `exhausted` flag is set (§7's first rule).
+    Exhausted,
+    /// A window is at or past `utilization >= 1.0` (§7's second rule).
+    WindowFull {
+        /// The full window's vendor id, e.g. `seven_day`.
+        id: String,
+    },
+    /// A present `status` that is not `"allowed"`, verbatim (§7's third rule).
+    Status(String),
+    /// The caller's cap is reached (§7's fourth rule).
+    CapReached {
+        /// What has been spent, in USD micros, as the caller counts it.
+        spent_micros: i64,
+        /// The cap that was compared against, in USD micros.
+        cap_micros: i64,
+    },
+}
+
+/// `R-AGT-8`'s skip predicate: §7's four rules over a stored quota document (plan D72).
+///
+/// The rules, **in §7's own order**, first match wins:
+///
+/// 1. `exhausted` is set → [`SkipReason::Exhausted`];
+/// 2. any window at `utilization >= 1.0` → [`SkipReason::WindowFull`], naming the first such
+///    window in the document's id order;
+/// 3. a **present** `status` that is not `"allowed"` → [`SkipReason::Status`], verbatim;
+/// 4. `spend >= cap` when **both** are `Some` → [`SkipReason::CapReached`].
+///
+/// The order is load-bearing, because rules overlap: a document [`normalize`] wrote for a
+/// `rejected` blob with a full window satisfies the first three at once, and reports the first.
+/// Keeping §7's order is what makes the verdict a function of the document rather than of this
+/// function's shape.
+///
+/// `spend` and `cap` are the **caller's** run- or batch-level figures — MOD-4's running total for
+/// the run or batch it is selecting for, against [`ProjectCaps`] — and deliberately *not* the
+/// document's `spend.session_micros`: a session is not a run, and one long-lived session can serve
+/// many runs. Both in USD micros; `None` for either means there is nothing to compare, which is
+/// unbounded.
+///
+/// # Unknown is available
+///
+/// A `None` quota, and a blob [`Quota::from_value`] cannot parse — the fixtures' pre-milestone-7
+/// `{ "remaining": 100 }` is the real instance — are **unknown**, and unknown is available: rules
+/// 1 to 3 have nothing to read, so they do not fire. §7 says why in as many words: otherwise
+/// `agy`, which demonstrably reports nothing, would never be selected. Unknown is not, however, a
+/// licence to overspend — rule 4 reads the caller's own figures and still applies.
+///
+/// # `allowed_warning`
+///
+/// `claude`'s status vocabulary includes `allowed_warning`, and rule 3 as §7 writes it **skips**
+/// it: the only permissive value is `"allowed"` exactly. That is implemented as written and pinned
+/// by `available_skips_an_allowed_warning_status` (blueprint H-7), so MOD-4 can loosen it — by
+/// treating that one reason as selectable — knowingly rather than by accident.
+///
+/// # No caller yet
+///
+/// MOD-2 has **no production caller**: MOD-4's selection loop is the consumer, and §7's rule is
+/// written for "the orchestrator", which is MOD-4's (plan D72). This milestone ships the predicate
+/// MOD-4 cannot write without the document's shape, and tests it here; inventing a use for it now
+/// would be a second orchestrator.
+#[must_use]
+pub fn available(quota: Option<&Value>, spend: Option<i64>, cap: Option<i64>) -> Availability {
+    // A document that does not parse is skipped over, not refused: the three rules that read one
+    // simply have nothing to read (§7's "null means unknown means available").
+    if let Some(quota) = quota.and_then(Quota::from_value) {
+        if quota.exhausted {
+            return Availability::Skip(SkipReason::Exhausted);
+        }
+        if let Some(full) = quota
+            .windows
+            .iter()
+            .find(|window| window.utilization >= 1.0)
+        {
+            return Availability::Skip(SkipReason::WindowFull {
+                id: full.id.clone(),
+            });
+        }
+        // Present *and* not `allowed`: an absent status is a row that says nothing, and a row that
+        // says nothing is available.
+        if let Some(status) = quota.status.filter(|status| status != ALLOWED) {
+            return Availability::Skip(SkipReason::Status(status));
+        }
+    }
+    match (spend, cap) {
+        // Reached, not exceeded: `>=`, the same comparison the recorder's per-run cap makes (D70),
+        // so a cap of `0` stops on the first costed row rather than never.
+        (Some(spent_micros), Some(cap_micros)) if spent_micros >= cap_micros => {
+            Availability::Skip(SkipReason::CapReached {
+                spent_micros,
+                cap_micros,
+            })
+        }
+        _ => Availability::Available,
     }
 }
 
@@ -766,6 +881,231 @@ mod tests {
         assert_eq!(
             normalize(QuotaSource::None, Billing::PerToken, None, None, at()).tightest_window(),
             None
+        );
+    }
+
+    /// A stored §7 document, built through the type that writes it — [`available`] reads whatever
+    /// the column holds, and a hand-written `json!` here could name a key the document does not.
+    ///
+    /// `exhausted` is taken rather than derived on purpose: the stored `exhausted` and the stored
+    /// windows are two facts a leaner writer can disagree on, and each of §7's first two rules has
+    /// to be provable on its own.
+    fn document(status: Option<&str>, exhausted: bool, windows: &[(&str, f64)]) -> Value {
+        Quota {
+            source: QuotaSource::AcpMetaRateLimit,
+            billing: Billing::Subscription,
+            status: status.map(str::to_owned),
+            exhausted,
+            windows: windows
+                .iter()
+                .map(|(id, utilization)| QuotaWindow {
+                    id: (*id).to_owned(),
+                    utilization: *utilization,
+                    resets_at: None,
+                })
+                .collect(),
+            spend: Spend::default(),
+            observed_at: at(),
+        }
+        .to_value()
+    }
+
+    /// §7's first rule, and the one that decides what a document failing two rules reports: an
+    /// `exhausted` document is `Exhausted` even when a window is full and the status is rejected,
+    /// because the rules are evaluated in the order §7 writes them.
+    #[test]
+    fn available_skips_an_exhausted_document_first() {
+        assert_eq!(
+            available(Some(&document(Some("allowed"), true, &[])), None, None),
+            Availability::Skip(SkipReason::Exhausted),
+            "`exhausted` alone is a skip: no window and an allowed status"
+        );
+        // The document `normalize` writes for a rejected blob: two rules fire, the first reports.
+        let rejected = normalize(
+            QuotaSource::AcpMetaRateLimit,
+            Billing::Subscription,
+            Some(&json!({
+                "status": "rejected",
+                "unifiedWindows": { "five_hour": { "utilization": 1.0 } },
+            })),
+            Some(10),
+            at(),
+        );
+        assert_eq!(
+            available(Some(&rejected.to_value()), Some(10), Some(5)),
+            Availability::Skip(SkipReason::Exhausted),
+            "the first rule that fires is the verdict, whatever the other three say"
+        );
+    }
+
+    /// §7's second rule: a window at exactly `1.0` is full, and it is a skip even when the writer
+    /// of the document did not derive `exhausted` from it.
+    #[test]
+    fn available_skips_a_window_at_exactly_one() {
+        assert_eq!(
+            available(
+                Some(&document(
+                    Some("allowed"),
+                    false,
+                    &[("five_hour", 0.2), ("seven_day", 1.0)]
+                )),
+                None,
+                None,
+            ),
+            Availability::Skip(SkipReason::WindowFull {
+                id: "seven_day".to_owned()
+            }),
+            "the reason names the window, which is what MOD-4 has to report"
+        );
+    }
+
+    /// §7's third rule over `rejected`: a present, non-`allowed` status is a skip on its own terms.
+    ///
+    /// The document is hand-built with `exhausted: false` so the verdict is the *status* rule and
+    /// not the `exhausted` one — [`normalize`] would derive `exhausted` here, and then §7's first
+    /// rule would answer first (`available_skips_an_exhausted_document_first`).
+    #[test]
+    fn available_skips_a_rejected_status() {
+        assert_eq!(
+            available(Some(&document(Some("rejected"), false, &[])), None, None),
+            Availability::Skip(SkipReason::Status("rejected".to_owned()))
+        );
+    }
+
+    /// Blueprint H-7, pinned: `claude`'s vocabulary includes `allowed_warning`, and §7's rule as
+    /// written skips it. If MOD-4 ever decides a warned agent is still selectable, this case is
+    /// where that decision has to be made explicitly.
+    #[test]
+    fn available_skips_an_allowed_warning_status() {
+        assert_eq!(
+            available(
+                Some(&document(
+                    Some("allowed_warning"),
+                    false,
+                    &[("five_hour", 0.11), ("seven_day", 0.62)]
+                )),
+                Some(351),
+                None,
+            ),
+            Availability::Skip(SkipReason::Status("allowed_warning".to_owned())),
+            "blueprint C's worked example: a warned status skips, deliberately"
+        );
+    }
+
+    /// §7's fourth rule, over the caller's figures: `spend >= cap` when both are `Some`, and the
+    /// reason carries both numbers so the operator sees what was compared.
+    #[test]
+    fn available_skips_a_cap_already_reached() {
+        let allowed = document(Some("allowed"), false, &[("seven_day", 0.62)]);
+        assert_eq!(
+            available(Some(&allowed), Some(300), Some(300)),
+            Availability::Skip(SkipReason::CapReached {
+                spent_micros: 300,
+                cap_micros: 300,
+            }),
+            "reached, not exceeded: `>=`, as the recorder's own cap check is"
+        );
+        // Blueprint C's worked example, over the real `claude` document.
+        let claude = normalize(
+            QuotaSource::AcpMetaRateLimit,
+            Billing::Subscription,
+            Some(&blob()),
+            Some(351),
+            at(),
+        )
+        .to_value();
+        assert_eq!(
+            available(Some(&claude), Some(351), Some(300)),
+            Availability::Skip(SkipReason::CapReached {
+                spent_micros: 351,
+                cap_micros: 300,
+            })
+        );
+        assert_eq!(
+            available(Some(&claude), Some(351), None),
+            Availability::Available,
+            "no cap is unbounded, whatever the spend"
+        );
+        assert_eq!(
+            available(Some(&claude), None, Some(300)),
+            Availability::Available,
+            "no spend figure has nothing to compare against"
+        );
+        assert_eq!(
+            available(Some(&claude), Some(299), Some(300)),
+            Availability::Available,
+            "under the cap is not at it"
+        );
+        // The cap is the caller's fact, not the document's: it is reached whether or not the row
+        // reports an allowance at all.
+        assert_eq!(
+            available(None, Some(300), Some(300)),
+            Availability::Skip(SkipReason::CapReached {
+                spent_micros: 300,
+                cap_micros: 300,
+            }),
+            "an unknown quota does not buy an unbounded run"
+        );
+    }
+
+    /// §7's own sentence: a **null** quota means unknown, and unknown is available — otherwise
+    /// `agy`, which reports nothing, would never be selected.
+    #[test]
+    fn an_unknown_quota_is_available() {
+        assert_eq!(
+            available(None, Some(1), None),
+            Availability::Available,
+            "no document and no cap: nothing says not to"
+        );
+        assert_eq!(
+            available(Some(&Value::Null), None, None),
+            Availability::Available
+        );
+    }
+
+    /// The two that must not skip on the document's own terms: a window under `1.0` with an
+    /// `allowed` status is a working agent, not a tired one.
+    #[test]
+    fn a_window_below_one_with_an_allowed_status_is_available() {
+        assert_eq!(
+            available(
+                Some(&document(Some("allowed"), false, &[("five_hour", 0.99)])),
+                None,
+                None,
+            ),
+            Availability::Available,
+            "0.99 is not 1.0, exactly as `exhausted` reads it"
+        );
+        assert_eq!(
+            available(Some(&document(None, false, &[])), None, None),
+            Availability::Available,
+            "a document that reports no status reports no reason to skip"
+        );
+    }
+
+    /// A blob that does not parse — the fixtures' pre-milestone-7 `{ "remaining": 100 }` — is
+    /// unknown, and unknown is available: it is not an empty allowance, and it is not an exhausted
+    /// one. `Quota::from_value` returning `None` is the same "we do not know" as no document.
+    #[test]
+    fn an_unparsable_blob_is_unknown_and_available() {
+        for blob in [
+            json!({ "remaining": 100 }),
+            json!("allowed"),
+            json!({ "source": "none", "billing": "per_token" }),
+        ] {
+            assert_eq!(
+                available(Some(&blob), None, None),
+                Availability::Available,
+                "{blob} does not parse, so it says nothing"
+            );
+        }
+        // Unknown is not a licence to overspend: the cap rule still reads the caller's figures.
+        assert_eq!(
+            available(Some(&json!({ "remaining": 100 })), Some(1), Some(1)),
+            Availability::Skip(SkipReason::CapReached {
+                spent_micros: 1,
+                cap_micros: 1,
+            })
         );
     }
 
