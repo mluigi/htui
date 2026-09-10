@@ -1600,3 +1600,156 @@ async fn a_probe_snapshot_round_trips_through_agent_box() {
 
     db.drop_db().await;
 }
+
+/// MOD-2 plan D67: `set_agent_box_quota` writes the two quota columns of an existing row and
+/// leaves `agent_box.probe` byte-identical.
+///
+/// The claim the narrow setter exists for, asserted in SQL rather than assumed: a latch runs
+/// inside a chat while a re-probe of the same row may be running beside it, so the statement that
+/// writes the allowance must not be the statement that writes the §4.6 snapshot. `updated_at` is
+/// read too, because the two backends have to agree on it - `MemStore` bumps it by hand and
+/// Postgres has `agent_box` in the `BEFORE UPDATE` trigger loop (`0001_init.sql:577`), so no
+/// `SET updated_at` is needed here.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_agent_box_quota_leaves_probe_byte_identical() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    // A document big enough that "byte-identical" is a claim about a payload and not about a
+    // two-key object JSONB might normalise either way.
+    let snapshot = serde_json::json!({
+        "transport": "acp",
+        "resolved": {
+            "command": "/usr/bin/node",
+            "args": ["/opt/claude-code-acp/dist/index.js", "--stdio"],
+            "env": { "CLAUDE_CODE_EXECUTABLE": "/usr/bin/claude" },
+        },
+        "tools": { "claude": "2.1.263", "claude_agent_acp": null, "node": "22.19.0" },
+        "handshake": {
+            "at": "2026-09-08T12:00:00Z",
+            "protocol_version": 1,
+            "agent_name": "claude-code-acp",
+            "agent_version": "0.7.1",
+            "capabilities": { "loadSession": false },
+            "auth_methods": [],
+        },
+        "status": "ready",
+        "stderr_tail": null,
+        "source": "probe",
+    });
+    // Microsecond-precision literals, `timestamptz`'s resolution — the
+    // `upsert_agent_updates_in_place_and_keeps_created_at` precedent above. `Utc::now()` carries
+    // nanoseconds Postgres rounds away, and this case compares stamps for equality.
+    let probed_at: DateTime<Utc> = "2026-09-10T06:00:00.000123Z"
+        .parse()
+        .expect("a microsecond-precision literal");
+    db.store
+        .upsert_agent_box(&AgentBox {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id: db.store.this_box(),
+            enabled: true,
+            version: Some("0.7.1".to_owned()),
+            path: Some("/usr/bin/node".to_owned()),
+            probed_at: Some(probed_at),
+            quota: None,
+            quota_at: None,
+            updated_at: probed_at,
+            probe: Some(snapshot.clone()),
+        })
+        .await
+        .expect("the probe row lands");
+    let before: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM agent_box WHERE agent_id = $1 AND box_id = $2")
+            .bind(ids::AGENT_CLAUDE.as_uuid())
+            .bind(db.store.this_box().as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read updated_at");
+
+    let quota = serde_json::json!({
+        "source": "acp_meta_rate_limit",
+        "billing": "subscription",
+        "status": "allowed",
+        "exhausted": false,
+        "windows": [{ "id": "five_hour", "utilization": 0.11 }],
+        "spend": { "session_micros": 351, "currency": "USD" },
+        "observed_at": "2026-09-10T09:00:00Z",
+    });
+    let quota_at: DateTime<Utc> = "2026-09-10T09:00:00.000456Z"
+        .parse()
+        .expect("a microsecond-precision literal");
+    db.store
+        .set_agent_box_quota(
+            ids::AGENT_CLAUDE,
+            db.store.this_box(),
+            quota.clone(),
+            quota_at,
+        )
+        .await
+        .expect("the latch lands on the probed row");
+
+    let row = sqlx::query(
+        "SELECT probe, quota, quota_at, updated_at, enabled, version, path, probed_at \
+         FROM agent_box WHERE agent_id = $1 AND box_id = $2",
+    )
+    .bind(ids::AGENT_CLAUDE.as_uuid())
+    .bind(db.store.this_box().as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the latched row");
+    assert_eq!(
+        row.get::<Option<serde_json::Value>, _>("probe").as_ref(),
+        Some(&snapshot),
+        "the §4.6 snapshot survives the latch byte for byte (D67)"
+    );
+    assert_eq!(
+        row.get::<Option<serde_json::Value>, _>("quota").as_ref(),
+        Some(&quota),
+        "the document is what the call passed"
+    );
+    assert_eq!(
+        row.get::<Option<DateTime<Utc>>, _>("quota_at"),
+        Some(quota_at),
+        "and `quota_at` with it"
+    );
+    assert!(
+        row.get::<bool, _>("enabled"),
+        "`enabled` is not one of the two columns"
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("version").as_deref(),
+        Some("0.7.1"),
+        "nor is `version`"
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("path").as_deref(),
+        Some("/usr/bin/node"),
+        "nor is `path`"
+    );
+    assert_eq!(
+        row.get::<Option<DateTime<Utc>>, _>("probed_at"),
+        Some(probed_at),
+        "nor is `probed_at`: a latch is not a probe"
+    );
+    assert!(
+        row.get::<DateTime<Utc>, _>("updated_at") > before,
+        "`updated_at` moved, and the `BEFORE UPDATE` trigger - not the statement - moved it"
+    );
+
+    let missing = db
+        .store
+        .set_agent_box_quota(AgentId::new(), db.store.this_box(), quota, quota_at)
+        .await;
+    assert!(
+        matches!(
+            missing,
+            Err(htui_core::store::StoreError::NotFound {
+                entity: "agent_box",
+                ..
+            })
+        ),
+        "`rows_affected() == 0` is the `NotFound`; there is no insert path, got {missing:?}"
+    );
+
+    db.drop_db().await;
+}

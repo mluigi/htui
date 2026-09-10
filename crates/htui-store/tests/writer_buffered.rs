@@ -273,6 +273,21 @@ async fn item_and_registry_writes_are_unreachable() {
             .await
             .expect_err("no probe write offline"),
     );
+    // MOD-2 plan D68: the quota latch is a registry write like the other two. The mirror holds no
+    // `agent_box` table, so an offline chat leaves the last server-side value standing and its
+    // buffered `usage` rows re-derive the spend after upload.
+    unreachable(
+        "set_agent_box_quota",
+        writer
+            .set_agent_box_quota(
+                demo.agents[0].id,
+                ids::BOX,
+                json!({ "source": "none" }),
+                fixtures::demo_at(3, 0),
+            )
+            .await
+            .expect_err("no quota latch offline"),
+    );
 
     assert_eq!(
         pending_files(writer.dir()),

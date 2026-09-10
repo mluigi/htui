@@ -30,9 +30,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, ChatRunSpec, DocumentHead, EventKind, EventRole, Item, ItemFilter, ItemId,
-    ItemPatch, ItemSummary, LinkGraph, NewItem, Note, RunId, RunStatus, RunSummary, Scope,
-    SessionEvent, Status, StepId,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, DocumentHead, EventKind, EventRole, Item,
+    ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, RunId, RunStatus,
+    RunSummary, Scope, SessionEvent, Status, StepId,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore, Result as StoreResult, UpdateOutcome, WriteStore};
@@ -535,6 +535,17 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     }
     async fn upsert_agent_box(&self, row: &AgentBox) -> StoreResult<()> {
         self.inner.upsert_agent_box(row).await
+    }
+    async fn set_agent_box_quota(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        quota: Value,
+        quota_at: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        self.inner
+            .set_agent_box_quota(agent_id, box_id, quota, quota_at)
+            .await
     }
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> StoreResult<()> {
         self.inner.start_chat_run(chat).await

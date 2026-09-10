@@ -42,6 +42,7 @@ pub const CASES: &[&str] = &[
     "start_chat_run_mints_chat_rows",
     "upsert_agent_by_id_name_unique",
     "upsert_agent_box_by_pk",
+    "set_agent_box_quota_updates_two_columns_or_not_found",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -77,6 +78,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "start_chat_run_mints_chat_rows" => start_chat_run_mints_chat_rows(store).await,
         "upsert_agent_by_id_name_unique" => upsert_agent_by_id_name_unique(store).await,
         "upsert_agent_box_by_pk" => upsert_agent_box_by_pk(store).await,
+        "set_agent_box_quota_updates_two_columns_or_not_found" => {
+            set_agent_box_quota_updates_two_columns_or_not_found(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1304,6 +1308,63 @@ async fn upsert_agent_box_by_pk<S: WriteStore>(store: &S) {
     assert!(
         matches!(orphan, Err(StoreError::Constraint(_))),
         "upsert_agent_box_by_pk: a row for an unknown agent is refused, got {orphan:?}"
+    );
+}
+
+/// `set_agent_box_quota` writes the two quota columns of an **existing** row and refuses a key it
+/// does not hold (MOD-2 plan D67).
+///
+/// The narrow setter has no insert path: a row that has never been probed has no columns to latch
+/// into, so an unknown `(agent_id, box_id)` is
+/// [`StoreError::NotFound`], never a silent no-op and never a fresh row. What the write leaves
+/// alone - `probe` above all - is asserted where a concrete store can be named and read back
+/// (`MemStore`'s `set_agent_box_quota_leaves_probe_and_version_alone` and `pg_criteria.rs`),
+/// because [`WriteStore`] carries no registry read.
+async fn set_agent_box_quota_updates_two_columns_or_not_found<S: WriteStore>(store: &S) {
+    store
+        .upsert_agent_box(&AgentBox {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id: ids::BOX,
+            enabled: true,
+            version: Some("1.2.3".to_owned()),
+            path: Some("/usr/bin/claude".to_owned()),
+            probed_at: Some(Utc::now()),
+            quota: None,
+            quota_at: None,
+            updated_at: Utc::now(),
+            probe: Some(json!({ "status": "ready", "source": "probe" })),
+        })
+        .await
+        .expect("set_agent_box_quota_updates_two_columns_or_not_found: the probed row must land");
+
+    store
+        .set_agent_box_quota(
+            ids::AGENT_CLAUDE,
+            ids::BOX,
+            json!({ "source": "none", "spend": { "session_micros": 7, "currency": "USD" } }),
+            Utc::now(),
+        )
+        .await
+        .expect("set_agent_box_quota_updates_two_columns_or_not_found: the latch lands on a row");
+
+    let missing = store
+        .set_agent_box_quota(
+            AgentId::new(),
+            ids::BOX,
+            json!({ "source": "none" }),
+            Utc::now(),
+        )
+        .await;
+    assert!(
+        matches!(
+            missing,
+            Err(StoreError::NotFound {
+                entity: "agent_box",
+                ..
+            })
+        ),
+        "set_agent_box_quota_updates_two_columns_or_not_found: an unprobed row has nothing to \
+         latch into, got {missing:?}"
     );
 }
 

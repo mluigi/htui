@@ -849,6 +849,30 @@ impl State {
         Ok(())
     }
 
+    /// The two-column quota latch of `docs/ANA-4.md` §7 (plan D67): an existing row only, with
+    /// `updated_at` bumped as `set_step_usage` bumps it and Postgres's `BEFORE UPDATE` trigger
+    /// does it there.
+    fn set_agent_box_quota(
+        &mut self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        quota: Value,
+        quota_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let row = self
+            .agent_boxes
+            .get_mut(&(agent_id, box_id))
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "agent_box",
+                id: format!("{agent_id}/{box_id}"),
+            })?;
+        row.quota = Some(quota);
+        row.quota_at = Some(quota_at);
+        row.updated_at = now;
+        Ok(())
+    }
+
     /// The `run` / `run_step` pair of a free-standing chat, both a no-op when the id is already
     /// stored (plan D4: `ON CONFLICT (id) DO NOTHING`).
     fn start_chat_run(&mut self, chat: &ChatRunSpec) -> Result<()> {
@@ -1040,6 +1064,17 @@ impl WriteStore for MemStore {
         self.write(|state| state.upsert_agent_box(row, now))
     }
 
+    async fn set_agent_box_quota(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        quota: Value,
+        quota_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.set_agent_box_quota(agent_id, box_id, quota, quota_at, now))
+    }
+
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
         self.write(|state| state.start_chat_run(chat))
     }
@@ -1060,8 +1095,9 @@ impl WriteStore for MemStore {
 mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
-    use crate::model::{AgentBox, ChatRunSpec, RunStatus, StepStatus};
+    use crate::model::{AgentBox, AgentId, ChatRunSpec, RunStatus, StepStatus};
     use crate::store::WriteStore as _;
+    use crate::store::error::StoreError;
     use chrono::Utc;
     use serde_json::json;
 
@@ -1273,6 +1309,100 @@ mod tests {
                 .and_then(|row| row.probe.as_ref()),
             None,
             "a second upsert with `probe: None` clears the snapshot"
+        );
+    }
+
+    /// MOD-2 plan D67: the narrow setter writes `quota` and `quota_at` and touches no other
+    /// column - the `probe` snapshot above all, which is the whole reason the latch does not go
+    /// through `upsert_agent_box`.
+    ///
+    /// The read-back is here rather than in `store::conformance` because [`WriteStore`] has no
+    /// registry read; `pg_criteria.rs` asserts the same claim in SQL, and the two together are
+    /// what keeps the backends from drifting.
+    #[tokio::test]
+    async fn set_agent_box_quota_leaves_probe_and_version_alone() {
+        let store = MemStore::demo();
+        let snapshot = serde_json::json!({ "status": "ready", "source": "probe" });
+        let probed_at = Utc::now() - chrono::TimeDelta::hours(3);
+        store
+            .upsert_agent_box(&AgentBox {
+                agent_id: ids::AGENT_CLAUDE,
+                box_id: ids::BOX,
+                enabled: true,
+                version: Some("1.2.3".to_owned()),
+                path: Some("claude".to_owned()),
+                probed_at: Some(probed_at),
+                quota: None,
+                quota_at: None,
+                updated_at: probed_at,
+                probe: Some(snapshot.clone()),
+            })
+            .await
+            .expect("the probe row lands");
+        let before = store
+            .read(|state| {
+                state
+                    .agent_boxes
+                    .get(&(ids::AGENT_CLAUDE, ids::BOX))
+                    .cloned()
+            })
+            .expect("the row is stored");
+
+        let quota = serde_json::json!({
+            "source": "acp_meta_rate_limit",
+            "spend": { "session_micros": 351, "currency": "USD" },
+        });
+        let quota_at = Utc::now();
+        store
+            .set_agent_box_quota(ids::AGENT_CLAUDE, ids::BOX, quota.clone(), quota_at)
+            .await
+            .expect("the latch lands on the probed row");
+
+        let after = store
+            .agents()
+            .await
+            .expect("agents must not fail")
+            .into_iter()
+            .find(|row| row.agent.id == ids::AGENT_CLAUDE)
+            .expect("claude is registered")
+            .on_box
+            .expect("this box has an agent_box row");
+        assert_eq!(after.quota.as_ref(), Some(&quota), "the document is stored");
+        assert_eq!(after.quota_at, Some(quota_at), "and its timestamp with it");
+        assert_eq!(
+            after.probe.as_ref(),
+            Some(&snapshot),
+            "the §4.6 snapshot is byte-identical across the latch (D67)"
+        );
+        assert_eq!(
+            after.version.as_deref(),
+            Some("1.2.3"),
+            "the setter is two columns wide: `version` is not one of them"
+        );
+        assert_eq!(after.path.as_deref(), Some("claude"), "nor is `path`");
+        assert!(after.enabled, "nor is `enabled`");
+        assert_eq!(
+            after.probed_at,
+            Some(probed_at),
+            "nor is `probed_at`: a latch is not a probe"
+        );
+        assert!(
+            after.updated_at > before.updated_at,
+            "`updated_at` moves, as Postgres's `BEFORE UPDATE` trigger moves it"
+        );
+
+        let missing = store
+            .set_agent_box_quota(AgentId::new(), ids::BOX, quota, quota_at)
+            .await;
+        assert!(
+            matches!(
+                missing,
+                Err(StoreError::NotFound {
+                    entity: "agent_box",
+                    ..
+                })
+            ),
+            "a row that has never been probed has no columns to latch into, got {missing:?}"
         );
     }
 }

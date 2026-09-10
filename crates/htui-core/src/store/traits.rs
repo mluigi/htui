@@ -8,7 +8,10 @@
 //! **MOD-2 (plan D3)** adds six [`WriteStore`] methods and nothing to [`ReadStore`]: the four of
 //! `docs/ANA-4.md` §4.1 that the session recorder writes through, plus the chat-run pair of the
 //! MOD-2 PRD. They are the *whole* store seam MOD-2 needs before its milestone 9, so milestones 2
-//! to 8 do not reopen this file. The registry read that goes with them, `agents()`, is **not**
+//! to 8 do not reopen this file. Milestone 7 reopens it once, for a seventh:
+//! [`WriteStore::set_agent_box_quota`], the two-column latch of `docs/ANA-4.md` §7 that plan D67
+//! keeps out of `upsert_agent_box` and plan D74 makes those two columns' only writer. The registry
+//! read that goes with them, `agents()`, is **not**
 //! here: `agent` and `agent_box` are not mirrored (`docs/ANA-9.md` §4.4), so it is inherent on
 //! `MemStore` / `PgStore` and dispatched by `Backend`, following the `workspaces` / `box_info` /
 //! `active_runs` / `projects` precedent.
@@ -17,9 +20,9 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::model::{
-    Agent, AgentBox, ChatRunSpec, DocumentHead, Item, ItemFilter, ItemId, ItemPatch, ItemRevision,
-    ItemSummary, LinkGraph, NewItem, Note, RunId, RunStatus, RunSummary, Scope, SessionEvent,
-    Status, StepId,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, DocumentHead, Item, ItemFilter, ItemId,
+    ItemPatch, ItemRevision, ItemSummary, LinkGraph, NewItem, Note, RunId, RunStatus, RunSummary,
+    Scope, SessionEvent, Status, StepId,
 };
 use crate::store::error::Result;
 
@@ -115,6 +118,30 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the agent or the box
     /// does not exist.
     async fn upsert_agent_box(&self, row: &AgentBox) -> Result<()>;
+
+    /// Writes `agent_box.quota` and `quota_at` of one **existing** row and nothing else — never
+    /// `probe`, `enabled`, `version` or `path` (MOD-2 plan D67; `docs/ANA-4.md` §7's passive
+    /// latch).
+    ///
+    /// Narrow on purpose: the latch runs inside a chat while a re-probe of the same row may be
+    /// running beside it (plan D55/D60), and two writers of one row must not be one statement
+    /// wide. No insert: a row that has never been probed has no columns to latch into.
+    ///
+    /// Since plan D74 this is also the **only** writer of the two columns —
+    /// [`upsert_agent_box`](WriteStore::upsert_agent_box) cannot set or clear either — so a latch
+    /// cannot be discarded by a re-probe that read the row before it landed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "agent_box"` and
+    /// id `"<agent_id>/<box_id>"` when no row has that key.
+    async fn set_agent_box_quota(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        quota: Value,
+        quota_at: DateTime<Utc>,
+    ) -> Result<()>;
 
     /// Mints the `run` / `run_step` pair of a free-standing chat, both `ON CONFLICT (id) DO
     /// NOTHING` (MOD-2 plan D4).

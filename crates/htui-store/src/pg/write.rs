@@ -16,8 +16,8 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, ChatRunSpec, Item, ItemId, ItemPatch, ItemRevision, NewItem, RunId, RunStatus,
-    SessionEvent, Status, StepId,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Item, ItemId, ItemPatch, ItemRevision, NewItem,
+    RunId, RunStatus, SessionEvent, Status, StepId,
 };
 use htui_core::store::{
     ReadStore as _, Result, StoreError, UpdateOutcome, WriteStore, chat_step_status,
@@ -443,6 +443,46 @@ impl WriteStore for PgStore {
         Ok(())
     }
 
+    /// The two-column quota latch of `docs/ANA-4.md` §7 (MOD-2 plan D67), keyed on the composite
+    /// primary key.
+    ///
+    /// Two columns and no more: `probe` and the four discovery columns belong to the probe, which
+    /// may be re-running beside this write. `updated_at` is the migration's `BEFORE UPDATE`
+    /// trigger's - `agent_box` is in the `0001_init.sql:577` loop, and "no write path may set
+    /// `updated_at` by hand" is that loop's own rule. `rows_affected() == 0` is the `NotFound`:
+    /// there is no insert path, because a row that has never been probed has no columns to latch
+    /// into.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no `agent_box` row has that key.
+    async fn set_agent_box_quota(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        quota: Value,
+        quota_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let updated = sqlx::query!(
+            "UPDATE agent_box SET quota = $3, quota_at = $4 WHERE agent_id = $1 AND box_id = $2",
+            agent_id.as_uuid(),
+            box_id.as_uuid(),
+            &quota,
+            quota_at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                entity: "agent_box",
+                id: format!("{agent_id}/{box_id}"),
+            });
+        }
+        Ok(())
+    }
+
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both
     /// `ON CONFLICT (id) DO NOTHING` (plan D4).
     ///
@@ -494,7 +534,7 @@ impl WriteStore for PgStore {
              ON CONFLICT (id) DO NOTHING",
             chat.step_id.as_uuid(),
             chat.run_id.as_uuid(),
-            chat.agent_id.map(htui_core::model::AgentId::as_uuid),
+            chat.agent_id.map(AgentId::as_uuid),
             chat.model.as_deref(),
             chat.started_at,
         )

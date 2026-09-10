@@ -29,9 +29,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, ChatRunSpec, DocumentHead, Item, ItemFilter, ItemId, ItemPatch, ItemSummary,
-    LinkGraph, NewItem, Note, ProjectId, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status,
-    StepId,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, DocumentHead, Item, ItemFilter, ItemId,
+    ItemPatch, ItemSummary, LinkGraph, NewItem, Note, ProjectId, RunId, RunStatus, RunSummary,
+    Scope, SessionEvent, Status, StepId,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError, UpdateOutcome, WriteStore};
 use serde_json::Value;
@@ -274,6 +274,24 @@ impl WriteStore for BufferedWriter {
         Err(registry_writes_need_the_server())
     }
 
+    /// Refused with the other registry writes (MOD-2 plan D68): the cache mirror holds no
+    /// `agent_box` table at all (`cache_migrations/0002_agent_mirror.sql:9-11`), so there is
+    /// nowhere to put a latch offline.
+    ///
+    /// The refusal is not a lost figure. An offline chat leaves the last server-side quota
+    /// standing and buffers its `usage` rows, from which `upload_pending` re-derives the spend -
+    /// the same trade `set_step_usage` makes above. The chat asks **before** the first `usage`
+    /// row rather than discovering this on it (`agent_worker::quota_latch_for`).
+    async fn set_agent_box_quota(
+        &self,
+        _agent_id: AgentId,
+        _box_id: BoxId,
+        _quota: Value,
+        _quota_at: DateTime<Utc>,
+    ) -> Result<()> {
+        Err(registry_writes_need_the_server())
+    }
+
     /// Registers the chat's step under its `(project, run)` pair and writes no row.
     ///
     /// The pair is what the buffer's file name carries, and `append_events` is the only thing that
@@ -325,8 +343,9 @@ fn item_writes_need_the_server() -> StoreError {
     )
 }
 
-/// D35's refusal for the two registry writes, and MOD-2 D52's for a probe that has no server to
-/// write its snapshot to: the same sentence in both places, on purpose.
+/// D35's refusal for the registry writes, and MOD-2 D52's for a probe that has no server to
+/// write its snapshot to: the same sentence in both places, on purpose. It is also what an
+/// offline chat logs when it declines to latch a quota (MOD-2 plan D68).
 ///
 /// A probe costs process spawns, so the caller checks this **before** it spawns anything rather
 /// than discovering the refusal on the write. Writing a probe result somewhere local is the
@@ -461,6 +480,31 @@ impl WriteStore for Writer {
             Self::Memory(store) => store.upsert_agent_box(row).await,
             Self::Online(pg) => pg.upsert_agent_box(row).await,
             Self::Buffered(buffer) => buffer.upsert_agent_box(row).await,
+        }
+    }
+
+    async fn set_agent_box_quota(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        quota: Value,
+        quota_at: DateTime<Utc>,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(store) => {
+                store
+                    .set_agent_box_quota(agent_id, box_id, quota, quota_at)
+                    .await
+            }
+            Self::Online(pg) => {
+                pg.set_agent_box_quota(agent_id, box_id, quota, quota_at)
+                    .await
+            }
+            Self::Buffered(buffer) => {
+                buffer
+                    .set_agent_box_quota(agent_id, box_id, quota, quota_at)
+                    .await
+            }
         }
     }
 
