@@ -1116,21 +1116,16 @@ impl AgentRuntime {
         // chat's own task on `ChatArgs`. `run_chat` holds a `Writer`, not the `Backend`, so this
         // is the last place that can ask.
         //
-        // A missing project row and a cap that does not parse both **refuse the chat**, which is
-        // the opposite of `AgentSettings` above and deliberately so: settings that do not parse
-        // are settings that are not set, but a cap an operator wrote and `htui` ignored is the
-        // risk table's "wrong by a factor of a million" pointing the other way — a run that was
-        // supposed to be bounded and was not.
-        let project_settings =
-            backend
-                .project_settings(project_id)
-                .await?
-                .ok_or_else(|| StoreError::NotFound {
-                    entity: "project",
-                    id: project_id.to_string(),
-                })?;
-        let project_caps = ProjectCaps::from_settings(&project_settings)
-            .map_err(|err| StoreError::Constraint(err.to_string()))?;
+        // A cap that does not parse **refuses the chat**, which is the opposite of `AgentSettings`
+        // above and deliberately so: settings that do not parse are settings that are not set, but
+        // a cap an operator wrote and `htui` ignored is the risk table's "wrong by a factor of a
+        // million" pointing the other way — a run that was supposed to be bounded and was not. An
+        // absent *row* is [`project_caps_for`]'s question, and its answer differs offline.
+        let project_caps = project_caps_for(
+            &writer,
+            project_id,
+            backend.project_settings(project_id).await?,
+        )?;
         if project_caps.batch_micros.is_some() {
             // Plan D71: read and reported, never compared. A batch spans runs MOD-4 does not yet
             // create, so enforcing it here would mean inventing the batch identity
@@ -1289,6 +1284,47 @@ impl core::fmt::Debug for ChatArgs {
             .field("quota_latch", &self.quota_latch.is_some())
             .finish()
     }
+}
+
+/// The caps a chat enforces, out of `project.settings` (plan D70) — and what an **absent** row
+/// means, which is not the same question online and offline (review M-3).
+///
+/// Online a `None` is a chat whose project is not in the database the chat is about to write to:
+/// the id came from the tab's own scope, read from that same database, so the row went away under
+/// the chat and refusing is the honest answer.
+///
+/// Offline the row comes from the **mirror**, and a mirror is a snapshot. A project created on the
+/// server since the last sync has no row here, and such a chat used to start perfectly well —
+/// [`Writer::Buffered`]'s `start_chat_run` reads no project at all, so nothing but this read
+/// refuses it. Turning that into a refusal would be a regression bought for nothing, so an
+/// unmirrored project is read as `{}`: unbounded, with a log line naming the situation. A cap the
+/// mirror *does* hold is enforced exactly as online, which is the property plan D70 chose this
+/// column for.
+///
+/// A document that does not parse refuses either way — that is `start_chat`'s own comment, and
+/// this function is where the two answers are told apart rather than folded into one `ok_or`.
+fn project_caps_for(
+    writer: &Writer,
+    project_id: ProjectId,
+    settings: Option<Value>,
+) -> Result<ProjectCaps, StoreError> {
+    let settings = match (settings, writer) {
+        (Some(settings), _) => settings,
+        (None, Writer::Buffered(_)) => {
+            tracing::info!(
+                project = %project_id,
+                "unmirrored project: no cap is enforced offline (plan D70)"
+            );
+            json!({})
+        }
+        (None, _) => {
+            return Err(StoreError::NotFound {
+                entity: "project",
+                id: project_id.to_string(),
+            });
+        }
+    };
+    ProjectCaps::from_settings(&settings).map_err(|err| StoreError::Constraint(err.to_string()))
 }
 
 /// The `agent_box` row a chat latches its allowance into, or `None` with the reason logged
@@ -3429,6 +3465,69 @@ pub(crate) mod tests {
             json!("end_turn"),
             "the turn ended on its own terms"
         );
+    }
+
+    /// Review M-3: an offline chat whose project is **not in the mirror** still starts, unbounded;
+    /// the same absent row online refuses the chat.
+    ///
+    /// `project_caps_for` is called directly for `a_buffered_writer_gets_no_latch`'s reason — the
+    /// thing under test is a decision, not a turn. The offline half cannot be driven through the
+    /// shell at all: an offline chat takes its project from `projects(scope)`, which joins the
+    /// mirrored `project` row it is about to be missing, so the situation this guards against
+    /// arrives from a caller that names a project id some other way (MOD-4's orchestrator is the
+    /// next one) rather than from the Chat tab's own composer.
+    ///
+    /// The third assertion is the one that keeps the degradation honest: a cap the mirror *does*
+    /// hold is enforced offline exactly as online, which is why plan D70 put the cap in a mirrored
+    /// column instead of an env knob.
+    #[tokio::test]
+    async fn an_unmirrored_project_is_unbounded_offline_and_refused_online() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "caps-test", 1)
+            .await
+            .expect("mirror");
+        let buffered = Writer::Buffered(htui_store::BufferedWriter::new(cache.clone()));
+
+        assert_eq!(
+            project_caps_for(&buffered, ids::PROJECT_HTUI, None)
+                .expect("an unmirrored project does not refuse an offline chat"),
+            ProjectCaps::default(),
+            "no row, no cap: `{{}}` is unbounded, and the chat records to the buffer as it always \
+             did"
+        );
+        let refused = project_caps_for(&Writer::Memory(MemStore::demo()), ids::PROJECT_HTUI, None);
+        match refused {
+            Err(StoreError::NotFound { entity, id }) => {
+                assert_eq!(entity, "project");
+                assert_eq!(
+                    id,
+                    ids::PROJECT_HTUI.to_string(),
+                    "the refusal names the row"
+                );
+            }
+            other => panic!("online, a project the store does not hold refuses: {other:?}"),
+        }
+        assert_eq!(
+            project_caps_for(
+                &buffered,
+                ids::PROJECT_HTUI,
+                Some(json!({ "per_token_cap_run": 300 })),
+            )
+            .expect("a mirrored document parses offline")
+            .run_micros,
+            Some(300),
+            "a cap the mirror holds is enforced offline, which is why D70 chose this column"
+        );
+        assert!(
+            project_caps_for(
+                &buffered,
+                ids::PROJECT_HTUI,
+                Some(json!({ "per_token_cap_run": -1 }))
+            )
+            .is_err(),
+            "and a document that does not parse still refuses, offline included"
+        );
+        cache.close().await;
     }
 
     /// Plan D66-D68: an offline chat latches no allowance and says why, decided at chat start
