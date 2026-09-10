@@ -1,14 +1,19 @@
 //! Recorded transcripts replayed through the §6.1 mapper (`docs/ANA-4.md` §8 test strategy 3).
 //!
-//! The fixtures are **real**: they were captured from `@agentclientprotocol/claude-agent-acp`
-//! 0.48.0 on 2026-09-07, driving one prompt ("reply with exactly the word ok") against the
-//! subscription login on this box. Session ids are substituted out and the
-//! `available_commands_update` list is trimmed to two entries, because that list is the
-//! developer's own installed commands and not part of the protocol's shape; nothing else is
-//! edited.
+//! The fixtures are **real**. `claude_acp_turn.jsonl` was captured from
+//! `@agentclientprotocol/claude-agent-acp` 0.48.0 on 2026-09-07, driving one prompt ("reply with
+//! exactly the word ok") against the subscription login on this box. `agy_acp_turn.jsonl` was
+//! captured from `antigravity-acp` 1.1.1 on 2026-09-10, driving three turns — a plain reply, a
+//! file read and a file write — through the production runtime (MOD-2 `T34`,
+//! `crates/htui/tests/chat_live_agy.rs`). Session ids are substituted out, `claude`'s
+//! `available_commands_update` list is trimmed to two entries because that list is the
+//! developer's own installed commands and not part of the protocol's shape, and `agy`'s scratch
+//! directory is rewritten to `/scratch`; nothing else is edited.
 //!
 //! This is the regression net for adapter drift: when an adapter ships a new update kind, the
-//! snapshot shows it landing in `other` instead of the build breaking.
+//! snapshot shows it landing in `other` instead of the build breaking. Two adapters rather than
+//! one is what keeps that claim honest — the two dialects disagree about almost everything except
+//! the envelope.
 
 use htui_agent::acp::map::Mapper;
 use htui_agent::event::DriverEvent;
@@ -41,6 +46,26 @@ fn a_recorded_turn_maps_to_the_rows_it_did_when_it_was_captured() {
     // `session_event.payload` is the *payload* struct, and the recorder owns that step. The
     // snapshot's job is to pin the decode, and the variant names are what a drift diff should show.
     insta::assert_debug_snapshot!("acp_map__turn", events);
+}
+
+/// The `agy` transcript, mapped: milestone 7's `T34` capture, replayed the same way.
+///
+/// Captured on 2026-09-10 from `antigravity-acp` 1.1.1 driving three turns through the production
+/// `AgentRuntime` (`crates/htui/tests/chat_live_agy.rs`). Session id substituted out and the
+/// scratch directory rewritten to `/scratch`; nothing else edited (blueprint H-13).
+///
+/// Its value beside the `claude` one is that it holds a **different** dialect of the same
+/// protocol, and the snapshot is where that shows: no `usage_update` at all, an `edit`-kinded
+/// `tool_call` whose `rawInput` keys are the vendor's (`code_content` / `target_file`), a
+/// `content[].type == "diff"` block that the mapper turns into an `edit_proposal` before the call
+/// row, and — this is the interesting one — the same `tool_call` **re-sent verbatim** where the
+/// spec's own example would send a `tool_call_update`. Nothing in §6.1 forbids it, and the mapper
+/// handles it as it handles any `tool_call`: what the snapshot pins is that it decodes to the same
+/// rows it did the day it was recorded.
+#[test]
+fn a_recorded_agy_turn_maps_to_the_rows_it_did_when_it_was_captured() {
+    let events = mapped("agy_acp_turn.jsonl");
+    insta::assert_debug_snapshot!("acp_map__agy_turn", events);
 }
 
 /// The handshake is not a `session/update` stream: what the fixture pins is that the two responses
@@ -146,5 +171,91 @@ fn the_recorded_usage_updates_show_what_acp_reports() {
             .all(|update| update.get("inputTokens").is_none()),
         "ACP reports no per-turn token counts on `usage_update` (§7), which is why the \
          conformance case asserts null token fields"
+    );
+}
+
+/// `docs/ANA-4.md` §11.14 `:1384-1388`, answered by the `agy` capture and pinned here so a future
+/// adapter that changes any of the three is caught by a test rather than by surprise (MOD-2 plan
+/// D65: `T34`'s answers are inputs to milestone 7, not a footnote after it).
+///
+/// The three answers, as this transcript holds them:
+///
+/// 1. **No `usage_update` at all**, over three turns including a tool call and a file write. So
+///    `agy` reports neither cost nor context occupancy, §7's "Unverified — MOD-2 must confirm" row
+///    is confirmed as *nothing*, the seed's `settings.quota.source` stays `"none"`, and the quota
+///    column reads `—` for this agent by design.
+/// 2. **`session/request_permission` is issued in `default` mode, for the write and not for the
+///    read**, offering exactly two options: `allow` / `allow_once` and `deny` / `reject_once`. No
+///    `allow_always`, no `reject_always`. The request itself is not a `session/update`, so it is
+///    not in this fixture — it is in the live test's output — but the `tool_call` it gates is the
+///    one below, in `status: "pending"`.
+/// 3. **The edit is a standard `tool_call` with `kind: "edit"` and a `diff` content block**, not a
+///    vendor shape in `other`. The `rawInput` keys are the vendor's own (`code_content`,
+///    `target_file`) and the diff block carries a vendor `_meta.kind`, but both ride inside
+///    schema-shaped fields the mapper already reads, so no mapper amendment is owed (plan D62).
+#[test]
+fn the_agy_capture_answers_the_three_open_11_14_questions() {
+    let updates: Vec<Value> = lines("agy_acp_turn.jsonl")
+        .into_iter()
+        .filter(|line| line["method"] == "session/update")
+        .map(|line| line["params"]["update"].clone())
+        .collect();
+    assert!(!updates.is_empty(), "the capture holds updates at all");
+
+    // 1. `:1384` — nothing. An absence, asserted, because milestone 7 builds on it.
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "usage_update"),
+        "`agy_acp_server` 1.1.1 emits no `usage_update`; if a release starts to, this is where it \
+         is noticed and §7's `agy` row has to be revisited"
+    );
+
+    // 3. `:1387-1388` — a schema-shaped `tool_call`, with the vendor's names inside it.
+    let edit = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "tool_call" && update["kind"] == "edit")
+        .expect("the write arrived as a `tool_call` of kind `edit`, not as a vendor `other` row");
+    assert_eq!(
+        edit["status"], "pending",
+        "the gated call is announced before the permission request, so the diff is on screen \
+         while the user decides: {edit}"
+    );
+    let diff = edit["content"]
+        .as_array()
+        .expect("the call carries content blocks")
+        .iter()
+        .find(|block| block["type"] == "diff")
+        .expect("one of them is a `diff` block, which is what becomes an `edit_proposal`");
+    assert!(diff["path"].is_string(), "{diff}");
+    assert_eq!(
+        diff["newText"], "ok\n",
+        "the block carries the whole new text, never a patch: {diff}"
+    );
+    assert!(
+        diff.get("oldText").is_none(),
+        "a created file has no old text, which is `a_new_file_diff_block_has_no_old_text`'s case \
+         seen live: {diff}"
+    );
+    assert!(
+        edit["rawInput"]["target_file"].is_string(),
+        "the vendor's own input keys ride inside the schema's `rawInput`, so nothing about them \
+         reaches the mapper: {edit}"
+    );
+
+    // The finding that is neither an assertion about `htui` nor about the protocol: this adapter
+    // re-sends `tool_call` for a call it has already announced, where the spec's example would
+    // send `tool_call_update`. Pinned because `htui`'s edit-proposal dedup is keyed per flush
+    // window, so the repeat is what produced three `edit_proposal` rows for one file in the live
+    // run — a recorder question, not a mapper one.
+    let repeats = updates
+        .iter()
+        .filter(|update| {
+            update["sessionUpdate"] == "tool_call" && update["toolCallId"] == edit["toolCallId"]
+        })
+        .count();
+    assert!(
+        repeats >= 2,
+        "the capture is the evidence for the re-sent `tool_call` finding: {repeats} announcement(s)"
     );
 }

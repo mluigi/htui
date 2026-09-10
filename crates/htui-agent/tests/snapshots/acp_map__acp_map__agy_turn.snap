@@ -1,0 +1,137 @@
+---
+source: crates/htui-agent/tests/acp_map.rs
+expression: events
+---
+[
+    Other(
+        OtherEvent {
+            update: "available_commands_update",
+            body: Object {
+                "availableCommands": Array [
+                    Object {
+                        "name": String("plan"),
+                        "description": String("Plan carefully before executing a task (generates an implementation plan artifact and awaits user approval)."),
+                    },
+                    Object {
+                        "name": String("logout"),
+                        "description": String("Log out and clear stored credentials."),
+                    },
+                ],
+            },
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "ok",
+            message_id: None,
+        },
+    ),
+    ToolCall(
+        ToolCallEvent {
+            tool_call_id: "call_688829",
+            title: "Running client_view_file",
+            tool_kind: Read,
+            input: Object {
+                "absolute_path": String("/scratch/README.md"),
+                "end_line": Number(10),
+                "start_line": Number(1),
+            },
+            locations: [
+                ToolLocation {
+                    path: "/scratch/README.md",
+                    line: Some(
+                        1,
+                    ),
+                },
+            ],
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "# htui agy probe",
+            message_id: None,
+        },
+    ),
+    ToolResult(
+        ToolResultEvent {
+            tool_call_id: "call_688829",
+            status: Completed,
+            output: None,
+            locations: [],
+            terminal_reason: None,
+        },
+    ),
+    ToolCall(
+        ToolCallEvent {
+            tool_call_id: "6d81335b45094e3ca3a5530d803c03ae",
+            title: "Run client_create_file?",
+            tool_kind: Edit,
+            input: Object {
+                "code_content": String("ok\n"),
+                "target_file": String("/scratch/htui-agy-probe.txt"),
+            },
+            locations: [
+                ToolLocation {
+                    path: "/scratch/htui-agy-probe.txt",
+                    line: None,
+                },
+            ],
+        },
+    ),
+    EditProposal(
+        EditProposalEvent {
+            tool_call_id: Some(
+                "6d81335b45094e3ca3a5530d803c03ae",
+            ),
+            path: "/scratch/htui-agy-probe.txt",
+            diff: "--- a//scratch/htui-agy-probe.txt\n+++ b//scratch/htui-agy-probe.txt\n@@ -0,0 +1 @@\n+ok\n",
+            accepted: None,
+        },
+    ),
+    ToolCall(
+        ToolCallEvent {
+            tool_call_id: "6d81335b45094e3ca3a5530d803c03ae",
+            title: "Run client_create_file?",
+            tool_kind: Edit,
+            input: Object {
+                "code_content": String("ok\n"),
+                "target_file": String("/scratch/htui-agy-probe.txt"),
+            },
+            locations: [
+                ToolLocation {
+                    path: "/scratch/htui-agy-probe.txt",
+                    line: None,
+                },
+            ],
+        },
+    ),
+    EditProposal(
+        EditProposalEvent {
+            tool_call_id: Some(
+                "6d81335b45094e3ca3a5530d803c03ae",
+            ),
+            path: "/scratch/htui-agy-probe.txt",
+            diff: "--- a//scratch/htui-agy-probe.txt\n+++ b//scratch/htui-agy-probe.txt\n@@ -0,0 +1 @@\n+ok\n",
+            accepted: None,
+        },
+    ),
+    EditProposal(
+        EditProposalEvent {
+            tool_call_id: Some(
+                "6d81335b45094e3ca3a5530d803c03ae",
+            ),
+            path: "/scratch/htui-agy-probe.txt",
+            diff: "--- a//scratch/htui-agy-probe.txt\n+++ b//scratch/htui-agy-probe.txt\n@@ -0,0 +1 @@\n+ok\n",
+            accepted: None,
+        },
+    ),
+    ToolResult(
+        ToolResultEvent {
+            tool_call_id: "6d81335b45094e3ca3a5530d803c03ae",
+            status: Completed,
+            output: None,
+            locations: [],
+            terminal_reason: None,
+        },
+    ),
+]

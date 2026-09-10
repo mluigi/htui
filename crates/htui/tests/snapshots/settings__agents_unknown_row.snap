@@ -7,9 +7,9 @@ Graphics · DESKTOP-HTUI · memory · 0 runs
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
 │ Agents                                                                                           │
 │name         transport billing      models default   enabled quota               on this box      │
-│agy          acp       subscription 0      —         yes     —                   not probed       │
+│agy          acp       subscription 11     gemini-3. yes     —                   not probed       │
 │claude       acp       subscription 0      —         yes     —                   not probed       │
-│kappa        acp       subscription 0      k1        yes     —                   not probed       │
+│kappa        acp       subscription 11     k1        yes     —                   not probed       │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

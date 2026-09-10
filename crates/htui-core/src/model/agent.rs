@@ -102,10 +102,19 @@ pub struct AgentBox {
 /// epoch — so the demo data and the real seed cannot drift, and a fixture that cannot launch stops
 /// being a trap for MOD-2's own tests.
 ///
-/// Both rows are `transport: acp`, `billing: subscription`, with **empty** `models` and no
-/// `default_model`: ACP delivers the model list as session config options at `session/new`, so a
-/// guessed list would go stale on every vendor release and the first successful handshake fills it
-/// (§5.3's three notes).
+/// Both rows are `transport: acp`, `billing: subscription`. `claude`'s `models` stays **empty**
+/// with no `default_model`: ACP delivers the model list as session config options at
+/// `session/new`, so a guessed list would go stale on every vendor release and the first
+/// successful handshake fills it (§5.3's three notes).
+///
+/// `agy`'s list is **not** a guess and is therefore seeded: MOD-2 `T34` read it off a live
+/// `session/new` on 2026-09-10 (plan D64), together with the `configOptions` entry id — `"model"`
+/// — that `settings.acp.model_config_id` needs before §4.4's selection-by-id can name anything,
+/// and the `currentValue` that installation was defaulting to. It stays **data**: no source file
+/// reads a model string, and `tests/extensibility.rs`'s vendor sweep is what keeps that true. An
+/// adapter release that renames a model degrades visibly rather than silently — `open_session`
+/// step 4 emits a `model_unavailable` `other` row and the turn proceeds on the adapter's own
+/// default — so a stale list costs a row in the log, never a failed session.
 ///
 /// # Panics
 /// Never in a shipped build: the two documents are compile-time constants and a unit test parses
@@ -191,13 +200,38 @@ mod tests {
             // (§5.3). A box on API-key auth flips the row in Settings.
             assert_eq!(row.transport, Transport::Acp, "{}", row.name);
             assert_eq!(row.billing, Billing::Subscription, "{}", row.name);
-            // Empty, not guessed: ACP delivers the model list at `session/new`.
-            assert!(row.models.is_empty(), "{}", row.name);
-            assert_eq!(row.default_model, None, "{}", row.name);
             assert!(row.enabled, "{}", row.name);
             assert_eq!(row.created_at, now);
             assert_eq!(row.updated_at, now);
         }
+
+        // Empty, not guessed: ACP delivers the model list at `session/new`, and no live capture
+        // has been folded into this row.
+        assert!(rows[0].models.is_empty(), "claude");
+        assert_eq!(rows[0].default_model, None, "claude");
+        assert_eq!(rows[0].settings["acp"]["model_config_id"], Value::Null);
+
+        // `agy`'s list *is* a live capture (plan D64, MOD-2 T34): `antigravity-acp` 1.1.1 answered
+        // `session/new` with a `configOptions` entry `id: "model"` carrying these eleven values
+        // and `currentValue: "gemini-3.7-flash-high"`. The count and the two ends are pinned
+        // rather than the whole vector: what must not rot is the *shape* — a non-empty list, a
+        // default drawn from it, and the option id §4.4 selects by.
+        assert_eq!(rows[1].models.len(), 11, "agy");
+        assert_eq!(rows[1].models[0], "gemini-3.8-flash-high");
+        assert_eq!(rows[1].models[10], "gemini-3.1-pro-low");
+        assert_eq!(
+            rows[1].default_model.as_deref(),
+            Some("gemini-3.7-flash-high"),
+            "agy"
+        );
+        assert!(
+            rows[1]
+                .models
+                .iter()
+                .any(|model| Some(model.as_str()) == rows[1].default_model.as_deref()),
+            "a seeded default has to be one of the seeded models, or §4.4 selects nothing"
+        );
+        assert_eq!(rows[1].settings["acp"]["model_config_id"], "model");
 
         assert_eq!(rows[0].launch["command"], "${node}");
         assert_eq!(rows[0].launch["args"][0], "${claude_agent_acp}");
