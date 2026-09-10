@@ -154,7 +154,7 @@ Concretely in scope:
 | 5 | Autodiscovery and box probe | The maintainer learns what this box can actually run without configuring anything: probes find agents and adapters, record versions, and mark per-box enablement. Migration `0002` lands here. | complete | [plan](../plans/mod-2-probe-autodiscovery.plan.md) |
 | 6 | `agy` over ACP | A second agent works through the same code paths as the first, differing only by registry row and capability banner. | complete | [plan](../plans/mod-2-agy-acp.plan.md), [T34 close-out](../plans/mod-2-quota-caps.plan.md) |
 | 7 | Quota and caps | Remaining allowance is visible per agent per box; a per-token cap breach cancels the session rather than being noticed on the invoice. | complete | [plan](../plans/mod-2-quota-caps.plan.md) |
-| 8 | Degraded CLI transport | An agent without ACP is still usable, with the capability banner stating exactly what it cannot do. | pending | — |
+| 8 | Degraded CLI transport | An agent without ACP is still usable, with the capability banner stating exactly what it cannot do. | in-progress | [plan](../plans/mod-2-cli-transport.plan.md) |
 | 9 | Prompt assembler + preview | The maintainer can see the exact prompt a step would receive — sections, trim record, digest — and confirm the ten default template bodies before MOD-4 depends on them. | pending | — |
 
 Milestone 6 went `complete` when `T34` closed inside milestone 7's plan. Milestone 7 also carried
