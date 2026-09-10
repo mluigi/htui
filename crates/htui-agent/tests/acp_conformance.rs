@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use htui_agent::acp::map::RATE_LIMIT_META_KEY;
 use htui_agent::acp::{AcpDriver, AcpIo, Stamp};
 use htui_agent::conformance::{self, CaseHarness, Script, ScriptEvent};
 use htui_agent::driver::AgentDriver;
@@ -82,7 +83,7 @@ impl CaseHarness for AcpHarness {
 async fn the_case_list_is_the_shared_one() {
     assert_eq!(
         conformance::CASES.len(),
-        13,
+        14,
         "adding a transport must add no case (`docs/ANA-4.md` §11 criterion 1)"
     );
 }
@@ -359,12 +360,22 @@ fn wire_update(event: &DriverEvent, cost_micros_total: &mut i64) -> Value {
                 reason = "a test's cost fits a f64 exactly; the wire field is a currency amount"
             )]
             let amount = *cost_micros_total as f64 / 1_000_000.0;
-            json!({
+            let mut update = json!({
                 "sessionUpdate": "usage_update",
                 "used": usage.context_used.unwrap_or_default(),
                 "size": usage.context_size.unwrap_or_default(),
                 "cost": { "amount": amount, "currency": "USD" },
-            })
+            });
+            // The inverse of the mapper's own read (`acp::map::RATE_LIMIT_META_KEY`, ANA-4 §7).
+            // Without it this transport would drop the vendor rate-limit blob on the floor and
+            // `quota_blob_latches_agent_box` would pass on the fake and fail here — criterion 1
+            // broken from the harness side, which is the one place criterion 1 cannot see
+            // (blueprint H-10). The key is the mapper's constant, so the two halves of the round
+            // trip have one definition.
+            if let Some(quota) = &usage.quota {
+                update["_meta"] = json!({ RATE_LIMIT_META_KEY: quota });
+            }
+            update
         }
         DriverEvent::Other(other) => {
             let mut update = json!({ "sessionUpdate": other.update });

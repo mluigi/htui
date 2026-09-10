@@ -30,9 +30,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, DocumentHead, EventKind, EventRole, Item,
-    ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, RunId, RunStatus,
-    RunSummary, Scope, SessionEvent, Status, StepId,
+    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, DocumentHead, EventKind, EventRole,
+    Item, ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, Quota, QuotaSource,
+    RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepId, normalize,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore, Result as StoreResult, UpdateOutcome, WriteStore};
@@ -49,7 +49,7 @@ use crate::event::{
     PermissionRequestEvent, StopReason, TerminalReason, TextChunk, ToolCallEvent, ToolKind,
     ToolResultEvent, ToolResultStatus, UsageEvent,
 };
-use crate::record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, pump};
+use crate::record::{AnsweredBy, CHUNK_FLUSH_BYTES, QuotaLatch, RecordError, Recorder, pump};
 
 // ---------------------------------------------------------------------------------------------
 // The script language
@@ -132,6 +132,7 @@ pub const CASES: &[&str] = &[
     "rejected_tool_gets_failed_result",
     "done_precedes_next_follow_up",
     "usage_deltas_sum_to_step_usage",
+    "quota_blob_latches_agent_box",
     "unknown_update_lands_in_other",
     "edit_proposal_deduped_per_call_and_path",
     "chunk_flush_at_16kib",
@@ -160,6 +161,7 @@ pub async fn run_case<H: CaseHarness, S: WriteStore>(name: &str, harness: &H, st
         }
         "done_precedes_next_follow_up" => done_precedes_next_follow_up(harness, store).await,
         "usage_deltas_sum_to_step_usage" => usage_deltas_sum_to_step_usage(harness, store).await,
+        "quota_blob_latches_agent_box" => quota_blob_latches_agent_box(harness, store).await,
         "unknown_update_lands_in_other" => unknown_update_lands_in_other(harness, store).await,
         "edit_proposal_deduped_per_call_and_path" => {
             edit_proposal_deduped_per_call_and_path(harness, store).await;
@@ -438,6 +440,15 @@ struct UsageCall {
     prompt_digest: Option<String>,
 }
 
+/// One `set_agent_box_quota` call a recorder made (plan D66-D68).
+#[derive(Debug, Clone, PartialEq)]
+struct QuotaCall {
+    agent_id: AgentId,
+    box_id: BoxId,
+    quota: Value,
+    quota_at: DateTime<Utc>,
+}
+
 /// A [`WriteStore`] that delegates to the case's store and remembers its `set_step_usage` calls.
 ///
 /// `run_step.usage` and `run_step.prompt_digest` are returned by **no** [`ReadStore`] method -
@@ -446,9 +457,14 @@ struct UsageCall {
 /// plan D15(a) defers to milestone 9, so this suite uses the device T4's `tests/recorder.rs`
 /// already uses: wrap the store and watch the write. Generic over `S`, so a milestone 3 binding
 /// over `PgStore` gets the same case for free.
+///
+/// `agent_box.quota` is the second such column, and for the same reason: the store suite is
+/// generic over [`WriteStore`] and has no `agent_box` read at all, so the latch of plan D66-D68 is
+/// observed where it is made.
 struct UsageSpy<'a, S: WriteStore> {
     inner: &'a S,
     calls: Mutex<Vec<UsageCall>>,
+    quota_calls: Mutex<Vec<QuotaCall>>,
 }
 
 impl<'a, S: WriteStore> UsageSpy<'a, S> {
@@ -456,12 +472,21 @@ impl<'a, S: WriteStore> UsageSpy<'a, S> {
         Self {
             inner,
             calls: Mutex::new(Vec::new()),
+            quota_calls: Mutex::new(Vec::new()),
         }
     }
 
     /// Every `set_step_usage` call so far, in order.
     fn calls(&self) -> Vec<UsageCall> {
         self.calls
+            .lock()
+            .expect("the spy log is never poisoned")
+            .clone()
+    }
+
+    /// Every `set_agent_box_quota` call so far, in order.
+    fn quota_calls(&self) -> Vec<QuotaCall> {
+        self.quota_calls
             .lock()
             .expect("the spy log is never poisoned")
             .clone()
@@ -543,9 +568,20 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         quota: Value,
         quota_at: DateTime<Utc>,
     ) -> StoreResult<()> {
+        // The write first, the log after: the `set_step_usage` rule above, for the same reason.
         self.inner
-            .set_agent_box_quota(agent_id, box_id, quota, quota_at)
-            .await
+            .set_agent_box_quota(agent_id, box_id, quota.clone(), quota_at)
+            .await?;
+        self.quota_calls
+            .lock()
+            .expect("the spy log is never poisoned")
+            .push(QuotaCall {
+                agent_id,
+                box_id,
+                quota,
+                quota_at,
+            });
+        Ok(())
     }
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> StoreResult<()> {
         self.inner.start_chat_run(chat).await
@@ -1181,6 +1217,256 @@ async fn usage_deltas_sum_to_step_usage<H: CaseHarness, S: WriteStore>(harness: 
         "usage_deltas_sum_to_step_usage: the prompt payload digest equals run_step.prompt_digest \
          (criterion 3)"
     );
+}
+
+/// The vendor rate-limit value of `crates/htui-agent/tests/fixtures/claude_acp_turn.jsonl` line 5,
+/// verbatim: the one real blob milestone 7 was designed against.
+///
+/// A **payload** value and not a wire shape. `UsageEvent.quota` carries whatever a transport's own
+/// vendor-extension slot held, and where that slot is belongs to the binding — over ACP it is
+/// `_meta` of the `usage_update`, which `crate::acp::map` names once. This suite therefore names
+/// no key, which is what keeps the case transport-neutral (criterion 1).
+fn rate_limit_blob() -> Value {
+    json!({
+        "status": "allowed",
+        "resetsAt": 1_788_801_600_i64,
+        "rateLimitType": "five_hour",
+        "overageStatus": "rejected",
+        "overageDisabledReason": "org_level_disabled",
+        "isUsingOverage": false,
+        "unifiedWindows": {
+            "five_hour": { "utilization": 0.11, "resetsAt": 1_788_801_600_i64 },
+            "seven_day": { "utilization": 0.62, "resetsAt": 1_788_854_400_i64 },
+        },
+    })
+}
+
+/// A `usage` row's vendor rate-limit blob becomes `agent_box.quota`: the passive latch of
+/// `docs/ANA-4.md` §7 (`:1110-1135`, plan D66-D68), one write per row that has something to say.
+///
+/// **This case reads a column its siblings cannot**, like `usage_deltas_sum_to_step_usage` above:
+/// the store suite is generic over [`WriteStore`] and has no `agent_box` read, so the latch is
+/// observed as the [`UsageSpy`] saw it made. `crates/htui/tests/chat_usage_pg.rs` is where it is
+/// read back out of a real `agent_box` row.
+///
+/// Two scripts, because §7 has two shapes and the *row* decides which:
+///
+/// - a source that reports an allowance publishes status, windows and spend — and says nothing at
+///   all until its first blob arrives, since a turn's first report carries none and an empty
+///   window list would erase the standing document (blueprint H-3);
+/// - a source that reports none publishes spend alone, on every costed row, which is the seeded
+///   live-ACP row's shape (plan D65).
+///
+/// Both are selected by `agent.settings.quota.source`, which the latch carries. Nothing here
+/// reads an agent's name (`R-AGT-5`), and the blob is a payload value both transports move
+/// unchanged.
+async fn quota_blob_latches_agent_box<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+    // The row the latch writes into. `quota` is NULL on a fresh row and is the narrow setter's
+    // alone (plan D74), so there is nothing to plant: what this case pins is that the latch puts
+    // §7's document where there was none.
+    let probe = json!({ "status": "ready", "source": "probe" });
+    store
+        .upsert_agent_box(&AgentBox {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id: ids::BOX,
+            enabled: true,
+            version: Some("1.2.3".to_owned()),
+            path: Some("agent".to_owned()),
+            probed_at: Some(epoch()),
+            quota: None,
+            quota_at: None,
+            updated_at: epoch(),
+            probe: Some(probe),
+        })
+        .await
+        .expect("quota_blob_latches_agent_box: the probed row must land");
+
+    // The same three reports `usage_deltas_sum_to_step_usage` uses — deltas 100, 250, 1, so the
+    // session spend runs 100, 350, 351 — with a vendor blob on whichever row the script says.
+    let usage = |used: i64, cost: i64, quota: Option<Value>| {
+        ScriptEvent::Emit(DriverEvent::Usage(UsageEvent {
+            cost_micros: Some(cost),
+            context_used: Some(used),
+            context_size: Some(200_000),
+            quota,
+            ..UsageEvent::default()
+        }))
+    };
+    let scrubber = scrubber();
+
+    // --- Script A: the blob arrives on the second report ---------------------------------------
+    let script = Script::one_turn(vec![
+        usage(1_000, 100, None),
+        usage(2_000, 250, Some(rate_limit_blob())),
+        usage(2_100, 1, None),
+        done(StopReason::EndTurn),
+    ]);
+    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let spy = UsageSpy::new(store);
+    let mut recorder =
+        Recorder::new(&spy, &scrubber, chat.step_id, false, None).with_quota_latch(QuotaLatch {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id: ids::BOX,
+            source: QuotaSource::AcpMetaRateLimit,
+            billing: Billing::Subscription,
+        });
+    recorder
+        .record_prompt(PROMPT, prompt_sections(), epoch())
+        .await
+        .expect("quota_blob_latches_agent_box: the prompt row must land");
+    pump(session.as_mut(), &mut recorder)
+        .await
+        .expect("quota_blob_latches_agent_box: the turn must reach done");
+    recorder
+        .finish()
+        .await
+        .expect("quota_blob_latches_agent_box: the recorder must close cleanly");
+
+    let log = rows(store, chat.step_id).await;
+    let reports: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::Usage)
+        .collect();
+    assert_eq!(
+        reports.len(),
+        3,
+        "quota_blob_latches_agent_box: each usage report is its own row"
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .map(|row| row.payload.get("quota"))
+            .collect::<Vec<_>>(),
+        vec![None, Some(&rate_limit_blob()), None],
+        "quota_blob_latches_agent_box: the persisted row carries the blob exactly as the report \
+         did — verbatim where there was one, absent where there was not (plan D66)"
+    );
+
+    let calls = spy.quota_calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "quota_blob_latches_agent_box: the first report has no allowance to publish and its spend \
+         alone would empty the column, so only the two rows after it latch (blueprint H-3), got \
+         {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.agent_id == ids::AGENT_CLAUDE && call.box_id == ids::BOX),
+        "quota_blob_latches_agent_box: every latch names the row the chat runs on"
+    );
+    assert_eq!(
+        calls[0].quota,
+        normalize(
+            QuotaSource::AcpMetaRateLimit,
+            Billing::Subscription,
+            Some(&rate_limit_blob()),
+            Some(350),
+            reports[1].at,
+        )
+        .to_value(),
+        "quota_blob_latches_agent_box: the blob's own row publishes it with the spend so far"
+    );
+    assert_eq!(
+        calls[1].quota,
+        normalize(
+            QuotaSource::AcpMetaRateLimit,
+            Billing::Subscription,
+            Some(&rate_limit_blob()),
+            Some(351),
+            reports[2].at,
+        )
+        .to_value(),
+        "quota_blob_latches_agent_box: and the report after it refreshes the spend while the \
+         windows stand"
+    );
+    assert_eq!(
+        calls[1].quota_at, reports[2].at,
+        "quota_blob_latches_agent_box: `quota_at` is the capture time of the row that produced \
+         the document, which its `observed_at` mirrors (§7)"
+    );
+    let document = Quota::from_value(&calls[1].quota)
+        .expect("quota_blob_latches_agent_box: the latched document parses back");
+    assert_eq!(
+        document
+            .windows
+            .iter()
+            .map(|window| window.id.as_str())
+            .collect::<Vec<_>>(),
+        ["five_hour", "seven_day"],
+        "quota_blob_latches_agent_box: both windows, sorted by id"
+    );
+    assert_eq!(document.status.as_deref(), Some("allowed"));
+    assert!(!document.exhausted);
+    assert_eq!(document.spend.session_micros, Some(351));
+
+    // --- Script B: a source that reports no allowance, so spend is the whole document ----------
+    let script = Script::one_turn(vec![
+        usage(1_000, 100, None),
+        usage(2_000, 250, None),
+        usage(2_100, 1, None),
+        done(StopReason::EndTurn),
+    ]);
+    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let spy = UsageSpy::new(store);
+    let mut recorder =
+        Recorder::new(&spy, &scrubber, chat.step_id, false, None).with_quota_latch(QuotaLatch {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id: ids::BOX,
+            source: QuotaSource::None,
+            billing: Billing::PerToken,
+        });
+    recorder
+        .record_prompt(PROMPT, prompt_sections(), epoch())
+        .await
+        .expect("quota_blob_latches_agent_box: the prompt row must land");
+    pump(session.as_mut(), &mut recorder)
+        .await
+        .expect("quota_blob_latches_agent_box: the turn must reach done");
+    recorder
+        .finish()
+        .await
+        .expect("quota_blob_latches_agent_box: the recorder must close cleanly");
+
+    let log = rows(store, chat.step_id).await;
+    let reports: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::Usage)
+        .collect();
+    assert!(
+        reports.iter().all(|row| row.payload.get("quota").is_none()),
+        "quota_blob_latches_agent_box: a report that carried no blob persists none"
+    );
+    let calls = spy.quota_calls();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.quota.clone())
+            .collect::<Vec<_>>(),
+        (0..3)
+            .map(|index| normalize(
+                QuotaSource::None,
+                Billing::PerToken,
+                None,
+                Some([100, 350, 351][index]),
+                reports[index].at,
+            )
+            .to_value())
+            .collect::<Vec<_>>(),
+        "quota_blob_latches_agent_box: a source that reports no allowance latches every costed \
+         row, and each document is spend plus the two row-side facts"
+    );
+    for call in &calls {
+        let document = Quota::from_value(&call.quota)
+            .expect("quota_blob_latches_agent_box: the latched document parses back");
+        assert_eq!(document.source, QuotaSource::None);
+        assert_eq!(document.billing, Billing::PerToken);
+        assert_eq!(document.status, None, "no status is reported");
+        assert!(document.windows.is_empty(), "and no windows");
+        assert!(!document.exhausted);
+        assert_eq!(document.spend.currency.as_deref(), Some("USD"));
+    }
 }
 
 /// A protocol update this event model does not map lands as kind `other` with its body verbatim,
