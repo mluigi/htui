@@ -757,10 +757,10 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// is while a run is in flight. That is what `R-AGT-7`'s "refreshed per run" asks for, and it
     /// costs nothing beyond the rows the session was writing anyway.
     ///
-    /// **Nothing to say** is the rule blueprint H-3 turns on: no blob seen this session *and* no
-    /// USD spend means no write at all, so a turn whose first report carries neither leaves the
-    /// standing document alone instead of replacing it with an empty one. Once a blob has been
-    /// seen it is remembered (`last_quota_raw`), so a later bare report refreshes the spend and
+    /// **Nothing to say** is the rule blueprint H-3 turns on, and [`Recorder::nothing_to_say`] is
+    /// where it is stated: a row that has learned nothing worth publishing leaves the standing
+    /// document alone instead of replacing it with an emptier one. Once a blob has been seen it is
+    /// remembered (`last_quota_raw`), so a later report with no `_meta` refreshes the spend and
     /// keeps the windows.
     ///
     /// **Best-effort** is plan D68: a failed allowance write is logged and dropped. `R-HIS-1`'s
@@ -789,7 +789,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         if let Some(raw) = payload.get("quota").filter(|raw| raw.is_object()) {
             self.last_quota_raw = Some(raw.clone());
         }
-        if self.last_quota_raw.is_none() && self.usage.cost_micros.is_none() {
+        if self.nothing_to_say(latch.source) {
             return;
         }
         let quota = normalize(
@@ -822,6 +822,30 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             Err(err) => {
                 tracing::warn!(%err, "the quota latch failed; the turn continues (plan D68)");
             }
+        }
+    }
+
+    /// Whether this session has learned nothing worth publishing yet — the rule that makes
+    /// blueprint H-3 impossible rather than merely unlikely.
+    ///
+    /// A row whose declared source **reports an allowance** has said nothing until that source's
+    /// first blob arrives, whatever it has spent. A turn's first `usage_update` carries no `_meta`
+    /// (`tests/acp_map.rs`), so a latch that fired on it would publish `windows: []` over the
+    /// windows the column already holds — the empty document erasing the last session's, which is
+    /// the failure H-3 names. A spend figure is not worth that: it is on the `usage` rows either
+    /// way, and the next report of this turn carries the blob.
+    ///
+    /// A row whose source **reports nothing** ([`QuotaSource::None`] — the seeded live-ACP row,
+    /// and every transport milestone 8 has yet to teach) has no allowance to wait for, so its
+    /// spend is the whole document: something to say once anything has been spent, and nothing
+    /// before that. That is why such a row's quota column reads `—` until it costs something
+    /// (plan D65) rather than reading a document full of nulls.
+    const fn nothing_to_say(&self, source: QuotaSource) -> bool {
+        match source {
+            QuotaSource::None => self.usage.cost_micros.is_none(),
+            QuotaSource::AcpMetaRateLimit
+            | QuotaSource::CliRateLimitEvent
+            | QuotaSource::CliStatusLine => self.last_quota_raw.is_none(),
         }
     }
 

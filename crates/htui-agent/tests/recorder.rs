@@ -920,8 +920,9 @@ fn probe_snapshot() -> Value {
 /// reports throughout.
 fn usage(cost: Option<i64>, quota: Option<Value>) -> DriverEnvelope {
     env(DriverEvent::Usage(UsageEvent {
+        // The delta, which is the key the recorder sums; the cumulative one is the mapper's and no
+        // reader on this path looks at it (`UsageTotals::add_payload` reads five fixed names).
         cost_micros: cost,
-        cost_micros_total: cost,
         context_used: Some(22_913),
         context_size: Some(1_000_000),
         quota,
@@ -1050,13 +1051,16 @@ async fn a_usage_row_carrying_a_blob_latches_the_seven_key_document() {
     );
 }
 
-/// Blueprint H-3: a turn's **first** `usage` report carries no `_meta` and often no cost either,
-/// and a latch that fired on every row would overwrite last session's windows with an empty
-/// document at the top of every turn.
+/// Blueprint H-3: a turn's **first** `usage` report carries no `_meta`, so a latch that fired on
+/// every row would overwrite last session's windows with an empty document at the top of every
+/// turn.
 ///
-/// So the latch has nothing to say until the session has seen a blob or a spend figure, and once
-/// it has seen a blob it keeps it: a later bare row refreshes the spend and leaves the windows
-/// standing.
+/// A costed first report is the sharp half of that, and the reason the rule is not "write once
+/// anything is known": row 2 below *has* a spend figure and still says nothing, because a row
+/// whose source reports an allowance has not reported one yet, and publishing `windows: []`
+/// alongside a spend would erase what the column holds to add a number the `usage` rows already
+/// carry. Once a blob has arrived it is remembered: the last row has no `_meta` of its own and
+/// refreshes the spend with the windows left standing.
 #[tokio::test]
 async fn a_bare_first_row_latches_nothing_and_a_later_one_keeps_the_last_blob() {
     let chat = chat_spec();
@@ -1081,12 +1085,23 @@ async fn a_bare_first_row_latches_nothing_and_a_later_one_keeps_the_last_blob() 
         "and the column is untouched, not emptied"
     );
 
+    // Costed, still no `_meta`: a spend figure is not worth an empty window list.
     recorder
-        .record(usage(Some(100), Some(quota_blob())))
+        .record(usage(Some(100), None))
+        .await
+        .expect("recording must land");
+    assert!(
+        store.quota_calls().is_empty(),
+        "a source that reports an allowance has said nothing until its first blob, whatever the \
+         row spent (H-3)"
+    );
+
+    recorder
+        .record(usage(Some(250), Some(quota_blob())))
         .await
         .expect("recording must land");
     recorder
-        .record(usage(Some(251), None))
+        .record(usage(Some(1), None))
         .await
         .expect("recording must land");
     recorder.finish().await.expect("close");
@@ -1099,10 +1114,11 @@ async fn a_bare_first_row_latches_nothing_and_a_later_one_keeps_the_last_blob() 
             QuotaSource::AcpMetaRateLimit,
             Billing::Subscription,
             Some(&quota_blob()),
-            Some(100),
+            Some(350),
             at()
         )
-        .to_value()
+        .to_value(),
+        "the blob's row publishes the spend the two rows before it accumulated"
     );
     assert_eq!(
         calls[1].quota,
@@ -1114,7 +1130,7 @@ async fn a_bare_first_row_latches_nothing_and_a_later_one_keeps_the_last_blob() 
             at()
         )
         .to_value(),
-        "the bare row refreshed the spend and kept the last blob's windows"
+        "and the `_meta`-less row after it refreshed the spend and kept the windows"
     );
     let stored = Quota::from_value(&calls[1].quota).expect("the document parses");
     assert_eq!(stored.windows.len(), 2, "the windows are still there");
