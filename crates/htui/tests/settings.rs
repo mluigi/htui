@@ -41,12 +41,23 @@ async fn demo_scope() -> Scope {
     Scope::from_workspace(workspaces.first().expect("the fixture has a workspace"))
 }
 
-/// Draws one section into a 100x30 buffer, the size the whole snapshot suite is pinned to.
-fn draw_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> Buffer {
+/// How wide this file draws a section: 100 columns, unbordered, the size the whole snapshot suite
+/// is pinned to.
+const SECTION_WIDE: u16 = 100;
+
+/// How wide the *running app* draws it: the Settings pane's border costs two columns of the same
+/// 100 (hazard H-12), and 98 is the width D76's ranking was decided at. The one case that has to be
+/// asserted here rather than at 100 is [`the_on_box_column_holds_the_whole_unauthenticated_verdict`]
+/// — the eighth column is the `Min` one, so it is the only column whose width differs between the
+/// two, and a verdict that fitted at 100 and clipped at 98 would be a pass over a broken screen.
+const SECTION_BORDERED: u16 = 98;
+
+/// Draws one section into a `width`x30 buffer.
+fn draw_section_at(section: &dyn SettingsSection, ctx: &Ctx<'_>, width: u16) -> Buffer {
     let mut terminal = Terminal::with_options(
-        TestBackend::new(100, 30),
+        TestBackend::new(width, 30),
         TerminalOptions {
-            viewport: Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            viewport: Viewport::Fixed(Rect::new(0, 0, width, 30)),
         },
     )
     .expect("a test terminal");
@@ -56,10 +67,14 @@ fn draw_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> Buffer {
     terminal.backend().buffer().clone()
 }
 
-/// Renders one section into a 100x30 buffer and returns it as text, the way `Harness::render`
-/// does for a whole frame.
-fn render_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> String {
-    let buffer = draw_section(section, ctx);
+/// Draws one section into a [`SECTION_WIDE`]x30 buffer, the size the whole snapshot suite is
+/// pinned to.
+fn draw_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> Buffer {
+    draw_section_at(section, ctx, SECTION_WIDE)
+}
+
+/// One drawn buffer as text, the way `Harness::render` returns a whole frame.
+fn text_of(buffer: &Buffer) -> String {
     (0..buffer.area.height)
         .map(|y| {
             (0..buffer.area.width)
@@ -70,6 +85,16 @@ fn render_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Renders one section into a [`SECTION_WIDE`]x30 buffer and returns it as text.
+fn render_section(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> String {
+    text_of(&draw_section(section, ctx))
+}
+
+/// Renders one section at a width of its own, for the case whose subject *is* the width.
+fn render_section_at(section: &dyn SettingsSection, ctx: &Ctx<'_>, width: u16) -> String {
+    text_of(&draw_section_at(section, ctx, width))
 }
 
 /// The lines a section drew in the theme's accent colour.
@@ -363,12 +388,11 @@ async fn the_status_column_renders_each_probe_outcome() {
         ("broke", "failed"),
         ("legacy", "9.9.9"),
     ] {
-        let line = rendered
-            .lines()
-            .find(|line| line.starts_with(row))
-            .unwrap_or_else(|| panic!("the `{row}` row is rendered:\n{rendered}"));
-        // Through [`as_drawn`] since D76: `unauthenticated` is 15 characters and the eighth column
-        // draws 13 of them here, which is the slack that column gave up for the whole model id.
+        let line = row_line(&rendered, row);
+        // Still through [`as_drawn`] after D76's third donor took the eighth column back to 15 at
+        // the bordered 98 (17 at this render): every verdict here now fits whole, but the install
+        // progress cells are longer than any width this section can hand out, so the helper stays
+        // on the path that expectation is compared through.
         assert!(
             line.ends_with(&as_drawn(expected)),
             "the `on this box` column of `{row}` reads `{expected}`: {line}"
@@ -378,26 +402,34 @@ async fn the_status_column_renders_each_probe_outcome() {
     insta::assert_snapshot!("agents_probed", rendered);
 }
 
-/// Where the `default` column starts in a rendered row: `name`'s 12, `transport`'s 9, `billing`'s
-/// 12 and `models`' 6, plus one space of `column_spacing` after each. None of the four moved with
-/// D76.
-const DEFAULT_AT: usize = 43;
+/// How wide the `name` column draws since D76's third donor: 8, the width every registry name in
+/// the tree fits in (`claude`, `agy`, `kappa`, `amp-acp`) and twice its own header.
+///
+/// The 4 characters it gave up are what took `on this box` back to the 15 `unauthenticated` needs.
+/// It is the one column here whose *fixture* names are longer than its content ever is in the
+/// registry — `needs-auth`, `spend-only`, `unparsable` and `loginable` are made-up row names — so
+/// [`row_line`] finds a row by the name **as drawn** rather than by the name as written.
+const NAME_WIDTH: usize = 8;
+
+/// Where the `default` column starts in a rendered row: `name`'s 8, `transport`'s 9, `billing`'s
+/// 12 and `models`' 6, plus one space of `column_spacing` after each.
+const DEFAULT_AT: usize = 39;
 
 /// How wide the `default` column is since D76: exactly `gemini-3.7-flash-high`, the longest id the
 /// seeds carry.
 const DEFAULT_WIDTH: usize = 21;
 
-/// Where the `quota` column starts in a rendered row: the six fixed columns before it — 12, 9, 12,
+/// Where the `quota` column starts in a rendered row: the six fixed columns before it — 8, 9, 12,
 /// 6, 21, 7 — plus one space of `column_spacing` after each.
-const QUOTA_AT: usize = 73;
+const QUOTA_AT: usize = 69;
 
 /// Where `on this box` starts: [`QUOTA_AT`] plus the quota column's own 13 (D76) and its space.
-const ON_BOX_AT: usize = 87;
+const ON_BOX_AT: usize = 83;
 
-/// How wide `on this box` draws at [`render_section`]'s 100 columns: whatever the seven fixed
-/// columns and their spacing leave it, which is what "the `Min` column absorbs what is left"
-/// amounts to since D76.
-const ON_BOX_WIDE: usize = 100 - ON_BOX_AT;
+/// How wide `on this box` draws at [`render_section`]'s [`SECTION_WIDE`] columns: whatever the
+/// seven fixed columns and their spacing leave it, which is what "the `Min` column absorbs what is
+/// left" amounts to. 17 here and 15 at [`SECTION_BORDERED`], and `unauthenticated` fits both.
+const ON_BOX_WIDE: usize = SECTION_WIDE as usize - ON_BOX_AT;
 
 /// The eight headers, in order.
 ///
@@ -467,11 +499,17 @@ fn default_cell(rendered: &str, name: &str) -> String {
         .to_owned()
 }
 
-/// The rendered line one row drew, by the name in its first column.
+/// The rendered line one row drew, by the name in its first column **as the column drew it**.
+///
+/// Clipped to [`NAME_WIDTH`] because four of this file's made-up row names are longer than that
+/// (`needs-auth`, `spend-only`, `unparsable`, `loginable`) and no registry name is. A case keeps
+/// naming its row the way it registered it; this is where the difference between the two is
+/// absorbed, once, instead of in every call site.
 fn row_line<'a>(rendered: &'a str, name: &str) -> &'a str {
+    let drawn = name.chars().take(NAME_WIDTH).collect::<String>();
     rendered
         .lines()
-        .find(|line| line.starts_with(name))
+        .find(|line| line.starts_with(&drawn))
         .unwrap_or_else(|| panic!("the `{name}` row is rendered:\n{rendered}"))
 }
 
@@ -508,6 +546,46 @@ async fn the_default_column_holds_the_whole_model_id() {
             "the `{label}` header is drawn whole: {header}"
         );
     }
+}
+
+/// D76's other half, and the one the third donor was needed for: the `on this box` column holds
+/// `unauthenticated` **whole**, at the [`SECTION_BORDERED`] width the running app draws in.
+///
+/// `unauthenticated` is 15 characters and it is the verdict MOD-21's whole login flow starts from —
+/// `a` is offered on a row that says it, and `unauthentic` is not a shorter way of saying it but an
+/// unreadable one. Paying for the model id out of this column's slack alone left it 11 at 98, so
+/// `name` gave the missing 4: its own content never uses them (every registry name fits in 8), and
+/// it is the only one of the seven columns of which that is true.
+///
+/// Asserted on the **same row and the same render** as the model id, because the two claims are the
+/// two ends of one trade: a fix for either that took width back off the other would pass one of
+/// these and fail the other, and this case is where that shows up as a test rather than as a
+/// screen.
+#[tokio::test]
+async fn the_on_box_column_holds_the_whole_unauthenticated_verdict() {
+    let bench = Bench::new().await;
+    let mut row = probed_row(
+        "seeded",
+        true,
+        Some("1.1.26"),
+        Some(json!({ "status": "unauthenticated", "source": "probe" })),
+    );
+    row.agent.default_model = Some(SEEDED_MODEL.to_owned());
+
+    let mut section = AgentsSection::new();
+    bench.reply(&mut section, &StoreReply::Agents(vec![row]));
+    let rendered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
+
+    assert_eq!(
+        on_box_cell(&rendered, "seeded"),
+        "unauthenticated",
+        "the `on this box` column renders the probe's verdict whole:\n{rendered}"
+    );
+    assert_eq!(
+        default_cell(&rendered, "seeded"),
+        SEEDED_MODEL,
+        "and it did not cost the model id a character:\n{rendered}"
+    );
 }
 
 /// The `quota` column, one row per shape plan D73 names (`R-TUI-8`, `docs/ANA-4.md` §7).
@@ -778,14 +856,16 @@ fn on_box_cell(rendered: &str, name: &str) -> String {
 
 /// One `on this box` expectation as the eighth column can actually draw it.
 ///
-/// D76 spent that column's slack on the whole model id, so the cell is [`ON_BOX_WIDE`] characters
-/// at this render and five of the words this section can put in it are longer than that:
-/// `unauthenticated`, `choose a method`, `downloading 42%`, `unpacking 100%` and
-/// `downloading 12.0 MB`. The expectations stay written **whole**, because they are what the
-/// section computed and a test with `downloading 1` inlined in it would read as a bug rather than
-/// as a packing decision; this clips them the way the frame does. What a cell holds past column
-/// [`ON_BOX_WIDE`] is no longer observable through a render, which is the third and lowest of
-/// D76's three priorities being paid.
+/// D76 spent that column's slack on the whole model id and then bought 4 of it back from `name`,
+/// so the cell is [`ON_BOX_WIDE`] characters at this render and 15 at the bordered 98. Every
+/// *verdict* fits both — `unauthenticated` and `choose a method` are 15 exactly, and
+/// [`the_on_box_column_holds_the_whole_unauthenticated_verdict`] is what pins that. What is left
+/// over the line is the install progress cells (`downloading 12.0 MB` is 19), which exceeded the
+/// 17 this column drew before D76 as well: no width was ever spent on them and none is now.
+///
+/// So the expectations stay written **whole**, because they are what the section computed and a
+/// test with `downloading 1` inlined in it would read as a bug rather than as a packing decision;
+/// this clips them the way the frame does.
 fn as_drawn(expected: &str) -> String {
     expected
         .chars()

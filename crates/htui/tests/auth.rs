@@ -34,10 +34,16 @@ use serde_json::{Value, json};
 /// before `a`: the cursor is what `a` acts on.
 const ROW: &str = "demo-login";
 
-/// Where `on this box` starts in a rendered row: the seven columns before it — 12, 9, 12, 6,
-/// MOD-2 D76's `default` 21, 7 and D73's `quota` 13 — plus one space of `column_spacing` after
-/// each.
-const ON_BOX_AT: usize = 87;
+/// Where `on this box` starts in a rendered row: the seven columns before it — MOD-2 D76's `name`
+/// 8, 9, 12, 6, D76's `default` 21, 7 and D73's `quota` 13 — plus one space of `column_spacing`
+/// after each. That leaves the eighth column 15 inside the pane's border, which is exactly what
+/// `unauthenticated` needs, and the 4 characters it needed came from `name`.
+const ON_BOX_AT: usize = 83;
+
+/// How wide the `name` column draws (D76). [`ROW`] is 10 characters, so the first cell of this
+/// file's row reads `demo-log`: a made-up fixture name longer than any name the registry carries,
+/// and the only thing in the suite that column's donation clips.
+const NAME_WIDTH: usize = 8;
 
 /// The one method the fixture advertises. A made-up id: the chooser is fed by the agent's own live
 /// `initialize`, so a case only ever needs *an* id.
@@ -306,19 +312,28 @@ impl Rig {
         .await;
     }
 
+    /// The login row's line, unbordered, found by the name **as the `name` column drew it**.
+    ///
+    /// Clipped to [`NAME_WIDTH`]: [`ROW`] is this file's own made-up name and is longer than any
+    /// the registry carries, so it is the one place D76's donation is visible.
+    fn row_line(&mut self) -> String {
+        let frame = self.harness.render();
+        let drawn = ROW.chars().take(NAME_WIDTH).collect::<String>();
+        frame
+            .lines()
+            .find(|line| line.trim_start_matches('\u{2502}').starts_with(&drawn))
+            .unwrap_or_else(|| panic!("the `{ROW}` row is rendered:\n{frame}"))
+            .trim_matches('\u{2502}')
+            .to_owned()
+    }
+
     /// The `on this box` cell of the login row, which is the last column of its line.
     ///
     /// By character offset since MOD-2 D73's `quota` column landed in front of it: that cell holds
     /// spaces of its own (`62% to 09-08 08:00`), so the columns after it can no longer be counted
     /// in words.
     fn on_box_cell(&mut self) -> String {
-        let frame = self.harness.render();
-        let line = frame
-            .lines()
-            .find(|line| line.trim_start_matches('\u{2502}').starts_with(ROW))
-            .unwrap_or_else(|| panic!("the `{ROW}` row is rendered:\n{frame}"))
-            .to_owned();
-        line.trim_matches('\u{2502}')
+        self.row_line()
             .chars()
             .skip(ON_BOX_AT)
             .collect::<String>()
@@ -328,13 +343,7 @@ impl Rig {
 
     /// The first six columns of the login row, which is the registry's own half of the table.
     fn agent_columns(&mut self) -> String {
-        let frame = self.harness.render();
-        let line = frame
-            .lines()
-            .find(|line| line.trim_start_matches('\u{2502}').starts_with(ROW))
-            .unwrap_or_else(|| panic!("the `{ROW}` row is rendered:\n{frame}"))
-            .to_owned();
-        line.trim_matches('\u{2502}')
+        self.row_line()
             .split_whitespace()
             .take(6)
             .collect::<Vec<_>>()

@@ -393,10 +393,12 @@ impl Rig {
     }
 }
 
-/// Where `on this box` starts in a rendered row: the seven columns before it — 12, 9, 12, 6,
-/// MOD-2 D76's `default` 21, 7 and D73's `quota` 13 — plus one space of `column_spacing` after
-/// each.
-const ON_BOX_AT: usize = 87;
+/// Where `on this box` starts in a rendered row: the seven columns before it — MOD-2 D76's `name`
+/// 8, 9, 12, 6, D76's `default` 21, 7 and D73's `quota` 13 — plus one space of `column_spacing`
+/// after each. The eighth column therefore draws 15 inside the pane's border, and this file's
+/// progress cells are the ones that still do not fit it: `downloading 12.0 MB` is 19, and it
+/// exceeded the 17 the column drew before D76 as well.
+const ON_BOX_AT: usize = 83;
 
 /// The `on this box` cell of the installable row.
 ///

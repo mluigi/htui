@@ -1017,31 +1017,46 @@ impl AgentsSection {
         //
         // So `default` is 21 — `gemini-3.7-flash-high`, the longest id the seeds carry — because
         // that id is the coordinate `docs/ANA-4.md` §4.4 selects a model by, and `gemini-3.` under
-        // the old `Length(9)` named nothing at all. Its 12 extra columns came from the two ranked
-        // below it and from nowhere else:
+        // the old `Length(9)` named nothing at all. The 12 characters it needed were bought as
+        // follows, and the last of the three donors was found only after the first two had left
+        // `on this box` too narrow for its own longest verdict:
         //
-        // - `on this box` gave 6, the whole of the slack between the 17 it used to absorb at 98 and
-        //   the 11 its own header needs. It is still the one `Min` column and still the last, so a
-        //   wider terminal hands it every character back first; at 98 it is exactly its header, and
-        //   a cell longer than that — `unauthenticated`, `downloading 12.0 MB` — is clipped. That
-        //   is the cost D76 accepted, and it is third in the order because a clipped status word is
-        //   still the status word while a clipped id is a different model.
         // - `quota` gave 6, which is exactly the reset's ` %H:%M` (19 → 13): `62% to 09-08 08:00`
         //   now reads `62% to 09-08`. [`reset_of`] drops the time by *format* rather than by clip,
         //   so `100% to 09-08` — the exhausted window this column exists to warn about — still
         //   fits whole in 13.
+        // - `on this box` gave 6 of slack, and that was 4 too many. `Min(11)` is its header, but
+        //   its *cells* are longer: `unauthenticated` is 15, and 15 is the width this column has to
+        //   have because that word is MOD-21's whole login flow written into one cell — `a` is
+        //   offered on an `unauthenticated` row, and `unauthentic` is not a shorter way of saying
+        //   so. `choose a method` is 15 for the same reason.
+        // - `name` gave the missing 4 (12 → 8), which is why it is the third donor rather than an
+        //   untouched column. It is the **only** one of the seven whose content is shorter than its
+        //   allowance, so it is the only one that can give width up without giving anything
+        //   observable up: its header is `name` (4) and every registry name in the tree fits in 8 —
+        //   `claude` (6), `agy` (3), `kappa` (5), and `amp-acp` (7), the longest id MOD-20's live
+        //   install proof carries. The other four are each already at their own longest string:
+        //   `transport` (9), `models` (6) and `enabled` (7) at their headers, `billing` (12) at
+        //   `subscription`.
         //
-        // `name` (12), `transport` (9), `billing` (12), `models` (6) and `enabled` (7) gave up
-        // nothing: `transport`, `models` and `enabled` are already at their own headers, `billing`
-        // at `subscription`, and D76 ranked nothing above any of them. The floor under the whole
-        // trade is that **all eight headers stay readable** — that is what stops the next column
-        // from being packed into a puzzle with no bottom, and `Min(11)` is `on this box`'s share of
-        // it. A ninth column (MOD-23's editor, MOD-12's caps section) has to be paid for out of
-        // this same 98, and this is the order to spend it in.
+        // That leaves 8 + 9 + 12 + 6 + 21 + 7 + 13 = 76 fixed, plus 7 single-space gaps of
+        // `column_spacing`, so the `Min` column draws 15 at the bordered 98 and every character a
+        // wider terminal adds still goes to it first.
+        //
+        // What is *still* clipped at 15, and is not new damage: the install progress cells, whose
+        // longest is `downloading 12.0 MB` (19). That one exceeded the old 17 as well, so no width
+        // was ever spent on it; a clipped byte count is a figure that keeps ticking on the next
+        // frame, which is the one thing here that a status word is not.
+        //
+        // The floor under the whole trade is that **all eight headers stay readable**, and above
+        // that floor a column may only donate what its own content does not use. A ninth column
+        // (MOD-23's editor, MOD-12's caps section) has to be paid for out of this same 98, and
+        // there is no slack of the `name` kind left to pay with — so it costs a ranking decision
+        // like D76's, not an adjustment.
         let table = Table::new(
             rows,
             [
-                Constraint::Length(12),
+                Constraint::Length(8),
                 Constraint::Length(9),
                 Constraint::Length(12),
                 Constraint::Length(6),
