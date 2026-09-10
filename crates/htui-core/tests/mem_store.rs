@@ -23,8 +23,8 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        21,
-        "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3) and milestone 7's quota \
-         latch (plan D67)"
+        22,
+        "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3) and milestone 7's two quota \
+         cases (plans D67 and D74)"
     );
 }

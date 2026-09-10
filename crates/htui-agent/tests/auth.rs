@@ -1220,7 +1220,7 @@ done
             stderr_tail: None,
             source: ProbeSource::Probe,
         };
-        agent_box_row(agent, BoxId::new(), None, &snapshot, Utc::now())
+        agent_box_row(agent, BoxId::new(), &snapshot, Utc::now())
     }
 
     /// Fails unless `pid` is gone **or** reaped-pending within [`KILL_WINDOW`]: a killed child

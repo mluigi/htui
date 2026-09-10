@@ -823,6 +823,12 @@ impl State {
 
     /// Insert-or-update on the composite primary key `(agent_id, box_id)`, both referents required
     /// (§5.7).
+    ///
+    /// `quota` and `quota_at` are written by neither branch (MOD-2 plan D74): the insert forces
+    /// them to `None`, which is the two columns the `INSERT` list no longer names, and the update
+    /// puts the stored pair back, which is the `SET quota = EXCLUDED.quota` the statement no longer
+    /// carries. The two backends have to agree here or the conformance case passes on one and
+    /// fails on the other.
     fn upsert_agent_box(&mut self, row: &AgentBox, now: DateTime<Utc>) -> Result<()> {
         if !self.agents.contains_key(&row.agent_id) {
             return Err(StoreError::Constraint(format!(
@@ -838,12 +844,22 @@ impl State {
         }
         match self.agent_boxes.get_mut(&(row.agent_id, row.box_id)) {
             Some(stored) => {
+                // D74: `*stored = row.clone()` is this backend's spelling of
+                // `SET quota = EXCLUDED.quota`, so the stored pair is taken out and put back.
+                let (quota, quota_at) = (stored.quota.clone(), stored.quota_at);
                 *stored = row.clone();
+                stored.quota = quota;
+                stored.quota_at = quota_at;
                 stored.updated_at = now;
             }
             None => {
-                self.agent_boxes
-                    .insert((row.agent_id, row.box_id), row.clone());
+                // The two columns the `INSERT` list does not name.
+                let fresh = AgentBox {
+                    quota: None,
+                    quota_at: None,
+                    ..row.clone()
+                };
+                self.agent_boxes.insert((row.agent_id, row.box_id), fresh);
             }
         }
         Ok(())
@@ -1404,5 +1420,116 @@ mod tests {
             ),
             "a row that has never been probed has no columns to latch into, got {missing:?}"
         );
+    }
+
+    /// MOD-2 plan D74: `upsert_agent_box` can neither set nor clear `quota` / `quota_at`, so a
+    /// re-probe cannot discard a latch that landed after it read the row.
+    ///
+    /// The memory half of the claim `pg_criteria.rs` makes in SQL. Both paths, because both are
+    /// `EXCLUDED.quota` in the statement being changed: an insert carrying a quota stores `None`,
+    /// and a conflict carrying one preserves the stored pair.
+    #[tokio::test]
+    async fn upsert_agent_box_cannot_write_the_quota_columns() {
+        let store = MemStore::demo();
+        let stamp = Utc::now();
+        let probed = AgentBox {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id: ids::BOX,
+            enabled: true,
+            version: Some("1.2.3".to_owned()),
+            path: Some("claude".to_owned()),
+            probed_at: Some(stamp),
+            quota: Some(json!({ "invented": "by the probe" })),
+            quota_at: Some(stamp),
+            updated_at: stamp,
+            probe: Some(json!({ "status": "ready", "source": "probe" })),
+        };
+        store
+            .upsert_agent_box(&probed)
+            .await
+            .expect("the insert lands");
+        let fresh = store
+            .read(|state| {
+                state
+                    .agent_boxes
+                    .get(&(ids::AGENT_CLAUDE, ids::BOX))
+                    .cloned()
+            })
+            .expect("the row is stored");
+        assert_eq!(
+            (fresh.quota.as_ref(), fresh.quota_at),
+            (None, None),
+            "the two columns are not in the INSERT list: a probe has no business seeding an \
+             allowance it never observed"
+        );
+        assert_eq!(
+            fresh.probe.as_ref(),
+            probed.probe.as_ref(),
+            "every other column the upsert does write is written"
+        );
+
+        let latched =
+            json!({ "source": "acp_meta_rate_limit", "spend": { "session_micros": 351 } });
+        let quota_at = Utc::now();
+        store
+            .set_agent_box_quota(ids::AGENT_CLAUDE, ids::BOX, latched.clone(), quota_at)
+            .await
+            .expect("the only writer of the two columns writes them");
+
+        // The conflict path: the re-probe hands back the row it read *before* the latch.
+        store
+            .upsert_agent_box(&AgentBox {
+                version: Some("1.3.0".to_owned()),
+                quota: Some(json!({ "stale": "read before the latch" })),
+                quota_at: None,
+                ..probed.clone()
+            })
+            .await
+            .expect("the update lands");
+        let after = store
+            .read(|state| {
+                state
+                    .agent_boxes
+                    .get(&(ids::AGENT_CLAUDE, ids::BOX))
+                    .cloned()
+            })
+            .expect("the row is stored");
+        assert_eq!(
+            after.quota.as_ref(),
+            Some(&latched),
+            "the stored document is still the latch's; the upsert's is discarded, not the other \
+             way round (D74)"
+        );
+        assert_eq!(after.quota_at, Some(quota_at), "and its timestamp with it");
+        assert_eq!(
+            after.version.as_deref(),
+            Some("1.3.0"),
+            "the columns the upsert *does* own still take the new row's values"
+        );
+
+        // Nor does a `None` clear them, the way a `None` probe clears its own column.
+        store
+            .upsert_agent_box(&AgentBox {
+                quota: None,
+                quota_at: None,
+                ..probed
+            })
+            .await
+            .expect("the second update lands");
+        let cleared = store
+            .read(|state| {
+                state
+                    .agent_boxes
+                    .get(&(ids::AGENT_CLAUDE, ids::BOX))
+                    .cloned()
+            })
+            .expect("the row is stored");
+        assert_eq!(
+            cleared.quota.as_ref(),
+            Some(&latched),
+            "`upsert_agent_box` has no way to clear a latch either: clearing is \
+             `set_agent_box_quota`'s too"
+        );
+        assert_eq!(cleared.quota_at, Some(quota_at));
     }
 }

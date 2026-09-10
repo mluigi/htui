@@ -75,9 +75,16 @@ pub struct AgentBox {
     pub path: Option<String>,
     /// `agent_box.probed_at`.
     pub probed_at: Option<DateTime<Utc>>,
-    /// `agent_box.quota` (`JSONB`) as reported by the agent.
+    /// `agent_box.quota` (`JSONB`): the `docs/ANA-4.md` §7 allowance document, as last observed.
+    ///
+    /// **Single-writer** since MOD-2 milestone 7 (plan D74):
+    /// `WriteStore::set_agent_box_quota` is the only path that writes this column.
+    /// `upsert_agent_box` can neither set nor clear it, so carrying a value here into an upsert is
+    /// accepted and ignored rather than written - the probe reads a row and rewrites it seconds
+    /// later, and a latch that landed in between must survive that.
     pub quota: Option<Value>,
-    /// `agent_box.quota_at`.
+    /// `agent_box.quota_at`: when [`AgentBox::quota`] was observed. Written by the same single
+    /// writer, and by nothing else (plan D74).
     pub quota_at: Option<DateTime<Utc>>,
     /// `agent_box.updated_at`.
     pub updated_at: DateTime<Utc>,

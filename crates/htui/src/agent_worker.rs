@@ -3373,11 +3373,17 @@ pub(crate) mod tests {
         assert!(on_box.probed_at.is_some());
     }
 
-    /// The re-probe hands `probe_agent` the row it found, and that argument is load-bearing:
-    /// `probe::agent_box_row` carries `quota`/`quota_at` over from it (the probe owns neither —
-    /// milestone 7 does), and `probe_agent` reads its `probe.source` for the manual-entry rule.
-    /// Without this case, passing `None` there wipes a box's quota on every stale-row chat start
-    /// and no test notices.
+    /// A re-probe mid-chat leaves the latched quota standing, and since MOD-2 plan D74 it is the
+    /// **store** that guarantees that rather than the probe.
+    ///
+    /// `probe::agent_box_row` projects `quota: None, quota_at: None` and
+    /// `WriteStore::upsert_agent_box` writes neither column, so the row the re-probe hands back
+    /// cannot discard a latch however stale its own copy is. It used to carry both forward, which
+    /// was the lost update D74 removes. `existing` is still load-bearing for the other reason:
+    /// `probe_agent` reads its `probe.source` for the manual-entry rule.
+    ///
+    /// Without this case, a backend that replaced the row wholesale would wipe a box's quota on
+    /// every stale-row chat start and no test would notice.
     #[tokio::test]
     async fn a_stale_row_keeps_the_quota_the_probe_does_not_own() {
         let store = MemStore::demo();
@@ -3387,13 +3393,17 @@ pub(crate) mod tests {
             .await
             .expect("the acp row lands");
         let quota_at = Utc::now() - chrono::TimeDelta::hours(30);
-        let mut stale = probed_row(agent_id, Some(Utc::now() - chrono::TimeDelta::hours(25)));
-        stale.quota = Some(json!({ "remaining": 1 }));
-        stale.quota_at = Some(quota_at);
+        let stale = probed_row(agent_id, Some(Utc::now() - chrono::TimeDelta::hours(25)));
         store
             .upsert_agent_box(&stale)
             .await
             .expect("the stale agent_box lands");
+        // Through the narrow setter, because since D74 that is the only way the two columns are
+        // ever written — an `upsert_agent_box` carrying a `quota` stores `None`.
+        store
+            .set_agent_box_quota(agent_id, stale.box_id, json!({ "remaining": 1 }), quota_at)
+            .await
+            .expect("the latch lands on the stale row");
         let backend = Backend::memory(store.clone());
         let mut runtime =
             AgentRuntime::new(acp_factory(Script::one_turn(vec![ScriptEvent::Emit(
@@ -3423,7 +3433,7 @@ pub(crate) mod tests {
         assert_eq!(
             on_box.quota,
             Some(json!({ "remaining": 1 })),
-            "the probe carries the quota it does not own"
+            "the upsert cannot write the two columns, so the latched value stands (D74)"
         );
         assert_eq!(on_box.quota_at, Some(quota_at), "and its timestamp with it");
         assert_ne!(

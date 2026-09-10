@@ -1349,7 +1349,7 @@ pub async fn probe_agent(
             reason: MANUAL_KEPT,
         };
     }
-    ProbeOutcome::Row(agent_box_row(agent, box_id, existing, &snapshot, ctx.now))
+    ProbeOutcome::Row(agent_box_row(agent, box_id, &snapshot, ctx.now))
 }
 
 /// Steps 1–7 of [`probe_agent`]: everything that decides the snapshot, with no knowledge of what
@@ -1501,13 +1501,22 @@ fn lines(text: &str) -> Vec<String> {
 ///
 /// `version` is the **handshake's** `agent_version` when tier 2 ran, which is what ANA-4 asks for;
 /// with no handshake it falls back to the tool that shares the agent's name (`claude`'s own CLI
-/// version for the `claude` row), and to `None` when neither answered. `quota` and `quota_at` are
-/// carried over from `existing` untouched: the probe owns neither, and MOD-7 writes both.
+/// version for the `claude` row), and to `None` when neither answered.
+///
+/// `quota` and `quota_at` are `None`, and this function takes no stored row to read them from.
+/// The probe owns neither field and, since MOD-2 milestone 7 (plan D74), no longer carries them
+/// forward either: `WriteStore::upsert_agent_box` cannot write those two columns at all, so there
+/// is nothing to carry them *to*. `WriteStore::set_agent_box_quota` is their only writer, and the
+/// values it wrote stay in the row this projection is about to update. Carrying a value into a
+/// statement that discards it is how a latch got lost - the probe read the row at chat start and
+/// wrote it back seconds later, throwing away every latch in between.
+///
+/// **MOD-7 inherits this**: box registration writes quota through `set_agent_box_quota` like
+/// everything else, not through the row.
 #[must_use]
 pub fn agent_box_row(
     agent: &Agent,
     box_id: BoxId,
-    existing: Option<&AgentBox>,
     snapshot: &ProbeSnapshot,
     now: DateTime<Utc>,
 ) -> AgentBox {
@@ -1525,8 +1534,8 @@ pub fn agent_box_row(
             .as_ref()
             .map(|resolved| resolved.command.clone()),
         probed_at: Some(now),
-        quota: existing.and_then(|row| row.quota.clone()),
-        quota_at: existing.and_then(|row| row.quota_at),
+        quota: None,
+        quota_at: None,
         updated_at: now,
         probe: Some(snapshot.to_value()),
     }

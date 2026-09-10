@@ -531,7 +531,7 @@ fn snapshot(source: ProbeSource, status: ProbeStatus, resolved: ResolvedLaunch) 
 
 /// This box's `agent_box` row for `agent`, through the same projection the probe writes.
 fn on_box(agent: &AgentRow, snapshot: &ProbeSnapshot) -> AgentBox {
-    agent_box_row(agent, BoxId::new(), None, snapshot, Utc::now())
+    agent_box_row(agent, BoxId::new(), snapshot, Utc::now())
 }
 
 /// A file that exists and is not an adapter: [`AcpDriver::launch_for`]'s fourth rule is a

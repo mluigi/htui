@@ -113,6 +113,16 @@ pub trait WriteStore: ReadStore {
     /// Inserts or updates one `agent_box` row, keyed by `(agent_id, box_id)` (`docs/ANA-4.md`
     /// §4.1, §5.7).
     ///
+    /// `row.quota` and `row.quota_at` are **not part of what this writes** (MOD-2 plan D74). On
+    /// the insert they land as `None`; on the update the stored pair is left exactly as it stood.
+    /// [`set_agent_box_quota`](WriteStore::set_agent_box_quota) is their only writer, so a probe
+    /// that read a row cannot hand a stale allowance back over a latch that landed after it - the
+    /// lost update D74 removes.
+    ///
+    /// An [`AgentBox`] carrying either field is therefore neither an error nor a write. That is
+    /// the one sharp edge the design keeps, and `store::conformance`'s
+    /// `upsert_agent_box_cannot_write_quota` is what pins it.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the agent or the box

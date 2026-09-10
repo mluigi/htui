@@ -1753,3 +1753,130 @@ async fn set_agent_box_quota_leaves_probe_byte_identical() {
 
     db.drop_db().await;
 }
+
+/// MOD-2 plan D74: `upsert_agent_box` can neither **set** nor **clear** `agent_box.quota` /
+/// `quota_at`. `set_agent_box_quota` is their only writer.
+///
+/// The proof has to be SQL-level, not trait-level: what is being removed is a
+/// `quota = EXCLUDED.quota` line out of an `ON CONFLICT ... DO UPDATE SET` list and a column out
+/// of an `INSERT` list, and no `WriteStore` call can see either. Both paths are read back with a
+/// raw `SELECT`.
+///
+/// The bug this closes is not a race that needs unlucky timing. `probe::agent_box_row` used to
+/// read `quota` off a row fetched at chat start and hand it to a statement whose `SET` list wrote
+/// it back, so every latch that landed in between was discarded - a lost update by construction.
+/// `COALESCE(EXCLUDED.quota, agent_box.quota)` was considered and rejected: it would still let an
+/// upsert *set* the column, and it would make clearing it impossible.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upsert_can_neither_set_nor_clear_the_quota_columns() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    /// `quota`, `quota_at` and the one probe column, straight out of SQL.
+    async fn columns(
+        pool: &PgPool,
+        box_id: htui_core::model::BoxId,
+    ) -> (
+        Option<serde_json::Value>,
+        Option<DateTime<Utc>>,
+        Option<String>,
+    ) {
+        let row = sqlx::query(
+            "SELECT quota, quota_at, version FROM agent_box WHERE agent_id = $1 AND box_id = $2",
+        )
+        .bind(ids::AGENT_CLAUDE.as_uuid())
+        .bind(box_id.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("read the agent_box row");
+        (row.get("quota"), row.get("quota_at"), row.get("version"))
+    }
+
+    let stamp: DateTime<Utc> = "2026-09-10T06:00:00.000123Z"
+        .parse()
+        .expect("a microsecond-precision literal");
+    let probed = AgentBox {
+        agent_id: ids::AGENT_CLAUDE,
+        box_id: db.store.this_box(),
+        enabled: true,
+        version: Some("1.2.3".to_owned()),
+        path: Some("/usr/bin/claude".to_owned()),
+        probed_at: Some(stamp),
+        // The insert path.
+        quota: Some(serde_json::json!({ "invented": "by the probe" })),
+        quota_at: Some(stamp),
+        updated_at: stamp,
+        probe: Some(serde_json::json!({ "status": "ready", "source": "probe" })),
+    };
+    db.store
+        .upsert_agent_box(&probed)
+        .await
+        .expect("an `AgentBox` carrying a quota is accepted, not refused");
+    let (quota, quota_at, _) = columns(&db.pool, db.store.this_box()).await;
+    assert_eq!(
+        (quota, quota_at),
+        (None, None),
+        "the two columns left the INSERT list, so a fresh row is NULL/NULL - the column default \
+         and the honest value: a row nobody has latched has no observed allowance"
+    );
+
+    let latched = serde_json::json!({
+        "source": "acp_meta_rate_limit",
+        "spend": { "session_micros": 351, "currency": "USD" },
+    });
+    let latched_at: DateTime<Utc> = "2026-09-10T09:00:00.000456Z"
+        .parse()
+        .expect("a microsecond-precision literal");
+    db.store
+        .set_agent_box_quota(
+            ids::AGENT_CLAUDE,
+            db.store.this_box(),
+            latched.clone(),
+            latched_at,
+        )
+        .await
+        .expect("the only writer writes");
+
+    // The conflict path, first half: a re-probe handing back the row it read before the latch.
+    db.store
+        .upsert_agent_box(&AgentBox {
+            version: Some("1.3.0".to_owned()),
+            quota: Some(serde_json::json!({ "stale": "read before the latch" })),
+            quota_at: None,
+            ..probed.clone()
+        })
+        .await
+        .expect("the update lands");
+    let (quota, quota_at, version) = columns(&db.pool, db.store.this_box()).await;
+    assert_eq!(
+        quota.as_ref(),
+        Some(&latched),
+        "`quota = EXCLUDED.quota` is gone from the SET list: the latch stands"
+    );
+    assert_eq!(quota_at, Some(latched_at), "and `quota_at` with it");
+    assert_eq!(
+        version.as_deref(),
+        Some("1.3.0"),
+        "the columns still in the SET list took the second write's value, so this is a row the \
+         upsert really did update"
+    );
+
+    // Second half: a `None` cannot clear them either, the way a `None` probe clears its own.
+    db.store
+        .upsert_agent_box(&AgentBox {
+            quota: None,
+            quota_at: None,
+            ..probed
+        })
+        .await
+        .expect("the second update lands");
+    let (quota, quota_at, _) = columns(&db.pool, db.store.this_box()).await;
+    assert_eq!(
+        quota.as_ref(),
+        Some(&latched),
+        "clearing a latch is `set_agent_box_quota`'s too; an upsert has no way to do it"
+    );
+    assert_eq!(quota_at, Some(latched_at));
+
+    db.drop_db().await;
+}

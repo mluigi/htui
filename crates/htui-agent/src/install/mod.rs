@@ -563,7 +563,9 @@ pub struct InstallJob<'a> {
     pub agent: &'a Agent,
     /// This box.
     pub box_id: BoxId,
-    /// The stored row, so the re-probe carries `quota` over and honours a `manual` source.
+    /// The stored row, so the re-probe honours a `manual` source. Not a quota carrier: since
+    /// MOD-2 plan D74 the two quota columns are `set_agent_box_quota`'s alone and
+    /// `probe::agent_box_row` does not read them.
     pub existing: Option<&'a AgentBox>,
     /// The box as a value, and the instant every timestamp is stamped with.
     pub ctx: &'a ProbeContext,

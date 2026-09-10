@@ -1897,8 +1897,18 @@ async fn a_manual_entry_survives_a_probe_that_finds_nothing_and_is_refreshed_by_
     );
 }
 
+/// MOD-2 plan D74: the projection does not carry `quota` / `quota_at` forward from the stored row.
+///
+/// It used to, and that was the lost update D74 removes: the row was read at chat start and handed
+/// back seconds later to a statement whose `SET` list wrote both columns, so every latch that
+/// landed in between was discarded. Since `upsert_agent_box` can no longer write them at all,
+/// there is nothing to carry them *to* - `set_agent_box_quota` is the only writer, and the values
+/// it wrote stay in the row the probe is about to update.
+///
+/// Every other projected field is asserted here too: what changed is two fields, not the
+/// projection.
 #[tokio::test]
-async fn a_probe_carries_quota_over_and_orders_keys_as_ana4_does() {
+async fn agent_box_row_does_not_carry_quota_forward() {
     let tmp = tempfile::tempdir().expect("temp box");
     let ctx = context(env(tmp.path()));
     let tool = tmp.path().join("bin").join(tool_name("htui-fake-tool"));
@@ -1930,12 +1940,48 @@ async fn a_probe_carries_quota_over_and_orders_keys_as_ana4_does() {
         .await,
     );
     assert_eq!(
-        row.quota,
-        Some(json!({ "remaining": 1 })),
-        "the probe owns neither quota field (MOD-7 writes them)"
+        row.quota, None,
+        "the probe owns neither quota field, and since D74 it does not carry them either"
     );
-    assert_eq!(row.quota_at, Some(quota_at));
+    assert_eq!(row.quota_at, None, "nor their timestamp");
 
+    // The rest of the projection is unchanged by D74.
+    assert_eq!(row.agent_id, agent.id);
+    assert_eq!(row.box_id, box_id);
+    assert!(row.enabled, "a ready handshake enables the box");
+    assert_eq!(
+        row.version.as_deref(),
+        Some("0.48.0"),
+        "`version` is the recorded handshake's `agent_version`, and it never came from `existing`"
+    );
+    assert_eq!(
+        row.path.as_deref(),
+        Some(tool.to_string_lossy().as_ref()),
+        "`path` is the resolved command"
+    );
+    assert_eq!(row.probed_at, Some(ctx.now));
+    assert_eq!(row.updated_at, ctx.now);
+    assert!(row.probe.is_some(), "the §4.6 snapshot rides the row");
+}
+
+#[tokio::test]
+async fn a_probe_snapshot_orders_keys_as_ana4_does() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let ctx = context(env(tmp.path()));
+    let tool = tmp.path().join("bin").join(tool_name("htui-fake-tool"));
+    executable(&tool, "#!/bin/sh\nexit 0\n");
+    let agent = synthetic_row("claude", &tool.to_string_lossy(), Transport::Acp);
+
+    let row = row_of(
+        probe_agent(
+            &agent,
+            BoxId::new(),
+            None,
+            &ctx,
+            &DuplexTier2(fixture_initialize_result()),
+        )
+        .await,
+    );
     let snapshot = ProbeSnapshot::from_row(&row).expect("the snapshot parses back");
     let text = serde_json::to_string(&snapshot).expect("the snapshot serialises");
     assert!(

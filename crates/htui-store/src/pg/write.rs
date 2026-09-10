@@ -410,21 +410,32 @@ impl WriteStore for PgStore {
     /// Inserts or updates one `agent_box` row on its composite primary key (`docs/ANA-4.md` §4.1,
     /// ANA-9 §5.7).
     ///
+    /// `quota` and `quota_at` are in **neither** list (MOD-2 plan D74): not in the `INSERT`
+    /// column list, so a fresh row gets the column default `NULL` - the honest value, since a row
+    /// nobody has latched has no observed allowance and a probe handshake reports none (§7) - and
+    /// not in the `DO UPDATE SET` list, so an upsert of an existing row cannot touch them.
+    /// [`WriteStore::set_agent_box_quota`] is their only writer.
+    ///
+    /// A `row` carrying either field is therefore accepted and ignored, which is the one sharp
+    /// edge this design keeps: it is not an error and it is not a write. That is deliberate.
+    /// Before D74 the probe read the row at chat start and handed both columns back to this
+    /// statement seconds later, discarding every latch that had landed in between - a lost update
+    /// by construction. `COALESCE(EXCLUDED.quota, agent_box.quota)` was considered and rejected:
+    /// it would still let an upsert *set* the column, and would make clearing it impossible.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`] when the agent or the box does not exist (`23503`).
     async fn upsert_agent_box(&self, row: &AgentBox) -> Result<()> {
         sqlx::query!(
-            "INSERT INTO agent_box (agent_id, box_id, enabled, version, path, probed_at, quota, \
-                                    quota_at, updated_at, probe) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+            "INSERT INTO agent_box (agent_id, box_id, enabled, version, path, probed_at, \
+                                    updated_at, probe) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (agent_id, box_id) DO UPDATE SET \
                  enabled   = EXCLUDED.enabled, \
                  version   = EXCLUDED.version, \
                  path      = EXCLUDED.path, \
                  probed_at = EXCLUDED.probed_at, \
-                 quota     = EXCLUDED.quota, \
-                 quota_at  = EXCLUDED.quota_at, \
                  probe     = EXCLUDED.probe",
             row.agent_id.as_uuid(),
             row.box_id.as_uuid(),
@@ -432,8 +443,6 @@ impl WriteStore for PgStore {
             row.version.as_deref(),
             row.path.as_deref(),
             row.probed_at,
-            row.quota.as_ref(),
-            row.quota_at,
             row.updated_at,
             row.probe.as_ref(),
         )

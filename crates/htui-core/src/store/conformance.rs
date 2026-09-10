@@ -43,6 +43,7 @@ pub const CASES: &[&str] = &[
     "upsert_agent_by_id_name_unique",
     "upsert_agent_box_by_pk",
     "set_agent_box_quota_updates_two_columns_or_not_found",
+    "upsert_agent_box_cannot_write_quota",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -81,6 +82,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "set_agent_box_quota_updates_two_columns_or_not_found" => {
             set_agent_box_quota_updates_two_columns_or_not_found(store).await;
         }
+        "upsert_agent_box_cannot_write_quota" => upsert_agent_box_cannot_write_quota(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1318,8 +1320,9 @@ async fn upsert_agent_box_by_pk<S: WriteStore>(store: &S) {
 /// into, so an unknown `(agent_id, box_id)` is
 /// [`StoreError::NotFound`], never a silent no-op and never a fresh row. What the write leaves
 /// alone - `probe` above all - is asserted where a concrete store can be named and read back
-/// (`MemStore`'s `set_agent_box_quota_leaves_probe_and_version_alone` and `pg_criteria.rs`),
-/// because [`WriteStore`] carries no registry read.
+/// (`mem.rs::set_agent_box_quota_leaves_probe_and_version_alone` and
+/// `pg_criteria.rs::set_agent_box_quota_leaves_probe_byte_identical`), because [`WriteStore`]
+/// carries no registry read.
 async fn set_agent_box_quota_updates_two_columns_or_not_found<S: WriteStore>(store: &S) {
     store
         .upsert_agent_box(&AgentBox {
@@ -1366,6 +1369,91 @@ async fn set_agent_box_quota_updates_two_columns_or_not_found<S: WriteStore>(sto
         "set_agent_box_quota_updates_two_columns_or_not_found: an unprobed row has nothing to \
          latch into, got {missing:?}"
     );
+}
+
+/// `upsert_agent_box` neither sets nor clears `quota` / `quota_at`: since MOD-2 plan D74 the two
+/// columns are [`WriteStore::set_agent_box_quota`]'s alone.
+///
+/// This case pins the **sharp edge** the design keeps: an [`AgentBox`] still *carries* both
+/// fields, and handing an upsert a populated `quota` is neither an error nor a write. It is
+/// accepted and ignored, on the insert path and on the conflict path alike, so a probe that read a
+/// row seconds ago cannot write a stale allowance back over a latch that landed in between - the
+/// lost update D74 exists to remove.
+///
+/// What the *stored* values then are is asserted where a store can be read back, because
+/// [`WriteStore`] carries no `agent_box` read: `mem.rs::upsert_agent_box_cannot_write_the_quota_columns`
+/// in-module, and `pg_criteria.rs::an_upsert_can_neither_set_nor_clear_the_quota_columns` with a
+/// raw `SELECT`. That one has to be SQL-level: the thing being removed is an `EXCLUDED.quota`
+/// line, and no trait call can see it.
+async fn upsert_agent_box_cannot_write_quota<S: WriteStore>(store: &S) {
+    let probed = AgentBox {
+        agent_id: ids::AGENT_CLAUDE,
+        box_id: ids::BOX,
+        enabled: true,
+        version: Some("1.2.3".to_owned()),
+        path: Some("/usr/bin/claude".to_owned()),
+        probed_at: Some(Utc::now()),
+        // The insert path: a probe seeding an allowance it never observed. Accepted, not written.
+        quota: Some(json!({ "invented": "by the probe" })),
+        quota_at: Some(Utc::now()),
+        updated_at: Utc::now(),
+        probe: Some(json!({ "status": "ready", "source": "probe" })),
+    };
+    store.upsert_agent_box(&probed).await.expect(
+        "upsert_agent_box_cannot_write_quota: an `AgentBox` carrying a quota is not an error - the \
+         column is simply not in the INSERT list",
+    );
+
+    // The latch is the only writer, and it finds the row the upsert inserted.
+    store
+        .set_agent_box_quota(
+            ids::AGENT_CLAUDE,
+            ids::BOX,
+            json!({ "source": "acp_meta_rate_limit", "spend": { "session_micros": 351 } }),
+            Utc::now(),
+        )
+        .await
+        .expect("upsert_agent_box_cannot_write_quota: the latch lands");
+
+    // The conflict path, twice: a re-probe carrying a *different* document, then one carrying
+    // `None`. Neither is a write, so neither can discard the latch above.
+    store
+        .upsert_agent_box(&AgentBox {
+            version: Some("1.3.0".to_owned()),
+            quota: Some(json!({ "stale": "read before the latch" })),
+            quota_at: None,
+            ..probed.clone()
+        })
+        .await
+        .expect(
+            "upsert_agent_box_cannot_write_quota: a re-probe carrying a stale quota is accepted \
+             and ignored, not refused",
+        );
+    store
+        .upsert_agent_box(&AgentBox {
+            quota: None,
+            quota_at: None,
+            ..probed.clone()
+        })
+        .await
+        .expect(
+            "upsert_agent_box_cannot_write_quota: nor does a `None` quota clear the column the \
+             way a `None` probe clears its own",
+        );
+
+    // The row is still one row under one key, and still latchable: the upserts updated it rather
+    // than replacing or removing it.
+    store
+        .set_agent_box_quota(
+            ids::AGENT_CLAUDE,
+            ids::BOX,
+            json!({ "source": "none" }),
+            Utc::now(),
+        )
+        .await
+        .expect(
+            "upsert_agent_box_cannot_write_quota: the latch still finds the row after two upserts",
+        );
 }
 
 #[cfg(test)]
