@@ -1,0 +1,2 @@
+{"direction":"stdin","line":{"type":"user","message":{"role":"user","content":[{"type":"text","text":"reply with exactly the word ok"}]}}}
+{"direction":"exit","status":1,"signal":null}
