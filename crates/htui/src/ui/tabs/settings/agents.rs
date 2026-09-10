@@ -1034,8 +1034,11 @@ impl AgentsSection {
         //   untouched column. It is the **only** one of the seven whose content is shorter than its
         //   allowance, so it is the only one that can give width up without giving anything
         //   observable up: its header is `name` (4) and every registry name in the tree fits in 8 —
-        //   `claude` (6), `agy` (3), `kappa` (5), and `amp-acp` (7), the longest id MOD-20's live
-        //   install proof carries. The other four are each already at their own longest string:
+        //   the two seeded rows are 6 and 3, the demo fixture's is 5, and the longest is the 7 of
+        //   the vendor id MOD-20's live install proof registers, which this comment deliberately
+        //   does not spell: `tests/extensibility.rs`'s `R-AGT-5` sweep refuses a vendor name in a
+        //   production file, comments included, and it is right to. The other four are each already
+        //   at their own longest string:
         //   `transport` (9), `models` (6) and `enabled` (7) at their headers, `billing` (12) at
         //   `subscription`.
         //
