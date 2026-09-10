@@ -271,6 +271,11 @@ pub struct SessionSpec {
     pub retain_raw: bool,
     /// The agent-side session id from a previous step, for `session/load` or `--resume`.
     pub resume: Option<AgentSessionRef>,
+    /// `project.settings.per_token_cap_run` in USD micros, when the project sets one (plan D90).
+    /// The recorder enforces the same figure client-side (D70); a transport that has a
+    /// server-side knob passes it too, so the two caps read **one** number — `claude
+    /// --max-budget-usd` (D83). ACP has no such knob and ignores it.
+    pub budget_micros: Option<i64>,
 }
 
 impl core::fmt::Debug for SessionSpec {
@@ -287,6 +292,7 @@ impl core::fmt::Debug for SessionSpec {
             .field("permission", &self.permission)
             .field("retain_raw", &self.retain_raw)
             .field("resume", &self.resume)
+            .field("budget_micros", &self.budget_micros)
             .finish()
     }
 }
@@ -331,6 +337,13 @@ pub struct DriverCaps {
     pub resume: bool,
     /// The transport reports usage at all.
     pub usage: bool,
+    /// The transport reports usage **while a turn is open**, so a cap can be reached mid-turn and
+    /// a `usage` row can carry a rate-limit blob before the turn's `done`. `false` means one
+    /// report per turn, on the message that ends it — the `claude` CLI's shape, where cost exists
+    /// only on `result` (`docs/ANA-4.md` §7, plan E-4): the recorder's per-run cap then fires on
+    /// the turn's closing row and cancels a turn that has already ended, and the conformance
+    /// suite asserts the turn-end form of criterion 7 rather than the per-report one.
+    pub usage_mid_turn: bool,
     /// The transport can log the agent in through its own protocol (plan MOD-21 D10, `R-AGT-9`):
     /// [`AgentDriver::authenticate`] answers something other than [`DriverError::Unsupported`].
     /// The Settings section refuses `a` on a row whose profile says `false` before a request is

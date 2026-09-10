@@ -110,6 +110,9 @@ impl FakeDriver {
             follow_up_in_session: true,
             resume: true,
             usage: true,
+            // A script puts a `usage` event wherever it likes, including mid-turn, so no case is
+            // skipped for want of this one (plan D91).
+            usage_mid_turn: true,
             // The one exception: the fake is the reference transport for *sessions*, and
             // `authenticate` is proven through the refusing default body instead (plan MOD-21
             // D10). A fake that claimed a login it does not perform would make the contract

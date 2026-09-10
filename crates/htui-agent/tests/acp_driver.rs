@@ -98,6 +98,7 @@ fn spec(cwd: PathBuf) -> SessionSpec {
         permission: PermissionPolicy::default(),
         retain_raw: false,
         resume: None,
+        budget_micros: None,
     }
 }
 

@@ -693,6 +693,7 @@ mod tests {
                     follow_up_in_session: true,
                     resume: true,
                     usage: true,
+                    usage_mid_turn: true,
                     authenticate: true,
                 },
                 writer_label: "memory",

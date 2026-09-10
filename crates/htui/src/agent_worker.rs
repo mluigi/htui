@@ -1162,6 +1162,11 @@ impl AgentRuntime {
             permission: settings.permission.clone(),
             retain_raw: std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
             resume: None,
+            // Plan D83/D90: the per-run cap the recorder enforces client-side, handed to the
+            // transport as well so one that has a server-side budget knob bounds the same run by
+            // the same number. `project_caps` is read once, above, and both readers take it from
+            // there — two reads of the setting would be two chances to convert it differently.
+            budget_micros: project_caps.run_micros,
         };
 
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -3116,6 +3121,20 @@ pub(crate) mod tests {
         script: Script,
         settings: Option<Value>,
     ) -> (MemStore, Backend, AgentRuntime, AgentId) {
+        let (store, backend, runtime, agent_id, _spec) =
+            fixture_with_spec_spy(script, settings).await;
+        (store, backend, runtime, agent_id)
+    }
+
+    /// [`fixture_with_project_settings`], plus the slot the driver records its [`SessionSpec`] in.
+    ///
+    /// What a chat puts *on* the spec is production wiring no transport-side assertion can see —
+    /// the fake reads the fields it needs and drops the rest — so the one case that asks whether a
+    /// figure reached the transport at all asks the spy instead.
+    async fn fixture_with_spec_spy(
+        script: Script,
+        settings: Option<Value>,
+    ) -> (MemStore, Backend, AgentRuntime, AgentId, SpecSlot) {
         let mut data = htui_core::fixtures::demo_data();
         if let Some(settings) = settings {
             for project in &mut data.projects {
@@ -3133,17 +3152,24 @@ pub(crate) mod tests {
 
         let adapter = Arc::new(FakeAdapter::new());
         adapter.load(script);
+        let spec: SpecSlot = Arc::new(Mutex::new(None));
         let mut factory = DriverFactory::new();
-        factory.register("cli/fake", Box::new(FakeBuilder(Arc::clone(&adapter))));
+        factory.register(
+            "cli/fake",
+            Box::new(FakeBuilder(Arc::clone(&adapter), Arc::clone(&spec))),
+        );
 
         let backend = Backend::memory(store.clone());
         let runtime = AgentRuntime::new(factory).with_grace(Duration::from_millis(0));
-        (store, backend, runtime, agent_id)
+        (store, backend, runtime, agent_id, spec)
     }
+
+    /// Where [`SpecSpy`] leaves the last spec a session was started with.
+    type SpecSlot = Arc<Mutex<Option<SessionSpec>>>;
 
     /// Lets one `FakeAdapter` be shared between the test and the factory.
     #[derive(Debug)]
-    struct FakeBuilder(Arc<FakeAdapter>);
+    struct FakeBuilder(Arc<FakeAdapter>, SpecSlot);
 
     impl htui_agent::registry::TransportBuilder for FakeBuilder {
         fn build(
@@ -3152,7 +3178,43 @@ pub(crate) mod tests {
             on_box: Option<&AgentBox>,
             caps: DriverCaps,
         ) -> Result<Box<dyn AgentDriver>, DriverError> {
-            self.0.build(agent, on_box, caps)
+            Ok(Box::new(SpecSpy {
+                inner: self.0.build(agent, on_box, caps)?,
+                seen: Arc::clone(&self.1),
+            }))
+        }
+    }
+
+    /// The fake driver with one addition: it writes down the [`SessionSpec`] it was started with.
+    ///
+    /// A wrapper rather than a field on the fake, because the fake is a *transport* under test in
+    /// two crates and this is a question about the worker that starts one.
+    #[derive(Debug)]
+    struct SpecSpy {
+        inner: Box<dyn AgentDriver>,
+        seen: SpecSlot,
+    }
+
+    impl AgentDriver for SpecSpy {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn caps(&self) -> DriverCaps {
+            self.inner.caps()
+        }
+
+        fn start<'a>(
+            &'a self,
+            spec: SessionSpec,
+            prompt: String,
+        ) -> htui_agent::driver::DriverFuture<'a, Box<dyn AgentSession>> {
+            // Recorded before the delegate runs, and the lock released here: the future below is
+            // `Send`, and a guard held across it would not compile.
+            if let Ok(mut slot) = self.seen.lock() {
+                *slot = Some(spec.clone());
+            }
+            self.inner.start(spec, prompt)
         }
     }
 
@@ -3311,6 +3373,46 @@ pub(crate) mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Plan D90: the per-run cap the recorder enforces client-side is also handed to the
+    /// transport, on the spec, so a transport with a server-side knob of its own (`--max-budget-usd`,
+    /// D83) bounds the same run by the same number.
+    ///
+    /// The point is that there is **one** figure. Two reads of `project.settings.per_token_cap_run`
+    /// would be two chances to convert dollars to micros differently, and the disagreement would
+    /// surface as a run that stopped at a figure no setting names.
+    #[tokio::test]
+    async fn the_projects_run_cap_reaches_the_transport_on_the_spec() {
+        let capped = Script::one_turn(vec![ends(StopReason::EndTurn)]);
+        let (_store, backend, mut runtime, agent_id, spec) =
+            fixture_with_spec_spy(capped, Some(json!({ "per_token_cap_run": 300 }))).await;
+        run(&mut runtime, &backend, start(agent_id, "spend a little")).await;
+        let started = spec
+            .lock()
+            .expect("the spy's slot is not poisoned")
+            .clone()
+            .expect("the chat started a session");
+        assert_eq!(
+            started.budget_micros,
+            Some(300),
+            "the same micros `RunCap` is built from, in the same units (D70)"
+        );
+
+        // And a project that sets no cap says so, rather than defaulting to a number: a transport
+        // that received `Some(0)` would refuse every turn.
+        let uncapped = Script::one_turn(vec![ends(StopReason::EndTurn)]);
+        let (_store, backend, mut runtime, agent_id, spec) =
+            fixture_with_spec_spy(uncapped, None).await;
+        run(&mut runtime, &backend, start(agent_id, "spend a little")).await;
+        assert_eq!(
+            spec.lock()
+                .expect("the spy's slot is not poisoned")
+                .clone()
+                .expect("the chat started a session")
+                .budget_micros,
+            None
+        );
     }
 
     /// The whole cap, end to end through the production path: `ChatStart` reads
@@ -3725,7 +3827,10 @@ pub(crate) mod tests {
         let adapter = Arc::new(FakeAdapter::new());
         adapter.load(script);
         let mut factory = DriverFactory::new();
-        factory.register("acp", Box::new(FakeBuilder(Arc::clone(&adapter))));
+        factory.register(
+            "acp",
+            Box::new(FakeBuilder(Arc::clone(&adapter), SpecSlot::default())),
+        );
         factory
     }
 
@@ -5105,7 +5210,10 @@ pub(crate) mod tests {
         let adapter = Arc::new(FakeAdapter::new());
         adapter.load(script);
         let mut factory = DriverFactory::new();
-        factory.register("cli/fake", Box::new(FakeBuilder(Arc::clone(&adapter))));
+        factory.register(
+            "cli/fake",
+            Box::new(FakeBuilder(Arc::clone(&adapter), SpecSlot::default())),
+        );
         let backend = Backend::memory(store.clone());
         let mut runtime = AgentRuntime::new(factory).with_grace(Duration::from_millis(0));
 

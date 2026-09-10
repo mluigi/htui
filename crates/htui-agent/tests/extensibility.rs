@@ -167,6 +167,9 @@ async fn an_unknown_agent_reaches_a_driver_from_its_row_alone() {
     // §6.2 maps a stdin NDJSON user message to `follow_up`, so a CLI follow-up stays in session.
     assert!(caps.follow_up_in_session);
     assert!(caps.usage);
+    // …but once per turn, on the message that ends it: a stream dialect reports cost with its
+    // result, not while the turn is open (§7, plan D91).
+    assert!(!caps.usage_mid_turn);
 }
 
 #[test]
@@ -502,6 +505,7 @@ async fn the_resolved_token_reaches_no_persisted_row() {
         // secret to survive, so the sweep is weaker without it.
         retain_raw: true,
         resume: None,
+        budget_micros: None,
     };
 
     // The scrubber is built from the same resolved env the session runs with, which is the wiring

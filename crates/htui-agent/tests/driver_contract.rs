@@ -142,6 +142,9 @@ fn spec() -> SessionSpec {
         permission: PermissionPolicy::default(),
         retain_raw: false,
         resume: None,
+        // A figure rather than `None`, so the hand-written `Debug` below is asserted against a
+        // value it could have dropped silently (plan D90).
+        budget_micros: Some(300),
     }
 }
 
@@ -341,6 +344,10 @@ fn session_spec_debug_redacts_every_environment_value() {
         !shown.contains("s3cr3t"),
         "no environment value survives Debug: {shown}"
     );
+    assert!(
+        shown.contains("budget_micros: Some(300)"),
+        "a hand-written Debug that forgot a field would hide it from every log: {shown}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -360,7 +367,39 @@ fn driver_caps_is_copy_and_defaults_to_all_false() {
     assert!(!caps.follow_up_in_session);
     assert!(!caps.resume);
     assert!(!caps.usage);
+    assert!(!caps.usage_mid_turn);
     assert!(!caps.authenticate);
+}
+
+/// D91: whether a cost figure can arrive *while* a turn is open, which decides whether the per-run
+/// cap is a live brake or a turn-granular one — and which form of ANA-4 §11 criterion 7 the
+/// conformance suite asserts.
+///
+/// The `Default` is `false` for the reason every other predicate defaults false: a transport that
+/// says nothing about reporting mid-turn is read as reporting once, at the end, which is the
+/// weaker claim and the safe one to act on.
+#[test]
+fn usage_mid_turn_is_a_capability_the_row_answers() {
+    assert!(
+        caps_for(&row_for_adapter("acp", "/bin/false")).usage_mid_turn,
+        "`session/update` carries a usage report whenever the adapter makes one"
+    );
+    assert!(
+        !caps_for(&row_for_adapter("cli/fake", "/bin/false")).usage_mid_turn,
+        "a stream dialect that carries cost only on the message ending the turn"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn the_fake_reports_usage_mid_turn_like_the_reference_transport_it_is() {
+    use htui_agent::fake::FakeDriver;
+
+    assert!(
+        FakeDriver::full_caps().usage_mid_turn,
+        "the fake emits a `usage` event wherever a script puts one, so no case is skipped for \
+         want of the capability"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

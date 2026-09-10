@@ -808,6 +808,7 @@ async fn an_unauthenticated_box_is_told_what_the_agent_said() {
         permission: PermissionPolicy::default(),
         retain_raw: false,
         resume: None,
+        budget_micros: None,
     };
     let opened = tokio::time::timeout(
         LIVE_TIMEOUT,

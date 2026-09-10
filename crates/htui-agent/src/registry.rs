@@ -149,6 +149,10 @@ fn caps_from(agent: &Agent, settings: &AgentSettings) -> DriverCaps {
             follow_up_in_session: true,
             resume: settings.acp.session.resume,
             usage: true,
+            // `session/update` carries a `usage_update` whenever the adapter reports one (§3), so
+            // a cost figure can arrive with the turn still open and the per-run cap is a live
+            // brake rather than a turn-granular one.
+            usage_mid_turn: true,
             authenticate: true,
         },
         // §4.3 verbatim: "the CLI transport reports `DriverCaps { permission_requests: false,
@@ -164,6 +168,11 @@ fn caps_from(agent: &Agent, settings: &AgentSettings) -> DriverCaps {
             follow_up_in_session: true,
             resume: true,
             usage: true,
+            // …but once per turn, on the message that ends it: §7 puts the cost of a headless
+            // stream on its terminal result, and nothing before it carries one (plan D91). The
+            // per-run cap is therefore turn-granular here, and the mid-turn guard is the argv's
+            // own budget flag (D83).
+            usage_mid_turn: false,
             // Plan MOD-21 D10: no CLI transport has a login verb; the vendor CLI's own is not
             // ours to drive, and a stream adapter has nowhere to put a method list.
             authenticate: false,
