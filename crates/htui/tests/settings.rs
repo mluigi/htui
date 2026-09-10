@@ -376,6 +376,137 @@ async fn the_status_column_renders_each_probe_outcome() {
     insta::assert_snapshot!("agents_probed", rendered);
 }
 
+/// Where the `quota` column starts in a rendered row: the six fixed columns before it — 12, 9, 12,
+/// 6, 9, 7 — plus one space of `column_spacing` after each.
+const QUOTA_AT: usize = 61;
+
+/// Where `on this box` starts: [`QUOTA_AT`] plus the quota column's own 19 and its space.
+const ON_BOX_AT: usize = 81;
+
+/// One registry row whose `agent_box` carries a `quota` blob, for the quota column's own table
+/// (MOD-2 D73).
+///
+/// Written onto a [`probed_row`] rather than through a parameter of it, so the twenty-odd cases
+/// that only care about `probe` keep the four-argument helper they were written against.
+fn quota_row(name: &str, quota: Option<Value>) -> AgentSummary {
+    let mut summary = probed_row(
+        name,
+        true,
+        Some("0.48.0"),
+        Some(json!({ "status": "ready", "source": "probe" })),
+    );
+    summary
+        .on_box
+        .as_mut()
+        .expect("`probed_row` always writes an `agent_box` row")
+        .quota = quota;
+    summary
+}
+
+/// The `quota` cell of one row, taken by character offset.
+///
+/// By offset and not by counting words, because a quota cell holds spaces of its own
+/// (`62% to 09-08 08:00`), so nothing after it can be found by splitting a line on whitespace.
+fn quota_cell(rendered: &str, name: &str) -> String {
+    row_line(rendered, name)
+        .chars()
+        .skip(QUOTA_AT)
+        .take(ON_BOX_AT - QUOTA_AT)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+/// The rendered line one row drew, by the name in its first column.
+fn row_line<'a>(rendered: &'a str, name: &str) -> &'a str {
+    rendered
+        .lines()
+        .find(|line| line.starts_with(name))
+        .unwrap_or_else(|| panic!("the `{name}` row is rendered:\n{rendered}"))
+}
+
+/// The `quota` column, one row per shape plan D73 names (`R-TUI-8`, `docs/ANA-4.md` §7).
+///
+/// The four rows are the four answers this column has: the ANA-4 §7 document, whose tightest
+/// window is the seven-day one; a source that reports no allowance at all and so carries only what
+/// the session has spent; a box with a row but no blob; and a blob that parses as JSON and says
+/// nothing this build understands — which is the `agy` fixture's shape, and is `—` rather than a
+/// guess.
+#[tokio::test]
+async fn the_quota_column_renders_windows_spend_and_nothing() {
+    let bench = Bench::new().await;
+    let rows = vec![
+        quota_row(
+            "windows",
+            Some(json!({
+                "source": "acp_meta_rate_limit",
+                "billing": "subscription",
+                "status": "allowed",
+                "exhausted": false,
+                "windows": [
+                    { "id": "five_hour", "utilization": 0.26, "resets_at": "2026-09-05T13:20:00Z" },
+                    { "id": "seven_day", "utilization": 0.62, "resets_at": "2026-09-08T08:00:00Z" },
+                ],
+                "spend": { "session_micros": 394_692, "currency": "USD" },
+                "observed_at": "2026-09-05T12:31:07Z",
+            })),
+        ),
+        quota_row(
+            "spend-only",
+            Some(json!({
+                "source": "none",
+                "billing": "per_token",
+                "status": "unknown",
+                "exhausted": false,
+                "windows": [],
+                "spend": { "session_micros": 394_692, "currency": "USD" },
+                "observed_at": "2026-09-05T12:31:07Z",
+            })),
+        ),
+        quota_row("no-blob", None),
+        quota_row("unparsable", Some(json!({ "remaining": 100 }))),
+    ];
+
+    let mut section = AgentsSection::new();
+    bench.reply(&mut section, &StoreReply::Agents(rows));
+    let rendered = render_section(&section, &bench.ctx());
+
+    for (row, expected) in [
+        ("windows", "62% to 09-08 08:00"),
+        ("spend-only", "$0.39 spent"),
+        ("no-blob", "\u{2014}"),
+        ("unparsable", "\u{2014}"),
+    ] {
+        assert_eq!(
+            quota_cell(&rendered, row),
+            expected,
+            "the `quota` column of `{row}` reads `{expected}`:\n{rendered}"
+        );
+    }
+
+    insta::assert_snapshot!("agents_quota", rendered);
+}
+
+/// `docs/ANA-4.md` §7 requires the refresh limit be "stated in the UI rather than implied": a
+/// probe handshake reports no allowance, so `r` re-probes every row and moves this column on none
+/// of them. The hint line is where the section says so, because it is where every other key it
+/// binds is written (MOD-20 D19).
+#[tokio::test]
+async fn the_idle_hint_says_r_cannot_refresh_quota() {
+    let bench = Bench::new().await;
+    let section = section_over(&bench, vec![registry_row("declared", true)]);
+
+    let rendered = render_section(&section, &bench.ctx());
+    let hint = rendered
+        .lines()
+        .last()
+        .expect("the section always draws a hint line");
+    assert!(
+        hint.contains("r cannot refresh"),
+        "the idle hint says `r` cannot refresh quota: `{hint}`"
+    );
+}
+
 /// A second section, so the strip has something to cycle between before MOD-7 and MOD-15 land.
 #[derive(Debug, Default)]
 struct ProbeSection;
@@ -546,15 +677,16 @@ fn section_over(bench: &Bench, rows: Vec<AgentSummary>) -> AgentsSection {
 }
 
 /// The `on this box` cell of one row, which is the last column of its line.
+///
+/// By character offset since D73's `quota` column landed in front of it: that cell holds spaces of
+/// its own, so the columns after it can no longer be counted in words.
 fn on_box_cell(rendered: &str, name: &str) -> String {
-    let line = rendered
-        .lines()
-        .find(|line| line.starts_with(name))
-        .unwrap_or_else(|| panic!("the `{name}` row is rendered:\n{rendered}"));
-    line.split_whitespace()
-        .skip(6)
-        .collect::<Vec<_>>()
-        .join(" ")
+    row_line(rendered, name)
+        .chars()
+        .skip(ON_BOX_AT)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
 }
 
 /// Plan D19's cursor: `j`/`k` only, no wrap at either end.

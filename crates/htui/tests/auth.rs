@@ -34,6 +34,10 @@ use serde_json::{Value, json};
 /// before `a`: the cursor is what `a` acts on.
 const ROW: &str = "demo-login";
 
+/// Where `on this box` starts in a rendered row: the seven columns before it — 12, 9, 12, 6, 9, 7
+/// and MOD-2 D73's `quota` 19 — plus one space of `column_spacing` after each.
+const ON_BOX_AT: usize = 81;
+
 /// The one method the fixture advertises. A made-up id: the chooser is fed by the agent's own live
 /// `initialize`, so a case only ever needs *an* id.
 const METHOD: &str = "m-one";
@@ -302,6 +306,10 @@ impl Rig {
     }
 
     /// The `on this box` cell of the login row, which is the last column of its line.
+    ///
+    /// By character offset since MOD-2 D73's `quota` column landed in front of it: that cell holds
+    /// spaces of its own (`62% to 09-08 08:00`), so the columns after it can no longer be counted
+    /// in words.
     fn on_box_cell(&mut self) -> String {
         let frame = self.harness.render();
         let line = frame
@@ -310,10 +318,11 @@ impl Rig {
             .unwrap_or_else(|| panic!("the `{ROW}` row is rendered:\n{frame}"))
             .to_owned();
         line.trim_matches('\u{2502}')
-            .split_whitespace()
-            .skip(6)
-            .collect::<Vec<_>>()
-            .join(" ")
+            .chars()
+            .skip(ON_BOX_AT)
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
     }
 
     /// The first six columns of the login row, which is the registry's own half of the table.

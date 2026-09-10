@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/settings.rs
+expression: rendered
+---
+name         transport billing      models default   enabled quota               on this box
+windows      acp       subscription 0      —         yes     62% to 09-08 08:00  0.48.0
+spend-only   acp       subscription 0      —         yes     $0.39 spent         0.48.0
+no-blob      acp       subscription 0      —         yes     —                   0.48.0
+unparsable   acp       subscription 0      —         yes     —                   0.48.0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+j/k select · r probe · i install · a authenticate · quota latches per chat, r cannot refresh it

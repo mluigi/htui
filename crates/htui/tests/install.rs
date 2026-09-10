@@ -393,17 +393,25 @@ impl Rig {
     }
 }
 
+/// Where `on this box` starts in a rendered row: the seven columns before it — 12, 9, 12, 6, 9, 7
+/// and MOD-2 D73's `quota` 19 — plus one space of `column_spacing` after each.
+const ON_BOX_AT: usize = 81;
+
 /// The `on this box` cell of the installable row.
+///
+/// By character offset since D73's `quota` column landed in front of it: that cell holds spaces of
+/// its own (`62% to 09-08 08:00`), so the columns after it can no longer be counted in words.
 fn on_box_cell(frame: &str) -> String {
     let line = frame
         .lines()
         .find(|line| line.trim_start_matches('\u{2502}').starts_with(ROW))
         .unwrap_or_else(|| panic!("the `{ROW}` row is rendered:\n{frame}"));
     line.trim_matches('\u{2502}')
-        .split_whitespace()
-        .skip(6)
-        .collect::<Vec<_>>()
-        .join(" ")
+        .chars()
+        .skip(ON_BOX_AT)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
 }
 
 // ---------------------------------------------------------------------------------------------

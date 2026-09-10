@@ -6,10 +6,10 @@ Graphics · DESKTOP-HTUI · memory · 0 runs
  1 Settings
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
 │ Agents                                                                                           │
-│name         transport billing      models default   enabled on this box                          │
-│agy          acp       subscription 0      —         yes     not probed                           │
-│claude       acp       subscription 0      —         yes     not probed                           │
-│kappa        acp       subscription 0      k1        yes     not probed                           │
+│name         transport billing      models default   enabled quota               on this box      │
+│agy          acp       subscription 0      —         yes     —                   not probed       │
+│claude       acp       subscription 0      —         yes     —                   not probed       │
+│kappa        acp       subscription 0      k1        yes     —                   not probed       │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -29,6 +29,6 @@ Graphics · DESKTOP-HTUI · memory · 0 runs
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│j/k select · r probe · i install · a authenticate                                                 │
+│j/k select · r probe · i install · a authenticate · quota latches per chat, r cannot refresh it   │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

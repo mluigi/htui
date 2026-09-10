@@ -3,8 +3,14 @@
 //!
 //! It lists what `agent` and this box's `agent_box` hold, and it is where a probe is asked for:
 //! `r` sends [`StoreRequest::ProbeAgents`] and the `on this box` column then says what this box
-//! can actually run (`R-AGT-6`). The caps banner is milestone 3's and the quota column milestone
-//! 7's — each is a column in this table and a field in the reply, not a rewrite of the section.
+//! can actually run (`R-AGT-6`). The caps banner is milestone 3's; the `quota` column arrived with
+//! milestone 7 (MOD-2 D73) and reads `agent_box.quota` by key — each is a column in this table and
+//! a field in the reply, not a rewrite of the section.
+//!
+//! What `r` does **not** do is refresh that column. Quota is latched from the usage a run reports,
+//! never polled: a probe handshake reports no allowance at all, so a re-probe moves every other
+//! column and this one on no row. `docs/ANA-4.md` §7 asks for that limit to be stated rather than
+//! implied, and [`QUOTA_NOTE`] on the hint line is where this section states it.
 //!
 //! Since MOD-20 it is also where an adapter is **installed**: `i` on the highlighted row asks for
 //! a pre-flight, the plan that comes back is drawn as a consent pane under the table, and only `y`
@@ -28,6 +34,7 @@
 //! lost its state would leave a spawned adapter, an open loopback listener and a human half-way
 //! through a browser page with no key on screen to stop any of it.
 
+use chrono::{DateTime, Utc};
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::PlanError;
 use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
@@ -58,13 +65,26 @@ const PROBING: &str = "probing\u{2026}";
 /// What the `on this box` column reads between `x` and the install's own last frame.
 const CANCELLING: &str = "cancelling\u{2026}";
 
-/// What replaces an absent `default_model`.
+/// What replaces an absent `default_model`, and a quota this build has nothing to say about.
 const NONE: &str = "\u{2014}";
 
 /// The hint line with nothing in flight. It stands in for a help entry: a Settings section has no
 /// [`KeyScope`](crate::keymap::KeyScope) of its own (MOD-20 D19), so the keys are written where
 /// they are pressed.
 const HINT_IDLE: &str = "j/k select \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
+
+/// What the idle line adds when it has the room: the one limit of this section that is not a key
+/// (MOD-2 D73).
+///
+/// `r` re-probes every row and moves the `quota` column on none of them, because a probe handshake
+/// reports no allowance and the value is latched from what a chat reports instead. `docs/ANA-4.md`
+/// §7 asks for that to be "stated in the UI rather than implied", and this is the statement.
+///
+/// *When it has the room*, because the hint row is one line of a 100-column frame: a notice is the
+/// answer to what the user just pressed, and a standing sentence that clipped a failure's own words
+/// off the right edge would be the wrong half of the line to keep. It is on the line the section
+/// **rests** in, which is the line a limit is read from.
+const QUOTA_NOTE: &str = "quota latches per chat, r cannot refresh it";
 
 /// The hint line while a plan waits for an answer.
 const HINT_PENDING: &str = "y install \u{b7} n cancel";
@@ -229,7 +249,7 @@ pub struct AgentsSection {
     /// The highlighted row — the first cursor in a Settings section (MOD-20 D19).
     ///
     /// `i` acts on one row, so there has to be a row it acts on. [`TableState`] is ratatui's own,
-    /// and `R-TUI-8`'s quota column will want it too.
+    /// and it is what scrolls the table once there are more agents than rows on screen.
     cursor: TableState,
     /// The install this section is waiting on.
     install: InstallState,
@@ -916,34 +936,41 @@ impl AgentsSection {
         }
     }
 
-    /// The one line under the pane: which keys mean something here, and the last outcome.
+    /// The one line under the pane: which keys mean something here, the one limit that is not a
+    /// key, and the last outcome.
+    ///
+    /// Keys and note separately because only one state has anything to say beyond its keys, and
+    /// because all three want the same room: a notice wins it, [`QUOTA_NOTE`] takes it when there
+    /// is no notice, and every other state has only keys to write there.
     fn hint(&self) -> String {
-        let keys = match &self.install {
+        let (keys, note) = match &self.install {
             // With no install in flight the login owns the line, because it is the only other
             // thing here that binds keys of its own.
             InstallState::Idle => match &self.auth {
-                AuthState::Idle => HINT_IDLE,
-                AuthState::Choosing { .. } => HINT_CHOOSING,
-                AuthState::Starting { .. } | AuthState::Running { .. } => HINT_AUTH_RUNNING,
+                AuthState::Idle => (HINT_IDLE, Some(QUOTA_NOTE)),
+                AuthState::Choosing { .. } => (HINT_CHOOSING, None),
+                AuthState::Starting { .. } | AuthState::Running { .. } => (HINT_AUTH_RUNNING, None),
             },
             // A pre-flight is one registry read and one `HEAD`, so this is usually gone before it
             // is read — but `x` is offered here too, because a plan task that ends without a frame
             // would otherwise leave no way out of this state (review finding, MOD-20 T8).
-            InstallState::Planning { .. } => HINT_RUNNING,
-            InstallState::Pending { .. } => HINT_PENDING,
-            InstallState::Running { .. } => HINT_RUNNING,
-            InstallState::Manual { .. } => HINT_MANUAL,
+            InstallState::Planning { .. } => (HINT_RUNNING, None),
+            InstallState::Pending { .. } => (HINT_PENDING, None),
+            InstallState::Running { .. } => (HINT_RUNNING, None),
+            InstallState::Manual { .. } => (HINT_MANUAL, None),
         };
-        match &self.notice {
-            Some(notice) => format!("{keys} \u{b7} {notice}"),
-            None => keys.to_owned(),
+        match (&self.notice, note) {
+            (Some(notice), _) => format!("{keys} \u{b7} {notice}"),
+            (None, Some(note)) => format!("{keys} \u{b7} {note}"),
+            (None, None) => keys.to_owned(),
         }
     }
 
-    /// The seven-column table, with the cursor row accented.
+    /// The eight-column table, with the cursor row accented.
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let rows = self.agents.iter().map(|summary| {
             let agent = &summary.agent;
+            let quota = quota_cell(summary);
             let on_box = self.on_box_cell(summary);
             let style = if agent.enabled {
                 ctx.theme.base
@@ -966,6 +993,7 @@ impl AgentsSection {
                     if agent.enabled { "yes" } else { "no" },
                     style,
                 )),
+                Cell::from(Line::styled(quota, ctx.theme.dim)),
                 Cell::from(Line::styled(on_box, ctx.theme.dim)),
             ])
         });
@@ -977,10 +1005,15 @@ impl AgentsSection {
             Cell::from("models"),
             Cell::from("default"),
             Cell::from("enabled"),
+            Cell::from("quota"),
             Cell::from("on this box"),
         ])
         .style(ctx.theme.title);
 
+        // `quota` is the seventh and `on this box` stays eighth, so the one `Min` column is still
+        // the last: the widest cell either can hold is `62% to 09-08 08:00` (18) and
+        // `downloading 12.0 MB` (19), and 55 fixed + 19 + 11 + 7 spaces = 92 leaves the eighth
+        // column room to grow into on the 98 the bordered section draws in (hazard H-12).
         let table = Table::new(
             rows,
             [
@@ -990,6 +1023,7 @@ impl AgentsSection {
                 Constraint::Length(6),
                 Constraint::Length(9),
                 Constraint::Length(7),
+                Constraint::Length(19),
                 Constraint::Min(11),
             ],
         )
@@ -1209,6 +1243,100 @@ fn declares_a_source(launch: &Value) -> bool {
         .ok()
         .and_then(|launch| launch.discovery)
         .is_some_and(|discovery| discovery.install.is_some())
+}
+
+/// The `quota` column of one row (`R-TUI-8`, MOD-2 D73).
+///
+/// Read off `agent_box.quota` the way [`AgentsSection::on_box_cell`] reads `probe.status`: **by
+/// key**, off a [`Value`]. That is what keeps this column free of the driver crate, and it is also
+/// `R-AGT-5` — nothing here is keyed on an agent's name, only on what its row says.
+///
+/// Three answers and a fallback, in the order `docs/ANA-4.md` §7 describes the document: the
+/// tightest window as a percentage with its reset when the blob has windows; the session spend
+/// when it has only that (a `per_token` row has no allowance to be a fraction of, so what has been
+/// spent is the only true thing to say); and [`NONE`] for a box with no `agent_box` row, a row with
+/// no blob, or a blob this build does not understand. A vendor shape nobody has written a mapper
+/// for is the last of those, and it renders as nothing rather than as a guess.
+///
+/// Refreshing is deliberately not offered: a probe handshake reports no allowance, so `r` cannot
+/// (§7), and [`QUOTA_NOTE`] says so.
+fn quota_cell(summary: &AgentSummary) -> String {
+    let Some(quota) = summary.on_box.as_ref().and_then(|row| row.quota.as_ref()) else {
+        return NONE.to_owned();
+    };
+    if let Some((utilization, window)) = tightest_window(quota) {
+        // `{:.0}` rather than a cast: `0.57 * 100.0` is `56.99999999999999`, so an `as u32` would
+        // report a fifty-seven-percent window as `56%`. A rounding format reads it as written.
+        let percentage = format!("{:.0}%", utilization * 100.0);
+        return match reset_of(window) {
+            Some(resets) => format!("{percentage} to {resets}"),
+            None => percentage,
+        };
+    }
+    quota
+        .get("spend")
+        .and_then(|spend| spend.get("session_micros"))
+        .and_then(Value::as_i64)
+        // The `usage_line` cast precedent (`chat/transcript.rs`): micros are money, and a figure
+        // this column has room for is nowhere near `f64`'s exact range.
+        .map_or_else(
+            || NONE.to_owned(),
+            |micros| format!("${:.2} spent", micros as f64 / 1_000_000.0),
+        )
+}
+
+/// The window a row is closest to the end of: the highest `utilization`, and the lowest `id` of
+/// the ones that tie.
+///
+/// The tie is broken on the `id` rather than on the array's own order so that two sources which
+/// serialise the same allowance in a different order render the same cell. A window carrying no
+/// numeric `utilization` is not one this column can render, so it is not a candidate at all —
+/// which is also why a blob with `"windows": []` falls through to the spend.
+fn tightest_window(quota: &Value) -> Option<(f64, &Value)> {
+    quota
+        .get("windows")?
+        .as_array()?
+        .iter()
+        .filter_map(|window| {
+            window
+                .get("utilization")
+                .and_then(Value::as_f64)
+                .map(|utilization| (utilization, window))
+        })
+        .reduce(|tightest, next| {
+            let (utilization, window) = next;
+            if utilization > tightest.0
+                || (utilization == tightest.0 && window_id(window) < window_id(tightest.1))
+            {
+                next
+            } else {
+                tightest
+            }
+        })
+}
+
+/// A window's `id`, or the empty string for one that carries none — enough to break a tie with.
+fn window_id(window: &Value) -> &str {
+    window.get("id").and_then(Value::as_str).unwrap_or_default()
+}
+
+/// A window's `resets_at` as the column says it: `%m-%d %H:%M`, in UTC.
+///
+/// Hazard H-18: this parse runs on the UI task and the string comes from an agent, so
+/// [`DateTime::parse_from_rfc3339`] is taken through `ok()`. A malformed one renders the
+/// percentage alone, which is still the true half of the answer, and never brings a frame down.
+/// The year is left off because the cell is 19 characters wide and a reset a year out is not what
+/// this column exists to warn about.
+fn reset_of(window: &Value) -> Option<String> {
+    let resets_at = window.get("resets_at")?.as_str()?;
+    DateTime::parse_from_rfc3339(resets_at)
+        .ok()
+        .map(|resets_at| {
+            resets_at
+                .with_timezone(&Utc)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
 }
 
 /// The progress cell of one frame (MOD-20 D19).
