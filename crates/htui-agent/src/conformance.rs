@@ -31,8 +31,9 @@ use chrono::{DateTime, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, DocumentHead, EventKind, EventRole,
-    Item, ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, Quota, QuotaSource,
-    RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepId, normalize,
+    Item, ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, PER_TOKEN_CAP_RUN,
+    Quota, QuotaSource, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepId,
+    normalize,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore, Result as StoreResult, UpdateOutcome, WriteStore};
@@ -49,7 +50,10 @@ use crate::event::{
     PermissionRequestEvent, StopReason, TerminalReason, TextChunk, ToolCallEvent, ToolKind,
     ToolResultEvent, ToolResultStatus, UsageEvent,
 };
-use crate::record::{AnsweredBy, CHUNK_FLUSH_BYTES, QuotaLatch, RecordError, Recorder, pump};
+use crate::record::{
+    AnsweredBy, CAP_EXCEEDED, CHUNK_FLUSH_BYTES, CapBreach, QuotaLatch, RecordError, Recorder,
+    RecorderSummary, RunCap, pump,
+};
 
 // ---------------------------------------------------------------------------------------------
 // The script language
@@ -133,6 +137,7 @@ pub const CASES: &[&str] = &[
     "done_precedes_next_follow_up",
     "usage_deltas_sum_to_step_usage",
     "quota_blob_latches_agent_box",
+    "run_cap_breach_cancels_within_one_event",
     "unknown_update_lands_in_other",
     "edit_proposal_deduped_per_call_and_path",
     "chunk_flush_at_16kib",
@@ -162,6 +167,9 @@ pub async fn run_case<H: CaseHarness, S: WriteStore>(name: &str, harness: &H, st
         "done_precedes_next_follow_up" => done_precedes_next_follow_up(harness, store).await,
         "usage_deltas_sum_to_step_usage" => usage_deltas_sum_to_step_usage(harness, store).await,
         "quota_blob_latches_agent_box" => quota_blob_latches_agent_box(harness, store).await,
+        "run_cap_breach_cancels_within_one_event" => {
+            run_cap_breach_cancels_within_one_event(harness, store).await;
+        }
         "unknown_update_lands_in_other" => unknown_update_lands_in_other(harness, store).await,
         "edit_proposal_deduped_per_call_and_path" => {
             edit_proposal_deduped_per_call_and_path(harness, store).await;
@@ -1467,6 +1475,269 @@ async fn quota_blob_latches_agent_box<H: CaseHarness, S: WriteStore>(harness: &H
         assert!(!document.exhausted);
         assert_eq!(document.spend.currency.as_deref(), Some("USD"));
     }
+}
+
+/// One capped session played to its end, and everything a cap assertion needs from it.
+///
+/// A struct rather than a tuple because five of the six things this case reads about a run are
+/// only observable in different places: the rows in the store, the verdict in the summary, the
+/// turn's end in [`pump`]'s return, `run_step.usage` in the [`UsageSpy`], and the step's identity
+/// in the log's own key.
+struct Played {
+    /// The persisted log, in `seq` order.
+    log: Vec<SessionEvent>,
+    /// What the recorder said it wrote, including [`RecorderSummary::cap_breach`].
+    summary: RecorderSummary,
+    /// The `done` the turn ended with, as the loop that drove it reported it.
+    stop: DoneEvent,
+    /// Every `set_step_usage` call, so the running spend the cap compared against is observable.
+    usage_calls: Vec<UsageCall>,
+    /// The step, for [`without_identity`].
+    step: StepId,
+    /// The transport's session id, for [`without_identity`].
+    session: Option<AgentSessionRef>,
+}
+
+/// Plays one script through a recorder carrying `cap` (`None` = unbounded) and reports what it
+/// wrote.
+///
+/// The grace is **zero**, which is what [`RunCap::grace`] carrying it rather than [`pump`] taking
+/// it is for: a suite that waited out a real cancel window would pay for it once per case, and the
+/// fake owns no child process to wait for (`cancel_answers_parked_permissions` passes zero for the
+/// same reason).
+async fn play_capped<H: CaseHarness, S: WriteStore>(
+    harness: &H,
+    store: &S,
+    cap: Option<i64>,
+    script: Script,
+) -> Played {
+    let scrubber = scrubber();
+    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let session_ref = session.session_ref().cloned();
+    let spy = UsageSpy::new(store);
+    let mut recorder = Recorder::new(&spy, &scrubber, chat.step_id, false, None);
+    if let Some(micros) = cap {
+        recorder = recorder.with_run_cap(RunCap {
+            micros,
+            grace: Duration::from_millis(0),
+        });
+    }
+    recorder
+        .record_prompt(PROMPT, prompt_sections(), epoch())
+        .await
+        .expect("run_cap_breach_cancels_within_one_event: the prompt row must land");
+    let stop = pump(session.as_mut(), &mut recorder)
+        .await
+        .expect("run_cap_breach_cancels_within_one_event: the turn must reach an end");
+    let summary = recorder
+        .finish()
+        .await
+        .expect("run_cap_breach_cancels_within_one_event: the recorder must close cleanly");
+    Played {
+        log: rows(store, chat.step_id).await,
+        summary,
+        stop,
+        usage_calls: spy.calls(),
+        step: chat.step_id,
+        session: session_ref,
+    }
+}
+
+/// The per-run cap of `docs/ANA-4.md` §7 (`:1143-1150`, as amended by plan D69) and §11 criterion
+/// 8: the session is cancelled **within one event** of the breach and the step's last two rows are
+/// `error{code:"cap_exceeded"}` then `done{stop_reason:"cancelled"}`.
+///
+/// "Within one event" is asserted as adjacency — the row after the breaching `usage` row is the
+/// `error` — which is the strongest form of the claim and the one this script can make: no tool
+/// call is open, so the cancel synthesizes nothing to sit in between. The interleaving where it
+/// does (an open call gets a `tool_result` between the two) is `tests/recorder.rs`'s, because the
+/// row it inserts is a property of a transport's cancel and not of the cap.
+///
+/// Transport-neutral by construction (criterion 1): the *detection* is the recorder's, the
+/// *cancel* is [`crate::record::enforce_breach`]'s, and neither knows which transport is on the
+/// other side of the [`AgentSession`] it holds. Four runs, because a guard rail has to be provably
+/// off as well as on.
+async fn run_cap_breach_cancels_within_one_event<H: CaseHarness, S: WriteStore>(
+    harness: &H,
+    store: &S,
+) {
+    // The deltas `usage_deltas_sum_to_step_usage` uses, so the running spend is 100 then 350: a
+    // cap of 300 is crossed by the second report and by no other number in the script.
+    let usage = |used: i64, cost: i64| {
+        ScriptEvent::Emit(DriverEvent::Usage(UsageEvent {
+            cost_micros: Some(cost),
+            context_used: Some(used),
+            context_size: Some(200_000),
+            ..UsageEvent::default()
+        }))
+    };
+
+    // --- (a) the cap is reached by the second report -------------------------------------------
+    // The turn has no `done` of its own: only the cap's cancel can end it, so a build that
+    // detected the breach and forgot to cancel reaches `ExpectCancel` and fails as a transport
+    // error rather than hanging (`ScriptEvent::ExpectCancel`).
+    let breached = play_capped(
+        harness,
+        store,
+        Some(300),
+        Script::one_turn(vec![
+            usage(1_000, 100),
+            usage(2_000, 250),
+            ScriptEvent::ExpectCancel,
+        ]),
+    )
+    .await;
+
+    assert_eq!(
+        breached.stop.stop_reason,
+        StopReason::Cancelled,
+        "run_cap_breach_cancels_within_one_event: a capped turn ends `cancelled`, whatever the \
+         transport's own `done` said"
+    );
+    let breaching = breached
+        .log
+        .iter()
+        .rposition(|row| row.kind == EventKind::Usage)
+        .expect("run_cap_breach_cancels_within_one_event: the breaching usage row is persisted");
+    assert_eq!(
+        breached.summary.cap_breach,
+        Some(CapBreach {
+            cap_micros: 300,
+            spent_micros: 350,
+            at: breached.log[breaching].at,
+        }),
+        "run_cap_breach_cancels_within_one_event: the verdict names the cap, the spend that \
+         reached it and the row that did"
+    );
+    assert_eq!(
+        breached.log[breaching + 1].kind,
+        EventKind::Error,
+        "run_cap_breach_cancels_within_one_event: `within one event of the breach` is the row \
+         after the breaching one, with no open call for the cancel to synthesize a result for: \
+         {:?}",
+        kinds(&breached.log)
+    );
+    let error = &breached.log[breaching + 1];
+    assert_eq!(str_at(error, "code"), Some(CAP_EXCEEDED));
+    assert_eq!(
+        error.role,
+        EventRole::Htui,
+        "run_cap_breach_cancels_within_one_event: `htui` authored this row, not the agent"
+    );
+    assert!(
+        str_at(error, "message").is_some_and(|message| message.contains(PER_TOKEN_CAP_RUN)),
+        "run_cap_breach_cancels_within_one_event: the message names the setting an operator \
+         would go and change: {:?}",
+        str_at(error, "message")
+    );
+    assert_eq!(
+        kinds(&breached.log[breached.log.len() - 2..]),
+        vec![EventKind::Error, EventKind::Done],
+        "run_cap_breach_cancels_within_one_event: the step's last two rows (criterion 8)"
+    );
+    assert_eq!(
+        breached
+            .log
+            .last()
+            .and_then(|row| str_at(row, "stop_reason")),
+        Some(StopReason::Cancelled.as_str()),
+        "run_cap_breach_cancels_within_one_event: and the last of them says `cancelled`"
+    );
+    assert_eq!(
+        breached
+            .log
+            .iter()
+            .filter(|row| row.kind == EventKind::Done)
+            .count(),
+        1,
+        "run_cap_breach_cancels_within_one_event: exactly one `done` per turn still holds (§4.1) \
+         — the transport's own is withheld, not recorded beside this one"
+    );
+    assert_eq!(
+        breached
+            .usage_calls
+            .last()
+            .and_then(|call| call.usage.get("cost_micros").cloned()),
+        Some(json!(350)),
+        "run_cap_breach_cancels_within_one_event: the breaching row was summed exactly once, so \
+         `run_step.usage` is the spend the verdict compared against"
+    );
+
+    // --- (b) the same script under a cap it never reaches --------------------------------------
+    let under = play_capped(
+        harness,
+        store,
+        Some(1_000),
+        Script::one_turn(vec![
+            usage(1_000, 100),
+            usage(2_000, 250),
+            done(StopReason::EndTurn),
+        ]),
+    )
+    .await;
+    assert_eq!(under.stop.stop_reason, StopReason::EndTurn);
+    assert_eq!(
+        under.summary.cap_breach, None,
+        "run_cap_breach_cancels_within_one_event: a session under its cap reports no breach"
+    );
+    assert!(
+        !under.log.iter().any(|row| row.kind == EventKind::Error),
+        "run_cap_breach_cancels_within_one_event: and writes no `error` row: {:?}",
+        kinds(&under.log)
+    );
+
+    // --- (c) the same script with no cap at all ------------------------------------------------
+    let unbounded = play_capped(
+        harness,
+        store,
+        None,
+        Script::one_turn(vec![
+            usage(1_000, 100),
+            usage(2_000, 250),
+            done(StopReason::EndTurn),
+        ]),
+    )
+    .await;
+    assert_eq!(unbounded.summary.cap_breach, None);
+    assert_eq!(
+        without_identity(&unbounded.log, unbounded.step, unbounded.session.as_ref()),
+        without_identity(&under.log, under.step, under.session.as_ref()),
+        "run_cap_breach_cancels_within_one_event: an absent cap is unbounded, not a cap of zero — \
+         the rows are the ones a cap nobody reached produced, down to the `at`s (plan D70)"
+    );
+
+    // --- (d) a cap below the first report's own delta -------------------------------------------
+    let immediate = play_capped(
+        harness,
+        store,
+        Some(50),
+        Script::one_turn(vec![usage(1_000, 100), ScriptEvent::ExpectCancel]),
+    )
+    .await;
+    assert_eq!(immediate.stop.stop_reason, StopReason::Cancelled);
+    assert_eq!(
+        immediate
+            .summary
+            .cap_breach
+            .map(|breach| breach.spent_micros),
+        Some(100),
+        "run_cap_breach_cancels_within_one_event: a cap under one report's delta is reached by \
+         that report, not missed by it (`spent >= cap`)"
+    );
+    assert_eq!(
+        immediate
+            .log
+            .iter()
+            .filter(|row| row.kind == EventKind::Usage)
+            .count(),
+        1,
+        "run_cap_breach_cancels_within_one_event: and nothing after it was pulled: {:?}",
+        kinds(&immediate.log)
+    );
+    assert_eq!(
+        kinds(&immediate.log[immediate.log.len() - 2..]),
+        vec![EventKind::Error, EventKind::Done]
+    );
 }
 
 /// A protocol update this event model does not map lands as kind `other` with its body verbatim,

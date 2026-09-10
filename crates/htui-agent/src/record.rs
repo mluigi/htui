@@ -2,7 +2,7 @@
 //! `session_event` log.
 //!
 //! A [`Recorder`] turns the driver's per-chunk event stream into the row set ANA-9 §4.3 asks for.
-//! It owns five things no one else may own:
+//! It owns six things no one else may own:
 //!
 //! 1. **Coalescing.** A contiguous run of [`DriverEvent::AssistantChunk`] /
 //!    [`DriverEvent::ThoughtChunk`] becomes one `assistant_text` / `thought` row. The flush
@@ -49,7 +49,15 @@
 //!    through [`WriteStore::set_agent_box_quota`]. Opt-in ([`Recorder::with_quota_latch`]),
 //!    best-effort — a refused allowance write never fails a turn — and silent when a row has
 //!    nothing to say, which is what keeps a turn's first, blob-less report from erasing the last
-//!    one. The cap that reads the same figure lands in milestone 7's second half.
+//!    one.
+//! 6. **The per-run cap** (`docs/ANA-4.md` §7 `:1143-1150`, §11 criterion 8, plan D69-D70). The
+//!    same fact that makes the recorder the latch's home makes it the cap's: it is the only place
+//!    that sees every `usage` row. What it does with the cap is **detect** — [`Recorder::record`]
+//!    returns a [`CapBreach`] on the one row whose running spend reached
+//!    [`RunCap::micros`] — and the cancel is [`enforce_breach`]'s, called by a layer that holds the
+//!    session. §7 as written puts the cancel here too; it cannot be here, because a `Recorder` with
+//!    a session in it is a recorder the conformance suite could not drive with no transport at all,
+//!    and plan D69 is the maintainer's record of that amendment.
 //!
 //! **Fail-closed.** When the scrubber returns [`Unmasked`] the recorder drops that row entirely,
 //! writes `error { code: "scrub_residue", message: "<rule> at <path>" }` with role `htui` in its
@@ -62,11 +70,12 @@
 //! nothing else; choosing `append_pending` over the store is milestone 4 (plan D8, D16).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use htui_core::model::{
-    AgentId, Billing, BoxId, EventKind, EventRole, QuotaSource, SessionEvent, StepId, UsageTotals,
-    quota::normalize,
+    AgentId, Billing, BoxId, EventKind, EventRole, PER_TOKEN_CAP_RUN, QuotaSource, SessionEvent,
+    StepId, UsageTotals, quota::normalize,
 };
 use htui_core::scrub::{Scrubber, Unmasked};
 use htui_core::store::{StoreError, WriteStore};
@@ -78,7 +87,7 @@ use tokio::sync::mpsc;
 
 use crate::driver::{AgentSession, PermissionRequestId};
 use crate::error::DriverError;
-use crate::event::{DoneEvent, DriverEnvelope, DriverEvent};
+use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, ErrorEvent, StopReason};
 
 /// Flush trigger 4: the accumulated text a coalesced run may reach before it is cut.
 ///
@@ -88,6 +97,14 @@ pub const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 
 /// `error.code` of the row the recorder writes in place of a payload the scrubber refused.
 const SCRUB_RESIDUE: &str = "scrub_residue";
+
+/// `error.code` of the row the recorder writes when the per-run cap is reached
+/// (`docs/ANA-4.md` §7 `:1143-1150`, §11 criterion 8).
+///
+/// Public because it is what a reader of the log matches on: the chat tab renders the row, and
+/// `crates/htui/src/agent_worker.rs`'s own cases assert the code rather than the message, which is
+/// prose and may be reworded.
+pub const CAP_EXCEEDED: &str = "cap_exceeded";
 
 /// What the passive latch of `docs/ANA-4.md` §7 (`:1131-1135`) needs (plan D66-D68): which
 /// `agent_box` row to write, and the two row-side facts the document carries.
@@ -106,6 +123,39 @@ pub struct QuotaLatch {
     pub source: QuotaSource,
     /// `agent.billing`, which the §7 document carries so a reader knows what `spend` means.
     pub billing: Billing,
+}
+
+/// The per-run cap (plan D70) and the grace the cancel it triggers may take (plan D69).
+///
+/// `micros` is `project.settings.per_token_cap_run`, in **USD micros** — the unit
+/// `UsageTotals::cost_micros` already sums, so the comparison is integer arithmetic and not a
+/// rounding argument. A cap of `0` is a real cap and cancels on the first row that reports any USD
+/// cost; an *absent* cap is [`Recorder::with_run_cap`] never being called.
+///
+/// The grace rides here rather than on [`pump`] so that seam keeps its signature (blueprint H-9):
+/// the worker passes its own `CANCEL_GRACE`, the conformance suite passes zero, and eighteen call
+/// sites do not move to carry a value only one of them has an opinion about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunCap {
+    /// The cap in USD micros.
+    pub micros: i64,
+    /// How long the cancel this cap triggers may wait before the process tree is killed.
+    pub grace: Duration,
+}
+
+/// The verdict [`Recorder::record`] returns **once** per session: the row that took the running USD
+/// spend to or past the cap.
+///
+/// `spent >= cap` is the same comparison `R-AGT-8`'s "the per-token cap is already reached" makes
+/// (`docs/ANA-4.md` §7), so a cap and a spend that are equal is a breach and not a near miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapBreach {
+    /// The cap that was reached, in USD micros.
+    pub cap_micros: i64,
+    /// The session's running spend at the breaching row, in USD micros.
+    pub spent_micros: i64,
+    /// The breaching row's capture time, which the `error` row that follows it carries.
+    pub at: DateTime<Utc>,
 }
 
 /// `TIMESTAMPTZ` keeps microseconds, so a capture time is truncated to microseconds before it is
@@ -208,6 +258,11 @@ pub struct RecorderSummary {
     pub usage: Value,
     /// Render frames the bounded UI channel could not take.
     pub dropped: usize,
+    /// The one per-run cap breach of this session, if it had one (plan D70).
+    ///
+    /// A property of the *session*, not of the last row: it is set once, by the row that reached
+    /// the cap, and a later row never replaces it.
+    pub cap_breach: Option<CapBreach>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -275,6 +330,11 @@ pub struct Recorder<'a, S: WriteStore> {
     /// turn's first report carries no `_meta` (blueprint H-3), and a document assembled from that
     /// row alone would say "no windows" about an allowance nobody re-reported.
     last_quota_raw: Option<Value>,
+    /// Plan D70: the per-run cap this session is bounded by, or `None` for an unbounded run.
+    run_cap: Option<RunCap>,
+    /// Set by the first breach and never cleared: a later `usage` row reports no second verdict,
+    /// because the session it would cancel is already being closed.
+    cap_breached: Option<CapBreach>,
     residue: Option<Unmasked>,
     dropped: usize,
     rows: usize,
@@ -298,6 +358,8 @@ impl<S: WriteStore> core::fmt::Debug for Recorder<'_, S> {
             // Whether a latch is configured, not which row it names: the identity of the row is
             // not what a recorder log is about either.
             .field("quota_latch", &self.quota_latch.is_some())
+            .field("run_cap", &self.run_cap)
+            .field("cap_breached", &self.cap_breached)
             .finish()
     }
 }
@@ -335,6 +397,8 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             usage_dirty: false,
             quota_latch: None,
             last_quota_raw: None,
+            run_cap: None,
+            cap_breached: None,
             residue: None,
             dropped: 0,
             rows: 0,
@@ -351,6 +415,33 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     pub fn with_quota_latch(mut self, latch: QuotaLatch) -> Self {
         self.quota_latch = Some(latch);
         self
+    }
+
+    /// Bounds this run by a per-run cap (`docs/ANA-4.md` §7 `:1143-1150`, plan D69-D70).
+    ///
+    /// A builder for [`Recorder::with_quota_latch`]'s reason and one more: an absent cap has to
+    /// mean *unbounded* rather than zero (plan D70), and a parameter would make every caller state
+    /// an opinion about a setting most projects do not have.
+    ///
+    /// What the recorder does with it is **detect**, and nothing else: [`Recorder::record`] returns
+    /// the verdict and the layer holding the session performs the cancel
+    /// ([`enforce_breach`]). That is plan D69's amendment to §7, and the reason for it is that a
+    /// recorder with a session in it would be a recorder the conformance suite could not drive with
+    /// no transport at all.
+    #[must_use]
+    pub fn with_run_cap(mut self, cap: RunCap) -> Self {
+        self.run_cap = Some(cap);
+        self
+    }
+
+    /// The per-run cap this recorder was configured with, if any.
+    ///
+    /// [`enforce_breach`] reads it for the grace: the cancel is performed by a layer that holds the
+    /// session and not the configuration, and this is how the two meet without [`pump`] growing a
+    /// parameter (blueprint H-9).
+    #[must_use]
+    pub const fn run_cap(&self) -> Option<RunCap> {
+        self.run_cap
     }
 
     /// Render frames the bounded UI channel could not take, so far.
@@ -515,15 +606,26 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// those false positives in masking, and this is where the recorder keeps one from becoming a
     /// failed turn.
     ///
+    /// **The return value is the cap verdict** (plan D69-D70): `Some` on the one `usage` row whose
+    /// running spend reached [`RunCap::micros`], and `None` on every other row of every session,
+    /// including every later row of a session that already breached. A caller that holds the
+    /// session answers it with [`enforce_breach`]; a caller that does not — a replay, an uploader,
+    /// a test asserting on rows — may ignore it, which is why it is not `#[must_use]`.
+    ///
     /// # Errors
     /// [`RecordError::Store`] when a flush fails, [`RecordError::Encode`] when the event cannot
     /// be represented as JSON at all.
-    pub async fn record(&mut self, envelope: DriverEnvelope) -> Result<(), RecordError> {
+    pub async fn record(
+        &mut self,
+        envelope: DriverEnvelope,
+    ) -> Result<Option<CapBreach>, RecordError> {
         let kind = EventKind::from(&envelope.event);
         let (event, payload, raw) = match self.scrub_envelope(&envelope) {
             Ok(triple) => triple,
             Err(ScrubRefusal::Unmasked(unmasked)) => {
-                return self.refuse(unmasked, envelope.at).await;
+                // A row that was never persisted spent nothing: a refused payload is not a `usage`
+                // report, whatever its event said it was.
+                return self.refuse(unmasked, envelope.at).await.map(|()| None);
             }
             Err(ScrubRefusal::Encode(message)) => return Err(RecordError::Encode(message)),
         };
@@ -552,6 +654,8 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         }
 
         let mut reached_bound = false;
+        // The cap verdict, set by the one `usage` row that reaches the cap (plan D70).
+        let mut breach = None;
         // Which buffered row this envelope became, so its `raw` lands on *that* row rather than
         // on whichever row happens to be last (the dedup arm updates a row further back).
         let target = match (&scrubbed.event, chunk) {
@@ -612,6 +716,10 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
                     self.usage.add_payload(&payload);
                     self.usage_dirty = true;
                     self.latch_quota(&payload, scrubbed.at).await;
+                    // After the latch, so a breached run still publishes the allowance the row it
+                    // died on reported: the cancel below is what ends the session, and the column
+                    // three readers render should not lose the last thing the vendor said.
+                    breach = self.check_cap(scrubbed.at);
                 }
                 self.push(PendingRow {
                     kind,
@@ -646,7 +754,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         }
 
         self.send_ui(scrubbed);
-        Ok(())
+        Ok(breach)
     }
 
     /// Trigger 5: closes the session's log.
@@ -671,6 +779,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             prompt_digest: self.prompt_digest.clone(),
             usage: self.usage.to_value(),
             dropped: self.dropped,
+            cap_breach: self.cap_breached,
         })
     }
 
@@ -849,6 +958,141 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         }
     }
 
+    /// The cap comparison of `docs/ANA-4.md` §7 (`:1143-1150`, plan D70): `Some` exactly once per
+    /// session, on the row that took the running spend to or past the cap.
+    ///
+    /// Three `?`s and an `if`, and each of them is a rule:
+    ///
+    /// - **no cap** is unbounded, not a cap of zero (plan D70's own sentence about an absent key);
+    /// - **no USD spend** cannot reach a cap denominated in USD micros, so a context-only report —
+    ///   `agy`'s whole shape and the first rows of every `claude` turn — never breaches, and a cap
+    ///   of `0` waits for the first *costed* row rather than firing on the first row (blueprint
+    ///   H-5). `usage.cost_micros` is `None` until a report carries a USD cost, which is also what
+    ///   a non-USD cost leaves it as (`acp::map`), so a cap has nothing to compare against there
+    ///   either and says so instead of guessing a conversion;
+    /// - **once**: a session that has breached is already being cancelled, and a second verdict
+    ///   would send a second cancel and write a second pair of closing rows.
+    ///
+    /// `>=` and not `>`: `R-AGT-8` reads "the per-token cap is **already reached**", so a spend
+    /// equal to the cap is a breach.
+    fn check_cap(&mut self, at: DateTime<Utc>) -> Option<CapBreach> {
+        let cap = self.run_cap?;
+        let spent = self.usage.cost_micros?;
+        if self.cap_breached.is_some() || spent < cap.micros {
+            return None;
+        }
+        let breach = CapBreach {
+            cap_micros: cap.micros,
+            spent_micros: spent,
+            at,
+        };
+        self.cap_breached = Some(breach);
+        Some(breach)
+    }
+
+    /// The two closing rows of `docs/ANA-4.md` §7 and §11 criterion 8, in this order and last:
+    /// `error { code: "cap_exceeded", message }` with role `htui` — as every row the recorder
+    /// authors itself — then `done { stop_reason: "cancelled" }`.
+    ///
+    /// `transport_done` is the transport's **own** turn end, taken off the stream by
+    /// [`enforce_breach`] and deliberately not recorded as it stood: its `stop_reason` may say
+    /// `end_turn` when the agent finished inside the grace window (blueprint H-4), and criterion 8
+    /// says the last row says `cancelled`. Its `at` and its `raw` are kept on the row written in
+    /// its place, so `keep_raw_events` still explains where that row came from; a `raw` the
+    /// scrubber refuses is **dropped** rather than refusing the row, because the row itself is
+    /// `htui`'s prose and dropping a debugging blob is cheaper than losing the log's last two rows.
+    /// Exactly one `done` per turn (§4.1) therefore still holds.
+    ///
+    /// Both rows are buffered **before** the flush that writes them, which is what makes a store
+    /// that refuses cost a retry rather than criterion 8 (blueprint H-2): the breaching `usage`
+    /// row, the `error` and the `done` are owed together, in that order, at the `seq` they were
+    /// given, and [`Recorder::finish`] writes them.
+    ///
+    /// Public because [`enforce_breach`] is the shared sequence and lives outside the type; a
+    /// caller that reaches for this directly is writing its own cancel, and plan D69 says there
+    /// should be exactly one.
+    ///
+    /// # Errors
+    /// [`RecordError::Store`] when the flush or the `run_step.usage` write fails,
+    /// [`RecordError::Encode`] when the two rows cannot be represented as JSON — which is
+    /// unreachable for two structs of `String`s, and is not worth a `panic` to prove.
+    pub async fn record_cap_breach(
+        &mut self,
+        breach: CapBreach,
+        transport_done: Option<DriverEnvelope>,
+    ) -> Result<(), RecordError> {
+        let error = ErrorEvent {
+            code: CAP_EXCEEDED.to_owned(),
+            // "Estimated", because it is: ANA-4 §7 frames a client-side cap as a guard rail and
+            // never as a billing statement, and the risk table asks that the row say so.
+            //
+            // **Both figures carry their micros**, not only the cap's. Four decimal places is the
+            // `usage_line` precedent (`chat/transcript.rs`), and at sub-cent amounts it renders a
+            // spend of 350 and a cap of 300 as `$0.0003` twice — a row that says the cap was
+            // reached and cannot say by how much. The micros are the number an operator would go
+            // and edit, so they belong in the row that told them to.
+            message: format!(
+                "per-run cap reached: an estimated ${:.4} ({} micros) spent against a cap of \
+                 ${:.4} (project.settings.{PER_TOKEN_CAP_RUN} = {} micros); the session was \
+                 cancelled",
+                breach.spent_micros as f64 / 1e6,
+                breach.spent_micros,
+                breach.cap_micros as f64 / 1e6,
+                breach.cap_micros,
+            ),
+        };
+        let done = DoneEvent {
+            stop_reason: StopReason::Cancelled,
+        };
+        let error_payload = encode(&error)?;
+        let done_payload = encode(&done)?;
+
+        let (done_at, done_raw) = match transport_done {
+            Some(envelope) => {
+                let raw = match (self.retain_raw, envelope.raw) {
+                    (true, Some(mut raw)) => self.scrubber.scrub(&mut raw).ok().map(|()| raw),
+                    _ => None,
+                };
+                (envelope.at, raw)
+            }
+            None => (breach.at, None),
+        };
+
+        self.push(PendingRow {
+            kind: EventKind::Error,
+            role: EventRole::Htui,
+            tool_call_id: None,
+            payload: error_payload,
+            raw: Vec::new(),
+            at: breach.at,
+        });
+        self.push(PendingRow {
+            kind: EventKind::Done,
+            role: EventRole::Htui,
+            tool_call_id: None,
+            payload: done_payload,
+            raw: done_raw.into_iter().collect(),
+            at: done_at,
+        });
+        self.flush().await?;
+        self.sync_step().await?;
+
+        // Both rows reach the chat tab, which is where a breach becomes visible to the user (plan
+        // D73: the `error` row *is* the visibility, and the tab renders it today). `raw: None` -
+        // the render path has never carried one.
+        self.send_ui(DriverEnvelope {
+            event: DriverEvent::Error(error),
+            raw: None,
+            at: breach.at,
+        });
+        self.send_ui(DriverEnvelope {
+            event: DriverEvent::Done(done),
+            raw: None,
+            at: done_at,
+        });
+        Ok(())
+    }
+
     /// Persists a row whose masked payload no longer reads back as its own event type.
     ///
     /// Masking is what broke it, so **nothing leaked and nothing is dropped**. An
@@ -883,11 +1127,16 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         payload: Value,
         raw: Option<Value>,
         at: DateTime<Utc>,
-    ) -> Result<(), RecordError> {
+    ) -> Result<Option<CapBreach>, RecordError> {
         self.flush().await?;
+        let mut breach = None;
         if kind == EventKind::Usage {
             self.usage.add_payload(&payload);
             self.usage_dirty = true;
+            // And it is **not** exempt from the cap either, for the same reason it is not exempt
+            // from the sum: the spend is real, the row records it, and a run that could dodge its
+            // cap by having one payload key masked would be a guard rail with a hole in it.
+            breach = self.check_cap(at);
         }
         let tool_call_id = payload
             .get("tool_call_id")
@@ -901,7 +1150,8 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             raw: raw.into_iter().collect(),
             at,
         });
-        self.flush().await
+        self.flush().await?;
+        Ok(breach)
     }
 
     /// The fail-closed path (`R-SEC-3`): drop the row, write a `scrub_residue` row in its place,
@@ -1000,6 +1250,15 @@ fn residue_row(unmasked: &Unmasked, at: DateTime<Utc>) -> PendingRow {
         raw: Vec::new(),
         at,
     }
+}
+
+/// One of the recorder's own events as the payload document it persists.
+///
+/// Pinned to the serde form rather than hand-built, unlike [`residue_row`]'s two constant strings:
+/// a hand-written `{"stop_reason": "cancelled"}` that drifted from [`DoneEvent`]'s serialisation
+/// would be a `done` row the chat tab and the replay path could no longer deserialise.
+fn encode<T: Serialize>(event: &T) -> Result<Value, RecordError> {
+    serde_json::to_value(event).map_err(|error| RecordError::Encode(error.to_string()))
 }
 
 /// `session_event.tool_call_id` for the events that name a call.
@@ -1118,6 +1377,10 @@ where
 /// caller runs `pump` once per prompt or follow-up. Envelopes after the `done` are left in the
 /// transport for the next turn.
 ///
+/// A turn that reaches its per-run cap ends `cancelled` rather than reaching the transport's own
+/// `done`: the breach verdict [`Recorder::record`] hands back is answered here, by
+/// [`enforce_breach`], because this is a layer that holds both the session and the recorder.
+///
 /// # Errors
 /// [`DriverError::Closed`] when the transport ends the stream without a `done`, whatever
 /// [`AgentSession::next_event`] returned otherwise, and the recorder's own failures mapped through
@@ -1134,9 +1397,65 @@ pub async fn pump<S: WriteStore>(
             DriverEvent::Done(done) => Some(*done),
             _ => None,
         };
-        recorder.record(envelope).await?;
+        if let Some(breach) = recorder.record(envelope).await? {
+            return enforce_breach(session, recorder, breach).await;
+        }
         if let Some(done) = done {
             return Ok(done);
         }
     }
+}
+
+/// The per-run cap's cancel-and-close sequence, performed by the layer that holds the session
+/// (plan D69 as amended by the blueprint's P-1).
+///
+/// **Why it is shared and not [`pump`]'s.** `Recorder` holds no session and must not: it is the
+/// type the conformance suite drives with no transport at all, which is exactly what makes the
+/// suite transport-neutral. So the cancel belongs to a loop that holds both — and there are **two**
+/// of those. `pump` is the one the suites and `tests/recorder.rs` drive; production drives
+/// `htui::agent_worker::run_turn`, which cannot be `pump` because `next_event` refuses while a
+/// permission request is parked, so the pull and the command channel have to be served by one
+/// loop. A sequence written into `pump` alone would be a cap the binary never enforced.
+///
+/// **The order, and why.** `cancel(grace)`; then pull what the cancel itself produced — the
+/// synthesized `tool_result` for every call it terminated (`docs/ANA-4.md` §4.3 makes those a
+/// MUST), any `error` the transport reports on its way out — into the log, **up to** the
+/// transport's own `done`, which is withheld; then the two closing rows
+/// ([`Recorder::record_cap_breach`]). The `done` is withheld rather than recorded because its
+/// `stop_reason` may say `end_turn` if the agent finished inside the grace window, and criterion 8
+/// says the last row says `cancelled`.
+///
+/// The grace comes off [`Recorder::run_cap`] rather than a parameter, which is what keeps `pump`'s
+/// signature and its eighteen call sites unchanged (blueprint H-9).
+///
+/// A **failed cancel is logged, not returned**: the kill path has already ended the session by
+/// then, and the rows still have to be written. Returning here would leave a log whose last row is
+/// the `usage` report that breached, and nothing saying why the conversation stopped.
+///
+/// # Errors
+/// The recorder's own, mapped through [`RecordError`]: a store that refuses the closing flush is
+/// reported to the caller, and the rows it numbered stay owed (blueprint H-2).
+pub async fn enforce_breach<S: WriteStore>(
+    session: &mut dyn AgentSession,
+    recorder: &mut Recorder<'_, S>,
+    breach: CapBreach,
+) -> Result<DoneEvent, DriverError> {
+    let grace = recorder.run_cap().map_or(Duration::ZERO, |cap| cap.grace);
+    if let Err(err) = session.cancel(grace).await {
+        tracing::warn!(%err, "the cap's cancel took the kill path; the closing rows are written anyway");
+    }
+    let mut transport_done = None;
+    while let Ok(Some(envelope)) = session.next_event().await {
+        if matches!(envelope.event, DriverEvent::Done(_)) {
+            transport_done = Some(envelope);
+            break;
+        }
+        // The verdict is spent, so this cannot answer `Some` again (`Recorder::check_cap`) - which
+        // is what keeps a second cancel out of a session that is already closing.
+        recorder.record(envelope).await?;
+    }
+    recorder.record_cap_breach(breach, transport_done).await?;
+    Ok(DoneEvent {
+        stop_reason: StopReason::Cancelled,
+    })
 }

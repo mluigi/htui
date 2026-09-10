@@ -83,7 +83,7 @@ impl CaseHarness for AcpHarness {
 async fn the_case_list_is_the_shared_one() {
     assert_eq!(
         conformance::CASES.len(),
-        14,
+        15,
         "adding a transport must add no case (`docs/ANA-4.md` §11 criterion 1)"
     );
 }

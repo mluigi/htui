@@ -25,7 +25,9 @@ use htui_agent::event::{
     PermissionOptionKind, PermissionRequestEvent, StopReason, TextChunk, ToolCallEvent, ToolKind,
     ToolResultEvent, ToolResultStatus, UsageEvent,
 };
-use htui_agent::record::{AnsweredBy, CHUNK_FLUSH_BYTES, QuotaLatch, RecordError, Recorder, pump};
+use htui_agent::record::{
+    AnsweredBy, CHUNK_FLUSH_BYTES, CapBreach, QuotaLatch, RecordError, Recorder, RunCap, pump,
+};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, DocumentHead, EventKind, EventRole,
@@ -397,6 +399,32 @@ impl htui_core::scrub::Scrubber for MaskKey {
 #[derive(Debug)]
 struct ScriptedSession {
     events: VecDeque<DriverEnvelope>,
+    /// What [`AgentSession::cancel`] puts on the wire, replacing whatever was still queued.
+    ///
+    /// Both real transports do exactly this: a cancel drops the rest of the turn, synthesizes a
+    /// `tool_result` for every call it terminated, and queues the turn's own `done`
+    /// (`fake.rs:404-436`, `acp/mod.rs`'s `cancel_session`). A stub that answered a cancel with an
+    /// empty queue could not exercise the cap's closing sequence at all, because the sequence is
+    /// defined by what the cancel produces.
+    on_cancel: Vec<DriverEnvelope>,
+}
+
+impl ScriptedSession {
+    /// A session that plays `events` and produces nothing of its own on a cancel.
+    fn new(events: Vec<DriverEnvelope>) -> Self {
+        Self {
+            events: VecDeque::from(events),
+            on_cancel: Vec::new(),
+        }
+    }
+
+    /// A session whose cancel drops what is queued and plays `on_cancel` instead.
+    fn cancelling(events: Vec<DriverEnvelope>, on_cancel: Vec<DriverEnvelope>) -> Self {
+        Self {
+            events: VecDeque::from(events),
+            on_cancel,
+        }
+    }
 }
 
 impl AgentSession for ScriptedSession {
@@ -417,7 +445,11 @@ impl AgentSession for ScriptedSession {
         Box::pin(async move { Err(DriverError::Closed) })
     }
     fn cancel<'a>(&'a mut self, _grace: Duration) -> DriverFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            self.events.clear();
+            self.events.extend(core::mem::take(&mut self.on_cancel));
+            Ok(())
+        })
     }
 }
 
@@ -1294,6 +1326,300 @@ async fn a_masked_usage_row_is_summed_but_not_latched() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// The per-run cap (`docs/ANA-4.md` §7 `:1143-1150`, §11 criterion 8, plan D69-D70)
+// ---------------------------------------------------------------------------------------------
+
+/// The cap the cases below record under: `micros` USD and a zero grace, which is what
+/// `RunCap.grace` riding on the configuration is for — a test that waited out a real cancel window
+/// would pay for it once per case, and a `ScriptedSession` owns no child process to wait for.
+fn run_cap(micros: i64) -> RunCap {
+    RunCap {
+        micros,
+        grace: Duration::from_millis(0),
+    }
+}
+
+/// The closing sequence of §11 criterion 8, with the one row that is allowed to sit inside it: a
+/// `tool_result` the transport's own cancel synthesized for a call that was still open.
+///
+/// The conformance case pins adjacency with no open call, which is the strongest form of "within
+/// one event". This is the other interleaving, and it is the *live* one — a cap breach mid-tool-call
+/// is exactly when a cancel has a call to terminate (`docs/ANA-4.md` §4.3 makes synthesizing that
+/// result a MUST, so the row cannot be suppressed to make the two closing rows adjacent). What
+/// criterion 8 actually asserts survives it: the **last two** rows are `error` then `done`.
+///
+/// It also pins that the verdict is reported **once**. `enforce_breach` records whatever the cancel
+/// produced through the same `record`, and a `check_cap` that answered a second time would send a
+/// second cancel into a session that is already closing.
+#[tokio::test]
+async fn a_breach_is_reported_once_and_the_closing_rows_are_error_then_done() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder =
+        Recorder::new(&store, &scrubber, chat.step_id, false, None).with_run_cap(run_cap(300));
+    let mut session = ScriptedSession::cancelling(
+        vec![
+            tool_call("call-1"),
+            usage(Some(100), None),
+            usage(Some(250), None),
+            // Never pulled: the cancel drops the rest of the turn, and a build that detected the
+            // breach without cancelling would record this row and prove itself wrong.
+            chunk("after the cap", "m1"),
+        ],
+        vec![
+            tool_result("call-1", json!({ "text": "cancelled" })),
+            env(DriverEvent::Done(DoneEvent {
+                stop_reason: StopReason::Cancelled,
+            })),
+        ],
+    );
+
+    let stop = pump(&mut session, &mut recorder)
+        .await
+        .expect("the capped turn still reaches an end");
+    assert_eq!(
+        stop.stop_reason,
+        StopReason::Cancelled,
+        "`pump` reports the cancelled end its own breach arm produced"
+    );
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![
+            EventKind::ToolCall,
+            EventKind::Usage,
+            EventKind::Usage,
+            EventKind::ToolResult,
+            EventKind::Error,
+            EventKind::Done,
+        ],
+        "the synthesized result of the open call lands between the breaching row and the error, \
+         and the last two rows are still the closing pair"
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        (0..6).collect::<Vec<_>>(),
+        "seq stays gapless across the closing sequence"
+    );
+    let error = &log[4];
+    assert_eq!(error.payload["code"], json!("cap_exceeded"));
+    assert_eq!(
+        error.role,
+        EventRole::Htui,
+        "`htui` authored the row, as it authors every row it writes itself"
+    );
+    assert!(
+        error.payload["message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("per_token_cap_run") && message.contains("estimated")
+            ),
+        "the message names the setting and says the figure is an estimate: {:?}",
+        error.payload["message"]
+    );
+    assert_eq!(log[5].payload["stop_reason"], json!("cancelled"));
+    assert_eq!(
+        log.iter().filter(|row| row.kind == EventKind::Done).count(),
+        1,
+        "exactly one `done` per turn (§4.1): the transport's own was withheld"
+    );
+
+    let again = recorder
+        .record(usage(Some(1_000), None))
+        .await
+        .expect("a later row still records");
+    assert_eq!(
+        again, None,
+        "the verdict is spent: a second breach would cancel a session that is already closed"
+    );
+    let summary = recorder.finish().await.expect("close");
+    assert_eq!(
+        summary.cap_breach,
+        Some(CapBreach {
+            cap_micros: 300,
+            spent_micros: 350,
+            at: at(),
+        }),
+        "and the summary carries the one verdict, not the last row's arithmetic"
+    );
+}
+
+/// Blueprint H-4: the agent's own `done` can arrive inside the grace window saying `end_turn` —
+/// the ACP transport records whatever `StopReason` the adapter sent, and the fake queues its own.
+/// Recording it as it stood would make the step's last row say the turn finished normally, which is
+/// the one thing criterion 8 forbids.
+///
+/// `enforce_breach` is called directly here, which is the seam the worker's `run_turn` uses: the
+/// case is about the shared sequence and not about which loop reached it.
+#[tokio::test]
+async fn a_transport_done_that_says_end_turn_is_still_recorded_cancelled() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder =
+        Recorder::new(&store, &scrubber, chat.step_id, false, None).with_run_cap(run_cap(100));
+    let mut session = ScriptedSession::cancelling(
+        Vec::new(),
+        vec![env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        }))],
+    );
+
+    let breach = recorder
+        .record(usage(Some(100), None))
+        .await
+        .expect("recording must land")
+        .expect("a spend equal to the cap has reached it");
+    let stop = htui_agent::record::enforce_breach(&mut session, &mut recorder, breach)
+        .await
+        .expect("the closing rows must land");
+    assert_eq!(
+        stop.stop_reason,
+        StopReason::Cancelled,
+        "the end handed back to the turn loop is the cancelled one"
+    );
+    recorder.finish().await.expect("close");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::Usage, EventKind::Error, EventKind::Done]
+    );
+    assert_eq!(
+        log[2].payload["stop_reason"],
+        json!("cancelled"),
+        "the transport said `end_turn`; the log says what happened"
+    );
+    assert_eq!(
+        log[2].at,
+        at(),
+        "the withheld `done`'s own capture time is kept, so `keep_raw_events` still explains the \
+         row"
+    );
+}
+
+/// Blueprint H-5: a context-only `usage` row reports no USD cost, and a cap of `0` compared
+/// against `cost_micros.unwrap_or(0)` would cancel a session that has spent nothing.
+///
+/// `0` is a real cap — it cancels on the first **costed** row — and this is the other half of that
+/// sentence: until one arrives there is nothing to compare, which is `agy`'s whole shape (§7's own
+/// table) and the opening rows of every `claude` turn.
+#[tokio::test]
+async fn no_cap_and_context_only_usage_never_breach() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder =
+        Recorder::new(&store, &scrubber, chat.step_id, false, None).with_run_cap(run_cap(0));
+
+    for _ in 0..3 {
+        assert_eq!(
+            recorder
+                .record(usage(None, None))
+                .await
+                .expect("recording must land"),
+            None,
+            "a row that reports no USD cost cannot reach a cap denominated in USD micros"
+        );
+    }
+    let summary = recorder.finish().await.expect("close");
+    assert_eq!(summary.cap_breach, None);
+    assert!(
+        !rows(&store, chat.step_id)
+            .await
+            .iter()
+            .any(|row| row.kind == EventKind::Error),
+        "and no `cap_exceeded` row was written"
+    );
+}
+
+/// A cap of `0` is a cap and not an absent one (plan D70): it cancels on the first row that reports
+/// any USD cost at all, however small.
+#[tokio::test]
+async fn a_cap_of_zero_cancels_on_the_first_costed_row() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder =
+        Recorder::new(&store, &scrubber, chat.step_id, false, None).with_run_cap(run_cap(0));
+
+    assert_eq!(
+        recorder
+            .record(usage(None, None))
+            .await
+            .expect("recording must land"),
+        None,
+        "the context-only row before it has nothing to compare"
+    );
+    assert_eq!(
+        recorder
+            .record(usage(Some(1), None))
+            .await
+            .expect("recording must land"),
+        Some(CapBreach {
+            cap_micros: 0,
+            spent_micros: 1,
+            at: at(),
+        }),
+        "one micro against a cap of zero is `spent >= cap`"
+    );
+    recorder.finish().await.expect("close");
+}
+
+/// Blueprint H-2: the flush that writes the two closing rows can be refused, and the rows are then
+/// **owed**, not lost.
+///
+/// The recorder's existing rule does the work — a refused flush commits nothing, keeps the numbered
+/// batch in `unflushed` and re-offers it at the same `seq` — and the reason it covers criterion 8
+/// is that the closing pair is buffered *before* that flush, so the breaching row and the two rows
+/// about it are owed together. `finish` then writes all three, in order, gapless.
+#[tokio::test]
+async fn a_refused_flush_leaves_the_two_closing_rows_owed_not_lost() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder =
+        Recorder::new(&store, &scrubber, chat.step_id, false, None).with_run_cap(run_cap(300));
+    let mut session = ScriptedSession::cancelling(
+        Vec::new(),
+        vec![env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::Cancelled,
+        }))],
+    );
+
+    let breach = recorder
+        .record(usage(Some(350), None))
+        .await
+        .expect("recording must land")
+        .expect("the cap is reached");
+    store.refuse_next_appends(1);
+    let refused = htui_agent::record::enforce_breach(&mut session, &mut recorder, breach).await;
+    assert!(
+        matches!(refused, Err(DriverError::Store(_))),
+        "a store that refuses the closing flush is reported, got {refused:?}"
+    );
+    let summary = recorder.finish().await.expect("the retry lands");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::Usage, EventKind::Error, EventKind::Done],
+        "the closing pair is written by the next flush, in the order it was authored"
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "at the very seq the refused flush had given them"
+    );
+    assert_eq!(
+        summary.usage["cost_micros"], 350,
+        "and the breaching row was summed exactly once, not once per attempt"
+    );
+}
+
 /// A secret from `SessionSpec.env` that reaches a tool result is `[REDACTED]` in the persisted row
 /// (`R-SEC-3`, ANA-4 §9: scrub before either write path).
 #[tokio::test]
@@ -1688,17 +2014,15 @@ async fn pump_drives_one_turn_to_done() {
     let scrubber = scrubber();
     let store = open_chat(&chat).await;
     let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
-    let mut session = ScriptedSession {
-        events: VecDeque::from(vec![
-            chunk("thinking ", "m1"),
-            tool_call("call-1"),
-            chunk("done", "m1"),
-            env(DriverEvent::Done(DoneEvent {
-                stop_reason: StopReason::EndTurn,
-            })),
-            chunk("never reached", "m2"),
-        ]),
-    };
+    let mut session = ScriptedSession::new(vec![
+        chunk("thinking ", "m1"),
+        tool_call("call-1"),
+        chunk("done", "m1"),
+        env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        })),
+        chunk("never reached", "m2"),
+    ]);
 
     let done = pump(&mut session, &mut recorder)
         .await
@@ -1996,9 +2320,7 @@ async fn pump_reports_a_session_that_closed_without_done() {
     let scrubber = scrubber();
     let store = open_chat(&chat).await;
     let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
-    let mut session = ScriptedSession {
-        events: VecDeque::from(vec![chunk("half a sentence", "m1")]),
-    };
+    let mut session = ScriptedSession::new(vec![chunk("half a sentence", "m1")]);
 
     let outcome = pump(&mut session, &mut recorder).await;
     assert!(

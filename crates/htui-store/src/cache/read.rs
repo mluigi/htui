@@ -759,6 +759,31 @@ impl CacheStore {
             .collect()
     }
 
+    /// `project.settings` of one mirrored project, or `None` when the mirror holds no such row
+    /// (MOD-2 plan D70).
+    ///
+    /// The offline arm of the per-run cap, and it needs no new mirrored column: `project.settings`
+    /// has been mirrored since `cache_migrations/0001_mirror.sql:57-61`. An offline chat therefore
+    /// enforces the same cap as an online one, off the same document — which is the reason D70
+    /// chose this column over an env knob or a new table.
+    ///
+    /// A runtime query rather than a macro, like every statement in this file: the mirror has no
+    /// compile-time schema for `sqlx` to check against.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`], or [`StoreError::Backend`] when the
+    /// mirrored column does not hold JSON.
+    pub async fn project_settings(&self, project: ProjectId) -> Result<Option<Value>> {
+        let row = sqlx::query("SELECT settings FROM project WHERE id = ?")
+            .bind(project.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        row.map(|row| json_col("project.settings", &text(&row, "settings")?))
+            .transpose()
+    }
+
     /// Who this process is, for `run.started_by`, resolved against the mirror (MOD-2 plan D33).
     ///
     /// [`user_named`](CacheStore::user_named) under

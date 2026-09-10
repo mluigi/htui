@@ -21,9 +21,10 @@
 use chrono::{DateTime, Utc};
 use htui_core::model::{
     AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note,
-    ProjectRef, RunSummary, Scope, SessionEvent, StepId, UserId, WorkspaceSummary,
+    ProjectId, ProjectRef, RunSummary, Scope, SessionEvent, StepId, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
+use serde_json::Value;
 
 use crate::cache::CacheStore;
 use crate::pg::PgStore;
@@ -294,6 +295,25 @@ impl Backend {
             Self::Memory(store) => store.agents().await,
             Self::Online { pg, .. } => pg.agents().await,
             Self::Offline { cache, .. } => cache.agents().await,
+        }
+    }
+
+    /// `project.settings` of one project, or `None` when the arm's store holds no such row
+    /// (MOD-2 plan D70).
+    ///
+    /// Every arm answers, including the offline one: `project.settings` is mirrored
+    /// (`cache_migrations/0001_mirror.sql:57-61`), so the per-run token cap in that document is
+    /// enforced by a chat that happened offline exactly as by one that did not. That is the whole
+    /// reason the cap lives in this column and not in a new table or an env knob.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Backend`] from the mirror decoder.
+    pub async fn project_settings(&self, project: ProjectId) -> Result<Option<Value>> {
+        match self {
+            Self::Memory(store) => store.project_settings(project).await,
+            Self::Online { pg, .. } => pg.project_settings(project).await,
+            Self::Offline { cache, .. } => cache.project_settings(project).await,
         }
     }
 }

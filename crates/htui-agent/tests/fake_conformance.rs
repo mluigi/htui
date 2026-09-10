@@ -25,12 +25,12 @@ impl CaseHarness for FakeHarness {
 /// The list is the suite's API and its length is asserted against a literal, the way
 /// `crates/htui-core/tests/mem_store.rs:24` asserts the store suite's.
 #[test]
-fn cases_len_is_fourteen() {
+fn cases_len_is_fifteen() {
     assert_eq!(
         conformance::CASES.len(),
-        14,
-        "D7's thirteen cases plus milestone 7's quota latch; a transport adds a harness, never a \
-         case (ANA-4 §11 criterion 1)"
+        15,
+        "D7's thirteen cases plus milestone 7's quota latch and its run cap; a transport adds a \
+         harness, never a case (ANA-4 §11 criterion 1)"
     );
 }
 

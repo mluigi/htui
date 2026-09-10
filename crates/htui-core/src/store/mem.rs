@@ -224,6 +224,25 @@ impl MemStore {
         Ok(self.read(State::agent_summaries))
     }
 
+    /// `project.settings` of one project, or `None` when this store holds no such project.
+    ///
+    /// Inherent for the reason [`MemStore::agents`] is — `Backend` dispatches over three stores and
+    /// no trait method is needed — and read at all because the per-run token cap lives in this
+    /// column (MOD-2 plan D70, `docs/ANA-4.md` §7 `:1143-1150`). The offline mirror carries
+    /// `project.settings`, so every backend can answer it, which is why the cap needed no migration
+    /// and no env stand-in.
+    ///
+    /// The whole document and not the two cap keys: reading the column is what the store owes, and
+    /// what a caller makes of its contents is
+    /// [`ProjectCaps::from_settings`](crate::model::ProjectCaps::from_settings)'s business.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn project_settings(&self, project: ProjectId) -> Result<Option<Value>> {
+        Ok(self.read(|state| state.projects.get(&project).map(|row| row.settings.clone())))
+    }
+
     /// Takes the read lock, runs `f`, drops the guard and returns `f`'s owned result.
     ///
     /// A poisoned lock is recovered rather than propagated: `State` mutations are infallible map
@@ -1419,6 +1438,33 @@ mod tests {
                 })
             ),
             "a row that has never been probed has no columns to latch into, got {missing:?}"
+        );
+    }
+
+    /// MOD-2 plan D70: `project.settings` is readable per project, because the per-run token cap
+    /// lives in it and a chat reads it at `ChatStart`.
+    ///
+    /// A project the store does not hold answers `None` rather than an empty document: the caller
+    /// refuses the chat, and an invented `{}` would silently mean "this project has no cap".
+    #[tokio::test]
+    async fn project_settings_reads_the_column_or_nothing() {
+        let store = MemStore::demo();
+        let settings = store
+            .project_settings(ids::PROJECT_HTUI)
+            .await
+            .expect("the read must not fail")
+            .expect("the demo fixture holds this project");
+        assert!(
+            settings.is_object(),
+            "`project.settings` is `JSONB NOT NULL`, so the value is a document: {settings}"
+        );
+        assert_eq!(
+            store
+                .project_settings(crate::model::ProjectId::new())
+                .await
+                .expect("the read must not fail"),
+            None,
+            "a project this store has never seen is absent, not unconfigured"
         );
     }
 

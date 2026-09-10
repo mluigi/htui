@@ -168,7 +168,11 @@ async fn record_every_kind(store: &MemStore, step: StepId) {
         .expect("the prompt must record");
     for slot in driver_script() {
         match slot {
-            Some(envelope) => recorder.record(envelope).await.expect("a row must record"),
+            // The cap verdict is discarded: a replay has no session to cancel, and every row of
+            // this fixture is being re-recorded rather than being spent for the first time.
+            Some(envelope) => {
+                recorder.record(envelope).await.expect("a row must record");
+            }
             None => recorder
                 .record_permission_answer(
                     &PermissionRequestId::new("req_1"),
@@ -329,7 +333,10 @@ async fn rows_re_recorded_from_their_envelopes_are_the_same_rows() {
         };
         match authored {
             Some(other) => replay_authored(&mut recorder, &other, envelope.at).await,
-            None => recorder.record(envelope).await.expect("a row must record"),
+            // The cap verdict is discarded, for the reason the loop above gives.
+            None => {
+                recorder.record(envelope).await.expect("a row must record");
+            }
         }
     }
     recorder.finish().await.expect("nothing to fail on");

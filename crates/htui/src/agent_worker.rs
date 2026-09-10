@@ -41,10 +41,13 @@ use htui_agent::launch::{AgentLaunch, AgentSettings};
 use htui_agent::probe::{
     ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeStatus, SpawnTier2, probe_agent,
 };
-use htui_agent::record::{AnsweredBy, Recorder};
+use htui_agent::record::{
+    AnsweredBy, CapBreach, QuotaLatch, Recorder, RunCap, enforce_breach as enforce_cap_breach,
+};
 use htui_agent::registry::{DriverFactory, caps_for};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, RunStatus, StepId, Transport,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, PER_TOKEN_CAP_BATCH, ProjectCaps, ProjectId,
+    QuotaSource, RunStatus, StepId, Transport,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{StoreError, WriteStore};
@@ -1055,7 +1058,7 @@ impl AgentRuntime {
         backend: &Backend,
         replies: &mpsc::UnboundedSender<ReplyEnvelope>,
         addr: ReplyAddr,
-        project_id: htui_core::model::ProjectId,
+        project_id: ProjectId,
         agent_id: AgentId,
         model: Option<String>,
         prompt: String,
@@ -1107,6 +1110,38 @@ impl AgentRuntime {
         let settings: AgentSettings =
             serde_json::from_value(summary.agent.settings.clone()).unwrap_or_default();
         let model = model.or_else(|| summary.agent.default_model.clone());
+
+        // Plan D70: the caps are the **project's**, read once here — beside the three registry
+        // reads above, on the worker's task and not the UI's (`R-NF-3`) — and carried into the
+        // chat's own task on `ChatArgs`. `run_chat` holds a `Writer`, not the `Backend`, so this
+        // is the last place that can ask.
+        //
+        // A missing project row and a cap that does not parse both **refuse the chat**, which is
+        // the opposite of `AgentSettings` above and deliberately so: settings that do not parse
+        // are settings that are not set, but a cap an operator wrote and `htui` ignored is the
+        // risk table's "wrong by a factor of a million" pointing the other way — a run that was
+        // supposed to be bounded and was not.
+        let project_settings =
+            backend
+                .project_settings(project_id)
+                .await?
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "project",
+                    id: project_id.to_string(),
+                })?;
+        let project_caps = ProjectCaps::from_settings(&project_settings)
+            .map_err(|err| StoreError::Constraint(err.to_string()))?;
+        if project_caps.batch_micros.is_some() {
+            // Plan D71: read and reported, never compared. A batch spans runs MOD-4 does not yet
+            // create, so enforcing it here would mean inventing the batch identity
+            // (`docs/ANA-4.md`:1283 assigns it to MOD-12).
+            tracing::info!(
+                project = %project_id,
+                key = PER_TOKEN_CAP_BATCH,
+                "a batch cap is set; a chat does not enforce it (ANA-4 §9: MOD-12 does)"
+            );
+        }
+        let quota_latch = quota_latch_for(&writer, &summary.agent, box_id, settings.quota.source);
 
         let chat = ChatRunSpec::mint(project_id, box_id, user, Some(agent_id), model.clone());
         writer.start_chat_run(&chat).await?;
@@ -1201,6 +1236,8 @@ impl AgentRuntime {
             },
             grace: self.grace,
             reprobe,
+            project_caps,
+            quota_latch,
         };
         Ok(Served::Start {
             step_id,
@@ -1229,6 +1266,15 @@ pub struct ChatArgs {
     /// writer (`upsert_agent_box` is refused, plan D52), and for a chat whose staleness re-probe
     /// is already running — a second one would race it for the same row.
     reprobe: Option<ReprobeArgs>,
+    /// Plan D70: `project.settings`'s two token caps, read at `ChatStart`.
+    ///
+    /// Not named `caps`: that field above is [`DriverCaps`], which is what the *transport* can do.
+    /// These are what the **project** allows it to spend, and two fields called `caps` in one
+    /// struct would be one bug away from each other.
+    project_caps: ProjectCaps,
+    /// Plan D66-D68: the `agent_box` row this chat latches its allowance into, or `None` with the
+    /// reason already logged by [`quota_latch_for`].
+    quota_latch: Option<QuotaLatch>,
 }
 
 impl core::fmt::Debug for ChatArgs {
@@ -1237,8 +1283,48 @@ impl core::fmt::Debug for ChatArgs {
             .field("driver", &self.driver.name())
             .field("step", &self.chat.step_id)
             .field("spec", &self.spec)
+            .field("project_caps", &self.project_caps)
+            // Whether this chat latches, not which row it names: `Recorder`'s own `Debug` makes
+            // the same choice for the same reason.
+            .field("quota_latch", &self.quota_latch.is_some())
             .finish()
     }
+}
+
+/// The `agent_box` row a chat latches its allowance into, or `None` with the reason logged
+/// (plan D66-D68).
+///
+/// The decision is made **here**, at chat start, rather than discovered on the first `usage` row:
+/// a [`Writer::Buffered`] refuses every registry write with
+/// [`REGISTRY_ON_SERVER_ONLY`](htui_store::REGISTRY_ON_SERVER_ONLY) (`recording_writer`, plan D52),
+/// because the offline mirror has no `agent_box` table at all — deliberately. An offline chat
+/// therefore leaves the last server-side value standing and buffers the `usage` rows that
+/// re-derive it after upload, which is what `R-HIS-1` actually asks for; failing or retrying a
+/// turn over an advisory allowance figure would trade the requirement for the courtesy.
+///
+/// `source` is `agent.settings.quota.source` and `billing` is `agent.billing`, both read off the
+/// row. Nothing here looks at `agent.name` (`R-AGT-5`) — the name is logged, and a log line is not
+/// a dispatch.
+fn quota_latch_for(
+    writer: &Writer,
+    agent: &Agent,
+    box_id: BoxId,
+    source: QuotaSource,
+) -> Option<QuotaLatch> {
+    if matches!(writer, Writer::Buffered(_)) {
+        tracing::info!(
+            agent = %agent.name,
+            reason = htui_store::REGISTRY_ON_SERVER_ONLY,
+            "offline: quota is not latched, and the usage rows are (plan D68)"
+        );
+        return None;
+    }
+    Some(QuotaLatch {
+        agent_id: agent.id,
+        box_id,
+        source,
+        billing: agent.billing,
+    })
 }
 
 /// Everything the probe task owns (MOD-2 D53).
@@ -2093,6 +2179,14 @@ enum TurnEnd {
     Done(StopReason),
     /// The user cancelled it, and the session is over.
     Cancelled,
+    /// The per-run token cap was reached: the session is cancelled and the run **fails**
+    /// (`docs/ANA-4.md` §7 `:1143-1150`, §11 criterion 8).
+    ///
+    /// Distinct from [`TurnEnd::Cancelled`] because the two close the run differently — a user's
+    /// cancel is `RunStatus::Cancelled` and a breached cap is `Failed`, which is §7's own word for
+    /// it ("marks the step failed"). The rows are already written by then: the `error` row the cap
+    /// authored is what the chat tab shows (plan D73).
+    CapExceeded,
 }
 
 /// One chat session, start to finish.
@@ -2114,6 +2208,8 @@ pub async fn run_chat(args: ChatArgs) {
         frames,
         grace,
         reprobe,
+        project_caps,
+        quota_latch,
     } = args;
 
     let scrubber = MinimalScrubber::new(spec.env.values().cloned());
@@ -2170,6 +2266,15 @@ pub async fn run_chat(args: ChatArgs) {
         std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
         Some(ui_tx),
     );
+    // Two opt-in builders rather than two more `new` parameters, because most recorders in this
+    // tree have neither (plan D66-D68, D70). The grace the cap's cancel takes is this runtime's
+    // own `CANCEL_GRACE`, riding on `RunCap` so `htui_agent::record::pump` keeps its signature.
+    if let Some(latch) = quota_latch {
+        recorder = recorder.with_quota_latch(latch);
+    }
+    if let Some(micros) = project_caps.run_micros {
+        recorder = recorder.with_run_cap(RunCap { micros, grace });
+    }
 
     let now = Utc::now();
     if let Err(err) = recorder
@@ -2202,6 +2307,16 @@ pub async fn run_chat(args: ChatArgs) {
             Ok(TurnEnd::Done(stop)) => last_stop = stop,
             Ok(TurnEnd::Cancelled) => {
                 status = RunStatus::Cancelled;
+                last_stop = StopReason::Cancelled;
+                break;
+            }
+            // The cap: the session is already cancelled and its two closing rows are already
+            // written, so all that is left is how the *run* closes. `Failed` is §7's own word
+            // ("marks the step failed"), and no `frames.failed` goes with it — plan D73 rules that
+            // the `error` row the cap authored is the visibility, and it reached the tab through
+            // the recorder's channel a moment ago.
+            Ok(TurnEnd::CapExceeded) => {
+                status = RunStatus::Failed;
                 last_stop = StopReason::Cancelled;
                 break;
             }
@@ -2393,7 +2508,18 @@ async fn run_turn(
             return Err(DriverError::Closed);
         };
         let event = envelope.event.clone();
-        record(recorder, envelope, ui, frames).await;
+        // Plan D69 as amended (blueprint P-1): the recorder **detects** the per-run cap and this
+        // loop — the one that holds the session in production — performs the cancel, through the
+        // same `enforce_breach` `htui_agent::record::pump` calls. `pump` cannot be reused here
+        // (`next_event` refuses while a permission request is parked, which is this function's
+        // whole reason for existing), so the sequence is shared and the loops are not.
+        if let Some(breach) = record(recorder, envelope, ui, frames).await {
+            enforce_cap_breach(session, recorder, breach).await?;
+            // The two closing rows the sequence just wrote, as frames: `enforce_breach` records
+            // through the recorder's channel like everything else, and nothing else drains it.
+            forward(ui, frames);
+            return Ok(TurnEnd::CapExceeded);
+        }
 
         match event {
             DriverEvent::ToolCall(call) => {
@@ -2433,19 +2559,37 @@ async fn run_turn(
     }
 }
 
-/// Records one envelope and forwards the scrubbed copy the recorder made of it.
+/// Records one envelope, forwards the scrubbed copy the recorder made of it, and hands back the
+/// per-run cap verdict.
 ///
 /// The frame comes from the recorder's own channel, never from the envelope this function was
 /// handed: what reaches the screen must be masked exactly as what reached the store (`R-SEC-3`).
+///
+/// A recording failure is logged and **not** returned, as it always was: the turn goes on and
+/// `finish` reports it. The verdict is `None` on that path too — a row the store never took spent
+/// nothing this loop should cancel over.
 async fn record(
     recorder: &mut Recorder<'_, Writer>,
     envelope: DriverEnvelope,
     ui: &mut mpsc::Receiver<DriverEnvelope>,
     frames: &Frames,
-) {
-    if let Err(err) = recorder.record(envelope).await {
-        tracing::error!(%err, "an event could not be recorded");
-    }
+) -> Option<CapBreach> {
+    let breach = match recorder.record(envelope).await {
+        Ok(breach) => breach,
+        Err(err) => {
+            tracing::error!(%err, "an event could not be recorded");
+            None
+        }
+    };
+    forward(ui, frames);
+    breach
+}
+
+/// Drains the recorder's render channel into the reply stream.
+///
+/// Extracted from [`record`] because the cap's closing sequence writes two rows without going
+/// through it, and their frames have to reach the tab the same way every other row's does.
+fn forward(ui: &mut mpsc::Receiver<DriverEnvelope>, frames: &Frames) {
     while let Ok(frame) = ui.try_recv() {
         frames.event(frame);
     }
@@ -2460,6 +2604,8 @@ async fn drain(
 ) {
     while let Ok(Some(envelope)) = session.next_event().await {
         let done = matches!(envelope.event, DriverEvent::Done(_));
+        // The cap verdict is discarded here on purpose: this session is already being cancelled,
+        // and a second cancel over a row pulled *by* the first would be a cancel of a cancel.
         record(recorder, envelope, ui, frames).await;
         if done {
             break;
@@ -2568,7 +2714,7 @@ pub(crate) mod tests {
     };
     use htui_agent::fake::FakeAdapter;
     use htui_core::fixtures::ids;
-    use htui_core::model::{Agent, AgentId, EventKind, Scope, Transport};
+    use htui_core::model::{Agent, AgentId, EventKind, EventRole, Scope, Transport};
     use htui_core::store::MemStore;
     use htui_core::store::ReadStore as _;
     use std::sync::Arc;
@@ -2905,7 +3051,28 @@ pub(crate) mod tests {
 
     /// A store holding the demo fixture plus the fake row, and the runtime that can drive it.
     async fn fixture(script: Script) -> (MemStore, Backend, AgentRuntime, AgentId) {
-        let store = MemStore::demo();
+        fixture_with_project_settings(script, None).await
+    }
+
+    /// [`fixture`], with `PROJECT_HTUI`'s `settings` column replaced.
+    ///
+    /// The caps a chat enforces are that column's (MOD-2 plan D70), so the cases below need a demo
+    /// fixture whose project carries one. `DemoData` is public and `MemStore::from_demo` takes it,
+    /// which is why this needs no store method and no migration: the document is edited before the
+    /// store is built, exactly as an operator would edit the row.
+    async fn fixture_with_project_settings(
+        script: Script,
+        settings: Option<Value>,
+    ) -> (MemStore, Backend, AgentRuntime, AgentId) {
+        let mut data = htui_core::fixtures::demo_data();
+        if let Some(settings) = settings {
+            for project in &mut data.projects {
+                if project.id == ids::PROJECT_HTUI {
+                    project.settings = settings.clone();
+                }
+            }
+        }
+        let store = MemStore::from_demo(data);
         let agent_id = AgentId::new();
         store
             .upsert_agent(&fake_row(agent_id))
@@ -3061,6 +3228,297 @@ pub(crate) mod tests {
             store.active_runs(&scope()).await.expect("count"),
             before,
             "a finished chat stops counting as an active run"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The per-run token cap (`docs/ANA-4.md` §7 `:1143-1150`, §11 criterion 8, plan D69-D71)
+    // -----------------------------------------------------------------------------------------
+
+    /// One `usage` report costing `cost` USD micros, with a context reading beside it.
+    fn usage(cost: i64) -> ScriptEvent {
+        ScriptEvent::Emit(DriverEvent::Usage(htui_agent::event::UsageEvent {
+            cost_micros: Some(cost),
+            context_used: Some(1_000),
+            context_size: Some(200_000),
+            ..htui_agent::event::UsageEvent::default()
+        }))
+    }
+
+    /// The turn's `done`.
+    fn ends(stop_reason: StopReason) -> ScriptEvent {
+        ScriptEvent::Emit(DriverEvent::Done(DoneEvent { stop_reason }))
+    }
+
+    /// The events a reply stream carried, as `DriverEvent`s.
+    fn stream_events(replies: &[ReplyEnvelope]) -> Vec<DriverEvent> {
+        replies
+            .iter()
+            .filter_map(|reply| match &reply.reply {
+                StoreReply::Chat(ChatFrame::Event(envelope)) => Some(envelope.event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The whole cap, end to end through the production path: `ChatStart` reads
+    /// `project.settings.per_token_cap_run`, `run_turn` answers the recorder's verdict with the
+    /// shared `enforce_breach`, and the run closes failed with the two rows criterion 8 names.
+    ///
+    /// **This is the case blueprint P-1 exists for.** `htui_agent::record::pump` is what the
+    /// conformance suites drive and production never calls it, so a cap wired into `pump` alone
+    /// would pass every suite in this repo and enforce nothing in the binary. Here the loop is
+    /// `run_turn`, the one that also serves the command channel, and it reaches the same sequence.
+    #[tokio::test]
+    async fn a_chat_over_its_run_cap_is_cancelled_and_its_run_fails() {
+        // 100 then 250 micros: the running spend is 350 against a cap of 300, crossed by the
+        // second report. The turn has no `done` of its own — only the cap's cancel can end it, so
+        // a build that read the cap and never enforced it hangs on `ExpectCancel` and fails.
+        let script = Script::one_turn(vec![usage(100), usage(250), ScriptEvent::ExpectCancel]);
+        let (store, backend, mut runtime, agent_id) =
+            fixture_with_project_settings(script, Some(json!({ "per_token_cap_run": 300 }))).await;
+        let before = store.active_runs(&scope()).await.expect("count");
+
+        let (step_id, replies) = run(&mut runtime, &backend, start(agent_id, "spend it")).await;
+
+        let events = stream_events(&replies);
+        let closing: Vec<&DriverEvent> = events
+            .iter()
+            .filter(|event| matches!(event, DriverEvent::Error(_) | DriverEvent::Done(_)))
+            .collect();
+        match closing.as_slice() {
+            [DriverEvent::Error(error), DriverEvent::Done(done)] => {
+                assert_eq!(error.code, "cap_exceeded");
+                assert!(
+                    error.message.contains("per_token_cap_run"),
+                    "the frame names the setting an operator would change: {}",
+                    error.message
+                );
+                assert_eq!(done.stop_reason, StopReason::Cancelled);
+            }
+            other => panic!("the tab is told what happened, in order: {other:?}"),
+        }
+        assert!(
+            matches!(
+                replies.last().map(|reply| &reply.reply),
+                Some(StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::Cancelled
+                }))
+            ),
+            "and the stream ends cancelled: {:?}",
+            replies.last()
+        );
+
+        let log = store
+            .step_events(step_id)
+            .await
+            .expect("the log reads")
+            .expect("the chat step has a log");
+        assert_eq!(
+            log.iter()
+                .rev()
+                .take(2)
+                .map(|row| row.kind)
+                .collect::<Vec<_>>(),
+            vec![EventKind::Done, EventKind::Error],
+            "criterion 8: `error{{cap_exceeded}}` then `done{{cancelled}}` are the step's last two \
+             rows — read backwards here, so the message says which end it read from"
+        );
+        assert_eq!(log[log.len() - 2].payload["code"], json!("cap_exceeded"));
+        assert_eq!(
+            log[log.len() - 2].role,
+            EventRole::Htui,
+            "`htui` authored it, not the agent"
+        );
+        assert_eq!(
+            log.last().expect("a last row").payload["stop_reason"],
+            json!("cancelled")
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|row| row.kind == EventKind::Usage)
+                .count(),
+            2,
+            "nothing after the breaching report was pulled: {:?}",
+            log.iter().map(|row| row.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store.active_runs(&scope()).await.expect("count"),
+            before,
+            "the run is closed, not left running"
+        );
+    }
+
+    /// A cap key an operator wrote and `htui` could not read **refuses the chat**, at the
+    /// `ChatStart` request's own address, naming the key.
+    ///
+    /// The opposite of `AgentSettings`, where settings that do not parse are settings that are not
+    /// set (`htui_agent::registry`), and deliberately so: an unreadable *cap* silently treated as
+    /// absent is the plan's "wrong by a factor of a million" risk pointing the other way — a run
+    /// that was supposed to be bounded and quietly was not. Refusing costs one visible error and
+    /// nothing else, because the read happens before the run row is minted.
+    #[tokio::test]
+    async fn a_negative_run_cap_refuses_the_chat_start() {
+        let script = Script::one_turn(vec![ends(StopReason::EndTurn)]);
+        let (store, backend, mut runtime, agent_id) =
+            fixture_with_project_settings(script, Some(json!({ "per_token_cap_run": -1 }))).await;
+        let before = store.active_runs(&scope()).await.expect("count");
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let served = runtime
+            .serve(&backend, &tx, &envelope(1, start(agent_id, "hi")))
+            .await;
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "chat_start");
+                assert!(
+                    message.contains("per_token_cap_run") && message.contains("micros"),
+                    "the refusal names the key and its unit: {message}"
+                );
+            }
+            other => panic!("a cap that does not parse refuses the chat: {other:?}"),
+        }
+        assert!(
+            runtime.live.is_empty(),
+            "no session was opened, so nothing is waiting for a command"
+        );
+        assert_eq!(
+            store.active_runs(&scope()).await.expect("count"),
+            before,
+            "and no run row was minted for a chat that never started"
+        );
+    }
+
+    /// Plan D71: `per_token_cap_batch` is **read** — a document carrying it parses, so the chat is
+    /// not refused — and **not enforced**, because a batch spans runs MOD-4 does not yet create
+    /// (`docs/ANA-4.md`:1283 assigns it to MOD-12).
+    ///
+    /// A cap of one micro is below the report's own cost, so a build that enforced the batch key
+    /// here would cancel this turn instead of finishing it.
+    #[tokio::test]
+    async fn a_batch_cap_is_read_and_not_enforced() {
+        let script = Script::one_turn(vec![usage(100), ends(StopReason::EndTurn)]);
+        let (store, backend, mut runtime, agent_id) =
+            fixture_with_project_settings(script, Some(json!({ "per_token_cap_batch": 1 }))).await;
+
+        let (step_id, replies) = run(&mut runtime, &backend, start(agent_id, "spend it")).await;
+
+        assert!(
+            matches!(replies[0].reply, StoreReply::ChatAccepted { .. }),
+            "the chat is accepted: a batch cap is readable, so it is not a bad document"
+        );
+        let log = store
+            .step_events(step_id)
+            .await
+            .expect("the log reads")
+            .expect("the chat step has a log");
+        assert!(
+            !log.iter().any(|row| row.kind == EventKind::Error),
+            "and nothing enforced it: {:?}",
+            log.iter().map(|row| row.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            log.last().expect("a last row").payload["stop_reason"],
+            json!("end_turn"),
+            "the turn ended on its own terms"
+        );
+    }
+
+    /// Plan D66-D68: an offline chat latches no allowance and says why, decided at chat start
+    /// rather than discovered on the first `usage` row.
+    ///
+    /// `quota_latch_for` is called directly because the thing under test is a decision, not a
+    /// turn: a `Writer::Buffered` refuses every registry write, so the latch has nowhere to go and
+    /// the *usage rows* are what carry the figure until they are uploaded.
+    #[tokio::test]
+    async fn a_buffered_writer_gets_no_latch() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "latch-test", 1)
+            .await
+            .expect("mirror");
+        let agent = fake_row(AgentId::new());
+
+        assert_eq!(
+            quota_latch_for(
+                &Writer::Buffered(htui_store::BufferedWriter::new(cache.clone())),
+                &agent,
+                ids::BOX,
+                QuotaSource::AcpMetaRateLimit,
+            ),
+            None,
+            "the offline mirror has no `agent_box` table at all, deliberately (plan D68)"
+        );
+        let online = quota_latch_for(
+            &Writer::Memory(MemStore::demo()),
+            &agent,
+            ids::BOX,
+            QuotaSource::AcpMetaRateLimit,
+        )
+        .expect("a writer that can reach the registry latches");
+        assert_eq!(online.agent_id, agent.id, "the row the chat runs on");
+        assert_eq!(online.box_id, ids::BOX);
+        assert_eq!(
+            online.source,
+            QuotaSource::AcpMetaRateLimit,
+            "the source is the row's declaration, passed through (`R-AGT-5`)"
+        );
+        assert_eq!(online.billing, agent.billing);
+        cache.close().await;
+    }
+
+    /// The latch, wired: a chat that reports a cost leaves `agent_box.quota` on the row it ran on.
+    ///
+    /// T39 proved the recorder latches; this proves the **worker hands it a latch**, which is a
+    /// separate claim and the one a user notices — without it the Settings quota column would read
+    /// `—` forever with every test still green. `fake_row` declares no quota source, so the
+    /// document is spend alone, which is the seeded live-ACP row's shape (plan D65) and `agy`'s.
+    #[tokio::test]
+    async fn a_chat_latches_the_quota_of_the_row_it_runs_on() {
+        let script = Script::one_turn(vec![usage(100), ends(StopReason::EndTurn)]);
+        let (store, backend, mut runtime, agent_id) = fixture(script).await;
+        // The row a latch writes into: two columns of an **existing** row, so an unprobed agent
+        // has nothing to latch into (plan D67) and the chat carries on regardless.
+        store
+            .upsert_agent_box(&probed_row(agent_id, Some(Utc::now())))
+            .await
+            .expect("the probed row lands");
+
+        run(&mut runtime, &backend, start(agent_id, "spend it")).await;
+
+        let on_box = store
+            .agents()
+            .await
+            .expect("the registry reads")
+            .into_iter()
+            .find(|row| row.agent.id == agent_id)
+            .expect("the row is registered")
+            .on_box
+            .expect("this box has an agent_box row");
+        let quota = on_box
+            .quota
+            .expect("the chat latched an allowance document");
+        assert_eq!(
+            quota["spend"]["session_micros"],
+            json!(100),
+            "the running spend of the session that just ended: {quota}"
+        );
+        assert_eq!(quota["source"], json!("none"), "as the row declares");
+        assert_eq!(
+            quota["billing"],
+            json!("per_token"),
+            "and the billing the row declares, so a reader knows what `spend` means"
+        );
+        assert_eq!(
+            on_box
+                .quota_at
+                .map(|at| serde_json::to_value(at).expect("a timestamp serialises")),
+            Some(quota["observed_at"].clone()),
+            "`agent_box.quota_at` mirrors the document's `observed_at` (ANA-4 §7)"
+        );
+        assert_eq!(
+            on_box.probe,
+            probed_row(agent_id, None).probe,
+            "and the probe snapshot beside it is untouched (plan D67)"
         );
     }
 

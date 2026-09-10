@@ -1,4 +1,5 @@
-//! `impl ReadStore for PgStore` and the four inherent reads (blueprint C.7, C.8).
+//! `impl ReadStore for PgStore` and the inherent reads beside it (blueprint C.7, C.8): the four
+//! the milestone named, plus `agents` (MOD-2 plan D3) and `project_settings` (MOD-2 plan D70).
 //!
 //! Ordering is `MemStore`'s, because `htui_core::store::conformance` is the spec both backends are
 //! written to: `items` by scope position then `(key_prefix, key_number)`, `links` breadth-first
@@ -16,6 +17,7 @@ use htui_core::model::{
     Scope, SessionEvent, StepId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
@@ -602,6 +604,27 @@ impl PgStore {
                 AgentSummary { agent, on_box }
             })
             .collect())
+    }
+
+    /// `project.settings` of one project, or `None` when no such row exists (MOD-2 plan D70).
+    ///
+    /// Inherent beside [`PgStore::agents`] rather than a [`ReadStore`]
+    /// method, for the reason that read gives: `Backend` dispatches over three stores and the
+    /// projection is one column. The per-run token cap lives in this document
+    /// (`docs/ANA-4.md` §7 `:1143-1150`), which is why the column needed a reader at all — it has
+    /// been `JSONB NOT NULL` since `0001_init.sql:150` and nothing read it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn project_settings(&self, project: ProjectId) -> Result<Option<Value>> {
+        sqlx::query_scalar!(
+            "SELECT settings FROM project WHERE id = $1",
+            project.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 }
 
