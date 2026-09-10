@@ -367,8 +367,10 @@ async fn the_status_column_renders_each_probe_outcome() {
             .lines()
             .find(|line| line.starts_with(row))
             .unwrap_or_else(|| panic!("the `{row}` row is rendered:\n{rendered}"));
+        // Through [`as_drawn`] since D76: `unauthenticated` is 15 characters and the eighth column
+        // draws 13 of them here, which is the slack that column gave up for the whole model id.
         assert!(
-            line.ends_with(expected),
+            line.ends_with(&as_drawn(expected)),
             "the `on this box` column of `{row}` reads `{expected}`: {line}"
         );
     }
@@ -376,12 +378,47 @@ async fn the_status_column_renders_each_probe_outcome() {
     insta::assert_snapshot!("agents_probed", rendered);
 }
 
-/// Where the `quota` column starts in a rendered row: the six fixed columns before it — 12, 9, 12,
-/// 6, 9, 7 — plus one space of `column_spacing` after each.
-const QUOTA_AT: usize = 61;
+/// Where the `default` column starts in a rendered row: `name`'s 12, `transport`'s 9, `billing`'s
+/// 12 and `models`' 6, plus one space of `column_spacing` after each. None of the four moved with
+/// D76.
+const DEFAULT_AT: usize = 43;
 
-/// Where `on this box` starts: [`QUOTA_AT`] plus the quota column's own 19 and its space.
-const ON_BOX_AT: usize = 81;
+/// How wide the `default` column is since D76: exactly `gemini-3.7-flash-high`, the longest id the
+/// seeds carry.
+const DEFAULT_WIDTH: usize = 21;
+
+/// Where the `quota` column starts in a rendered row: the six fixed columns before it — 12, 9, 12,
+/// 6, 21, 7 — plus one space of `column_spacing` after each.
+const QUOTA_AT: usize = 73;
+
+/// Where `on this box` starts: [`QUOTA_AT`] plus the quota column's own 13 (D76) and its space.
+const ON_BOX_AT: usize = 87;
+
+/// How wide `on this box` draws at [`render_section`]'s 100 columns: whatever the seven fixed
+/// columns and their spacing leave it, which is what "the `Min` column absorbs what is left"
+/// amounts to since D76.
+const ON_BOX_WIDE: usize = 100 - ON_BOX_AT;
+
+/// The eight headers, in order.
+///
+/// D76 made them the floor of the packing: the width for a whole model id came out of the other
+/// seven columns, and a column shrunk past its own header would have bought that width with a word
+/// nobody can read. Asserted as a set rather than as one pinned line so that a ninth column
+/// (MOD-23's editor, MOD-12's caps section) fails this on the word it clipped.
+const HEADERS: [&str; 8] = [
+    "name",
+    "transport",
+    "billing",
+    "models",
+    "default",
+    "enabled",
+    "quota",
+    "on this box",
+];
+
+/// `agy`'s seeded `default_model` (`crates/htui-core/seeds/agent_agy.json`), and the longest id in
+/// the fixture at 21 characters.
+const SEEDED_MODEL: &str = "gemini-3.7-flash-high";
 
 /// One registry row whose `agent_box` carries a `quota` blob, for the quota column's own table
 /// (MOD-2 D73).
@@ -406,12 +443,25 @@ fn quota_row(name: &str, quota: Option<Value>) -> AgentSummary {
 /// The `quota` cell of one row, taken by character offset.
 ///
 /// By offset and not by counting words, because a quota cell holds spaces of its own
-/// (`62% to 09-08 08:00`), so nothing after it can be found by splitting a line on whitespace.
+/// (`62% to 09-08`), so nothing after it can be found by splitting a line on whitespace.
 fn quota_cell(rendered: &str, name: &str) -> String {
     row_line(rendered, name)
         .chars()
         .skip(QUOTA_AT)
         .take(ON_BOX_AT - QUOTA_AT)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+/// The `default` cell of one row, taken by character offset for [`quota_cell`]'s reason: a model
+/// id is one word, but the columns on either side of it are not, so the cell is found by where it
+/// starts and not by counting.
+fn default_cell(rendered: &str, name: &str) -> String {
+    row_line(rendered, name)
+        .chars()
+        .skip(DEFAULT_AT)
+        .take(DEFAULT_WIDTH)
         .collect::<String>()
         .trim_end()
         .to_owned()
@@ -423,6 +473,41 @@ fn row_line<'a>(rendered: &'a str, name: &str) -> &'a str {
         .lines()
         .find(|line| line.starts_with(name))
         .unwrap_or_else(|| panic!("the `{name}` row is rendered:\n{rendered}"))
+}
+
+/// D76: the `default` column holds the whole `default_model` string, not a prefix of it.
+///
+/// `gemini-3.7-flash-high` is `agy`'s seeded default and 21 characters long; at `Length(9)` the
+/// cell read `gemini-3.`, which names no model at all — the id *is* the coordinate
+/// `docs/ANA-4.md` §4.4 selects a model by, so a truncated one is not a shorter answer but a wrong
+/// one. The eight headers are asserted beside it because the 12 columns this needed came out of
+/// the other seven, and the floor D76 set on that trade is that every header still reads.
+#[tokio::test]
+async fn the_default_column_holds_the_whole_model_id() {
+    let bench = Bench::new().await;
+    let mut row = quota_row("seeded", None);
+    row.agent.default_model = Some(SEEDED_MODEL.to_owned());
+
+    let mut section = AgentsSection::new();
+    bench.reply(&mut section, &StoreReply::Agents(vec![row]));
+    let rendered = render_section(&section, &bench.ctx());
+
+    assert_eq!(
+        default_cell(&rendered, "seeded"),
+        SEEDED_MODEL,
+        "the `default` column renders the id whole:\n{rendered}"
+    );
+
+    let header = rendered
+        .lines()
+        .next()
+        .expect("the table draws a header row");
+    for label in HEADERS {
+        assert!(
+            header.contains(label),
+            "the `{label}` header is drawn whole: {header}"
+        );
+    }
 }
 
 /// The `quota` column, one row per shape plan D73 names (`R-TUI-8`, `docs/ANA-4.md` §7).
@@ -472,7 +557,9 @@ async fn the_quota_column_renders_windows_spend_and_nothing() {
     let rendered = render_section(&section, &bench.ctx());
 
     for (row, expected) in [
-        ("windows", "62% to 09-08 08:00"),
+        // The reset without its clock time: D76 spent ` %H:%M` on the `default` column, and the
+        // date is what a window's own doc comment calls the true half of the warning.
+        ("windows", "62% to 09-08"),
         ("spend-only", "$0.39 spent"),
         ("no-blob", "\u{2014}"),
         ("unparsable", "\u{2014}"),
@@ -684,6 +771,25 @@ fn on_box_cell(rendered: &str, name: &str) -> String {
     row_line(rendered, name)
         .chars()
         .skip(ON_BOX_AT)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+/// One `on this box` expectation as the eighth column can actually draw it.
+///
+/// D76 spent that column's slack on the whole model id, so the cell is [`ON_BOX_WIDE`] characters
+/// at this render and five of the words this section can put in it are longer than that:
+/// `unauthenticated`, `choose a method`, `downloading 42%`, `unpacking 100%` and
+/// `downloading 12.0 MB`. The expectations stay written **whole**, because they are what the
+/// section computed and a test with `downloading 1` inlined in it would read as a bug rather than
+/// as a packing decision; this clips them the way the frame does. What a cell holds past column
+/// [`ON_BOX_WIDE`] is no longer observable through a render, which is the third and lowest of
+/// D76's three priorities being paid.
+fn as_drawn(expected: &str) -> String {
+    expected
+        .chars()
+        .take(ON_BOX_WIDE)
         .collect::<String>()
         .trim_end()
         .to_owned()
@@ -1031,9 +1137,12 @@ async fn the_progress_cell_renders_each_phase_and_never_a_misleading_zero() {
             &StoreReply::Install(InstallFrame::Progress { phase, done, total }),
         );
         let rendered = render_section(&section, &bench.ctx());
+        // Through [`as_drawn`]: three of the eight phase cells are longer than the 13 columns
+        // `on this box` draws in since D76, and what this case is about — that a zero numerator
+        // renders the phase word instead of `0%` — is decided in the first twelve of them.
         assert_eq!(
             on_box_cell(&rendered, "declared"),
-            expected,
+            as_drawn(expected),
             "{phase} {done}/{total:?}:\n{rendered}"
         );
         assert!(
@@ -1250,7 +1359,7 @@ async fn an_agents_reply_does_not_clear_an_install_in_flight() {
     let rendered = render_section(&section, &bench.ctx());
     assert_eq!(
         on_box_cell(&rendered, "declared"),
-        "downloading 42%",
+        as_drawn("downloading 42%"),
         "the download is still running and still says so: {rendered}"
     );
     assert!(
@@ -1439,7 +1548,7 @@ async fn a_on_a_cli_row_is_refused_by_name_and_sends_nothing() {
     );
     assert_eq!(
         on_box_cell(&render_section(&section, &bench.ctx()), "cli-row"),
-        "unauthenticated",
+        as_drawn("unauthenticated"),
         "and the row is exactly where it was"
     );
 }
@@ -1641,7 +1750,7 @@ async fn a_methods_frame_renders_the_chooser_with_names_descriptions_logout_and_
     );
     assert_eq!(
         on_box_cell(&rendered, "loginable"),
-        "choose a method",
+        as_drawn("choose a method"),
         "the cell says what the pane is waiting for"
     );
     assert!(
@@ -1892,7 +2001,7 @@ async fn x_sends_auth_cancel_and_the_cell_reads_cancelling() {
     assert!(rendered.contains("login cancelled"), "{rendered}");
     assert_eq!(
         on_box_cell(&rendered, "loginable"),
-        "unauthenticated",
+        as_drawn("unauthenticated"),
         "and the row goes back to what the probe last said about it: {rendered}"
     );
 }
@@ -1927,7 +2036,7 @@ async fn a_refused_open_keeps_the_pane_and_a_refused_start_clears_it() {
     );
     assert_eq!(
         on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
-        "unauthenticated",
+        as_drawn("unauthenticated"),
         "a refused request of the flow itself leaves a state a second `a` can start from"
     );
 }
@@ -1977,7 +2086,7 @@ async fn a_methods_frame_does_not_undo_a_cancel_pressed_while_starting() {
     bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelled));
     assert_eq!(
         on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
-        "unauthenticated"
+        as_drawn("unauthenticated")
     );
 }
 
@@ -2026,7 +2135,7 @@ async fn a_second_choice_refused_by_a_live_flow_keeps_the_pane_and_the_others_cl
         );
         assert_eq!(
             on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
-            "unauthenticated",
+            as_drawn("unauthenticated"),
             "`{message}` leaves a state a second `a` can start from"
         );
     }
@@ -2106,7 +2215,7 @@ async fn refused_shows_the_agents_sentence() {
     );
     assert_eq!(
         on_box_cell(&rendered, "loginable"),
-        "unauthenticated",
+        as_drawn("unauthenticated"),
         "and the flow is over"
     );
 }

@@ -34,9 +34,10 @@ use serde_json::{Value, json};
 /// before `a`: the cursor is what `a` acts on.
 const ROW: &str = "demo-login";
 
-/// Where `on this box` starts in a rendered row: the seven columns before it — 12, 9, 12, 6, 9, 7
-/// and MOD-2 D73's `quota` 19 — plus one space of `column_spacing` after each.
-const ON_BOX_AT: usize = 81;
+/// Where `on this box` starts in a rendered row: the seven columns before it — 12, 9, 12, 6,
+/// MOD-2 D76's `default` 21, 7 and D73's `quota` 13 — plus one space of `column_spacing` after
+/// each.
+const ON_BOX_AT: usize = 87;
 
 /// The one method the fixture advertises. A made-up id: the chooser is fed by the agent's own live
 /// `initialize`, so a case only ever needs *an* id.

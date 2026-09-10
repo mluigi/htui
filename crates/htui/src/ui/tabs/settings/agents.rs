@@ -1010,10 +1010,34 @@ impl AgentsSection {
         ])
         .style(ctx.theme.title);
 
-        // `quota` is the seventh and `on this box` stays eighth, so the one `Min` column is still
-        // the last: the widest cell either can hold is `62% to 09-08 08:00` (18) and
-        // `downloading 12.0 MB` (19), and 55 fixed + 19 + 11 + 7 spaces = 92 leaves the eighth
-        // column room to grow into on the 98 the bordered section draws in (hazard H-12).
+        // MOD-2 D76's packing. The eight columns want ~107 characters and the bordered section
+        // draws in 98 (hazard H-12), so the width does not divide and a **ranking** decides it
+        // rather than arithmetic. The maintainer's order, highest first: the whole `default_model`
+        // string; then the quota window's reset time; then `on this box`'s slack.
+        //
+        // So `default` is 21 — `gemini-3.7-flash-high`, the longest id the seeds carry — because
+        // that id is the coordinate `docs/ANA-4.md` §4.4 selects a model by, and `gemini-3.` under
+        // the old `Length(9)` named nothing at all. Its 12 extra columns came from the two ranked
+        // below it and from nowhere else:
+        //
+        // - `on this box` gave 6, the whole of the slack between the 17 it used to absorb at 98 and
+        //   the 11 its own header needs. It is still the one `Min` column and still the last, so a
+        //   wider terminal hands it every character back first; at 98 it is exactly its header, and
+        //   a cell longer than that — `unauthenticated`, `downloading 12.0 MB` — is clipped. That
+        //   is the cost D76 accepted, and it is third in the order because a clipped status word is
+        //   still the status word while a clipped id is a different model.
+        // - `quota` gave 6, which is exactly the reset's ` %H:%M` (19 → 13): `62% to 09-08 08:00`
+        //   now reads `62% to 09-08`. [`reset_of`] drops the time by *format* rather than by clip,
+        //   so `100% to 09-08` — the exhausted window this column exists to warn about — still
+        //   fits whole in 13.
+        //
+        // `name` (12), `transport` (9), `billing` (12), `models` (6) and `enabled` (7) gave up
+        // nothing: `transport`, `models` and `enabled` are already at their own headers, `billing`
+        // at `subscription`, and D76 ranked nothing above any of them. The floor under the whole
+        // trade is that **all eight headers stay readable** — that is what stops the next column
+        // from being packed into a puzzle with no bottom, and `Min(11)` is `on this box`'s share of
+        // it. A ninth column (MOD-23's editor, MOD-12's caps section) has to be paid for out of
+        // this same 98, and this is the order to spend it in.
         let table = Table::new(
             rows,
             [
@@ -1021,9 +1045,9 @@ impl AgentsSection {
                 Constraint::Length(9),
                 Constraint::Length(12),
                 Constraint::Length(6),
-                Constraint::Length(9),
+                Constraint::Length(21),
                 Constraint::Length(7),
-                Constraint::Length(19),
+                Constraint::Length(13),
                 Constraint::Min(11),
             ],
         )
@@ -1320,23 +1344,27 @@ fn window_id(window: &Value) -> &str {
     window.get("id").and_then(Value::as_str).unwrap_or_default()
 }
 
-/// A window's `resets_at` as the column says it: `%m-%d %H:%M`, in UTC.
+/// A window's `resets_at` as the column says it: `%m-%d`, in UTC.
+///
+/// The date alone since MOD-2 D76, which ranked the reset's clock time below the whole
+/// `default_model` string and above nothing else: the six characters of ` %H:%M` are half of what
+/// bought `default` its 21, so `62% to 09-08 08:00` now reads `62% to 09-08`. The year was already
+/// left off, and for the same kind of reason — a reset a year out is not what this column warns
+/// about.
+///
+/// Dropped by **format** and not by letting the 13-wide column clip it, because the clip is wrong
+/// where it matters most: `100% to 09-08 08:00` cut at 13 reads `100% to 09-0`, a broken date on
+/// the exhausted window this column exists for, while the formatted `100% to 09-08` is 13 exactly
+/// and fits whole.
 ///
 /// Hazard H-18: this parse runs on the UI task and the string comes from an agent, so
 /// [`DateTime::parse_from_rfc3339`] is taken through `ok()`. A malformed one renders the
 /// percentage alone, which is still the true half of the answer, and never brings a frame down.
-/// The year is left off because the cell is 19 characters wide and a reset a year out is not what
-/// this column exists to warn about.
 fn reset_of(window: &Value) -> Option<String> {
     let resets_at = window.get("resets_at")?.as_str()?;
     DateTime::parse_from_rfc3339(resets_at)
         .ok()
-        .map(|resets_at| {
-            resets_at
-                .with_timezone(&Utc)
-                .format("%m-%d %H:%M")
-                .to_string()
-        })
+        .map(|resets_at| resets_at.with_timezone(&Utc).format("%m-%d").to_string())
 }
 
 /// The progress cell of one frame (MOD-20 D19).

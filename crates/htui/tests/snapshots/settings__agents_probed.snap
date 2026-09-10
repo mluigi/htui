@@ -2,13 +2,13 @@
 source: crates/htui/tests/settings.rs
 expression: rendered
 ---
-name         transport billing      models default   enabled quota               on this box
-ready-on     acp       subscription 0      —         yes     —                   0.48.0
-ready-off    acp       subscription 0      —         yes     —                   0.48.0 (off)
-gone         acp       subscription 0      —         yes     —                   missing
-needs-auth   acp       subscription 0      —         yes     —                   unauthenticated
-broke        acp       subscription 0      —         yes     —                   failed
-legacy       acp       subscription 0      —         yes     —                   9.9.9
+name         transport billing      models default               enabled quota         on this box
+ready-on     acp       subscription 0      —                     yes     —             0.48.0
+ready-off    acp       subscription 0      —                     yes     —             0.48.0 (off)
+gone         acp       subscription 0      —                     yes     —             missing
+needs-auth   acp       subscription 0      —                     yes     —             unauthenticat
+broke        acp       subscription 0      —                     yes     —             failed
+legacy       acp       subscription 0      —                     yes     —             9.9.9
 
 
 
