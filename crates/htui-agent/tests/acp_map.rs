@@ -15,8 +15,9 @@
 //! one is what keeps that claim honest — the two dialects disagree about almost everything except
 //! the envelope.
 
-use htui_agent::acp::map::Mapper;
-use htui_agent::event::DriverEvent;
+use htui_agent::acp::map::{Mapper, RATE_LIMIT_META_KEY};
+use htui_agent::event::{DriverEvent, UsageEvent};
+use htui_core::model::UsageTotals;
 use serde_json::Value;
 
 /// One recorded line.
@@ -171,6 +172,87 @@ fn the_recorded_usage_updates_show_what_acp_reports() {
             .all(|update| update.get("inputTokens").is_none()),
         "ACP reports no per-turn token counts on `usage_update` (§7), which is why the \
          conformance case asserts null token fields"
+    );
+}
+
+/// Every `usage` event of a fixture, in order.
+fn usage_events(name: &str) -> Vec<UsageEvent> {
+    mapped(name)
+        .into_iter()
+        .filter_map(|event| match event {
+            DriverEvent::Usage(usage) => Some(usage),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D66: the vendor rate-limit blob reaches `UsageEvent.quota` **verbatim**, and it cannot reach a
+/// total.
+///
+/// Both halves are load-bearing. Verbatim, because milestone 7 normalizes the blob in
+/// `htui_core::model::quota` and MOD-12 may want a key this milestone does not read — the mapper
+/// that edits it is the mapper that loses it. And never summed, because the blob rides in the same
+/// `usage` payload the recorder persists and `UsageTotals::add_payload` walks that document:
+/// `add_payload` reads five *fixed* key names (`htui-core/src/model/usage.rs:48-54`), so an object
+/// under a sixth name is structurally incapable of moving a number. That is asserted rather than
+/// argued, because the day someone reaches for `for (key, value) in payload` this test is what says
+/// no.
+///
+/// The fixture supplies both cases of the presence question on its own: the first report of the
+/// turn carries no `_meta` at all (line 2), a later one carries the blob (line 5).
+#[test]
+fn the_rate_limit_blob_is_captured_verbatim_and_never_summed() {
+    // Parsed out of the fixture line rather than transcribed: a hand-copied literal would pass a
+    // mapper that silently reshaped the document, which is the one thing this test is for.
+    let from_the_wire = lines("claude_acp_turn.jsonl")
+        .into_iter()
+        .filter(|line| line["method"] == "session/update")
+        .map(|line| line["params"]["update"].clone())
+        .find(|update| update["_meta"][RATE_LIMIT_META_KEY].is_object())
+        .map(|update| update["_meta"][RATE_LIMIT_META_KEY].clone())
+        .expect("the capture carries the blob on one of its usage reports");
+
+    let usage = usage_events("claude_acp_turn.jsonl");
+    assert!(
+        usage.len() >= 2,
+        "the capture holds more than one usage report: {usage:?}"
+    );
+    assert_eq!(
+        usage[0].quota, None,
+        "the first report of a turn carries no `_meta`, so a client must not expect an allowance \
+         on every one: {:?}",
+        usage[0]
+    );
+    let carried = usage
+        .iter()
+        .find(|event| event.quota.is_some())
+        .expect("a later report carries it");
+    assert_eq!(
+        carried.quota.as_ref(),
+        Some(&from_the_wire),
+        "the blob is stored exactly as it arrived, keys the mapper does not understand included"
+    );
+
+    // The capture reports the allowance and the cost on separate updates, so the cost is spliced
+    // onto the blob-carrying event here: with both present, "only `cost_micros` moved" is a claim
+    // about the blob rather than about an absent number.
+    let mut both = carried.clone();
+    both.cost_micros = Some(1_337);
+    let payload = serde_json::to_value(&both).expect("a usage event serializes");
+    assert!(
+        payload["quota"].is_object(),
+        "the blob is in the document `add_payload` is handed, not just in the struct: {payload}"
+    );
+    let mut totals = UsageTotals::default();
+    totals.add_payload(&payload);
+    assert_eq!(
+        totals,
+        UsageTotals {
+            cost_micros: Some(1_337),
+            ..UsageTotals::default()
+        },
+        "the four token totals stay `None` — the difference between nobody reporting and a \
+         reported zero — and no total is invented from the blob"
     );
 }
 

@@ -145,6 +145,7 @@ expression: decoded
                 cost_amount: None,
                 cost_currency: None,
                 usage_scope: None,
+                quota: None,
             },
         ),
         raw: None,

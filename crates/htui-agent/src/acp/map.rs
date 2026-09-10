@@ -28,6 +28,11 @@ const MISSING_KIND: &str = "<missing>";
 /// One micro-dollar, as the multiplier from the `cost.amount` ACP reports in whole currency units.
 const MICROS_PER_UNIT: f64 = 1_000_000.0;
 
+/// The one `_meta` key `docs/ANA-4.md` §7 documents on a `usage_update`. A wire key read for
+/// **every** ACP agent, not an agent-name dispatch: an adapter that does not send it maps to
+/// `quota: None`, which is what `R-AGT-5` requires and what `agy` is expected to do (§11.14).
+pub const RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
+
 /// Per-session mapping state.
 ///
 /// Only the cumulative cost: ACP reports `cost` as the session total (§3), while
@@ -103,6 +108,16 @@ impl Mapper {
             }
             _ => {}
         }
+        // Verbatim and unparsed: normalizing the vendor's shape is `htui_core::model::quota`'s
+        // job, selected by the row's declared source rather than by the agent's name (D66). The
+        // `is_object` filter is the only judgement made here — a scalar or a list under that key
+        // is not the document §7 describes, and storing one would hand the normalizer a shape it
+        // would have to reject anyway.
+        event.quota = update
+            .get("_meta")
+            .and_then(|meta| meta.get(RATE_LIMIT_META_KEY))
+            .filter(|blob| blob.is_object())
+            .cloned();
         event
     }
 }

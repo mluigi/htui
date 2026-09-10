@@ -44,6 +44,7 @@ expression: decoded
                 cost_amount: None,
                 cost_currency: None,
                 usage_scope: None,
+                quota: None,
             },
         ),
         raw: None,
@@ -79,6 +80,26 @@ expression: decoded
                 cost_amount: None,
                 cost_currency: None,
                 usage_scope: None,
+                quota: Some(
+                    Object {
+                        "status": String("allowed"),
+                        "resetsAt": Number(1788801600),
+                        "rateLimitType": String("five_hour"),
+                        "overageStatus": String("rejected"),
+                        "overageDisabledReason": String("org_level_disabled"),
+                        "isUsingOverage": Bool(false),
+                        "unifiedWindows": Object {
+                            "five_hour": Object {
+                                "utilization": Number(0.11),
+                                "resetsAt": Number(1788801600),
+                            },
+                            "seven_day": Object {
+                                "utilization": Number(0.62),
+                                "resetsAt": Number(1788854400),
+                            },
+                        },
+                    },
+                ),
             },
         ),
         raw: None,
@@ -106,6 +127,7 @@ expression: decoded
                 cost_amount: None,
                 cost_currency: None,
                 usage_scope: None,
+                quota: None,
             },
         ),
         raw: None,

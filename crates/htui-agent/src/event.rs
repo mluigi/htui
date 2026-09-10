@@ -359,6 +359,13 @@ pub struct UsageEvent {
     /// `agent.settings.usage.scope` (§5.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_scope: Option<String>,
+    /// Added key (§7, plan D66): the transport's vendor rate-limit blob, **verbatim**. Over ACP it
+    /// is `_meta["_claude/rateLimit"]` of the `usage_update`, present on some reports and not on
+    /// others (`tests/acp_map.rs`: the first report of a turn carries none). Not one of the five
+    /// summed keys — `UsageTotals::add_payload` reads five fixed names (`usage.rs:48-54`) — and
+    /// normalized into `agent_box.quota` by `htui_core::model::quota::normalize`, never here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<Value>,
 }
 
 /// `error` (§6.1). Also the shape the recorder writes for its own failures, with role `htui`.
