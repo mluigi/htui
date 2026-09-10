@@ -1781,13 +1781,21 @@ async fn unknown_update_lands_in_other<H: CaseHarness, S: WriteStore>(harness: &
     );
 }
 
-/// Edit proposals dedupe per `(tool_call_id, path)`: the buffered row is updated before the flush,
-/// never written twice (plan D6, `docs/ANA-4.md` §4.3).
+/// Edit proposals dedupe per `(tool_call_id, path)` **per step**, across a flush: one row for the
+/// key, updated in place, never written twice (`docs/ANA-4.md` §4.3, §11 criterion 6, plan D6/D77).
 ///
-/// The rule asserted here is the **buffer-scoped** one: contiguous proposals collapse. ANA-4 §11
-/// criterion 6's other half - a second write to the same path arriving *after* the row was already
-/// flushed - needs an update path on the store seam that milestone 1 does not open, and is
-/// milestone 3's.
+/// The case name is unchanged and its **script is not** (T46). It used to write the same path twice
+/// with nothing in between, which only ever exercised the buffer-scoped half of the rule — and a
+/// fake that never flushes mid-call is precisely why a transport-neutral suite reported criterion 6
+/// as holding while `agy` was leaving three rows for one file write in production. The assistant
+/// chunk between the two writes is the flush: it forces the open buffer out on the kind change,
+/// which is what used to clear the dedup index and open a second row.
+///
+/// The two writes to `src/a.rs` **differ**, so what is proved is the general rule and not the
+/// suppression of a byte-identical repeat: the surviving row has to carry the *second* write's
+/// content, at the *first* write's `seq` (plan D77 reserves the `seq` at announcement and holds only
+/// the row). `src/b.rs` is the control — a different path under the same call is a different key and
+/// keeps its own row.
 async fn edit_proposal_deduped_per_call_and_path<H: CaseHarness, S: WriteStore>(
     harness: &H,
     store: &S,
@@ -1803,6 +1811,9 @@ async fn edit_proposal_deduped_per_call_and_path<H: CaseHarness, S: WriteStore>(
     let script = Script::one_turn(vec![
         proposal("src/a.rs", "@@ first", None),
         proposal("src/b.rs", "@@ other file", None),
+        // The flush the live defect needed. Any of §4.1's triggers would do — live it was the
+        // permission park/answer — and a kind change is the one every binding can produce.
+        chunk("thinking about it ", "m1"),
         proposal("src/a.rs", "@@ second", Some(true)),
         done(StopReason::EndTurn),
     ]);
@@ -1849,6 +1860,27 @@ async fn edit_proposal_deduped_per_call_and_path<H: CaseHarness, S: WriteStore>(
         Some(true)
     );
     assert_eq!(str_at(edits[1], "path"), Some("src/b.rs"));
+
+    // The reservation, which is the half a row count cannot see: the surviving row sits where it
+    // was **announced**, ahead of the row whose flush used to break the rule, even though it was
+    // written after it. Replay reads by `seq`, so this is what keeps the transcript's order true.
+    let flushed = log
+        .iter()
+        .find(|row| row.kind == EventKind::AssistantText)
+        .expect("edit_proposal_deduped_per_call_and_path: the chunk between the writes is a row");
+    assert!(
+        edits[0].seq < flushed.seq && edits[1].seq < flushed.seq,
+        "edit_proposal_deduped_per_call_and_path: an `edit_proposal` reserves its `seq` at the \
+         announcement: {} and {} against {}",
+        edits[0].seq,
+        edits[1].seq,
+        flushed.seq
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        (0..i32::try_from(log.len()).expect("a case's log is short")).collect::<Vec<_>>(),
+        "edit_proposal_deduped_per_call_and_path: and `seq` is still gapless 0..n"
+    );
 }
 
 /// Flush trigger 4: a coalesced run is cut at [`CHUNK_FLUSH_BYTES`] rather than buffered

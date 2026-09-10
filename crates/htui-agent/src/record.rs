@@ -58,6 +58,27 @@
 //!    session. §7 as written puts the cancel here too; it cannot be here, because a `Recorder` with
 //!    a session in it is a recorder the conformance suite could not drive with no transport at all,
 //!    and plan D69 is the maintainer's record of that amendment.
+//! 7. **One `edit_proposal` row per `(tool_call_id, path)` per step** (ANA-4 §4.3, §11 criterion 6,
+//!    plan D77). Announced *n* times, a proposal is one row: the first announcement reserves the
+//!    row's `seq` and the row is then **held** rather than flushed, a re-announcement updates the
+//!    held row in place, and the write happens when the tool call closes — its `tool_result`, the
+//!    turn's `done`, a cancel, or [`Recorder::finish`] as the backstop under all three. The rule
+//!    used to live inside one flush window, which made it
+//!    hold only until the first flush - one `agy` file write left three rows in production, because
+//!    that adapter re-announces `tool_call` verbatim where the spec's example sends
+//!    `tool_call_update` and the permission park/answer flushed in between.
+//!
+//!    Two things make deferring the write cost nothing the user can see. **Display is already
+//!    separate**: the render frame goes out at the announcement (item 4's channel), so the chat tab
+//!    shows the diff immediately and only the database write waits. And **`seq` was never given
+//!    up**: it is reserved at the announcement, so `seq` stays gapless `0..n` (item 2) and a row
+//!    written after higher-numbered rows still replays in the order it happened, every reader of a
+//!    step's log ordering by `seq`.
+//!
+//!    The price, accepted knowingly in plan D77: **a process death mid-tool-call loses a proposal
+//!    row that was durable before this change.** One row of a step whose `tool_call` row still
+//!    records the attempt, against a store-seam update path (option (a)) or a transcript whose order
+//!    depends on when a write landed (option (b)).
 //!
 //! **Fail-closed.** When the scrubber returns [`Unmasked`] the recorder drops that row entirely,
 //! writes `error { code: "scrub_residue", message: "<rule> at <path>" }` with role `htui` in its
@@ -70,6 +91,7 @@
 //! nothing else; choosing `append_pending` over the store is milestone 4 (plan D8, D16).
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::time::Duration;
 
 use chrono::{DateTime, SubsecRound, Utc};
@@ -283,6 +305,46 @@ struct PendingRow {
     at: DateTime<Utc>,
 }
 
+/// What `docs/ANA-4.md` §4.3 makes **one row per, per step**: an `edit_proposal`'s
+/// `(tool_call_id, path)`. A proposal with no call id is a legitimate key of its own, not an absent
+/// one.
+type EditKey = (Option<String>, String);
+
+/// An `edit_proposal` whose `seq` is taken and whose row is not written yet (plan D77, T46).
+///
+/// The two stamps are held rather than taken at the write, which is the whole of what makes option
+/// (d) work:
+///
+/// - **`seq`** is reserved at the *first* announcement, so a row written after higher-numbered rows
+///   still replays in the order it happened — every reader of a step's log orders by `seq`
+///   (`step_events`, `replay::envelopes`, `UsageTotals::from_rows`), and the store's insert takes an
+///   explicit `seq` with `ON CONFLICT (run_step_id, seq)` as its only opinion about ordering. It
+///   also keeps `seq` gapless `0..n` (§11 criterion 3), which deferring the *number* would not.
+/// - **`turn`** is the announcement's, because a buffered row's rule — take the `turn` at flush time,
+///   which works only because [`Recorder::record_follow_up`] flushes before it increments — does not
+///   survive a row that outlives its flush.
+#[derive(Debug, Clone)]
+struct HeldEdit {
+    /// The `seq` reserved at the first announcement of this `(tool_call_id, path)`.
+    seq: i32,
+    /// The `turn` that announcement belonged to.
+    turn: i32,
+    /// The row as the **latest** announcement left it.
+    row: PendingRow,
+}
+
+/// Which row an envelope's `raw` blob belongs on.
+///
+/// Not an index alone since plan D77: an `edit_proposal` is not in `buffer` at all, and charging its
+/// wire message to whichever row happens to be buffered last is the bug this type exists to make
+/// unrepresentable.
+enum RawTarget {
+    /// An index into [`Recorder::buffer`].
+    Buffered(usize),
+    /// The held `edit_proposal` under this key.
+    Held(EditKey),
+}
+
 // ---------------------------------------------------------------------------------------------
 // The recorder
 // ---------------------------------------------------------------------------------------------
@@ -306,11 +368,30 @@ pub struct Recorder<'a, S: WriteStore> {
     buffer_kind: Option<EventKind>,
     /// The open text run's grouping key, meaningful only while `buffer_kind` is a chunk kind.
     open_message_id: Option<String>,
-    /// `(tool_call_id, path)` to its index in `buffer`, for the edit-proposal dedup rule.
-    edits: BTreeMap<(Option<String>, String), usize>,
-    /// Rows a flush numbered and the store then refused. They keep their `seq` and go out ahead
-    /// of the buffer on the next flush, which is what makes a failed append cost a retry rather
-    /// than a hole in the log.
+    /// `edit_proposal` rows whose `seq` is reserved and whose write is owed (plan D77, T46).
+    ///
+    /// **Not cleared by a flush**, which is the fix: `docs/ANA-4.md` §4.3 asks for one row per
+    /// `(tool_call_id, path)` **per step**, and an index living inside one flush window made that
+    /// hold only until the first flush. One `agy` file write left three rows in production — the
+    /// adapter re-announces `tool_call` verbatim where the spec's example sends `tool_call_update`,
+    /// and the permission park/answer flushed in between.
+    ///
+    /// A re-announcement of a key already here updates the held row in place; the row is written
+    /// when the call closes ([`Recorder::release_held`]). Nothing the user sees moves, because the
+    /// render frame goes out at the announcement ([`Recorder::send_ui`]) and only the database write
+    /// waits.
+    held: BTreeMap<EditKey, HeldEdit>,
+    /// Rows already numbered and owed to the store. They keep their `seq` and go out ahead of the
+    /// buffer on the next flush, which is what makes a failed append cost a retry rather than a
+    /// hole in the log.
+    ///
+    /// Two things land here: a batch a flush numbered and the store then refused, and a held
+    /// `edit_proposal` whose call has closed. So the batch a flush offers is **not** necessarily
+    /// ascending in `seq` — a released row's number was reserved before a refused batch's were — and
+    /// that is safe on every path, verified rather than assumed: `append_events` inserts row by row
+    /// from an explicit `seq` with `ON CONFLICT (run_step_id, seq) DO NOTHING` (`pg/write.rs`),
+    /// `MemStore` does the same scan, every reader orders by `seq`, and the offline buffer's loader
+    /// dedupes on `(run_step_id, seq)` and sorts by `seq` before it uploads (`cache/pending.rs`).
     unflushed: Vec<SessionEvent>,
 
     next_seq: i32,
@@ -350,6 +431,7 @@ impl<S: WriteStore> core::fmt::Debug for Recorder<'_, S> {
             .field("ui", &self.ui.is_some())
             .field("buffered", &self.buffer.len())
             .field("buffer_kind", &self.buffer_kind)
+            .field("held", &self.held.len())
             .field("unflushed", &self.unflushed.len())
             .field("next_seq", &self.next_seq)
             .field("turn", &self.turn)
@@ -386,7 +468,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             buffer: Vec::new(),
             buffer_kind: None,
             open_message_id: None,
-            edits: BTreeMap::new(),
+            held: BTreeMap::new(),
             unflushed: Vec::new(),
             next_seq: 0,
             turn: 0,
@@ -670,8 +752,8 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         let mut reached_bound = false;
         // The cap verdict, set by the one `usage` row that reaches the cap (plan D70).
         let mut breach = None;
-        // Which buffered row this envelope became, so its `raw` lands on *that* row rather than
-        // on whichever row happens to be last (the dedup arm updates a row further back).
+        // Which row this envelope became, so its `raw` lands on *that* row rather than on whichever
+        // row happens to be last (the dedup arm updates a row that is not in the buffer at all).
         let target = match (&scrubbed.event, chunk) {
             (_, Some(text)) => {
                 if self.buffer_kind.is_none() {
@@ -695,33 +777,50 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
                     .and_then(|open| open.payload.get("text"))
                     .and_then(Value::as_str)
                     .is_some_and(|open_text| open_text.len() >= CHUNK_FLUSH_BYTES);
-                self.buffer.len() - 1
+                RawTarget::Buffered(self.buffer.len() - 1)
             }
             (DriverEvent::EditProposal(proposal), _) => {
                 let key = (proposal.tool_call_id.clone(), proposal.path.clone());
-                // Dedup per `(tool_call_id, path)`: the buffered row is updated before the flush,
-                // never written twice (ANA-4 §4.3, plan D6). The row *is* the update once it is
-                // updated - it carries the update's `diff` and `accepted` - so it carries the
-                // update's capture time as well, and (below) the update's `raw`.
-                if let Some(&index) = self.edits.get(&key) {
-                    let open = &mut self.buffer[index];
-                    open.payload = payload;
-                    open.at = scrubbed.at;
-                    index
-                } else {
-                    self.edits.insert(key, self.buffer.len());
-                    self.push(PendingRow {
-                        kind,
-                        role: EventRole::Agent,
-                        tool_call_id: proposal.tool_call_id.clone(),
-                        payload,
-                        raw: Vec::new(),
-                        at: scrubbed.at,
-                    });
-                    self.buffer.len() - 1
+                let row = PendingRow {
+                    kind,
+                    role: EventRole::Agent,
+                    tool_call_id: proposal.tool_call_id.clone(),
+                    payload,
+                    raw: Vec::new(),
+                    at: scrubbed.at,
+                };
+                // The `seq` is taken from the field rather than through a method, so the reservation
+                // and the `entry` borrow are two disjoint fields and the number is taken **only**
+                // when the key is new: a reservation with no row behind it would be a `seq` gap.
+                let next_seq = &mut self.next_seq;
+                let turn = self.turn;
+                match self.held.entry(key.clone()) {
+                    // Dedup per `(tool_call_id, path)` for the whole step (ANA-4 §4.3, §11
+                    // criterion 6, plan D77). The held row *is* the update once it is updated - it
+                    // carries the update's `diff` and `accepted` - so it carries the update's
+                    // capture time as well, and (below) the update's `raw`. What it keeps is the
+                    // `seq` and the `turn` of the announcement.
+                    Entry::Occupied(mut open) => {
+                        let open = open.get_mut();
+                        open.row.payload = row.payload;
+                        open.row.at = row.at;
+                    }
+                    Entry::Vacant(slot) => {
+                        let seq = *next_seq;
+                        *next_seq += 1;
+                        slot.insert(HeldEdit { seq, turn, row });
+                    }
                 }
+                RawTarget::Held(key)
             }
             (event, _) => {
+                if let DriverEvent::ToolResult(result) = event {
+                    // The call is closing, so its held proposals are owed now (plan D77). A
+                    // terminal `tool_call_update` maps to a `tool_result` too (`acp::map`), so this
+                    // one arm covers both of §4.3's completion shapes.
+                    let id = result.tool_call_id.clone();
+                    self.release_held(|(call, _)| call.as_deref() == Some(id.as_str()));
+                }
                 if matches!(event, DriverEvent::Usage(_)) {
                     // The scrubbed document that is about to be persisted, not the typed event:
                     // the uploader (`htui-store`) has only these bytes, and summing them on both
@@ -743,7 +842,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
                     raw: Vec::new(),
                     at: scrubbed.at,
                 });
-                self.buffer.len() - 1
+                RawTarget::Buffered(self.buffer.len() - 1)
             }
         };
 
@@ -755,14 +854,30 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         } else {
             scrubbed.raw.take()
         };
-        if let Some(raw) = raw
-            && let Some(open) = self.buffer.get_mut(target)
-        {
-            open.raw.push(raw);
+        if let Some(raw) = raw {
+            match target {
+                RawTarget::Buffered(index) => {
+                    if let Some(open) = self.buffer.get_mut(index) {
+                        open.raw.push(raw);
+                    }
+                }
+                RawTarget::Held(key) => {
+                    if let Some(open) = self.held.get_mut(&key) {
+                        open.row.raw.push(raw);
+                    }
+                }
+            }
         }
 
         // Triggers 3 and 4: the turn ended, or the open run reached the byte bound.
-        if matches!(scrubbed.event, DriverEvent::Done(_)) || reached_bound {
+        let turn_ended = matches!(scrubbed.event, DriverEvent::Done(_));
+        if turn_ended {
+            // Nothing later in this turn can close a call, and a held row must never outlive the
+            // turn that reserved its `seq` (plan D77): the `turn` it carries would then name a turn
+            // the log had already closed.
+            self.release_held(|_| true);
+        }
+        if turn_ended || reached_bound {
             self.flush().await?;
             self.sync_step().await?;
         }
@@ -776,11 +891,17 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// Flushes what is buffered, writes `run_step.usage` (and the digest, if no usage report has
     /// carried it yet), and reports the summary.
     ///
+    /// **The backstop for a held `edit_proposal`** (plan D77): a row whose tool call never closed —
+    /// a turn that simply ended with the call open, a transport that never reported the result — is
+    /// released here. A held row that was never written would be a `seq` gap, which is worse than
+    /// the duplicate the rule exists to prevent.
+    ///
     /// # Errors
     /// [`RecordError::Unmasked`] when any payload of this session failed to scrub - the rows are
     /// still written, minus the refused ones - and [`RecordError::Store`] when the final writes
     /// fail.
     pub async fn finish(mut self) -> Result<RecorderSummary, RecordError> {
+        self.release_held(|_| true);
         self.flush().await?;
         self.sync_step().await?;
         if let Some(unmasked) = self.residue.clone() {
@@ -813,16 +934,24 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// chunks only exists once the run is assembled; masking is idempotent, so scrubbing the
     /// already-scrubbed pieces again costs a pass and changes nothing.
     ///
-    /// **Failure-atomic.** The batch is numbered into a local vector, and `next_seq` / `rows`
-    /// move only once the store has said `Ok`. A store that refuses keeps the numbered batch in
-    /// `unflushed`, so the next flush offers those rows again, ahead of anything buffered since
-    /// and at the very `seq` they were given: with one writer, a failed append costs a retry and
-    /// never a hole. Re-offering is safe because `append_events` skips a `(run_step_id, seq)` it
-    /// already holds, so a partially applied batch cannot be written twice.
+    /// **Failure-atomic.** The batch is numbered into a local vector and `rows` moves only once the
+    /// store has said `Ok`. A store that refuses keeps the numbered batch in `unflushed`, so the
+    /// next flush offers those rows again, ahead of anything buffered since and at the very `seq`
+    /// they were given: with one writer, a failed append costs a retry and never a hole. Re-offering
+    /// is safe because `append_events` skips a `(run_step_id, seq)` it already holds, so a partially
+    /// applied batch cannot be written twice.
+    ///
+    /// `next_seq` advances at **numbering** time rather than at commit, because since plan D77 it is
+    /// not only the flush that hands out numbers — a held `edit_proposal` reserves one at its
+    /// announcement. A refused batch keeps the numbers it was given (they are on the rows in
+    /// `unflushed`, which are not renumbered), so the counter and the log still agree; advancing it
+    /// only on success would let a reservation collide with a refused batch's numbers.
+    ///
+    /// **What it does not do is clear the held rows.** That was T46's defect: `(tool_call_id, path)`
+    /// identity is a domain fact and a flush is a persistence detail.
     async fn flush(&mut self) -> Result<(), RecordError> {
         self.buffer_kind = None;
         self.open_message_id = None;
-        self.edits.clear();
         if self.buffer.is_empty() && self.unflushed.is_empty() {
             return Ok(());
         }
@@ -839,16 +968,13 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
                     residue_row(&unmasked, row.at)
                 }
             };
-            rows.push(self.event_row(row));
-        }
-        let mut seq = self.next_seq;
-        for row in &mut rows {
-            row.seq = seq;
-            seq += 1;
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            let turn = self.turn;
+            rows.push(self.event_row(row, seq, turn));
         }
         match self.store.append_events(&rows).await {
             Ok(written) => {
-                self.next_seq = seq;
                 self.rows += written;
                 Ok(())
             }
@@ -856,6 +982,58 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
                 self.unflushed = rows;
                 Err(RecordError::Store(error))
             }
+        }
+    }
+
+    /// Hands the held `edit_proposal` rows the filter selects to the store's owed set, in the order
+    /// their `seq` was reserved (plan D77, T46).
+    ///
+    /// **Called on every path that can close a proposal**, because a held row that is never written
+    /// is a `seq` gap:
+    ///
+    /// 1. the tool call's completion — a `tool_result`, which is also what a terminal
+    ///    `tool_call_update` maps to ([`Recorder::record`]);
+    /// 2. the turn's `done`, after which nothing can close a call and the `turn` the row carries
+    ///    would name a closed turn;
+    /// 3. the cap's cancel ([`Recorder::record_cap_breach`], reached only through
+    ///    [`enforce_breach`]), whose closing pair must not be written over a hole;
+    /// 4. [`Recorder::finish`], the backstop under all three.
+    ///
+    /// The row goes to `unflushed` rather than to `buffer`: it is already numbered, and `buffer`
+    /// holds rows that take their `seq` at the flush. The final scrub pass — the one that catches a
+    /// secret no single announcement carried (`R-SEC-3`) — happens here instead of in the flush, for
+    /// the same reason, and a refusal replaces the row with a `scrub_residue` row at that same `seq`
+    /// so the fail-closed path still leaves no gap.
+    ///
+    /// **The price plan D77 accepted knowingly**: a process death between the announcement and the
+    /// close loses a proposal row that is durable today. It is one row of a step whose `tool_call`
+    /// row still records that the edit was attempted, the `seq` is re-derived on the next run rather
+    /// than left as a hole, and the alternative options each cost a store-seam change or the
+    /// transcript's order.
+    fn release_held<F: Fn(&EditKey) -> bool>(&mut self, wanted: F) {
+        let mut owed: Vec<(i32, EditKey)> = self
+            .held
+            .iter()
+            .filter(|(key, _)| wanted(key))
+            .map(|(key, held)| (held.seq, key.clone()))
+            .collect();
+        // Reserved order, so a batch stays ascending in `seq` where it can. Correctness does not
+        // rest on it - the insert takes an explicit `seq` - but a wire batch a human can read does.
+        owed.sort_unstable();
+        for (_, key) in owed {
+            let Some(HeldEdit { seq, turn, mut row }) = self.held.remove(&key) else {
+                continue;
+            };
+            let outcome = self.scrubber.scrub(&mut row.payload);
+            let row = match outcome {
+                Ok(()) => row,
+                Err(unmasked) => {
+                    self.note_residue(&unmasked);
+                    residue_row(&unmasked, row.at)
+                }
+            };
+            let event = self.event_row(row, seq, turn);
+            self.unflushed.push(event);
         }
     }
 
@@ -1107,6 +1285,12 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             None => (breach.at, None),
         };
 
+        // A cancel closes every call it terminated, so a proposal still held is owed now (plan
+        // D77). The cancel's own synthesized `tool_result`s have usually released theirs already
+        // ([`enforce_breach`] pulls them through `record`), but §4.3 makes those a MUST of the
+        // *transport* and this sequence may not depend on a transport keeping it: the closing pair
+        // below must never be written over a hole.
+        self.release_held(|_| true);
         self.push(PendingRow {
             kind: EventKind::Error,
             role: EventRole::Htui,
@@ -1161,8 +1345,9 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// masked document verbatim.
     ///
     /// What the row loses is the two things that read the typed event: it cannot be coalesced into
-    /// an open run, nor deduped against an earlier proposal, so the open run is flushed first and
-    /// the row stands alone. `tool_call_id` is taken from the masked document, which is why the
+    /// an open run, nor matched against a held `edit_proposal` — so it is neither deduped against
+    /// one nor held itself, the open run is flushed first and the row stands alone, written at the
+    /// `seq` its own flush gives it. `tool_call_id` is taken from the masked document, which is why the
     /// column can never carry an unmasked id. No frame reaches the chat tab, which has no scrubbed
     /// event to render; the row is there when it reloads.
     ///
@@ -1247,8 +1432,12 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         }
     }
 
-    /// Stamps a buffered row with its step and turn. `seq` is assigned by the caller.
-    fn event_row(&self, row: PendingRow) -> SessionEvent {
+    /// Stamps a pending row with its step, its `seq` and its `turn`.
+    ///
+    /// Both numbers are parameters rather than reads of `self`, because there are now two kinds of
+    /// row: a buffered one takes both at the flush, and a held `edit_proposal` carries the pair it
+    /// was given at its announcement (plan D77).
+    fn event_row(&self, row: PendingRow, seq: i32, turn: i32) -> SessionEvent {
         let raw = match row.raw.len() {
             0 => None,
             // One row, one message. A coalesced row is many messages, so it carries the array
@@ -1258,8 +1447,8 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         };
         SessionEvent {
             run_step_id: self.step,
-            seq: 0,
-            turn: self.turn,
+            seq,
+            turn,
             kind: row.kind,
             role: row.role,
             tool_call_id: row.tool_call_id,

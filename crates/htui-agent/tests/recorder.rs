@@ -2068,6 +2068,301 @@ async fn edit_proposals_dedupe_per_call_and_path() {
     }
 }
 
+/// T46 / plan D77: the dedup rule of `docs/ANA-4.md` §11 criterion 6 survives a **flush**.
+///
+/// The row that broke it live: `agy` re-announces a `tool_call` verbatim where the spec's example
+/// sends `tool_call_update`, and the permission park/answer flushes in between, so the second
+/// announcement found an empty index and opened a second row. The fix reserves the `seq` at the
+/// first announcement and holds the row until the call closes, so what a flush in between costs is
+/// nothing at all.
+///
+/// Four things are asserted, and each is a separate half of D77: **one** row for the key, carrying
+/// the **latest** content, at the **first** announcement's `seq` — that is what makes replay, which
+/// reads by `seq`, keep the true order of a row written late — and `seq` gapless over the whole log.
+#[tokio::test]
+async fn an_edit_proposal_reserves_its_seq_and_survives_a_flush() {
+    let later = at() + chrono::TimeDelta::seconds(5);
+    let proposal = |diff: &str, accepted: Option<bool>, at| DriverEnvelope {
+        event: DriverEvent::EditProposal(EditProposalEvent {
+            tool_call_id: Some("call-1".to_owned()),
+            path: "src/a.rs".to_owned(),
+            diff: diff.to_owned(),
+            accepted,
+        }),
+        raw: None,
+        at,
+    };
+    let request_id = htui_agent::driver::PermissionRequestId::new("req-1");
+
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    // A live chat tab, because the other half of D77 is that **nothing the user sees moves**: the
+    // render frame goes out at the announcement and only the database write waits.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, Some(tx));
+
+    recorder
+        .record(tool_call("call-1"))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(proposal("@@ first", None, at()))
+        .await
+        .expect("recording must land");
+    // The real-world flush: the parked permission request is answered, and answering it writes.
+    recorder
+        .record_permission_answer(&request_id, Some("allow"), AnsweredBy::User, false, at())
+        .await
+        .expect("the answer must land");
+    assert_eq!(
+        rows(&store, chat.step_id)
+            .await
+            .iter()
+            .filter(|row| row.kind == EventKind::EditProposal)
+            .count(),
+        0,
+        "the proposal's `seq` is reserved, but its row is held rather than written (D77)"
+    );
+    let frames: Vec<DriverEvent> = core::iter::from_fn(|| rx.try_recv().ok())
+        .map(|envelope| envelope.event)
+        .collect();
+    assert!(
+        frames.iter().any(
+            |frame| matches!(frame, DriverEvent::EditProposal(edit) if edit.diff == "@@ first")
+        ),
+        "the diff was on screen at the announcement, with the row still unwritten: {frames:?}"
+    );
+
+    recorder
+        .record(proposal("@@ second", Some(true), later))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(env(DriverEvent::ToolResult(ToolResultEvent {
+            tool_call_id: "call-1".to_owned(),
+            status: ToolResultStatus::Completed,
+            output: None,
+            locations: Vec::new(),
+            terminal_reason: None,
+        })))
+        .await
+        .expect("recording must land");
+    recorder.finish().await.expect("close");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![
+            EventKind::ToolCall,
+            EventKind::EditProposal,
+            EventKind::PermissionAnswer,
+            EventKind::ToolResult,
+        ],
+        "one row per (tool_call_id, path) for the whole step, and it sits where it was announced"
+    );
+    let edit = &log[1];
+    assert_eq!(
+        edit.seq, 1,
+        "the `seq` is the first announcement's, taken before the answer's row was numbered: a row \
+         written late still replays in the order it happened"
+    );
+    assert_eq!(
+        edit.payload.get("diff").and_then(Value::as_str),
+        Some("@@ second"),
+        "the held row carries the latest content"
+    );
+    assert_eq!(
+        edit.payload.get("accepted").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        edit.at, later,
+        "the held row *is* the update, so it carries the update's capture time"
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        (0..i32::try_from(log.len()).expect("short")).collect::<Vec<_>>(),
+        "and `seq` is still gapless 0..n, which is what a reservation buys over a deferral"
+    );
+}
+
+/// T46's regression witness: the recorded `agy` transcript, replayed through the **recorder**.
+///
+/// `tests/acp_map.rs` pins what the mapper makes of this fixture — two `tool_call`s and three
+/// `edit_proposal`s for one file write, because the adapter re-announces the call verbatim. This
+/// case pins what the *recorder* does with that, which is where criterion 6 lives: exactly **one**
+/// `edit_proposal` row for the write. The live run left three, at `seq` 12, 15 and 16.
+///
+/// The permission answer is interleaved after the second announcement because that is where it fell
+/// live: `agy` requests permission for the write, and answering a parked request flushes. Without it
+/// the same replay left two rows rather than three — the count is a function of the interleaving,
+/// which is exactly why a fake that never flushes mid-call could not see the defect.
+#[tokio::test]
+async fn the_recorded_agy_write_leaves_one_edit_proposal_row() {
+    let path = format!(
+        "{}/tests/fixtures/agy_acp_turn.jsonl",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path}: {err}"));
+    let mut mapper = htui_agent::acp::map::Mapper::new();
+    let events: Vec<DriverEvent> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("a fixture line is JSON"))
+        .filter(|line| line["method"] == "session/update")
+        .flat_map(|line| mapper.map(&line["params"]["update"]))
+        .collect();
+    let announcements = events
+        .iter()
+        .filter(|event| matches!(event, DriverEvent::EditProposal(_)))
+        .count();
+    assert_eq!(
+        announcements, 3,
+        "the fixture is the one the defect was measured on: three announcements of one write"
+    );
+
+    let request_id = htui_agent::driver::PermissionRequestId::new("perm-1");
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+    recorder
+        .record_prompt("write a file", json!({}), at())
+        .await
+        .expect("the prompt row must land");
+    let mut seen = 0;
+    for event in events {
+        let announcement = matches!(event, DriverEvent::EditProposal(_));
+        recorder
+            .record(env(event))
+            .await
+            .expect("recording must land");
+        if announcement {
+            seen += 1;
+            if seen == 2 {
+                recorder
+                    .record_permission_answer(
+                        &request_id,
+                        Some("allow"),
+                        AnsweredBy::User,
+                        false,
+                        at(),
+                    )
+                    .await
+                    .expect("the answer must land");
+            }
+        }
+    }
+    recorder.finish().await.expect("close");
+
+    let log = rows(&store, chat.step_id).await;
+    let edits: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::EditProposal)
+        .collect();
+    assert_eq!(
+        edits.len(),
+        1,
+        "one `edit_proposal` for the write, where the live run left three (seq 12, 15, 16)"
+    );
+    assert_eq!(
+        edits[0].payload.get("path").and_then(Value::as_str),
+        Some("/scratch/htui-agy-probe.txt")
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        (0..i32::try_from(log.len()).expect("short")).collect::<Vec<_>>(),
+        "`seq` is gapless across the whole replayed turn"
+    );
+}
+
+/// D77's two backstops: a held row whose tool call never closes is written by the **cancel** and by
+/// **`finish`**, because a held row that was never written would be a `seq` gap — worse than the
+/// duplicate the rule exists to prevent.
+///
+/// The cancel is the cap's (`enforce_breach`), which is the one shared cancel-and-close sequence and
+/// therefore the only cancel path there is. `finish` is the backstop under everything, including a
+/// turn that simply ends with a call still open.
+#[tokio::test]
+async fn a_held_edit_proposal_is_written_by_a_cancel_and_by_finish() {
+    let proposal = env(DriverEvent::EditProposal(EditProposalEvent {
+        tool_call_id: Some("call-1".to_owned()),
+        path: "src/a.rs".to_owned(),
+        diff: "@@ held".to_owned(),
+        accepted: None,
+    }));
+
+    // `finish`: the call never closes and the turn never ends.
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+    recorder
+        .record(tool_call("call-1"))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(proposal.clone())
+        .await
+        .expect("recording must land");
+    let summary = recorder.finish().await.expect("close");
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::ToolCall, EventKind::EditProposal],
+        "`finish` writes what is still held"
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![0, 1],
+        "at the reserved `seq`, with no gap"
+    );
+    assert_eq!(
+        summary.seq, 2,
+        "and the summary's `seq` counts the row it authored"
+    );
+
+    // The cancel: the cap fires with the proposal still held, and the closing pair must not be
+    // written over a hole.
+    let chat = chat_spec();
+    let store = open_chat(&chat).await;
+    let mut recorder =
+        Recorder::new(&store, &scrubber, chat.step_id, false, None).with_run_cap(run_cap(100));
+    let mut session = ScriptedSession::cancelling(Vec::new(), Vec::new());
+    recorder
+        .record(proposal)
+        .await
+        .expect("recording must land");
+    let breach = recorder
+        .record(usage(Some(100), None))
+        .await
+        .expect("recording must land")
+        .expect("a spend equal to the cap has reached it");
+    htui_agent::record::enforce_breach(&mut session, &mut recorder, breach)
+        .await
+        .expect("the closing rows must land");
+    recorder.finish().await.expect("close");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![
+            EventKind::EditProposal,
+            EventKind::Usage,
+            EventKind::Error,
+            EventKind::Done,
+        ],
+        "the cancel writes the held row before the closing pair, and criterion 8's last row still \
+         says `cancelled`"
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "no gap where the held row was"
+    );
+}
+
 /// A secret split across two chunks only exists once the run is assembled, so the coalesced row
 /// is scrubbed again at the flush; masking is idempotent, so the pieces already scrubbed at
 /// capture cost a pass and change nothing.
