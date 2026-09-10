@@ -179,7 +179,7 @@ impl core::fmt::Debug for LiveInstall {
 
 /// The one refusal of an `auth_choose` that leaves the login **running** (review L-4).
 ///
-/// [`run_auth`] takes the choice sender exactly once, so a second choice is refused rather than
+/// `run_auth` takes the choice sender exactly once, so a second choice is refused rather than
 /// dropped — the pane hears back for every request it spends. But the other two refusals of that
 /// request ("no login is running", "this login has ended") mean the flow is *gone* and this one
 /// means it is very much there, and a section that treated them alike would clear its pane and
@@ -195,7 +195,7 @@ pub const AUTH_ALREADY_CHOSEN: &str = "a method was already chosen";
 /// The [`ChatCommand`] shape, and for the same reason: there are two things a running flow can be
 /// told, each answered at the address of the request that asked. A `oneshot` on the runtime would
 /// carry one of them, and the opener has to run somewhere the runtime can name — `background`
-/// would trip [`AgentRuntime::claim_is_free`]'s "a probe is running", and a bare `tokio::spawn`
+/// would trip `AgentRuntime::claim_is_free`'s "a probe is running", and a bare `tokio::spawn`
 /// would be a task nobody owns.
 #[derive(Debug)]
 pub enum AuthCommand {

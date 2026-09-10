@@ -271,13 +271,49 @@ empty; without it the server's startup path tries to drop privileges to a `nobod
 (`Check failed: LookupGIDByGroupName(…)`) before it reads a byte of stdin. The probe applies the
 append, which is why `Settings > r` is what makes a chat launch a working `agy`.
 
-**Authentication is the vendor's, not `htui`'s.** The server keeps its own configuration under
+## Logging an agent in
+
+An installed adapter is not a usable one. `agy_acp_server` keeps its credential under
 `$GEMINI_HOME/antigravity-acp/` (default `~/.gemini/antigravity-acp/`) — a *sibling of, and
 separate from*, the `agy` CLI's own directory, so being logged into the CLI does not log in the
-adapter. Until it holds a credential the probe records `unauthenticated` and leaves the agent
-disabled on this box; a chat started anyway now reports the server's own message, which names the
-methods it accepts (`oauth-personal`, `gemini-api-key`, `agent-platform`, `oauth-business`) and the
-`settings.json` that selects one. `htui` never sees the credential and cannot perform the login.
+adapter, and until that directory holds a token the probe records `unauthenticated`.
+
+Since `R-AGT-9` that state is actionable from the app. In **Settings > Agents**, `a` on the
+highlighted row starts a login. The agent is asked which methods it accepts and answers with its
+own words — `agy` offers "Log in with Google", "Log in with Gemini Enterprise", "Gemini API key"
+and "Gemini Enterprise Agent Platform" — `j`/`k` and `Enter` choose one, `o` opens the link the
+agent prints, and `x` cancels. Where the agent advertises logging out, the chooser offers that too.
+No agent name and no method id appears anywhere in the code: the list comes off the wire
+(`R-AGT-5`).
+
+**`htui` never reads, holds or stores the credential.** It triggers the agent's own flow and
+watches what happens; the token is written by the vendor, where the vendor keeps it. What the app
+records afterwards is a **re-probe**, so the `on this box` cell is the probe's verdict and not the
+login's claim — a flow that reported success into a box holding no credential still reads
+`unauthenticated`. Authentication is a fact about a box, never about a registry row: the `agent`
+row is byte-identical before and after.
+
+Two of the four methods are not browser flows at all. `gemini-api-key` and `agent-platform` want a
+variable in the environment the adapter is *launched from*, and the agent says so itself
+(`The GEMINI_API_KEY environment variable must be set…`). `htui` relays that rather than hiding the
+method; injecting the value is the secret provider's job (`R-SEC-1..4`, MOD-10), not this flow's.
+
+A login is paced by a human, so it has no timeout — only `x`, and a cap on **silence** that ends a
+flow nobody is watching. While it waits, the rest of the app keeps working: the flow runs off the
+worker loop like every other long operation (`R-NF-3`).
+
+One thing the app cannot fix for you yet. The agent opens its own redirect listener on
+**this box's** loopback, on a fresh port per attempt. If you run `htui` on a server, the link your
+browser opens redirects to `127.0.0.1` on *your* machine, where nothing is listening. Until MOD-22
+lands, finish the flow by copying the failed `http://127.0.0.1:<port>/?code=…&state=…` out of the
+address bar and re-issuing it on the box:
+
+```bash
+curl -s "http://127.0.0.1:<port>/?code=…&state=…"
+```
+
+The adapter takes the code from its own loopback and the login completes. Forwarding the port
+(`ssh -L`) is the other route and works on some setups; the paste-back works on all of them.
 
 ## Platforms
 

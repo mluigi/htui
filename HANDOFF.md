@@ -14,25 +14,36 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-09):** **MOD-20 landed** (`docs/decisions/mod/mod-20.md`): `htui`
-installs an ACP agent's adapter itself, from the ACP registry, for any agent that declares how —
-`Settings > Agents`, `j`/`k`, **`i`**, a consent pane naming the licence, the size and whether a
-digest can be verified, then `y`. Nothing is fetched before consent, and the row's status afterwards
-is the **probe's** answer, never the installer's. `R-AGT-10` is met and `docs/ANA-4.md` §4.6's
-"MOD-2 should not become a package manager" deferral is reversed; the README's hand-written `curl`
-is gone. Its `R-AGT-5` proof is live: **`amp-acp`** — a vendor no seed, no source file and no code
-path knows — installed from a registry row the test itself writes. It also **amended MOD-2 plan
-D48**: `newest()` is version-aware now, because `unzip` gives a tree the vendor's build date and the
-old path tie-break ranked `1.9.0` above `1.10.0`. 589 tests green on **Linux** with Postgres live.
-**Its Windows-conditional code could not be lint-checked at all — see TOOL-3, which is a maintainer
-decision**, and MOD-16 inherits the runtime half either way.
-Before it, MOD-2 milestone 6 landed and is reviewed (`acf16f7`), one task short: **`agy` works over
-ACP**, `agy_acp_server` is installed here, and ANA-4 §11 criterion 10 is proven live. The driver
-spawns what the probe recorded, the only path carrying `agy`'s Linux-only `--uid=` — an argument the
-live run proved **mandatory**. Outstanding: the live `agy` **chat** needs the maintainer to
-authenticate `agy_acp_server` through the vendor's own flow (`$GEMINI_HOME/antigravity-acp/`,
-separate from the `agy` CLI's login), and three ANA-4 §11.14 items wait on it. Logging an agent in
-**from the app** is MOD-21 (`R-AGT-9`); MOD-20 is its other half and the shape to follow.
+**Current status (2026-09-10):** **MOD-21 landed** (`docs/decisions/mod/mod-21.md`): an agent that
+reports itself installed-but-unauthenticated is logged in **from inside `htui`** — `Settings >
+Agents`, `j`/`k`, **`a`**, the agent's own methods in its own words, `Enter` to choose, `o` to open
+the link it prints, `x` to cancel, logout where advertised. `htui` triggers the flow and never
+reads, holds or stores the credential; what changes the row afterwards is a **re-probe**, so the
+cell is the probe's verdict and not the login's claim, and the `agent` row is byte-identical before
+and after. `R-AGT-9` is met and `docs/ANA-4.md` §4.5's "`htui` cannot log in non-interactively" is
+reversed **in fact**: `agy` went `unauthenticated` → `ready` through the app on this box on
+2026-09-10, and the seed's declared credential path (`~/.gemini/antigravity-acp/acp_token.json`) is
+**confirmed** rather than guessed. Live research settled three things a design would have got wrong:
+`authenticate` blocks for the whole human round trip, the URL comes back on **stderr** as prose and
+not through `elicitation/create` even when elicitation is advertised, and the adapter spawns a
+browser whose output lands in the **JSON-RPC stream** unless `BROWSER` is neutralised. 687 tests
+green on **Linux** with Postgres live. Its Windows half could not be lint-checked either (TOOL-3);
+MOD-16 inherits those runtime facts by name. **A box the browser cannot reach cannot finish the
+flow** — the agent's redirect listener is on `htui`'s own loopback — which is **MOD-22**.
+Before it, **MOD-20 landed** (`docs/decisions/mod/mod-20.md`): `htui` installs an ACP agent's
+adapter itself from the ACP registry, `Settings > i`, consent before a byte is fetched, and the
+row's status afterwards is the probe's answer. `R-AGT-10` is met, `docs/ANA-4.md` §4.6's deferral is
+reversed, and its `R-AGT-5` proof is live — **`amp-acp`**, a vendor no seed and no code path knows,
+installed from a registry row the test itself writes. It **amended MOD-2 plan D48**: `newest()` is
+version-aware, because `unzip` gives a tree the vendor's build date and the old tie-break ranked
+`1.9.0` above `1.10.0`.
+**MOD-2 milestone 6's T34 is unblocked and half answered.** The box is authenticated now, so
+`agy_live.rs` passes 4/4 against a logged-in server and `session/new` succeeds, reporting its
+`config_options` (permission modes `default`, `auto_edit`, `yolo` — MOD-2 D64's coordinate, now
+learnable). The **three ANA-4 §11.14 questions still need a live turn**, which is MOD-2's own work:
+whether `agy_acp_server` emits `usage_update` and in what field, whether it issues
+`session/request_permission` in `default` mode and with what option ids, and whether its edits
+arrive as a standard `tool_call` + `diff` or in a vendor shape.
 **Live coordinates.** Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql`
 is no longer held (`docs/ANA-2.md` §9) and is **still the next migration** — MOD-20 deliberately
 added none. Adapters install under `HTUI_AGENTS_ROOT`, default `dirs::data_local_dir()/htui/agents`;
@@ -230,11 +241,14 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `agy_acp_server_1.1.1` — D57's "the registry value is a download coordinate only" still holds, its
   stated reason does not; and §4.5's protocol-echo warning is **confirmed live** (the server echoed
   `protocolVersion 99` when sent 99, so the echo is no evidence of support).
-  **What milestone 6 still owes** (`T34`, blocked on a maintainer action, not on code): the live
-  `agy` chat. `agy_acp_server` keeps its credentials in `$GEMINI_HOME/antigravity-acp/`, a sibling
-  of and separate from the `agy` CLI's own directory, so the CLI's login does not count and `htui`
-  cannot log in non-interactively; until the maintainer authenticates the server itself, `session/new`
-  is refused and **three ANA-4 §11.14 items stay open** — whether `agy_acp_server` emits
+  **What milestone 6 still owes** (`T34`) — **no longer blocked**: the live `agy` chat.
+  `agy_acp_server` keeps its credentials in `$GEMINI_HOME/antigravity-acp/`, a sibling of and
+  separate from the `agy` CLI's own directory, so the CLI's login does not count — and **MOD-21
+  logged it in from the app on 2026-09-10** (`docs/decisions/mod/mod-21.md`), which is what
+  unblocked this. `agy_live.rs` now passes 4/4 against the logged-in server and `session/new`
+  succeeds, reporting `config_options` (`default`, `auto_edit`, `yolo` — the D64 coordinate).
+  What remains is **a live turn**, which none of the four existing cases drives, and with it
+  **three ANA-4 §11.14 items** — whether `agy_acp_server` emits
   `usage_update` and in what field, whether it issues `session/request_permission` in `default` mode
   and with what option ids, and whether its edits arrive as a standard `tool_call` + `diff` or in a
   vendor shape. Two of the six closed here: the `.par` mechanics (the `--uid=` finding above;
@@ -385,6 +399,16 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `reqwest`'s `system-proxy` reading the OS proxy configuration; and whether a partial
   `.staging/` entry can be removed while its file handle is open, which `fetch.rs`'s abandon path
   was restructured for but which no Linux test can distinguish.
+  **MOD-21 added a third body of Windows-only code** (`docs/decisions/mod/mod-21.md`), unlinted for
+  the same TOOL-3 reason and reviewed by eye. The runtime facts it defers here, by name: whether any
+  Windows opener honours `BROWSER` at all and whether `cmd.exe /c exit 0` is a value it accepts —
+  the neutraliser works only on an opener that *word-splits* the variable, and one that treats it as
+  a single path falls through to exactly the stdout hijack the policy exists to stop, which was
+  observed live on Linux; that `powershell.exe -NoProfile -NonInteractive -Command "Start-Process
+  -FilePath $env:HTUI_OPEN_URL"` reaches the default browser under `CREATE_NO_WINDOW`
+  (`ShellExecuteW` is unsafe FFI the workspace forbids, which is why the URL travels in the child's
+  environment); and that the job object reaps the auth child **with its loopback listener** — MOD-2
+  §11 criterion 11, now with a socket and a child that lives for minutes rather than seconds.
 
 - [ ] **MOD-17 - Local-only mode: a writable local store** (from ANA-10). `R-STO-1`, `R-STO-3..6`,
   `R-ENT-7`, `R-TUI-1`, `R-TUI-8`, `R-NF-3`, `R-ID-3`, `R-ID-7`, `R-HIS-1`, `R-USR-2`, `R-BOX-1`.
@@ -430,63 +454,58 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   than move one (`store_worker.rs:572-575`) while a `Backend::Local` and its open `local.sqlite`
   are still in hand. Buys one avoided restart and nothing else; MOD-17's M2b delivers the objective
   without it. Blocked on MOD-17 (M3).
-- [ ] **MOD-21 - In-app agent authentication** (from MOD-2 milestone 6). **`R-AGT-9`**, `R-AGT-1`,
-  `R-AGT-4..6`, `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent that reports `unauthenticated` is logged in
-  **from inside `htui`**, not by leaving the app for a vendor CLI. **This reverses a design
-  statement by maintainer decision (2026-09-09):** `docs/ANA-4.md` §4.5 concluded "`htui` cannot log
-  in non-interactively; a probe that gets a valid `initialize` with a non-empty `authMethods` and no
-  token is recorded as *installed-but-unauthenticated* and the agent is left disabled on that box
-  until the user authenticates through the vendor's own flow." Milestone 6 made that state visible
-  and honest — the probe records it, and the agent's own refusal now reaches the user instead of
-  being swallowed — but visible is not actionable, and today the only cure is a vendor login `htui`
-  neither performs nor explains.
-  The protocol already carries the call: ACP v1 has `authenticate`
-  (`agent-client-protocol-schema-1.7.0/src/v1/agent.rs:295`, `AuthenticateRequest`), which is how
-  Zed logs an agent in, and `agy_acp_server`'s own refusal names it first
-  ("call the `authenticate` method (supports `oauth-personal`, `gemini-api-key`,
-  `agent-platform`)"). The inputs are already stored: `probe.handshake.auth_methods` records the
-  ids in the order the agent listed them, and `agentCapabilities.auth.logout` says whether logging
-  *out* is offered — `agy` advertises it. So this item adds a driver call, a Settings action beside
-  `r`, and the transitions around them; it invents no vocabulary.
-  Scope: an `authenticate` on the driver seam (`R-AGT-1`), capability-gated so the CLI transport,
-  which has no such call, refuses rather than pretends; a chooser when a row offers several methods;
-  the flow's own progress surfaced in the TUI (`R-TUI-8`) without blocking the UI task (`R-NF-3`);
-  a re-probe on success so `unauthenticated` becomes `ready` by the same path that decided it; and
-  logout where the agent advertises it. **`htui` must still never read or store the credential** -
-  MOD-2's D59 rule stands (existence check only, tier name recorded, value never touched); the
-  vendor keeps its own token in its own directory, and this item only *triggers* the flow.
-  **Open questions this item must settle** - unrouted, and the list argues for the PRD path:
-  what an agent actually *does* during `authenticate` is unverified for both agents (does
-  `agy_acp_server` open a browser itself, print a URL on stderr, or block until a redirect?), and a
-  full-screen TUI has nowhere to put a URL a user must click, so the hand-off needs deciding
-  (render it, or `xdg-open`/`open`/`ShellExecute` it, with the Windows half **MOD-16's**);
-  the call has no documented timeout or cancellation semantics in v1 and an OAuth round trip is
-  human-paced, so it cannot use `HANDSHAKE_TIMEOUT`; the API-key methods are not a browser flow at
-  all (`gemini-api-key` wants `GEMINI_API_KEY`, `agent-platform` wants `GOOGLE_API_KEY` or
-  application-default credentials) and injecting those is **MOD-10's** secret provider, so this item
-  must call that seam rather than grow a second environment mechanism; authentication is a fact
-  about a *box*, not about the registry row, so nothing here may write `agent`; and a failed or
-  abandoned flow must leave the row exactly as it found it.
-  **`R-AGT-9` was added to `docs/REQUIREMENTS.md` on 2026-09-09 by maintainer decision**, so this
-  item is requirement-backed rather than proposing one: an agent reporting itself installed but
-  unauthenticated is authenticated from the app, through the agent's own protocol, with `htui`
-  triggering the flow and never reading, holding or storing the credential, and authentication a
-  fact about a box rather than a registry row.
-  Not blocked, and **MOD-2 is not blocked on it** - milestone 6's T34 needs only a logged-in server,
-  by any means. Cross-links: **MOD-2** owns the probe, the credential tier and the status this acts
-  on; **MOD-10** owns every credential *value*; **MOD-20 landed**
-  (`docs/decisions/mod/mod-20.md`) and is the other half of the same story - the adapter installs
-  from the app, and this item logs it in, one "make this box ready" flow. Its `Settings > i` action,
-  its consent pane and its per-box `manifest.json` are the shapes to follow rather than re-invent,
-  and the live proof recorded `amp-acp` reporting `authMethods: ["setup"]` on a box with no
-  credential - a second agent whose `unauthenticated` this item must answer. **MOD-7** owns the
-  Settings box profile the action sits in; **MOD-16** owns the Windows runtime facts.
+- [ ] **MOD-22 - Complete a loopback OAuth login from a box the browser cannot reach** (from MOD-21).
+  `R-AGT-9`, `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent's own login flow redirects to a
+  listener **inside the adapter process**, on that box's loopback: `agy_acp_server`'s URL carries
+  `redirect_uri=http://127.0.0.1:<ephemeral port>/`, a different port per attempt (39879, then
+  50651, measured live on 2026-09-09). When `htui` runs on the same machine as the browser this is
+  invisible. When it runs on a **server**, the browser resolves `127.0.0.1` to the *user's* machine,
+  nothing is listening, and the flow cannot be completed from the app at all - which is `R-AGT-9`'s
+  own sentence left unfinished. Confirmed on this maintainer's setup 2026-09-10: of the two
+  workarounds, **`ssh -L` port forwarding did not work and pasting the redirect back did** -
+  copying the failed `http://127.0.0.1:<port>/?code=…&state=…` out of the browser's address bar and
+  re-issuing it on the box (`curl`) hands the code to the adapter and `authenticate` returns.
+  Scope: that paste-back, performed **in the TUI** rather than in a second terminal - a field in
+  MOD-21's login pane that accepts the redirect URL the browser could not reach, validates it
+  (loopback host, the port the flow actually advertised, `code`/`state` present), issues the request
+  to that port **on the box `htui` runs on**, and reports what the listener said; the login then
+  completes through MOD-21's existing path, so nothing here re-implements `authenticate`, the
+  re-probe, or the outcome. Needs a text-input widget the Settings tab does not have yet
+  (`R-TUI-8`), off the UI task like every other request (`R-NF-3`).
+  **The URL is a credential-bearing value for the length of one request** - it carries an
+  authorization `code` - so `R-SEC-2`/`R-ID-7` bind: it is never logged, never persisted, never put
+  on a frame that outlives the request, and the pane must not echo it back after use. This is the
+  one rule this item can most easily break, and MOD-21's `auth_live.rs` module doc is the precedent
+  for stating it where the code is.
+  Out of scope: changing what the agent binds (the vendor's, not `htui`'s), a `redirect_uri`
+  override (not offered by ACP v1), and any general port-forwarding feature. Cross-links: **MOD-21**
+  owns the login flow, its pane and its frames and is the shape to extend rather than duplicate;
+  **MOD-16** owns whether the same paste-back works from a Windows box; **MOD-7**'s box registry is
+  where "this box is remote" would eventually be a recorded fact rather than a guess. **Not
+  blocked** — MOD-21 landed (`docs/decisions/mod/mod-21.md`). Found while running its live proof on
+  2026-09-10.
 
 ### Deferred backlog
 
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
+- [ ] **CLEAN-1 - `cargo doc` cannot build `htui-agent`, and has not been able to for some time.**
+  `R-NF-3`. `rustdoc::private_intra_doc_links` is `deny` in the workspace lint set, and **eight**
+  public doc comments link to private items, so `cargo doc -p htui-agent --no-deps` fails outright:
+  `acp/mod.rs:376` (`crate::probe::is_file`), `acp/mod.rs:862` (`answer_from_connection`),
+  `install/archive.rs:75` (`descend`), `install/http.rs:11` (`HeadInfo`, `RegistryFetch`,
+  `HttpError` - three on one line), `launch.rs:699` (`ChildGuard`) and `probe.rs:798`
+  (`version_key`), plus two "`install`/`plan` is both a function and a module" ambiguities
+  (`lib.rs:22`, `install/mod.rs:3`). Every one is a doc that should say `` `Name` `` or point at
+  something public; none is a code defect. Fix: demote the links, or make the item public where the
+  doc genuinely wants to link it. **Why it matters beyond tidiness:** because the command is red for
+  reasons nobody owns, a *new* error hides in the noise - MOD-21 shipped three of its own into
+  `crates/htui/` (`AUTH_ALREADY_CHOSEN`, `AuthCommand`, `drive_to_end`) and they were caught by a
+  reviewer's eye rather than by a gate, then fixed at that item's close-out. Consider adding
+  `cargo doc --workspace --no-deps --all-features` to the standing validation block once this is
+  green, which is the only thing that stops it rotting again. Found during MOD-21 T4/T5 on
+  2026-09-09 and confirmed at its close-out on 2026-09-10; predates MOD-21.
 - [ ] **MOD-8 - Legacy markdown import.** `R-LATER-3`. Map old prefixes to kinds per project,
   preserve keys, build links. Later tier; MOD-6 landed (`docs/decisions/mod/mod-6.md`, importer
   mint variant per ANA-9 §7.1 still to write).
@@ -539,6 +558,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-3 context tools, ANA-7 secrets)                                                    |
-| MOD-N   | 18 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-21 in-app auth; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 0                                                                                         |
+| MOD-N   | 18 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-22 loopback paste-back; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
 | TOOL-N  | 3 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable) |

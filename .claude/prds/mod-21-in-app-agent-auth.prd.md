@@ -209,10 +209,19 @@ Concretely in scope:
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | The call, capability-gated | `htui` can ask an agent, off any UI, "which ways can I log you in, and start this one" — spawning, initializing, sending `authenticate`, and killing the child on every exit path. A transport without the call refuses. | pending | — |
-| 2 | The hand-off a TUI can survive | What the agent says during the flow reaches the user as it happens, the URL is offered for opening on an explicit key, and the agent's own browser cannot touch the protocol stream or the terminal. Cancel kills the child; nothing leaks. | pending | — |
-| 3 | The action in the app | The maintainer logs an agent in from Settings: choose a method, watch the flow, cancel it, and see the row change — decided by a re-probe, with the TUI responsive throughout. Logout where advertised. | pending | — |
-| 4 | Proven on a real login | `agy` on this box goes `unauthenticated` → `ready` through the app, the declared credential path is confirmed or corrected, MOD-2's T34 chat runs, and the README says what to do instead of what to install. | pending | — |
+| 1 | The call, capability-gated | `htui` can ask an agent, off any UI, "which ways can I log you in, and start this one" — spawning, initializing, sending `authenticate`, and killing the child on every exit path. A transport without the call refuses. | complete | [plan](../plans/mod-21-in-app-agent-auth.plan.md) |
+| 2 | The hand-off a TUI can survive | What the agent says during the flow reaches the user as it happens, the URL is offered for opening on an explicit key, and the agent's own browser cannot touch the protocol stream or the terminal. Cancel kills the child; nothing leaks. | complete | [plan](../plans/mod-21-in-app-agent-auth.plan.md) |
+| 3 | The action in the app | The maintainer logs an agent in from Settings: choose a method, watch the flow, cancel it, and see the row change — decided by a re-probe, with the TUI responsive throughout. Logout where advertised. | complete | [plan](../plans/mod-21-in-app-agent-auth.plan.md) |
+| 4 | Proven on a real login | `agy` on this box goes `unauthenticated` → `ready` through the app, the declared credential path is confirmed or corrected, MOD-2's T34 chat runs, and the README says what to do instead of what to install. | complete¹ | [plan](../plans/mod-21-in-app-agent-auth.plan.md) |
+
+¹ **Milestone 4's T34 clause is met as far as this item can meet it, and no further.** The login
+landed on 2026-09-10, the seed's credential path is confirmed, and `agy_live.rs` passes 4/4 against
+the now-authenticated server — including `session_new_reports_its_config_options`, which was
+unreachable while unauthenticated. But **no live chat *turn* was driven**: none of `agy_live.rs`'s
+four cases sends a prompt, so ANA-4 §11.14's three questions (does `agy_acp_server` emit
+`usage_update` and in what field; does it issue `session/request_permission` in `default` mode and
+with what option ids; do its edits arrive as a standard `tool_call` + `diff`) remain open. Writing
+that turn is **MOD-2's own T34 work**, which this item unblocked rather than performed.
 
 Milestones 1 and 2 are testable without a UI and without a real account (a fixture agent that
 advertises methods, blocks, and prints a URL). Milestone 3 is the first that needs the store worker.
@@ -270,4 +279,4 @@ constraint.
 | The flow races the probe or an install for the same row | Medium | Medium | The runtime's existing one-at-a-time claim (MOD-20 hazard H-10, MOD-2 D60's claim) covers all three, extended rather than duplicated |
 
 ---
-*Status: PLANNING — decisions D1–D8 confirmed by the maintainer on 2026-09-09; no milestone started.*
+*Status: COMPLETE — all four milestones landed 2026-09-10; write-up at `docs/decisions/mod/mod-21.md`.*

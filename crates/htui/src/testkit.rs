@@ -275,7 +275,7 @@ impl Harness {
     /// # Panics
     ///
     /// If the shell never goes quiet, like [`Harness::settle`], or if a chat task has not ended
-    /// [`CHAT_END`] after being asked to. A task that never returns would otherwise hang the whole
+    /// `CHAT_END` after being asked to. A task that never returns would otherwise hang the whole
     /// suite with no output at all; the panic names the step, which is the one fact that turns
     /// "the tests stopped" into a diagnosis.
     pub async fn drive_to_end(&mut self) {

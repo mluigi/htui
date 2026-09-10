@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[MOD-21](docs/decisions/mod/mod-21.md)** - In-app agent authentication (done, 2026-09-10)
 - **[MOD-20](docs/decisions/mod/mod-20.md)** - Registry-driven adapter install (done, 2026-09-09)
 - **[ANA-10](docs/decisions/ana/ana-10.md)** - Local-only mode: SQLite as a primary writable store (done, 2026-09-08)
 - **[ANA-5](docs/decisions/ana/ana-5.md)** - Prompt assembly: template contract, section model, upstream walk, trim order, file excerpts (done, 2026-09-06)
