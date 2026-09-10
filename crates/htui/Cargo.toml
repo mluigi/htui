@@ -48,6 +48,11 @@ htui-agent = { workspace = true, features = ["test-support"] }
 htui-store = { workspace = true, features = ["demo", "test-support"] }
 # `filters` so a chat snapshot can substitute the session id the transport mints per run.
 insta    = { workspace = true, features = ["filters"] }
+# T43 reads `run_step.usage` and the two `agent_box` quota columns with a raw `SELECT` over
+# `testkit::TestDb::pool`: no `ReadStore` method returns either (`pg_criteria.rs:93-105` says why),
+# and the point of that suite is what Postgres actually holds. Runtime-checked queries only, so
+# `.sqlx/` stays a `htui-store` concern.
+sqlx     = { workspace = true }
 # `net` for the loopback fixture servers the MOD-20 install cases answer from (blueprint P-5).
 tokio    = { workspace = true, features = ["test-util", "net"] }
 # The store worker's swap tests open a throwaway `cache.sqlite`, never the user's.

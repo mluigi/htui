@@ -1549,6 +1549,7 @@ dependencies = [
  "insta",
  "ratatui",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
  "tokio-util",
