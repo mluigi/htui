@@ -21,7 +21,7 @@ use htui_agent::launch::{
     resolve,
 };
 #[cfg(unix)]
-use htui_agent::launch::{ResolvedLaunch, Spawned};
+use htui_agent::launch::{ResolvedLaunch, Spawned, StopSignal};
 #[cfg(unix)]
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -777,5 +777,117 @@ async fn a_non_utf8_byte_neither_ends_the_stream_nor_hides_the_line_after_it() {
         spawned.stderr_tail(),
         lines,
         "and the tail is the same two lines, so a failed handshake is still explained"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Signals short of a kill (plan MOD-2 D81)
+// ---------------------------------------------------------------------------------------------
+
+/// Whether a process id still names a live process, through `kill -0` rather than `/proc`: the
+/// question is POSIX, and `/proc` is Linux's answer to it.
+#[cfg(unix)]
+async fn alive(pid: &str) -> bool {
+    tokio::process::Command::new("kill")
+        .args(["-0", pid])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
+}
+
+/// Waits until `pid` is gone, or gives up after [`PATIENCE`].
+#[cfg(unix)]
+async fn gone(pid: &str) -> bool {
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        if !alive(pid).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// An interrupt is a **request**, and that is the whole difference from
+/// [`Spawned::kill_tree`](htui_agent::launch::Spawned::kill_tree): the child gets to run its own
+/// handler and choose its exit status. A cancel that only knew how to `SIGKILL` could never let an
+/// agent write the closing message that ends the turn cleanly.
+///
+/// `exit 42` is what makes this assertable: a status nothing but the child's own trap can produce,
+/// and one no signal death carries.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_interrupt_lets_the_child_exit_on_its_own_terms() {
+    let tmp = tempfile::tempdir().expect("a temp working directory");
+    let ready = tmp.path().join("ready");
+    let script = format!(
+        "trap 'exit 42' INT; printf ready > {}; while :; do sleep 0.05; done",
+        ready.display()
+    );
+    let mut spawned = spawn_sh(&script, tmp.path()).await;
+
+    // Not a sleep: the trap must be installed before the signal, or the shell dies by default
+    // disposition and this case would pass for the wrong reason.
+    let deadline = Instant::now() + PATIENCE;
+    while !ready.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready.exists(), "the fixture installed its trap");
+
+    spawned
+        .signal(StopSignal::Interrupt)
+        .expect("the child's process group accepts a signal");
+
+    let status = tokio::time::timeout(PATIENCE, spawned.wait())
+        .await
+        .expect("the interrupted child exits within the patience window")
+        .expect("the wait itself succeeds");
+    assert_eq!(
+        status.code(),
+        Some(42),
+        "the child ran its own handler; a kill would have left a signal death instead: {status:?}"
+    );
+}
+
+/// The signal goes to the **group**, not to the direct child.
+///
+/// The same reason `kill_tree` exists: an agent that spawned a helper is a tree, and a supervisor
+/// that signalled only the process it can name would leave the rest running with nobody holding
+/// them. The background `sleep` here is that helper, and it is never signalled by this test — only
+/// its group is.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_signal_reaches_the_whole_process_group() {
+    let tmp = tempfile::tempdir().expect("a temp working directory");
+    let pidfile = tmp.path().join("helper.pid");
+    let script = format!(
+        "sleep 30 & printf %s $! > {}; while :; do sleep 0.05; done",
+        pidfile.display()
+    );
+    let mut spawned = spawn_sh(&script, tmp.path()).await;
+
+    let deadline = Instant::now() + PATIENCE;
+    while !pidfile.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let helper = std::fs::read_to_string(&pidfile).expect("the fixture recorded its helper's pid");
+    assert!(
+        alive(&helper).await,
+        "the helper is running before the signal"
+    );
+
+    spawned
+        .signal(StopSignal::Terminate)
+        .expect("the child's process group accepts a signal");
+
+    tokio::time::timeout(PATIENCE, spawned.wait())
+        .await
+        .expect("the terminated child exits within the patience window")
+        .expect("the wait itself succeeds");
+    assert!(
+        gone(&helper).await,
+        "the helper the fixture spawned was never named by this test, and died with its group"
     );
 }

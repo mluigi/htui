@@ -136,8 +136,8 @@ pub use install::{
 pub use launch::{
     AcpSettings, AgentLaunch, AgentSettings, CliSettings, ClientCapabilities, CredentialProbe,
     Discovery, FallbackCommand, Install, InstallSource, PlatformGlob, QuotaSettings, QuotaSource,
-    ResolvedLaunch, SessionSettings, Spawned, ToolMap, ToolProbe, UsageScope, UsageSettings,
-    VersionProbe, resolve, spawn,
+    ResolvedLaunch, SessionSettings, Spawned, StopSignal, ToolMap, ToolProbe, UsageScope,
+    UsageSettings, VersionProbe, resolve, spawn,
 };
 pub use permission::{PolicyAnswer, PolicyStage, evaluate as evaluate_permission};
 pub use probe::{

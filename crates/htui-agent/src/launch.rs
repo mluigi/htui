@@ -540,6 +540,42 @@ struct StderrTail {
     ended: bool,
 }
 
+/// What [`Spawned::signal`] may ask a child, short of killing it.
+///
+/// Two values, not an `i32`: these are the only two a cancel sequence has any use for, and a
+/// number would put "which signals may `htui` send a process it supervises" in the caller's hands
+/// instead of here. Both numbers are fixed by POSIX and identical on every unix `htui` builds for,
+/// which is why naming them here costs no platform dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopSignal {
+    /// `SIGINT` (2): what a terminal sends on Ctrl-C. The request a cancel makes first, because it
+    /// is the one a CLI agent is written to expect (`docs/ANA-4.md` §4.4, plan D81).
+    Interrupt,
+    /// `SIGTERM` (15): the conventional "stop now, tidily". Sent when an interrupt was ignored and
+    /// before a kill takes the choice away.
+    Terminate,
+}
+
+impl StopSignal {
+    /// The signal number, as `killpg` takes it.
+    #[must_use]
+    pub const fn number(self) -> i32 {
+        match self {
+            Self::Interrupt => 2,
+            Self::Terminate => 15,
+        }
+    }
+}
+
+impl core::fmt::Display for StopSignal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        })
+    }
+}
+
 /// A running agent process and the handles a transport talks to it through.
 #[derive(Debug)]
 pub struct Spawned {
@@ -668,6 +704,47 @@ impl Spawned {
             .wait()
             .await
             .map_err(|error| DriverError::Transport(format!("waiting for the agent: {error}")))
+    }
+
+    /// Signals the child's process group **without** killing it: the polite half of
+    /// [`kill_tree`](Self::kill_tree).
+    ///
+    /// The two existing exits from a session are both `SIGKILL` — `kill_tree` and
+    /// [`start_kill`](Self::start_kill) — and a transport whose only cancel is a kill cannot let an
+    /// agent finish the message that ends its turn. A cancel sequence therefore asks first
+    /// ([`StopSignal::Interrupt`]), waits out its grace window, and kills only what is still there
+    /// (`docs/ANA-4.md` §4.4, plan D81). What the child does with the request is the child's
+    /// business: it may exit with a status of its own, it may ignore the signal entirely, and this
+    /// method neither waits for it nor claims it worked.
+    ///
+    /// The **group**, not the process: `process-wrap` puts the child in its own group at spawn, so
+    /// this is a `killpg` and reaches a helper the agent spawned exactly as `kill_tree` does. A
+    /// supervisor that signalled only the pid it can name would leave the rest of the tree running
+    /// with nobody holding it.
+    ///
+    /// **On Windows there are no signals**, and this answers [`DriverError::Transport`] saying so
+    /// rather than silently doing nothing: a caller that believed a request had been delivered
+    /// would spend its grace window waiting for an exit nobody asked for. The Windows cancel is
+    /// therefore stdin's close, then the grace, then the job object — which is what
+    /// [`kill_tree`](Self::kill_tree) already is. (`unsafe_code = "forbid"`, so the signal goes
+    /// through `process-wrap`'s own safe wrapper and there is no `libc::kill` here.)
+    ///
+    /// # Errors
+    /// [`DriverError::Transport`] when the signal is refused — including a group that has already
+    /// exited, which is not an error a caller has to treat as one — and on every non-unix platform.
+    pub fn signal(&self, signal: StopSignal) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.child.signal(signal.number()).map_err(|error| {
+                DriverError::Transport(format!("signalling the agent with {signal}: {error}"))
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Err(DriverError::Transport(format!(
+                "this platform has no {signal}; a cancel here closes stdin and then kills the tree"
+            )))
+        }
     }
 
     /// Kills the whole process tree: the job object on Windows, the process group on unix.
