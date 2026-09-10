@@ -51,8 +51,9 @@ use crate::event::{
 };
 use crate::registry::{DriverFactory, TransportBuilder};
 
-/// `other.update` of the session banner (`docs/ANA-4.md` §4.4, `docs/ANA-2.md` §4.8).
-pub const SESSION_STARTED: &str = "session_started";
+// The banner's `other.update`, published here too: the fake writes the same banner every transport
+// writes, and it is one string with one definition (`crate::event`).
+pub use crate::event::SESSION_STARTED;
 
 /// The name [`FakeDriver::scripted`] gives its driver, and the `cli.stream` value milestone 2
 /// registers it under (adapter id `cli/fake`, plan D12 / assumption A2).

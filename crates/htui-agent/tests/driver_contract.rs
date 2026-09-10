@@ -524,6 +524,52 @@ async fn every_registered_adapter_agrees_with_its_predicate() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// 6. The pieces every transport shares live below all of them
+// ---------------------------------------------------------------------------------------------
+
+/// The capture clock, the child's byte streams and the two wire strings a transport writes are
+/// **seam** pieces, not one transport's property: they live in `event` and `launch`, which every
+/// transport already depends on, so a second transport reaches them without importing the first.
+///
+/// This is a compile-time assertion wearing a test's clothes — every line below fails to compile
+/// if a piece moves back into a transport module — plus the one runtime check that the names the
+/// ACP module still publishes are the very same items and not copies that can drift.
+#[test]
+fn the_pieces_both_transports_share_live_below_either_of_them() {
+    use htui_agent::acp::{
+        AcpIo, SESSION_STARTED as ACP_BANNER, Stamp as AcpStamp,
+        TRANSPORT_CLOSED as ACP_TRANSPORT_CLOSED,
+    };
+    use htui_agent::event::{SESSION_STARTED, Stamp, TRANSPORT_CLOSED};
+    use htui_agent::launch::{ChildIo, Spawned};
+
+    let epoch = chrono::DateTime::UNIX_EPOCH;
+    assert_eq!(
+        Stamp::Fixed { epoch }.at(2),
+        epoch + chrono::TimeDelta::milliseconds(2)
+    );
+
+    assert_eq!(SESSION_STARTED, "session_started");
+    assert_eq!(TRANSPORT_CLOSED, "transport_closed");
+
+    // The ACP module's names are re-exports of these, not second definitions. The two type
+    // annotations are the proof: they do not type-check against a copy, however identical its
+    // body, and a copy is exactly what a second transport would be tempted to write.
+    let _from_spawned: fn(Spawned) -> Result<ChildIo, DriverError> = AcpIo::from_spawned;
+    let _clock: Stamp = AcpStamp::Wall;
+    assert_eq!(ACP_BANNER, SESSION_STARTED);
+    assert_eq!(ACP_TRANSPORT_CLOSED, TRANSPORT_CLOSED);
+
+    // The fake writes the banner with its own path and the chat tab matches it with the ACP one
+    // (`agent_worker.rs`); one definition is what keeps those two the same string.
+    #[cfg(feature = "test-support")]
+    {
+        use htui_agent::fake::SESSION_STARTED as FAKE_BANNER;
+        assert_eq!(FAKE_BANNER, SESSION_STARTED);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The JSONB vocabularies: `as_str` and serde must never disagree (htui-core `str_enum!` rule).
 // ---------------------------------------------------------------------------------------------
 

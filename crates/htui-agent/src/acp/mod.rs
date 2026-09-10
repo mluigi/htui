@@ -35,7 +35,6 @@ use agent_client_protocol::schema::v1::{
     SessionConfigOptionValue, SetSessionConfigOptionRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Dispatch, SessionMessage};
-use chrono::{DateTime, SubsecRound, Utc};
 use htui_core::model::{Agent as AgentRow, AgentBox};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -57,7 +56,14 @@ use crate::event::{
     DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, ErrorEvent, OtherEvent,
     PermissionOptionKind, StopReason, TerminalReason, ToolResultEvent, ToolResultStatus,
 };
-use crate::launch::{AcpSettings, AgentLaunch, AgentSettings, ChildGuard, ResolvedLaunch, Spawned};
+// The three pieces this transport shares with every other one, published under the paths its own
+// callers have always used: the capture clock and the two wire strings live in `crate::event`, the
+// byte-stream pair beside the spawn that produces it. `AcpIo` keeps its name here because the
+// call sites that spell it are naming *this* transport's input, and a rename would be churn in a
+// dozen files for no reader's benefit.
+pub use crate::event::{SESSION_STARTED, Stamp, TRANSPORT_CLOSED};
+pub use crate::launch::ChildIo as AcpIo;
+use crate::launch::{AcpSettings, AgentLaunch, AgentSettings, ChildGuard, ResolvedLaunch};
 use crate::registry::TransportBuilder;
 
 /// `other.update` of the row written when the agent offers no option for the requested model.
@@ -65,14 +71,6 @@ use crate::registry::TransportBuilder;
 /// `SessionSpec.model` is advisory over ACP: §4.4 requires tolerating an agent that offers no
 /// model option at all, and the step records what actually happened rather than failing.
 pub const MODEL_UNAVAILABLE: &str = "model_unavailable";
-
-/// `other.update` of the session banner (§4.4 "Session load and resume").
-///
-/// The agent-side session id has no column in ANA-9, so resuming a step is a query for this row.
-pub const SESSION_STARTED: &str = "session_started";
-
-/// `error.code` of the row written when the transport ends before the turn does.
-pub const TRANSPORT_CLOSED: &str = "transport_closed";
 
 /// `error.code` of a refused `fs/*` path (plan D22, [`fs::PathOutside`]).
 pub const PATH_OUTSIDE_SESSION: &str = "path_outside_session";
@@ -100,88 +98,8 @@ pub const DROP_GRACE: Duration = Duration::from_secs(1);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------------------------
-// Clock
-// ---------------------------------------------------------------------------------------------
-
-/// How [`DriverEnvelope::at`] is stamped.
-///
-/// A seam rather than a bare `Utc::now()`, because ANA-4 §11 criterion 2 compares replayed rows
-/// byte for byte and the conformance suite compares `at`. Production stamps the wall clock; a test
-/// stamps `epoch + n ms`, exactly as the fake does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stamp {
-    /// `Utc::now()` truncated to microseconds — `TIMESTAMPTZ`'s resolution, the rule the recorder
-    /// already follows for the rows it authors itself.
-    Wall,
-    /// `epoch + n ms` for the *n*-th envelope of the session.
-    Fixed {
-        /// The session's zero point.
-        epoch: DateTime<Utc>,
-    },
-}
-
-impl Stamp {
-    /// The capture time of the *n*-th envelope.
-    #[must_use]
-    pub fn at(self, n: u64) -> DateTime<Utc> {
-        match self {
-            Self::Wall => Utc::now().trunc_subsecs(6),
-            Self::Fixed { epoch } => {
-                epoch + chrono::TimeDelta::milliseconds(i64::try_from(n).unwrap_or(i64::MAX))
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------------------------
-
-/// The byte streams a session runs over, plus the child that owns them when there is one.
-///
-/// Held as `tokio` traits and adapted to `futures::io` exactly once, where the transport is built:
-/// everything else in this crate speaks `tokio`.
-pub struct AcpIo {
-    /// The agent's stdout, as this client reads it.
-    pub reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-    /// The agent's stdin, as this client writes it.
-    pub writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-    /// `Some` when [`AcpDriver::start`] spawned the process; `None` for an in-process pair.
-    pub child: Option<Spawned>,
-}
-
-impl AcpIo {
-    /// The streams of a child this crate spawned, with the child carried along.
-    ///
-    /// Factored out of [`AcpDriver::start`]'s own spawn so the probe's tier 2 reaches the agent
-    /// exactly the way a session does — one place decides what "piped stdio" means, and a probe
-    /// that resolved a launch differently from the chat would be measuring the wrong box.
-    ///
-    /// # Errors
-    /// [`DriverError::Spawn`] when stdin or stdout was not piped (already taken, or a spawn that
-    /// did not request them).
-    pub fn from_spawned(mut spawned: Spawned) -> Result<Self> {
-        let writer = spawned
-            .take_stdin()
-            .ok_or_else(|| DriverError::Spawn("the agent's stdin was not piped".to_owned()))?;
-        let reader = spawned
-            .take_stdout()
-            .ok_or_else(|| DriverError::Spawn("the agent's stdout was not piped".to_owned()))?;
-        Ok(Self {
-            reader: Box::new(reader.into_inner()),
-            writer: Box::new(writer.into_inner()),
-            child: Some(spawned),
-        })
-    }
-}
-
-impl core::fmt::Debug for AcpIo {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("AcpIo")
-            .field("child", &self.child.is_some())
-            .finish()
-    }
-}
 
 /// Everything the session task needs besides the streams.
 #[derive(Debug, Clone)]

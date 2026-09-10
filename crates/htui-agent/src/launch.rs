@@ -10,6 +10,11 @@
 //! `which` crate rather than `Command::new`: `std::process::Command` does not read `PATHEXT`, so
 //! handing it a Windows `.cmd` shim yields `os error 193` (ANA-4 §4.6, "Windows shim handling, as
 //! a rule").
+//!
+//! What a spawn hands back is a [`Spawned`], and [`ChildIo::from_spawned`] is the one place that
+//! turns it into the reader/writer pair a protocol runs over. Both live here rather than in a
+//! transport module because both are transport-neutral: which protocol speaks over the pair is the
+//! caller's business, and a second transport must not have to import the first one to spawn.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -707,6 +712,61 @@ impl Spawned {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The byte streams a session runs over
+// ---------------------------------------------------------------------------------------------
+
+/// The byte streams a session runs over, plus the child that owns them when there is one.
+///
+/// Held as `tokio` traits and adapted to `futures::io` exactly once, where the transport is built:
+/// everything else in this crate speaks `tokio`.
+///
+/// Beside [`Spawned`] rather than inside a transport module because it is the seam between the two:
+/// a spawn produces one of these, and *which* protocol then runs over the pair is the caller's
+/// business. A second transport that had to import the first one's type to say "a reader, a writer
+/// and maybe a child" would be depending on the first transport for nothing.
+pub struct ChildIo {
+    /// The agent's stdout, as this client reads it.
+    pub reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    /// The agent's stdin, as this client writes it.
+    pub writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    /// `Some` when the transport spawned the process; `None` for an in-process pair.
+    pub child: Option<Spawned>,
+}
+
+impl ChildIo {
+    /// The streams of a child this crate spawned, with the child carried along.
+    ///
+    /// Factored out of the ACP driver's own spawn so the probe's tier 2 reaches the agent exactly
+    /// the way a session does — one place decides what "piped stdio" means, and a probe that
+    /// resolved a launch differently from the chat would be measuring the wrong box.
+    ///
+    /// # Errors
+    /// [`DriverError::Spawn`] when stdin or stdout was not piped (already taken, or a spawn that
+    /// did not request them).
+    pub fn from_spawned(mut spawned: Spawned) -> Result<Self> {
+        let writer = spawned
+            .take_stdin()
+            .ok_or_else(|| DriverError::Spawn("the agent's stdin was not piped".to_owned()))?;
+        let reader = spawned
+            .take_stdout()
+            .ok_or_else(|| DriverError::Spawn("the agent's stdout was not piped".to_owned()))?;
+        Ok(Self {
+            reader: Box::new(reader.into_inner()),
+            writer: Box::new(writer.into_inner()),
+            child: Some(spawned),
+        })
+    }
+}
+
+impl core::fmt::Debug for ChildIo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ChildIo")
+            .field("child", &self.child.is_some())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The child guard
 // ---------------------------------------------------------------------------------------------
 
@@ -736,10 +796,8 @@ pub(crate) struct ChildGuard {
 }
 
 impl ChildGuard {
-    /// A guard over `child`. `None` is a guard over nothing — an [`AcpIo`] built from an in-process
-    /// duplex has no process to kill.
-    ///
-    /// [`AcpIo`]: crate::acp::AcpIo
+    /// A guard over `child`. `None` is a guard over nothing — a [`ChildIo`] built from an
+    /// in-process duplex has no process to kill.
     pub(crate) fn new(child: Option<Spawned>) -> Self {
         Self { child }
     }

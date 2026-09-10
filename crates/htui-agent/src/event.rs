@@ -8,8 +8,14 @@
 //! Every payload struct here serialises into `session_event.payload`. The keys of ANA-9 §4.3 are
 //! the minimum contract: a driver may **add** keys, never rename a documented one, which is why
 //! the §7 usage reconciliation fields live on [`UsageEvent`] next to §4.3's five.
+//!
+//! Three things that are *not* an event live here for the same reason the events do: they belong
+//! to no single transport. [`Stamp`] is how a capture time is made, [`SESSION_STARTED`] is the
+//! `other.update` a session banner carries and [`TRANSPORT_CLOSED`] is the `error.code` a child
+//! that died mid-turn leaves behind. Each has more than one writer and more than one reader, and a
+//! copy per transport would be a string — or a clock — that can drift.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use htui_core::model::EventKind;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -134,6 +140,56 @@ wire_enum!(
         Low => "low",
     }
 );
+
+// ---------------------------------------------------------------------------------------------
+// The wire strings and the clock every transport shares
+// ---------------------------------------------------------------------------------------------
+
+/// `other.update` of the session banner (`docs/ANA-4.md` §4.4 "Session load and resume",
+/// `docs/ANA-2.md` §4.8).
+///
+/// The agent-side session id has no column in ANA-9, so resuming a step is a query for this row.
+/// Here rather than in a transport module because **every** transport opens a session and every
+/// reader — the chat tab's transcript, the replay, the conformance suite's
+/// `session_banner_is_first_other_row` — matches this one string: a second definition beside a
+/// second transport would be a string that can drift from the readers'.
+pub const SESSION_STARTED: &str = "session_started";
+
+/// `error.code` of the row written when the transport ends before the turn does.
+///
+/// Shared for [`SESSION_STARTED`]'s reason: a child that dies mid-turn is every transport's
+/// failure mode, and the row a reader recognizes must say the same thing whichever one it was.
+pub const TRANSPORT_CLOSED: &str = "transport_closed";
+
+/// How [`DriverEnvelope::at`] is stamped.
+///
+/// A seam rather than a bare `Utc::now()`, because ANA-4 §11 criterion 2 compares replayed rows
+/// byte for byte and the conformance suite compares `at`. Production stamps the wall clock; a test
+/// stamps `epoch + n ms`, exactly as the fake does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stamp {
+    /// `Utc::now()` truncated to microseconds — `TIMESTAMPTZ`'s resolution, the rule the recorder
+    /// already follows for the rows it authors itself.
+    Wall,
+    /// `epoch + n ms` for the *n*-th envelope of the session.
+    Fixed {
+        /// The session's zero point.
+        epoch: DateTime<Utc>,
+    },
+}
+
+impl Stamp {
+    /// The capture time of the *n*-th envelope.
+    #[must_use]
+    pub fn at(self, n: u64) -> DateTime<Utc> {
+        match self {
+            Self::Wall => Utc::now().trunc_subsecs(6),
+            Self::Fixed { epoch } => {
+                epoch + chrono::TimeDelta::milliseconds(i64::try_from(n).unwrap_or(i64::MAX))
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // The envelope and the event
