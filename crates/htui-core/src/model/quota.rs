@@ -74,7 +74,8 @@ pub struct Spend {
     /// non-USD one. A cap in micros has nothing to compare against either way (blueprint H-5), and
     /// "no USD spend" is the honest answer rather than a wrong number.
     pub session_micros: Option<i64>,
-    /// [`USD`] whenever `session_micros` is `Some`, `None` otherwise.
+    /// `"USD"` whenever `session_micros` is `Some`, `None` otherwise: micros are USD by definition
+    /// (`UsageEvent.cost_micros`, ANA-4 §7).
     pub currency: Option<String>,
 }
 
@@ -169,7 +170,7 @@ impl Quota {
 /// `resetsAt` read as epoch seconds (`None` when it is absent, not an integer, or out of range),
 /// sorted by id. Any other source, and `raw == None`, give no status, no windows and
 /// `exhausted: false` — a source with no reader yet reports nothing rather than guessing at a
-/// shape (milestone 8 owns the two CLI ones). `spend` is `session_micros` with [`USD`] iff `Some`.
+/// shape (milestone 8 owns the two CLI ones). `spend` is `session_micros` with `"USD"` iff `Some`.
 ///
 /// Every vendor key is read through `get` / `as_*`: a report with no `cost`, a `cost` in another
 /// currency, a missing `unifiedWindows` or a window without a numeric `utilization` each cost that
