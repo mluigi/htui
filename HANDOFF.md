@@ -256,6 +256,66 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   it, checked by moving it aside) and the `session/new` model list, which is **not learnable while
   unauthenticated**, so D64 leaves `models: []` and `model_config_id: null` as seeded. Milestone 7
   (quota and caps) can start without any of this.
+  **Phase 7 landed (2026-09-10, `142beb1`..`44e6743`), one task short:** the live `agy` turn plus
+  quota and caps, planned in `.claude/plans/mod-2-quota-caps.plan.md` with the `code-architect`
+  blueprint beside it. **Milestone 6's `T34` is closed and all three remaining ANA-4 §11.14 `agy`
+  items are answered live** (`crates/htui/tests/chat_live_agy.rs`, transcript fixture recorded, two
+  runs agreeing): `agy_acp_server` emits **no `usage_update` whatsoever** — so §7's unverified row
+  for `agy` resolves to *nothing*, its seed keeps `quota.source: "none"` and its quota column reads
+  `—` by design; it **does** issue `session/request_permission` in `default` mode for a write but not
+  for a read, offering exactly `allow`/`deny` with kinds `allow_once`/`reject_once` and no
+  `*_always`; and its edits arrive as a **standard** `tool_call` with `kind: "edit"` and a `diff`,
+  the vendor's own names riding inside schema fields, so **no mapper change was demanded** and the
+  eleven `DriverEvent` variants stand. **D64 resolved the other way from milestone 6's fallback**:
+  `session/new` does return `configOptions` with eleven model ids, so the seed now carries them,
+  `default_model: "gemini-3.7-flash-high"` and `model_config_id: "model"`, and ANA-4 §4.4's
+  selection-by-option-id is exercised end to end for the first time.
+  Milestone 7 itself: `htui_core::model::quota` holds §7's document (`normalize`, `Quota`,
+  `ProjectCaps`, and `available` — `R-AGT-8`'s skip predicate, which **MOD-4 consumes and MOD-2 only
+  tests**), `QuotaSource` moved there with it; the ACP mapper lifts `_meta["_claude/rateLimit"]`
+  verbatim onto `UsageEvent.quota`; the recorder **latches** the document passively after every
+  `usage` row through a new narrow `WriteStore::set_agent_box_quota`; the **per-run cap** is detected
+  in the recorder and cancelled by the loop that holds the session, leaving `error{cap_exceeded}`
+  then `done{stop_reason:cancelled}` as a step's last two rows (§11 criterion 8); and
+  `Settings > Agents` gained a `quota` column that states `r` cannot refresh it. **§11 criterion 7 is
+  proven both clauses on live Postgres** (`crates/htui/tests/chat_usage_pg.rs`), and by construction
+  rather than fixture luck — the mapper's delta is `round(total) − previous round(total)`, so a sum
+  of deltas *is* the last rounded total. Caps are **USD micros** in `project.settings`
+  (`per_token_cap_run` enforced, `per_token_cap_batch` read and logged — **MOD-12 enforces it**,
+  ANA-4:1283); absent means unbounded, `0` cancels on the first costed row, and a malformed value
+  refuses the chat. **No migration**: `agent_box.quota`/`quota_at` have existed since `0001`, so
+  MOD-4's `0003` is still unheld. 738 tests green on **Linux** with Postgres live (46 targets).
+  **Three ANA-4 amendments, maintainer-approved and recorded here rather than in the ANA** (the
+  milestone-5 precedent): **D69** — §7's "the recorder … calls `AgentSession::cancel()`" is not
+  implementable, since `Recorder` holds no session and must not; detection stays in the recorder and
+  the cancel moved to a shared `enforce_breach` called by **both** `pump` and the production
+  `run_turn` (`pump` is not the binary's loop, which the plan originally got wrong). **D74** —
+  `agent_box.quota`/`quota_at` are now **single-writer**: `upsert_agent_box` can no longer write them
+  on either path and the probe no longer carries them forward, because a probe read-modify-writing a
+  column the latch owns discarded every latch in between — a lost update by construction, fixed at
+  the maintainer's instruction rather than accepted. **D76** — the `default` column shows a model id
+  **whole**, since the id is §4.4's selection coordinate and `gemini-3.` names nothing; the table was
+  rebalanced for it and **has no width slack left** (each of eight columns now sits at its own longest
+  string), which MOD-23 and MOD-12 inherit.
+  `rust-reviewer` returned **no CRITICAL and no HIGH**; its four MEDIUM and six LOW were adjudicated
+  — eight applied (`bf2cd2e`, `4742ce3`, `44e6743`), one **rejected on evidence** (L-5 claimed the
+  `R-AGT-5` sweep does not read comments; it does — `the_installer_names_no_vendor` sweeps
+  `production_half()` for four vendor strings and fired on one in a comment earlier the same day —
+  the finding had read the *other* sweep, the `zeta` one), and one left with the maintainer
+  (**M-2**: a `per_token` row whose `quota.source` is still `acp_meta_rate_limit` never publishes
+  spend, because the H-3 rule waits for a blob that will never arrive).
+  **What milestone 7 still owes (`T46`), blocked on a maintainer decision rather than on code:**
+  ANA-4 §11 **criterion 6 does not hold across a flush**. `Recorder.edits` is cleared by `flush()`,
+  so "one `edit_proposal` row per `(tool_call_id, path)` per step" (§4.3) holds only inside one flush
+  window — one live `agy` file write leaves **three** rows, reproduced from the committed fixture.
+  A faithful fix needs a **store update seam that does not exist** (`append_events` is
+  `ON CONFLICT … DO NOTHING` by design, which is what makes a refused flush's re-offer safe) across
+  six `WriteStore` impls, **plus** an offline durability call: `BufferedWriter`'s append-only JSONL
+  takes its upload idempotency from that same clause, so either criterion 6 holds online only or
+  `upload_pending` becomes last-line-wins and stops protecting `UsageTotals::from_rows` from
+  double-counting. Criterion 6 therefore passes **against the fake only** — and the fake never
+  flushed mid-tool-call, which is why a transport-neutral suite could not see it. The PRD row stays
+  `in-progress`, as milestone 6's did for T34.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
@@ -427,9 +487,9 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `docs/ANA-10.md` §9.1; **M2b is the milestone that satisfies the item's stated objective** and
   M0+M1+M2+M2b is a complete shippable answer on its own (§9.2). Blocked on nothing, but **M3 must
   land before MOD-4's build step 1** (§9.1's ordering rule), and M6 is gated on the `R-ENT-7`
-  amendment (`docs/ANA-10.md` §6.1, §10.3). MOD-13's and MOD-15's create/edit paths for a
-  server-less box depend on it; MOD-15 owns the Settings connection *section*, this item owns the
-  credential *field* inside it (§9.4). The requirement amendments of §6.1 are proposed, not
+  amendment (`docs/ANA-10.md` §6.1, §10.3). MOD-13's, MOD-15's and **MOD-23's** create/edit paths
+  for a server-less box depend on it; MOD-15 owns the Settings connection *section*, this item owns
+  the credential *field* inside it (§9.4). The requirement amendments of §6.1 are proposed, not
   applied — `docs/REQUIREMENTS.md` is maintainer-only.
 - [ ] **MOD-18 - Adoption of local rows into a server** (from ANA-10). `R-STO-1`, `R-STO-7`,
   `R-ENT-7`, `R-USR-2`, `R-HIS-1`. `docs/ANA-10.md` §9.1's M7. **Funded, not deferred** (§10.5, on
@@ -484,6 +544,33 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   where "this box is remote" would eventually be a recorded fact rather than a guess. **Not
   blocked** — MOD-21 landed (`docs/decisions/mod/mod-21.md`). Found while running its live proof on
   2026-09-10.
+- [ ] **MOD-23 - Agent registry editing in the Settings agents section** (from MOD-2). `R-AGT-4`,
+  `R-AGT-6`, `R-TUI-8`. Create a manual agent row and edit an existing one: transport (`acp` or
+  `cli`), launch command and args, model list, default model, billing mode, the `agent` row's
+  `enabled` and the per-box `agent_box.enabled`. The surface is the **`agents` section of the
+  Settings tab, not a tab of its own** — `SettingsSection`/`SectionId("agents")` in the section
+  strip (`crates/htui/src/ui/tabs/settings/{mod.rs,agents.rs}`), which is still the *only*
+  registered section (MOD-7's box profile, MOD-9's skills and MOD-15's hierarchy each add their
+  own). MOD-2 built it read-only (`r` probe, `i` install, `a` authenticate, `o` open, `x` cancel)
+  and MOD-20/MOD-21 added the install and login actions, so what is missing is the **write** half
+  that `R-AGT-4`'s field list and `R-AGT-6`'s "manual entries allowed" still owe. MOD-2 milestone 5
+  **D45** already added `probe.source` (`probe` | `manual`) so that "a manual entry is never
+  overwritten by a probe that finds nothing" (`docs/ANA-4.md` §4.6) — a guard that today protects
+  rows no UI can create. Needs the same text-input widget MOD-22 needs and the Settings tab does not
+  have yet (`R-TUI-8`), off the UI task like every other request (`R-NF-3`). Registry writes are
+  server-only (`REGISTRY_ON_SERVER_ONLY`, MOD-6 plan D52), so the same actions on a box with no DSN
+  are **blocked on MOD-17** (ANA-10's `R-AGT-4` amendment, `docs/ANA-10.md` §6.1); the Postgres path
+  is **not blocked** and can start now. File collisions to expect in that one section file: MOD-2
+  milestone 7 adds a quota column to this table (plan D73), MOD-12 owns the Settings caps section,
+  MOD-15 owns kinds and step graphs. **Budget warning inherited from MOD-2 milestone 7 (plan D76,
+  T47/T48):** the table now runs eight columns with **no width slack left** — each sits at its own
+  longest string (`transport`/`models`/`enabled` at their headers, `billing` at `subscription`,
+  `default` at a 21-char model id, `quota` at `100% to 09-08`, `name` at `amp-acp`, `on this box` at
+  `unauthenticated`) inside 98 usable columns. A ninth column costs a **ranking decision**, not an
+  adjustment; an edit *pane* below the table, which this item needs anyway for its text input, is
+  the cheaper shape than more columns. Out of scope: the caps editor (MOD-12), box-profile capability
+  edits (MOD-7), and anything keyed on an agent's name (`R-AGT-5`). Raised by the maintainer on
+  2026-09-10 while MOD-2 milestone 7 was in flight.
 
 ### Deferred backlog
 
@@ -552,12 +639,51 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `.sqlx` alone and assumed the Postgres half passed). Fix: have `demo_db()` seed under a name the
   fixture cannot hold (or parameterise the fixture's user), and consider making the skip path
   distinguishable from a real pass. Found during MOD-2 milestone 1 on 2026-09-07; predates MOD-2.
+- [ ] **TOOL-4 - `crates/htui/tests/auth.rs` flakes as a whole binary, and the assertion is not yet
+  captured.** `R-NF-3`. Measured on 2026-09-10 on this box: **1 failure in 43** runs of
+  `USERNAME=htui-ci cargo test -p htui --features testkit --test auth`, against **0 in 10** runs of
+  the single test `o_opens_the_link_through_the_injected_opener` filtered on its own — so the defect
+  is a **cross-test interaction inside the binary**, not that test in isolation. The one observed
+  failure finished in **0.15 s** while passing runs take 0.05-0.9 s, which **rules out deadline
+  exhaustion**: `Rig::until` retries against a 60 s `PATIENCE` (`tests/auth.rs:283-297`), so a
+  timeout would have cost 60 s. It is therefore an immediate assertion, and **its text was not
+  captured** — the failing run's output was consumed by a `grep` that did not match the failure
+  block, and 43 later runs (12 warm, 25 warm, 6 forced-relink) did not reproduce it. Hypotheses
+  already **ruled out**: the 10 ms `TICK` poll being too short (the loop is deadline-bounded, not
+  iteration-bounded); cold start (6/6 pass with a forced relink); and the `ETXTBSY` fd-inheritance
+  hazard, which is already mitigated by running the fixture as `/bin/sh <path>`
+  (`tests/auth.rs:100-102`). Still open as suspects: the `FIXTURE_HOLD` fixture's `sleep 3600`
+  child (`:84`) outliving its case under parallel test threads, and the two cases that share a
+  `FIXTURE_DIR` pid file (`:76`). **Reproduce under load** — the single failure occurred while a
+  concurrent `cargo` build and a 1.88 GB ACP adapter were running — and capture the whole `cargo
+  test` output (`--test-threads=1` versus the default is the first discriminator worth trying).
+  Predates this branch: found by MOD-2 milestone 7's T41 implementer, which re-checked it with its
+  own changes reverted. Not `o`-specific until the captured assertion says so.
+
+- [ ] **TOOL-5 - The dev Postgres crashes into recovery under two concurrent test suites; its
+  container has Docker's default 64 MiB `/dev/shm`.** `R-NF-3`. Observed **four times** on
+  2026-09-10 during MOD-2 milestone 7, every time with two `cargo test --workspace --all-features`
+  runs overlapping: the container logs `server process (PID …) exited with exit code 2` then
+  `all server processes terminated; reinitializing`, and every in-flight Postgres case fails
+  `57P03 the database system is in recovery mode` — **not** an assertion failure, but
+  indistinguishable from one in a summary line. Recovery costs ~3-4 minutes of
+  `syncing data directory (fsync)` per crash. `compose.yaml` declares no `shm_size` for the
+  `postgres:16` service, so the container runs the 64 MiB default (`docker inspect htui-postgres
+  --format '{{.HostConfig.ShmSize}}'` → `67108864`), which is the documented way to make a
+  containerised Postgres fall over once parallel workers and many databases are live — each suite
+  mints its own throwaway `htui_test_*`, so two suites is easily 17+. **First fix to try:**
+  `shm_size: 1gb` on the service in `compose.yaml`. Host memory was **not** the cause and should not
+  be blamed: 47 GB were available when this was checked, though an implementer saw swap saturated
+  mid-build, so heavy cargo builds are a contributing load rather than the mechanism.
+  **Until it is fixed, the workspace Postgres line must not be run by two agents at once** — telling
+  each one not to does not work, since they cannot see each other; serialise the tasks instead.
+  Found while landing T42 and T43 in parallel.
 
 ## Summary
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-3 context tools, ANA-7 secrets)                                                    |
-| MOD-N   | 18 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-22 loopback paste-back; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 19 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-22 loopback paste-back, MOD-23 agent registry editing; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
-| TOOL-N  | 3 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable) |
+| TOOL-N  | 5 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-4 `tests/auth.rs` whole-binary flake, TOOL-5 dev Postgres crashes under concurrent suites, 64 MiB shm) |

@@ -231,6 +231,38 @@ Two environment knobs, both off by default:
 | `HTUI_KEEP_RAW_EVENTS=1` | Keep the verbatim wire message on every recorded row. `project.settings.keep_raw_events` replaces this once the project editor exists |
 | `HTUI_TOOL_<NAME>` | Override one `${name}` placeholder of `agent.launch` — `HTUI_TOOL_NODE`, `HTUI_TOOL_CLAUDE_AGENT_ACP`, … — for a box whose layout the built-in resolver does not understand |
 
+### Spending caps
+
+Two keys of `project.settings`, both **USD micros** (1 000 000 = one dollar) and both absent by
+default, which means unbounded:
+
+| Key | Effect |
+|---|---|
+| `per_token_cap_run` | The most one run may spend. The recorder compares the run's accumulated `cost_micros` after every usage report and, on reaching the cap, cancels the session: the step's last two rows are `error{code:"cap_exceeded"}` and `done{stop_reason:"cancelled"}`, and the run closes failed |
+| `per_token_cap_batch` | Read and reported, **not** enforced yet — a batch spans runs the orchestrator does not create yet, so MOD-12 owns it (`docs/ANA-4.md` §9) |
+
+Micros rather than dollars because the figure a cap is compared against is an integer of micros, and
+a float cap against an integer total is a rounding argument waiting to happen. `0` is a real cap and
+cancels on the first report that carries any cost; a negative or non-integer value **refuses the
+chat** rather than being ignored, because a cap the operator wrote and the app quietly dropped is
+the worse failure.
+
+Both figures are client-side estimates the agent reports, so a cap is a **guard rail and never a
+billing statement** — it can differ from the invoice, and the cancellation message says so.
+
+### Remaining allowance
+
+`Settings > Agents` carries a `quota` column per agent for this box: the tightest window as a
+percentage with its reset date for a subscription agent, session spend for a per-token one, and `—`
+for an agent that reports nothing (which is every agent whose registry row declares
+`settings.quota.source: "none"`).
+
+The value is **latched passively** — every usage report a running chat sees updates it, which costs
+nothing — so `r` re-probes the row but **cannot** refresh quota: a probe handshake reports no
+allowance at all. The section says so on its hint line rather than leaving it to be discovered.
+An offline chat latches nothing (the mirror holds no `agent_box` row); its usage rows are buffered
+and the figure re-derives after upload.
+
 ## Installing an agent's adapter
 
 `claude` reaches ACP through an npm adapter the probe can find on its own. `agy` does not: Google
