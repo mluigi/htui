@@ -29,6 +29,48 @@ below is reviewed by eye and named in the phase note; the runtime fact is MOD-16
 
 ---
 
+## D93 reconciliation — read this before B.4, B.5, B.6, H-3, F-T51 or F-T53
+
+This blueprint was written **before** the maintainer answered E-1, and it argues for the route they
+rejected. Where the two disagree, **D93 in the plan wins**. Concretely, superseding the conventions
+paragraph above and every section that leans on E-1:
+
+1. **There IS a new `DriverEvent` variant.** `DriverEvent::PermissionAnswer` is the **twelfth**,
+   landed in `35ba550`; `driver_contract.rs` now pins twelve and `14 − 2 = 12`. The conventions
+   paragraph's "no new `DriverEvent` variant (eleven …)" is **void**. `permission_answer` is no
+   longer htui-authored-only: `docs/ANA-4.md` §4.1 is amended to "authored by `htui`, or reported by
+   a transport that answered by policy".
+2. **B.4's `denials_of` returns `Vec<DriverEvent>` of `DriverEvent::PermissionAnswer`**, not of
+   `Other { update: PERMISSION_DENIED }`. The role is selected from `AnsweredBy::Policy`, which the
+   recorder already understands.
+3. **B.5's conversion arm has no job and is dropped.** With a typed variant nothing matches a string
+   to write the row. `record::PERMISSION_DENIED` is landed as a shared *name* only (no arm); if T53
+   still wants a second route to the same row it must justify it or delete the constant.
+4. **`conformance::driver_rows` (`conformance.rs:324`) must stop filtering `permission_answer` out**,
+   and its "the three kinds `htui` writes itself" doc is now false. This is **T53's first change**,
+   and B.6's `rejected_tool_gets_failed_result` depends on it.
+5. **`rate_limit_event` stays `other`, exactly as B.4 already has it.** The plan's D93 first draft
+   said `EventKind::Usage`; that was withdrawn on 2026-09-10 because a `usage` row arriving mid-turn
+   contradicts D91's `usage_mid_turn: false` for this very transport. The blob is **held** and rides
+   the turn's single `usage` row at `result`. B.4 was right; the plan was wrong.
+6. **§A's file table is incomplete for D93.** Four exhaustive matches also needed arms
+   (`fake.rs::payload_of`, `chat/transcript.rs::apply`, `tests/acp_conformance.rs::wire_update`,
+   `tests/chat_live_agy.rs::report`) and there is a seventh `DriverCaps` literal in
+   `chat/mod.rs:688`'s `mod tests`. All are already handled in `35ba550`.
+7. **The signal method is `Spawned::signal(StopSignal)` on every platform**, landed by T50a in
+   `8ac20f6` — not §A row 3's `#[cfg(unix)] interrupt()` assigned to T50. T50's cancel path needs
+   SIGTERM as well as SIGINT, and a `cfg`-shaped method would make the supervisor's cancel path
+   `cfg`-shaped too. On Windows it returns `DriverError::Transport` naming the platform fact rather
+   than reporting a success that never happened.
+8. **`uuid` is still not an `htui-agent` dependency.** §A row 1 assigns it to T50a; T50a correctly
+   declined, since it exists only for D84's `Uuid::now_v7()` in `cli/mod.rs`. **T50 adds it.**
+
+Also corrected against the tree by T50a: §A's `SessionSpec` site list (E-8 ii) is **exact** — six
+literals plus the hand-written `Debug` at `driver.rs:276-292`, every line number still right, and
+`agent_worker.rs:1144` is indeed the one taking a real value.
+
+---
+
 ## E. Errors in the plan, for the maintainer
 
 These are the findings the plan asked this step to produce. Each names the evidence, the
