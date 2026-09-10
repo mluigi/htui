@@ -1121,6 +1121,16 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// tidiness: `upload_pending` sums *every* persisted `usage` row of a chat that happened
     /// offline (MOD-2 plan D36), so an online step and the same step uploaded from a buffer would
     /// disagree for exactly this one row shape.
+    ///
+    /// **A breach outlives a refused flush.** The sum and [`Recorder::check_cap`] run before the
+    /// trailing flush, so by the time that flush can fail the verdict is already spent: `spent` is
+    /// counted, `cap_breached` is `Some`, and no later row of this session can breach again. A
+    /// store error returned *instead of* the verdict would therefore disarm the cap for the rest
+    /// of the session — one masked row plus one store fault, and a capped run continues
+    /// unbounded — so the verdict wins and the error is logged. Nothing is lost by that: a refused
+    /// flush commits nothing and keeps its numbered rows in `unflushed`, which
+    /// [`Recorder::record_cap_breach`]'s own flush re-offers **ahead of** the closing pair
+    /// (blueprint H-2), so the breaching row is written by the very sequence the verdict triggers.
     async fn record_unreadable(
         &mut self,
         kind: EventKind,
@@ -1150,8 +1160,20 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             raw: raw.into_iter().collect(),
             at,
         });
-        self.flush().await?;
-        Ok(breach)
+        match (self.flush().await, breach) {
+            // The verdict over the error, for the reason in this method's doc: the row is summed
+            // and the cap is spent whether or not the store took the batch.
+            (Err(err), Some(breach)) => {
+                tracing::warn!(
+                    %err,
+                    "the flush of a breaching row was refused; the cap is enforced anyway and the \
+                     row is written with the closing pair (blueprint H-2)"
+                );
+                Ok(Some(breach))
+            }
+            (Err(err), None) => Err(err),
+            (Ok(()), breach) => Ok(breach),
+        }
     }
 
     /// The fail-closed path (`R-SEC-3`): drop the row, write a `scrub_residue` row in its place,

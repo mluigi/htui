@@ -1620,6 +1620,88 @@ async fn a_refused_flush_leaves_the_two_closing_rows_owed_not_lost() {
     );
 }
 
+/// Review M-1: a breach detected on a row whose flush the store then refuses is **still reported**.
+///
+/// The unreadable path is the one that could lose it. `record_unreadable` sums the masked payload
+/// and compares the cap *before* its trailing flush, so when that flush fails the session is in the
+/// worst possible state: the spend is counted, `cap_breached` is `Some` — which makes every later
+/// `check_cap` answer `None` — and the caller has an error where the verdict should be. The worker
+/// logs a recording error and carries on (`agent_worker::record`), so a build that returned the
+/// error instead of the verdict would disarm the cap for the rest of the session on one masked row
+/// plus one store fault: a run that was supposed to be bounded, running unbounded, with nothing on
+/// screen saying so.
+///
+/// Nothing is traded for that: the refused batch stays in `unflushed` and the closing sequence the
+/// verdict triggers writes it ahead of the two closing rows (blueprint H-2), which is what the row
+/// order below asserts.
+#[tokio::test]
+async fn a_breach_survives_the_refused_flush_of_the_row_that_caused_it() {
+    let chat = chat_spec();
+    // A masked `output_tokens` sends the row down the unreadable path; `cost_micros` stays
+    // readable, so the row is summed and the cap is compared exactly as on the readable path.
+    let scrubber = MaskKey("output_tokens");
+    let store = open_chat(&chat).await;
+    let mut recorder =
+        Recorder::new(&store, &scrubber, chat.step_id, false, None).with_run_cap(run_cap(300));
+    let mut session = ScriptedSession::cancelling(
+        Vec::new(),
+        vec![env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::Cancelled,
+        }))],
+    );
+
+    store.refuse_next_appends(1);
+    let breach = recorder
+        .record(env(DriverEvent::Usage(UsageEvent {
+            output_tokens: Some(5),
+            cost_micros: Some(350),
+            ..UsageEvent::default()
+        })))
+        .await
+        .expect("a refused flush is not what the caller hears about: the breach is")
+        .expect("the row was summed and reached the cap, so the cap fired");
+    assert_eq!(
+        breach,
+        CapBreach {
+            cap_micros: 300,
+            spent_micros: 350,
+            at: at(),
+        },
+        "the verdict names the cap, the spend that reached it and the row that did"
+    );
+
+    // And the verdict is answerable: the sequence the worker would run next lands the row the
+    // refused flush was carrying, in front of the pair it writes itself.
+    let stop = htui_agent::record::enforce_breach(&mut session, &mut recorder, breach)
+        .await
+        .expect("the closing sequence writes the owed row and the two closing ones");
+    assert_eq!(stop.stop_reason, StopReason::Cancelled);
+    let summary = recorder.finish().await.expect("close");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::Usage, EventKind::Error, EventKind::Done],
+        "the owed row is re-offered ahead of the closing pair (blueprint H-2)"
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "at the seq the refused flush had given it"
+    );
+    assert_eq!(log[1].payload["code"], json!("cap_exceeded"));
+    assert_eq!(log[2].payload["stop_reason"], json!("cancelled"));
+    assert_eq!(
+        summary.usage["cost_micros"], 350,
+        "and the breaching row was summed once, not once per attempt"
+    );
+    assert_eq!(
+        summary.cap_breach,
+        Some(breach),
+        "the session's one verdict is the one the refused flush could not swallow"
+    );
+}
+
 /// A secret from `SessionSpec.env` that reaches a tool result is `[REDACTED]` in the persisted row
 /// (`R-SEC-3`, ANA-4 §9: scrub before either write path).
 #[tokio::test]

@@ -2566,8 +2566,15 @@ async fn run_turn(
 /// handed: what reaches the screen must be masked exactly as what reached the store (`R-SEC-3`).
 ///
 /// A recording failure is logged and **not** returned, as it always was: the turn goes on and
-/// `finish` reports it. The verdict is `None` on that path too — a row the store never took spent
-/// nothing this loop should cancel over.
+/// `finish` reports it, and there is no verdict to answer because the call that failed produced
+/// none.
+///
+/// That last clause is the whole of it, and it used to read "a row the store never took spent
+/// nothing" — which was wrong on one path (review M-1). A `usage` row is summed and compared
+/// **before** the flush that persists it, so a store that refuses that flush leaves a session
+/// whose spend is counted and whose cap is spent. The recorder therefore hands the verdict back on
+/// that path rather than the error (`Recorder::record_unreadable`), and this arm's `None` means
+/// only what it says: nothing to cancel over.
 async fn record(
     recorder: &mut Recorder<'_, Writer>,
     envelope: DriverEnvelope,
