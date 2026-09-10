@@ -42,6 +42,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::Path;
 
+use crate::agent_worker::AUTH_ALREADY_CHOSEN;
 use crate::app::{Action, Ctx, Handled};
 use crate::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use crate::ui::Theme;
@@ -535,7 +536,14 @@ impl AgentsSection {
             } => {
                 // The list belongs to the flow that is running; a frame with no flow behind it is
                 // a stale one the shell's own freshness check let through (blueprint H-26).
-                if let Some(agent_id) = self.auth_agent() {
+                //
+                // And to a flow that is still *starting*: `begin_auth_cancel` from `Starting`
+                // synthesises a `Running { cancelling: true }` at the same `AuthStart` address, so
+                // a list already in flight when `x` was pressed would otherwise replace it with a
+                // chooser and lose the flag until `Cancelled` arrived (review L-3).
+                if let Some(agent_id) = self.auth_agent()
+                    && matches!(self.auth, AuthState::Starting { .. })
+                {
                     self.auth = AuthState::Choosing {
                         agent_id,
                         methods: methods.clone(),
@@ -1134,6 +1142,14 @@ impl SettingsSection for AgentsSection {
             // Hazard H-22, the first of the two `Failed`s: a **request** of the flow was refused,
             // so the flow this section thought it had is not there. The shell owns the sentence;
             // all this section owes is a state a second `a` can start from.
+            //
+            // With one exception, and it is the reverse of the rule rather than a hole in it
+            // (review L-4): a second choice is refused *by a login that is still running*, and
+            // clearing the pane on that one would leave a live adapter — with its loopback
+            // listener open — and no `x` to cancel it. The pane stays exactly where it was, as it
+            // does for a refused `auth_open`.
+            StoreReply::Failed { request, message }
+                if *request == "auth_choose" && message == AUTH_ALREADY_CHOSEN => {}
             StoreReply::Failed { request, .. }
                 if matches!(*request, "auth_start" | "auth_choose" | "auth_cancel") =>
             {

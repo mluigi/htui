@@ -858,8 +858,34 @@ pub async fn spawn(launch: &ResolvedLaunch, cwd: &Path) -> Result<Spawned> {
     if let Some(stderr) = child.stderr().take() {
         let tail = Arc::clone(&stderr_tail);
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            // `read_until` and `from_utf8_lossy`, not `lines()`: that iterator answers
+            // `Err(InvalidData)` on a single byte that is not UTF-8 and **ends** — which would end
+            // this reader, close the tap and freeze the tail on the first stray byte an adapter
+            // wrote, and then stop draining the pipe at all, so a child that filled it would block
+            // on its own stderr. A login is where that costs the most: the line after the stray
+            // byte is often the one carrying the URL. Lossy is what this file's `tap_stderr` doc
+            // has promised all along.
+            let mut reader = BufReader::new(stderr);
+            let mut buffer = Vec::new();
+            loop {
+                buffer.clear();
+                match reader.read_until(b'\n', &mut buffer).await {
+                    // End of stream.
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    // A real I/O failure on the pipe, which `lines()` also stopped at: there is
+                    // nothing left to read from a descriptor that answers an error.
+                    Err(_) => break,
+                }
+                // The separators `lines()` strips, stripped the same way: a `\n`, and the `\r`
+                // before it that a Windows child writes.
+                if buffer.last() == Some(&b'\n') {
+                    buffer.pop();
+                    if buffer.last() == Some(&b'\r') {
+                        buffer.pop();
+                    }
+                }
+                let line = String::from_utf8_lossy(&buffer).into_owned();
                 let Ok(mut tail) = tail.lock() else { return };
                 if tail.lines.len() == STDERR_TAIL_LINES {
                     tail.lines.pop_front();

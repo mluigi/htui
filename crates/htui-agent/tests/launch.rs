@@ -743,3 +743,39 @@ async fn a_second_tap_replaces_the_first() {
         "the replacement is a late tap like any other: the tail first, then the stream"
     );
 }
+
+/// Review L-5: one byte that is not UTF-8 does not end the reader.
+///
+/// `tap_stderr`'s doc has always promised "lossy UTF-8", and `BufReader::lines()` does not give it:
+/// it answers `Err(InvalidData)` and **stops**, which closed the tap, froze the tail and left the
+/// pipe undrained — so a child with more to say would eventually block on its own stderr. The line
+/// after the stray byte is the one a login cares about, because that is where the link is.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_non_utf8_byte_neither_ends_the_stream_nor_hides_the_line_after_it() {
+    let tmp = tempfile::tempdir().expect("a temp working directory");
+    let go = tmp.path().join("go");
+    // `\376` is a byte no UTF-8 sequence may begin with: a spinner from a legacy encoding, written
+    // mid-line, with the line that matters printed after it.
+    let script = format!(
+        "printf 'spin\\376ner\\n' >&2; {}printf 'open https://h.invalid/login\\n' >&2",
+        wait_for(&go)
+    );
+    let mut spawned = spawn_sh(&script, tmp.path()).await;
+
+    let mut tap = spawned.tap_stderr();
+    go_ahead(&go);
+    let lines = drain(&mut tap).await;
+    spawned.wait().await.expect("the child exits");
+
+    assert_eq!(
+        lines,
+        ["spin\u{fffd}ner", "open https://h.invalid/login"],
+        "the byte is replaced and the stream carries on: {lines:?}"
+    );
+    assert_eq!(
+        spawned.stderr_tail(),
+        lines,
+        "and the tail is the same two lines, so a failed handshake is still explained"
+    );
+}

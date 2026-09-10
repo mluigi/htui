@@ -89,17 +89,30 @@ enum Wire {
     HandshakeTimeout(Duration),
 }
 
-/// Which request the foreground future is parked on.
+/// Where the foreground future is, when it is not the one doing the answering.
 ///
 /// The one fact the `oneshot` cannot carry. A sender dropped **unused** says only that the
 /// connection actor gave up on the foreground future, and the message that reports it has to name
 /// what that future was waiting for — "the agent ended before answering logout" is a sentence a
 /// user can act on and "the agent ended" is not. Shared as an atomic because the outer frame reads
 /// it exactly once, after the future that writes it is already gone.
+///
+/// Not every stage is a request (review L-2). The wait for the human's choice is the longest of the
+/// four and the only one nothing was asked during, and a value that still read `Initialize` there
+/// would name the one thing about it that is provably false: `initialize` *was* answered, and the
+/// list the user is reading came out of it.
+///
+/// No message renders this variant today — with the pinned SDK the "sender dropped unused" arm is
+/// unreachable while the foreground future is parked on a human, which
+/// `tests/auth.rs::an_adapter_that_dies_during_the_chooser_is_left_to_the_callers_clock` measures.
+/// It is stored anyway because what this atomic reports must be true of the flow and not of the
+/// transport that happens to be under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     /// The handshake.
     Initialize,
+    /// The method list is out and the human has not answered it yet.
+    Choosing,
     /// `authenticate`.
     Authenticate,
     /// `logout`.
@@ -113,6 +126,7 @@ impl Stage {
             Self::Initialize => 0,
             Self::Authenticate => 1,
             Self::Logout => 2,
+            Self::Choosing => 3,
         }
     }
 
@@ -122,16 +136,19 @@ impl Stage {
         match code {
             1 => Self::Authenticate,
             2 => Self::Logout,
+            3 => Self::Choosing,
             _ => Self::Initialize,
         }
     }
 
-    /// The protocol method this stage is waiting on.
-    const fn as_str(self) -> &'static str {
+    /// What a child that died at this stage is reported as, whole: three of the four name the
+    /// method nothing answered, and the fourth names the wait it interrupted.
+    const fn ended(self) -> &'static str {
         match self {
-            Self::Initialize => "initialize",
-            Self::Authenticate => "authenticate",
-            Self::Logout => "logout",
+            Self::Initialize => "the agent ended before answering initialize",
+            Self::Choosing => "the agent ended while a method was being chosen",
+            Self::Authenticate => "the agent ended before answering authenticate",
+            Self::Logout => "the agent ended before answering logout",
         }
     }
 }
@@ -155,10 +172,11 @@ impl Stage {
 /// # Errors
 /// [`DriverError::Transport`]: `initialize failed: {err}` plus the child's stderr tail on a new
 /// line when there is one; `the agent did not complete its handshake within {timeout:?}` on
-/// timeout; `the agent ended before answering {initialize|authenticate|logout}` when the connection
-/// actor failed first and dropped the foreground future, plus the same tail — the child's own last
-/// words are usually the only account of why it died. In every case the child has been killed
-/// **and reaped** before this returns.
+/// timeout; `the agent ended before answering {initialize|authenticate|logout}` — or `the agent
+/// ended while a method was being chosen` — when the connection actor failed first and dropped the
+/// foreground future, plus the same tail, because the child's own last words are usually the only
+/// account of why it died. In every case the child has been killed **and reaped** before this
+/// returns.
 pub async fn run(io: AcpIo, settings: &AcpSettings, flow: WireFlow) -> Result<AuthOutcome> {
     let AcpIo {
         reader,
@@ -201,6 +219,10 @@ pub async fn run(io: AcpIo, settings: &AcpSettings, flow: WireFlow) -> Result<Au
                             logout,
                             hidden: hidden.clone(),
                         });
+                        // Stored the instant the list is out, so a child that dies while the human
+                        // reads it is reported as what it interrupted rather than as the handshake
+                        // it had already completed (review L-2).
+                        waiting_on.store(Stage::Choosing.code(), Ordering::Relaxed);
                         // The choice is awaited *here*, inside the future, because this is the only
                         // place the SDK lets a request be sent from — and it is raced against the
                         // token so a cancel during the chooser ends the connection cleanly rather
@@ -264,10 +286,9 @@ pub async fn run(io: AcpIo, settings: &AcpSettings, flow: WireFlow) -> Result<Au
             }
             Ok(Wire::Answered(outcome)) => Ok(outcome),
             Ok(Wire::Cancelled) => Ok(AuthOutcome::Cancelled),
-            Ok(Wire::Ended(stage)) => Err(DriverError::Transport(with_tail(
-                format!("the agent ended before answering {}", stage.as_str()),
-                &guard,
-            ))),
+            Ok(Wire::Ended(stage)) => {
+                Err(DriverError::Transport(with_tail(stage.ended().to_owned(), &guard)))
+            }
             Ok(Wire::HandshakeFailed(err)) => Err(DriverError::Transport(with_tail(
                 format!("initialize failed: {err}"),
                 &guard,
@@ -281,10 +302,9 @@ pub async fn run(io: AcpIo, settings: &AcpSettings, flow: WireFlow) -> Result<Au
             // The sender was dropped without being used: `connect_with` gave up on the foreground
             // future — the connection actor failed first — before the call was answered.
             Err(_) => Err(DriverError::Transport(with_tail(
-                format!(
-                    "the agent ended before answering {}",
-                    Stage::from_code(stage.load(Ordering::Relaxed)).as_str()
-                ),
+                Stage::from_code(stage.load(Ordering::Relaxed))
+                    .ended()
+                    .to_owned(),
                 &guard,
             ))),
         },

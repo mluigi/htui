@@ -177,6 +177,19 @@ impl core::fmt::Debug for LiveInstall {
     }
 }
 
+/// The one refusal of an `auth_choose` that leaves the login **running** (review L-4).
+///
+/// [`run_auth`] takes the choice sender exactly once, so a second choice is refused rather than
+/// dropped — the pane hears back for every request it spends. But the other two refusals of that
+/// request ("no login is running", "this login has ended") mean the flow is *gone* and this one
+/// means it is very much there, and a section that treated them alike would clear its pane and
+/// leave a live adapter with no `x` to cancel it.
+///
+/// A constant rather than a literal at each end because both ends are in this crate: the settings
+/// section matches on this exact value, and a sentence the compiler links is not a sentence one
+/// side can reword without the other.
+pub const AUTH_ALREADY_CHOSEN: &str = "a method was already chosen";
+
 /// What the worker asks a live login to do (MOD-21 D18).
 ///
 /// The [`ChatCommand`] shape, and for the same reason: there are two things a running flow can be
@@ -932,10 +945,15 @@ impl AgentRuntime {
     /// Forwards a command to the live login (MOD-21 D18).
     ///
     /// [`command`](Self::command)'s shape, and its two refusals: nothing running, and a channel
-    /// the task has already dropped. Both are refusals *of the request*
+    /// the task has closed on its way out or already dropped. Both are refusals *of the request*
     /// ([`StoreReply::Failed`]), never frames of a stream that has ended — the section keeps its
     /// pane on the second one for `auth_open` and clears it on the flow's own terminal frame
     /// (blueprint H-22).
+    ///
+    /// A closed channel is **not** on its own a finished task (review L-1: [`run_auth`] closes it
+    /// before its re-probe), so the value is let go of only once the task is, exactly as the sweep
+    /// at the top of [`serve`](Self::serve) does it. Dropping it any earlier would release the
+    /// re-probe claim while the flow's own probe is still writing the row (blueprint H-16).
     fn auth_command(&mut self, request: &'static str, command: AuthCommand) -> Served {
         let Some(live) = self.auth.as_ref() else {
             return Served::Reply(StoreReply::Failed {
@@ -944,7 +962,7 @@ impl AgentRuntime {
             });
         };
         if live.commands.send(command).is_err() {
-            self.auth = None;
+            self.auth.take_if(|live| live.task.is_finished());
             return Served::Reply(StoreReply::Failed {
                 request,
                 message: "this login has ended".to_owned(),
@@ -1815,6 +1833,12 @@ impl core::fmt::Debug for AuthArgs {
 /// version string. Every other outcome writes **nothing at all**, `probed_at` included: a refusal,
 /// a cancel and an abandoned flow each leave `agent_box` exactly as they found it.
 ///
+/// **The command channel is the caller's last word.** A `None` from it cancels the flow (review
+/// M-1): the only thing that closes it is the runtime letting go of this login, and a login nobody
+/// can choose for, open a link for or cancel is one that has to end itself. In the other direction,
+/// the channel is closed and drained the instant the loop breaks (review L-1), so a command that
+/// arrives during the re-probe is refused rather than carried down with the task.
+///
 /// Nothing here touches `agent`. A login is a fact about a box (`R-AGT-9`).
 async fn run_auth(args: AuthArgs) {
     let AuthArgs {
@@ -1842,7 +1866,8 @@ async fn run_auth(args: AuthArgs) {
         cwd: cwd.clone(),
         events: events_tx,
         choice: choice_rx,
-        cancel,
+        // Cloned, not moved: the arm below needs a way to end a flow no caller can reach any more.
+        cancel: cancel.clone(),
         idle: AUTH_IDLE_CAP,
         browser: BrowserPolicy::Neutralised,
     });
@@ -1870,7 +1895,7 @@ async fn run_auth(args: AuthArgs) {
                         &reply,
                         StoreReply::Failed {
                             request: "auth_choose",
-                            message: "a method was already chosen".to_owned(),
+                            message: AUTH_ALREADY_CHOSEN.to_owned(),
                         },
                     ),
                 },
@@ -1886,11 +1911,43 @@ async fn run_auth(args: AuthArgs) {
                     };
                     frames.reply(&reply, answer);
                 }
-                // The runtime let go of this login: nothing more will be asked of it.
-                None => serving = false,
+                // The runtime let go of this login **without** cancelling it: a panic on the worker
+                // loop, or any drop of `AgentRuntime` that never reached `shutdown`, closes this
+                // channel and drops the token clone rather than tripping it. A closed channel means
+                // no caller can ever reach this flow again — its `AuthCancel` has nowhere to go —
+                // so cancelling is the only correct reading. Without it the child, and the OAuth
+                // loopback listener it is holding open, would wait on a human nobody can answer for
+                // until the idle cap; and since every stderr line restarts that clock
+                // (`htui-agent`'s `auth/run.rs`), an adapter that prints anything periodically
+                // would never reach it at all.
+                None => {
+                    serving = false;
+                    cancel.cancel();
+                }
             },
         }
     };
+
+    // Closed **before** the drain, the re-probe and the row write, which are seconds a caller could
+    // otherwise spend a request into: from here on `auth_command` fails to send and refuses the
+    // request itself, which is the answer it already has words for.
+    commands.close();
+    // What was already in the queue when the loop broke is answered at its own address rather than
+    // dropped with the task: a `Served::Deferred` the pane never hears back from is the shape
+    // MOD-20's review rejected, and this flow has nothing left to do for any of them.
+    while let Ok(command) = commands.try_recv() {
+        let (request, reply) = match command {
+            AuthCommand::Choose { reply, .. } => ("auth_choose", reply),
+            AuthCommand::Open { reply, .. } => ("auth_open", reply),
+        };
+        frames.reply(
+            &reply,
+            StoreReply::Failed {
+                request,
+                message: "this login has ended".to_owned(),
+            },
+        );
+    }
 
     // The events sender lived inside the future that has just returned, so this drains what it
     // wrote on its way out and then ends — the last stderr line an adapter prints is often the
@@ -5723,6 +5780,145 @@ done
             assert!(
                 runtime.reprobe_claims.claim((agent_id, ids::BOX)).is_some(),
                 "and the claim goes with the flow"
+            );
+        }
+
+        /// Review M-1: a runtime that lets go of a login **without** cancelling it.
+        ///
+        /// A panic on the worker loop, or any drop of [`AgentRuntime`] that never reaches
+        /// `shutdown`, drops the [`LiveAuth`] — which closes the command channel and *drops* the
+        /// token clone rather than tripping it. From that moment nobody can choose, open or cancel
+        /// this flow: its `AuthCancel` has no runtime to reach. Bounded only by the idle clock it
+        /// would keep an adapter — and its OAuth loopback listener — alive for the whole cap, and
+        /// an adapter that prints any periodic line resets that clock forever (`auth/run.rs`).
+        ///
+        /// So a closed command channel is read as what it is: the last caller is gone.
+        #[tokio::test]
+        async fn a_login_whose_runtime_let_go_of_it_cancels_itself_rather_than_waiting() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) =
+                login_store(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")]).await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let pid = fixture_pid(tmp.path()).expect("the fixture wrote its pid when it started");
+
+            // The drop a panicking loop leaves behind: the task handle is detached rather than
+            // aborted, the sender goes, and the token is dropped **uncancelled**.
+            drop(runtime.auth.take().expect("the login is live"));
+
+            let last = loop {
+                let (_, frame) = next_frame(&mut rx).await;
+                if is_terminal(&frame) {
+                    break frame;
+                }
+            };
+            assert!(
+                matches!(last, AuthFrame::Cancelled),
+                "a flow no caller can reach again ends itself: {last:?}"
+            );
+            assert_not_running(pid, "a login whose runtime let go of it").await;
+        }
+
+        /// A driver whose `authenticate` is the seam's default: it refuses, and it refuses on the
+        /// **first poll**.
+        ///
+        /// That is what makes review L-1 a deterministic case rather than a race: the loop's
+        /// `select!` is `biased` towards the flow, so a command queued before the task starts is
+        /// still in the channel when the loop breaks, and whether it is ever answered is then a
+        /// question about the drain and not about scheduling.
+        #[derive(Debug)]
+        struct RefusingDriver;
+
+        impl AgentDriver for RefusingDriver {
+            fn name(&self) -> &str {
+                "refusing-fixture"
+            }
+
+            fn caps(&self) -> DriverCaps {
+                DriverCaps::default()
+            }
+
+            fn start<'a>(
+                &'a self,
+                _spec: SessionSpec,
+                _prompt: String,
+            ) -> htui_agent::driver::DriverFuture<'a, Box<dyn AgentSession>> {
+                Box::pin(async { Err(DriverError::Unsupported("start")) })
+            }
+        }
+
+        /// Review L-1: a command deferred into the window between the loop and the last frame is
+        /// answered at its own address, not dropped.
+        ///
+        /// `auth_command` sees a live receiver for as long as the task holds one — through the
+        /// event drain, the re-probe and the row write — and answers [`Served::Deferred`]. A
+        /// command that then goes down with the task is the "deferred with no frame" shape MOD-20's
+        /// own review rejected: the pane spent a request and hears nothing back, ever.
+        #[tokio::test]
+        async fn a_command_still_queued_when_the_flow_ends_is_refused_rather_than_dropped() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let backend = Backend::memory(MemStore::demo());
+            let writer = recording_writer(&backend).expect("a memory backend hands out a writer");
+            let origin = Origin::Tab(crate::ui::tabs::TabId("settings"));
+            let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            // Queued before the flow is polled even once, and never read by the loop.
+            commands_tx
+                .send(AuthCommand::Open {
+                    url: LINK.to_owned(),
+                    reply: ReplyAddr {
+                        seq: 3,
+                        origin: origin.clone(),
+                    },
+                })
+                .expect("the task holds the receiver");
+
+            run_auth(AuthArgs {
+                driver: Box::new(RefusingDriver),
+                agent: login_row(AgentId::new(), Transport::Acp, tmp.path(), &[]),
+                existing: None,
+                box_id: ids::BOX,
+                writer,
+                cwd: tmp.path().to_path_buf(),
+                cancel: CancellationToken::new(),
+                commands: commands_rx,
+                opener: OpenerCommand::Custom(recorder(tmp.path())),
+                frames: Frames {
+                    tx,
+                    addr: ReplyAddr {
+                        seq: 2,
+                        origin: origin.clone(),
+                    },
+                },
+            })
+            .await;
+
+            let mut replies = Vec::new();
+            while let Some(reply) = rx.recv().await {
+                replies.push((reply.seq, reply.reply));
+            }
+            assert!(
+                replies.iter().any(|(seq, reply)| *seq == 3
+                    && matches!(
+                        reply,
+                        StoreReply::Failed { request, message }
+                            if *request == "auth_open" && message == "this login has ended"
+                    )),
+                "the queued command is answered at its own address: {replies:?}"
+            );
+            assert!(
+                replies.iter().any(|(seq, reply)| *seq == 2
+                    && matches!(reply, StoreReply::Auth(AuthFrame::Failed { .. }))),
+                "and the stream still ends with the flow's own last frame: {replies:?}"
+            );
+            assert!(
+                opened(tmp.path()).is_empty(),
+                "a login that has ended opens nothing: {:?}",
+                opened(tmp.path())
             );
         }
     }

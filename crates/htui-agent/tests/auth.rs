@@ -210,6 +210,51 @@ fn silent_io() -> AcpIo {
     }
 }
 
+/// An [`AcpIo`] whose far end answers `initialize` with `methods` and then **ends** the moment the
+/// returned sender is fired: the adapter dying while the human is still reading the method list.
+///
+/// On cue rather than straight after the answer, because the two orderings are different cases:
+/// this one is only about the flow that got its list and was waiting for a choice, and a fixture
+/// that closed at once would race the client's own dispatch of the response it had just written.
+fn io_that_ends_on_cue(methods: Value) -> (AcpIo, oneshot::Sender<()>) {
+    let (client_end, agent_end) = tokio::io::duplex(DUPLEX_BYTES);
+    let (reader, writer) = tokio::io::split(client_end);
+    let (close_tx, close_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (agent_reader, mut agent_writer) = tokio::io::split(agent_end);
+        let mut lines = BufReader::new(agent_reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if request.get("method").and_then(Value::as_str) != Some("initialize") {
+                continue;
+            }
+            let answer = json!({
+                "jsonrpc": "2.0",
+                "id": request.get("id").cloned().unwrap_or(Value::Null),
+                "result": init_result(methods.clone(), false),
+            });
+            let mut text = serde_json::to_string(&answer).expect("the response serialises");
+            text.push('\n');
+            let _ = agent_writer.write_all(text.as_bytes()).await;
+            let _ = agent_writer.flush().await;
+            break;
+        }
+        // The cue, and then end of file: dropping both halves is what the client reads as a dead
+        // adapter.
+        let _ = close_rx.await;
+    });
+    (
+        AcpIo {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            child: None,
+        },
+        close_tx,
+    )
+}
+
 /// A [`WireFlow`] and the three ends its caller keeps: the events, the choice, the token.
 fn wire_flow(
     handshake_timeout: Duration,
@@ -714,6 +759,53 @@ async fn the_choice_sender_dropped_is_declined() {
         "a caller that went away without choosing declined; it did not cancel and did not fail"
     );
     assert_eq!(calls(&log), vec!["initialize".to_owned()]);
+}
+
+/// An adapter that dies while the chooser is open is left to the **caller's** clock (D13).
+///
+/// Measured rather than assumed, and it is the answer to review L-2, which expected this to be
+/// reported as "the agent ended before answering …". It is not reported at all: end of file with no
+/// request outstanding is not an answer, and this SDK's `connect_with` does not give up on a
+/// foreground future that is parked on a human rather than on a request. So the outer frame's
+/// "sender dropped unused" arm is never reached from here, the flow simply waits — and what ends it
+/// is the pane's cancel or `authenticate`'s own idle cap, which is the second half of the pair D13
+/// describes: the two defences really are one defence.
+///
+/// The moment a choice *is* made the ordinary path takes over: the request goes out on a closed
+/// transport, the SDK marks the error, and `Wire::Ended(Stage::Authenticate)` names the call
+/// nobody answered.
+#[tokio::test]
+async fn an_adapter_that_dies_during_the_chooser_is_left_to_the_callers_clock() {
+    let (io, close) = io_that_ends_on_cue(json!([{ "id": "m-one", "name": "One" }]));
+    let (flow, mut events, _choice_tx, cancel) = wire_flow(PATIENCE);
+    let settings = settings();
+    let running = run_auth(io, &settings, flow);
+    tokio::pin!(running);
+
+    // The list is in the caller's hands, so the flow is provably past `initialize` and parked on a
+    // choice when the adapter goes away.
+    let event = tokio::select! {
+        outcome = &mut running => panic!("the flow ended before it offered anything: {outcome:?}"),
+        event = events.recv() => event,
+    };
+    let (methods, _, _) = methods_of(event);
+    assert_eq!(methods, vec![info("m-one", "One", None)]);
+
+    close.send(()).expect("the fixture is waiting on its cue");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut running)
+            .await
+            .is_err(),
+        "end of file with nothing outstanding neither answers the flow nor fails it"
+    );
+
+    // And the caller's own token is what gets it out, exactly as it does for an adapter that is
+    // still alive and silent.
+    cancel.cancel();
+    let outcome = running
+        .await
+        .expect("a cancel is an outcome, not a failure");
+    assert_eq!(outcome, AuthOutcome::Cancelled);
 }
 
 #[tokio::test]

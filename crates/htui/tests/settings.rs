@@ -1800,6 +1800,106 @@ async fn a_refused_open_keeps_the_pane_and_a_refused_start_clears_it() {
     );
 }
 
+/// Review L-3: a method list already in flight when `x` was pressed does not undo the cancel.
+///
+/// `begin_auth_cancel` from `Starting` synthesises a `Running { cancelling: true }` at the very
+/// address the `AuthStart` is streaming to, so a `Methods` frame the adapter had already sent
+/// arrives afterwards and — matching only on "is a flow running?" — replaced it with a chooser. The
+/// cell then read `choose a method` for a login already on its way out, and offered the user a list
+/// whose `Enter` would go into a flow that was being killed.
+#[tokio::test]
+async fn a_methods_frame_does_not_undo_a_cancel_pressed_while_starting() {
+    let bench = Bench::new().await;
+    let mut section = section_over(
+        &bench,
+        vec![login_row(
+            "loginable",
+            ProbeStatus::Unauthenticated,
+            &[METHOD, OTHER_METHOD],
+        )],
+    );
+    bench.key(&mut section, "a");
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "x"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert!(
+        matches!(&emitted[..], [Action::Store(StoreRequest::AuthCancel)]),
+        "`x` while starting asks the runtime to stop the flow: {emitted:?}"
+    );
+
+    // The frame that was already on its way when the key landed.
+    bench.reply(&mut section, &methods_frame(true, 0));
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        "cancelling\u{2026}",
+        "the cancel stands: {rendered}"
+    );
+    assert!(
+        !rendered.contains("the first way in"),
+        "and no chooser is offered for a flow that is being killed: {rendered}"
+    );
+
+    // The flow's own last frame is still what clears the state.
+    bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelled));
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
+        "unauthenticated"
+    );
+}
+
+/// Review L-4: the one refused `auth_choose` that leaves the login running.
+///
+/// `no login is running` and `this login has ended` both mean the flow is gone, and `Idle` is the
+/// state a second `a` starts from. `a method was already chosen` means the opposite — the runtime
+/// took the first choice and the adapter is live — and clearing the pane on it would leave a spawned
+/// child, an open loopback listener and no `x` on screen to stop either.
+#[tokio::test]
+async fn a_second_choice_refused_by_a_live_flow_keeps_the_pane_and_the_others_clear_it() {
+    let bench = Bench::new().await;
+    let mut section = chooser_over(&bench, false, 0);
+    bench.key(&mut section, "Enter");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "auth_choose",
+            message: htui::agent_worker::AUTH_ALREADY_CHOSEN.to_owned(),
+        },
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        "logging in\u{2026}",
+        "the flow the runtime refused a second choice for is still running: {rendered}"
+    );
+    assert!(
+        rendered.contains("x cancel"),
+        "and the key that stops it is still on screen: {rendered}"
+    );
+
+    // The two that do mean the flow is gone still clear it.
+    for message in ["no login is running", "this login has ended"] {
+        let mut section = chooser_over(&bench, false, 0);
+        bench.key(&mut section, "Enter");
+        let _ = bench.drained();
+        bench.reply(
+            &mut section,
+            &StoreReply::Failed {
+                request: "auth_choose",
+                message: message.to_owned(),
+            },
+        );
+        assert_eq!(
+            on_box_cell(&render_section(&section, &bench.ctx()), "loginable"),
+            "unauthenticated",
+            "`{message}` leaves a state a second `a` can start from"
+        );
+    }
+}
+
 /// `R-AGT-6` at the section: `Done` is not a status, it is the cue to read the registry again.
 #[tokio::test]
 async fn done_clears_the_state_notes_the_status_and_re_reads_the_registry() {
