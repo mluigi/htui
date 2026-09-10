@@ -153,16 +153,15 @@ Concretely in scope:
 | 4 | Durable history and replay | Nothing about a session exists only in memory: events persist scrubbed, an offline session buffers and uploads idempotently, and any past step reopens read-only and replays. | complete | [plan](../plans/mod-2-durable-history-replay.plan.md) |
 | 5 | Autodiscovery and box probe | The maintainer learns what this box can actually run without configuring anything: probes find agents and adapters, record versions, and mark per-box enablement. Migration `0002` lands here. | complete | [plan](../plans/mod-2-probe-autodiscovery.plan.md) |
 | 6 | `agy` over ACP | A second agent works through the same code paths as the first, differing only by registry row and capability banner. | complete | [plan](../plans/mod-2-agy-acp.plan.md), [T34 close-out](../plans/mod-2-quota-caps.plan.md) |
-| 7 | Quota and caps | Remaining allowance is visible per agent per box; a per-token cap breach cancels the session rather than being noticed on the invoice. | in-progress | [plan](../plans/mod-2-quota-caps.plan.md) |
+| 7 | Quota and caps | Remaining allowance is visible per agent per box; a per-token cap breach cancels the session rather than being noticed on the invoice. | complete | [plan](../plans/mod-2-quota-caps.plan.md) |
 | 8 | Degraded CLI transport | An agent without ACP is still usable, with the capability banner stating exactly what it cannot do. | pending | — |
 | 9 | Prompt assembler + preview | The maintainer can see the exact prompt a step would receive — sections, trim record, digest — and confirm the ten default template bodies before MOD-4 depends on them. | pending | — |
 
-Milestone 7 is `in-progress` rather than `complete` for one task, `T46`: ANA-4 §11 criterion 6's
-`edit_proposal` dedup rule does not survive a flush, and a faithful fix needs a store update seam
-that does not exist plus a decision about offline upload idempotency — with the maintainer, per the
-plan's D75. Everything else the row promises is landed and proven, including criterion 7 on live
-Postgres and criterion 8's cancelling cap. Milestone 6 went `complete` when `T34` closed inside
-milestone 7's plan.
+Milestone 6 went `complete` when `T34` closed inside milestone 7's plan. Milestone 7 also carried
+`T46`, which was **not** in its original scope: the review gate's live evidence showed ANA-4 §11
+criterion 6's `edit_proposal` dedup rule failing across a flush — a defect from milestone 3/4 that
+had passed only because the fake transport never flushed mid-tool-call. It is fixed here (D77) with
+no new store seam, so criterion 6 is now honest for MOD-2's close-out.
 
 Milestones 1–8 follow `docs/ANA-4.md` §9's build order; milestone 9 is `docs/ANA-5.md` §8's, and is
 independent of 3–8 (it shares only milestone 1's store work). Milestone 9 may run in parallel with

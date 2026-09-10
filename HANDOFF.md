@@ -256,7 +256,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   it, checked by moving it aside) and the `session/new` model list, which is **not learnable while
   unauthenticated**, so D64 leaves `models: []` and `model_config_id: null` as seeded. Milestone 7
   (quota and caps) can start without any of this.
-  **Phase 7 landed (2026-09-10, `142beb1`..`44e6743`), one task short:** the live `agy` turn plus
+  **Phase 7 landed (2026-09-10, `142beb1`..`acec1b8`), complete:** the live `agy` turn plus
   quota and caps, planned in `.claude/plans/mod-2-quota-caps.plan.md` with the `code-architect`
   blueprint beside it. **Milestone 6's `T34` is closed and all three remaining ANA-4 §11.14 `agy`
   items are answered live** (`crates/htui/tests/chat_live_agy.rs`, transcript fixture recorded, two
@@ -304,18 +304,33 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   the finding had read the *other* sweep, the `zeta` one), and one left with the maintainer
   (**M-2**: a `per_token` row whose `quota.source` is still `acp_meta_rate_limit` never publishes
   spend, because the H-3 rule waits for a blob that will never arrive).
-  **What milestone 7 still owes (`T46`), blocked on a maintainer decision rather than on code:**
-  ANA-4 §11 **criterion 6 does not hold across a flush**. `Recorder.edits` is cleared by `flush()`,
-  so "one `edit_proposal` row per `(tool_call_id, path)` per step" (§4.3) holds only inside one flush
-  window — one live `agy` file write leaves **three** rows, reproduced from the committed fixture.
-  A faithful fix needs a **store update seam that does not exist** (`append_events` is
-  `ON CONFLICT … DO NOTHING` by design, which is what makes a refused flush's re-offer safe) across
-  six `WriteStore` impls, **plus** an offline durability call: `BufferedWriter`'s append-only JSONL
-  takes its upload idempotency from that same clause, so either criterion 6 holds online only or
-  `upload_pending` becomes last-line-wins and stops protecting `UsageTotals::from_rows` from
-  double-counting. Criterion 6 therefore passes **against the fake only** — and the fake never
-  flushed mid-tool-call, which is why a transport-neutral suite could not see it. The PRD row stays
-  `in-progress`, as milestone 6's did for T34.
+  **`T46` closed and ANA-4 §11 criterion 6 now holds across a flush** (`2deb7f8`, `acec1b8`, both
+  maintainer-decided after the review gate). The defect was real and live: `Recorder.edits` was
+  cleared by `flush()`, so §4.3's "one `edit_proposal` row per `(tool_call_id, path)` per step" held
+  only inside one flush window, and one `agy` file write left **three** rows — `agy` re-announces
+  `tool_call` verbatim where the spec's example sends `tool_call_update`, and answering the
+  permission prompt flushes in between. Measured from the committed fixture, the same write now
+  leaves **1** row (3 → 1 with the live interleaving, 2 → 1 without). **D77** is how, and it adds no
+  store seam: an `edit_proposal` **reserves its `seq` at announcement** and only its *write* waits,
+  so a re-announcement updates the held row in place and the row is written when its tool call
+  closes. Nothing the user sees moved — the recorder's UI frame already goes out at announcement, so
+  only the database write is deferred, and replay reads by `seq`, which was never given up. Held rows
+  are released on four paths (a `tool_result` or terminal `tool_call_update`, the turn's `done`, a
+  cancel including the cap's `enforce_breach`, and `finish()` as the backstop), because a held row
+  that was never written would be a `seq` gap — worse than the duplicate it replaced. `next_seq` now
+  advances at numbering rather than at commit, since the flush is no longer the only allocator, and a
+  refused batch keeps the numbers already on its rows. The three rejected options are recorded in the
+  plan: a store `update_event_payload` across six impls would have forced a choice between "criterion
+  6 online only" and making `upload_pending` last-line-wins, which is the rule protecting
+  `UsageTotals::from_rows` from double-counting; deferring the `seq` too would have reordered the
+  transcript; and suppressing byte-identical repeats would have fixed this `agy` case and none of the
+  general one. The accepted price, knowingly: a process death mid-tool-call loses a proposal row that
+  was durable before. **The amended conformance case is the lasting fix** — its script now flushes
+  between two *differing* writes, because the fake never flushed mid-tool-call and that is precisely
+  why a transport-neutral suite could not see a live defect. **D78** closed the review gate's last
+  finding with it: a `per_token` row publishes its spend on the first costed row instead of waiting
+  for an allowance blob that a per-token agent never sends (§7 gives it no `windows`, so the H-3
+  guard had nothing to protect). 742 tests green on **Linux** with Postgres live, 46 targets.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
