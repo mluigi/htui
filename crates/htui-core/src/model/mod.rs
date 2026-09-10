@@ -87,6 +87,7 @@ pub mod item;
 pub mod kind;
 pub mod link;
 pub mod note;
+pub mod quota;
 pub mod run;
 pub mod scope;
 pub mod usage;
@@ -110,6 +111,10 @@ pub use kind::{
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode};
 pub use note::Note;
+pub use quota::{
+    CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota, QuotaSource, QuotaWindow,
+    Spend, normalize,
+};
 pub use run::{
     ChatRunSpec, GateOutcome, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
     RunStepSummary, RunSummary, StepStatus,

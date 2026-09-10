@@ -381,21 +381,12 @@ pub struct QuotaSettings {
     pub source: QuotaSource,
 }
 
-wire_enum!(
-    /// `agent.settings.quota.source` (§5.2, §7).
-    #[derive(Default)]
-    QuotaSource {
-        /// ACP's `_meta.rate_limit` on the session update.
-        AcpMetaRateLimit => "acp_meta_rate_limit",
-        /// A rate-limit event in the CLI's JSON stream.
-        CliRateLimitEvent => "cli_rate_limit_event",
-        /// The CLI's status line.
-        CliStatusLine => "cli_status_line",
-        /// No quota is reported. The default: a row that says nothing promises nothing.
-        #[default]
-        None => "none",
-    }
-);
+// `QuotaSource` was a `wire_enum!` here until MOD-2 milestone 7 (plan D66, blueprint P-6). It
+// moved to `htui_core::model::quota` because `normalize` — which turns a transport's raw blob into
+// the `agent_box.quota` document of `docs/ANA-4.md` §7 — selects on it, and `htui-core` cannot
+// name a type of this crate. The re-export keeps `htui_agent::launch::QuotaSource` resolving, so
+// the driver-side spelling is the same type and no caller moved.
+pub use htui_core::model::QuotaSource;
 
 /// `agent.settings.usage` (§5.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
