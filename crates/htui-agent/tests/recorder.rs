@@ -1620,6 +1620,72 @@ async fn a_refused_flush_leaves_the_two_closing_rows_owed_not_lost() {
     );
 }
 
+/// Review L-1: the tab is told about the cap **before** the flush that could fail, so a store that
+/// refuses the closing write costs a retry and not the two frames.
+///
+/// Plan D73 rules that the `error` row *is* how a breach becomes visible — the chat tab renders it
+/// and nothing else on screen says a cap fired. Sending it after the flush meant the one path where
+/// the rows are owed (blueprint H-2) was also the one path where the user was told nothing: the tab
+/// got the transport error and `Ended{EndTurn}` while the log said `done{cancelled}`. The channel is
+/// a `try_send` the same task drains, so moving the frames earlier cannot stall or fail.
+#[tokio::test]
+async fn the_closing_frames_reach_the_tab_even_when_their_flush_is_refused() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let mut recorder =
+        Recorder::new(&store, &scrubber, chat.step_id, false, Some(tx)).with_run_cap(run_cap(300));
+    let mut session = ScriptedSession::cancelling(
+        Vec::new(),
+        vec![env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::Cancelled,
+        }))],
+    );
+
+    let breach = recorder
+        .record(usage(Some(350), None))
+        .await
+        .expect("recording must land")
+        .expect("the cap is reached");
+    store.refuse_next_appends(1);
+    let refused = htui_agent::record::enforce_breach(&mut session, &mut recorder, breach).await;
+    assert!(
+        matches!(refused, Err(DriverError::Store(_))),
+        "the caller still hears that the closing write failed, got {refused:?}"
+    );
+
+    let frames: Vec<DriverEvent> = core::iter::from_fn(|| rx.try_recv().ok())
+        .map(|frame| frame.event)
+        .collect();
+    match frames.as_slice() {
+        [
+            DriverEvent::Usage(_),
+            DriverEvent::Error(error),
+            DriverEvent::Done(done),
+        ] => {
+            assert_eq!(error.code, "cap_exceeded");
+            assert_eq!(
+                done.stop_reason,
+                StopReason::Cancelled,
+                "the frame says what the log's last row says"
+            );
+        }
+        other => panic!("the breaching row and both closing frames reach the tab: {other:?}"),
+    }
+
+    // And the rows are still owed rather than lost, which is what makes the frames honest.
+    recorder.finish().await.expect("the retry lands");
+    assert_eq!(
+        rows(&store, chat.step_id)
+            .await
+            .iter()
+            .map(|row| row.kind)
+            .collect::<Vec<_>>(),
+        vec![EventKind::Usage, EventKind::Error, EventKind::Done]
+    );
+}
+
 /// Review M-1: a breach detected on a row whose flush the store then refuses is **still reported**.
 ///
 /// The unreadable path is the one that could lose it. `record_unreadable` sums the masked payload

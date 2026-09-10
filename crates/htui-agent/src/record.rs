@@ -444,6 +444,20 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         self.run_cap
     }
 
+    /// This session's one per-run cap breach, if a row has reached the cap (plan D70).
+    ///
+    /// The same value [`RecorderSummary::cap_breach`] carries, readable **while** the recorder is
+    /// still alive: `finish` consumes it, and the caller that has to decide how a run closes is
+    /// still holding the recorder at that point. `run_chat`'s error arm is that caller (review
+    /// L-1) — a turn that ends in a transport error *after* the cap fired closes `cancelled`,
+    /// because that is what the log's last row says and the two must agree.
+    ///
+    /// Set once, by the row that reached the cap, and never replaced (`Recorder::check_cap`).
+    #[must_use]
+    pub const fn cap_breach(&self) -> Option<CapBreach> {
+        self.cap_breached
+    }
+
     /// Render frames the bounded UI channel could not take, so far.
     #[must_use]
     pub const fn dropped(&self) -> usize {
@@ -892,6 +906,14 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// per report — and the write is one indexed two-column `UPDATE`. If it ever matters the latch
     /// moves to [`Recorder::sync_step`]'s cadence: the same document, written less often.
     async fn latch_quota(&mut self, payload: &Value, at: DateTime<Utc>) {
+        // The truncation belongs here and not to the caller (review L-4). `agent_box.quota_at` is
+        // a `TIMESTAMPTZ` like every other stamp this file writes, and the document's `observed_at`
+        // is the same instant, so a sub-microsecond `at` would make the column and the JSON key
+        // disagree with the row they were derived from. The ACP transport happens to truncate at
+        // the source (`acp::Stamp::Wall`), which is why the two agree today; [`stamp`]'s own doc
+        // says the rule lives in the recorder "so a caller cannot forget it", and milestone 8's
+        // CLI transport is the caller that could.
+        let at = stamp(at);
         let Some(latch) = self.quota_latch else {
             return;
         };
@@ -1008,15 +1030,25 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// row, the `error` and the `done` are owed together, in that order, at the `seq` they were
     /// given, and [`Recorder::finish`] writes them.
     ///
-    /// Public because [`enforce_breach`] is the shared sequence and lives outside the type; a
-    /// caller that reaches for this directly is writing its own cancel, and plan D69 says there
-    /// should be exactly one.
+    /// **Private** (review M-4): [`enforce_breach`] is the one shared cancel-and-close sequence
+    /// (plan D69) and it lives in this module, so it reaches this without the method being part of
+    /// the crate's surface. A caller that could reach it directly would be writing a second cancel
+    /// path — the two closing rows without the `cancel`, or without the withheld transport `done` —
+    /// and there is to be exactly one.
+    ///
+    /// `at` on the `error` row is `breach.at`, the breaching row's own capture time, while the
+    /// rows the cancel produces in between are recorded with **their** capture times, which are
+    /// later. So `at` is not monotonic across `seq` here (review L-2), and that is documented
+    /// rather than changed: every reader of a step's log orders by `seq` (`step_events`, the
+    /// transcript, `UsageTotals::from_rows`), the `error` row is honestly stamped with the instant
+    /// the cap was reached, and re-stamping it with the flush's clock would make the log say the
+    /// breach happened later than it did to buy an ordering nobody reads.
     ///
     /// # Errors
     /// [`RecordError::Store`] when the flush or the `run_step.usage` write fails,
     /// [`RecordError::Encode`] when the two rows cannot be represented as JSON — which is
     /// unreachable for two structs of `String`s, and is not worth a `panic` to prove.
-    pub async fn record_cap_breach(
+    async fn record_cap_breach(
         &mut self,
         breach: CapBreach,
         transport_done: Option<DriverEnvelope>,
@@ -1074,12 +1106,17 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             raw: done_raw.into_iter().collect(),
             at: done_at,
         });
-        self.flush().await?;
-        self.sync_step().await?;
-
         // Both rows reach the chat tab, which is where a breach becomes visible to the user (plan
         // D73: the `error` row *is* the visibility, and the tab renders it today). `raw: None` -
         // the render path has never carried one.
+        //
+        // **Before the flush** (review L-1), which is the one ordering question here. `send_ui` is
+        // a `try_send` on a bounded channel that the same task drains after every record, so
+        // nothing stalls and nothing can fail; the flush *can* fail, and a store that refuses it
+        // used to cost the tab both closing frames on top of the retry. The user then saw the
+        // transport error and `Ended{EndTurn}` while the log said `done{cancelled}` — the two
+        // stories the log and the screen must not tell. The rows are owed either way (blueprint
+        // H-2), so telling the tab first is free.
         self.send_ui(DriverEnvelope {
             event: DriverEvent::Error(error),
             raw: None,
@@ -1090,7 +1127,8 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             raw: None,
             at: done_at,
         });
-        Ok(())
+        self.flush().await?;
+        self.sync_step().await
     }
 
     /// Persists a row whose masked payload no longer reads back as its own event type.
@@ -1443,7 +1481,8 @@ pub async fn pump<S: WriteStore>(
 /// synthesized `tool_result` for every call it terminated (`docs/ANA-4.md` §4.3 makes those a
 /// MUST), any `error` the transport reports on its way out — into the log, **up to** the
 /// transport's own `done`, which is withheld; then the two closing rows
-/// ([`Recorder::record_cap_breach`]). The `done` is withheld rather than recorded because its
+/// (`Recorder::record_cap_breach`, private to this module since review M-4 so that this is the
+/// only way to reach the sequence). The `done` is withheld rather than recorded because its
 /// `stop_reason` may say `end_turn` if the agent finished inside the grace window, and criterion 8
 /// says the last row says `cancelled`.
 ///

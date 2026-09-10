@@ -141,6 +141,18 @@ pub trait WriteStore: ReadStore {
     /// [`upsert_agent_box`](WriteStore::upsert_agent_box) cannot set or clear either — so a latch
     /// cannot be discarded by a re-probe that read the row before it landed.
     ///
+    /// # Nothing can clear them yet (review L-6)
+    ///
+    /// The parameters are `Value` and `DateTime`, not `Option`s, so the single writer of the two
+    /// columns can write them and **not** blank them: `Value::Null` would store a JSON null where
+    /// `NULL` belongs, which no reader treats as "never latched". No caller needs clearing today —
+    /// the latch always has a document, and a row nobody has latched into is `NULL` from its
+    /// insert. **MOD-7 is the caller that will**: unregistering an agent from a box, or a
+    /// re-registration that must not carry the last box's allowance forward, has to put the pair
+    /// back to `NULL`, and that is when these two parameters become `Option`s across the six
+    /// implementations and `store::conformance`. Widening them before there is a caller would be
+    /// six signatures changed to express a case no code can reach.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "agent_box"` and

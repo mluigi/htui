@@ -2359,6 +2359,15 @@ pub async fn run_chat(args: ChatArgs) {
             Err(err) => {
                 tracing::warn!(%err, "the chat session ended with a transport error");
                 status = RunStatus::Failed;
+                // The stop reason follows the **log**, not the error (review L-1). A turn that
+                // failed *after* the cap fired has `error{cap_exceeded}` and `done{cancelled}` as
+                // its last two rows — the H-2 path writes them from `finish` even when the flush
+                // that was supposed to fails — so `Ended{EndTurn}` here would leave the tab's
+                // closing frame contradicting the row underneath it. Every other failure keeps the
+                // last turn's own reason, which is what it always was.
+                if recorder.cap_breach().is_some() {
+                    last_stop = StopReason::Cancelled;
+                }
                 frames.failed(err.to_string());
                 break;
             }

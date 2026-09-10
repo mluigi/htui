@@ -1553,7 +1553,8 @@ mod tests {
             "the columns the upsert *does* own still take the new row's values"
         );
 
-        // Nor does a `None` clear them, the way a `None` probe clears its own column.
+        // Nor does a `None` clear them, the way a `None` probe clears its own column — and nothing
+        // else does either (review L-6).
         store
             .upsert_agent_box(&AgentBox {
                 quota: None,
@@ -1573,8 +1574,10 @@ mod tests {
         assert_eq!(
             cleared.quota.as_ref(),
             Some(&latched),
-            "`upsert_agent_box` has no way to clear a latch either: clearing is \
-             `set_agent_box_quota`'s too"
+            "`upsert_agent_box` has no way to clear a latch either — and today **nothing** does: \
+             `set_agent_box_quota` takes a `Value` and a `DateTime`, so the single writer can \
+             replace the pair and not blank it (the gap is documented on the trait method, and \
+             MOD-7's unregistration is the caller that turns both into `Option`s)"
         );
         assert_eq!(cleared.quota_at, Some(quota_at));
     }

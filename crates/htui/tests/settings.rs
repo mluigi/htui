@@ -652,6 +652,69 @@ async fn the_quota_column_renders_windows_spend_and_nothing() {
     insta::assert_snapshot!("agents_quota", rendered);
 }
 
+/// Review L-3: a window at `0.996` reads **`99%`**, not `100%`.
+///
+/// `{:.0}` rounded `0.995..0.999` up, and `100%` in this column is a claim about the *other* reader
+/// of the same document: `quota::available` skips a row on `utilization >= 1.0` and this window is
+/// below it, so the cell announced an exhausted allowance the predicate would still have selected —
+/// two readers of one blob disagreeing, with the pessimistic one on screen.
+///
+/// The second row is the other half of the trade: `0.57` still reads `57%`, which a plain
+/// `floor` of the product would render `56%` (`0.57 * 100.0` is `56.99999999999999289`). A window
+/// that genuinely is full still reads `100%`, and the availability verdicts are asserted beside the
+/// cells so a future change to either side fails here rather than on a screen.
+#[tokio::test]
+async fn a_window_short_of_full_is_not_rounded_up_to_a_full_one() {
+    use htui_core::model::{Availability, quota};
+
+    let window = |utilization: f64| {
+        json!({
+            "source": "acp_meta_rate_limit",
+            "billing": "subscription",
+            "status": "allowed",
+            "exhausted": false,
+            "windows": [
+                { "id": "five_hour", "utilization": utilization,
+                  "resets_at": "2026-09-08T08:00:00Z" },
+            ],
+            "spend": { "session_micros": 394_692, "currency": "USD" },
+            "observed_at": "2026-09-05T12:31:07Z",
+        })
+    };
+
+    let bench = Bench::new().await;
+    let rows = vec![
+        quota_row("nearly", Some(window(0.996))),
+        quota_row("mid", Some(window(0.57))),
+        quota_row("full", Some(window(1.0))),
+    ];
+
+    let mut section = AgentsSection::new();
+    bench.reply(&mut section, &StoreReply::Agents(rows));
+    let rendered = render_section(&section, &bench.ctx());
+
+    for (row, utilization, expected) in [
+        ("nearly", 0.996, "99% to 09-08"),
+        ("mid", 0.57, "57% to 09-08"),
+        ("full", 1.0, "100% to 09-08"),
+    ] {
+        assert_eq!(
+            quota_cell(&rendered, row),
+            expected,
+            "the `quota` column of `{row}` reads `{expected}`:\n{rendered}"
+        );
+        let full = matches!(
+            quota::available(Some(&window(utilization)), None, None),
+            Availability::Skip(_)
+        );
+        assert_eq!(
+            full,
+            expected.starts_with("100%"),
+            "the cell and the predicate agree about `{row}`: only a full window reads `100%`"
+        );
+    }
+}
+
 /// `docs/ANA-4.md` §7 requires the refresh limit be "stated in the UI rather than implied": a
 /// probe handshake reports no allowance, so `r` re-probes every row and moves this column on none
 /// of them. The hint line is where the section says so, because it is where every other key it

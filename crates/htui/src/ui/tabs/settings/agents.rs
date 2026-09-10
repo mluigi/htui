@@ -68,6 +68,14 @@ const CANCELLING: &str = "cancelling\u{2026}";
 /// What replaces an absent `default_model`, and a quota this build has nothing to say about.
 const NONE: &str = "\u{2014}";
 
+/// The `utilization` at which a window **is** full: `docs/ANA-4.md` §7's own threshold, and the
+/// one [`available`](htui_core::model::quota::available) skips a row on (`>= 1.0`).
+const FULL: f64 = 1.0;
+
+/// The highest percentage a window below [`FULL`] may render as, so the cell never claims an
+/// allowance is exhausted while the predicate would still select it (review L-3).
+const NEARLY_FULL: f64 = 99.0;
+
 /// The hint line with nothing in flight. It stands in for a help entry: a Settings section has no
 /// [`KeyScope`](crate::keymap::KeyScope) of its own (MOD-20 D19), so the keys are written where
 /// they are pressed.
@@ -1307,9 +1315,25 @@ fn quota_cell(summary: &AgentSummary) -> String {
         return NONE.to_owned();
     };
     if let Some((utilization, window)) = tightest_window(quota) {
-        // `{:.0}` rather than a cast: `0.57 * 100.0` is `56.99999999999999`, so an `as u32` would
-        // report a fifty-seven-percent window as `56%`. A rounding format reads it as written.
-        let percentage = format!("{:.0}%", utilization * 100.0);
+        // **A window that is not full never reads `100%`** (review L-3). `{:.0}` alone rounds
+        // `0.995..0.999` up to `100%`, and a cell saying `100%` says
+        // [`available`](htui_core::model::quota::available) would skip this row — which it would
+        // not, because that predicate's rule is `utilization >= 1.0` and this window is not full.
+        // The two have to agree, and the honest side of the disagreement is the one that does not
+        // announce an exhausted allowance the operator still has room in.
+        //
+        // A **cap** rather than the review's `floor` of the product, because a bare floor trades
+        // this error for the one the rounding format was there to avoid: `0.57 * 100.0` is
+        // `56.99999999999999289` in binary floating point, so `floor` reports a fifty-seven-percent
+        // window as `56%`. Capping at 99 below the threshold is the same answer as `floor` for
+        // every value the finding is about — `0.996` reads `99%` either way — and leaves every
+        // other window reading as written.
+        let scaled = utilization * 100.0;
+        let percentage = if utilization < FULL {
+            format!("{:.0}%", scaled.min(NEARLY_FULL))
+        } else {
+            format!("{scaled:.0}%")
+        };
         return match reset_of(window) {
             Some(resets) => format!("{percentage} to {resets}"),
             None => percentage,
