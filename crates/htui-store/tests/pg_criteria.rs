@@ -1338,8 +1338,8 @@ async fn upsert_agent_updates_in_place_and_keeps_created_at() {
     );
     assert_eq!(
         registry.len(),
-        3,
-        "the fixture's two agents plus this one, and the rename took no other row with it"
+        4,
+        "the fixture's agents plus this one, and the rename took no other row with it"
     );
     let after = registry
         .into_iter()
@@ -1443,7 +1443,7 @@ async fn inherent_reads_answer_the_fixture() {
     );
 
     // MOD-2 plan D3: the registry read is inherent too, because `agent` / `agent_box` are not
-    // mirrored. The demo loader inserts the two `agent` rows and no `agent_box` row at all, so
+    // mirrored. The demo loader inserts the seed's `agent` rows and no `agent_box` row at all, so
     // every summary is unprobed on this box.
     let agents = db.store.agents().await.expect("agents must not fail");
     assert_eq!(
@@ -1451,7 +1451,7 @@ async fn inherent_reads_answer_the_fixture() {
             .iter()
             .map(|row| row.agent.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["agy", "claude"],
+        vec!["agy", "claude", "claude-cli"],
         "the registry comes back ordered by agent.name"
     );
     assert!(

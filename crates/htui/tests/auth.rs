@@ -270,9 +270,22 @@ impl Rig {
             .with_agent_runtime(runtime);
         harness.drive().await;
 
-        // Onto the login row. The seeds are `agy` and `claude`, and both sort before it.
-        harness.key("j");
-        harness.key("j");
+        // Onto the login row, counted rather than hard-coded. It used to be two `j`s because the
+        // seeds were `agy` and `claude`; MOD-2 D79 added a third that also sorts before
+        // `demo-login`, and the cursor landed on a `cli` row whose `authenticate` correctly refuses
+        // (MOD-21 D10) — five cases failing on a fixture's arithmetic rather than on their subject.
+        // Deriving the count from the store means the next registry addition moves the cursor with
+        // it, which is what MOD-23 and MOD-12 are about to do.
+        let before = store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .iter()
+            .filter(|summary| summary.agent.name.as_str() < ROW)
+            .count();
+        for _ in 0..before {
+            harness.key("j");
+        }
         Self {
             tmp,
             store,

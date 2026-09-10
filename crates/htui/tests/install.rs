@@ -371,6 +371,17 @@ impl Rig {
             .await
             .expect("the row lands");
 
+        // How far down the installable row sits, counted rather than hard-coded — read here
+        // because `store` is moved into the harness below. See the note in `tests/auth.rs`: this
+        // was two `j`s against a two-row seed set until MOD-2 D79 added a third.
+        let before = store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .iter()
+            .filter(|summary| summary.agent.name.as_str() < ROW)
+            .count();
+
         let root = tmp.path().join("agents");
         let runtime = AgentRuntime::new(DriverFactory::new())
             .with_installer(InstallConfig::new(fixture.base(), Some(root.clone())));
@@ -381,9 +392,10 @@ impl Rig {
             .with_agent_runtime(runtime);
         harness.drive().await;
 
-        // Onto the installable row. The seeds are `agy` and `claude`, and both sort before it.
-        harness.key("j");
-        harness.key("j");
+        // Onto the installable row.
+        for _ in 0..before {
+            harness.key("j");
+        }
         Self {
             tmp,
             root,

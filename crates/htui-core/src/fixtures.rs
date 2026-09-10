@@ -120,6 +120,8 @@ pub mod ids {
         /// `agent` `agy` (`acp`, `subscription` — ANA-4 §5.3; it was `cli`/`per_token` before
         /// MOD-2 corrected the fixture to the seed).
         AGENT_AGY: AgentId = (class::AGENT, 1),
+        /// `agent` `claude-cli` (`cli`, `subscription`), MOD-2 D79's third seed row.
+        AGENT_CLAUDE_CLI: AgentId = (class::AGENT, 2),
         /// `workspace` `Platform`.
         WORKSPACE_PLATFORM: WorkspaceId = (class::WORKSPACE, 0),
         /// `workspace` `Graphics`.
@@ -381,7 +383,7 @@ fn boxes() -> Vec<BoxRow> {
     }]
 }
 
-/// `agent` (§5.7, §5.10): the two agents the seed installs.
+/// `agent` (§5.7, §5.10): every agent the seed installs.
 ///
 /// **The real seed rows, re-stamped** — [`seed_rows`](crate::model::agent::seed_rows) with the
 /// fixture's deterministic ids and epoch in place of the minted id and wall clock. The fixture
@@ -390,9 +392,22 @@ fn boxes() -> Vec<BoxRow> {
 /// argv shape predates §5.1, and `claude-agent-acp` is the one artifact `htui` must never spawn by
 /// name. A demo agent that cannot launch is a trap for MOD-2's own tests, so the fixture is
 /// derived from the seed rather than kept beside it.
+///
+/// # Panics
+/// When the id array and the seed no longer have the same length. The pairing used to be a plain
+/// `zip`, which stops at the shorter side **silently**: a seed row added by a later milestone
+/// simply vanished from the demo registry, and every fixture-based test went on passing over a
+/// registry smaller than the one a real box seeds. The length is therefore checked first, so
+/// adding a seed without an id fails loudly here rather than quietly everywhere else.
 fn agents() -> Vec<Agent> {
-    let ids = [ids::AGENT_CLAUDE, ids::AGENT_AGY];
-    crate::model::agent::seed_rows(epoch())
+    let ids = [ids::AGENT_CLAUDE, ids::AGENT_AGY, ids::AGENT_CLAUDE_CLI];
+    let seeds = crate::model::agent::seed_rows(epoch());
+    assert_eq!(
+        seeds.len(),
+        ids.len(),
+        "every seed row owns a fixture id, or `zip` would drop it"
+    );
+    seeds
         .into_iter()
         .zip(ids)
         .map(|(agent, id)| Agent { id, ..agent })
@@ -1377,6 +1392,32 @@ mod tests {
         for row in &data.steps {
             push(row.id.as_uuid());
         }
+    }
+
+    /// The demo registry is **every** seed row, one fixture id each.
+    ///
+    /// [`super::agents`] used to pair the seed rows with a fixed id array by `zip`, which is
+    /// silently lossy in whichever direction is shorter: a seed row past the end of the array
+    /// vanished, and the demo store would have come up holding a registry smaller than the one a
+    /// real box seeds — every fixture-based test then passing over the wrong registry. This is the
+    /// guard, and it is why the array and the rows are length-checked before they are paired.
+    #[test]
+    fn the_demo_registry_carries_one_row_per_seed() {
+        let data = demo_data();
+        let seeds = crate::model::agent::seed_rows(super::epoch());
+
+        assert_eq!(
+            data.agents.len(),
+            seeds.len(),
+            "the fixture drops no seed row"
+        );
+        let names: Vec<&str> = data.agents.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["claude", "agy", "claude-cli"]);
+        assert_eq!(
+            data.agents.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [ids::AGENT_CLAUDE, ids::AGENT_AGY, ids::AGENT_CLAUDE_CLI],
+            "in seed order, each under its own fixture id"
+        );
     }
 
     #[test]

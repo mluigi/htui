@@ -521,11 +521,12 @@ async fn seed_is_idempotent() {
         "cache_refresh_seconds, cache_overlap_seconds and ANA-5's ten"
     );
     // MOD-6 left this at zero because `agent.launch`'s shape was still ANA-4's to settle. It is
-    // settled (§5.1, §5.3), so MOD-2 seeds the two rows and this asserts they arrive exactly once.
+    // settled (§5.1, §5.3), so MOD-2 seeds the rows and this asserts they arrive exactly once.
     assert_eq!(
         common::count(&db.pool, "agent").await,
-        2,
-        "the two ANA-4 §5.3 agent rows, and no third from the second and third seed passes"
+        3,
+        "the ANA-4 §5.3 agent rows as MOD-2 amended them, and no duplicate from the second and \
+         third seed passes"
     );
 
     let agents = db.store.agents().await.expect("the registry reads");
@@ -533,7 +534,11 @@ async fn seed_is_idempotent() {
         .iter()
         .map(|summary| summary.agent.name.as_str())
         .collect();
-    assert_eq!(names, ["agy", "claude"], "both seeds, ordered by name");
+    assert_eq!(
+        names,
+        ["agy", "claude", "claude-cli"],
+        "every seed, ordered by name"
+    );
     for summary in &agents {
         assert!(
             summary.on_box.is_none(),
@@ -554,6 +559,71 @@ async fn seed_is_idempotent() {
         .await
         .expect("read capability_tag.seeded");
     assert!(seeded, "every seeded tag is marked as such");
+
+    db.drop_db().await;
+}
+
+/// MOD-2 D88: a database that was seeded before a row existed gains it on the next pass, and an
+/// operator's edit to a row that is already there survives.
+///
+/// The guard `seed_if_empty_as` used to carry was "insert nothing unless the `agent` table is
+/// empty", which meant every box that had ever launched — which is every real box — would never
+/// see a row added by a later milestone, and the feature would be verifiable only on a fresh
+/// database. The guard is now `ON CONFLICT (name) DO NOTHING` alone, which is a *name*-keyed
+/// top-up: it adds the names the table lacks and touches nothing it already holds. That is what
+/// the second half asserts, because it is the reason the empty-table guard existed — a maintainer
+/// who disabled a row has decided something, and a later seed pass must not undo it.
+///
+/// The price, accepted at CONFIRM: a row the maintainer *deleted* comes back. MOD-23's model is
+/// `enabled = false`, not deletion, so the exposure is one row on a screen that can disable it.
+#[tokio::test]
+async fn a_seeded_database_gains_a_later_row_and_keeps_an_operator_edit() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    // The state every real box is in: seeded once, under an older `seed_rows` that knew two names,
+    // and then edited. `enabled = false` is MOD-23's disable, written here in SQL because the
+    // editor is not built yet.
+    sqlx::query("DELETE FROM agent WHERE name = 'claude-cli'")
+        .execute(&db.pool)
+        .await
+        .expect("wind the registry back to the two rows an older build seeded");
+    sqlx::query("UPDATE agent SET enabled = false WHERE name = 'agy'")
+        .execute(&db.pool)
+        .await
+        .expect("an operator disables a row");
+    assert_eq!(
+        common::count(&db.pool, "agent").await,
+        2,
+        "two rows, one off"
+    );
+
+    db.store.seed_if_empty().await.expect("the next seed pass");
+
+    let agents = db.store.agents().await.expect("the registry reads");
+    let names: Vec<&str> = agents
+        .iter()
+        .map(|summary| summary.agent.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["agy", "claude", "claude-cli"],
+        "a non-empty table still gains the name it lacks"
+    );
+
+    let disabled = agents
+        .iter()
+        .find(|summary| summary.agent.name == "agy")
+        .expect("the disabled row is still there");
+    assert!(
+        !disabled.agent.enabled,
+        "`ON CONFLICT (name) DO NOTHING`: a row the operator edited is not re-seeded over"
+    );
+
+    // And it is still idempotent: a third pass adds nothing.
+    db.store.seed_if_empty().await.expect("and once more");
+    assert_eq!(common::count(&db.pool, "agent").await, 3);
 
     db.drop_db().await;
 }

@@ -199,7 +199,7 @@ async fn settings_over(store: MemStore) -> Harness {
 }
 
 #[tokio::test]
-async fn the_demo_registry_lists_both_agents() {
+async fn the_demo_registry_lists_every_seeded_agent() {
     let mut harness = settings_over(MemStore::demo()).await;
     let frame = harness.render();
 
@@ -209,8 +209,11 @@ async fn the_demo_registry_lists_both_agents() {
         frame.contains("not probed"),
         "no probe has run in the fixture"
     );
-    // Both seeds are `acp`/`subscription` since ANA-4 §5.3; the fixture is derived from them.
+    // Two seeds are `acp` and one is `cli` since MOD-2 D79 gave the CLI transport its own row
+    // rather than hiding it inside `claude`'s; all three are `subscription`. The fixture is derived
+    // from them, so both transports appear here without this test naming either agent.
     assert!(frame.contains("acp"), "the transport column");
+    assert!(frame.contains("cli"), "and the degraded transport's row");
     assert!(frame.contains("subscription"), "the billing column");
     insta::assert_snapshot!("agents_demo", frame);
 }

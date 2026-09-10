@@ -4605,7 +4605,9 @@ pub(crate) mod tests {
                 replies[0].reply
             )
         };
-        assert_eq!(rows.len(), 2);
+        // Three since MOD-2 D79 added the `cli` row: the demo fixture derives from `seed_rows`,
+        // so a registry addition lands here without this test being about the registry.
+        assert_eq!(rows.len(), 3);
         for row in rows {
             let on_box = row
                 .on_box
@@ -4633,7 +4635,7 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|summary| summary.on_box.is_some())
                 .count(),
-            2,
+            3,
             "the reply states what the task itself wrote"
         );
     }

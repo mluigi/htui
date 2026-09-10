@@ -101,18 +101,26 @@ pub struct AgentBox {
     pub probe: Option<Value>,
 }
 
-/// The two `agent` rows MOD-2 seeds (`docs/ANA-4.md` §5.3), stamped with `now`.
+/// The `agent` rows MOD-2 seeds (`docs/ANA-4.md` §5.3 as plan D79 amends it), stamped with `now`.
 ///
-/// One source, two JSON documents under `crates/htui-core/seeds/`, compiled in with
-/// `include_str!`. `PgStore::seed_if_empty_as` inserts them when the `agent` table is empty, and
-/// `fixtures::agents()` is these same rows re-stamped with the fixture's deterministic ids and
-/// epoch — so the demo data and the real seed cannot drift, and a fixture that cannot launch stops
-/// being a trap for MOD-2's own tests.
+/// One source, one JSON document per row under `crates/htui-core/seeds/`, compiled in with
+/// `include_str!`. `PgStore::seed_if_empty_as` inserts the names the `agent` table lacks (plan
+/// D88), and `fixtures::agents()` is these same rows re-stamped with the fixture's deterministic
+/// ids and epoch — so the demo data and the real seed cannot drift, and a fixture that cannot
+/// launch stops being a trap for MOD-2's own tests.
 ///
-/// Both rows are `transport: acp`, `billing: subscription`. `claude`'s `models` stays **empty**
-/// with no `default_model`: ACP delivers the model list as session config options at
-/// `session/new`, so a guessed list would go stale on every vendor release and the first
-/// successful handshake fills it (§5.3's three notes).
+/// Every row is `billing: subscription`. The first two are `transport: acp`; the third is the
+/// **degraded** path of §4.4 — the same vendor CLI driven over its stream-json dialect, which
+/// carries no permission requests, no edit proposals and no plans. It is a second row rather than
+/// a field on the first because `registry::caps_from` and `adapter_id_from` both branch on
+/// `agent.transport`, so one row cannot report two capability profiles, and `DriverCaps` is a
+/// value the chat tab and MOD-4 branch on: it must not change under them mid-session (D79).
+///
+/// `models` stays **empty** with no `default_model` on both `transport: acp` rows that have not
+/// been captured live: ACP delivers the model list as session config options at `session/new`, so
+/// a guessed list would go stale on every vendor release and the first successful handshake fills
+/// it (§5.3's three notes). The CLI row's stays empty for a different reason — nothing on that
+/// transport reports a list at all, and the model travels as one argv flag.
 ///
 /// `agy`'s list is **not** a guess and is therefore seeded: MOD-2 `T34` read it off a live
 /// `session/new` on 2026-09-10 (plan D64), together with the `configOptions` entry id — `"model"`
@@ -124,13 +132,14 @@ pub struct AgentBox {
 /// default — so a stale list costs a row in the log, never a failed session.
 ///
 /// # Panics
-/// Never in a shipped build: the two documents are compile-time constants and a unit test parses
-/// both, so a malformed seed fails the suite rather than a session.
+/// Never in a shipped build: the documents are compile-time constants and a unit test parses every
+/// one, so a malformed seed fails the suite rather than a session.
 #[must_use]
 pub fn seed_rows(now: DateTime<Utc>) -> Vec<Agent> {
     [
         include_str!("../../seeds/agent_claude.json"),
         include_str!("../../seeds/agent_agy.json"),
+        include_str!("../../seeds/agent_claude_cli.json"),
     ]
     .into_iter()
     .map(|document| {
@@ -197,20 +206,27 @@ mod tests {
         let now = DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp");
         let rows = seed_rows(now);
 
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].name, "claude");
         assert_eq!(rows[1].name, "agy");
+        assert_eq!(rows[2].name, "claude-cli");
 
         for row in &rows {
-            // Both rows speak ACP and both are subscription-billed: `agy`'s credit overage is
-            // undocumented as to whether it meters per token, so `per_token` would be a guess
-            // (§5.3). A box on API-key auth flips the row in Settings.
-            assert_eq!(row.transport, Transport::Acp, "{}", row.name);
+            // Every row is subscription-billed: `agy`'s credit overage is undocumented as to
+            // whether it meters per token, so `per_token` would be a guess (§5.3), and the third
+            // row's login *is* a subscription login (plan D92). A box on API-key auth flips the
+            // row in Settings.
             assert_eq!(row.billing, Billing::Subscription, "{}", row.name);
             assert!(row.enabled, "{}", row.name);
             assert_eq!(row.created_at, now);
             assert_eq!(row.updated_at, now);
         }
+
+        // The first two rows speak ACP; the third is the degraded stream-json path (plan D79).
+        for row in &rows[..2] {
+            assert_eq!(row.transport, Transport::Acp, "{}", row.name);
+        }
+        assert_eq!(rows[2].transport, Transport::Cli);
 
         // Empty, not guessed: ACP delivers the model list at `session/new`, and no live capture
         // has been folded into this row.
@@ -245,12 +261,43 @@ mod tests {
         assert_eq!(rows[0].launch["env"]["CLAUDE_CODE_EXECUTABLE"], "${claude}");
         assert_eq!(rows[1].launch["command"], "${agy_acp_server}");
 
-        // The CLI block is `claude`'s alone: `agy` has no CLI path built, so the row must not
-        // advertise one (§5.3).
-        assert_eq!(rows[0].settings["cli"]["stream"], "claude_stream_json");
-        assert!(rows[1].settings.get("cli").is_none());
+        // The `cli` block belongs to the `cli` row and to nothing else (plan D79). It used to sit
+        // on the first row as well, where `caps_from` and `adapter_id_from` never read it — they
+        // branch on `agent.transport` — so it was unread data and a second source of truth for one
+        // dialect. `agy` never had one: no CLI path is built for it (§5.3).
+        assert!(rows[0].settings.get("cli").is_none(), "claude");
+        assert!(rows[1].settings.get("cli").is_none(), "agy");
         assert_eq!(rows[0].settings["quota"]["source"], "acp_meta_rate_limit");
         assert_eq!(rows[1].settings["quota"]["source"], "none");
+
+        // The third row, in full: it is the whole of what the CLI transport is configured by, and
+        // every field here is one the driver reads at launch.
+        assert!(rows[2].models.is_empty(), "claude-cli");
+        assert_eq!(rows[2].default_model, None, "claude-cli");
+        assert_eq!(rows[2].launch["command"], "${claude}");
+        assert_eq!(rows[2].launch["discovery"]["handshake"], false);
+        assert!(
+            rows[2].launch["discovery"]["tools"]["claude"].is_object(),
+            "the row resolves one tool and no adapter package"
+        );
+        assert_eq!(
+            rows[2].launch["discovery"]["tools"]
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(1),
+        );
+        assert_eq!(rows[2].settings["cli"]["stream"], "claude_stream_json");
+        assert_eq!(rows[2].settings["cli"]["permission_mode"], "acceptEdits");
+        // Empty, not `["--bare"]` (plan D92): that flag makes authentication strictly an API key
+        // or an `apiKeyHelper` and never reads the login this row is billed against, so a
+        // `subscription` row that passed it would contradict itself.
+        assert_eq!(rows[2].settings["cli"]["extra_args"], serde_json::json!([]));
+        assert_eq!(rows[2].settings["quota"]["source"], "cli_rate_limit_event");
+        assert_eq!(rows[2].settings["usage"]["scope"], "model_usage");
+        assert!(
+            rows[2].settings.get("acp").is_none(),
+            "a CLI row advertises no ACP capabilities"
+        );
     }
 
     /// Ids are minted per call, not baked into the document: two seeds of the same file are two

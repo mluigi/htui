@@ -215,17 +215,23 @@ impl PgStore {
     ///
     /// Idempotent: every insert is conditional. Seeds one `app_user`, the ten `capability_tag`
     /// rows with `seeded = true`, the `app_setting` defaults `cache_refresh_seconds` = 30 and
-    /// `cache_overlap_seconds` = 300, and the two `agent` rows of `docs/ANA-4.md` §5.3.
+    /// `cache_overlap_seconds` = 300, and the `agent` rows of `docs/ANA-4.md` §5.3 as MOD-2's plan
+    /// amends them.
     ///
     /// MOD-6 deliberately seeded **no** agent, because `agent.launch` is `JSONB NOT NULL` and its
     /// shape was still ANA-4's to settle, so a guess would have needed migrating away (MOD-6 plan
     /// D5, blueprint H.2). ANA-4 settled it and assigned the seed to MOD-2, which is this: the
     /// rows come from [`seed_rows`], one source shared with the demo fixture.
     ///
-    /// The agent insert is guarded on the table being **empty**, not on `ON CONFLICT (name)`: a
-    /// maintainer who deletes `agy` in the Settings tab has decided something, and a later seed
-    /// pass must not undo it. `ON CONFLICT (name) DO NOTHING` remains as a backstop for the race
-    /// where two connects seed at once.
+    /// The agent insert is a **name-keyed top-up** (MOD-2 D88): every row of [`seed_rows`] is
+    /// offered on every pass and `ON CONFLICT (name) DO NOTHING` decides. It used to be guarded on
+    /// the `agent` table being empty as well, so that a maintainer's edit could not be undone —
+    /// but `ON CONFLICT (name) DO NOTHING` already protects an existing row, edits included, while
+    /// the emptiness guard also refused a row that had never been seeded *at all*. Every box that
+    /// has ever launched has a non-empty table, so a row a later milestone adds would have reached
+    /// none of them, and the feature would be verifiable only on a fresh database. The cost,
+    /// accepted at CONFIRM: a row that was **deleted** comes back on the next connect. MOD-23's
+    /// model for retiring an agent is `enabled = false`, not deletion, and that survives.
     ///
     /// **`R-USR-2`, one row, whatever the OS user is called.** The `app_user` insert is guarded by
     /// `WHERE NOT EXISTS (SELECT 1 FROM app_user)` rather than by `ON CONFLICT (name)`: a second
@@ -287,16 +293,12 @@ impl PgStore {
             .map_err(map_sqlx)?;
         }
 
-        // Emptiness is read **once**, before the loop: a per-statement `WHERE NOT EXISTS` would be
-        // false by the time the second row ran, and the registry would come up holding `claude`
-        // alone. The read is inside the transaction that holds the `app_user` lock, so a
-        // concurrent seed cannot slip a row in between the check and the inserts.
-        let empty = sqlx::query_scalar!(r#"SELECT NOT EXISTS(SELECT 1 FROM agent) AS "empty!""#)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(map_sqlx)?;
-
-        for agent in seed_rows(Utc::now()).into_iter().filter(|_| empty) {
+        // A **name**-keyed top-up (MOD-2 D88), not an emptiness check: `ON CONFLICT (name) DO
+        // NOTHING` inserts only the names the table lacks, so a box that was seeded by an older
+        // build gains a row a later milestone added, and a row that is already there is not
+        // written over — which is what the empty-table guard was protecting. It is inside the
+        // transaction that holds the `app_user` lock, so two first connects cannot both insert.
+        for agent in seed_rows(Utc::now()) {
             sqlx::query!(
                 "INSERT INTO agent (id, name, transport, launch, models, default_model, billing, \
                                     enabled, settings, created_at, updated_at) \

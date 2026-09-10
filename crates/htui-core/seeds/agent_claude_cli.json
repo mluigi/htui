@@ -1,0 +1,27 @@
+{
+  "name": "claude-cli",
+  "transport": "cli",
+  "billing": "subscription",
+  "models": [],
+  "default_model": null,
+  "launch": {
+    "command": "${claude}",
+    "args": [],
+    "env": {},
+    "discovery": {
+      "tools": {
+        "claude": { "kind": "path", "names": ["claude"],
+                    "version": { "args": ["--version"],
+                                 "pattern": "^(\\d+\\.\\d+\\.\\d+) \\(Claude Code\\)$" } }
+      },
+      "handshake": false
+    }
+  },
+  "settings": {
+    "cli": { "stream": "claude_stream_json", "permission_mode": "acceptEdits",
+             "extra_args": [] },
+    "permission": { "default": "ask", "rules": [], "remembered": [] },
+    "quota": { "source": "cli_rate_limit_event" },
+    "usage": { "scope": "model_usage" }
+  }
+}

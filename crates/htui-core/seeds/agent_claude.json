@@ -35,8 +35,6 @@
                                       "elicitation": false },
              "model_config_id": null,
              "session": { "load": true, "resume": true } },
-    "cli": { "stream": "claude_stream_json", "permission_mode": "acceptEdits",
-             "extra_args": ["--bare"] },
     "permission": { "default": "ask", "rules": [], "remembered": [] },
     "quota": { "source": "acp_meta_rate_limit" },
     "usage": { "scope": "model_usage" }

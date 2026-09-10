@@ -208,7 +208,7 @@ async fn a_pass_mirrors_the_demo_projects() {
     assert_eq!(report.uploaded, 0, "nothing was buffered offline");
     assert_eq!(
         report.rows("agent"),
-        2,
+        3,
         "the unscoped registry rides the pass beside `app_user` (D32)"
     );
     assert!(report.rows("item") > 0, "items were mirrored");
@@ -823,7 +823,7 @@ async fn a_pass_mirrors_the_agent_registry() {
     let report = run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
         .await
         .expect("one pass");
-    assert_eq!(report.rows("agent"), 2, "the fixture's two registry rows");
+    assert_eq!(report.rows("agent"), 3, "the fixture's registry rows");
 
     let mirrored = cache.agents().await.expect("read the mirrored registry");
     assert_eq!(
@@ -831,7 +831,7 @@ async fn a_pass_mirrors_the_agent_registry() {
             .iter()
             .map(|row| row.agent.name.as_str())
             .collect::<Vec<&str>>(),
-        vec!["agy", "claude"],
+        vec!["agy", "claude", "claude-cli"],
         "ordered by agent.name, as the Postgres read is",
     );
     assert!(
@@ -851,10 +851,10 @@ async fn a_pass_mirrors_the_agent_registry() {
     let second = run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
         .await
         .expect("a second pass");
-    assert_eq!(second.rows("agent"), 2);
+    assert_eq!(second.rows("agent"), 3);
     assert_eq!(
         mirror_count(cache.pool(), "agent").await,
-        2,
+        3,
         "the second pass replaced the rows rather than duplicating them",
     );
     let cursors: i64 =
@@ -899,7 +899,7 @@ async fn an_offline_backend_lists_the_mirrored_registry() {
             .iter()
             .map(|row| row.agent.name.as_str())
             .collect::<Vec<&str>>(),
-        vec!["agy", "claude"],
+        vec!["agy", "claude", "claude-cli"],
     );
     assert!(listed.iter().all(|row| row.on_box.is_none()));
     assert!(

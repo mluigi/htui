@@ -59,20 +59,28 @@ async fn r_in_the_agents_section_probes_and_the_column_reads_the_status() {
         "nothing has been probed before `r`"
     );
 
+    // Counted from the registry, not written as a literal: MOD-2 D79 made the seed set three and
+    // a literal here would have to be edited by every milestone that adds a row.
+    let seeded = store
+        .agents()
+        .await
+        .expect("the memory store never fails")
+        .len();
+
     harness.key("r");
     let waiting = harness.render();
     assert_eq!(
         waiting.matches("probing\u{2026}").count(),
-        2,
-        "both rows say so while the one probe runs, before anything is served: {waiting}"
+        seeded,
+        "every row says so while the one probe runs, before anything is served: {waiting}"
     );
 
     harness.drive_to_end().await;
     let probed = harness.render();
     assert_eq!(
         probed.matches("missing").count(),
-        2,
-        "a tool that resolves nowhere is `missing` on both rows: {probed}"
+        seeded,
+        "a tool that resolves nowhere is `missing` on every row: {probed}"
     );
     assert!(
         !probed.contains("probing"),
@@ -82,7 +90,7 @@ async fn r_in_the_agents_section_probes_and_the_column_reads_the_status() {
     let rows = store.agents().await.expect("the memory store never fails");
     assert_eq!(
         rows.iter().filter(|row| row.on_box.is_some()).count(),
-        2,
+        seeded,
         "the probe wrote an `agent_box` row per enabled registry row"
     );
     insta::assert_snapshot!("agents_probed_missing", probed);
@@ -93,6 +101,12 @@ async fn r_in_the_agents_section_probes_and_the_column_reads_the_status() {
 async fn a_second_r_while_probing_is_refused_on_the_status_line() {
     let store = unresolvable_registry().await;
     let mut harness = settings_over(store.clone(), Some(AgentRuntime::production())).await;
+
+    let seeded = store
+        .agents()
+        .await
+        .expect("the memory store never fails")
+        .len();
 
     harness.key("r");
     harness.key("r");
@@ -108,7 +122,7 @@ async fn a_second_r_while_probing_is_refused_on_the_status_line() {
     let rows = store.agents().await.expect("the memory store never fails");
     assert_eq!(
         rows.iter().filter(|row| row.on_box.is_some()).count(),
-        2,
+        seeded,
         "one probe ran, not two"
     );
     assert!(

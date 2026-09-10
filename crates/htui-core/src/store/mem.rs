@@ -1268,7 +1268,7 @@ mod tests {
                 .iter()
                 .map(|row| row.agent.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["agy", "claude"],
+            vec!["agy", "claude", "claude-cli"],
             "ordered by agent.name"
         );
         assert!(
