@@ -389,7 +389,13 @@ fn wire_update(event: &DriverEvent, cost_micros_total: &mut i64) -> Value {
             }
             update
         }
-        DriverEvent::PermissionRequest(_) | DriverEvent::Error(_) | DriverEvent::Done(_) => {
+        // `PermissionAnswer` is on this list for a different reason from the other three: ACP has
+        // no shape for one at all. This transport asks and waits (`caps.permission_requests`), so
+        // an answer it *reported* would be a message the protocol does not have (plan D93).
+        DriverEvent::PermissionRequest(_)
+        | DriverEvent::Error(_)
+        | DriverEvent::Done(_)
+        | DriverEvent::PermissionAnswer(_) => {
             panic!("{event:?} has no `session/update` shape; it is sent by another route")
         }
     }

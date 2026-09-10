@@ -21,9 +21,9 @@ use chrono::{DateTime, Utc};
 use htui_agent::driver::{AgentSession, AgentSessionRef, DriverFuture, PermissionAnswer};
 use htui_agent::error::DriverError;
 use htui_agent::event::{
-    DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, OtherEvent, PermissionOption,
-    PermissionOptionKind, PermissionRequestEvent, StopReason, TextChunk, ToolCallEvent, ToolKind,
-    ToolResultEvent, ToolResultStatus, UsageEvent,
+    DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, OtherEvent, PermissionAnswerEvent,
+    PermissionOption, PermissionOptionKind, PermissionRequestEvent, StopReason, TextChunk,
+    ToolCallEvent, ToolKind, ToolResultEvent, ToolResultStatus, UsageEvent,
 };
 use htui_agent::record::{
     AnsweredBy, CHUNK_FLUSH_BYTES, CapBreach, QuotaLatch, RecordError, Recorder, RunCap, pump,
@@ -2463,6 +2463,60 @@ async fn bounded_ui_channel_drops_are_counted() {
         8,
         "a dropped render frame never costs a row"
     );
+}
+
+/// A `permission_answer` a **transport** reported is written under the role its author implies,
+/// not under the `agent` every other driver row gets (plan D93).
+///
+/// This is the whole cost of the twelfth variant, and the reason it is not a second mechanism: the
+/// role comes from [`AnsweredBy::role`], the same function `record_permission_answer` calls for the
+/// answer a human gave. A transport that had to be trusted to *state* the role could state the
+/// wrong one, and a row claiming the user chose when nobody was asked is the failure that matters.
+#[tokio::test]
+async fn a_policy_answer_a_transport_reported_is_htuis_row() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+
+    recorder
+        .record(env(DriverEvent::PermissionAnswer(PermissionAnswerEvent {
+            request_id: htui_agent::driver::PermissionRequestId::new("call-9"),
+            tool_call_id: Some("call-9".to_owned()),
+            option_id: None,
+            by: AnsweredBy::Policy,
+            cancelled: false,
+            denied: true,
+        })))
+        .await
+        .expect("recording must land");
+    recorder.finish().await.expect("close");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::PermissionAnswer]
+    );
+    assert_eq!(
+        log[0].role,
+        EventRole::Htui,
+        "a policy answer is htui's row whoever reported it"
+    );
+    assert_eq!(
+        log[0].tool_call_id.as_deref(),
+        Some("call-9"),
+        "the column `idx_session_event_tool` joins on carries the call the answer settled"
+    );
+    assert_eq!(
+        log[0].payload.get("by").and_then(Value::as_str),
+        Some("policy")
+    );
+    assert_eq!(
+        log[0].payload.get("denied").and_then(Value::as_bool),
+        Some(true),
+        "the added key that tells a denial from an answer somebody gave"
+    );
+    assert_eq!(log[0].payload.get("option_id"), Some(&Value::Null));
 }
 
 /// `record_permission_answer` writes the `permission_answer` row of ANA-9 §4.3, with the role the

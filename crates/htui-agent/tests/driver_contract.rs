@@ -1,12 +1,14 @@
 //! The Task 1 contract of `docs/ANA-4.md` §4.1 (plan MOD-2 D2, D16).
 //!
-//! Four properties, none of which any later task may quietly drop:
+//! Six properties, none of which any later task may quietly drop:
 //!
 //! 1. `AgentDriver` and `AgentSession` are dyn-compatible, and a session driven from a spawned
 //!    task is `Send` — the property MOD-4 needs to put one task on the runtime per session.
-//! 2. `From<&DriverEvent> for EventKind` is **total** over the eleven `EventKind` values a driver
-//!    can produce: the fourteen of `crates/htui-core/src/model/event.rs` minus the three `htui`
-//!    authors itself (`prompt`, `follow_up`, `permission_answer`).
+//! 2. `From<&DriverEvent> for EventKind` is **total** over the twelve `EventKind` values a driver
+//!    can produce: the fourteen of `crates/htui-core/src/model/event.rs` minus the two `htui`
+//!    alone authors (`prompt`, `follow_up`). `permission_answer` left that set in plan D93: a
+//!    transport whose own policy settled a request reports the answer, and the role — not the
+//!    kind — is what says who chose.
 //! 3. `SessionSpec`'s hand-written `Debug` prints every environment value as `[REDACTED]`
 //!    (ANA-4 §4.1's mechanical enforcement of invariant 4).
 //! 4. `DriverCaps` is `Copy` and defaults to all-false, so a transport that forgets to answer a
@@ -14,6 +16,9 @@
 //! 5. `AgentDriver::authenticate` **refuses by default** (plan MOD-21 D10): a transport that says
 //!    nothing about authentication has none, and every registered adapter's predicate agrees with
 //!    what its operation actually answers.
+//! 6. The pieces every transport shares — the capture clock, the child's byte streams, the banner
+//!    and transport-closed strings — live below all of them, so a second transport reaches them
+//!    without importing the first.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -30,10 +35,12 @@ use htui_agent::driver::{
 use htui_agent::error::DriverError;
 use htui_agent::event::{
     DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, ErrorEvent, OtherEvent,
-    PermissionOption, PermissionOptionKind, PermissionRequestEvent, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PlanEvent, StopReason, TerminalReason, TextChunk, ToolCallEvent, ToolKind,
-    ToolLocation, ToolResultEvent, ToolResultStatus, UsageEvent,
+    PermissionAnswerEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanEvent, StopReason, TerminalReason,
+    TextChunk, ToolCallEvent, ToolKind, ToolLocation, ToolResultEvent, ToolResultStatus,
+    UsageEvent,
 };
+use htui_agent::record::AnsweredBy;
 use htui_agent::registry::{DriverFactory, caps_for};
 use htui_core::model::{Agent, AgentId, Billing, EventKind, StepId, Transport};
 use serde_json::json;
@@ -187,7 +194,7 @@ async fn trait_pair_is_dyn_compatible_and_a_session_is_send() {
 // 2. `From<&DriverEvent> for EventKind` is total
 // ---------------------------------------------------------------------------------------------
 
-/// One value per `DriverEvent` variant, in the §4.1 declaration order. A twelfth variant added
+/// One value per `DriverEvent` variant, in the §4.1 declaration order. A thirteenth variant added
 /// without a line here fails to compile: the `match` below is exhaustive.
 fn every_driver_event() -> Vec<DriverEvent> {
     let all = vec![
@@ -250,6 +257,14 @@ fn every_driver_event() -> Vec<DriverEvent> {
             update: "session_info_update".to_owned(),
             body: json!({ "sessionId": "s1" }),
         }),
+        DriverEvent::PermissionAnswer(PermissionAnswerEvent {
+            request_id: PermissionRequestId("call-3".to_owned()),
+            tool_call_id: Some("call-3".to_owned()),
+            option_id: None,
+            by: AnsweredBy::Policy,
+            cancelled: false,
+            denied: true,
+        }),
     ];
 
     // Exhaustiveness: a new variant breaks this match, not just the length assertion.
@@ -265,27 +280,29 @@ fn every_driver_event() -> Vec<DriverEvent> {
             | DriverEvent::Usage(_)
             | DriverEvent::Error(_)
             | DriverEvent::Done(_)
-            | DriverEvent::Other(_) => {}
+            | DriverEvent::Other(_)
+            | DriverEvent::PermissionAnswer(_) => {}
         }
     }
 
     all
 }
 
-/// The three kinds `htui` writes itself; no driver may ever produce one (ANA-4 §6).
-const HTUI_AUTHORED: [EventKind; 3] = [
-    EventKind::Prompt,
-    EventKind::FollowUp,
-    EventKind::PermissionAnswer,
-];
+/// The two kinds `htui` alone writes; no driver may ever produce one (ANA-4 §6).
+///
+/// `permission_answer` was a third until plan D93. It is a kind a transport can now report — its
+/// own policy answered, so there was nothing to ask a human — and the `session_event.role` of the
+/// row, `htui` rather than `agent`, is what keeps the answer's author unambiguous. A prompt and a
+/// follow-up are different: no transport can *observe* one, because they are what `htui` sends.
+const HTUI_AUTHORED: [EventKind; 2] = [EventKind::Prompt, EventKind::FollowUp];
 
 #[test]
 fn driver_events_reach_every_event_kind_htui_does_not_author() {
     let events = every_driver_event();
     assert_eq!(
         events.len(),
-        11,
-        "ANA-4 §4.1 fixes eleven DriverEvent variants"
+        12,
+        "ANA-4 §4.1 as amended by plan D93 fixes twelve DriverEvent variants"
     );
     assert_eq!(
         EventKind::ALL.len(),
@@ -312,7 +329,7 @@ fn driver_events_reach_every_event_kind_htui_does_not_author() {
         .copied()
         .filter(|kind| !HTUI_AUTHORED.contains(kind))
         .collect();
-    assert_eq!(expected.len(), 11, "14 - 3 = 11");
+    assert_eq!(expected.len(), 12, "14 - 2 = 12");
     for kind in &expected {
         assert!(reached.contains(kind), "no DriverEvent maps to {kind}");
     }

@@ -60,7 +60,8 @@ pub struct ReplayError {
 
 /// The strict decode: `Ok` for every row the recorder can have written, `Err` for one it cannot.
 ///
-/// The three `htui`-authored kinds and `other` are always `Ok`, as [`DriverEvent::Other`]. Tests
+/// The two `htui`-authored kinds, `permission_answer` and `other` are always `Ok`, as
+/// [`DriverEvent::Other`]. Tests
 /// and the round-trip regression net call this; the transcript calls [`envelope_or_other`],
 /// because a decode failure there would cost the reader the rest of the step.
 ///
@@ -104,8 +105,10 @@ pub fn envelopes(rows: &[SessionEvent]) -> Vec<DriverEnvelope> {
 /// The decode table of blueprint section E, one arm per [`EventKind`].
 fn event_from_row(row: &SessionEvent) -> Result<DriverEvent, ReplayError> {
     match row.kind {
-        // No `DriverEvent` variant exists for the three kinds `htui` authors itself; the live tab
-        // receives them as `other` too, so this *is* the shape, not a fallback.
+        // The rows `htui` itself authors reach the live tab as `other` carrying the payload, so
+        // this *is* the shape, not a fallback. `permission_answer` is on this list even though a
+        // transport can now report one (plan D93): what a **row** is replayed as is the tab's
+        // contract, and the tab reads an answer's payload the same way whoever wrote it.
         EventKind::Prompt | EventKind::FollowUp | EventKind::PermissionAnswer => Ok(verbatim(row)),
         EventKind::AssistantText => Ok(DriverEvent::AssistantChunk(chunk(row)?)),
         EventKind::Thought => Ok(DriverEvent::ThoughtChunk(chunk(row)?)),
@@ -126,8 +129,8 @@ fn event_from_row(row: &SessionEvent) -> Result<DriverEvent, ReplayError> {
     }
 }
 
-/// The row as `Other { update: <kind>, body: <payload> }`: what the three `htui`-authored kinds
-/// decode to, and what the lossy form falls back to for anything else.
+/// The row as `Other { update: <kind>, body: <payload> }`: what the three kinds the tab reads as
+/// `other` decode to, and what the lossy form falls back to for anything else.
 fn verbatim(row: &SessionEvent) -> DriverEvent {
     DriverEvent::Other(OtherEvent {
         update: row.kind.as_str().to_owned(),

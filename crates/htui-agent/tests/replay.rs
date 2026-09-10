@@ -243,8 +243,10 @@ async fn every_recorded_kind_decodes_to_the_event_that_produced_it() {
         assert_eq!(decoded.raw, row.raw, "`raw` is the row's, seq {}", row.seq);
 
         match row.kind {
-            // The three kinds `htui` authors itself have no `DriverEvent` variant; they reach the
-            // live transcript as `other` carrying the payload, and replay must be that shape.
+            // These three reach the live transcript as `other` carrying the payload, and replay
+            // must be that shape. Two of them have no `DriverEvent` variant at all; the third,
+            // `permission_answer`, has had one since plan D93 and is still replayed as `other`,
+            // because the shape a *row* comes back as is what the tab reads.
             EventKind::Prompt | EventKind::FollowUp | EventKind::PermissionAnswer => {
                 let other = other_of(&decoded);
                 assert_eq!(other.update, row.kind.as_str());

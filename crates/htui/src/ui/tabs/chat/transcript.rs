@@ -300,6 +300,18 @@ impl Transcript {
                 stop_reason: done.stop_reason,
             }),
             DriverEvent::Other(other) => self.apply_other(other),
+            // Plan D93: a transport whose own policy settled a request reports the answer instead
+            // of parking it. It resolves the request the same way `htui`'s own answer does — and
+            // when there is no parked row to resolve, because a transport with no permission
+            // channel never announced one, what the user saw live is the verbatim `other` the
+            // transport sent beside it (ANA-4 §6.2) and the answer is a row of the replay.
+            DriverEvent::PermissionAnswer(answer) => self.resolve(
+                answer.request_id.as_str(),
+                Resolution {
+                    option_id: answer.option_id.clone(),
+                    by: answer.by.as_str().to_owned(),
+                },
+            ),
         }
     }
 
@@ -349,6 +361,14 @@ impl Transcript {
                 .unwrap_or("policy")
                 .to_owned(),
         };
+        self.resolve(request_id, resolution);
+    }
+
+    /// Marks the newest matching `permission_request` row answered, whoever answered it.
+    ///
+    /// Nothing happens when no row matches: an answer to a request this transcript never saw is
+    /// not an error, it is a transport that answered before it asked.
+    fn resolve(&mut self, request_id: &str, resolution: Resolution) {
         if let Some(TranscriptRow::Permission { resolved, .. }) =
             self.rows.iter_mut().rev().find(|row| {
                 matches!(row, TranscriptRow::Permission { request_id: id, .. }

@@ -1,9 +1,15 @@
 //! The driver event model of `docs/ANA-4.md` §4.1, and its total map onto
 //! [`htui_core::model::EventKind`].
 //!
-//! [`DriverEvent`] is exactly `EventKind` minus the three kinds `htui` authors itself — `prompt`,
-//! `follow_up` and `permission_answer` — so [`From<&DriverEvent>`] for `EventKind` is total in
-//! both directions: eleven variants, eleven reachable kinds (plan MOD-2 D2).
+//! [`DriverEvent`] is exactly `EventKind` minus the two kinds `htui` alone authors — `prompt` and
+//! `follow_up` — so [`From<&DriverEvent>`] for `EventKind` is total in both directions: twelve
+//! variants, twelve reachable kinds (plan MOD-2 D2, as amended by MOD-2 D93).
+//!
+//! `permission_answer` was a third `htui`-authored kind until D93. A transport whose own policy
+//! settled a request has an answer to report and nobody to ask, so it reports one — and the row's
+//! `session_event.role`, taken from [`crate::record::AnsweredBy`], is what says who chose. A
+//! prompt and a follow-up stay `htui`'s alone for a reason no decision can change: they are what
+//! `htui` sends, so there is nothing for a transport to observe.
 //!
 //! Every payload struct here serialises into `session_event.payload`. The keys of ANA-9 §4.3 are
 //! the minimum contract: a driver may **add** keys, never rename a documented one, which is why
@@ -21,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::driver::PermissionRequestId;
+use crate::record::AnsweredBy;
 
 // ---------------------------------------------------------------------------------------------
 // Vocabularies
@@ -208,11 +215,13 @@ pub struct DriverEnvelope {
     pub at: DateTime<Utc>,
 }
 
-/// Exactly [`EventKind`] minus the three kinds `htui` authors itself (`prompt`, `follow_up`,
-/// `permission_answer`), so `From<&DriverEvent> for EventKind` is total (§4.1).
+/// Exactly [`EventKind`] minus the two kinds `htui` alone authors (`prompt`, `follow_up`), so
+/// `From<&DriverEvent> for EventKind` is total (§4.1, plan D93).
 ///
-/// Eleven variants. Adding a twelfth means adding an `EventKind`, which is an ANA-9 §4.3 schema
-/// change, not a driver change.
+/// Twelve variants. Adding a thirteenth means adding an `EventKind`, which is an ANA-9 §4.3 schema
+/// change — a migration — not a driver change. That is the boundary, and it is why a recognizable
+/// wire shape gets a variant of its own only where an existing `EventKind` is its destination;
+/// everything else is an [`OtherEvent`], which is §6.2's extension point.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DriverEvent {
     /// A chunk of agent text; the recorder coalesces a contiguous run into one `assistant_text`.
@@ -237,11 +246,14 @@ pub enum DriverEvent {
     Done(DoneEvent),
     /// Any protocol update not mapped above, stored verbatim.
     Other(OtherEvent),
+    /// A permission request the transport's **own policy** settled, reported rather than asked
+    /// (plan D93). The only variant whose row is not the agent's.
+    PermissionAnswer(PermissionAnswerEvent),
 }
 
 impl From<&DriverEvent> for EventKind {
-    /// The total map of §4.1. Every arm is a distinct kind, and no arm is one of the three kinds
-    /// `htui` authors itself — `crates/htui-agent/tests/driver_contract.rs` asserts both.
+    /// The total map of §4.1. Every arm is a distinct kind, and no arm is one of the two kinds
+    /// `htui` alone authors — `crates/htui-agent/tests/driver_contract.rs` asserts both.
     fn from(event: &DriverEvent) -> Self {
         match event {
             DriverEvent::AssistantChunk(_) => Self::AssistantText,
@@ -255,6 +267,7 @@ impl From<&DriverEvent> for EventKind {
             DriverEvent::Error(_) => Self::Error,
             DriverEvent::Done(_) => Self::Done,
             DriverEvent::Other(_) => Self::Other,
+            DriverEvent::PermissionAnswer(_) => Self::PermissionAnswer,
         }
     }
 }
@@ -355,6 +368,42 @@ pub struct PermissionRequestEvent {
     pub tool_call_id: Option<String>,
     /// Every option, in the order the agent offered them.
     pub options: Vec<PermissionOption>,
+}
+
+/// `permission_answer` (ANA-9 §4.3), as a **transport** reports it (plan D85, D93).
+///
+/// The kind `htui` writes for an answer a human gave, reached from the other side: a transport
+/// whose `agent.settings.permission` policy — or whose own permission mode — refused a call has
+/// the same four facts to record and nobody to ask for them. What it does **not** carry is the
+/// row's role: that is [`AnsweredBy::role`]'s, so a transport cannot claim a user chose.
+///
+/// [`AnsweredBy::role`]: crate::record::AnsweredBy::role
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionAnswerEvent {
+    /// The request this answers. A transport with no permission channel (§4.3) never announced
+    /// one, so this is the id of the call that was refused — the same string as
+    /// [`tool_call_id`](Self::tool_call_id), which is what makes the pair joinable either way.
+    pub request_id: PermissionRequestId,
+    /// The tool call the answer settled, when the transport named one. Copied by the recorder into
+    /// the `session_event.tool_call_id` column that `idx_session_event_tool` joins on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// The option chosen. `None` when the answer chose none: a denial and a cancellation both
+    /// settle a request without picking anything.
+    ///
+    /// Serialised even when it is `None`, unlike the field above: `permission_answer` payloads are
+    /// read by key (`crates/htui/src/ui/tabs/chat/transcript.rs`), the ANA-9 §4.3 key set is what
+    /// a reader expects to find, and the row `htui` writes for a human's answer carries an
+    /// explicit `null` here too. An answer with no option is a fact, not a missing field.
+    #[serde(default)]
+    pub option_id: Option<String>,
+    /// Who chose, and therefore which `session_event.role` the row is written under.
+    pub by: AnsweredBy,
+    /// `true` when one answer settled every outstanding request at once (§4.3's cancellation).
+    pub cancelled: bool,
+    /// `true` when the answer refused the call. An **added** key, not a renamed one: it is what
+    /// tells a policy denial apart from an answer somebody actually gave (§6.2, plan D85).
+    pub denied: bool,
 }
 
 /// One entry of a `plan` update.

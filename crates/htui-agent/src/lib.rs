@@ -2,7 +2,7 @@
 //!
 //! [`driver`] holds the two traits every transport implements — a `Send + Sync` [`AgentDriver`]
 //! per `agent` row and a `Send` [`AgentSession`] per live session — plus the inputs a session
-//! starts from. [`event`] holds the eleven-variant [`DriverEvent`] and its **total** map onto
+//! starts from. [`event`] holds the twelve-variant [`DriverEvent`] and its **total** map onto
 //! `htui_core::model::EventKind`. [`error`] holds the one [`DriverError`] this crate returns.
 //!
 //! Only the *persisted* types stay in `htui-core`: the trait, the event enum and (from milestone
@@ -120,9 +120,10 @@ pub use driver::{
 pub use error::{DriverError, Result};
 pub use event::{
     DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, ErrorEvent, OtherEvent,
-    PermissionOption, PermissionOptionKind, PermissionRequestEvent, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PlanEvent, StopReason, TerminalReason, TextChunk, ToolCallEvent, ToolKind,
-    ToolLocation, ToolResultEvent, ToolResultStatus, UsageEvent,
+    PermissionAnswerEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanEvent, StopReason, TerminalReason,
+    TextChunk, ToolCallEvent, ToolKind, ToolLocation, ToolResultEvent, ToolResultStatus,
+    UsageEvent,
 };
 // `plan_install`, not `plan`: at the crate root the bare name says nothing about what is being
 // planned, and `resolve_tools` set the precedent.
@@ -144,7 +145,9 @@ pub use probe::{
     ProbeSource, ProbeStatus, SpawnTier2, Tier2, ToolReport, ToolResolution, default_install_root,
     install_root, platform_key, probe_agent, probe_tools, resolve_credential,
 };
-pub use record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, RecorderSummary, pump};
+pub use record::{
+    AnsweredBy, CHUNK_FLUSH_BYTES, PERMISSION_DENIED, RecordError, Recorder, RecorderSummary, pump,
+};
 pub use registry::{DriverFactory, TransportBuilder, adapter_id, caps_for};
 // `replay_envelopes`, not `envelopes`: at the crate root the bare name says nothing about which
 // direction it runs, and `record`'s counterpart is spelled out too.

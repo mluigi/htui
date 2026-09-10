@@ -454,6 +454,7 @@ fn payload_of(event: &DriverEvent) -> Value {
         DriverEvent::ToolResult(inner) => serde_json::to_value(inner),
         DriverEvent::EditProposal(inner) => serde_json::to_value(inner),
         DriverEvent::PermissionRequest(inner) => serde_json::to_value(inner),
+        DriverEvent::PermissionAnswer(inner) => serde_json::to_value(inner),
         DriverEvent::Plan(inner) => serde_json::to_value(inner),
         DriverEvent::Usage(inner) => serde_json::to_value(inner),
         DriverEvent::Error(inner) => serde_json::to_value(inner),

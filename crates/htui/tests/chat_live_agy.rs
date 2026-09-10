@@ -600,6 +600,14 @@ fn report(event: &DriverEvent, observed: &mut Observed) {
             println!("frame: other `{}` {}", other.update, other.body);
             observed.others.push(other.update.clone());
         }
+        // Never reached over ACP — this transport asks and waits — but printed rather than ignored:
+        // a live run that produced one would be telling us something about the adapter (plan D93).
+        DriverEvent::PermissionAnswer(answer) => println!(
+            "frame: permission_answer {} by {} (denied: {})",
+            answer.request_id.as_str(),
+            answer.by.as_str(),
+            answer.denied
+        ),
     }
 }
 
