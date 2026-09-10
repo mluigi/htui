@@ -2,7 +2,7 @@
 //! `session_event` log.
 //!
 //! A [`Recorder`] turns the driver's per-chunk event stream into the row set ANA-9 §4.3 asks for.
-//! It owns four things no one else may own:
+//! It owns five things no one else may own:
 //!
 //! 1. **Coalescing.** A contiguous run of [`DriverEvent::AssistantChunk`] /
 //!    [`DriverEvent::ThoughtChunk`] becomes one `assistant_text` / `thought` row. The flush
@@ -43,6 +43,13 @@
 //!    The channel is bounded and written with `try_send`, so a paused chat tab can never stall
 //!    the agent; drops are counted ([`Recorder::dropped`]) rather than waited on, because a
 //!    dropped render frame is recoverable from the store and a dropped row is not.
+//! 5. **The passive quota latch** (`docs/ANA-4.md` §7 `:1131-1135`, plan D66-D68). The recorder is
+//!    the only place that sees every `usage` row, so it is where `agent_box.quota` is refreshed:
+//!    it normalizes the row's vendor rate-limit blob into §7's document and writes two columns
+//!    through [`WriteStore::set_agent_box_quota`]. Opt-in ([`Recorder::with_quota_latch`]),
+//!    best-effort — a refused allowance write never fails a turn — and silent when a row has
+//!    nothing to say, which is what keeps a turn's first, blob-less report from erasing the last
+//!    one. The cap that reads the same figure lands in milestone 7's second half.
 //!
 //! **Fail-closed.** When the scrubber returns [`Unmasked`] the recorder drops that row entirely,
 //! writes `error { code: "scrub_residue", message: "<rule> at <path>" }` with role `htui` in its
@@ -57,7 +64,10 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, SubsecRound, Utc};
-use htui_core::model::{EventKind, EventRole, SessionEvent, StepId, UsageTotals};
+use htui_core::model::{
+    AgentId, Billing, BoxId, EventKind, EventRole, QuotaSource, SessionEvent, StepId, UsageTotals,
+    quota::normalize,
+};
 use htui_core::scrub::{Scrubber, Unmasked};
 use htui_core::store::{StoreError, WriteStore};
 use serde::Serialize;
@@ -78,6 +88,25 @@ pub const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 
 /// `error.code` of the row the recorder writes in place of a payload the scrubber refused.
 const SCRUB_RESIDUE: &str = "scrub_residue";
+
+/// What the passive latch of `docs/ANA-4.md` §7 (`:1131-1135`) needs (plan D66-D68): which
+/// `agent_box` row to write, and the two row-side facts the document carries.
+///
+/// `source` is `agent.settings.quota.source` and `billing` is `agent.billing` — both read off the
+/// `agent` row, never derived from its name (`R-AGT-5`). The recorder holds the latch rather than
+/// looking either up, because it has no registry read and must not grow one: it is what the
+/// conformance suite drives with no transport and no registry at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaLatch {
+    /// `agent_box.agent_id` of the row to latch into.
+    pub agent_id: AgentId,
+    /// `agent_box.box_id` of the row to latch into: the box this chat runs on.
+    pub box_id: BoxId,
+    /// How this row's transport reports an allowance, as the row itself declares.
+    pub source: QuotaSource,
+    /// `agent.billing`, which the §7 document carries so a reader knows what `spend` means.
+    pub billing: Billing,
+}
 
 /// `TIMESTAMPTZ` keeps microseconds, so a capture time is truncated to microseconds before it is
 /// written; otherwise a `MemStore` row and its `PgStore` twin would differ in a column neither
@@ -237,6 +266,15 @@ pub struct Recorder<'a, S: WriteStore> {
     digest_pending: Option<String>,
     usage: UsageTotals,
     usage_dirty: bool,
+    /// Plan D66-D68: `None` records no quota — a test, an offline chat, or a backend that refused
+    /// the latch once and will not be asked again this session.
+    quota_latch: Option<QuotaLatch>,
+    /// The last vendor blob a `usage` row of this session carried, as scrubbed and persisted.
+    ///
+    /// Kept so a later row without one refreshes the spend figure without erasing the windows: a
+    /// turn's first report carries no `_meta` (blueprint H-3), and a document assembled from that
+    /// row alone would say "no windows" about an allowance nobody re-reported.
+    last_quota_raw: Option<Value>,
     residue: Option<Unmasked>,
     dropped: usize,
     rows: usize,
@@ -257,6 +295,9 @@ impl<S: WriteStore> core::fmt::Debug for Recorder<'_, S> {
             .field("turn", &self.turn)
             .field("dropped", &self.dropped)
             .field("residue", &self.residue)
+            // Whether a latch is configured, not which row it names: the identity of the row is
+            // not what a recorder log is about either.
+            .field("quota_latch", &self.quota_latch.is_some())
             .finish()
     }
 }
@@ -292,10 +333,24 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             digest_pending: None,
             usage: UsageTotals::default(),
             usage_dirty: false,
+            quota_latch: None,
+            last_quota_raw: None,
             residue: None,
             dropped: 0,
             rows: 0,
         }
+    }
+
+    /// Records `agent_box.quota` for one row as well as the step's log (plan D66-D68).
+    ///
+    /// A builder rather than a sixth parameter to [`Recorder::new`] because most recorders have no
+    /// latch: every conformance case that is not about quota, every offline chat (a buffered writer
+    /// refuses registry writes, so the worker answers `None` before the first row rather than
+    /// discovering it on one), and every test of the other twelve rules.
+    #[must_use]
+    pub fn with_quota_latch(mut self, latch: QuotaLatch) -> Self {
+        self.quota_latch = Some(latch);
+        self
     }
 
     /// Render frames the bounded UI channel could not take, so far.
@@ -556,6 +611,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
                     // from an online one (plan D36).
                     self.usage.add_payload(&payload);
                     self.usage_dirty = true;
+                    self.latch_quota(&payload, scrubbed.at).await;
                 }
                 self.push(PendingRow {
                     kind,
@@ -693,6 +749,82 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         Ok(())
     }
 
+    /// The passive latch of `docs/ANA-4.md` §7 (`:1131-1135`, plan D66-D68): after every `usage`
+    /// row, publish `agent_box.quota` when the row has something to say — and never fail the turn.
+    ///
+    /// **Passive** means there is no query path: `Settings > Refresh agents` re-runs the probes and
+    /// a handshake reports no allowance, so the only time `htui` learns anything about an allowance
+    /// is while a run is in flight. That is what `R-AGT-7`'s "refreshed per run" asks for, and it
+    /// costs nothing beyond the rows the session was writing anyway.
+    ///
+    /// **Nothing to say** is the rule blueprint H-3 turns on: no blob seen this session *and* no
+    /// USD spend means no write at all, so a turn whose first report carries neither leaves the
+    /// standing document alone instead of replacing it with an empty one. Once a blob has been
+    /// seen it is remembered (`last_quota_raw`), so a later bare report refreshes the spend and
+    /// keeps the windows.
+    ///
+    /// **Best-effort** is plan D68: a failed allowance write is logged and dropped. `R-HIS-1`'s
+    /// durability is carried by the `usage` rows, which are buffered offline and re-derive the
+    /// figure after upload; failing a turn because an advisory number could not be stored would
+    /// trade the requirement for the courtesy. Two of the four outcomes also switch the latch off
+    /// for the session, because they will not change: an unreachable registry
+    /// (`REGISTRY_ON_SERVER_ONLY` — the offline refusal, which the worker normally answers before
+    /// the first row) and a missing `agent_box` row, which no later report of this session probes
+    /// into existence.
+    ///
+    /// The document is assembled from the **scrubbed payload** that is about to be persisted, not
+    /// from the typed event, for `UsageTotals::add_payload`'s reason: the row's bytes are what a
+    /// second reader would see, and a latch that published more than the row carries would put a
+    /// value in a column that no log explains.
+    ///
+    /// Blueprint H-17, accepted rather than fixed: this awaits a store write inside
+    /// [`Recorder::record`], before the row is buffered, so a slow server makes every `usage` row
+    /// cost a round trip. It is not on the UI task (`R-NF-3` holds), a `usage` row is rare — one
+    /// per report — and the write is one indexed two-column `UPDATE`. If it ever matters the latch
+    /// moves to [`Recorder::sync_step`]'s cadence: the same document, written less often.
+    async fn latch_quota(&mut self, payload: &Value, at: DateTime<Utc>) {
+        let Some(latch) = self.quota_latch else {
+            return;
+        };
+        if let Some(raw) = payload.get("quota").filter(|raw| raw.is_object()) {
+            self.last_quota_raw = Some(raw.clone());
+        }
+        if self.last_quota_raw.is_none() && self.usage.cost_micros.is_none() {
+            return;
+        }
+        let quota = normalize(
+            latch.source,
+            latch.billing,
+            self.last_quota_raw.as_ref(),
+            self.usage.cost_micros,
+            at,
+        );
+        match self
+            .store
+            .set_agent_box_quota(latch.agent_id, latch.box_id, quota.to_value(), at)
+            .await
+        {
+            Ok(()) => {}
+            Err(StoreError::Unreachable(reason)) => {
+                tracing::info!(
+                    %reason,
+                    "quota is not latched on this backend; the usage rows are (plan D68)"
+                );
+                self.quota_latch = None;
+            }
+            Err(StoreError::NotFound { .. }) => {
+                tracing::debug!(
+                    "no agent_box row for this agent on this box; nothing to latch into until it \
+                     is probed"
+                );
+                self.quota_latch = None;
+            }
+            Err(err) => {
+                tracing::warn!(%err, "the quota latch failed; the turn continues (plan D68)");
+            }
+        }
+    }
+
     /// Persists a row whose masked payload no longer reads back as its own event type.
     ///
     /// Masking is what broke it, so **nothing leaked and nothing is dropped**. An
@@ -710,6 +842,10 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// the row stands alone. `tool_call_id` is taken from the masked document, which is why the
     /// column can never carry an unmasked id. No frame reaches the chat tab, which has no scrubbed
     /// event to render; the row is there when it reloads.
+    ///
+    /// It is **not** latched either. [`Recorder::latch_quota`] assembles the §7 allowance document
+    /// out of the payload, and a masked payload is not a document to publish; the row keeps the
+    /// vendor blob it carried, so a later readable report of the same session publishes it.
     ///
     /// It is **not** exempt from `run_step.usage`. A persisted `usage` row is summed from its
     /// document, not from its typed event ([`UsageTotals::add_payload`]), so masking costs it only

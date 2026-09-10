@@ -25,12 +25,12 @@ use htui_agent::event::{
     PermissionOptionKind, PermissionRequestEvent, StopReason, TextChunk, ToolCallEvent, ToolKind,
     ToolResultEvent, ToolResultStatus, UsageEvent,
 };
-use htui_agent::record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, pump};
+use htui_agent::record::{AnsweredBy, CHUNK_FLUSH_BYTES, QuotaLatch, RecordError, Recorder, pump};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, DocumentHead, EventKind, EventRole, Item,
-    ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, RunId, RunStatus,
-    RunSummary, Scope, SessionEvent, Status, StepId,
+    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, DocumentHead, EventKind, EventRole,
+    Item, ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, Quota, QuotaSource,
+    RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepId, normalize,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{
@@ -156,14 +156,35 @@ struct UsageCall {
     prompt_digest: Option<String>,
 }
 
-/// A `WriteStore` that delegates everything to `MemStore`, remembers the `set_step_usage` calls
-/// the read seam does not expose, and can be told to refuse the next few appends.
+/// One `set_agent_box_quota` call the recorder **attempted** (MOD-2 plan D66-D68).
+///
+/// An attempt and not a success: the latch is best-effort and gives up on a refusal, so "it did
+/// not retry" is a statement about how many times it tried, and a log of successes could not make
+/// it.
+#[derive(Debug, Clone, PartialEq)]
+struct QuotaCall {
+    /// The row the latch named.
+    key: (AgentId, BoxId),
+    /// The §7 document offered.
+    quota: Value,
+    /// `agent_box.quota_at`, which mirrors the document's `observed_at`.
+    quota_at: DateTime<Utc>,
+}
+
+/// A `WriteStore` that delegates everything to `MemStore`, remembers the `set_step_usage` and
+/// `set_agent_box_quota` calls the read seam does not expose, and can be told to refuse the next
+/// few appends or every quota latch.
 #[derive(Debug)]
 struct SpyStore {
     inner: MemStore,
     usage_calls: Mutex<Vec<UsageCall>>,
+    quota_calls: Mutex<Vec<QuotaCall>>,
     /// Appends still to be refused before one is let through again.
     refuse_appends: Mutex<usize>,
+    /// The error every `set_agent_box_quota` answers with, if any. Not consumed: a backend that
+    /// fails once usually fails again, and the point of the case is what the recorder does with
+    /// the second answer.
+    refuse_quota: Mutex<Option<StoreError>>,
 }
 
 impl SpyStore {
@@ -171,8 +192,26 @@ impl SpyStore {
         Self {
             inner: MemStore::demo(),
             usage_calls: Mutex::new(Vec::new()),
+            quota_calls: Mutex::new(Vec::new()),
             refuse_appends: Mutex::new(0),
+            refuse_quota: Mutex::new(None),
         }
+    }
+
+    /// Every `set_agent_box_quota` attempt so far, in order.
+    fn quota_calls(&self) -> Vec<QuotaCall> {
+        self.quota_calls
+            .lock()
+            .expect("the spy log is never poisoned")
+            .clone()
+    }
+
+    /// Makes every quota latch fail with `error`, for as long as this store lives.
+    fn refuse_quota_with(&self, error: StoreError) {
+        *self
+            .refuse_quota
+            .lock()
+            .expect("the spy log is never poisoned") = Some(error);
     }
 
     /// Every `set_step_usage` call so far, in order.
@@ -285,9 +324,29 @@ impl WriteStore for SpyStore {
         quota: Value,
         quota_at: DateTime<Utc>,
     ) -> StoreResult<()> {
-        self.inner
-            .set_agent_box_quota(agent_id, box_id, quota, quota_at)
-            .await
+        // The attempt is logged before the outcome is decided, because a refused latch has to be
+        // countable; both guards are taken and dropped with no `.await` in scope.
+        self.quota_calls
+            .lock()
+            .expect("the spy log is never poisoned")
+            .push(QuotaCall {
+                key: (agent_id, box_id),
+                quota: quota.clone(),
+                quota_at,
+            });
+        let refusal = self
+            .refuse_quota
+            .lock()
+            .expect("the spy log is never poisoned")
+            .clone();
+        match refusal {
+            Some(error) => Err(error),
+            None => {
+                self.inner
+                    .set_agent_box_quota(agent_id, box_id, quota, quota_at)
+                    .await
+            }
+        }
     }
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> StoreResult<()> {
         self.inner.start_chat_run(chat).await
@@ -824,6 +883,398 @@ async fn an_unreadable_usage_row_is_still_summed_into_step_usage() {
         htui_core::model::UsageTotals::from_rows(&log).to_value(),
         summary.usage,
         "the recorder's sum and the uploader's sum over the same persisted rows are one document"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The passive quota latch (`docs/ANA-4.md` §7 `:1131-1135`, plan D66-D68)
+// ---------------------------------------------------------------------------------------------
+
+/// The `_meta` rate-limit value of `tests/fixtures/claude_acp_turn.jsonl` line 5, verbatim: the
+/// one real blob this milestone was designed against.
+fn quota_blob() -> Value {
+    json!({
+        "status": "allowed",
+        "resetsAt": 1_788_801_600_i64,
+        "rateLimitType": "five_hour",
+        "overageStatus": "rejected",
+        "overageDisabledReason": "org_level_disabled",
+        "isUsingOverage": false,
+        "unifiedWindows": {
+            "five_hour": { "utilization": 0.11, "resetsAt": 1_788_801_600_i64 },
+            "seven_day": { "utilization": 0.62, "resetsAt": 1_788_854_400_i64 },
+        },
+    })
+}
+
+/// The §4.6 probe snapshot the latched row already carries: the document
+/// `set_agent_box_quota` must leave byte-identical (plan D67).
+fn probe_snapshot() -> Value {
+    json!({ "status": "ready", "source": "probe" })
+}
+
+/// A `usage` report: a context reading always, a USD cost when `cost` is `Some`, and a vendor
+/// rate-limit blob when `quota` is `Some`.
+///
+/// `cost: None` is the context-only shape ANA-4 §7 says every ACP turn opens with and `agy`
+/// reports throughout.
+fn usage(cost: Option<i64>, quota: Option<Value>) -> DriverEnvelope {
+    env(DriverEvent::Usage(UsageEvent {
+        cost_micros: cost,
+        cost_micros_total: cost,
+        context_used: Some(22_913),
+        context_size: Some(1_000_000),
+        quota,
+        ..UsageEvent::default()
+    }))
+}
+
+/// The probed `agent_box` row a latch writes into, with `quota` NULL as a fresh row has it (D74).
+async fn probe_agent_box(store: &SpyStore) {
+    store
+        .upsert_agent_box(&AgentBox {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id: ids::BOX,
+            enabled: true,
+            version: Some("1.2.3".to_owned()),
+            path: Some("agent".to_owned()),
+            probed_at: Some(at()),
+            quota: None,
+            quota_at: None,
+            updated_at: at(),
+            probe: Some(probe_snapshot()),
+        })
+        .await
+        .expect("the probed row lands");
+}
+
+/// The latch the worker builds at chat start: which row to write, plus the two row-side facts the
+/// document carries. `source` is `agent.settings.quota.source` and `billing` is `agent.billing` —
+/// never the agent's name (`R-AGT-5`).
+fn latch(source: QuotaSource, billing: Billing) -> QuotaLatch {
+    QuotaLatch {
+        agent_id: ids::AGENT_CLAUDE,
+        box_id: ids::BOX,
+        source,
+        billing,
+    }
+}
+
+/// `agent_box` of this box, read back through the registry projection.
+async fn on_box(store: &SpyStore) -> AgentBox {
+    store
+        .inner
+        .agents()
+        .await
+        .expect("the registry reads")
+        .into_iter()
+        .find(|row| row.agent.id == ids::AGENT_CLAUDE)
+        .expect("the agent is registered")
+        .on_box
+        .expect("this box has an agent_box row")
+}
+
+/// A `usage` row carrying a vendor rate-limit blob leaves `agent_box.quota` equal to §7's
+/// seven-key document, with `quota_at` mirroring its `observed_at` (`docs/ANA-4.md:1112-1127`).
+///
+/// The document is compared against `htui_core::model::normalize` rather than against a literal:
+/// the normalizer's own cases pin what the seven keys contain (`model/quota.rs`), and what this
+/// case owns is that the recorder latches *that* document, for *that* row, at the capture time of
+/// the row that produced it.
+#[tokio::test]
+async fn a_usage_row_carrying_a_blob_latches_the_seven_key_document() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    probe_agent_box(&store).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None)
+        .with_quota_latch(latch(QuotaSource::AcpMetaRateLimit, Billing::Subscription));
+
+    recorder
+        .record(usage(Some(351), Some(quota_blob())))
+        .await
+        .expect("recording must land");
+    recorder.finish().await.expect("close");
+
+    let expected = normalize(
+        QuotaSource::AcpMetaRateLimit,
+        Billing::Subscription,
+        Some(&quota_blob()),
+        Some(351),
+        at(),
+    );
+    assert_eq!(
+        store.quota_calls(),
+        vec![QuotaCall {
+            key: (ids::AGENT_CLAUDE, ids::BOX),
+            quota: expected.to_value(),
+            quota_at: at(),
+        }],
+        "one usage row, one latch, on the row the latch named"
+    );
+    assert_eq!(
+        expected.observed_at,
+        at(),
+        "`observed_at` is the row's capture time, so `quota_at` mirrors it (§7)"
+    );
+
+    let row = on_box(&store).await;
+    assert_eq!(
+        row.quota.as_ref(),
+        Some(&expected.to_value()),
+        "the document reached the column"
+    );
+    assert_eq!(row.quota_at, Some(at()));
+    assert_eq!(
+        row.probe.as_ref(),
+        Some(&probe_snapshot()),
+        "and the §4.6 snapshot beside it is byte-identical (D67)"
+    );
+    assert_eq!(
+        Quota::from_value(row.quota.as_ref().expect("a document"))
+            .expect("the stored document parses")
+            .windows
+            .iter()
+            .map(|window| window.id.as_str())
+            .collect::<Vec<_>>(),
+        ["five_hour", "seven_day"],
+        "both windows, sorted by id"
+    );
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log[0].payload.get("quota"),
+        Some(&quota_blob()),
+        "and the `usage` row still carries the vendor blob verbatim (D66): the keys §7 does not \
+         normalize are recorded rather than discarded"
+    );
+}
+
+/// Blueprint H-3: a turn's **first** `usage` report carries no `_meta` and often no cost either,
+/// and a latch that fired on every row would overwrite last session's windows with an empty
+/// document at the top of every turn.
+///
+/// So the latch has nothing to say until the session has seen a blob or a spend figure, and once
+/// it has seen a blob it keeps it: a later bare row refreshes the spend and leaves the windows
+/// standing.
+#[tokio::test]
+async fn a_bare_first_row_latches_nothing_and_a_later_one_keeps_the_last_blob() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    probe_agent_box(&store).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None)
+        .with_quota_latch(latch(QuotaSource::AcpMetaRateLimit, Billing::Subscription));
+
+    // Context only: no blob, no cost, nothing to publish.
+    recorder
+        .record(usage(None, None))
+        .await
+        .expect("recording must land");
+    assert!(
+        store.quota_calls().is_empty(),
+        "a bare first report writes nothing at all, so the standing document survives it"
+    );
+    assert_eq!(
+        on_box(&store).await.quota,
+        None,
+        "and the column is untouched, not emptied"
+    );
+
+    recorder
+        .record(usage(Some(100), Some(quota_blob())))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(usage(Some(251), None))
+        .await
+        .expect("recording must land");
+    recorder.finish().await.expect("close");
+
+    let calls = store.quota_calls();
+    assert_eq!(calls.len(), 2, "the two rows that had something to say");
+    assert_eq!(
+        calls[0].quota,
+        normalize(
+            QuotaSource::AcpMetaRateLimit,
+            Billing::Subscription,
+            Some(&quota_blob()),
+            Some(100),
+            at()
+        )
+        .to_value()
+    );
+    assert_eq!(
+        calls[1].quota,
+        normalize(
+            QuotaSource::AcpMetaRateLimit,
+            Billing::Subscription,
+            Some(&quota_blob()),
+            Some(351),
+            at()
+        )
+        .to_value(),
+        "the bare row refreshed the spend and kept the last blob's windows"
+    );
+    let stored = Quota::from_value(&calls[1].quota).expect("the document parses");
+    assert_eq!(stored.windows.len(), 2, "the windows are still there");
+    assert_eq!(stored.spend.session_micros, Some(351));
+}
+
+/// A row whose `agent.settings.quota.source` is `none` latches **spend only**: no status, no
+/// windows, not exhausted — and, with nothing spent, nothing at all.
+///
+/// This is the seeded live-ACP row that reports no allowance (plan D65): its quota column shows a
+/// spend figure once it has cost something and `—` until then, by design rather than by omission.
+/// The blob on the row is ignored because the *row* says its source reports none, which is D66's
+/// selection rule: declared, never sniffed.
+#[tokio::test]
+async fn a_row_declaring_source_none_latches_spend_only() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    probe_agent_box(&store).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None)
+        .with_quota_latch(latch(QuotaSource::None, Billing::PerToken));
+
+    recorder
+        .record(usage(None, None))
+        .await
+        .expect("recording must land");
+    assert!(
+        store.quota_calls().is_empty(),
+        "context-only reports and no declared source: nothing to say, so nothing written"
+    );
+
+    recorder
+        .record(usage(Some(100), Some(quota_blob())))
+        .await
+        .expect("recording must land");
+    recorder.finish().await.expect("close");
+
+    let calls = store.quota_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].quota,
+        json!({
+            "source": "none",
+            "billing": "per_token",
+            "status": Value::Null,
+            "exhausted": false,
+            "windows": [],
+            "spend": { "session_micros": 100, "currency": "USD" },
+            "observed_at": at(),
+        }),
+        "spend and the two row-side facts; the blob the transport sent is not this row's source"
+    );
+}
+
+/// Plan D68: the latch is best-effort. A store that refuses it neither fails the turn nor gets
+/// asked again — the `usage` rows are what durability rests on (`R-HIS-1`), and an advisory
+/// allowance figure must not cost a session.
+///
+/// The two refusals that mean *stop asking* are answered by switching the latch off for the
+/// session: `Unreachable` is the offline backend's refusal (`REGISTRY_ON_SERVER_ONLY`), and
+/// `NotFound` means no `agent_box` row exists to latch into, which no later row of this session
+/// will change. Anything else is retried per row, because it may well be transient.
+#[tokio::test]
+async fn a_refused_latch_neither_fails_the_turn_nor_retries() {
+    /// Three costed `usage` rows through a recorder whose store answers every latch with `error`.
+    async fn play(error: StoreError) -> (SpyStore, usize) {
+        let chat = chat_spec();
+        let scrubber = scrubber();
+        let store = open_chat(&chat).await;
+        probe_agent_box(&store).await;
+        store.refuse_quota_with(error);
+        let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None)
+            .with_quota_latch(latch(QuotaSource::AcpMetaRateLimit, Billing::Subscription));
+        for cost in [100, 250, 1] {
+            recorder
+                .record(usage(Some(cost), Some(quota_blob())))
+                .await
+                .expect("a refused latch is not a recording failure");
+        }
+        let summary = recorder.finish().await.expect("nor a failed session");
+        assert_eq!(
+            summary.usage["cost_micros"], 351,
+            "the usage rows and their sum are unaffected"
+        );
+        let rows = rows(&store, chat.step_id).await;
+        assert_eq!(rows.len(), 3, "three usage rows, none of them an error row");
+        (store, 3)
+    }
+
+    let (store, rows) = play(StoreError::Unreachable(
+        "the agent registry is written on the server only".to_owned(),
+    ))
+    .await;
+    assert_eq!(
+        store.quota_calls().len(),
+        1,
+        "an unreachable registry is asked once and then left alone for the session"
+    );
+
+    let (store, _) = play(StoreError::NotFound {
+        entity: "agent_box",
+        id: "unprobed".to_owned(),
+    })
+    .await;
+    assert_eq!(
+        store.quota_calls().len(),
+        1,
+        "a row that does not exist will not exist on the next report either"
+    );
+
+    let (store, _) = play(StoreError::Backend("the pool is busy".to_owned())).await;
+    assert_eq!(
+        store.quota_calls().len(),
+        rows,
+        "anything else may be transient, so the next report tries again"
+    );
+}
+
+/// A `usage` row masking made unreadable is summed into `run_step.usage` and **not** latched: a
+/// masked document is not a document to publish.
+///
+/// The row itself is still persisted verbatim, so the blob it carried is not lost — a later,
+/// readable report of the same session republishes it. Latching a document assembled out of a
+/// masked payload is the one thing that would put `[REDACTED]` into a column three readers render.
+#[tokio::test]
+async fn a_masked_usage_row_is_summed_but_not_latched() {
+    let chat = chat_spec();
+    // A masked `output_tokens` is a string where an `Option<i64>` belongs, so the payload stops
+    // reading back as a `UsageEvent` and the row takes the recorder's unreadable path.
+    let scrubber = MaskKey("output_tokens");
+    let store = open_chat(&chat).await;
+    probe_agent_box(&store).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None)
+        .with_quota_latch(latch(QuotaSource::AcpMetaRateLimit, Billing::Subscription));
+
+    recorder
+        .record(env(DriverEvent::Usage(UsageEvent {
+            output_tokens: Some(5),
+            cost_micros: Some(100),
+            quota: Some(quota_blob()),
+            ..UsageEvent::default()
+        })))
+        .await
+        .expect("a masked usage key is not a recording failure");
+    let summary = recorder.finish().await.expect("close");
+
+    assert_eq!(
+        summary.usage["cost_micros"], 100,
+        "the keys masking left readable are still summed (plan D36)"
+    );
+    assert!(
+        store.quota_calls().is_empty(),
+        "and the masked row publishes no allowance document"
+    );
+    assert_eq!(on_box(&store).await.quota, None);
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log[0].payload.get("quota"),
+        Some(&quota_blob()),
+        "the row keeps the blob, so a later readable report can still publish it"
     );
 }
 
