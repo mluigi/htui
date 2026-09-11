@@ -363,6 +363,10 @@ impl Rig {
         self.row_line()
             .chars()
             .skip(ON_BOX_AT)
+            // Bounded by the column's own width rather than by the end of the line: since D89
+            // `on this box` is a `Length(13)` and no longer the column that absorbs the slack, so
+            // reading to the end of a wider render would pick up padding that belongs to nobody.
+            .take(ON_BOX_WIDTH)
             .collect::<String>()
             .trim_end()
             .to_owned()

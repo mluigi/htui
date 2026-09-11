@@ -418,11 +418,10 @@ const GAPS: usize = 7;
 
 /// How wide the `name` column draws at a given section width — D89's reversal of D76's ranking.
 ///
-/// `name` is `Constraint::Min(10)` and therefore the column that absorbs the slack, so its width
-/// is a **function of the render** rather than a constant, and so is the position of every column
-/// after it. 10 at [`SECTION_BORDERED`], which is exactly `claude-cli` and the reason the constraint
-/// is 10; 12 at [`SECTION_WIDE`]; 30 at a 120-column terminal. That growth is the whole of D89's
-/// "like 128" instruction made real.
+/// `name` is `Constraint::Fill(1)` and therefore the column that absorbs the slack, so its width is
+/// a **function of the render** rather than a constant, and so is the position of every column
+/// after it. 10 at [`SECTION_BORDERED`], 12 at [`SECTION_WIDE`], 32 at a 120-column terminal, 112 at
+/// 200. There is no cap and no tuned floor: "as wide as the terminal allows" is the whole rule.
 ///
 /// It is also why [`row_line`] finds a row by the name **as drawn**: four of this file's made-up
 /// row names are longer than the narrow widths (`needs-auth`, `spend-only`, `unparsable`,
@@ -673,13 +672,17 @@ async fn the_name_column_holds_the_whole_row_name_and_on_this_box_pays() {
     );
 }
 
-/// D89's other half: every character a wider terminal adds goes to `name` first.
+/// D89's other half: every character a wider terminal adds goes to `name` first, uncapped.
 ///
-/// This is the behaviour the maintainer asked for when they said "like 128", and the reason a
-/// literal `Length(128)` was refused rather than approximated — it is arithmetically impossible in
-/// a table that shares 91 columns, while `Min(10)` delivers the *growth* the instruction was
-/// actually about. At 160 columns `name` draws 72, which is a width no registry name will reach and
-/// is exactly the point: the column stops being the one that clips.
+/// This is the behaviour the maintainer asked for — "wider, like 128", then "increase it to maximum
+/// or like 256, there is no need to optimize the length" — and `Fill(1)` is that instruction with
+/// no number in it at all.
+///
+/// The widths below are the measured resolution of ratatui 0.30.2's solver, and the case exists
+/// because the obvious literal reading of the instruction does the opposite of what it sounds like:
+/// `Constraint::Min(256)` resolves to `[91, 0, 0, 0, 0, 0, 0, 0]` at 98 — one column of names and
+/// seven of nothing. A floor larger than the width does not widen a column, it starves its
+/// neighbours. `Max(256)` and `Fill(1)` are identical at every width, so the code says `Fill(1)`.
 #[tokio::test]
 async fn the_name_column_absorbs_every_character_a_wider_terminal_adds() {
     let bench = Bench::new().await;
@@ -687,11 +690,18 @@ async fn the_name_column_absorbs_every_character_a_wider_terminal_adds() {
     let mut section = AgentsSection::new();
     bench.reply(&mut section, &StoreReply::Agents(vec![row]));
 
-    for (width, expected) in [(98usize, 10usize), (100, 12), (120, 32), (160, 72)] {
+    for (width, expected) in [
+        (98usize, 10usize),
+        (100, 12),
+        (120, 32),
+        (160, 72),
+        (200, 112),
+    ] {
         assert_eq!(
             name_width(width),
             expected,
-            "the arithmetic D89 was decided on"
+            "the arithmetic D89 was decided on: width minus the seven fixed columns and their \
+             seven gaps, with no cap above it"
         );
         let rendered = render_section_at(
             &section,

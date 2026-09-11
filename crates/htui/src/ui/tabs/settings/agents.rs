@@ -1018,55 +1018,64 @@ impl AgentsSection {
         ])
         .style(ctx.theme.title);
 
-        // MOD-2 D89's packing, which **reverses D76's ranking**. The eight columns want ~107
-        // characters and the bordered section draws in 98 (hazard H-12), so the width does not
-        // divide and a **ranking** decides it rather than arithmetic. D76's order put the whole
-        // `default_model` string first, the quota window's reset time second and `on this box`'s
-        // slack third, and paid the remainder out of `name`, which it narrowed 12 → 8. D89 puts
-        // `name` **first** and makes `on this box` the donor.
+        // MOD-2 D89's packing, which **reverses D76's ranking**: `name` takes the slack, and
+        // `on this box` is the donor that pays for it.
         //
-        // The instruction was "settings name should be wider, like 128". A literal `Length(128)`
-        // is arithmetically impossible and `Max(128)` would have delivered nothing: with
-        // `column_spacing` 1 across 7 gaps the eight columns share exactly **91** at the bordered
-        // 98, and 128 for one column exceeds the whole table. `Min(10)` is what makes the intent
-        // real instead of nominal — 10 is the longest registry name in the tree rendered whole at
-        // the narrow guard width, and **every character a wider terminal adds goes to `name`
-        // first**: 30 at a 120-column terminal, 70 at 160. That is the "like 128" behaviour without
-        // the impossible constant.
+        // **`name` has no width of its own to tune, and that is the decision.** `Fill(1)` takes
+        // every column the seven fixed ones leave, so the answer to "how wide should a name be" is
+        // "as wide as the terminal allows" rather than a constant somebody chose. D76 had it as
+        // `Length(8)` — a number picked to fit the longest name *then in the tree*, which is a
+        // constant that goes stale the next time a registry row is added, and did: `claude-cli` is
+        // 10.
         //
-        // Widening `name` is never free, and this is the arithmetic that says so. Each of the other
-        // seven already sits at its own floor: `transport` (9), `models` (6) and `enabled` (7) at
-        // their headers, `billing` (12) at `subscription`, `default` (21) at
-        // `gemini-3.7-flash-high` — the model id `docs/ANA-4.md` §4.4 selects by, and D76's own #1 —
-        // and `quota` (13) at `100% to 09-08`, the exhausted window that column exists to warn
-        // about. So the width had to come out of a column that was already spending it.
+        // The instruction that produced this was "wider, like 128", and then "increase it to
+        // maximum or like 256, there is no need to optimize the length". Both are satisfied here,
+        // and the measured reason a literal 256 is *not* what the code says is worth recording,
+        // because it is counter-intuitive: as a `Min` it does not widen this column, it **deletes
+        // the other seven**. `Min(256)` and `Min(128)` both resolve to `[91, 0, 0, 0, 0, 0, 0, 0]`
+        // at the bordered 98 — one column of names and seven of nothing — and `Min(128)` is still
+        // `[128, 4, 3, 4, 3, 4, 3, 4]` at 160. Measured against ratatui 0.30.2's solver, not
+        // reasoned about. As a `Max`, 256 is a no-op: `Max(256)` and `Fill(1)` resolve identically
+        // at every width, so `Fill(1)` is the same behaviour written without a number that invites
+        // a reader to think it means something.
         //
-        // **The donor is `on this box`, and its price is stated rather than discovered.** Fixed at
-        // 13, its two longest cells clip: `unauthenticated` (15) renders `unauthenticat` and
-        // `choose a method` (15) renders `choose a meth`. Both are MOD-21's login flow written into
-        // a cell, and clipping them is a real loss — the reason it is the affordable one is that
-        // `on this box` carries *status words*, where `default` carries a selection coordinate and
-        // `quota` carries an exhaustion warning, and a truncated status word is still legible as
-        // itself. D76 had already ranked this column's slack last for the same reason. The `a` key
-        // is still offered on the row.
+        // What `Fill(1)` gives at each width, which is the whole of the intent: 10 at the bordered
+        // 98, 12 at 100, 32 at 120, 72 at 160, 112 at 200. **Every character a wider terminal adds
+        // goes here first**, without a cap of any kind.
         //
-        // That leaves 9 + 12 + 6 + 21 + 7 + 13 + 13 = 81 fixed, plus 7 single-space gaps, so the
-        // `Min` column draws 10 at the bordered 98 — exactly a whole name at the guard width, with
-        // nothing to spare, which is the point.
+        // Below ~98 the column yields rather than starving its neighbours, and can reach 0. That is
+        // the one thing a `Min(10)` floor would have bought, and it is not bought here: at those
+        // widths the table is already past the point of being readable — `default` gets 6 columns
+        // for a 21-character model id — so a floor would preserve the *name* of a row whose every
+        // other cell had become nonsense. The section is drawn inside a pane the app does not offer
+        // below a usable size.
         //
-        // What is *still* clipped, and is not new damage: the install progress cells, whose longest
-        // is `downloading 12.0 MB` (19). That one exceeded D76's 15 as well, so no width was ever
-        // spent on it; a clipped byte count is a figure that keeps ticking on the next frame, which
-        // is the one thing here that a status word is not.
+        // The seven fixed columns each sit at their own longest string, which is why they are the
+        // ones that do not move: `transport` (9), `models` (6) and `enabled` (7) at their headers,
+        // `billing` (12) at `subscription`, `default` (21) at `gemini-3.7-flash-high` — the model id
+        // `docs/ANA-4.md` §4.4 selects by, and D76's #1, which D89 leaves untouched — `quota` (13)
+        // at `100% to 09-08`, the exhausted window that column exists to warn about, and
+        // `on this box` (13), the donor.
         //
-        // The floor under the whole trade is that **all eight headers stay readable**, and above
-        // that floor a column may only donate what its own content does not use. There is no slack
-        // of the old `name` kind left anywhere in the row: a ninth column (MOD-23's editor,
-        // MOD-12's caps section) costs another ranking decision like this one, not an adjustment.
+        // **The donor's price is stated rather than discovered.** At 13, its two longest cells clip:
+        // `unauthenticated` (15) renders `unauthenticat` and `choose a method` (15) renders
+        // `choose a meth`. Both are MOD-21's login flow written into a cell and the loss is real.
+        // It is the affordable one because this column carries *status words*, where `default`
+        // carries a selection coordinate and `quota` carries an exhaustion warning, and a truncated
+        // status word is still legible as itself. D76 had already ranked its slack last for that
+        // reason. The `a` key is still offered on the row.
+        //
+        // A number to be sceptical of if you are reading this to add a ninth column: the 98 that
+        // every "at the bordered width" claim above refers to is **the test harness**, not a
+        // screen. `testkit.rs`'s `DEFAULT_SIZE` is 100x30 and the pane's border costs two of it.
+        // Nobody runs `htui` at 98 columns. It is the width the snapshots are pinned to, so it is
+        // the width a regression is *caught* at, which is worth something — but it is not the width
+        // the packing should be designed for, and D76's ranking was tighter than it needed to be
+        // because it treated a fixture constant as a constraint.
         let table = Table::new(
             rows,
             [
-                Constraint::Min(10),
+                Constraint::Fill(1),
                 Constraint::Length(9),
                 Constraint::Length(12),
                 Constraint::Length(6),
