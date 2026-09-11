@@ -18,14 +18,17 @@
 //! - [`StepRow`] carries `run_id` so the caller can group the second statement's rows.
 //! - [`LinkNodeRow`] carries the recursive CTE's `depth` as the `INTEGER` Postgres produces;
 //!   [`LinkNode`](htui_core::model::LinkNode) declares it as a `u8`.
+//! - [`UpstreamRow`] does the same for the amended §7.3 walk of `docs/ANA-5.md` §4.3, and joins
+//!   `project.slug` into the `qualified_key` the render and the sort both key on.
 //!
 //! Field order is load-bearing: `query_as!` binds result columns to fields positionally, so the
 //! `SELECT` list in `read.rs` is written in the order declared here.
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    AgentId, BoxId, GateOutcome, ItemId, LinkNode, ProjectId, RunId, RunKind, RunMode, RunStatus,
-    RunStepSummary, RunSummary, Status, StepId, StepStatus,
+    AgentId, BoundSkill, BoxId, GateOutcome, ItemId, LinkNode, PhaseId, ProjectId, RunId, RunKind,
+    RunMode, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId,
+    SkillVersion, Status, StepId, StepStatus, UpstreamEntry,
 };
 
 /// One `run` row with the joined `box.hostname`: every [`RunSummary`] field except `steps`.
@@ -173,5 +176,100 @@ impl LinkNodeRow {
             status: self.status,
             depth: u8::try_from(self.depth).unwrap_or(u8::MAX),
         }
+    }
+}
+
+/// One row of the amended §7.3 walk (`docs/ANA-5.md` §4.3): an [`UpstreamEntry`] whose `depth` is
+/// still the `INTEGER` the recursive CTE produces.
+///
+/// Every column arrives through a `!` / `?` override, because `query_as!` infers a recursive
+/// CTE's whole projection as nullable ([`LinkNodeRow`]'s statement is the same case).
+#[derive(Debug, Clone)]
+pub(crate) struct UpstreamRow {
+    /// `item.id`.
+    pub(crate) item_id: ItemId,
+    /// `project.slug || ':' || item.key`.
+    pub(crate) qualified_key: String,
+    /// `item.title`, raw.
+    pub(crate) title: String,
+    /// `item.status`.
+    pub(crate) status: Status,
+    /// `MIN(depth)` over every path the walk took to this item.
+    pub(crate) depth: i32,
+    /// `s.project_id IS NOT NULL`: whether the item's project is inside the bound.
+    pub(crate) in_scope: bool,
+    /// The latest `document.kind = 'summary'` body, read only for an in-scope item.
+    pub(crate) summary: Option<String>,
+}
+
+impl UpstreamRow {
+    /// This row as an [`UpstreamEntry`], narrowing `depth` to the `u8` the model declares.
+    ///
+    /// Saturating rather than `expect`, for [`LinkNodeRow::into_node`]'s reason: the walk is
+    /// bounded by `hops <= 2`, so the cast cannot lose information today and degrades into a
+    /// clamped depth rather than a panic in a read path if that bound ever widens.
+    pub(crate) fn into_entry(self) -> UpstreamEntry {
+        UpstreamEntry {
+            item_id: self.item_id,
+            qualified_key: self.qualified_key,
+            title: self.title,
+            status: self.status,
+            depth: u8::try_from(self.depth).unwrap_or(u8::MAX),
+            in_scope: self.in_scope,
+            summary: self.summary,
+        }
+    }
+}
+
+/// One `skill_binding` row with `skill.name` joined: what one level of
+/// [`PgStore::bound_skills`](crate::PgStore::bound_skills) selects before `R-SKL-2` is resolved.
+///
+/// Every `skill_binding` column is carried, not just the two
+/// [`SkillBinding::version_in_force`] reads, so [`bind`](SkillBindingRow::bind) can rebuild the
+/// real [`SkillBinding`] and call that method rather than re-deriving the pin rule from a pair of
+/// loose fields.
+#[derive(Debug, Clone)]
+pub(crate) struct SkillBindingRow {
+    /// `skill_binding.id`.
+    pub(crate) id: SkillBindingId,
+    /// `skill_binding.skill_id`.
+    pub(crate) skill_id: SkillId,
+    /// `skill_binding.project_id`.
+    pub(crate) project_id: ProjectId,
+    /// `skill_binding.phase_id`; `None` is the project level.
+    pub(crate) phase_id: Option<PhaseId>,
+    /// `skill_binding.pinned_version`; `None` follows the latest version.
+    pub(crate) pinned_version: Option<i32>,
+    /// `skill_binding.position`.
+    pub(crate) position: i32,
+    /// `skill_binding.updated_at`.
+    pub(crate) updated_at: DateTime<Utc>,
+    /// `skill.name`, joined: the `<skill name="..">` attribute and the order's tie-break.
+    pub(crate) name: String,
+}
+
+impl SkillBindingRow {
+    /// This binding resolved against `versions`, or `None` when the version in force is missing.
+    ///
+    /// `None` is `MemStore::State::bind`'s answer to the same input: a pin that cannot be honoured
+    /// renders nothing rather than quietly falling back to a body the binding did not ask for.
+    pub(crate) fn bind(self, versions: &[SkillVersion]) -> Option<BoundSkill> {
+        let binding = SkillBinding {
+            id: self.id,
+            skill_id: self.skill_id,
+            project_id: self.project_id,
+            phase_id: self.phase_id,
+            pinned_version: self.pinned_version,
+            position: self.position,
+            updated_at: self.updated_at,
+        };
+        let version = binding.version_in_force(versions)?;
+        Some(BoundSkill {
+            skill_id: binding.skill_id,
+            name: self.name,
+            version: version.version,
+            position: binding.position,
+            body: version.body.clone(),
+        })
     }
 }

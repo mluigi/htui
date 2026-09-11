@@ -698,6 +698,12 @@ impl State {
 
     /// The latest version of each named kind, in `kinds` order; an empty `kinds` means every kind
     /// the item has, in kind **byte** order (blueprint P-12).
+    ///
+    /// The `all.is_empty()` guard is not a shortcut: without it an item that has **no** documents
+    /// resolves the empty `kinds` to an empty kind list and recurses on it forever, which is a
+    /// stack overflow in a read path rather than an error a caller can see. `MemStore::demo`'s own
+    /// `htui:FEAT-3` is such an item, and `documents_of_kinds(FEAT-3, &[])` is the call that
+    /// found it.
     fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Vec<Document> {
         if kinds.is_empty() {
             let mut all: Vec<String> = self
@@ -708,6 +714,9 @@ impl State {
                 .collect();
             all.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
             all.dedup();
+            if all.is_empty() {
+                return Vec::new();
+            }
             return self.documents_of_kinds(item, &all);
         }
         kinds

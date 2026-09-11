@@ -1715,6 +1715,21 @@ async fn documents_of_kinds_latest_per_kind_in_order<S: ReadStore>(store: &S) {
             .is_empty(),
         "documents_of_kinds_latest_per_kind_in_order: an item with no documents answers none"
     );
+
+    // The two empties together, which is the combination that has to be written down: a store that
+    // resolves "every kind" by listing the item's kinds and re-entering itself has an item with no
+    // documents as its non-terminating case, and `MemStore` did — the read overflowed the stack
+    // rather than answering. It is a normal call: the preview's form of this read passes no kinds
+    // (plan D103) and an item may have no documents yet.
+    assert!(
+        store
+            .documents_of_kinds(ids::HTUI_FEAT_3, &[])
+            .await
+            .expect("documents_of_kinds_latest_per_kind_in_order: the fifth read must not fail")
+            .is_empty(),
+        "documents_of_kinds_latest_per_kind_in_order: an empty `kinds` on an item with no \
+         documents is an empty answer, not a recursion"
+    );
 }
 
 /// `ReadStore::project` answers the row with its `settings` document, and `None` for an unknown

@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 use super::CacheStore;
 use crate::error::map_sqlx;
+use crate::{MAX_UPSTREAM_HOPS, order_documents};
 
 // ------------------------------------------------------------------------------------------------
 // Decoding helpers
@@ -178,6 +179,24 @@ fn item_summary_of(row: &SqliteRow) -> Result<ItemSummary> {
         priority: get(row, "priority")?,
         required_tags: strings_col("item.required_tags", &text(row, "required_tags")?)?,
         updated_at: ts_col("item.updated_at", get(row, "updated_at")?)?,
+    })
+}
+
+/// One `document` row **with its body**, every column of §5.5's `document`.
+fn document_of(row: &SqliteRow) -> Result<Document> {
+    Ok(Document {
+        id: uuid_col("document.id", &text(row, "id")?)?,
+        item_id: uuid_col("document.item_id", &text(row, "item_id")?)?,
+        kind: text(row, "kind")?,
+        version: get(row, "version")?,
+        title: text(row, "title")?,
+        body: text(row, "body")?,
+        produced_by_step_id: opt_uuid_col::<StepId>(
+            "document.produced_by_step_id",
+            opt_text(row, "produced_by_step_id")?.as_deref(),
+        )?,
+        created_by: uuid_col::<UserId>("document.created_by", &text(row, "created_by")?)?,
+        created_at: ts_col("document.created_at", get(row, "created_at")?)?,
     })
 }
 
@@ -594,30 +613,143 @@ impl ReadStore for CacheStore {
 
     // -------------------------------------------------------------------------------------------
     // MOD-2 milestone 9's four reads. Every table they touch **is** mirrored — `document` body and
-    // all, `project.settings`, `item_link`, `workspace_project` — which is why they are trait
-    // methods rather than inherent ones (plan D96). The signatures land with the seam (T62); the
-    // bodies are T63's, and with them `store::conformance::READ_CASES` runs over the mirror.
+    // all (`0001_mirror.sql:97-101`), `project.settings` (`:57-61`), `item_link`,
+    // `workspace_project` — which is why they are trait methods rather than inherent ones
+    // (plan D96), and it is what lets `store::conformance::READ_CASES` run over the mirror.
     // -------------------------------------------------------------------------------------------
 
-    async fn document(&self, _id: DocumentId) -> Result<Option<Document>> {
-        todo!("T63: SELECT the mirrored document row with its body")
+    async fn document(&self, id: DocumentId) -> Result<Option<Document>> {
+        let row = sqlx::query(
+            "SELECT id, item_id, kind, version, title, body, produced_by_step_id, created_by, \
+             created_at FROM document WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.as_ref().map(document_of).transpose()
     }
 
-    async fn documents_of_kinds(&self, _item: ItemId, _kinds: &[String]) -> Result<Vec<Document>> {
-        todo!("T63: latest version per kind over the mirror, then the caller's order")
+    async fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Result<Vec<Document>> {
+        // `DISTINCT ON` is Postgres-only; the mirror picks the latest version per kind with the
+        // window function SQLite has had since 3.25, and `json_each` over a bound JSON array
+        // stands in for `kind = ANY($2)` (SQLite has no array type - the file's rule 1).
+        let rows = sqlx::query(
+            "SELECT id, item_id, kind, version, title, body, produced_by_step_id, created_by, \
+                    created_at \
+               FROM (SELECT d.*, ROW_NUMBER() OVER (PARTITION BY d.kind ORDER BY d.version DESC) \
+                                      AS rank_in_kind \
+                       FROM document d \
+                      WHERE d.item_id = ? \
+                        AND (json_array_length(?) = 0 \
+                             OR d.kind IN (SELECT k.value FROM json_each(?) k))) \
+              WHERE rank_in_kind = 1",
+        )
+        .bind(item.to_string())
+        .bind(serde_json::to_string(kinds).unwrap_or_else(|_| "[]".to_owned()))
+        .bind(serde_json::to_string(kinds).unwrap_or_else(|_| "[]".to_owned()))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let latest: Vec<Document> = rows.iter().map(document_of).collect::<Result<_>>()?;
+        Ok(order_documents(latest, kinds))
     }
 
+    /// `docs/ANA-9.md` §7.3 as amended by `docs/ANA-5.md` §4.3, on the mirror.
+    ///
+    /// The Postgres text of `pg/read.rs` with this file's three substitutions plus one more:
+    /// SQLite has no `LATERAL`, so the latest-summary lookup is a correlated subquery in the
+    /// `SELECT` list. The workspace is bound **twice**, positionally, rather than reused through a
+    /// `?NNN` placeholder, because every statement in this file binds plain `?` in order.
     async fn upstream_summaries(
         &self,
-        _id: ItemId,
-        _hops: u8,
-        _scope: &PromptScope,
+        id: ItemId,
+        hops: u8,
+        scope: &PromptScope,
     ) -> Result<Vec<UpstreamEntry>> {
-        todo!("T63: the amended §7.3 walk on SQLite (blueprint C.2), then sort_canonical")
+        let hops = hops.min(MAX_UPSTREAM_HOPS);
+        if hops == 0 {
+            return Ok(Vec::new());
+        }
+        let workspace = scope.workspace.map(|id| id.to_string());
+
+        let rows = sqlx::query(
+            "WITH RECURSIVE up(item_id, depth) AS ( \
+                     SELECT to_item_id, 1 FROM item_link \
+                      WHERE from_item_id = ? AND kind IN ('blocked_by','origin') \
+                 UNION \
+                     SELECT l.to_item_id, up.depth + 1 \
+                       FROM item_link l JOIN up ON l.from_item_id = up.item_id \
+                      WHERE up.depth < ? AND l.kind IN ('blocked_by','origin') \
+             ), \
+             best AS (SELECT item_id, MIN(depth) AS depth FROM up GROUP BY item_id), \
+             scope AS ( \
+                     SELECT project_id FROM workspace_project WHERE workspace_id = ? \
+                 UNION \
+                     SELECT ? WHERE ? IS NULL \
+             ) \
+             SELECT i.id AS item_id, p.slug || ':' || i.key AS qualified_key, i.title, i.status, \
+                    best.depth, \
+                    (s.project_id IS NOT NULL) AS in_scope, \
+                    CASE WHEN s.project_id IS NOT NULL THEN \
+                         (SELECT body FROM document d WHERE d.item_id = i.id AND d.kind = 'summary' \
+                           ORDER BY d.version DESC LIMIT 1) END AS summary \
+               FROM best \
+               JOIN item i    ON i.id = best.item_id \
+               JOIN project p ON p.id = i.project_id \
+               LEFT JOIN scope s ON s.project_id = i.project_id \
+              ORDER BY best.depth, qualified_key, i.id",
+        )
+        .bind(id.to_string())
+        .bind(i64::from(hops))
+        .bind(workspace.clone())
+        .bind(scope.project.to_string())
+        .bind(workspace)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in &rows {
+            entries.push(UpstreamEntry {
+                item_id: uuid_col("item.id", &text(row, "item_id")?)?,
+                qualified_key: text(row, "qualified_key")?,
+                title: text(row, "title")?,
+                status: get::<Status>(row, "status")?,
+                depth: u8::try_from(get::<i64>(row, "depth")?).unwrap_or(u8::MAX),
+                in_scope: bool_col(get::<i64>(row, "in_scope")?),
+                summary: opt_text(row, "summary")?,
+            });
+        }
+        // The mirror's `ORDER BY` is byte order and Postgres's is collation order, so neither is
+        // the contract: this is.
+        UpstreamEntry::sort_canonical(&mut entries);
+        Ok(entries)
     }
 
-    async fn project(&self, _id: ProjectId) -> Result<Option<Project>> {
-        todo!("T63: SELECT the mirrored project row with its settings")
+    async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
+        let row = sqlx::query(
+            "SELECT id, slug, name, description, secret_provider, secret_scope, settings, \
+             created_by, created_at, updated_at FROM project WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let Some(row) = row else { return Ok(None) };
+        Ok(Some(Project {
+            id: uuid_col::<ProjectId>("project.id", &text(&row, "id")?)?,
+            slug: text(&row, "slug")?,
+            name: text(&row, "name")?,
+            description: text(&row, "description")?,
+            secret_provider: opt_text(&row, "secret_provider")?,
+            secret_scope: opt_text(&row, "secret_scope")?,
+            settings: json_col("project.settings", &text(&row, "settings")?)?,
+            created_by: uuid_col::<UserId>("project.created_by", &text(&row, "created_by")?)?,
+            created_at: ts_col("project.created_at", get(&row, "created_at")?)?,
+            updated_at: ts_col("project.updated_at", get(&row, "updated_at")?)?,
+        }))
     }
 }
 

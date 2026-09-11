@@ -1880,3 +1880,188 @@ async fn an_upsert_can_neither_set_nor_clear_the_quota_columns() {
 
     db.drop_db().await;
 }
+
+/// MOD-2 milestone 9's five inherent prompt reads (blueprint B.13), against the fixture.
+///
+/// `prompt_template`, `skill`, `skill_version`, `skill_binding` and `box_tool` are the prompt
+/// inputs `docs/ANA-9.md` §4.4 does **not** mirror, so these five never became `ReadStore`
+/// methods and `Backend`'s offline arm refuses them (plan D109). What they cannot get from the
+/// conformance suite they get here: the fixture's own rows, read through Postgres, compared
+/// against the `MemStore` that the suite pins — which is only possible because `load_demo` now
+/// inserts those four tables too (blueprint E-7).
+#[tokio::test(flavor = "multi_thread")]
+async fn inherent_prompt_reads_answer_the_fixture() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mem = htui_core::store::MemStore::demo();
+
+    // Ten names, one version each, ordered by `(name, version)` in byte order (ANA-5 §4.6).
+    let templates = db
+        .store
+        .prompt_templates(ids::PROJECT_HTUI)
+        .await
+        .expect("prompt_templates must not fail");
+    assert_eq!(
+        templates.len(),
+        10,
+        "the fixture seeds one version of each of the ten default templates per project"
+    );
+    assert_eq!(
+        templates,
+        mem.prompt_templates(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore::prompt_templates"),
+        "Postgres and the reference store answer the same rows in the same order"
+    );
+    assert!(
+        templates
+            .iter()
+            .all(|row| row.project_id == ids::PROJECT_HTUI),
+        "a project's templates and no other project's"
+    );
+
+    // `R-SKL-2`: the phase binding overrides the project binding of the same skill, **once**, at
+    // the phase binding's pinned version and position.
+    let project_level = db
+        .store
+        .bound_skills(ids::PROJECT_HTUI, None)
+        .await
+        .expect("bound_skills must not fail");
+    assert_eq!(
+        project_level
+            .iter()
+            .map(|skill| (skill.name.as_str(), skill.version, skill.position))
+            .collect::<Vec<_>>(),
+        vec![("tests", 1, 0), ("rust-style", 2, 1)],
+        "with no phase the project bindings stand, ordered by (position, name bytes), and an \
+         unpinned binding follows the latest version"
+    );
+
+    let phase_level = db
+        .store
+        .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+        .await
+        .expect("bound_skills must not fail");
+    assert_eq!(
+        phase_level
+            .iter()
+            .map(|skill| (skill.name.as_str(), skill.version, skill.position))
+            .collect::<Vec<_>>(),
+        vec![("tests", 1, 0), ("rust-style", 1, 2)],
+        "the `implement` phase pins rust-style at v1 and the collapse renders it once, at the \
+         phase binding's position"
+    );
+    assert_eq!(
+        phase_level
+            .iter()
+            .filter(|skill| skill.name == "rust-style")
+            .count(),
+        1,
+        "a skill bound at both levels is rendered exactly once (R-SKL-2)"
+    );
+    assert_eq!(
+        phase_level,
+        mem.bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+            .await
+            .expect("MemStore::bound_skills"),
+        "the collapse is `BoundSkill::collapse` on both backends, bodies included"
+    );
+
+    // The box section: the probe's tools in name byte order, versions kept, `path` dropped.
+    let profile = db
+        .store
+        .box_profile(db.store.this_box())
+        .await
+        .expect("box_profile must not fail")
+        .expect("the fixture registers this box");
+    assert_eq!(
+        profile.tools,
+        vec![
+            ("cargo".to_owned(), "1.98.0".to_owned()),
+            ("cmake".to_owned(), String::new()),
+            ("git".to_owned(), "2.51.0".to_owned()),
+            ("rustc".to_owned(), "1.98.0".to_owned()),
+        ],
+        "the fixture's four `box_tool` rows, name-byte-sorted, the version-less one kept"
+    );
+    assert_eq!(
+        profile.more_tools, 0,
+        "four tools is under the cap, so nothing is reported as dropped"
+    );
+    assert_eq!(
+        profile,
+        mem.box_profile(db.store.this_box())
+            .await
+            .expect("MemStore::box_profile")
+            .expect("the fixture registers this box"),
+        "the projection is `BoxProfile::project` on both backends"
+    );
+    assert!(
+        db.store
+            .box_profile(htui_core::model::BoxId::new())
+            .await
+            .expect("an unknown box is not an error")
+            .is_none(),
+        "an id nothing has is None, not a default profile"
+    );
+
+    // ANA-5 §9's ten `app_setting` defaults, as migration `0002` seeded them.
+    let settings = db
+        .store
+        .app_settings()
+        .await
+        .expect("app_settings must not fail");
+    for (key, expected) in [
+        ("token_budget", 120_000_i64),
+        ("prompt_upstream_hops", 2),
+        ("max_skill_tokens", 20_000),
+        ("excerpt_max_files", 12),
+        ("excerpt_file_line_cap", 400),
+        ("excerpt_head_lines", 200),
+        ("excerpt_max_file_bytes", 524_288),
+        ("excerpt_max_scan_files", 20_000),
+        ("excerpt_provider_deadline_ms", 1_500),
+    ] {
+        assert_eq!(
+            settings.get(key).and_then(serde_json::Value::as_i64),
+            Some(expected),
+            "app_setting.{key} is the ANA-5 §9 default the migration seeded"
+        );
+    }
+    assert_eq!(
+        settings
+            .get("prompt_reserve_fraction")
+            .and_then(serde_json::Value::as_f64),
+        Some(0.10),
+        "the tenth key is the one fractional default"
+    );
+
+    // `item_kind`, the read `{{item_kind}}` needs and §6.1 returns nowhere (blueprint E-6).
+    let item = db
+        .store
+        .item(ids::HTUI_FEAT_1)
+        .await
+        .expect("item must not fail")
+        .expect("the fixture holds FEAT-1");
+    let kind = db
+        .store
+        .item_kind(item.kind_id)
+        .await
+        .expect("item_kind must not fail")
+        .expect("every item's kind_id references a row");
+    assert_eq!(
+        (kind.prefix.as_str(), kind.name.as_str()),
+        ("FEAT", "feature"),
+        "the kind behind FEAT-1 is the one the key prefix names"
+    );
+    assert_eq!(
+        Some(kind),
+        mem.item_kind(item.kind_id)
+            .await
+            .expect("MemStore::item_kind"),
+        "the two backends answer the same row"
+    );
+
+    db.drop_db().await;
+}

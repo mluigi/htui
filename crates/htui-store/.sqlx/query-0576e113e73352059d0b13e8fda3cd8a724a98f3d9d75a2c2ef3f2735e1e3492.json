@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT b.id         AS \"id: htui_core::model::SkillBindingId\",\n                       b.skill_id   AS \"skill_id: SkillId\",\n                       b.project_id AS \"project_id: ProjectId\",\n                       b.phase_id   AS \"phase_id: PhaseId\",\n                       b.pinned_version,\n                       b.position,\n                       b.updated_at,\n                       s.name\n                  FROM skill_binding b JOIN skill s ON s.id = b.skill_id\n                 WHERE b.project_id = $1 AND b.phase_id = $2\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: htui_core::model::SkillBindingId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "skill_id: SkillId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "skill_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "project_id: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "phase_id: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "phase_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "pinned_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "pinned_version"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skill",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0576e113e73352059d0b13e8fda3cd8a724a98f3d9d75a2c2ef3f2735e1e3492"
+}

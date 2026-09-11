@@ -11,11 +11,14 @@
 //! (blueprint A.8). Result columns come back through the type-override syntax, which only needs
 //! `Decode`.
 
+use std::collections::BTreeMap;
+
 use htui_core::model::{
-    Agent, AgentBox, AgentId, AgentSummary, BoxInfo, Document, DocumentHead, DocumentId, Item,
-    ItemFilter, ItemId, LinkEdge, LinkGraph, LinkKind, Note, Project, ProjectId, ProjectRef,
-    PromptScope, RunId, RunStepSummary, RunSummary, Scope, SessionEvent, StepId, UpstreamEntry,
-    WorkspaceSummary,
+    Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
+    BoxTool, Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
+    LinkEdge, LinkGraph, LinkKind, Note, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
+    PromptTemplate, RunId, RunStepSummary, RunSummary, Scope, SessionEvent, SkillId, SkillVersion,
+    StepId, UpstreamEntry, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -23,7 +26,8 @@ use uuid::Uuid;
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
-use crate::pg::rows::{LinkNodeRow, RunRow, StepRow};
+use crate::pg::rows::{LinkNodeRow, RunRow, SkillBindingRow, StepRow, UpstreamRow};
+use crate::{MAX_UPSTREAM_HOPS, order_documents};
 
 /// The `status IN (...)` list `active_runs` spells out, because `query!` needs a literal and
 /// cannot read a Rust constant.
@@ -387,30 +391,179 @@ impl ReadStore for PgStore {
     }
 
     // -------------------------------------------------------------------------------------------
-    // MOD-2 milestone 9's four reads. The signatures land with the seam (T62) so the workspace
-    // compiles against one trait; the bodies — the amended §7.3 recursive CTE of blueprint C.1
-    // among them — are T63's, with the `.sqlx` data they need.
+    // MOD-2 milestone 9's four reads (`docs/ANA-5.md` §8). Every table they touch is mirrored, so
+    // `CacheStore` answers them too and `store::conformance::READ_CASES` runs over both.
     // -------------------------------------------------------------------------------------------
 
-    async fn document(&self, _id: DocumentId) -> Result<Option<Document>> {
-        todo!("T63: SELECT the document row with its body")
+    /// One document **with its body**, or `None` when no row has that id.
+    async fn document(&self, id: DocumentId) -> Result<Option<Document>> {
+        sqlx::query_as!(
+            Document,
+            r#"
+            SELECT id                  AS "id: DocumentId",
+                   item_id             AS "item_id: ItemId",
+                   kind,
+                   version,
+                   title,
+                   body,
+                   produced_by_step_id AS "produced_by_step_id: StepId",
+                   created_by          AS "created_by: htui_core::model::UserId",
+                   created_at
+              FROM document WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
-    async fn documents_of_kinds(&self, _item: ItemId, _kinds: &[String]) -> Result<Vec<Document>> {
-        todo!("T63: DISTINCT ON (kind) ... ORDER BY kind, version DESC, then the caller's order")
+    /// The latest version of each `kind`, **in `kinds` order**; an empty `kinds` is every kind the
+    /// item has, in kind byte order.
+    ///
+    /// `DISTINCT ON (kind) ... ORDER BY kind, version DESC` is the latest-per-kind pick; the
+    /// caller's order is then applied in Rust rather than in SQL, because it is an arbitrary
+    /// permutation no `ORDER BY` expresses and because Postgres would sort the empty case by
+    /// collation where `MemStore` and the mirror sort by bytes
+    /// ([`UpstreamEntry::sort_canonical`] gives the argument in full).
+    async fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Result<Vec<Document>> {
+        let latest = sqlx::query_as!(
+            Document,
+            r#"
+            SELECT DISTINCT ON (kind)
+                   id                  AS "id: DocumentId",
+                   item_id             AS "item_id: ItemId",
+                   kind,
+                   version,
+                   title,
+                   body,
+                   produced_by_step_id AS "produced_by_step_id: StepId",
+                   created_by          AS "created_by: htui_core::model::UserId",
+                   created_at
+              FROM document
+             WHERE item_id = $1 AND (cardinality($2::text[]) = 0 OR kind = ANY($2))
+             ORDER BY kind, version DESC
+            "#,
+            item.as_uuid(),
+            kinds,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(order_documents(latest, kinds))
     }
 
+    /// `docs/ANA-9.md` §7.3 as amended by `docs/ANA-5.md` §4.3, in one round trip.
+    ///
+    /// `best` is the amendment that matters: the shipped `UNION` dedups whole rows, that is
+    /// `(item_id, depth)` pairs, so a diamond emitted its apex twice and the prompt digest became
+    /// a function of edge insertion order. `MIN(depth)` collapses it to one row at the nearest
+    /// hop. The scope CTE is the workspace's projects, or — with no workspace (`R-ENT-2`) — the
+    /// one project the caller named, and it gates only the `summary` projection, never the walk:
+    /// an out-of-scope item is still reached and rendered as the `R-PRM-2` stub.
+    ///
+    /// The `ORDER BY` is there for readability and is **not** the contract:
+    /// [`UpstreamEntry::sort_canonical`] re-sorts in Rust, because Postgres orders
+    /// `qualified_key` by the database collation and the SQLite mirror by byte value.
+    ///
+    /// Three of the `!` overrides are load-bearing and were measured one at a time:
+    /// `qualified_key` (a `||` expression), `depth` (a `MIN` aggregate) and `in_scope` (an
+    /// `IS NOT NULL` predicate). `item_id`, `title` and `status` come through an ordinary inner
+    /// join and sqlx types them `NOT NULL` unaided, so the blueprint's "a recursive CTE makes
+    /// every column nullable" is true of the computed columns only; theirs are kept for the reason
+    /// [`links`](ReadStore::links) keeps its whole set — the inference is the macro's, not the
+    /// schema's, and a `!` on a column that is already non-null costs nothing.
     async fn upstream_summaries(
         &self,
-        _id: ItemId,
-        _hops: u8,
-        _scope: &PromptScope,
+        id: ItemId,
+        hops: u8,
+        scope: &PromptScope,
     ) -> Result<Vec<UpstreamEntry>> {
-        todo!("T63: the amended §7.3 recursive CTE (blueprint C.1), then sort_canonical")
+        // `hops == 0` is no upstream at all - unlike `links(id, 0)`, the root is the step's own
+        // item and is never an entry - and the anchor term of the CTE has no depth guard of its
+        // own, so the zero case has to be answered before the round trip rather than by the SQL.
+        let hops = hops.min(MAX_UPSTREAM_HOPS);
+        if hops == 0 {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query_as!(
+            UpstreamRow,
+            r#"
+            WITH RECURSIVE up AS (
+                    SELECT l.to_item_id AS item_id, 1 AS depth
+                      FROM item_link l
+                     WHERE l.from_item_id = $1
+                       AND l.kind IN ('blocked_by','origin') AND l.deleted_at IS NULL
+                UNION
+                    SELECT l.to_item_id, up.depth + 1
+                      FROM item_link l JOIN up ON l.from_item_id = up.item_id
+                     WHERE up.depth < $2::int
+                       AND l.kind IN ('blocked_by','origin') AND l.deleted_at IS NULL
+            ),
+            best AS (SELECT item_id, MIN(depth) AS depth FROM up GROUP BY item_id),
+            scope AS (
+                    SELECT project_id FROM workspace_project WHERE workspace_id = $3::uuid
+                UNION
+                    SELECT $4::uuid WHERE $3::uuid IS NULL
+            )
+            SELECT i.id                       AS "item_id!: ItemId",
+                   p.slug || ':' || i.key     AS "qualified_key!",
+                   i.title                    AS "title!",
+                   i.status                   AS "status!: htui_core::model::Status",
+                   best.depth                 AS "depth!",
+                   (s.project_id IS NOT NULL) AS "in_scope!",
+                   CASE WHEN s.project_id IS NOT NULL THEN d.body END AS "summary?"
+              FROM best
+              JOIN item i    ON i.id = best.item_id
+              JOIN project p ON p.id = i.project_id
+              LEFT JOIN scope s ON s.project_id = i.project_id
+              LEFT JOIN LATERAL (SELECT body FROM document
+                                  WHERE item_id = i.id AND kind = 'summary'
+                                  ORDER BY version DESC LIMIT 1) d ON TRUE
+             -- The key is spelled out rather than referenced as `qualified_key`: the `!` of the
+             -- nullability override is part of the quoted output name Postgres sees, so the alias
+             -- an `ORDER BY` could use is `"qualified_key!"` and not `qualified_key`.
+             ORDER BY best.depth, p.slug || ':' || i.key, i.id
+            "#,
+            id.as_uuid(),
+            i32::from(hops),
+            scope.workspace.map(htui_core::model::WorkspaceId::as_uuid),
+            scope.project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let mut entries: Vec<UpstreamEntry> =
+            rows.into_iter().map(UpstreamRow::into_entry).collect();
+        UpstreamEntry::sort_canonical(&mut entries);
+        Ok(entries)
     }
 
-    async fn project(&self, _id: ProjectId) -> Result<Option<Project>> {
-        todo!("T63: SELECT the project row with its settings")
+    /// One project row with its `settings`, or `None` when no row has that id.
+    async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
+        sqlx::query_as!(
+            Project,
+            r#"
+            SELECT id              AS "id: ProjectId",
+                   slug,
+                   name,
+                   description,
+                   secret_provider,
+                   secret_scope,
+                   settings,
+                   created_by      AS "created_by: htui_core::model::UserId",
+                   created_at,
+                   updated_at
+              FROM project WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 }
 
@@ -658,6 +811,247 @@ impl PgStore {
         sqlx::query_scalar!(
             "SELECT settings FROM project WHERE id = $1",
             project.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // MOD-2 milestone 9's five prompt reads (`docs/ANA-5.md` §8, blueprint B.13).
+    //
+    // Inherent for the reason `agents` is, and a stronger one: `prompt_template`, `skill`,
+    // `skill_version`, `skill_binding` and `box_tool` are absent from the mirrored table list
+    // (`docs/ANA-9.md` §4.4), so no offline backend could answer them and `Backend`'s `Offline`
+    // arm refuses with `PROMPT_ON_SERVER_ONLY` (plan D109). Each signature is `MemStore`'s to the
+    // byte, which is what lets `Backend` dispatch over both without a third trait.
+    // -------------------------------------------------------------------------------------------
+
+    /// A project's `prompt_template` rows, ordered by `(name, version)` (`docs/ANA-5.md` §4.6).
+    ///
+    /// Every version, not the latest per name: a phase may pin `template_version`, and picking
+    /// here would hide the pin. `COLLATE "C"` rather than a bare `ORDER BY name`, so the order is
+    /// the byte order `MemStore` sorts by and not the database's collation — the same argument
+    /// [`UpstreamEntry::sort_canonical`] makes, applied where a re-sort in Rust would be the only
+    /// other answer.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn prompt_templates(&self, project: ProjectId) -> Result<Vec<PromptTemplate>> {
+        sqlx::query_as!(
+            PromptTemplate,
+            r#"
+            SELECT id         AS "id: htui_core::model::PromptTemplateId",
+                   project_id AS "project_id: ProjectId",
+                   name,
+                   version,
+                   body,
+                   created_by AS "created_by: htui_core::model::UserId",
+                   created_at,
+                   updated_at
+              FROM prompt_template
+             WHERE project_id = $1
+             ORDER BY name COLLATE "C", version
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// The skills in force for a project, or for one phase of it: `R-SKL-2`'s collapse
+    /// (`docs/ANA-5.md` §4.2), already resolved to a version and a body.
+    ///
+    /// Two `SELECT`s — the project level (`phase_id IS NULL`) and the phase level — and then
+    /// [`BoundSkill::collapse`] in Rust, exactly as `MemStore` does. The override rule and the
+    /// render order therefore have **one** definition rather than one per backend; expressing
+    /// `R-SKL-2` a second time in SQL would be a copy to keep in step.
+    /// [`SkillBinding::version_in_force`](htui_core::model::SkillBinding::version_in_force)
+    /// resolves `pinned_version` against the same rows for the
+    /// same reason, and a pin that names no `skill_version` drops the binding rather than
+    /// rendering it bodiless.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn bound_skills(
+        &self,
+        project: ProjectId,
+        phase: Option<PhaseId>,
+    ) -> Result<Vec<BoundSkill>> {
+        // Every version of every skill this project binds, once: `version_in_force` ignores
+        // another skill's rows, so one statement answers every binding of both levels.
+        let versions = sqlx::query_as!(
+            SkillVersion,
+            r#"
+            SELECT v.skill_id  AS "skill_id: SkillId",
+                   v.version,
+                   v.body,
+                   v.created_by AS "created_by: htui_core::model::UserId",
+                   v.created_at
+              FROM skill_version v
+             WHERE v.skill_id IN (SELECT skill_id FROM skill_binding WHERE project_id = $1)
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let project_level = sqlx::query_as!(
+            SkillBindingRow,
+            r#"
+            SELECT b.id         AS "id: htui_core::model::SkillBindingId",
+                   b.skill_id   AS "skill_id: SkillId",
+                   b.project_id AS "project_id: ProjectId",
+                   b.phase_id   AS "phase_id: PhaseId",
+                   b.pinned_version,
+                   b.position,
+                   b.updated_at,
+                   s.name
+              FROM skill_binding b JOIN skill s ON s.id = b.skill_id
+             WHERE b.project_id = $1 AND b.phase_id IS NULL
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let phase_level = match phase {
+            None => Vec::new(),
+            Some(phase) => sqlx::query_as!(
+                SkillBindingRow,
+                r#"
+                SELECT b.id         AS "id: htui_core::model::SkillBindingId",
+                       b.skill_id   AS "skill_id: SkillId",
+                       b.project_id AS "project_id: ProjectId",
+                       b.phase_id   AS "phase_id: PhaseId",
+                       b.pinned_version,
+                       b.position,
+                       b.updated_at,
+                       s.name
+                  FROM skill_binding b JOIN skill s ON s.id = b.skill_id
+                 WHERE b.project_id = $1 AND b.phase_id = $2
+                "#,
+                project.as_uuid(),
+                phase.as_uuid(),
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+        };
+
+        let bind = |rows: Vec<SkillBindingRow>| -> Vec<BoundSkill> {
+            rows.into_iter()
+                .filter_map(|row| row.bind(&versions))
+                .collect()
+        };
+        Ok(BoundSkill::collapse(bind(project_level), bind(phase_level)))
+    }
+
+    /// One box projected for the prompt's `box` section, or `None` when no row has that id.
+    ///
+    /// The `box_tool` join is [`BoxProfile::project`]'s: name byte order, capped at
+    /// [`BoxProfile::MAX_TOOLS`], `path` dropped because §4.2 rule 5 forbids an absolute
+    /// filesystem path anywhere in a prompt. The statement's `ORDER BY name` is readability only —
+    /// the projection re-sorts by bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn box_profile(&self, id: BoxId) -> Result<Option<BoxProfile>> {
+        let Some(row) = sqlx::query_as!(
+            BoxRow,
+            r#"
+            SELECT id             AS "id: BoxId",
+                   user_id        AS "user_id: htui_core::model::UserId",
+                   hostname,
+                   os_family      AS "os_family: htui_core::model::OsFamily",
+                   os_version,
+                   arch,
+                   cpu,
+                   ram_mb,
+                   gpu_present,
+                   gpu_vendor,
+                   htui_version,
+                   probed_tags,
+                   declared_tags,
+                   quirks,
+                   settings,
+                   registered_at,
+                   last_seen_at,
+                   last_probed_at,
+                   updated_at
+              FROM box WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        else {
+            return Ok(None);
+        };
+
+        let tools = sqlx::query_as!(
+            BoxTool,
+            r#"
+            SELECT box_id AS "box_id: BoxId", name, version, path, probed_at
+              FROM box_tool WHERE box_id = $1 ORDER BY name
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(Some(BoxProfile::project(&row, tools)))
+    }
+
+    /// Every `app_setting` row, keyed by name: the last rung of the prompt's settings chain
+    /// (`docs/ANA-5.md` §4.4).
+    ///
+    /// A [`BTreeMap`] and not a [`HashMap`](std::collections::HashMap): the assembler records
+    /// which rung answered, and a map iterated in hash order would make that record depend on the
+    /// process's random state.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn app_settings(&self) -> Result<BTreeMap<String, Value>> {
+        let rows = sqlx::query!(r#"SELECT key, value FROM app_setting ORDER BY key"#)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(rows.into_iter().map(|row| (row.key, row.value)).collect())
+    }
+
+    /// One `item_kind` row, or `None` when no row has that id.
+    ///
+    /// The prompt's `{{item}}` section names the kind and `item` carries only `kind_id`; §6.1
+    /// returns the kind nowhere, so the assembler's caller reads it here (blueprint E-6).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn item_kind(&self, id: ItemKindId) -> Result<Option<ItemKind>> {
+        sqlx::query_as!(
+            ItemKind,
+            r#"
+            SELECT id               AS "id: ItemKindId",
+                   project_id       AS "project_id: ProjectId",
+                   prefix,
+                   name,
+                   description,
+                   default_graph_id AS "default_graph_id: htui_core::model::StepGraphId",
+                   position,
+                   updated_at
+              FROM item_kind WHERE id = $1
+            "#,
+            id.as_uuid(),
         )
         .fetch_optional(&self.pool)
         .await

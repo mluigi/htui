@@ -18,18 +18,21 @@
 //! Both claims are documented here and deliberately not covered by a compile-fail test: they are
 //! not worth a `trybuild` dependency.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    AgentSummary, BoxInfo, Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId,
-    ItemSummary, LinkGraph, Note, Project, ProjectId, ProjectRef, PromptScope, RunSummary, Scope,
-    SessionEvent, StepId, UpstreamEntry, UserId, WorkspaceSummary,
+    AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, Document, DocumentHead, DocumentId, Item,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemSummary, LinkGraph, Note, PhaseId, Project,
+    ProjectId, ProjectRef, PromptScope, PromptTemplate, RunSummary, Scope, SessionEvent, StepId,
+    UpstreamEntry, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
 
 use crate::cache::CacheStore;
 use crate::pg::PgStore;
-use crate::writer::{BufferedWriter, Writer};
+use crate::writer::{BufferedWriter, PROMPT_ON_SERVER_ONLY, Writer};
 
 /// Seconds in a minute and minutes in an hour: the two thresholds of [`Backend::label`].
 const MINUTE: i64 = 60;
@@ -317,6 +320,103 @@ impl Backend {
             Self::Offline { cache, .. } => cache.project_settings(project).await,
         }
     }
+
+    // -------------------------------------------------------------------------------------------
+    // MOD-2 milestone 9's five prompt reads (blueprint B.13).
+    //
+    // Three arms like every inherent read above, except that the offline one **refuses**:
+    // `prompt_template`, `skill`, `skill_version`, `skill_binding` and `box_tool` are absent from
+    // the mirrored table list (`docs/ANA-9.md` §4.4), so there is nothing for `CacheStore` to
+    // answer from and nothing to stand in with. Plan D109 made that refusal the product's
+    // direction rather than a milestone expedient: `htui` is an online-only program, and a preview
+    // rendered from compiled-in defaults would be bytes no run produces.
+    // -------------------------------------------------------------------------------------------
+
+    /// A project's `prompt_template` rows, ordered by `(name, version)` (`docs/ANA-5.md` §4.6).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`PROMPT_ON_SERVER_ONLY`].
+    pub async fn prompt_templates(&self, project: ProjectId) -> Result<Vec<PromptTemplate>> {
+        match self {
+            Self::Memory(store) => store.prompt_templates(project).await,
+            Self::Online { pg, .. } => pg.prompt_templates(project).await,
+            Self::Offline { .. } => Err(prompt_offline()),
+        }
+    }
+
+    /// The skills in force for a project, or for one phase of it: `R-SKL-2`'s collapse
+    /// (`docs/ANA-5.md` §4.2).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`PROMPT_ON_SERVER_ONLY`].
+    pub async fn bound_skills(
+        &self,
+        project: ProjectId,
+        phase: Option<PhaseId>,
+    ) -> Result<Vec<BoundSkill>> {
+        match self {
+            Self::Memory(store) => store.bound_skills(project, phase).await,
+            Self::Online { pg, .. } => pg.bound_skills(project, phase).await,
+            Self::Offline { .. } => Err(prompt_offline()),
+        }
+    }
+
+    /// One box projected for the prompt's `box` section, or `None` when no row has that id.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`PROMPT_ON_SERVER_ONLY`].
+    pub async fn box_profile(&self, id: BoxId) -> Result<Option<BoxProfile>> {
+        match self {
+            Self::Memory(store) => store.box_profile(id).await,
+            Self::Online { pg, .. } => pg.box_profile(id).await,
+            Self::Offline { .. } => Err(prompt_offline()),
+        }
+    }
+
+    /// Every `app_setting` row, keyed by name: the last rung of the prompt's settings chain
+    /// (`docs/ANA-5.md` §4.4).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`PROMPT_ON_SERVER_ONLY`].
+    pub async fn app_settings(&self) -> Result<BTreeMap<String, Value>> {
+        match self {
+            Self::Memory(store) => store.app_settings().await,
+            Self::Online { pg, .. } => pg.app_settings().await,
+            Self::Offline { .. } => Err(prompt_offline()),
+        }
+    }
+
+    /// One `item_kind` row, or `None` when no row has that id.
+    ///
+    /// Refused offline with the other four even though `item_kind` **is** mirrored
+    /// (`0001_mirror.sql:69-73`): it is read only as one input of the prompt spec, and a preview
+    /// that resolved the kind and then failed on the template would be a slower refusal telling
+    /// the user the same thing (plan D109).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`PROMPT_ON_SERVER_ONLY`].
+    pub async fn item_kind(&self, id: ItemKindId) -> Result<Option<ItemKind>> {
+        match self {
+            Self::Memory(store) => store.item_kind(id).await,
+            Self::Online { pg, .. } => pg.item_kind(id).await,
+            Self::Offline { .. } => Err(prompt_offline()),
+        }
+    }
+}
+
+/// The one sentence every offline prompt read answers with (plan D109).
+fn prompt_offline() -> StoreError {
+    StoreError::Unreachable(PROMPT_ON_SERVER_ONLY.to_owned())
 }
 
 /// The dispatch rule of plan D12: [`Backend::Online`] reads go to **Postgres**, never to the

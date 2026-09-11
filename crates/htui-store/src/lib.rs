@@ -29,6 +29,47 @@ pub use identity::Identity;
 pub use pg::{Connected, MigrationState, PgStore};
 pub use writer::{BufferedWriter, PROMPT_ON_SERVER_ONLY, REGISTRY_ON_SERVER_ONLY, Writer};
 
+/// The hop ceiling of the amended §7.3 upstream walk (`docs/ANA-5.md` §4.3).
+///
+/// `R-PRM-1` says "one to two hops", so `2` is the ceiling and `0` is answered without a round
+/// trip: the anchor term of the recursive CTE has no depth guard of its own, and unlike
+/// `ReadStore::links(id, 0)` the root is the step's own item and is never an upstream entry.
+/// `MemStore` clamps identically (`store::mem`), which is what lets the three backends agree on a
+/// `hops` the caller did not sanitise.
+pub(crate) const MAX_UPSTREAM_HOPS: u8 = 2;
+
+/// [`htui_core::store::ReadStore::documents_of_kinds`]' ordering, applied in Rust by both SQL
+/// backends over the latest-per-kind rows their statement returned.
+///
+/// The caller's order is an arbitrary permutation no `ORDER BY` expresses, and it is the contract:
+/// `docs/ANA-5.md` §4.7 rule 3 renders documents in the phase's `input_kinds` order and the prompt
+/// digest is a function of that order. An empty `kinds` is every kind the item has in kind **byte**
+/// order, for the reason
+/// [`UpstreamEntry::sort_canonical`](htui_core::model::UpstreamEntry::sort_canonical) gives:
+/// Postgres would otherwise order by collation and the mirror by bytes.
+///
+/// A kind the item has no row for is omitted rather than an error; a kind named twice is returned
+/// twice, which is what `MemStore` does with the same input.
+pub(crate) fn order_documents(
+    latest: Vec<htui_core::model::Document>,
+    kinds: &[String],
+) -> Vec<htui_core::model::Document> {
+    if kinds.is_empty() {
+        let mut every = latest;
+        every.sort_by(|left, right| left.kind.as_bytes().cmp(right.kind.as_bytes()));
+        return every;
+    }
+    kinds
+        .iter()
+        .filter_map(|kind| {
+            latest
+                .iter()
+                .find(|document| &document.kind == kind)
+                .cloned()
+        })
+        .collect()
+}
+
 /// The embedded Postgres schema (ANA-9 §5), applied by [`PgStore::apply_migrations`].
 ///
 /// Forward-only: a later ANA adds `000N_*.sql` next to `0001_init.sql` and never edits it, because

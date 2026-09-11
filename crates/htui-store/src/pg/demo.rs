@@ -13,7 +13,8 @@
 use htui_core::fixtures::DemoData;
 use htui_core::model::{
     AgentId, BoxId, CommandQueue, DocumentId, Gate, GateOutcome, Isolation, ItemId, ItemKindId,
-    NoteId, ProjectId, RunId, StepGraphId, StepId, UserId, WorkspaceId,
+    NoteId, PhaseId, ProjectId, RunId, SkillBindingId, SkillId, StepGraphId, StepId, UserId,
+    WorkspaceId,
 };
 use htui_core::store::Result;
 
@@ -24,8 +25,15 @@ impl PgStore {
     /// Loads a [`DemoData`] fixture with its own ids and timestamps, in foreign-key order.
     ///
     /// `DemoData` has no `repo`, `repo_box_path`, `workspace_box_path`, `capability_tag`,
-    /// `phase_agent`, `agent_box`, `skill*`, `run_step_commit`, `command_run` or `app_setting`
-    /// field, so those tables are left alone.
+    /// `phase_agent`, `agent_box`, `run_step_commit`, `command_run` or `app_setting` field, so
+    /// those tables are left alone. `repo` stays on that list by plan D110, which dropped the
+    /// fixture rows this milestone would otherwise have added.
+    ///
+    /// `skill`, `skill_version`, `skill_binding` and `box_tool` came **off** it in milestone 9
+    /// (blueprint E-7): the fixture carries those rows for `MemStore`, and a loader that skipped
+    /// them would run `PgStore::bound_skills` and `PgStore::box_profile` against empty tables
+    /// while `MemStore` answered from the fixture — two backends the conformance suite could not
+    /// compare.
     ///
     /// Takes `&mut self` because the fixture also names the box and the author the store points at
     /// (`this_box`, `this_user`), exactly as `MemStore::from_demo` does; the blueprint's `&self`
@@ -233,6 +241,73 @@ impl PgStore {
                 row.body,
                 UserId::as_uuid(row.created_by),
                 row.created_at,
+                row.updated_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        // `box_tool` and the three `skill` tables, in foreign-key order: `skill` before its
+        // versions and its bindings, and the bindings after `step_graph_phase` (inserted above)
+        // because a phase-level binding references one. `box_tool` needs only the `box` rows from
+        // the top of this transaction.
+        for row in &data.box_tools {
+            sqlx::query!(
+                "INSERT INTO box_tool (box_id, name, version, path, probed_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                BoxId::as_uuid(row.box_id),
+                row.name,
+                row.version,
+                row.path,
+                row.probed_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        for row in &data.skills {
+            sqlx::query!(
+                "INSERT INTO skill (id, name, description, created_by, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                SkillId::as_uuid(row.id),
+                row.name,
+                row.description,
+                UserId::as_uuid(row.created_by),
+                row.created_at,
+                row.updated_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        for row in &data.skill_versions {
+            sqlx::query!(
+                "INSERT INTO skill_version (skill_id, version, body, created_by, created_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                SkillId::as_uuid(row.skill_id),
+                row.version,
+                row.body,
+                UserId::as_uuid(row.created_by),
+                row.created_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        for row in &data.skill_bindings {
+            sqlx::query!(
+                "INSERT INTO skill_binding (id, skill_id, project_id, phase_id, pinned_version, \
+                 position, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                SkillBindingId::as_uuid(row.id),
+                SkillId::as_uuid(row.skill_id),
+                ProjectId::as_uuid(row.project_id),
+                row.phase_id.map(PhaseId::as_uuid),
+                row.pinned_version,
+                row.position,
                 row.updated_at,
             )
             .execute(&mut *tx)

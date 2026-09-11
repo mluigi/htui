@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH RECURSIVE up AS (\n                    SELECT l.to_item_id AS item_id, 1 AS depth\n                      FROM item_link l\n                     WHERE l.from_item_id = $1\n                       AND l.kind IN ('blocked_by','origin') AND l.deleted_at IS NULL\n                UNION\n                    SELECT l.to_item_id, up.depth + 1\n                      FROM item_link l JOIN up ON l.from_item_id = up.item_id\n                     WHERE up.depth < $2::int\n                       AND l.kind IN ('blocked_by','origin') AND l.deleted_at IS NULL\n            ),\n            best AS (SELECT item_id, MIN(depth) AS depth FROM up GROUP BY item_id),\n            scope AS (\n                    SELECT project_id FROM workspace_project WHERE workspace_id = $3::uuid\n                UNION\n                    SELECT $4::uuid WHERE $3::uuid IS NULL\n            )\n            SELECT i.id                       AS \"item_id!: ItemId\",\n                   p.slug || ':' || i.key     AS \"qualified_key!\",\n                   i.title                    AS \"title!\",\n                   i.status                   AS \"status!: htui_core::model::Status\",\n                   best.depth                 AS \"depth!\",\n                   (s.project_id IS NOT NULL) AS \"in_scope!\",\n                   CASE WHEN s.project_id IS NOT NULL THEN d.body END AS \"summary?\"\n              FROM best\n              JOIN item i    ON i.id = best.item_id\n              JOIN project p ON p.id = i.project_id\n              LEFT JOIN scope s ON s.project_id = i.project_id\n              LEFT JOIN LATERAL (SELECT body FROM document\n                                  WHERE item_id = i.id AND kind = 'summary'\n                                  ORDER BY version DESC LIMIT 1) d ON TRUE\n             -- The key is spelled out rather than referenced as `qualified_key`: the `!` of the\n             -- nullability override is part of the quoted output name Postgres sees, so the alias\n             -- an `ORDER BY` could use is `\"qualified_key!\"` and not `qualified_key`.\n             ORDER BY best.depth, p.slug || ':' || i.key, i.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id!: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "qualified_key!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "title!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status!: htui_core::model::Status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "depth!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "in_scope!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "summary?",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      false,
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "2a6b73d9c29b1b4c746e07eef521ae8ed8ec9a7634a154cfb4fb708b540466ce"
+}

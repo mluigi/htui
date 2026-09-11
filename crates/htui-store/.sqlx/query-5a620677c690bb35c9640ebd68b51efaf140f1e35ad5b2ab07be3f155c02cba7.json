@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT v.skill_id  AS \"skill_id: SkillId\",\n                   v.version,\n                   v.body,\n                   v.created_by AS \"created_by: htui_core::model::UserId\",\n                   v.created_at\n              FROM skill_version v\n             WHERE v.skill_id IN (SELECT skill_id FROM skill_binding WHERE project_id = $1)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "skill_id: SkillId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_version",
+            "name": "skill_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "skill_version",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "body",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skill_version",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_by: htui_core::model::UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_version",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "skill_version",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5a620677c690bb35c9640ebd68b51efaf140f1e35ad5b2ab07be3f155c02cba7"
+}

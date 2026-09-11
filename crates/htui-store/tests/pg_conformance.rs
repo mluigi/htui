@@ -41,3 +41,29 @@ async fn pg_store_conformance() {
         db.drop_db().await;
     }
 }
+
+/// MOD-2 milestone 9's read suite (plan D96's `READ_CASES`) run against `PgStore`.
+///
+/// A second loop rather than six more entries in `CASES`: `run_case` is bound to `WriteStore` and
+/// eleven of its cases write, so the bound could not be relaxed without splitting every one of
+/// them. `READ_CASES` is additive, and running it here is one half of what makes ANA-5 §12
+/// criterion 7's "the same diamond read through `PgStore` and through `CacheStore` renders
+/// byte-identically" a test — `cache.rs::the_mirror_passes_the_read_cases` is the other.
+///
+/// One database per case for `pg_store_conformance`'s reason, even though no read case writes:
+/// the loop is the same shape and a read case that grew a write later would not need this file
+/// reopened.
+#[cfg(feature = "demo")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_store_read_conformance() {
+    use htui_core::store::conformance;
+
+    for name in conformance::READ_CASES {
+        let Some(db) = common::demo_db().await else {
+            return; // `common` printed the skip line already (plan D13).
+        };
+        println!("read case {name}");
+        conformance::run_read_case(name, &db.store).await;
+        db.drop_db().await;
+    }
+}

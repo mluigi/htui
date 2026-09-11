@@ -20,8 +20,8 @@ use std::path::Path;
 use chrono::{TimeDelta, Utc};
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
-    EventKind, EventRole, ItemFilter, LinkGraph, ProjectId, RunId, Scope, SessionEvent, StepId,
-    UserId, WorkspaceSummary,
+    EventKind, EventRole, ItemFilter, LinkGraph, ProjectId, PromptScope, RunId, Scope,
+    SessionEvent, StepId, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore as _, StoreError};
 use htui_store::cache::pending::{append_pending, seal_orphaned, seal_pending, upload_pending};
@@ -225,6 +225,103 @@ async fn a_pass_mirrors_the_demo_projects() {
     teardown(db, &[&cache]).await;
 }
 
+/// `document` and `documents_of_kinds` over the mirror, against the reference store.
+///
+/// One of the three halves of [`mirror_reads_equal_the_reference_store`]'s milestone-9 additions.
+/// Functions rather than three more blocks inline, so the case above stays readable at the length
+/// the four new reads take it to; the assertions are that case's, and it is the only caller.
+async fn documents_agree(cache: &CacheStore, mem: &MemStore) {
+    for item in [
+        ids::HTUI_ANA_1,
+        ids::HTUI_FEAT_1,
+        ids::HTUI_FEAT_3,
+        ids::AGY_ANA_1,
+        ids::AGY_FIX_1,
+    ] {
+        for kinds in [
+            vec![],
+            vec!["prd".to_owned(), "plan".to_owned()],
+            vec!["plan".to_owned(), "prd".to_owned(), "missing".to_owned()],
+            vec!["summary".to_owned()],
+        ] {
+            assert_eq!(
+                cache
+                    .documents_of_kinds(item, &kinds)
+                    .await
+                    .expect("cache documents_of_kinds"),
+                mem.documents_of_kinds(item, &kinds)
+                    .await
+                    .expect("mem documents_of_kinds"),
+                "documents_of_kinds({kinds:?}) of {item}"
+            );
+        }
+        for head in mem.documents(item).await.expect("mem documents") {
+            assert_eq!(
+                cache.document(head.id).await.expect("cache document"),
+                mem.document(head.id).await.expect("mem document"),
+                "document {} of {item}, body and all",
+                head.id
+            );
+        }
+    }
+    assert_eq!(
+        cache
+            .document(htui_core::model::DocumentId::new())
+            .await
+            .expect("cache document of an unknown id"),
+        None,
+        "an id nothing has is None, not a default row"
+    );
+}
+
+/// The amended §7.3 walk over the mirror, against the reference store: both bounds, every hop
+/// count the contract admits.
+///
+/// `AGY_FIX_1` is the fixture's diamond root (blueprint C.4); the other two roots reach less or
+/// nothing, which is an answer the two stores still have to agree on. `hops` runs to `3` because
+/// the clamp to `1..=2` is a store's job and all three must clamp alike.
+async fn upstream_agrees(cache: &CacheStore, mem: &MemStore, scope: &Scope) {
+    for root in [ids::AGY_FIX_1, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1] {
+        for bound in [
+            PromptScope::from_scope(scope, ids::PROJECT_AGY),
+            PromptScope::project_only(ids::PROJECT_AGY),
+            PromptScope::project_only(ids::PROJECT_HTUI),
+        ] {
+            for hops in [0, 1, 2, 3] {
+                assert_eq!(
+                    cache
+                        .upstream_summaries(root, hops, &bound)
+                        .await
+                        .expect("cache upstream_summaries"),
+                    mem.upstream_summaries(root, hops, &bound)
+                        .await
+                        .expect("mem upstream_summaries"),
+                    "upstream_summaries({root}, {hops}, {bound:?})"
+                );
+            }
+        }
+    }
+}
+
+/// `project` over the mirror, settings document included, against the reference store.
+async fn projects_agree(cache: &CacheStore, mem: &MemStore) {
+    for project in all_projects() {
+        assert_eq!(
+            cache.project(project).await.expect("cache project"),
+            mem.project(project).await.expect("mem project"),
+            "project {project}, settings document included"
+        );
+    }
+    assert_eq!(
+        cache
+            .project(ProjectId::new())
+            .await
+            .expect("cache project of an unknown id"),
+        None,
+        "an id the mirror does not hold is None, not an error"
+    );
+}
+
 #[tokio::test]
 async fn mirror_reads_equal_the_reference_store() {
     let Some(db) = common::demo_db().await else {
@@ -351,6 +448,52 @@ async fn mirror_reads_equal_the_reference_store() {
         cache.box_info().await.expect("cache box_info"),
         mem.box_info().await.expect("mem box_info"),
     );
+
+    // MOD-2 milestone 9's four additions. Every table they touch is mirrored — `document` body and
+    // all, `project.settings`, `item_link`, `workspace_project` — so the mirror owes the same
+    // answers here as for everything above; that is ANA-5 §12 criterion 19's second clause.
+    documents_agree(&cache, &mem).await;
+    upstream_agrees(&cache, &mem, &scope).await;
+    projects_agree(&cache, &mem).await;
+
+    teardown(db, &[&cache]).await;
+}
+
+/// ANA-5 §12 criterion 19's second clause, as a **suite** rather than as pairwise comparisons:
+/// `store::conformance::READ_CASES` run over the mirror (plan D96).
+///
+/// `mirror_reads_equal_the_reference_store` above proves the mirror and `MemStore` agree on the
+/// four new reads; `pg_conformance.rs::pg_store_read_conformance` proves Postgres and the suite
+/// agree. This one closes the triangle, and with it criterion 7's second clause — the same diamond
+/// read through `PgStore` and through `CacheStore` renders the same entries in the same canonical
+/// order, which is what the prompt digest is a function of.
+///
+/// `CacheStore` is the only store in the workspace that implements `ReadStore` and not
+/// `WriteStore`, so before `READ_CASES` existed there was no harness it could be a target of at
+/// all.
+#[tokio::test]
+async fn the_mirror_passes_the_read_cases() {
+    use htui_core::store::conformance;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let refresh = settings(&db, 20);
+    let projects = all_projects();
+
+    // `run_all_reads` builds a store per case; the second pass onwards is an incremental no-op
+    // against the same cursors, so this costs one full pull and five cheap ones rather than six
+    // mirrors. The bindings are references so the futures the closure returns borrow the test's
+    // scope and not the closure's own.
+    let (pool, cache_ref, projects_ref, refresh_ref) = (&db.pool, &cache, &projects, &refresh);
+    conformance::run_all_reads(move || async move {
+        run_pass(pool, cache_ref, projects_ref, refresh_ref)
+            .await
+            .expect("one pass");
+        cache_ref.clone()
+    })
+    .await;
 
     teardown(db, &[&cache]).await;
 }
