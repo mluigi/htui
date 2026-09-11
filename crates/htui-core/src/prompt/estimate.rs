@@ -46,9 +46,10 @@ impl TokenEstimator {
     };
 
     /// `chars-v1-gpt`: 4.0 / 3.3 for the GPT and Gemini families — **unverified**, and kept at
-    /// ANA-5's published figures. `agy_acp_server` emits no `usage_update` (MOD-2 milestone 7), so
-    /// there is nothing to difference. Named apart from [`TokenEstimator::DEFAULT`] so a stored
-    /// `trim_record` says which arithmetic produced it (D108).
+    /// ANA-5's published figures. The registry row that would serve those families emits no
+    /// `usage_update` (MOD-2 milestone 7), so there is nothing to difference. Named apart from
+    /// [`TokenEstimator::DEFAULT`] so a stored `trim_record` says which arithmetic produced it
+    /// (D108).
     pub const WIDE: Self = Self {
         id: "chars-v1-gpt",
         prose_cpt: 40,

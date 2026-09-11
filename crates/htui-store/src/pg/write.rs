@@ -613,6 +613,42 @@ impl WriteStore for PgStore {
 
         tx.commit().await.map_err(map_sqlx)
     }
+
+    /// `run_step.prompt_digest` and `run_step.trim_record`, both, unconditionally
+    /// (`docs/ANA-5.md` §4.4): the pre-flight audit of `R-PRM-3`, written at stage 3 before a
+    /// session starts.
+    ///
+    /// No `COALESCE` here, unlike [`set_step_usage`](PgStore::set_step_usage) above: that one's
+    /// digest is optional because the chat path writes usage many times and a digest once, while a
+    /// caller of this one has just assembled a prompt and always has both values. A re-run of the
+    /// same step assembles a new prompt, so overwriting is the behaviour, not a side effect.
+    ///
+    /// `updated_at` is not in the `SET` list: the migration's `BEFORE UPDATE` trigger owns it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when the step does not exist - zero rows updated is the only thing
+    /// this statement can mean.
+    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
+        let updated = sqlx::query!(
+            "UPDATE run_step SET prompt_digest = $2, trim_record = $3 WHERE id = $1",
+            step.as_uuid(),
+            digest,
+            trim,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl PgStore {

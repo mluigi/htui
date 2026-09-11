@@ -327,6 +327,49 @@ async fn set_step_usage_is_a_no_op() {
     cache.close().await;
 }
 
+/// The neighbour of `set_step_usage_is_a_no_op` above, and the contrast is the point (MOD-2
+/// milestone 9, blueprint E-8).
+///
+/// `run_step.usage` may be dropped silently because `upload_pending` recomputes it from the
+/// uploaded `session_event` rows (D36). Nothing recomputes a **trim record**: the buffer's line
+/// format is `session_event` columns only, and the `prompt` event's payload carries an abridged
+/// `sections[]` that is a lossy projection of the record. A no-op would therefore leave a step
+/// with a `prompt` event and no audit row, which is what `R-PRM-3`'s "recorded on the step"
+/// forbids — so this one refuses, loudly, for a registered step and an unknown one alike.
+#[tokio::test]
+async fn set_step_prompt_is_refused_offline() {
+    let root = tempfile::tempdir().expect("temp root");
+    let cache = cache(root.path()).await;
+    let writer = BufferedWriter::new(cache.clone());
+    let chat = chat();
+    writer.start_chat_run(&chat).await.expect("register");
+
+    for (what, step) in [
+        ("a registered step", chat.step_id),
+        ("an unknown step", StepId::new()),
+    ] {
+        let err = writer
+            .set_step_prompt(step, "9f8e", &json!({ "estimated_after": 34_000 }))
+            .await
+            .expect_err("the prompt audit has no offline home");
+        assert!(
+            matches!(err, StoreError::Unreachable(_)),
+            "{what}: a refusal, not a no-op and not a NotFound, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("trim record"),
+            "{what}: the sentence names the row that has nowhere to go, got {err}"
+        );
+    }
+
+    assert_eq!(
+        pending_files(writer.dir()),
+        0,
+        "a refusal writes nothing to the buffer either"
+    );
+    cache.close().await;
+}
+
 /// `[H-1]` The seal is what keeps `upload_pending` off a buffer whose chat is still running.
 #[tokio::test]
 async fn finish_chat_run_seals_the_buffer() {

@@ -30,9 +30,10 @@ use htui_agent::record::{
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, DocumentHead, EventKind, EventRole,
-    Item, ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, Quota, QuotaSource,
-    RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepId, normalize,
+    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId,
+    EventKind, EventRole, Item, ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem,
+    Note, Project, ProjectId, PromptScope, Quota, QuotaSource, RunId, RunStatus, RunSummary, Scope,
+    SessionEvent, Status, StepId, UpstreamEntry, normalize,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{
@@ -187,6 +188,14 @@ struct SpyStore {
     /// fails once usually fails again, and the point of the case is what the recorder does with
     /// the second answer.
     refuse_quota: Mutex<Option<StoreError>>,
+    /// Every `set_step_prompt` call so far, as `(step, digest)`.
+    ///
+    /// The pre-flight audit row is as invisible to the read seam as `run_step.usage` is:
+    /// `RunStepSummary` carries the two derived figures and neither the digest nor the record, so
+    /// the only way to assert *which digest* a caller wrote is to watch the call. MOD-2 milestone
+    /// 9's `record_prompt` case is what reads it — the assembler and the recorder compute the same
+    /// `Sha256` over the same text, and that is the claim.
+    prompt_calls: Mutex<Vec<(StepId, String)>>,
 }
 
 impl SpyStore {
@@ -197,6 +206,7 @@ impl SpyStore {
             quota_calls: Mutex::new(Vec::new()),
             refuse_appends: Mutex::new(0),
             refuse_quota: Mutex::new(None),
+            prompt_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -219,6 +229,19 @@ impl SpyStore {
     /// Every `set_step_usage` call so far, in order.
     fn usage_calls(&self) -> Vec<UsageCall> {
         self.usage_calls
+            .lock()
+            .expect("the spy log is never poisoned")
+            .clone()
+    }
+
+    /// Every `set_step_prompt` call so far, as `(step, digest)`, in order.
+    ///
+    /// Unused until MOD-2 milestone 9's T65 asserts that the recorder recomputes the digest the
+    /// assembler already wrote; it lands with the trait method so the double is complete rather
+    /// than half-written.
+    #[expect(dead_code, reason = "written by T62, read by T65's record_prompt case")]
+    fn prompt_calls(&self) -> Vec<(StepId, String)> {
+        self.prompt_calls
             .lock()
             .expect("the spy log is never poisoned")
             .clone()
@@ -268,6 +291,27 @@ impl ReadStore for SpyStore {
     }
     async fn step_events(&self, step: StepId) -> StoreResult<Option<Vec<SessionEvent>>> {
         self.inner.step_events(step).await
+    }
+    async fn document(&self, id: DocumentId) -> StoreResult<Option<Document>> {
+        self.inner.document(id).await
+    }
+    async fn documents_of_kinds(
+        &self,
+        item: ItemId,
+        kinds: &[String],
+    ) -> StoreResult<Vec<Document>> {
+        self.inner.documents_of_kinds(item, kinds).await
+    }
+    async fn upstream_summaries(
+        &self,
+        id: ItemId,
+        hops: u8,
+        scope: &PromptScope,
+    ) -> StoreResult<Vec<UpstreamEntry>> {
+        self.inner.upstream_summaries(id, hops, scope).await
+    }
+    async fn project(&self, id: ProjectId) -> StoreResult<Option<Project>> {
+        self.inner.project(id).await
     }
 }
 
@@ -363,6 +407,14 @@ impl WriteStore for SpyStore {
         self.inner
             .finish_chat_run(run, step, status, finished_at)
             .await
+    }
+    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> StoreResult<()> {
+        self.inner.set_step_prompt(step, digest, trim).await?;
+        self.prompt_calls
+            .lock()
+            .expect("the spy log is never poisoned")
+            .push((step, digest.to_owned()));
+        Ok(())
     }
 }
 

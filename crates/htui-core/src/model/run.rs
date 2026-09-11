@@ -284,6 +284,45 @@ pub struct RunStepSummary {
     pub started_at: Option<DateTime<Utc>>,
     /// `run_step.finished_at`.
     pub finished_at: Option<DateTime<Utc>>,
+    /// `run_step.trim_record.estimated_after`: what the assembler believed the prompt cost after
+    /// trimming, or `None` on a step no assembler ever wrote (plan D106, `docs/ANA-5.md` §4.4).
+    ///
+    /// A projection of `trim_record` and not a column: the record itself is a whole JSON document
+    /// the Runs pane has no room for, and `ReadStore` exposes neither it nor `prompt_digest`, so
+    /// these two fields are the seam's only trace of a written prompt audit.
+    pub prompt_tokens: Option<i32>,
+    /// Whether any `trim_record.sections[].trimmed` is `true`: the `!` the Runs pane renders
+    /// beside the token figure (plan D106).
+    pub trimmed: bool,
+}
+
+/// Plan D106's derivation of [`RunStepSummary::prompt_tokens`] and [`RunStepSummary::trimmed`]
+/// from `run_step.trim_record`, in one place so `MemStore` and the two SQL projections agree by
+/// test rather than by luck.
+///
+/// A record with no `estimated_after`, a non-integer one, or one outside `i32` yields `None`
+/// rather than a wrong number; `trimmed` is `false` unless `sections` is an array holding at least
+/// one object whose `trimmed` is the JSON `true`. Both halves are deliberately total: `trim_record`
+/// is an untyped `JSONB` column and a malformed document must render as "no figure", never panic a
+/// list.
+#[must_use]
+pub fn prompt_summary(trim_record: Option<&Value>) -> (Option<i32>, bool) {
+    let Some(record) = trim_record else {
+        return (None, false);
+    };
+    let tokens = record
+        .get("estimated_after")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let trimmed = record
+        .get("sections")
+        .and_then(Value::as_array)
+        .is_some_and(|sections| {
+            sections
+                .iter()
+                .any(|section| section.get("trimmed").and_then(Value::as_bool) == Some(true))
+        });
+    (tokens, trimmed)
 }
 
 /// Result row of [`crate::store::ReadStore::runs`]: a run with its steps, newest run first.
@@ -318,4 +357,52 @@ pub struct RunSummary {
     pub failure: Option<String>,
     /// The run's steps, ordered by `(position, attempt, fanout_index)`.
     pub steps: Vec<RunStepSummary>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_summary;
+    use serde_json::json;
+
+    /// Plan D106's two figures, and the four ways a record can decline to supply them.
+    #[test]
+    fn prompt_summary_reads_estimated_after_and_any_trimmed() {
+        assert_eq!(
+            prompt_summary(None),
+            (None, false),
+            "a step no assembler wrote has no figure and was not trimmed"
+        );
+        assert_eq!(
+            prompt_summary(Some(&json!({
+                "estimated_after": 34_000,
+                "sections": [
+                    { "name": "template", "trimmed": false },
+                    { "name": "excerpts", "trimmed": true },
+                ],
+                "v": 1,
+            }))),
+            (Some(34_000), true),
+            "one trimmed section is enough"
+        );
+        assert_eq!(
+            prompt_summary(Some(&json!({ "estimated_after": 12, "sections": [] }))),
+            (Some(12), false),
+            "an empty section list is not a trim"
+        );
+        assert_eq!(
+            prompt_summary(Some(&json!({ "sections": [{ "trimmed": true }] }))),
+            (None, true),
+            "the two facts are independent"
+        );
+        assert_eq!(
+            prompt_summary(Some(&json!({ "estimated_after": "34000", "sections": {} }))),
+            (None, false),
+            "a malformed JSONB document renders as `no figure`, never a wrong one"
+        );
+        assert_eq!(
+            prompt_summary(Some(&json!({ "estimated_after": 3_000_000_000_i64 }))),
+            (None, false),
+            "a value outside i32 is no figure rather than a truncated one"
+        );
+    }
 }

@@ -12,7 +12,7 @@ expression: decoded
                     "digest": String("9f2c1b7e4a08d3556c9e1af0b74d28e63c05a91f7d4b8e2016a3c5d7f908b1e2"),
                     "sections": Array [
                         Object {
-                            "name": String("prd"),
+                            "name": String("documents:prd"),
                             "tokens": Number(800),
                             "trimmed": Bool(false),
                         },

@@ -12,9 +12,10 @@
 //! `Decode`.
 
 use htui_core::model::{
-    Agent, AgentBox, AgentId, AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId,
-    LinkEdge, LinkGraph, LinkKind, Note, ProjectId, ProjectRef, RunId, RunStepSummary, RunSummary,
-    Scope, SessionEvent, StepId, WorkspaceSummary,
+    Agent, AgentBox, AgentId, AgentSummary, BoxInfo, Document, DocumentHead, DocumentId, Item,
+    ItemFilter, ItemId, LinkEdge, LinkGraph, LinkKind, Note, Project, ProjectId, ProjectRef,
+    PromptScope, RunId, RunStepSummary, RunSummary, Scope, SessionEvent, StepId, UpstreamEntry,
+    WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -325,7 +326,16 @@ impl ReadStore for PgStore {
                    s.status       AS "status: htui_core::model::StepStatus",
                    s.gate_outcome AS "gate_outcome: htui_core::model::GateOutcome",
                    s.started_at,
-                   s.finished_at
+                   s.finished_at,
+                   -- Plan D106's two figures, derived from `trim_record` in SQL rather than
+                   -- returned whole: the record is a document the Runs pane has no room for, and
+                   -- §6.1 exposes neither it nor `prompt_digest`. `htui_core::model::prompt_summary`
+                   -- is the same derivation in Rust, and `MemStore` uses it, so the two agree by
+                   -- the `set_step_prompt` conformance case rather than by luck.
+                   (s.trim_record->>'estimated_after')::int          AS "prompt_tokens?",
+                   COALESCE((SELECT bool_or((e->>'trimmed')::bool)
+                               FROM jsonb_array_elements(s.trim_record->'sections') e),
+                            false)                                   AS "trimmed!"
               FROM run_step s
              WHERE s.run_id = ANY($1)
              ORDER BY s.run_id, s.position, s.attempt, s.fanout_index
@@ -374,6 +384,33 @@ impl ReadStore for PgStore {
         .map_err(map_sqlx)?;
 
         Ok((!events.is_empty()).then_some(events))
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // MOD-2 milestone 9's four reads. The signatures land with the seam (T62) so the workspace
+    // compiles against one trait; the bodies — the amended §7.3 recursive CTE of blueprint C.1
+    // among them — are T63's, with the `.sqlx` data they need.
+    // -------------------------------------------------------------------------------------------
+
+    async fn document(&self, _id: DocumentId) -> Result<Option<Document>> {
+        todo!("T63: SELECT the document row with its body")
+    }
+
+    async fn documents_of_kinds(&self, _item: ItemId, _kinds: &[String]) -> Result<Vec<Document>> {
+        todo!("T63: DISTINCT ON (kind) ... ORDER BY kind, version DESC, then the caller's order")
+    }
+
+    async fn upstream_summaries(
+        &self,
+        _id: ItemId,
+        _hops: u8,
+        _scope: &PromptScope,
+    ) -> Result<Vec<UpstreamEntry>> {
+        todo!("T63: the amended §7.3 recursive CTE (blueprint C.1), then sort_canonical")
+    }
+
+    async fn project(&self, _id: ProjectId) -> Result<Option<Project>> {
+        todo!("T63: SELECT the project row with its settings")
     }
 }
 

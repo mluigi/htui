@@ -29,9 +29,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, DocumentHead, Item, ItemFilter, ItemId,
-    ItemPatch, ItemSummary, LinkGraph, NewItem, Note, ProjectId, RunId, RunStatus, RunSummary,
-    Scope, SessionEvent, Status, StepId,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, Item,
+    ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, Project, ProjectId,
+    PromptScope, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepId, UpstreamEntry,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError, UpdateOutcome, WriteStore};
 use serde_json::Value;
@@ -76,6 +76,9 @@ impl Writer {
 ///   [`StoreError::NotFound`], never a silent drop.
 /// - `set_step_usage` is a no-op: `run_step.usage` has nowhere to go in the buffer, and
 ///   `upload_pending` recomputes it from the uploaded rows (plan D36) rather than losing it.
+/// - `set_step_prompt` is a **refusal**, and the contrast with the line above is the point: no
+///   upload can recompute `run_step.trim_record`, so a no-op would silently drop the audit row
+///   `R-PRM-3` requires to be "recorded on the step" (MOD-2 milestone 9, blueprint E-8).
 /// - `finish_chat_run` **seals** the buffer (risk `[H-1]`), which is a deliberate deviation from
 ///   D35's "a no-op that logs at debug": without it, a chat that outlives a reconnect is uploaded
 ///   mid-flight and its `run_step.usage` frozen at a partial sum.
@@ -181,6 +184,27 @@ impl ReadStore for BufferedWriter {
     async fn step_events(&self, step: StepId) -> Result<Option<Vec<SessionEvent>>> {
         self.cache.step_events(step).await
     }
+
+    async fn document(&self, id: DocumentId) -> Result<Option<Document>> {
+        self.cache.document(id).await
+    }
+
+    async fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Result<Vec<Document>> {
+        self.cache.documents_of_kinds(item, kinds).await
+    }
+
+    async fn upstream_summaries(
+        &self,
+        id: ItemId,
+        hops: u8,
+        scope: &PromptScope,
+    ) -> Result<Vec<UpstreamEntry>> {
+        self.cache.upstream_summaries(id, hops, scope).await
+    }
+
+    async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
+        self.cache.project(id).await
+    }
 }
 
 impl WriteStore for BufferedWriter {
@@ -264,6 +288,29 @@ impl WriteStore for BufferedWriter {
     ) -> Result<()> {
         tracing::debug!(%step, "buffered: run_step.usage is recomputed at upload (D36)");
         Ok(())
+    }
+
+    /// Refused, not a no-op — which is the whole difference from
+    /// [`set_step_usage`](BufferedWriter::set_step_usage) directly above (blueprint E-8).
+    ///
+    /// That one may be silent because `upload_pending` recomputes `run_step.usage` from the
+    /// uploaded `session_event` rows (plan D36), so the figure is deferred rather than lost.
+    /// Nothing can recompute a **trim record**: the buffer's line format holds `session_event`
+    /// columns only, and the `prompt` event's payload carries an abridged `sections[]` that is a
+    /// lossy projection of the record, not the record. A silent no-op would therefore leave a step
+    /// with a `prompt` event and no audit row, which is exactly what `R-PRM-3`'s "recorded on the
+    /// step" forbids.
+    ///
+    /// `R-STO-4` starts no graph run offline, so nothing in this milestone reaches this arm. When
+    /// MOD-4 first does, the refusal is the signal that an offline graph step needs a design — not
+    /// a stub that already silently discarded its audit.
+    ///
+    /// # Errors
+    ///
+    /// Always [`StoreError::Unreachable`] with [`PROMPT_ON_SERVER_ONLY`].
+    async fn set_step_prompt(&self, step: StepId, _digest: &str, _trim: &Value) -> Result<()> {
+        tracing::debug!(%step, "buffered: run_step.trim_record cannot be buffered (E-8)");
+        Err(StoreError::Unreachable(PROMPT_ON_SERVER_ONLY.to_owned()))
     }
 
     async fn upsert_agent(&self, _agent: &Agent) -> Result<()> {
@@ -357,6 +404,20 @@ fn registry_writes_need_the_server() -> StoreError {
     StoreError::Unreachable(REGISTRY_ON_SERVER_ONLY.to_owned())
 }
 
+/// The one sentence the whole prompt path answers with off the server (MOD-2 plan D109,
+/// blueprint E-8).
+///
+/// It names **two** facts because they are the same fact from either end. Reading: four of the
+/// assembler's inputs — `prompt_template`, `skill`, `skill_version`, `skill_binding`, `box_tool` —
+/// have no cache mirror, so a preview cannot be assembled offline at all. Writing:
+/// `run_step.trim_record` has nowhere to go in the pending buffer, whose line format is
+/// `session_event` columns only, and unlike `run_step.usage` nothing can recompute it at upload.
+///
+/// One constant, so a user who meets the refusal from the preview and from a step's audit row
+/// reads the same sentence and does not have to decide whether they are two problems.
+pub const PROMPT_ON_SERVER_ONLY: &str = "the prompt path needs the server: templates, skills and box tools are not mirrored, and a \
+     step's trim record has nowhere to go offline";
+
 /// Plain delegation: a `Writer` decides *which* store, never *what* a read means.
 impl ReadStore for Writer {
     async fn items(&self, scope: &Scope, filter: &ItemFilter) -> Result<Vec<ItemSummary>> {
@@ -412,6 +473,43 @@ impl ReadStore for Writer {
             Self::Memory(store) => store.step_events(step).await,
             Self::Online(pg) => pg.step_events(step).await,
             Self::Buffered(buffer) => buffer.step_events(step).await,
+        }
+    }
+
+    async fn document(&self, id: DocumentId) -> Result<Option<Document>> {
+        match self {
+            Self::Memory(store) => store.document(id).await,
+            Self::Online(pg) => pg.document(id).await,
+            Self::Buffered(buffer) => buffer.document(id).await,
+        }
+    }
+
+    async fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Result<Vec<Document>> {
+        match self {
+            Self::Memory(store) => store.documents_of_kinds(item, kinds).await,
+            Self::Online(pg) => pg.documents_of_kinds(item, kinds).await,
+            Self::Buffered(buffer) => buffer.documents_of_kinds(item, kinds).await,
+        }
+    }
+
+    async fn upstream_summaries(
+        &self,
+        id: ItemId,
+        hops: u8,
+        scope: &PromptScope,
+    ) -> Result<Vec<UpstreamEntry>> {
+        match self {
+            Self::Memory(store) => store.upstream_summaries(id, hops, scope).await,
+            Self::Online(pg) => pg.upstream_summaries(id, hops, scope).await,
+            Self::Buffered(buffer) => buffer.upstream_summaries(id, hops, scope).await,
+        }
+    }
+
+    async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
+        match self {
+            Self::Memory(store) => store.project(id).await,
+            Self::Online(pg) => pg.project(id).await,
+            Self::Buffered(buffer) => buffer.project(id).await,
         }
     }
 }
@@ -527,6 +625,14 @@ impl WriteStore for Writer {
             Self::Memory(store) => store.finish_chat_run(run, step, status, finished_at).await,
             Self::Online(pg) => pg.finish_chat_run(run, step, status, finished_at).await,
             Self::Buffered(buffer) => buffer.finish_chat_run(run, step, status, finished_at).await,
+        }
+    }
+
+    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.set_step_prompt(step, digest, trim).await,
+            Self::Online(pg) => pg.set_step_prompt(step, digest, trim).await,
+            Self::Buffered(buffer) => buffer.set_step_prompt(step, digest, trim).await,
         }
     }
 }

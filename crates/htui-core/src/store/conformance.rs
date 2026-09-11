@@ -9,16 +9,16 @@
 use core::future::Future;
 
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::fixtures::ids;
 use crate::model::{
-    Agent, AgentBox, AgentId, Billing, ChatRunSpec, EventKind, EventRole, ItemFilter, ItemId,
-    ItemKindId, ItemPatch, ItemSummary, LinkKind, NewItem, ProjectId, RunId, RunStatus, Scope,
-    SessionEvent, Status, StepId, Transport, UserId,
+    Agent, AgentBox, AgentId, Billing, ChatRunSpec, DocumentId, EventKind, EventRole, ItemFilter,
+    ItemId, ItemKindId, ItemPatch, ItemSummary, LinkKind, NewItem, ProjectId, PromptScope, RunId,
+    RunStatus, Scope, SessionEvent, Status, StepId, Transport, UpstreamEntry, UserId,
 };
 use crate::store::error::StoreError;
-use crate::store::traits::{UpdateOutcome, WriteStore};
+use crate::store::traits::{ReadStore, UpdateOutcome, WriteStore};
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
 pub const CASES: &[&str] = &[
@@ -44,6 +44,7 @@ pub const CASES: &[&str] = &[
     "upsert_agent_box_by_pk",
     "set_agent_box_quota_updates_two_columns_or_not_found",
     "upsert_agent_box_cannot_write_quota",
+    "set_step_prompt_writes_digest_and_trim",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -83,6 +84,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             set_agent_box_quota_updates_two_columns_or_not_found(store).await;
         }
         "upsert_agent_box_cannot_write_quota" => upsert_agent_box_cannot_write_quota(store).await,
+        "set_step_prompt_writes_digest_and_trim" => {
+            set_step_prompt_writes_digest_and_trim(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -104,6 +108,62 @@ where
 {
     for name in CASES {
         run_case(name, &make().await).await;
+    }
+}
+
+/// The read-only half of the suite, in run order (plan D96). A name never changes.
+///
+/// A second list beside [`CASES`] rather than a relaxed bound on [`run_case`]: eleven of the
+/// twenty-three cases above call [`WriteStore`] methods, so `run_case` cannot be generalised to
+/// [`ReadStore`] without splitting every one of them. These six are written against `ReadStore`
+/// alone, which is what lets the **mirror** be a target — `CacheStore` implements `ReadStore` and
+/// not `WriteStore`, so before this list there was no way to assert that an offline read and an
+/// online one agree beyond comparing them pairwise in `htui-store`'s own tests.
+///
+/// Every case here reads the fixture and writes nothing, so unlike [`CASES`] they may share one
+/// store; [`run_all_reads`] still builds a fresh one per case, because a `make` that refreshes a
+/// mirror is cheaper to write than one that promises not to have been disturbed.
+pub const READ_CASES: &[&str] = &[
+    "document_body_round_trip",
+    "documents_of_kinds_latest_per_kind_in_order",
+    "project_row_has_settings",
+    "upstream_diamond_dedup",
+    "upstream_in_scope_no_summary",
+    "upstream_out_of_scope_stub",
+];
+
+/// Runs one [`READ_CASES`] case by name against an already-loaded store.
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case, and on an unknown `name`.
+pub async fn run_read_case<S: ReadStore>(name: &str, store: &S) {
+    match name {
+        "document_body_round_trip" => document_body_round_trip(store).await,
+        "documents_of_kinds_latest_per_kind_in_order" => {
+            documents_of_kinds_latest_per_kind_in_order(store).await;
+        }
+        "project_row_has_settings" => project_row_has_settings(store).await,
+        "upstream_diamond_dedup" => upstream_diamond_dedup(store).await,
+        "upstream_in_scope_no_summary" => upstream_in_scope_no_summary(store).await,
+        "upstream_out_of_scope_stub" => upstream_out_of_scope_stub(store).await,
+        other => panic!("unknown read case `{other}`; READ_CASES and run_read_case disagree"),
+    }
+}
+
+/// Runs every case in [`READ_CASES`], each against a store `make` produced fresh.
+///
+/// # Panics
+///
+/// On the first failed assertion, naming the case.
+pub async fn run_all_reads<S, F, Fut>(make: F)
+where
+    S: ReadStore,
+    F: Fn() -> Fut,
+    Fut: Future<Output = S>,
+{
+    for name in READ_CASES {
+        run_read_case(name, &make().await).await;
     }
 }
 
@@ -1456,9 +1516,437 @@ async fn upsert_agent_box_cannot_write_quota<S: WriteStore>(store: &S) {
         );
 }
 
+/// `set_step_prompt` writes `run_step.prompt_digest` and `run_step.trim_record`, both, on an
+/// existing step and answers `NotFound` on one that does not exist (`docs/ANA-5.md` §4.4).
+///
+/// The write is observed through [`ReadStore::runs`], because §6.1 returns neither column: the two
+/// fields plan D106 put on `RunStepSummary` — `prompt_tokens` and `trimmed` — are the read seam's
+/// whole trace of the record, so this case pins the projection and the write at once. That the
+/// **only** columns written are those two is asserted per backend, where the columns can be read
+/// back: `mem.rs::set_step_prompt_writes_both_columns` here, and a raw `SELECT` in
+/// `pg_criteria.rs` for Postgres.
+///
+/// The second write is what makes it an overwrite rather than an append: a re-run of the same step
+/// assembles a new prompt, and a record that kept the first `trimmed` would report a trim that no
+/// longer happened.
+async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
+    let tokens_of = |runs: &[crate::model::RunSummary], step: StepId| {
+        runs.iter()
+            .flat_map(|run| run.steps.iter())
+            .find(|row| row.id == step)
+            .map(|row| (row.prompt_tokens, row.trimmed))
+    };
+
+    store
+        .set_step_prompt(
+            ids::STEP_IMPL,
+            "9f8e",
+            &json!({
+                "estimated_after": 34_000,
+                "sections": [
+                    { "name": "template", "trimmed": false },
+                    { "name": "excerpts", "trimmed": true },
+                ],
+                "v": 1,
+            }),
+        )
+        .await
+        .expect("set_step_prompt_writes_digest_and_trim: the first write must land");
+
+    let after_first = store
+        .runs(ids::HTUI_FEAT_1)
+        .await
+        .expect("set_step_prompt_writes_digest_and_trim: the read must not fail");
+    assert_eq!(
+        tokens_of(&after_first, ids::STEP_IMPL),
+        Some((Some(34_000), true)),
+        "set_step_prompt_writes_digest_and_trim: estimated_after, and one trimmed section is enough"
+    );
+    assert_eq!(
+        tokens_of(&after_first, ids::STEP_PLAN),
+        Some((None, false)),
+        "set_step_prompt_writes_digest_and_trim: a step nobody wrote has no figure"
+    );
+
+    store
+        .set_step_prompt(
+            ids::STEP_IMPL,
+            "0a1b",
+            &json!({ "estimated_after": 12, "sections": [], "v": 1 }),
+        )
+        .await
+        .expect("set_step_prompt_writes_digest_and_trim: the second write must land");
+    assert_eq!(
+        tokens_of(
+            &store
+                .runs(ids::HTUI_FEAT_1)
+                .await
+                .expect("set_step_prompt_writes_digest_and_trim: the second read must not fail"),
+            ids::STEP_IMPL,
+        ),
+        Some((Some(12), false)),
+        "set_step_prompt_writes_digest_and_trim: the second record replaces the first, trim and all"
+    );
+
+    let unknown = store
+        .set_step_prompt(StepId::new(), "9f8e", &json!({}))
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "set_step_prompt_writes_digest_and_trim: an unknown step is NotFound, got {unknown:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// READ_CASES: the read-only half, so the mirror can be a target too (plan D96)
+// ------------------------------------------------------------------------------------------------
+
+/// The walk's bound in the fixture's usual scope: the `Platform` workspace, for an `agy` item.
+fn platform_prompt_scope() -> PromptScope {
+    PromptScope::from_scope(&platform_scope(), ids::PROJECT_AGY)
+}
+
+/// The fixture's `document.body` for one id, so a case asserts against the seed rather than
+/// against a copy of it that a fixture edit would leave stale.
+fn fixture_document_body(id: DocumentId) -> String {
+    crate::fixtures::demo_data()
+        .documents
+        .into_iter()
+        .find(|document| document.id == id)
+        .expect("the fixture holds that document")
+        .body
+}
+
+/// `ReadStore::document` answers the row **with its body**, and `None` for an id nothing has.
+///
+/// `documents()` answers heads, which is what a list needs and what every shipped caller uses; the
+/// prompt assembler needs the text, and reading a body through a head would be a second round trip
+/// per document (`docs/ANA-5.md` §8).
+async fn document_body_round_trip<S: ReadStore>(store: &S) {
+    let found = store
+        .document(ids::DOC_FEAT_1_PLAN_V2)
+        .await
+        .expect("document_body_round_trip: the read must not fail")
+        .expect("document_body_round_trip: the fixture holds plan v2");
+    assert_eq!(
+        (found.item_id, found.kind.as_str(), found.version),
+        (ids::HTUI_FEAT_1, "plan", 2),
+        "document_body_round_trip: the row is the one that was asked for"
+    );
+    assert_eq!(
+        found.body,
+        fixture_document_body(ids::DOC_FEAT_1_PLAN_V2),
+        "document_body_round_trip: the body is the seeded one, byte for byte"
+    );
+
+    assert!(
+        store
+            .document(DocumentId::new())
+            .await
+            .expect("document_body_round_trip: an unknown id is not an error")
+            .is_none(),
+        "document_body_round_trip: an id nothing has is None, not a default row"
+    );
+}
+
+/// `documents_of_kinds` answers the **latest version of each kind, in the caller's order**, and
+/// omits a kind the item has no row for.
+///
+/// The order is the caller's because `docs/ANA-5.md` §4.7 rule 3 renders documents in the phase's
+/// `input_kinds` order and the prompt digest is a function of that order; a store that sorted
+/// would make itself the authority on something the step graph owns. An empty `kinds` is the
+/// preview's form (plan D103) and orders by kind **bytes**, so Postgres's collation and the
+/// mirror's byte order cannot disagree.
+async fn documents_of_kinds_latest_per_kind_in_order<S: ReadStore>(store: &S) {
+    let shape = |documents: &[crate::model::Document]| {
+        documents
+            .iter()
+            .map(|document| (document.kind.clone(), document.version))
+            .collect::<Vec<_>>()
+    };
+    let prd = ("prd".to_owned(), 1);
+    let plan = ("plan".to_owned(), 2);
+
+    let asked = store
+        .documents_of_kinds(ids::HTUI_FEAT_1, &["prd".to_owned(), "plan".to_owned()])
+        .await
+        .expect("documents_of_kinds_latest_per_kind_in_order: the read must not fail");
+    assert_eq!(
+        shape(&asked),
+        vec![prd.clone(), plan.clone()],
+        "documents_of_kinds_latest_per_kind_in_order: kinds order, and plan v1 loses to v2"
+    );
+
+    let reversed = store
+        .documents_of_kinds(
+            ids::HTUI_FEAT_1,
+            &["plan".to_owned(), "prd".to_owned(), "missing".to_owned()],
+        )
+        .await
+        .expect("documents_of_kinds_latest_per_kind_in_order: the second read must not fail");
+    assert_eq!(
+        shape(&reversed),
+        vec![plan.clone(), prd.clone()],
+        "documents_of_kinds_latest_per_kind_in_order: the caller's order, and an absent kind is \
+         omitted rather than an error"
+    );
+
+    let all = store
+        .documents_of_kinds(ids::HTUI_FEAT_1, &[])
+        .await
+        .expect("documents_of_kinds_latest_per_kind_in_order: the third read must not fail");
+    assert_eq!(
+        shape(&all),
+        vec![plan, prd],
+        "documents_of_kinds_latest_per_kind_in_order: an empty `kinds` is every kind in byte order"
+    );
+
+    assert!(
+        store
+            .documents_of_kinds(ids::HTUI_FEAT_3, &["plan".to_owned()])
+            .await
+            .expect("documents_of_kinds_latest_per_kind_in_order: the fourth read must not fail")
+            .is_empty(),
+        "documents_of_kinds_latest_per_kind_in_order: an item with no documents answers none"
+    );
+}
+
+/// `ReadStore::project` answers the row with its `settings` document, and `None` for an unknown
+/// id.
+///
+/// The settings column is where the prompt's `token_budget` rung lives (`docs/ANA-5.md` §4.4), and
+/// it is mirrored, which is why this is a trait method rather than an inherent read beside
+/// `project_settings` — that one returns the column alone and `run_read_case` could not call it.
+async fn project_row_has_settings<S: ReadStore>(store: &S) {
+    let project = store
+        .project(ids::PROJECT_HTUI)
+        .await
+        .expect("project_row_has_settings: the read must not fail")
+        .expect("project_row_has_settings: the fixture holds `htui`");
+    assert_eq!(
+        project.slug, "htui",
+        "project_row_has_settings: the row is the one that was asked for"
+    );
+    assert_eq!(
+        project.settings.get("token_budget").and_then(Value::as_i64),
+        Some(120_000),
+        "project_row_has_settings: the settings document arrives whole, cap and all"
+    );
+
+    assert!(
+        store
+            .project(ProjectId::new())
+            .await
+            .expect("project_row_has_settings: an unknown id is not an error")
+            .is_none(),
+        "project_row_has_settings: an id nothing has is None"
+    );
+}
+
+/// The diamond of the fixture's §4.3 walk: `htui:ANA-1` is reached at depth 2 down **both** arms
+/// and must be rendered **once**, at that depth, with its summary.
+///
+/// The shipped `UNION` of `docs/ANA-9.md` §7.3 dedups whole rows, that is `(item_id, depth)`
+/// pairs, so a diamond emitted the same item twice and the prompt carried its summary twice — a
+/// digest that depended on edge insertion order. `MIN(depth)` is the amendment, and this is what
+/// asserts it on every backend.
+///
+/// The whole vector is compared against a canonically re-sorted copy of itself, because the order
+/// is the contract: Postgres orders `qualified_key` by the database collation and the SQLite
+/// mirror by byte value, so a backend that forgot the Rust re-sort would still pass every
+/// per-entry assertion here.
+async fn upstream_diamond_dedup<S: ReadStore>(store: &S) {
+    let scope = platform_prompt_scope();
+    let two = store
+        .upstream_summaries(ids::AGY_FIX_1, 2, &scope)
+        .await
+        .expect("upstream_diamond_dedup: the walk must not fail");
+
+    assert_eq!(
+        two.iter()
+            .map(|entry| (entry.qualified_key.as_str(), entry.depth))
+            .collect::<Vec<_>>(),
+        vec![
+            ("agy:ANA-1", 1),
+            ("htui:TOOL-1", 1),
+            ("vulkan-tutorials:FEAT-1", 1),
+            ("htui:ANA-1", 2),
+        ],
+        "upstream_diamond_dedup: canonical order is depth, then qualified_key bytes, then id"
+    );
+
+    let apex: Vec<&UpstreamEntry> = two
+        .iter()
+        .filter(|entry| entry.item_id == ids::HTUI_ANA_1)
+        .collect();
+    assert_eq!(
+        apex.len(),
+        1,
+        "upstream_diamond_dedup: two paths reach ANA-1 and it is rendered once, got {apex:?}"
+    );
+    assert_eq!(
+        (apex[0].depth, apex[0].in_scope, apex[0].summary.is_some()),
+        (2, true, true),
+        "upstream_diamond_dedup: at its minimum depth, in scope, with the summary document"
+    );
+    assert_eq!(
+        apex[0].summary.as_deref(),
+        Some(fixture_document_body(ids::DOC_ANA_1_SUMMARY).as_str()),
+        "upstream_diamond_dedup: the summary is the document body, verbatim"
+    );
+
+    let mut canonical = two.clone();
+    UpstreamEntry::sort_canonical(&mut canonical);
+    assert_eq!(
+        two, canonical,
+        "upstream_diamond_dedup: the walk returns canonical order, not the backend's ORDER BY"
+    );
+
+    let one = store
+        .upstream_summaries(ids::AGY_FIX_1, 1, &scope)
+        .await
+        .expect("upstream_diamond_dedup: the one-hop walk must not fail");
+    assert!(
+        !one.iter().any(|entry| entry.item_id == ids::HTUI_ANA_1),
+        "upstream_diamond_dedup: ANA-1 is two hops out and `hops == 1` does not reach it"
+    );
+    assert!(
+        one.iter().all(|entry| entry.depth == 1),
+        "upstream_diamond_dedup: `hops == 1` is the first ring and nothing else, got {one:?}"
+    );
+
+    let none = store
+        .upstream_summaries(ids::AGY_FIX_1, 0, &scope)
+        .await
+        .expect("upstream_diamond_dedup: a zero-hop walk is not an error");
+    assert!(
+        none.is_empty(),
+        "upstream_diamond_dedup: `hops == 0` is no upstream at all — the root is the step's own \
+         item and is never an entry, unlike `links(id, 0)`"
+    );
+
+    // Directed and kind-filtered, both in one assertion: `agy:FEAT-1` is one undirected hop from
+    // `agy:FIX-1`'s neighbourhood through the `relates` edge `AGY_FEAT_1 -> HTUI_FEAT_2`, and
+    // `htui:FEAT-1` is reachable from `htui:ANA-1` only by following an `origin` edge backwards.
+    let reached: Vec<&str> = two
+        .iter()
+        .map(|entry| entry.qualified_key.as_str())
+        .collect();
+    assert!(
+        !reached.contains(&"htui:FEAT-1") && !reached.contains(&"agy:FEAT-1"),
+        "upstream_diamond_dedup: the walk follows `to_item_id` only, and only `blocked_by` and \
+         `origin`, got {reached:?}"
+    );
+}
+
+/// `docs/ANA-5.md` §4.3's third render state: in scope, and nobody has written a summary yet.
+///
+/// It is the common case rather than the edge case — `document.kind = 'summary'` is written at
+/// close-out and `done` is not `closed` — and it is a different fact from the `R-PRM-2` stub: this
+/// one names an item the agent can go and read documents about.
+async fn upstream_in_scope_no_summary<S: ReadStore>(store: &S) {
+    let entries = store
+        .upstream_summaries(ids::AGY_FIX_1, 2, &platform_prompt_scope())
+        .await
+        .expect("upstream_in_scope_no_summary: the walk must not fail");
+
+    for (item, key, status) in [
+        (ids::AGY_ANA_1, "agy:ANA-1", Status::Done),
+        (ids::HTUI_TOOL_1, "htui:TOOL-1", Status::AwaitingApproval),
+    ] {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.item_id == item)
+            .unwrap_or_else(|| panic!("upstream_in_scope_no_summary: {key} is one hop out"));
+        assert_eq!(
+            (
+                entry.qualified_key.as_str(),
+                entry.depth,
+                entry.in_scope,
+                entry.summary.is_none(),
+                entry.status,
+            ),
+            (key, 1, true, true, status),
+            "upstream_in_scope_no_summary: {key} renders as `no summary yet`"
+        );
+        assert!(
+            entry.is_pending() && !entry.is_summary(),
+            "upstream_in_scope_no_summary: {key} is Pending, not Summary"
+        );
+    }
+}
+
+/// `R-PRM-2`'s stub, and the separability the amended query exists for.
+///
+/// `vulkan-tutorials:FEAT-1` is in the `Graphics` workspace, so under the `Platform` scope it is
+/// out of scope. And under a **project-only** bound (`R-ENT-2`, no workspace), `htui:ANA-1` is out
+/// of scope with `summary == None` even though its summary document exists and the same walk
+/// returned it a moment ago: `in_scope` and `summary.is_some()` are two facts, and the shipped
+/// query conflated them into one `NULL`.
+async fn upstream_out_of_scope_stub<S: ReadStore>(store: &S) {
+    let entries = store
+        .upstream_summaries(ids::AGY_FIX_1, 2, &platform_prompt_scope())
+        .await
+        .expect("upstream_out_of_scope_stub: the walk must not fail");
+    let stub = entries
+        .iter()
+        .find(|entry| entry.item_id == ids::VULKAN_FEAT_1)
+        .expect("upstream_out_of_scope_stub: the cross-workspace origin is still reached");
+    assert_eq!(
+        (
+            stub.qualified_key.as_str(),
+            stub.depth,
+            stub.in_scope,
+            stub.summary.as_deref(),
+        ),
+        ("vulkan-tutorials:FEAT-1", 1, false, None),
+        "upstream_out_of_scope_stub: an item outside the workspace is a stub, summary unread"
+    );
+    assert!(
+        !stub.is_summary() && !stub.is_pending(),
+        "upstream_out_of_scope_stub: a stub is neither of the two in-scope states"
+    );
+
+    let project_only = store
+        .upstream_summaries(
+            ids::AGY_FIX_1,
+            2,
+            &PromptScope::project_only(ids::PROJECT_AGY),
+        )
+        .await
+        .expect("upstream_out_of_scope_stub: the project-only walk must not fail");
+    assert_eq!(
+        project_only
+            .iter()
+            .map(|entry| (entry.qualified_key.as_str(), entry.in_scope))
+            .collect::<Vec<_>>(),
+        vec![
+            ("agy:ANA-1", true),
+            ("htui:TOOL-1", false),
+            ("vulkan-tutorials:FEAT-1", false),
+            ("htui:ANA-1", false),
+        ],
+        "upstream_out_of_scope_stub: with no workspace the bound is the one project"
+    );
+    assert_eq!(
+        project_only
+            .iter()
+            .find(|entry| entry.item_id == ids::HTUI_ANA_1)
+            .and_then(|entry| entry.summary.as_deref()),
+        None,
+        "upstream_out_of_scope_stub: an out-of-scope item's summary is not read, though it exists"
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CASES, run_case};
+    use super::{CASES, READ_CASES, run_case, run_read_case};
     use crate::store::MemStore;
 
     #[test]
@@ -1467,6 +1955,17 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
+
+        // The two lists are reported separately by MOD-6's binding, so a name may not be in both
+        // either: a duplicate across them would be run twice and reported once.
+        let mut both: Vec<&str> = CASES.iter().chain(READ_CASES).copied().collect();
+        both.sort_unstable();
+        both.dedup();
+        assert_eq!(
+            both.len(),
+            CASES.len() + READ_CASES.len(),
+            "a case name is unique across both lists"
+        );
     }
 
     /// Every test this module's doc comments cross-refer to exists under the name they give it.
@@ -1555,6 +2054,19 @@ mod tests {
         // running the list through it is what keeps `CASES` and the dispatcher in step.
         for name in CASES {
             run_case(name, &MemStore::demo()).await;
+        }
+    }
+
+    /// The same guard for the read half (plan D96): `run_read_case`'s `match` is the only thing
+    /// that can disagree with [`READ_CASES`], and a name in the list with no arm is a case that
+    /// silently never ran on the mirror.
+    #[tokio::test]
+    async fn run_read_case_accepts_every_name_in_read_cases() {
+        // One store for all six: every read case writes nothing, which is what makes the list
+        // runnable against a `CacheStore` at all.
+        let store = MemStore::demo();
+        for name in READ_CASES {
+            run_read_case(name, &store).await;
         }
     }
 }

@@ -11,7 +11,7 @@
 //! `(project, prefix)` key counter and the absent delete path of §4.1, and the compare-and-set on
 //! `version` with its `Diverged { head, ancestor }` answer of §4.2.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -19,13 +19,14 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoxId, BoxInfo, BoxRow, ChatRunSpec, Document,
-    DocumentHead, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemLink, ItemPatch,
-    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewItem, Note, Project,
-    ProjectId, ProjectRef, PromptTemplate, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepSummary, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId,
-    StepGraphPhase, StepId, StepStatus, UserId, Workspace, WorkspaceId, WorkspaceProject,
-    WorkspaceSummary,
+    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProfile,
+    BoxRow, BoxTool, ChatRunSpec, Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId,
+    ItemKind, ItemKindId, ItemLink, ItemPatch, ItemRevision, ItemSummary, LinkEdge, LinkGraph,
+    LinkKind, LinkNode, NewItem, Note, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
+    PromptTemplate, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepSummary, RunSummary,
+    Scope, SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceId,
+    WorkspaceProject, WorkspaceSummary, prompt_summary,
 };
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
@@ -62,9 +63,21 @@ struct State {
     /// `step_graph_phase`. Held for the modules that read it: no §6.1 method exposes it yet (blueprint B.8).
     #[expect(dead_code, reason = "loaded now, read by MOD-2 / MOD-4 / MOD-15")]
     phases: Vec<StepGraphPhase>,
-    /// `prompt_template`. Held for the modules that read it: no §6.1 method exposes it yet (blueprint B.8).
-    #[expect(dead_code, reason = "loaded now, read by MOD-2 / MOD-4 / MOD-15")]
+    /// `prompt_template`, read by the inherent [`MemStore::prompt_templates`] (MOD-2 plan D102).
     templates: Vec<PromptTemplate>,
+    /// `skill`, read by the inherent [`MemStore::bound_skills`] (MOD-2 plan D105).
+    skills: HashMap<SkillId, Skill>,
+    /// `skill_version`, resolved through [`SkillBinding::version_in_force`].
+    skill_versions: Vec<SkillVersion>,
+    /// `skill_binding`, collapsed through [`BoundSkill::collapse`].
+    skill_bindings: Vec<SkillBinding>,
+    /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
+    box_tools: Vec<BoxTool>,
+    /// `app_setting`, the last rung of the prompt's settings chain (`docs/ANA-5.md` §4.4).
+    ///
+    /// Empty unless a test sets it: no fixture loads it, and
+    /// [`MemStore::set_app_setting`] is its only writer.
+    app_settings: BTreeMap<String, Value>,
     /// `agent`, read by the inherent [`MemStore::agents`] (MOD-2 plan D3).
     agents: HashMap<AgentId, Agent>,
     /// `agent_box`, keyed as its composite primary key is. Empty until something probes a box:
@@ -145,6 +158,11 @@ impl MemStore {
             graphs: data.graphs.into_iter().map(|row| (row.id, row)).collect(),
             phases: data.phases,
             templates: data.templates,
+            skills: data.skills.into_iter().map(|row| (row.id, row)).collect(),
+            skill_versions: data.skill_versions,
+            skill_bindings: data.skill_bindings,
+            box_tools: data.box_tools,
+            app_settings: BTreeMap::new(),
             agents: data.agents.into_iter().map(|row| (row.id, row)).collect(),
             agent_boxes: HashMap::new(),
             item_key_counter: data.item_key_counter,
@@ -241,6 +259,135 @@ impl MemStore {
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
     pub async fn project_settings(&self, project: ProjectId) -> Result<Option<Value>> {
         Ok(self.read(|state| state.projects.get(&project).map(|row| row.settings.clone())))
+    }
+
+    /// A project's `prompt_template` rows, ordered by `(name, version)` (`docs/ANA-5.md` §4.6).
+    ///
+    /// Inherent rather than a [`ReadStore`] method for the reason [`MemStore::agents`] is, plus
+    /// the one that decided the other four prompt reads: `prompt_template` has no cache mirror
+    /// (`cache_migrations/0001_mirror.sql` declares no such table), so no offline backend could
+    /// answer it and the `Backend::Offline` arm refuses (plan D109).
+    ///
+    /// Every version, not the latest per name: the caller picks by `(name, version)` because a
+    /// phase may pin `template_version`, and picking here would hide the pin.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn prompt_templates(&self, project: ProjectId) -> Result<Vec<PromptTemplate>> {
+        Ok(self.read(|state| {
+            let mut rows: Vec<PromptTemplate> = state
+                .templates
+                .iter()
+                .filter(|row| row.project_id == project)
+                .cloned()
+                .collect();
+            rows.sort_by(|left, right| {
+                left.name
+                    .as_bytes()
+                    .cmp(right.name.as_bytes())
+                    .then_with(|| left.version.cmp(&right.version))
+            });
+            rows
+        }))
+    }
+
+    /// The skills in force for a project, or for one phase of it: `R-SKL-2`'s collapse
+    /// (`docs/ANA-5.md` §4.2), already resolved to a version and a body.
+    ///
+    /// `phase: None` asks for the project-level bindings alone. With a phase, the phase's bindings
+    /// override the project's per `skill_id` and
+    /// [`BoundSkill::collapse`](crate::model::BoundSkill::collapse) is what says so — this method
+    /// resolves rows and calls that, exactly as `PgStore`'s two `SELECT`s do, so the rule has one
+    /// definition rather than one per backend.
+    ///
+    /// A binding whose version cannot be resolved is dropped rather than rendered bodiless: see
+    /// [`SkillBinding::version_in_force`](crate::model::SkillBinding::version_in_force) for why a
+    /// pin that names no row resolves to nothing.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn bound_skills(
+        &self,
+        project: ProjectId,
+        phase: Option<PhaseId>,
+    ) -> Result<Vec<BoundSkill>> {
+        Ok(self.read(|state| {
+            let level = |want: Option<PhaseId>| -> Vec<BoundSkill> {
+                state
+                    .skill_bindings
+                    .iter()
+                    .filter(|binding| binding.project_id == project && binding.phase_id == want)
+                    .filter_map(|binding| state.bind(binding))
+                    .collect()
+            };
+            BoundSkill::collapse(
+                level(None),
+                phase.map(|id| level(Some(id))).unwrap_or_default(),
+            )
+        }))
+    }
+
+    /// One box projected for the prompt's `box` section, or `None` when no row has that id.
+    ///
+    /// The `box_tool` join is [`BoxProfile::project`](crate::model::BoxProfile::project)'s: name
+    /// byte order, capped, `path` dropped.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn box_profile(&self, id: BoxId) -> Result<Option<BoxProfile>> {
+        Ok(self.read(|state| {
+            let row = state.boxes.get(&id)?;
+            let tools: Vec<BoxTool> = state
+                .box_tools
+                .iter()
+                .filter(|tool| tool.box_id == id)
+                .cloned()
+                .collect();
+            Some(BoxProfile::project(row, tools))
+        }))
+    }
+
+    /// Every `app_setting` row, keyed by name: the last rung of the prompt's settings chain
+    /// (`docs/ANA-5.md` §4.4).
+    ///
+    /// A [`BTreeMap`] and not a [`HashMap`]: the assembler's budget resolution records which rung
+    /// answered, and a map iterated in hash order would make that record depend on the process's
+    /// random state.
+    ///
+    /// A `MemStore` loads none of these from the fixture, so this is empty unless a test called
+    /// [`MemStore::set_app_setting`]. That is not a gap: plan D101 compiles the defaults into
+    /// `prompt::settings::DEFAULTS` precisely because `app_setting` is the one prompt input with
+    /// no mirror **and** no generic reader, so an absent row is the normal case, not a failure.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn app_settings(&self) -> Result<BTreeMap<String, Value>> {
+        Ok(self.read(|state| state.app_settings.clone()))
+    }
+
+    /// Writes one `app_setting` row. **Tests only**, and the only writer of that map.
+    ///
+    /// `app_setting` is seeded by migration `0002` and edited nowhere in the product (MOD-15 owns
+    /// any editor), so this exists to let a test drive
+    /// [`app_settings`](MemStore::app_settings)'s rung of the settings chain without a Postgres.
+    pub fn set_app_setting(&self, key: &str, value: Value) {
+        self.write(|state| state.app_settings.insert(key.to_owned(), value));
+    }
+
+    /// One `item_kind` row, or `None` when no row has that id.
+    ///
+    /// The prompt's `{{item}}` section names the kind, and `item` carries only `kind_id`; `§6.1`
+    /// returns the kind nowhere, so the assembler's caller reads it here.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn item_kind(&self, id: ItemKindId) -> Result<Option<ItemKind>> {
+        Ok(self.read(|state| state.kinds.get(&id).cloned()))
     }
 
     /// Takes the read lock, runs `f`, drops the guard and returns `f`'s owned result.
@@ -458,6 +605,133 @@ impl State {
         Ok(LinkGraph { root, nodes, edges })
     }
 
+    /// `docs/ANA-9.md` §7.3 as amended by `docs/ANA-5.md` §4.3, walked in memory.
+    ///
+    /// Four rules, each of which the SQL backends express in their own dialect and all four of
+    /// which a reader of [`link_graph`](State::link_graph) above would get wrong by analogy:
+    ///
+    /// 1. **Directed.** Only `to_item_id` is followed. `link_graph` follows an edge from either
+    ///    end and a conformance case pins that, so the two walks cannot share a step.
+    /// 2. **Kind-filtered.** `blocked_by` and `origin` only; `relates` and `supersedes` are not
+    ///    upstream, they are context.
+    /// 3. **`MIN(depth)`.** `seen` is written on first arrival and breadth-first order means first
+    ///    arrival is the nearest one, so a diamond renders its apex once, at the shorter depth.
+    /// 4. **Canonical order**, by [`UpstreamEntry::sort_canonical`], so this backend and the two
+    ///    SQL ones hand the assembler the same bytes.
+    ///
+    /// `hops` above 2 is clamped to 2; `hops == 0` returns nothing at all, which is the one place
+    /// this differs from `link_graph`'s "hops 0 is the root alone" — the root is the step's own
+    /// item and is never an upstream entry.
+    ///
+    /// `in_scope` and the summary lookup are separate: an out-of-scope item's `summary` is not
+    /// read, an in-scope one's is read and may still be `None`.
+    fn upstream(&self, root: ItemId, hops: u8, scope: &PromptScope) -> Vec<UpstreamEntry> {
+        let hops = hops.min(2);
+        let mut entries: Vec<UpstreamEntry> = Vec::new();
+        let mut seen = vec![root];
+        let mut frontier = vec![root];
+
+        for depth in 1..=hops {
+            let mut next: Vec<ItemId> = Vec::new();
+            for current in &frontier {
+                for link in self.links.iter().filter(|link| {
+                    link.deleted_at.is_none()
+                        && matches!(link.kind, LinkKind::BlockedBy | LinkKind::Origin)
+                        && link.from_item_id == *current
+                }) {
+                    let target = link.to_item_id;
+                    if seen.contains(&target) {
+                        continue;
+                    }
+                    seen.push(target);
+                    let Some(item) = self.items.get(&target) else {
+                        continue;
+                    };
+                    next.push(target);
+                    entries.push(self.upstream_entry(item, depth, scope));
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+
+        UpstreamEntry::sort_canonical(&mut entries);
+        entries
+    }
+
+    /// One reached item classified against the walk's bound (`R-PRM-1`, `R-PRM-2`).
+    fn upstream_entry(&self, item: &Item, depth: u8, scope: &PromptScope) -> UpstreamEntry {
+        // `R-ENT-2`: with no workspace the bound is the one project, because there is no implicit
+        // workspace row to ask.
+        let in_scope = scope
+            .workspace
+            .map_or(item.project_id == scope.project, |ws| {
+                self.workspace_projects
+                    .iter()
+                    .any(|member| member.workspace_id == ws && member.project_id == item.project_id)
+            });
+        UpstreamEntry {
+            item_id: item.id,
+            qualified_key: format!("{}:{}", self.project_slug(item.project_id), item.key),
+            title: item.title.clone(),
+            status: item.status,
+            depth,
+            in_scope,
+            summary: in_scope
+                .then(|| {
+                    self.latest_document(item.id, "summary")
+                        .map(|d| d.body.clone())
+                })
+                .flatten(),
+        }
+    }
+
+    /// The highest-`version` `document` of one kind on one item.
+    fn latest_document(&self, item: ItemId, kind: &str) -> Option<&Document> {
+        self.documents
+            .iter()
+            .filter(|document| document.item_id == item && document.kind == kind)
+            .max_by_key(|document| document.version)
+    }
+
+    /// The latest version of each named kind, in `kinds` order; an empty `kinds` means every kind
+    /// the item has, in kind **byte** order (blueprint P-12).
+    fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Vec<Document> {
+        if kinds.is_empty() {
+            let mut all: Vec<String> = self
+                .documents
+                .iter()
+                .filter(|document| document.item_id == item)
+                .map(|document| document.kind.clone())
+                .collect();
+            all.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            all.dedup();
+            return self.documents_of_kinds(item, &all);
+        }
+        kinds
+            .iter()
+            .filter_map(|kind| self.latest_document(item, kind).cloned())
+            .collect()
+    }
+
+    /// One binding resolved to the skill, the version in force and the body (`R-SKL-2`).
+    ///
+    /// `None` when the skill row or the version in force is missing, which is
+    /// [`SkillBinding::version_in_force`]'s "a pin that cannot be honoured renders nothing".
+    fn bind(&self, binding: &SkillBinding) -> Option<BoundSkill> {
+        let skill = self.skills.get(&binding.skill_id)?;
+        let version = binding.version_in_force(&self.skill_versions)?;
+        Some(BoundSkill {
+            skill_id: skill.id,
+            name: skill.name.clone(),
+            version: version.version,
+            position: binding.position,
+            body: version.body.clone(),
+        })
+    }
+
     /// The item's documents without their bodies, grouped by kind and ascending by version.
     fn document_heads(&self, id: ItemId) -> Vec<DocumentHead> {
         let mut heads: Vec<DocumentHead> = self
@@ -495,6 +769,11 @@ impl State {
     }
 
     /// A run's steps, ordered by `(position, attempt, fanout_index)`.
+    ///
+    /// `prompt_tokens` and `trimmed` are [`prompt_summary`]'s projection of `run_step.trim_record`
+    /// (plan D106), shared with the two SQL backends so the three cannot drift: the record itself
+    /// is a whole JSON document and §6.1 returns neither it nor `prompt_digest`, so these two
+    /// fields are the read seam's only trace of a written prompt audit.
     fn run_steps(&self, run: RunId) -> Vec<RunStepSummary> {
         let mut steps: Vec<&RunStep> = self
             .steps
@@ -504,18 +783,23 @@ impl State {
         steps.sort_by_key(|step| (step.position, step.attempt, step.fanout_index));
         steps
             .into_iter()
-            .map(|step| RunStepSummary {
-                id: step.id,
-                position: step.position,
-                attempt: step.attempt,
-                fanout_index: step.fanout_index,
-                phase_name: step.phase_name.clone(),
-                agent_id: step.agent_id,
-                model: step.model.clone(),
-                status: step.status,
-                gate_outcome: step.gate_outcome,
-                started_at: step.started_at,
-                finished_at: step.finished_at,
+            .map(|step| {
+                let (prompt_tokens, trimmed) = prompt_summary(step.trim_record.as_ref());
+                RunStepSummary {
+                    id: step.id,
+                    position: step.position,
+                    attempt: step.attempt,
+                    fanout_index: step.fanout_index,
+                    phase_name: step.phase_name.clone(),
+                    agent_id: step.agent_id,
+                    model: step.model.clone(),
+                    status: step.status,
+                    gate_outcome: step.gate_outcome,
+                    started_at: step.started_at,
+                    finished_at: step.finished_at,
+                    prompt_tokens,
+                    trimmed,
+                }
             })
             .collect()
     }
@@ -811,6 +1095,33 @@ impl State {
         Ok(())
     }
 
+    /// `run_step.prompt_digest` **and** `run_step.trim_record`, both, and nothing else
+    /// (`docs/ANA-5.md` §4.4): the pre-flight audit the assembler writes before a session starts.
+    ///
+    /// Unconditional where [`set_step_usage`](State::set_step_usage)'s digest write is
+    /// conditional: that one takes an `Option` because the chat path has no digest to offer on
+    /// most calls (plan D97), while a caller of this one has assembled a prompt and always has
+    /// both values.
+    fn set_step_prompt(
+        &mut self,
+        step: StepId,
+        digest: &str,
+        trim: &Value,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let row = self
+            .steps
+            .get_mut(&step)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })?;
+        row.prompt_digest = Some(digest.to_owned());
+        row.trim_record = Some(trim.clone());
+        row.updated_at = now;
+        Ok(())
+    }
+
     /// Insert-or-update on `agent.id`, with `agent.name` unique across every other id (§5.7).
     ///
     /// `created_at` is the stored row's on an update, never the caller's, and `updated_at` is the
@@ -1052,6 +1363,33 @@ impl ReadStore for MemStore {
     async fn step_events(&self, step: StepId) -> Result<Option<Vec<SessionEvent>>> {
         Ok(self.read(|state| state.step_log(step)))
     }
+
+    async fn document(&self, id: DocumentId) -> Result<Option<Document>> {
+        Ok(self.read(|state| {
+            state
+                .documents
+                .iter()
+                .find(|document| document.id == id)
+                .cloned()
+        }))
+    }
+
+    async fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Result<Vec<Document>> {
+        Ok(self.read(|state| state.documents_of_kinds(item, kinds)))
+    }
+
+    async fn upstream_summaries(
+        &self,
+        id: ItemId,
+        hops: u8,
+        scope: &PromptScope,
+    ) -> Result<Vec<UpstreamEntry>> {
+        Ok(self.read(|state| state.upstream(id, hops, scope)))
+    }
+
+    async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
+        Ok(self.read(|state| state.projects.get(&id).cloned()))
+    }
 }
 
 impl WriteStore for MemStore {
@@ -1124,15 +1462,20 @@ impl WriteStore for MemStore {
         let now = Utc::now();
         self.write(|state| state.finish_chat_run(run, step, status, finished_at, now))
     }
+
+    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.set_step_prompt(step, digest, trim, now))
+    }
 }
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
-    use crate::model::{AgentBox, AgentId, ChatRunSpec, RunStatus, StepStatus};
-    use crate::store::WriteStore as _;
+    use crate::model::{AgentBox, AgentId, ChatRunSpec, ItemId, RunStatus, StepId, StepStatus};
     use crate::store::error::StoreError;
+    use crate::store::{ReadStore as _, WriteStore as _};
     use chrono::Utc;
     use serde_json::json;
 
@@ -1171,6 +1514,214 @@ mod tests {
             step.prompt_digest.as_deref(),
             Some("abc"),
             "a `None` digest leaves the stored one alone (plan D15(b))"
+        );
+    }
+
+    /// `set_step_prompt` writes `prompt_digest` and `trim_record` and **nothing else**
+    /// (`docs/ANA-5.md` §4.4).
+    ///
+    /// The conformance case can only see the two `RunStepSummary` fields, because §6.1 returns
+    /// neither column; this reads `State` directly, which is what a unit test in this module is
+    /// for. `usage` is the column that proves "nothing else": the fixture leaves it `None`, a
+    /// `set_step_usage` call fills it, and a later `set_step_prompt` must not disturb it — the two
+    /// writers of `prompt_digest` share the column and must not share anything more.
+    #[tokio::test]
+    async fn set_step_prompt_writes_both_columns() {
+        let store = MemStore::demo();
+        store
+            .set_step_usage(ids::STEP_IMPL, json!({ "input_tokens": 7 }), None)
+            .await
+            .expect("the usage write lands");
+        store
+            .set_step_prompt(
+                ids::STEP_IMPL,
+                "9f8e",
+                &json!({ "estimated_after": 34_000, "sections": [], "v": 1 }),
+            )
+            .await
+            .expect("the prompt write lands");
+
+        let step = store.read(|state| {
+            state
+                .steps
+                .get(&ids::STEP_IMPL)
+                .cloned()
+                .expect("the fixture step")
+        });
+        assert_eq!(
+            step.prompt_digest.as_deref(),
+            Some("9f8e"),
+            "the digest is written unconditionally, unlike `set_step_usage`'s optional one"
+        );
+        assert_eq!(
+            step.trim_record,
+            Some(json!({ "estimated_after": 34_000, "sections": [], "v": 1 })),
+            "the record is stored whole, not a projection of it"
+        );
+        assert_eq!(
+            step.usage,
+            Some(json!({ "input_tokens": 7 })),
+            "the pre-flight audit does not touch the post-flight figure"
+        );
+
+        let unknown = store
+            .set_step_prompt(StepId::new(), "9f8e", &json!({}))
+            .await;
+        assert!(
+            matches!(
+                unknown,
+                Err(StoreError::NotFound {
+                    entity: "run_step",
+                    ..
+                })
+            ),
+            "an unknown step is NotFound, got {unknown:?}"
+        );
+    }
+
+    /// The read the preview makes for its skills section: `R-SKL-2`'s collapse over the fixture's
+    /// two project bindings and one phase override (`docs/ANA-5.md` §4.2).
+    ///
+    /// The fixture is built so that three mistakes are each caught by a different assertion.
+    /// Rendering `rust-style` twice — the bug OpenHands had to fix — shows up in the length.
+    /// Ignoring the phase's `pinned_version` shows up as v2 where v1 is in force. And keeping the
+    /// project order rather than the collapsed `(position, name bytes)` one shows up as
+    /// `rust-style` before `tests`, because the phase binding sits at position 2 and `tests` at 0.
+    #[tokio::test]
+    async fn a_preview_style_bound_skills_read_collapses_overrides() {
+        let store = MemStore::demo();
+
+        let project_level = store
+            .bound_skills(ids::PROJECT_HTUI, None)
+            .await
+            .expect("bound_skills must not fail");
+        assert_eq!(
+            project_level
+                .iter()
+                .map(|skill| (skill.name.as_str(), skill.version, skill.position))
+                .collect::<Vec<_>>(),
+            vec![("tests", 1, 0), ("rust-style", 2, 1)],
+            "with no phase, the project bindings alone, each at its latest version"
+        );
+
+        let with_phase = store
+            .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+            .await
+            .expect("bound_skills must not fail");
+        assert_eq!(
+            with_phase
+                .iter()
+                .map(|skill| (skill.name.as_str(), skill.version, skill.position))
+                .collect::<Vec<_>>(),
+            vec![("tests", 1, 0), ("rust-style", 1, 2)],
+            "the phase binding overrides the project one: once, pinned to v1, at position 2"
+        );
+        assert_eq!(
+            with_phase[1].body, "Prefer `expect` with a reason.",
+            "the pinned version's body, not the latest one's"
+        );
+
+        assert!(
+            store
+                .bound_skills(ids::PROJECT_AGY, None)
+                .await
+                .expect("bound_skills must not fail")
+                .is_empty(),
+            "a project with no bindings has no skills, not every skill"
+        );
+    }
+
+    /// The four rules of the amended §7.3 walk that a reader would get wrong by analogy with
+    /// [`ReadStore::links`], asserted against the same fixture from the same root.
+    ///
+    /// The conformance case pins the walk's output; this one pins it against `links`, because the
+    /// two traversals sit twenty lines apart in this file and the failure mode is copying the
+    /// wrong one. `links(AGY_FIX_1, 2)` is undirected, un-kind-filtered and unscoped, so it
+    /// reaches strictly more items — and every extra item it reaches is a rule this walk keeps.
+    #[tokio::test]
+    async fn upstream_walk_is_directed_and_kind_filtered() {
+        let store = MemStore::demo();
+        let scope = crate::model::PromptScope::from_scope(
+            &crate::model::Scope {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+            },
+            ids::PROJECT_AGY,
+        );
+
+        let upstream = store
+            .upstream_summaries(ids::AGY_FIX_1, 2, &scope)
+            .await
+            .expect("the walk must not fail");
+        let walked: Vec<ItemId> = upstream.iter().map(|entry| entry.item_id).collect();
+
+        /// Every item [`ReadStore::links`] reaches, root included: the undirected comparison.
+        async fn neighbourhood(store: &MemStore, root: ItemId, hops: u8) -> Vec<ItemId> {
+            let graph = store
+                .links(root, hops)
+                .await
+                .expect("the neighbourhood must not fail");
+            graph.nodes.iter().map(|node| node.item_id).collect()
+        }
+
+        let around_fix_1 = neighbourhood(&store, ids::AGY_FIX_1, 2).await;
+        for reached in &walked {
+            assert!(
+                around_fix_1.contains(reached),
+                "the directed walk cannot reach what the undirected one does not"
+            );
+        }
+        assert!(
+            !walked.contains(&ids::AGY_FIX_1),
+            "the root is the step's own item and is never an upstream entry"
+        );
+        assert_eq!(
+            walked.iter().filter(|id| **id == ids::HTUI_ANA_1).count(),
+            1,
+            "the diamond's apex is reached twice at depth 2 and rendered once"
+        );
+
+        // Directed. `htui:ANA-1` has four live edges and every one of them points *at* it, so the
+        // undirected `links` finds four neighbours and the upstream walk finds nothing at all.
+        let htui = crate::model::PromptScope::from_scope(
+            &crate::model::Scope {
+                workspace_id: ids::WORKSPACE_PLATFORM,
+                project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+            },
+            ids::PROJECT_HTUI,
+        );
+        assert_eq!(
+            neighbourhood(&store, ids::HTUI_ANA_1, 1).await.len(),
+            5,
+            "root + 4"
+        );
+        assert!(
+            store
+                .upstream_summaries(ids::HTUI_ANA_1, 1, &htui)
+                .await
+                .expect("the walk must not fail")
+                .is_empty(),
+            "every edge at ANA-1 is incoming, and `to_item_id` is the only one followed"
+        );
+
+        // Kind-filtered. `FEAT-3` has one `origin` edge and one `relates` edge, both outgoing.
+        let feat_3: Vec<ItemId> = store
+            .upstream_summaries(ids::HTUI_FEAT_3, 1, &htui)
+            .await
+            .expect("the walk must not fail")
+            .iter()
+            .map(|entry| entry.item_id)
+            .collect();
+        assert_eq!(
+            feat_3,
+            vec![ids::HTUI_ANA_1],
+            "`relates` is context, not upstream: only the `origin` target is followed"
+        );
+        assert!(
+            neighbourhood(&store, ids::HTUI_FEAT_3, 1)
+                .await
+                .contains(&ids::HTUI_FEAT_1),
+            "…while `links` follows the same `relates` edge, which is what it is for"
         );
     }
 

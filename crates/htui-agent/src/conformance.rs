@@ -30,10 +30,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, DocumentHead, EventKind, EventRole,
-    Item, ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, PER_TOKEN_CAP_RUN,
-    Quota, QuotaSource, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepId,
-    normalize,
+    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId,
+    EventKind, EventRole, Item, ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem,
+    Note, PER_TOKEN_CAP_RUN, Project, ProjectId, PromptScope, Quota, QuotaSource, RunId, RunStatus,
+    RunSummary, Scope, SessionEvent, Status, StepId, UpstreamEntry, normalize,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore, Result as StoreResult, UpdateOutcome, WriteStore};
@@ -611,6 +611,27 @@ impl<S: WriteStore> ReadStore for UsageSpy<'_, S> {
     async fn step_events(&self, step: StepId) -> StoreResult<Option<Vec<SessionEvent>>> {
         self.inner.step_events(step).await
     }
+    async fn document(&self, id: DocumentId) -> StoreResult<Option<Document>> {
+        self.inner.document(id).await
+    }
+    async fn documents_of_kinds(
+        &self,
+        item: ItemId,
+        kinds: &[String],
+    ) -> StoreResult<Vec<Document>> {
+        self.inner.documents_of_kinds(item, kinds).await
+    }
+    async fn upstream_summaries(
+        &self,
+        id: ItemId,
+        hops: u8,
+        scope: &PromptScope,
+    ) -> StoreResult<Vec<UpstreamEntry>> {
+        self.inner.upstream_summaries(id, hops, scope).await
+    }
+    async fn project(&self, id: ProjectId) -> StoreResult<Option<Project>> {
+        self.inner.project(id).await
+    }
 }
 
 impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
@@ -692,6 +713,12 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         self.inner
             .finish_chat_run(run, step, status, finished_at)
             .await
+    }
+    /// Delegated, and deliberately not logged: this spy watches `set_step_usage` and the quota
+    /// latch, and the chat path this suite drives never assembles a prompt (MOD-2 plan D97). The
+    /// recorder's own `SpyStore` keeps the prompt log.
+    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> StoreResult<()> {
+        self.inner.set_step_prompt(step, digest, trim).await
     }
 }
 

@@ -27,7 +27,7 @@ pub use connect::{ConnEvent, StartOptions, Started};
 pub use error::map_sqlx;
 pub use identity::Identity;
 pub use pg::{Connected, MigrationState, PgStore};
-pub use writer::{BufferedWriter, REGISTRY_ON_SERVER_ONLY, Writer};
+pub use writer::{BufferedWriter, PROMPT_ON_SERVER_ONLY, REGISTRY_ON_SERVER_ONLY, Writer};
 
 /// The embedded Postgres schema (ANA-9 §5), applied by [`PgStore::apply_migrations`].
 ///

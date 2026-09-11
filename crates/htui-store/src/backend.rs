@@ -20,8 +20,9 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph, Note,
-    ProjectId, ProjectRef, RunSummary, Scope, SessionEvent, StepId, UserId, WorkspaceSummary,
+    AgentSummary, BoxInfo, Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId,
+    ItemSummary, LinkGraph, Note, Project, ProjectId, ProjectRef, PromptScope, RunSummary, Scope,
+    SessionEvent, StepId, UpstreamEntry, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -375,6 +376,43 @@ impl ReadStore for Backend {
             Self::Memory(store) => store.step_events(step).await,
             Self::Online { pg, .. } => pg.step_events(step).await,
             Self::Offline { cache, .. } => cache.step_events(step).await,
+        }
+    }
+
+    async fn document(&self, id: DocumentId) -> Result<Option<Document>> {
+        match self {
+            Self::Memory(store) => store.document(id).await,
+            Self::Online { pg, .. } => pg.document(id).await,
+            Self::Offline { cache, .. } => cache.document(id).await,
+        }
+    }
+
+    async fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Result<Vec<Document>> {
+        match self {
+            Self::Memory(store) => store.documents_of_kinds(item, kinds).await,
+            Self::Online { pg, .. } => pg.documents_of_kinds(item, kinds).await,
+            Self::Offline { cache, .. } => cache.documents_of_kinds(item, kinds).await,
+        }
+    }
+
+    async fn upstream_summaries(
+        &self,
+        id: ItemId,
+        hops: u8,
+        scope: &PromptScope,
+    ) -> Result<Vec<UpstreamEntry>> {
+        match self {
+            Self::Memory(store) => store.upstream_summaries(id, hops, scope).await,
+            Self::Online { pg, .. } => pg.upstream_summaries(id, hops, scope).await,
+            Self::Offline { cache, .. } => cache.upstream_summaries(id, hops, scope).await,
+        }
+    }
+
+    async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
+        match self {
+            Self::Memory(store) => store.project(id).await,
+            Self::Online { pg, .. } => pg.project(id).await,
+            Self::Offline { cache, .. } => cache.project(id).await,
         }
     }
 }

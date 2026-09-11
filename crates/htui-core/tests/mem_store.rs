@@ -13,6 +13,17 @@ async fn mem_store_conformance() {
     conformance::run_all(|| async { MemStore::demo() }).await;
 }
 
+/// The read-only half of the suite (plan D96), bound to the same fixture.
+///
+/// A second binding rather than more cases in the first: `run_all` is generic over `WriteStore`,
+/// and the point of `READ_CASES` is that its harness is generic over `ReadStore`, so MOD-2
+/// milestone 9's `CacheStore` can be a target too. Running it here is what makes `MemStore` the
+/// reference those two are compared against.
+#[tokio::test]
+async fn mem_store_read_conformance() {
+    conformance::run_all_reads(|| async { MemStore::demo() }).await;
+}
+
 #[tokio::test]
 async fn demo_store_loads_the_fixture() {
     let store = MemStore::demo();
@@ -23,8 +34,13 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        22,
-        "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3) and milestone 7's two quota \
-         cases (plans D67 and D74)"
+        23,
+        "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
+         cases (plans D67 and D74) and milestone 9's `set_step_prompt`"
+    );
+    assert_eq!(
+        conformance::READ_CASES.len(),
+        6,
+        "milestone 9's four `ReadStore` additions, the upstream walk taking three cases (D96)"
     );
 }

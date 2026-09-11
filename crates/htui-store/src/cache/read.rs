@@ -27,11 +27,12 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, DocumentHead, DocumentId, EventKind,
-    EventRole, GateOutcome, Item, ItemFilter, ItemId, ItemSummary, LinkEdge, LinkGraph, LinkKind,
-    LinkNode, Note, NoteId, OsFamily, ProjectId, ProjectRef, RunId, RunKind, RunMode, RunStatus,
-    RunStepSummary, RunSummary, Scope, SessionEvent, Status, StepGraphId, StepId, StepStatus,
-    Transport, UserId, WorkspaceId, WorkspaceSummary,
+    Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, Document, DocumentHead, DocumentId,
+    EventKind, EventRole, GateOutcome, Item, ItemFilter, ItemId, ItemSummary, LinkEdge, LinkGraph,
+    LinkKind, LinkNode, Note, NoteId, OsFamily, Project, ProjectId, ProjectRef, PromptScope, RunId,
+    RunKind, RunMode, RunStatus, RunStepSummary, RunSummary, Scope, SessionEvent, Status,
+    StepGraphId, StepId, StepStatus, Transport, UpstreamEntry, UserId, WorkspaceId,
+    WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -478,8 +479,16 @@ impl ReadStore for CacheStore {
             .map(|row| text(row, "id"))
             .collect::<Result<_>>()?;
         let sql = format!(
+            // The last two columns are plan D106's figures, the same derivation the Postgres
+            // statement makes and `htui_core::model::prompt_summary` makes in Rust. `max` over
+            // `json_each` is SQLite's `bool_or`: there is no such aggregate, and the values are
+            // the integers 0 and 1.
             "SELECT run_id, id, position, attempt, fanout_index, phase_name, agent_id, model, \
-                    status, gate_outcome, started_at, finished_at \
+                    status, gate_outcome, started_at, finished_at, \
+                    json_extract(trim_record, '$.estimated_after') AS prompt_tokens, \
+                    COALESCE((SELECT max(json_extract(e.value, '$.trimmed')) \
+                                FROM json_each(run_step.trim_record, '$.sections') e), 0) \
+                        AS trimmed \
                FROM run_step WHERE run_id IN ({}) \
               ORDER BY run_id, position, attempt, fanout_index",
             placeholders(ids.len()),
@@ -509,6 +518,11 @@ impl ReadStore for CacheStore {
                     gate_outcome: get::<Option<GateOutcome>>(row, "gate_outcome")?,
                     started_at: opt_ts_col("run_step.started_at", get(row, "started_at")?)?,
                     finished_at: opt_ts_col("run_step.finished_at", get(row, "finished_at")?)?,
+                    // A figure outside `i32` is no figure rather than a truncated one, which is
+                    // what `prompt_summary` does with the same value in Rust.
+                    prompt_tokens: get::<Option<i64>>(row, "prompt_tokens")?
+                        .and_then(|tokens| i32::try_from(tokens).ok()),
+                    trimmed: bool_col(get::<i64>(row, "trimmed")?),
                 },
             ));
         }
@@ -576,6 +590,34 @@ impl ReadStore for CacheStore {
             })
             .collect::<Result<Vec<_>>>()
             .map(Some)
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // MOD-2 milestone 9's four reads. Every table they touch **is** mirrored — `document` body and
+    // all, `project.settings`, `item_link`, `workspace_project` — which is why they are trait
+    // methods rather than inherent ones (plan D96). The signatures land with the seam (T62); the
+    // bodies are T63's, and with them `store::conformance::READ_CASES` runs over the mirror.
+    // -------------------------------------------------------------------------------------------
+
+    async fn document(&self, _id: DocumentId) -> Result<Option<Document>> {
+        todo!("T63: SELECT the mirrored document row with its body")
+    }
+
+    async fn documents_of_kinds(&self, _item: ItemId, _kinds: &[String]) -> Result<Vec<Document>> {
+        todo!("T63: latest version per kind over the mirror, then the caller's order")
+    }
+
+    async fn upstream_summaries(
+        &self,
+        _id: ItemId,
+        _hops: u8,
+        _scope: &PromptScope,
+    ) -> Result<Vec<UpstreamEntry>> {
+        todo!("T63: the amended §7.3 walk on SQLite (blueprint C.2), then sort_canonical")
+    }
+
+    async fn project(&self, _id: ProjectId) -> Result<Option<Project>> {
+        todo!("T63: SELECT the mirrored project row with its settings")
     }
 }
 

@@ -108,6 +108,13 @@ pub(crate) struct StepRow {
     pub(crate) started_at: Option<DateTime<Utc>>,
     /// `run_step.finished_at`.
     pub(crate) finished_at: Option<DateTime<Utc>>,
+    /// `run_step.trim_record->>'estimated_after'`, the statement's own projection (plan D106).
+    ///
+    /// Appended, never inserted: `query_as!` binds a struct's fields **positionally**, so a new
+    /// field in the middle would silently re-map every column after it.
+    pub(crate) prompt_tokens: Option<i32>,
+    /// Whether any `run_step.trim_record->'sections'` entry has `trimmed: true` (plan D106).
+    pub(crate) trimmed: bool,
 }
 
 impl StepRow {
@@ -125,6 +132,8 @@ impl StepRow {
             gate_outcome: self.gate_outcome,
             started_at: self.started_at,
             finished_at: self.finished_at,
+            prompt_tokens: self.prompt_tokens,
+            trimmed: self.trimmed,
         }
     }
 }

@@ -15,14 +15,25 @@
 //! here: `agent` and `agent_box` are not mirrored (`docs/ANA-9.md` §4.4), so it is inherent on
 //! `MemStore` / `PgStore` and dispatched by `Backend`, following the `workspaces` / `box_info` /
 //! `active_runs` / `projects` precedent.
+//!
+//! **MOD-2 milestone 9** reopens it a second time, and this time [`ReadStore`] grows too: the
+//! prompt assembler of `docs/ANA-5.md` needs a document's **body**, the latest document per kind,
+//! the amended §7.3 upstream walk and a project's `settings`. All four are reads of tables the
+//! cache mirrors, which is ANA-2 §8's test for a trait method rather than an inherent one — and
+//! that is what lets `CacheStore` answer them and `store::conformance`'s `READ_CASES` run over the
+//! mirror (plan D96). [`WriteStore`] gains one: [`WriteStore::set_step_prompt`], the pre-flight
+//! audit row. The prompt inputs that are **not** mirrored — `prompt_template`, `skill`,
+//! `skill_version`, `skill_binding`, `box_tool` — stay inherent on `MemStore` / `PgStore` for the
+//! same reason `agents()` does.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, DocumentHead, Item, ItemFilter, ItemId,
-    ItemPatch, ItemRevision, ItemSummary, LinkGraph, NewItem, Note, RunId, RunStatus, RunSummary,
-    Scope, SessionEvent, Status, StepId,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, Item,
+    ItemFilter, ItemId, ItemPatch, ItemRevision, ItemSummary, LinkGraph, NewItem, Note, Project,
+    ProjectId, PromptScope, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepId,
+    UpstreamEntry,
 };
 use crate::store::error::Result;
 
@@ -45,6 +56,55 @@ pub trait ReadStore: Send + Sync {
     async fn runs(&self, id: ItemId) -> Result<Vec<RunSummary>>;
     /// The replay log of one step.
     async fn step_events(&self, step: StepId) -> Result<Option<Vec<SessionEvent>>>; // None = not cached
+
+    /// One document **with its body**, or `None` when no row has that id (`docs/ANA-5.md` §8).
+    ///
+    /// [`documents`](ReadStore::documents) answers heads, which is what a list needs; the prompt
+    /// assembler needs the text. On `ReadStore` rather than inherent because `document` is
+    /// mirrored body and all (`cache_migrations/0001_mirror.sql:97-101`), so every backend can
+    /// answer it.
+    async fn document(&self, id: DocumentId) -> Result<Option<Document>>;
+
+    /// The **latest version of each `kind`**, in `kinds` order, kinds the item has no row for
+    /// omitted. An empty `kinds` means every kind the item has, in kind byte order.
+    ///
+    /// The order is the caller's because `docs/ANA-5.md` §4.7 rule 3 renders documents in the
+    /// phase's `input_kinds` order and the prompt digest is a function of that order; sorting here
+    /// would make the store the authority on something the graph owns. Byte order for the empty
+    /// case for the reason [`UpstreamEntry::sort_canonical`](crate::model::UpstreamEntry::sort_canonical)
+    /// gives: Postgres would otherwise order by collation and the mirror by bytes.
+    ///
+    /// This is **not** ANA-2 §8's resolver: it prefers no run's output and excludes no loser,
+    /// because both need `run_step` rows MOD-4 owns. MOD-4 layers that on top (blueprint P-12).
+    async fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Result<Vec<Document>>;
+
+    /// Upstream items reached over `blocked_by` and `origin` edges, up to `hops` (clamped to
+    /// `1..=2`; `0` returns nothing), **one row per item at its minimum depth**, classified
+    /// against `scope` (`R-PRM-1`, `R-PRM-2`).
+    ///
+    /// `docs/ANA-9.md` §7.3 as amended by `docs/ANA-5.md` §4.3, returned in canonical order
+    /// ([`UpstreamEntry::sort_canonical`](crate::model::UpstreamEntry::sort_canonical)) so the
+    /// three backends hand the assembler the same bytes.
+    ///
+    /// Directed, unlike [`links`](ReadStore::links): only `to_item_id` is followed, and only those
+    /// two link kinds. `in_scope` and `summary.is_some()` are separable facts — an in-scope item
+    /// with no summary renders as `no summary yet`, an out-of-scope one as the `R-PRM-2` stub
+    /// whose summary is not read at all.
+    async fn upstream_summaries(
+        &self,
+        id: ItemId,
+        hops: u8,
+        scope: &PromptScope,
+    ) -> Result<Vec<UpstreamEntry>>;
+
+    /// One project row with its `settings`, or `None` when no row has that id
+    /// (`docs/ANA-5.md` §8).
+    ///
+    /// `project.settings` is mirrored (`cache_migrations/0001_mirror.sql:57-61`), which is why
+    /// this is a trait method while
+    /// [`MemStore::project_settings`](crate::store::MemStore::project_settings) — the column
+    /// alone, for the per-run token cap — stays inherent beside it.
+    async fn project(&self, id: ProjectId) -> Result<Option<Project>>;
 }
 
 /// Everything a write path needs.
@@ -199,7 +259,24 @@ pub trait WriteStore: ReadStore {
         status: RunStatus,
         finished_at: DateTime<Utc>,
     ) -> Result<()>;
-    // links, notes, documents, skills, templates, box ...
+
+    /// Writes `run_step.prompt_digest` and `run_step.trim_record`, both, and nothing else
+    /// (`docs/ANA-5.md` §4.4): the pre-flight audit of `R-PRM-3` / `R-ORCH-11`, written at stage 3
+    /// before a session starts.
+    ///
+    /// The same digest `htui_agent`'s `Recorder::record_prompt` will later recompute over the same
+    /// text and hand to [`set_step_usage`](WriteStore::set_step_usage), so the column's two
+    /// writers agree by construction rather than by ordering.
+    ///
+    /// Not folded into `set_step_usage`: that one is the **chat** path's digest writer (plan D97),
+    /// whose prompt has no template, no sections and no trim record to write.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "run_step"` when
+    /// the step does not exist.
+    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()>;
+    // links, notes, templates, box ...
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the

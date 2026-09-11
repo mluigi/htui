@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET prompt_digest = $2, trim_record = $3 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "87c6bb412e9e04b9ebbab2c40ac3eefb6cf9869328adb7deff70d1343eeeae6f"
+}

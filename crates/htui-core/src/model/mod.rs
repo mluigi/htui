@@ -119,7 +119,7 @@ pub use quota::{
 };
 pub use run::{
     ChatRunSpec, GateOutcome, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepSummary, RunSummary, StepStatus,
+    RunStepSummary, RunSummary, StepStatus, prompt_summary,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{BoundSkill, Skill, SkillBinding, SkillVersion};

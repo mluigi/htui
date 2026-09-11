@@ -16,11 +16,11 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AppUser, BoxRow, CommandQueue, Document, EventKind, EventRole, Gate, GateOutcome, Item,
-    ItemKind, ItemKindId, ItemLink, ItemRevision, LinkKind, Note, NoteId, OsFamily, PhaseId,
-    Project, ProjectId, PromptTemplate, PromptTemplateId, Run, RunKind, RunMode, RunStatus,
-    RunStep, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus,
-    Workspace, WorkspaceProject,
+    Agent, AppUser, BoxRow, BoxTool, CommandQueue, Document, EventKind, EventRole, Gate,
+    GateOutcome, Item, ItemKind, ItemKindId, ItemLink, ItemRevision, LinkKind, Note, NoteId,
+    OsFamily, PhaseId, Project, ProjectId, PromptTemplate, PromptTemplateId, Run, RunKind, RunMode,
+    RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
 };
 
 /// Milliseconds of `2026-09-03T00:00:00Z`, the timestamp field of every [`demo_uuid`].
@@ -60,6 +60,10 @@ mod class {
     pub const AGENT: u8 = 14;
     /// `prompt_template`.
     pub const PROMPT_TEMPLATE: u8 = 15;
+    /// `skill`.
+    pub const SKILL: u8 = 16;
+    /// `skill_binding`. `skill_version` needs none: its primary key is `(skill_id, version)`.
+    pub const SKILL_BINDING: u8 = 17;
 }
 
 /// A v7-shaped, fully deterministic UUID: 48-bit timestamp = [`DEMO_EPOCH_MS`] + `class` * 1000 +
@@ -91,13 +95,15 @@ pub fn demo_at(day: i64, hour: i64) -> DateTime<Utc> {
 
 /// Every identifier of the fixture, named as in the blueprint §G tables.
 ///
-/// Phase and prompt-template ids are not listed: they are generated from the per-project formula
-/// in [`demo_data`] and nothing outside this module refers to one.
+/// Prompt-template ids are not listed: they are generated from the per-project formula in
+/// [`demo_data`] and nothing outside this module refers to one. Phase ids are generated the same
+/// way and only one is named — [`ids::PHASE_HTUI_IMPLEMENT`], because a `skill_binding` row has to
+/// point at a phase for the `R-SKL-2` override to be exercised at all.
 pub mod ids {
     use super::{class, demo_uuid};
     use crate::model::{
-        AgentId, BoxId, DocumentId, ItemId, ItemKindId, NoteId, ProjectId, RunId, StepGraphId,
-        StepId, UserId, WorkspaceId,
+        AgentId, BoxId, DocumentId, ItemId, ItemKindId, NoteId, PhaseId, ProjectId, RunId,
+        SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
     };
 
     /// Declares the fixture identifiers of one §5 table.
@@ -264,6 +270,26 @@ pub mod ids {
         /// The pending `prd` step of [`RUN_2`].
         STEP_R2_PRD: StepId = (class::RUN_STEP, 4),
     );
+
+    demo_ids!(
+        /// `step_graph_phase` `implement` of `htui`'s default `FEAT` graph.
+        ///
+        /// The one phase id the fixture names, for [`BINDING_HTUI_IMPLEMENT_RUST_STYLE`]. `4` is
+        /// what the per-project formula in `catalogue` assigns it: `htui` starts at `0`, `ANA`
+        /// spends `0..=1` on `research` / `verdict`, and `FEAT`'s four phases run `2..=5`.
+        PHASE_HTUI_IMPLEMENT: PhaseId = (class::PHASE, 4),
+        /// `skill` `rust-style`, two versions.
+        SKILL_RUST_STYLE: SkillId = (class::SKILL, 0),
+        /// `skill` `tests`, one version.
+        SKILL_TESTS: SkillId = (class::SKILL, 1),
+        /// `skill_binding`: `rust-style` on project `htui`, unpinned, position 1.
+        BINDING_HTUI_RUST_STYLE: SkillBindingId = (class::SKILL_BINDING, 0),
+        /// `skill_binding`: `tests` on project `htui`, unpinned, position 0.
+        BINDING_HTUI_TESTS: SkillBindingId = (class::SKILL_BINDING, 1),
+        /// `skill_binding`: `rust-style` on `htui`'s `implement` phase, pinned to v1, position 2.
+        /// The `R-SKL-2` override of [`BINDING_HTUI_RUST_STYLE`].
+        BINDING_HTUI_IMPLEMENT_RUST_STYLE: SkillBindingId = (class::SKILL_BINDING, 2),
+    );
 }
 
 /// The whole fixture: one collection per §5 table `MemStore`'s state holds.
@@ -294,6 +320,14 @@ pub struct DemoData {
     pub templates: Vec<PromptTemplate>,
     /// `agent` rows.
     pub agents: Vec<Agent>,
+    /// `skill` rows (§5.6); read-only in MOD-2 (plan D105).
+    pub skills: Vec<Skill>,
+    /// `skill_version` rows (§5.6).
+    pub skill_versions: Vec<SkillVersion>,
+    /// `skill_binding` rows (§5.6): project-level and one phase-level override.
+    pub skill_bindings: Vec<SkillBinding>,
+    /// `box_tool` rows (§5.2): what the prompt's `box` section lists.
+    pub box_tools: Vec<BoxTool>,
     /// `item_key_counter` rows, keyed by `(project_id, prefix)` (§4.1).
     pub item_key_counter: HashMap<(ProjectId, String), i32>,
     /// `item` rows.
@@ -330,6 +364,10 @@ pub fn demo_data() -> DemoData {
         phases,
         templates,
         agents: agents(),
+        skills: skills(),
+        skill_versions: skill_versions(),
+        skill_bindings: skill_bindings(),
+        box_tools: box_tools(),
         item_key_counter: counters(),
         items: items(),
         revisions: revisions(),
@@ -412,6 +450,121 @@ fn agents() -> Vec<Agent> {
         .zip(ids)
         .map(|(agent, id)| Agent { id, ..agent })
         .collect()
+}
+
+/// `skill` (§5.6): two library entries, read-only in this milestone (plan D105).
+fn skills() -> Vec<Skill> {
+    [
+        (
+            ids::SKILL_RUST_STYLE,
+            "rust-style",
+            "House Rust conventions: no `unwrap` off the test path, one error enum per crate",
+        ),
+        (
+            ids::SKILL_TESTS,
+            "tests",
+            "How this workspace writes tests: named cases, assertions that carry their reason",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, name, description)| Skill {
+        id,
+        name: name.to_owned(),
+        description: description.to_owned(),
+        created_by: ids::USER,
+        created_at: epoch(),
+        updated_at: epoch(),
+    })
+    .collect()
+}
+
+/// `skill_version` (§5.6): `rust-style` at v1 and v2, `tests` at v1.
+///
+/// Two versions of one skill is what makes a `pinned_version` observable — an unpinned binding
+/// follows v2 and the phase-level pin holds v1, so
+/// [`SkillBinding::version_in_force`](crate::model::SkillBinding::version_in_force) has something
+/// to resolve.
+fn skill_versions() -> Vec<SkillVersion> {
+    [
+        (ids::SKILL_RUST_STYLE, 1, "Prefer `expect` with a reason."),
+        (
+            ids::SKILL_RUST_STYLE,
+            2,
+            "Prefer `expect` with a reason. One error enum per crate.",
+        ),
+        (ids::SKILL_TESTS, 1, "Name the case after the rule it pins."),
+    ]
+    .into_iter()
+    .map(|(skill_id, version, body)| SkillVersion {
+        skill_id,
+        version,
+        body: body.to_owned(),
+        created_by: ids::USER,
+        created_at: epoch(),
+    })
+    .collect()
+}
+
+/// `skill_binding` (§5.6): two project-level bindings on `htui` and one phase-level override.
+///
+/// The override is the `R-SKL-2` case of `docs/ANA-5.md` §4.2: `rust-style` is bound at the
+/// project **and** at `htui`'s `implement` phase, so a resolution that forgot to collapse would
+/// render it twice. The positions are deliberately not the render order — `tests` sits at 0 and
+/// the phase binding at 2 — so a read that kept the project order would be caught.
+fn skill_bindings() -> Vec<SkillBinding> {
+    [
+        (
+            ids::BINDING_HTUI_RUST_STYLE,
+            ids::SKILL_RUST_STYLE,
+            None,
+            None,
+            1,
+        ),
+        (ids::BINDING_HTUI_TESTS, ids::SKILL_TESTS, None, None, 0),
+        (
+            ids::BINDING_HTUI_IMPLEMENT_RUST_STYLE,
+            ids::SKILL_RUST_STYLE,
+            Some(ids::PHASE_HTUI_IMPLEMENT),
+            Some(1),
+            2,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(id, skill_id, phase_id, pinned_version, position)| SkillBinding {
+            id,
+            skill_id,
+            project_id: ids::PROJECT_HTUI,
+            phase_id,
+            pinned_version,
+            position,
+            updated_at: epoch(),
+        },
+    )
+    .collect()
+}
+
+/// `box_tool` (§5.2): what the probe found on the one demo box.
+///
+/// Deliberately not in name order, and one row with an empty version:
+/// [`BoxProfile::project`](crate::model::BoxProfile::project) sorts by name bytes and renders a
+/// version-less tool as the bare name, and a fixture already sorted would prove neither.
+fn box_tools() -> Vec<BoxTool> {
+    [
+        ("rustc", "1.98.0"),
+        ("cargo", "1.98.0"),
+        ("git", "2.51.0"),
+        ("cmake", ""),
+    ]
+    .into_iter()
+    .map(|(name, version)| BoxTool {
+        box_id: ids::BOX,
+        name: name.to_owned(),
+        version: version.to_owned(),
+        path: format!("/usr/bin/{name}"),
+        probed_at: epoch(),
+    })
+    .collect()
 }
 
 /// `workspace` (§5.3).
@@ -967,9 +1120,30 @@ fn revisions() -> Vec<ItemRevision> {
         .collect()
 }
 
-/// `item_link` (§5.5): six live edges and one tombstone.
+/// `item_link` (§5.5): eleven live edges and one tombstone.
+///
+/// Rows eight to twelve are `docs/ANA-5.md` §4.3's walk made testable, all five hanging off
+/// `agy` `FIX-1` so no pinned set of the first seven moves:
+///
+/// ```text
+///                 AGY_FIX_1
+///    blocked_by /     | origin      \ origin
+///    AGY_ANA_1        HTUI_TOOL_1    VULKAN_FEAT_1   (depth 1)
+///  blocked_by \       / blocked_by
+///              HTUI_ANA_1                            (depth 2, by two paths)
+/// ```
+///
+/// `HTUI_ANA_1` is the diamond: reached at depth 2 down both arms, it must appear **once**.
+/// `AGY_ANA_1` and `HTUI_TOOL_1` are in the Platform workspace with no `summary` document, so they
+/// are the amended query's third render state (`in_scope`, no summary). `VULKAN_FEAT_1` is in the
+/// Graphics workspace, so it is the `R-PRM-2` stub.
+///
+/// Nothing here disturbs what is already pinned. `links_hops_1_vs_2` pins the exact hop-1 and
+/// hop-2 sets of `HTUI_FEAT_2` and no new edge touches `FEAT_2`, `FEAT_1` or `AGY_FEAT_1`. The
+/// ready list keeps `AGY_FIX_1`, because the only `blocked_by` added from an **open** item points
+/// at `AGY_ANA_1`, which is `done` and so terminal (§7.4).
 fn links() -> Vec<ItemLink> {
-    let specs: [(crate::model::ItemId, LinkKind, crate::model::ItemId, bool); 7] = [
+    let specs: [(crate::model::ItemId, LinkKind, crate::model::ItemId, bool); 12] = [
         (ids::HTUI_FEAT_1, LinkKind::Origin, ids::HTUI_ANA_1, false),
         (
             ids::HTUI_FEAT_2,
@@ -987,6 +1161,17 @@ fn links() -> Vec<ItemLink> {
         ),
         (ids::AGY_FEAT_1, LinkKind::Relates, ids::HTUI_FEAT_2, false),
         (ids::HTUI_TOOL_1, LinkKind::Relates, ids::HTUI_FEAT_1, true),
+        // ANA-5 §4.3's walk, rooted at `agy` FIX-1.
+        (ids::AGY_FIX_1, LinkKind::BlockedBy, ids::AGY_ANA_1, false),
+        (ids::AGY_FIX_1, LinkKind::Origin, ids::HTUI_TOOL_1, false),
+        (ids::AGY_ANA_1, LinkKind::BlockedBy, ids::HTUI_ANA_1, false),
+        (
+            ids::HTUI_TOOL_1,
+            LinkKind::BlockedBy,
+            ids::HTUI_ANA_1,
+            false,
+        ),
+        (ids::AGY_FIX_1, LinkKind::Origin, ids::VULKAN_FEAT_1, false),
     ];
     specs
         .into_iter()
