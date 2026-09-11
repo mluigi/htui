@@ -203,6 +203,24 @@ a row count the projection has already discarded); `SkillBinding::version_in_for
 pinned-versus-latest rule would be written three times across `MemStore`, `PgStore` and `CacheStore`;
 `PromptScope`'s two constructors are `const fn`.
 
+**F-28 — a per-crate gate is not a gate, and two tasks proved it in a row.** T59 and T60 each
+reported green and each left a failure that only the **workspace** suite sees, because their
+validation lines were `-p htui-core` and `-p htui`:
+
+- T59's `prompt/estimate.rs:49` doc comment spelled `agy_acp_server`, which
+  `htui-agent::extensibility::the_installer_names_no_vendor` forbids anywhere in `src/` — the
+  `R-AGT-5` vendor sweep. A doc comment broke a requirement test in another crate.
+- T60's fixture change (`"prd"` → `"documents:prd"`) left
+  `htui-agent::replay::the_fixture_plan_step_decodes`'s snapshot stale.
+
+Neither is a defect in the work; both are the same gap. **Every remaining task's validation line is
+the workspace suite**, not its own crate — `cargo test --workspace --all-features --no-fail-fast`,
+with `--no-fail-fast` because `cargo test` otherwise stops at the first failing binary, which is how
+milestone 8 briefly called two broken suites green. Two further traps this milestone has now hit
+twice: `cargo doc` catches `deny`-level intra-doc breakage that `cargo test` and `clippy` are both
+blind to (T62 found two such breaks in inherited work), and the workspace suite must not run
+concurrently in two places against the single dev Postgres.
+
 **F-25 — the fixture id collision E-5 predicted is real, and was measured before it was fixed.** With
 ten `TEMPLATE_NAMES` under the old `project_index * 8` stride the demo fixture minted **26 distinct
 ids for 30 rows** and `every_id_is_distinct` failed on
