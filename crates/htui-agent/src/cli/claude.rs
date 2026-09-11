@@ -150,10 +150,19 @@ impl Mapper {
             // kept is the one in the position it actually occupied. A transcript that reported
             // three denials at the end of a turn instead of at the three moments they happened
             // would be a worse account of the same turn.
-            ("system", Some("permission_denied")) => self
-                .denial(line.get("tool_use_id").and_then(Value::as_str))
-                .into_iter()
-                .collect(),
+            //
+            // A line carrying **no** `tool_use_id` falls through to `other` rather than to
+            // nothing: an answer with no call to join is not a `permission_answer` this build can
+            // write, but §6.2's rule for a shape it cannot use is "stored verbatim", and a refusal
+            // that vanished from the transcript entirely would be the worst of the three outcomes.
+            // The by-id suppression is separate and still applies — a repeat returns `None` and is
+            // *meant* to disappear, which is why the two cases cannot share one fallback.
+            ("system", Some("permission_denied")) => {
+                match line.get("tool_use_id").and_then(Value::as_str) {
+                    Some(id) => self.denial(Some(id)).into_iter().collect(),
+                    None => vec![other(line)],
+                }
+            }
             ("result", _) => self.result(line),
             // `system/init`, the two hook kinds, `status`, `thinking_tokens`, the three `task_*`,
             // `compact_boundary`, plugins, and every kind a future release ships ahead of this
@@ -341,8 +350,28 @@ impl Mapper {
             ..UsageEvent::default()
         };
 
-        if let Some(total_usd) = line.get("total_cost_usd").and_then(Value::as_f64) {
-            let total = saturating_micros(total_usd);
+        // **A cumulative figure cannot decrease**, and an envelope where it did is not reporting
+        // this session's total — so it contributes nothing, *baseline included*.
+        //
+        // The shape is measured rather than defensive (review gate, HIGH): `_bare`'s terminal
+        // envelope is `total_cost_usd: 0` with an empty `modelUsage`, `is_error: true`,
+        // `terminal_reason: "api_error"` — and an `api_error` is **not** a cancellation, so F-2's
+        // guard above does not cover it. Subtracting through it in a multi-turn process produced
+        // `cost_micros = 0 − <the session so far>` on the row **and** reset the baseline to zero,
+        // so the next turn re-reported the whole session total as its own delta. `run_step.usage`
+        // went negative and then double-counted — criterion 7 broken in both directions by one
+        // envelope — and the per-run cap reads that same figure.
+        //
+        // Clamping the delta at zero would be the wrong repair: it hides the negative row and
+        // leaves the baseline reset, so the double count on the following turn survives. Leaving
+        // the field and the baseline alone is what keeps the sum of the deltas equal to the last
+        // real total, which is criterion 7 stated exactly.
+        if let Some(total) = line
+            .get("total_cost_usd")
+            .and_then(Value::as_f64)
+            .map(saturating_micros)
+            .filter(|total| *total >= self.last.cost_micros)
+        {
             event.cost_micros = Some(total.saturating_sub(self.last.cost_micros));
             event.cost_micros_total = Some(total);
             self.last.cost_micros = total;
@@ -351,7 +380,20 @@ impl Mapper {
         // An absent or empty `modelUsage` answers `null` rather than `0` — a harness that sends
         // none yields the five-null shape `usage_deltas_sum_to_step_usage` expects, and a real
         // turn that reported none did not report a zero.
-        if let Some(sums) = sums.filter(|_| models.is_some_and(|models| !models.is_empty())) {
+        //
+        // The four keys move together or not at all: they are four readings of one counter, so one
+        // of them going backwards says the whole report is not this session's, and differencing the
+        // other three against a baseline the fourth contradicts would be arithmetic on two
+        // different sessions.
+        if let Some(sums) = sums
+            .filter(|_| models.is_some_and(|models| !models.is_empty()))
+            .filter(|sums| {
+                sums.input >= self.last.input
+                    && sums.output >= self.last.output
+                    && sums.cache_read >= self.last.cache_read
+                    && sums.cache_write >= self.last.cache_write
+            })
+        {
             event.input_tokens = Some(sums.input.saturating_sub(self.last.input));
             event.output_tokens = Some(sums.output.saturating_sub(self.last.output));
             event.cache_read_tokens = Some(sums.cache_read.saturating_sub(self.last.cache_read));

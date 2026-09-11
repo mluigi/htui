@@ -563,7 +563,10 @@ impl AgentSession for CliSession {
             }
             let (done, mut ack) = oneshot::channel();
             if self.send(Command::Cancel { grace, done }).is_err() {
-                self.ended = true;
+                // `send` has already drained the task's last rows into `pending` and marked the
+                // session ended. A cancel of a session that is already over is `Ok`, not an error
+                // — there is nothing left to stop — but the rows it wrote on its way out are still
+                // owed to the recorder.
                 return Ok(());
             }
             // Keep draining while the task shuts down: the drained `result`, the synthesized
@@ -607,12 +610,30 @@ impl CliSession {
     }
 
     /// Sends a command, turning a dead task into [`DriverError::Closed`].
+    ///
+    /// **The rows the task already wrote are rescued before the session is marked ended**, because
+    /// a dead task is usually one that has just finished saying something: the EOF path writes
+    /// `error{transport_closed}`, a synthesized `failed` result for every open call, and a
+    /// `done{cancelled}` — and *then* the task returns, which is what makes this send fail.
+    /// [`Self::next_event`] honours `ended` before it looks at the channel, so marking it first
+    /// would answer `Ok(None)` over a queue still holding the turn's last rows, and the recorder
+    /// would never write them. Draining into `pending` costs nothing and keeps the transcript
+    /// complete on exactly the path where it is hardest to reconstruct.
     fn send(&mut self, command: Command) -> Result<()> {
         if self.commands.send(command).is_err() {
+            self.drain_into_pending();
             self.ended = true;
             return Err(DriverError::Closed);
         }
         Ok(())
+    }
+
+    /// Moves everything the task has already queued into `pending`, which `next_event` serves
+    /// ahead of the channel and ahead of `ended`.
+    fn drain_into_pending(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            self.pending.push_back(event);
+        }
     }
 }
 

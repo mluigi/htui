@@ -622,8 +622,22 @@ impl AcpSession {
     }
 
     /// Sends a command, turning a dead task into [`DriverError::Closed`].
+    ///
+    /// **The rows the task already wrote are rescued before the session is marked ended.** A dead
+    /// task is usually one that has just finished saying something — the transport-closed path
+    /// writes an `error`, a synthesized `failed` result per open call and a `done`, and *then*
+    /// returns, which is what makes this send fail. [`Self::next_event`] honours `ended` before it
+    /// looks at the channel, so marking it first answers `Ok(None)` over a queue still holding the
+    /// turn's last rows and the recorder never writes them.
+    ///
+    /// Found by the milestone-8 review gate in `cli/mod.rs` and fixed in both transports at once:
+    /// the shape is identical, the consequence is identical, and leaving one of the two to be
+    /// rediscovered later would be the worse half of knowing.
     fn send(&mut self, command: SessionCommand) -> Result<()> {
         if self.commands.send(command).is_err() {
+            while let Ok(envelope) = self.events.try_recv() {
+                self.pending.push_back(envelope);
+            }
             self.ended = true;
             return Err(DriverError::Closed);
         }

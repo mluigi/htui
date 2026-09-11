@@ -34,10 +34,17 @@ pub enum CallStatus {
 /// How a permission request was answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution {
-    /// The chosen option, or `None` for a cancellation.
+    /// The chosen option, or `None` for a cancellation or a refusal.
     pub option_id: Option<String>,
     /// `user` or `policy` (ANA-9 §4.3).
     pub by: String,
+    /// `true` when the answer **refused** the call rather than settling it some other way.
+    ///
+    /// An absent `option_id` alone cannot tell a refusal from a cancellation, and they are
+    /// different facts about what happened to the user's work: a cancellation is something they
+    /// asked for, a denial is something a policy did to them. MOD-2 D85's whole purpose is to make
+    /// the second visible, so the transcript has to be able to say which.
+    pub denied: bool,
 }
 
 /// One rendered thing in a chat.
@@ -305,13 +312,31 @@ impl Transcript {
             // when there is no parked row to resolve, because a transport with no permission
             // channel never announced one, what the user saw live is the verbatim `other` the
             // transport sent beside it (ANA-4 §6.2) and the answer is a row of the replay.
-            DriverEvent::PermissionAnswer(answer) => self.resolve(
-                answer.request_id.as_str(),
-                Resolution {
+            DriverEvent::PermissionAnswer(answer) => {
+                let resolution = Resolution {
                     option_id: answer.option_id.clone(),
                     by: answer.by.as_str().to_owned(),
-                },
-            ),
+                    denied: answer.denied,
+                };
+                if !self.resolve(answer.request_id.as_str(), resolution.clone()) {
+                    // Nothing to resolve, because this transport never announced a request: the
+                    // CLI's own `--permission-mode` refused the call and only *reported* it
+                    // (§4.3, D85). The answer is still the one thing the user needs to see — it is
+                    // why their tool call failed — so it becomes a row of its own rather than
+                    // being dropped. Without this the chat tab showed the failed `tool_result` and
+                    // no reason for it, live **and** on replay, which is the whole of what D85 was
+                    // for.
+                    self.rows.push(TranscriptRow::Permission {
+                        request_id: answer.request_id.clone(),
+                        tool_call_id: answer.tool_call_id.clone(),
+                        // No options: there was never a choice to offer. The renderer reads the
+                        // resolution, not the list, so an empty one costs nothing and inventing
+                        // entries would claim the user could have answered.
+                        options: Vec::new(),
+                        resolved: Some(resolution),
+                    });
+                }
+            }
         }
     }
 
@@ -360,15 +385,29 @@ impl Transcript {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("policy")
                 .to_owned(),
+            // Absent on every row written before MOD-2 milestone 8, which is why the event's own
+            // field is `#[serde(default)]` (D94) and why this reads the same way: a row that
+            // carries no `denied` key was written when a denial could not be reported at all, and
+            // an answer that picked an option is not one.
+            denied: body
+                .get("denied")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         };
-        self.resolve(request_id, resolution);
+        // The replay path, where the same answer arrives as a persisted row. Its return is
+        // discarded on purpose: a replayed log carries the denial's own `permission_answer` row,
+        // and `apply` has already pushed a `Permission` row for it if there was nothing to
+        // resolve, so a second one here would double it.
+        let _ = self.resolve(request_id, resolution);
     }
 
     /// Marks the newest matching `permission_request` row answered, whoever answered it.
     ///
-    /// Nothing happens when no row matches: an answer to a request this transcript never saw is
-    /// not an error, it is a transport that answered before it asked.
-    fn resolve(&mut self, request_id: &str, resolution: Resolution) {
+    /// Answers **whether a row matched**. Nothing matching is not an error — it is a transport
+    /// that answered before it asked, which is exactly what a CLI policy denial is — but the
+    /// caller has to know, because an answer with no request still has to reach the screen
+    /// somehow.
+    fn resolve(&mut self, request_id: &str, resolution: Resolution) -> bool {
         if let Some(TranscriptRow::Permission { resolved, .. }) =
             self.rows.iter_mut().rev().find(|row| {
                 matches!(row, TranscriptRow::Permission { request_id: id, .. }
@@ -376,7 +415,9 @@ impl Transcript {
             })
         {
             *resolved = Some(resolution);
+            return true;
         }
+        false
     }
 
     /// Appends a chunk to the open run of the same kind and key, or starts a new one.
@@ -533,8 +574,19 @@ impl Transcript {
                 options, resolved, ..
             } => {
                 let text = match resolved {
-                    Some(Resolution { option_id, by }) => {
-                        let chosen = option_id.as_deref().unwrap_or("cancelled");
+                    Some(Resolution {
+                        option_id,
+                        by,
+                        denied,
+                    }) => {
+                        // `denied` before the absent option: both a refusal and a cancellation
+                        // carry `option_id: None`, and reporting a policy refusal as "cancelled"
+                        // would tell the user they stopped their own tool call.
+                        let chosen = match (denied, option_id.as_deref()) {
+                            (true, _) => "denied",
+                            (false, Some(option)) => option,
+                            (false, None) => "cancelled",
+                        };
                         format!("permission  {chosen} (by {by})")
                     }
                     None => format!("permission  waiting on you ({} options)", options.len()),
@@ -607,9 +659,10 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use htui_agent::event::{
-        DoneEvent, EditProposalEvent, OtherEvent, PermissionOptionKind, PermissionRequestEvent,
-        TextChunk, ToolCallEvent, ToolResultEvent, ToolResultStatus,
+        DoneEvent, EditProposalEvent, OtherEvent, PermissionAnswerEvent, PermissionOptionKind,
+        PermissionRequestEvent, TextChunk, ToolCallEvent, ToolResultEvent, ToolResultStatus,
     };
+    use htui_agent::record::AnsweredBy;
     use serde_json::json;
 
     fn envelope(event: DriverEvent) -> DriverEnvelope {
@@ -720,6 +773,51 @@ mod tests {
         assert!(
             transcript.parked().is_none(),
             "an answered request is no longer waiting on the user"
+        );
+    }
+
+    /// A refusal by a transport that never asked is still the reason the user's tool call failed,
+    /// so it is on the screen (MOD-2 D85, review gate MEDIUM).
+    ///
+    /// The CLI transport declares `permission_requests: false` and announces nothing; its
+    /// `--permission-mode` refuses a call and *reports* the answer. Before this, `resolve` found no
+    /// parked row and returned silently, so the chat tab showed a failed `tool_result` and no
+    /// reason for it — live **and** on replay. The comment then in the code claimed the user saw
+    /// "the verbatim `other` the transport sent beside it", and no such row exists: the mapper
+    /// emits the typed answer alone.
+    #[test]
+    fn a_policy_denial_with_no_request_is_still_a_row() {
+        let mut transcript = Transcript::new();
+        transcript.apply(&envelope(DriverEvent::PermissionAnswer(
+            PermissionAnswerEvent {
+                request_id: PermissionRequestId::new("toolu_1"),
+                tool_call_id: Some("toolu_1".to_owned()),
+                option_id: None,
+                by: AnsweredBy::Policy,
+                cancelled: false,
+                denied: true,
+            },
+        )));
+        let rows = transcript.rows();
+        assert_eq!(rows.len(), 1, "the refusal is a row of its own: {rows:?}");
+        let theme = Theme::default();
+        let text = transcript
+            .render_row(&rows[0], &theme)
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            text.contains("denied") && text.contains("policy"),
+            "and it reads as a refusal by a policy, not as something the user did: {text:?}"
+        );
+        assert!(
+            !text.contains("cancelled"),
+            "a denial is not a cancellation — both carry no `option_id`, and calling a policy \
+             refusal `cancelled` tells the user they stopped their own tool call: {text:?}"
+        );
+        assert!(
+            transcript.parked().is_none(),
+            "and nothing is waiting on the user, because nothing ever asked"
         );
     }
 

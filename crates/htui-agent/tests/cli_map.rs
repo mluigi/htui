@@ -791,3 +791,90 @@ fn the_interruption_notice_is_kept_as_what_it_is() {
          message is not the agent speaking"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// A cumulative counter that goes backwards (review gate, HIGH)
+// ---------------------------------------------------------------------------------------------
+
+/// A `result` reporting **less** than the session total so far is not reporting this session's
+/// total, and nothing about it may reach `run_step.usage`.
+///
+/// The shape is real and measured, not hypothetical: `_bare`'s terminal envelope is
+/// `total_cost_usd: 0`, `modelUsage: {}`, `is_error: true`, `terminal_reason: "api_error"` — and an
+/// `api_error` is **not** a cancellation, so F-2's guard does not cover it. In a multi-turn process
+/// a costed turn followed by one of these produced `cost_micros = 0 − 168710` on the row **and**
+/// reset the baseline to `0`, so the *next* turn re-reported the whole session total as its own
+/// delta. `run_step.usage` went negative and then double-counted — criterion 7 broken in both
+/// directions by one envelope — and the per-run cap reads the same figure.
+///
+/// Clamping the delta at zero would have been the wrong fix: it hides the negative row and leaves
+/// the baseline reset, so the double count on the following turn survives. The rule is the honest
+/// one — a cumulative figure cannot decrease, so an envelope where it did is not a measurement of
+/// this session and is left out entirely, baseline included.
+#[test]
+fn a_result_reporting_less_than_the_session_total_is_not_a_measurement() {
+    let mut mapper = Mapper::new(UsageScope::ModelUsage);
+
+    let costed = json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "terminal_reason": "completed", "total_cost_usd": 0.168_710,
+        "modelUsage": { "m": { "inputTokens": 2, "outputTokens": 4 } }
+    });
+    let first = mapper.map(&costed);
+    let usage = usage_events(&first);
+    assert_eq!(
+        usage[0].cost_micros,
+        Some(168_710),
+        "the first turn's spend"
+    );
+
+    // The `_bare` shape: an error-shaped, **uncancelled** result reporting nothing.
+    let api_error = json!({
+        "type": "result", "subtype": "success", "is_error": true,
+        "terminal_reason": "api_error", "result": "Not logged in · Please run /login",
+        "total_cost_usd": 0, "modelUsage": {}
+    });
+    let second = mapper.map(&api_error);
+    assert!(
+        usage_events(&second).is_empty(),
+        "a turn that reported less than the session total reports nothing at all: {:?}",
+        usage_events(&second)
+    );
+    assert!(
+        second
+            .iter()
+            .any(|event| matches!(event, DriverEvent::Error(_))),
+        "the failure is still an `error` row — what is dropped is the false measurement, not the \
+         fact that the turn failed"
+    );
+
+    // The baseline must not have moved, or this turn pays for the first one twice.
+    let third = mapper.map(&json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "terminal_reason": "completed", "total_cost_usd": 0.185_455,
+        "modelUsage": { "m": { "inputTokens": 4, "outputTokens": 7 } }
+    }));
+    let usage = usage_events(&third);
+    assert_eq!(
+        usage[0].cost_micros,
+        Some(185_455 - 168_710),
+        "the delta is measured from the last **real** total, not from the zero the failed turn \
+         reported"
+    );
+    assert_eq!(
+        usage[0].input_tokens,
+        Some(2),
+        "and the token baseline survived the same way"
+    );
+
+    // Criterion 7 over the three turns: the deltas still reconstruct the last cumulative figure.
+    let summed: i64 = [&first, &second, &third]
+        .iter()
+        .flat_map(|events| usage_events(events))
+        .filter_map(|usage| usage.cost_micros)
+        .sum();
+    assert_eq!(
+        summed, 185_455,
+        "the sum of the deltas is the last total, exactly"
+    );
+}
