@@ -150,9 +150,7 @@ pub use probe::{
     ProbeSource, ProbeStatus, SpawnTier2, Tier2, ToolReport, ToolResolution, default_install_root,
     install_root, platform_key, probe_agent, probe_tools, resolve_credential,
 };
-pub use record::{
-    AnsweredBy, CHUNK_FLUSH_BYTES, PERMISSION_DENIED, RecordError, Recorder, RecorderSummary, pump,
-};
+pub use record::{AnsweredBy, CHUNK_FLUSH_BYTES, RecordError, Recorder, RecorderSummary, pump};
 pub use registry::{DriverFactory, TransportBuilder, adapter_id, caps_for};
 // `replay_envelopes`, not `envelopes`: at the crate root the bare name says nothing about which
 // direction it runs, and `record`'s counterpart is spelled out too.

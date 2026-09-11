@@ -124,9 +124,8 @@ pub enum ScriptEvent {
     /// (`by: policy`, `denied: true`, no option, not cancelled) followed by the synthesized
     /// `failed` result harness rule 3 owes any settled call — the refusal is the answer, so the
     /// call is closed and the protocol's own later result for it is dropped. The event is emitted
-    /// **directly**: since plan D93 the answer is a typed event, so nothing has to recognize a
-    /// string to turn it into the row (`record::PERMISSION_DENIED` names the vendor's verbatim
-    /// `other` shape, which is a different thing and rides beside it).
+    /// **directly**: since plan D93 the answer is a typed event, so no `other` row carries the
+    /// refusal and no string has to be recognized to turn one into the row.
     PolicyDenied(String),
 }
 

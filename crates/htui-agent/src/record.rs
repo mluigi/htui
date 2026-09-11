@@ -128,21 +128,6 @@ const SCRUB_RESIDUE: &str = "scrub_residue";
 /// prose and may be reworded.
 pub const CAP_EXCEEDED: &str = "cap_exceeded";
 
-/// The name `htui` gives a permission its own transport's policy denied (`docs/ANA-4.md` §6.2,
-/// plan D85).
-///
-/// Since plan D93 the denial itself is a typed event — [`DriverEvent::PermissionAnswer`] carrying
-/// [`AnsweredBy::Policy`] — so nothing has to match a string to write the row. What the string is
-/// for is the *other* half of §6.2: a transport that also passes the vendor's verbatim shape
-/// through, as an [`OtherEvent`], names it with this one constant rather than with a literal of
-/// its own, so the live envelope and the recorded answer are recognizably the same event.
-/// [`SESSION_STARTED`] is the precedent — an `other.update` every transport agrees on, owned by
-/// this crate, matched by nothing keyed on an agent's name (`R-AGT-5`).
-///
-/// [`OtherEvent`]: crate::event::OtherEvent
-/// [`SESSION_STARTED`]: crate::event::SESSION_STARTED
-pub const PERMISSION_DENIED: &str = "permission_denied";
-
 /// What the passive latch of `docs/ANA-4.md` §7 (`:1131-1135`) needs (plan D66-D68): which
 /// `agent_box` row to write, and the two row-side facts the document carries.
 ///
