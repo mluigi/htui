@@ -279,8 +279,20 @@ impl Mapper {
         // A cancelled turn reports `total_cost_usd: 0` and an empty `modelUsage` (F-2), which is
         // an absence of measurement rather than a measurement of zero — so it gets no `usage` row
         // at all. Writing one would put a zero in `run_step.usage` that nothing spent.
+        //
+        // The same sentence, generalised (T54): a `result` that reported **nothing** — no
+        // `total_cost_usd`, no `modelUsage`, no rate-limit blob waiting for it — gets no row
+        // either. Every recorded transcript's `result` carries a cost, so the guard never fires on
+        // a real box; what it stops is a `usage` row of five nulls and no money, which adds nothing
+        // to `run_step.usage` (`UsageTotals::add_payload` sums five absent keys to the same total)
+        // and sits in the transcript between the reply and the `done` saying nothing at all. That
+        // it is a row and not a no-op is measurable: `coalesce_across_message_id` asserts a step's
+        // kinds exactly, and it is the case that found this.
         if !cancelled {
-            events.push(DriverEvent::Usage(self.usage(line)));
+            let usage = self.usage(line);
+            if reports_a_measurement(&usage) {
+                events.push(DriverEvent::Usage(usage));
+            }
         }
 
         // F-8: the verdict is `is_error`, never `subtype`. An unauthenticated run reports
@@ -602,6 +614,22 @@ fn text_at(value: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+/// Whether a `usage` event carries anything a reader could use, as opposed to only the scope label
+/// every one of them is stamped with.
+///
+/// The **quota** counts, and it is the clause that matters: [`Mapper::usage`] *takes*
+/// `pending_quota`, so a blob held from a mid-turn `rate_limit_event` would be dropped on the floor
+/// by a result this predicate refused. A turn that reported an allowance and no money still has
+/// something to say, and `agent_box.quota` is where it says it (§7, plan D66).
+fn reports_a_measurement(usage: &UsageEvent) -> bool {
+    usage.cost_micros.is_some()
+        || usage.input_tokens.is_some()
+        || usage.output_tokens.is_some()
+        || usage.cache_read_tokens.is_some()
+        || usage.cache_write_tokens.is_some()
+        || usage.quota.is_some()
 }
 
 /// One token key summed across `modelUsage`'s per-model objects.
