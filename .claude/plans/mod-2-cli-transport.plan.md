@@ -492,17 +492,28 @@ step 3.5) extends this table before the maintainer sees the plan.
 
 ## Acceptance
 
-- [ ] All tasks complete
-- [ ] `CASES` still holds 15 names, and three bindings report every one
-- [ ] `adapter_ids()` is 2 for 3 registry rows (`R-AGT-5`)
-- [ ] §11.14's CLI cancellation and thinking-block items answered from a live run, recorded as
-      fixtures
-- [ ] Criterion 7 holds over the CLI transport (`run_step.usage` = the sum of its `usage` rows)
-- [ ] Criterion 11's CLI half holds on Linux; the Windows half is stated as MOD-16's, not claimed
-- [ ] The chat tab banner names `permission_request`, `edit_proposal` and `plan` as unavailable
-- [ ] `claude-cli` renders whole in the Settings `name` column at the 100-column guard width, and
-      `name` absorbs the slack at wider ones (D89)
+- [x] All tasks complete — T49, T49b, T50a, T50, T51, T52, T53, T54, T55, T56, T57, T58
+- [x] `CASES` still holds 15 names, and three bindings report every one (`fake_conformance`,
+      `acp_conformance`, `cli_conformance`), with the first two green **assertions unchanged**
+- [x] `adapter_ids()` is 2 for 3 registry rows (`R-AGT-5`) — asserted on the **production** factory,
+      and every `seed_rows` entry resolves onto one of the two
+- [x] §11.14's CLI cancellation and thinking-block items answered from a live run, recorded as
+      fixtures — F-1..F-3 and F-6, fifteen committed transcripts
+- [x] Criterion 7 holds over the CLI transport — proven live over two turns:
+      `168710 + 16745 = 185455` = the last `cost_micros_total`
+- [x] Criterion 11's CLI half holds on Linux; the Windows half is stated as MOD-16's, not claimed
+      (the Windows lint target cannot build on this box, TOOL-3)
+- [x] The chat tab banner names `permission_request`, `edit_proposal` and `plan` as unavailable —
+      and is pinned by a test that spawns nothing, so it is defended on days nobody spends tokens
+- [x] `claude-cli` renders whole in the Settings `name` column, and `name` absorbs the slack at
+      wider widths (D89, amended to `Fill(1)`: no width to tune at all)
 - [ ] `rust-reviewer` gate run over the full change set, findings applied or deferred with the
       maintainer
-- [ ] Validator green; PRD milestone 8 row `complete`; `HANDOFF.md` phase note carries D79/D88's
-      ANA-4 amendments
+- [x] Validator green (0 errors); PRD milestone 8 row `complete`; `HANDOFF.md` phase note carries
+      the **four** ANA-4 amendments (D79, D88's companion D92, D93, D94)
+
+## Status
+
+**Complete**, pending the review gate's findings. Landed 2026-09-10..11 across `a3cbfff`..`42294d8`.
+The plan's own "Probe findings" table (F-1..F-15, F-12b) is the durable record of what the live
+probes measured, and five of those findings changed code that was about to be written.

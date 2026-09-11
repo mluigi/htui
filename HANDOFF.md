@@ -14,7 +14,19 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-10):** **MOD-21 landed** (`docs/decisions/mod/mod-21.md`): an agent that
+**Current status (2026-09-11):** **MOD-2 milestone 8 landed** (`a3cbfff`..`42294d8`, phase note
+below): an agent that speaks no ACP — only its own headless JSON stream — now reaches the same chat
+tab, recorder, store rows and replay as an ACP one, losing exactly three event kinds and saying so
+in its banner. `R-AGT-3` is met. The registry carries a second row, **`claude-cli`**; `CASES` is
+still **15** with **three** bindings reporting every one (§11 criterion 1 in fact, not by
+assertion); criterion 7 is proven live over two real turns. **Nine probes ran before a line of
+`src/cli/` was written**, and five of their findings changed code that was about to ship — most
+sharply that `modelUsage` is *cumulative* while `result.usage` is per-turn, which written the other
+way would have double-counted a two-turn chat with **no test in the tree failing**. `docs/ANA-4.md`
+§11.14's two CLI items are answered from live runs, and the ANA is amended in four places (D79,
+D92, D93, D94) here rather than in the file, per the milestone-5 precedent. Milestone 9 (the prompt
+assembler and preview) is the last of the nine.
+Before it, **MOD-21 landed** (`docs/decisions/mod/mod-21.md`): an agent that
 reports itself installed-but-unauthenticated is logged in **from inside `htui`** — `Settings >
 Agents`, `j`/`k`, **`a`**, the agent's own methods in its own words, `Enter` to choose, `o` to open
 the link it prints, `x` to cancel, logout where advertised. `htui` triggers the flow and never
@@ -332,6 +344,112 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   finding with it: a `per_token` row publishes its spend on the first costed row instead of waiting
   for an allowance blob that a per-token agent never sends (§7 gives it no `windows`, so the H-3
   guard had nothing to protect). 742 tests green on **Linux** with Postgres live, 46 targets.
+  **Phase 8 landed (2026-09-10..11, `a3cbfff`..`42294d8`), complete:** the **degraded CLI
+  transport**, planned in `.claude/plans/mod-2-cli-transport.plan.md` with the `code-architect`
+  blueprint beside it. An agent that speaks only its own headless JSON stream now reaches the same
+  chat tab, recorder, store rows and replay as an ACP one — losing exactly three event kinds, and
+  saying so on screen. `R-AGT-3` is met.
+  New: the **`claude-cli`** registry row (D79 — a second row, not a degradation inside the `claude`
+  one; D88's name-keyed `seed_missing_agents` top-up rather than a migration, so **MOD-4's `0003` is
+  still unheld**); `htui-agent::cli::{mod,claude}` (supervisor and §6.2 mapper); a **third**
+  conformance binding; `DriverFactory::with_acp` → `production`, registering two adapters for three
+  rows (D87, `R-AGT-5`).
+  **§11 criterion 1 holds in fact, not by assertion**: `CASES` is still **15**, and three transports
+  report all fifteen. D80 and D91 are why — six cases gained a *capability-gated second arm* rather
+  than a skip, so a transport without a capability must prove the **negative** (no `permission_request`
+  row, no `edit_proposal` row, one turn-end `usage` row). `DriverCaps` gained `usage_mid_turn` to say
+  which. **That change immediately caught a real defect** in the place the suite is strongest:
+  `tests/extensibility.rs` drives all fifteen cases over a **CLI** row, and the fake was replaying a
+  script its own declared capabilities said it could not have produced. `fake.rs` gained a sixth
+  harness rule — *a transport plays the wire its `DriverCaps` declare* — so all six arms execute today.
+  **§11 criterion 7 proven live over the CLI row** (`crates/htui/tests/chat_live_cli.rs`, two turns,
+  real binary, real store): `168710 + 16745 = 185455` = the last `cost_micros_total`, exactly.
+  Criterion 11's CLI half holds on **Linux**; the Windows half is **MOD-16's** and is not claimed —
+  the Windows lint target still cannot build here (TOOL-3).
+  **Nine live probes ran before a line of `src/cli/` was written** (`tests/cli_live.rs`, fourteen
+  committed transcripts), and their answers are the plan's **"Probe findings" F-1..F-15**. Five
+  changed code that was about to be written, and three of those would have shipped silently:
+  **F-4** — `modelUsage[*]` tokens are **cumulative** across a session while `result.usage` is
+  per-turn, the inversion of what the names suggest, so every figure the mapper reports is a delta;
+  written as planned, a two-turn chat would have double-counted into `run_step.usage` and **no test
+  in the tree would have failed**. **F-7** — a turn's thinking block and its reply share one
+  `message.id`, so the coalescing key is `(message.id, block index)`; the plan's `message.id` alone
+  would have folded a thought into a reply. **F-13** — `quota::normalize` **discarded** the blob for
+  `CliRateLimitEvent`, so D86's "drives the quota latch through the existing `normalize`" was a
+  no-op; every quota test in the tree is ACP-sourced, so nothing would have caught it. Also **F-8**
+  (`result.subtype: "success"` arrives with `is_error: true` on an unauthenticated run — the verdict
+  is `is_error`/`terminal_reason`, never `subtype`) and **F-10** (`--max-budget-usd 0` is refused
+  before stdin is read, so "no cap" must pass no flag).
+  **D81 survives its own probe, with §4.4's wording corrected** (F-1..F-3): stdin close alone is an
+  end-of-input and **not** a cancel (the turn completes, exit 0); SIGINT after it *does* bring a
+  terminal envelope — but an error-shaped one, `subtype: error_during_execution`, `is_error: true`,
+  carrying **`terminal_reason: "aborted_streaming"`**, which is what the mapper keys `cancelled` on
+  so a turn cancelled from elsewhere still reports honestly; SIGTERM leaves exit **143** and no
+  `result` at all. **D82 survives with its payload gone** (F-6): thinking is *signalled and not
+  disclosed* here — `thinking` is the empty string beside a `signature` — so a `thought` over this
+  transport carries no prose, and the signature never becomes its text.
+  **D85 was proven, after failing to be** (F-12): the first denial probe asked for `Bash(ls)` and
+  this box's settings carry `Bash(ls *)`, so it chose the one command the box pre-approves and read
+  the empty array as though it said something about the dialect. A tenth case using
+  `--permission-prompts none` makes the refusal a property of the *invocation* instead, and it
+  fires. That run also caught a gap: D85 named **two** sources and only one was implemented — the
+  CLI announces a refusal live as `system/permission_denied` **and** repeats it on the terminal
+  `result`, so the mapper takes the live one (the denial lands where it happened) and deduplicates
+  the repeat by `tool_use_id` (**F-12b**).
+  **Four ANA-4 amendments, maintainer-approved and recorded here rather than in the ANA** (the
+  milestone-5 precedent): **D79** — §5.3/§4.4's "one `claude` row with the CLI as an in-row
+  degradation" becomes two rows, and `settings.cli` leaves the `acp` row. **D92** — §4.4's
+  recommendation of `--bare` is **withdrawn**: `claude --help` on 2.1.267 says `--bare` reads auth
+  *strictly* from `ANTHROPIC_API_KEY`, and the probe measured it — a `--bare` run answers
+  `terminal_reason: "api_error"`, `"Not logged in · Please run /login"` on this subscription box. The
+  price is a pre-`init` buffer, because hook envelopes then precede `system/init` (**F-9**, measured:
+  four pairs on this box), and D84's banner must still be the step's first `other` row. **D93** —
+  §4.1's `permission_answer` moves from "htui-authored only" to "authored by `htui` *or* reported by
+  a transport that answered by policy"; it is a real twelfth `DriverEvent` variant, and
+  `driver_contract.rs`'s identity is now `14 − 2 = 12`. **D94** — replay decodes it to that typed
+  variant, closing the asymmetry D93 opened (it had been typed live and `other` on replay);
+  `PermissionAnswerEvent::denied` gains `#[serde(default)]` for rows written before this milestone,
+  and `record_permission_answer` writes the key from now on.
+  **`docs/ANA-4.md` §11.14's two CLI items are answered from live runs**, which is what this
+  milestone owed: the cancellation semantics (F-1..F-3) and the thinking-block shape (F-6), both
+  recorded as committed fixtures rather than as prose.
+  **Two holes in the fixtures' own redaction were found and closed**, each by a *later* probe reading
+  an *earlier* one's committed transcript — an argument for keeping fixtures under test rather than
+  merely under version control. The rule was applied to the serialised file, and a needle only had to
+  arrive spelled differently to walk through it: **split across streaming deltas** (the model chunks
+  wherever the tokeniser did, so a quoted path arrives as five JSON strings and none holds the
+  needle — *and the self-check re-read the same unreassembled text*, so a green redaction check
+  proved nothing about the stream), and **slugged** (the CLI derives a project directory from the
+  cwd, so `/tmp/.tmpAbCdEf` is reported as `-tmp--tmpAbCdEf`; thirteen of fourteen transcripts
+  carried it). What leaked was a tempdir name and a username already in every commit, so the exposure
+  is nil — the hole is the same size for the `SECRET_NAMES` half, which exists so a token echoed by a
+  hook cannot ride into git. Neither fix is a general defence and the code says so: a needle can be
+  base64'd, URL-encoded, or split *and* slugged.
+  Also landed: **D89** re-ranks the Settings agents table — `name` became `Constraint::Fill(1)`, with
+  no width to tune, after measuring that the literal instruction (`Min(256)`) does not widen that
+  column but **deletes the other seven** (`[91, 0, 0, 0, 0, 0, 0, 0]` at the bordered 98). `name` now
+  takes every spare column — 10 at 98, 32 at 120, 112 at 200 — and `on this box` is the donor, fixed
+  at 13, which clips `unauthenticated` to `unauthenticat` and `choose a method` to `choose a meth` as
+  the stated price. **A correction for whoever packs this table next**: the 98 that D76's and D89's
+  arithmetic both argue from is the **test harness** (`testkit.rs`'s `DEFAULT_SIZE`, 100×30, minus
+  the pane border), not a screen — D76's ranking was tighter than it needed to be because it treated
+  a fixture constant as a constraint.
+  **Verified on Linux with Postgres live**: `cargo fmt --check` clean, workspace
+  `clippy --all-targets --all-features -D warnings` clean, and every binary of `htui-agent` (23) and
+  `htui` (16) green under **`--no-fail-fast`** — which is load-bearing rather than pedantic: `cargo
+  test` stops at the first failing binary, and a run that reported the `auth.rs` flake and exited is
+  how two width-broken suites (`install.rs`, `probe.rs`) were briefly called green.
+  **Live coordinates for the next session.** `claude` on this box is **2.1.267**; the seed passes no
+  `--bare`; `--permission-prompts none` is the deterministic way to provoke a policy denial, and
+  `~/.claude/settings.json`'s allow list (`Bash(ls *)`) is why the obvious way does not. The CLI
+  reports `claude_code_version` on `system/init` (there is no `version` key), re-emits `system/init`
+  on **every turn** of a multi-turn session (the banner consumes the first; re-emitting it would
+  break `session_banner_is_first_other_row` on the live path only), and emits a `system/status`
+  row per turn that §6.2 does not name. **Once F-13's reader is on, this box's live blob is
+  `status: "allowed_warning"` at 0.77 utilization, and `available()` skips every status that is not
+  exactly `"allowed"`** — so the `claude-cli` row will report `Skip(Status("allowed_warning"))` to
+  MOD-4 the moment MOD-4 has a selection loop. That is deliberately MOD-4's to loosen
+  (`quota.rs:403-408`), but it is now a live fact about a real row rather than a hypothetical.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
@@ -695,6 +813,28 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   **Until it is fixed, the workspace Postgres line must not be run by two agents at once** — telling
   each one not to does not work, since they cannot see each other; serialise the tasks instead.
   Found while landing T42 and T43 in parallel.
+  **`shm_size: 1gb` landed (`287e7b8`) and did not close it.** During MOD-2 milestone 8 on
+  2026-09-11 the container crashed **twice more** on the 1 GiB shm: once with
+  `server process (PID 62737) exited with exit code 2` → `reinitializing` under a *single* live
+  cargo run, and once leaving every Postgres binary on `57P03 … in recovery mode` with
+  `syncing data directory (fsync), elapsed time: 110.65 s`. So the first fix reduced the trigger
+  but the crash is not shm-exhaustion alone, and the "serialise the suites" rule still stands. The
+  next thing to look at is the per-suite throwaway `htui_test_*` databases themselves — 17+ live
+  databases is the load, and dropping them eagerly may matter more than the shm figure.
+
+- [ ] **TOOL-6 - `crates/htui-agent/tests/launch.rs` failed once under whole-crate load and has not
+  been reproduced.** `R-NF-3`. Seen on 2026-09-11 during MOD-2 milestone 8's T52: one
+  `cargo test -p htui-agent --features test-support --no-fail-fast` run reported
+  `20 passed; 1 failed` in `tests/launch.rs`, and **the failing case's name was not captured** — the
+  observing agent's `tail` cut it. **Not reproduced in 15 subsequent runs** (10 isolated
+  `--test launch`, 5 whole-crate), so there is no diagnosis here, only an observation recorded
+  rather than dropped. It is written down because of *where* it is: `launch.rs` holds the process
+  and signal timing cases — `a_signal_reaches_the_whole_process_group`,
+  `an_interrupt_lets_the_child_exit_on_its_own_terms` — which are exactly the paths MOD-2 D81's
+  cancel sequence depends on, and a rare timing failure there is the kind that reappears as a
+  hung session rather than as a red test. **First step:** re-run the whole crate under load with
+  the name captured (`--no-fail-fast 2>&1 | tee`), and if it reappears, check whether the child is
+  being reaped before the assertion reads `/proc/<pid>`.
 
 ## Summary
 
@@ -703,4 +843,4 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | ANA-N   | 3 (ANA-3 context tools, ANA-7 secrets, ANA-11 requirements/decisions models)              |
 | MOD-N   | 20 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
-| TOOL-N  | 5 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-4 `tests/auth.rs` whole-binary flake, TOOL-5 dev Postgres crashes under concurrent suites, 64 MiB shm) |
+| TOOL-N  | 6 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-4 `tests/auth.rs` whole-binary flake, TOOL-5 dev Postgres crashes under concurrent suites, TOOL-6 `tests/launch.rs` failed once unreproduced) |
