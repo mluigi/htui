@@ -479,7 +479,7 @@ fn every_adapter() -> DriverFactory {
     use htui_agent::conformance::Script;
     use htui_agent::fake::FakeAdapter;
 
-    let mut factory = DriverFactory::with_acp();
+    let mut factory = DriverFactory::production();
     // The fake takes its script at `build`, so a factory whose slot is empty cannot answer
     // `driver_for` at all; the script is never pulled here.
     let adapter = FakeAdapter::new();
@@ -491,7 +491,7 @@ fn every_adapter() -> DriverFactory {
 /// The production factory alone.
 #[cfg(not(feature = "test-support"))]
 fn every_adapter() -> DriverFactory {
-    DriverFactory::with_acp()
+    DriverFactory::production()
 }
 
 #[tokio::test]

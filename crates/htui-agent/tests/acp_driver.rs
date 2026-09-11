@@ -662,7 +662,7 @@ async fn through_the_factory_the_spawned_argv_carries_the_marker() {
         &snapshot(ProbeSource::Probe, ProbeStatus::Ready, recorded),
     );
 
-    let driver = DriverFactory::with_acp()
+    let driver = DriverFactory::production()
         .driver_for(&agent, Some(&row_on_box))
         .expect("the `acp` adapter builds this row");
     let spec = spec(tmp.path().to_path_buf());

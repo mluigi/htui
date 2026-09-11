@@ -271,7 +271,7 @@ impl Rig {
 
         // The real ACP transport, because the subject is a login that spawns a process: a scripted
         // adapter would answer `Unsupported` and prove nothing.
-        let runtime = AgentRuntime::new(DriverFactory::with_acp())
+        let runtime = AgentRuntime::new(DriverFactory::production())
             .with_grace(Duration::ZERO)
             .with_opener(OpenerCommand::Custom(recorder(tmp.path())));
         let mut harness = Harness::over(store.clone())

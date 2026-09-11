@@ -57,16 +57,31 @@ impl DriverFactory {
         Self::default()
     }
 
-    /// The production factory: one adapter, `acp` (milestone 3).
+    /// The production factory: two adapters, `acp` (milestone 3) and `cli/claude_stream_json`
+    /// (milestone 8).
     ///
-    /// Milestone 8 adds `cli/claude_stream_json` here and nothing else changes — that one line per
-    /// *transport*, and none per agent, is what `R-AGT-5` measures.
+    /// Named for what it *is*, not for what it happens to hold (plan D87). `with_acp` stopped
+    /// being true the line the stream adapter was registered beside it, and a constructor whose
+    /// name misreports its contents is precisely the drift
+    /// [`adapter_ids`](Self::adapter_ids) exists to catch — a reader who trusts the name never
+    /// looks, and a `cli` row then fails with [`DriverError::UnknownAdapter`] at session start
+    /// instead of at review.
+    ///
+    /// Milestone 8 cost the one `register` call below and nothing else: **two adapters carry the
+    /// three seeded rows** (`claude` and `agy` over `acp`, `claude-cli` over the stream), and a
+    /// fourth row costs nothing here at all. That ratio — entries per *transport*, never per agent
+    /// — is what `R-AGT-5` measures, and `crates/htui-agent/tests/extensibility.rs` asserts it on
+    /// this factory rather than on a hand-built one.
     #[must_use]
-    pub fn with_acp() -> Self {
+    pub fn production() -> Self {
         let mut factory = Self::new();
         factory.register(
             crate::acp::ADAPTER_ID,
             Box::new(crate::acp::AcpAdapter) as Box<dyn TransportBuilder>,
+        );
+        factory.register(
+            crate::cli::ADAPTER_ID,
+            Box::new(crate::cli::ClaudeStreamAdapter) as Box<dyn TransportBuilder>,
         );
         factory
     }

@@ -814,10 +814,10 @@ async fn agy_logs_in_through_the_app_and_the_probe_reads_ready() {
         AUTH_IDLE_CAP.as_secs()
     );
 
-    // The production chain, not a hand-built driver: `DriverFactory::with_acp` is what the worker
+    // The production chain, not a hand-built driver: `DriverFactory::production` is what the worker
     // holds, `driver_for` is what it calls, and for an `acp` row the `authenticate` below is
     // `AcpDriver`'s. The probed row goes in so the flow spawns D58's recording — `--uid=` and all.
-    let driver = DriverFactory::with_acp()
+    let driver = DriverFactory::production()
         .driver_for(&agy_row(), Some(&on_box))
         .expect("the seeded agy row builds its production driver");
     let (outcome, seen) = drive(driver.as_ref(), &AuthChoice::Method(method.clone())).await;
@@ -941,7 +941,7 @@ async fn agy_logs_out_when_asked() {
     println!("--- the seed's credential candidates, before the logout ---");
     print!("{}", credential_report(&candidates, &credential, &env));
 
-    let driver = DriverFactory::with_acp()
+    let driver = DriverFactory::production()
         .driver_for(&agy_row(), Some(&on_box))
         .expect("the seeded agy row builds its production driver");
     let (outcome, seen) = drive(driver.as_ref(), &AuthChoice::Logout).await;

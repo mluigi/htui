@@ -355,14 +355,17 @@ impl AgentRuntime {
         }
     }
 
-    /// The production runtime: the ACP transport and nothing else (milestone 8 adds the CLI one).
+    /// The production runtime: every transport this build ships, which is whatever
+    /// [`DriverFactory::production`] registers — the ACP one and, since milestone 8, the headless
+    /// CLI stream. The list lives there and is named nowhere here, so a third transport reaches
+    /// the worker without touching this file (`R-AGT-5`).
     ///
     /// It carries an installer, and carrying one costs nothing until the user presses `i`: the
     /// value is where the registry is and where a tree may be written, and the HTTP clients it
     /// implies are built inside the install task (blueprint P-13).
     #[must_use]
     pub fn production() -> Self {
-        Self::new(DriverFactory::with_acp()).with_installer(InstallConfig::default())
+        Self::new(DriverFactory::production()).with_installer(InstallConfig::default())
     }
 
     /// A runtime that installs from this registry, into this root (MOD-20 D18).
@@ -5476,7 +5479,7 @@ done
         /// The real transport because the subject is a login that spawns a process; a scripted
         /// adapter would answer `Unsupported` and prove nothing.
         pub(crate) fn login_runtime(dir: &Path) -> AgentRuntime {
-            AgentRuntime::new(DriverFactory::with_acp())
+            AgentRuntime::new(DriverFactory::production())
                 .with_grace(Duration::ZERO)
                 .with_opener(OpenerCommand::Custom(recorder(dir)))
         }
