@@ -643,11 +643,6 @@ pub struct SessionOptions {
     pub session_id: String,
 }
 
-/// What the task reports once `system/init` has arrived and the first prompt is on the wire.
-struct Ready {
-    session_ref: AgentSessionRef,
-}
-
 /// Opens a session: spawns the task, waits for `system/init`, returns the handle.
 ///
 /// # Errors
@@ -674,6 +669,10 @@ pub async fn open_session(
     let (ready_tx, ready_rx) = oneshot::channel();
 
     let timeout = options.init_timeout;
+    // Built here and not carried back from the task: over ACP the id is the *agent's* answer to
+    // `session/new` and has to travel, but `--session-id` makes it `htui`'s own (D84) — so the task
+    // answers only *whether* the stream opened, and a disagreement with what `system/init` echoes
+    // is a `warn!` there rather than a value here (blueprint H-17).
     let session_ref = AgentSessionRef::new(options.session_id.clone());
     let task = tokio::spawn(run_session(
         io,
@@ -699,8 +698,8 @@ pub async fn open_session(
                 timeout.as_secs()
             )))
         }
-        Ok(Ok(Ok(ready))) => Ok(CliSession {
-            session_ref: ready.session_ref,
+        Ok(Ok(Ok(()))) => Ok(CliSession {
+            session_ref,
             events: events_rx,
             commands: commands_tx,
             pending: VecDeque::new(),
@@ -730,7 +729,7 @@ async fn run_session(
     spec: SessionSpec,
     prompt: String,
     options: SessionOptions,
-    ready: oneshot::Sender<Result<Ready>>,
+    ready: oneshot::Sender<Result<()>>,
     events: mpsc::Sender<DriverEnvelope>,
     commands: mpsc::UnboundedReceiver<Command>,
 ) {
@@ -837,7 +836,7 @@ async fn session_main(
     spec: SessionSpec,
     prompt: String,
     options: SessionOptions,
-    ready: oneshot::Sender<Result<Ready>>,
+    ready: oneshot::Sender<Result<()>>,
     events: mpsc::Sender<DriverEnvelope>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     mut lines: mpsc::Receiver<String>,
@@ -931,7 +930,7 @@ async fn session_main(
     }
 
     // 4. The handle may exist now: everything above is what `start` promised to have done.
-    if ready.send(Ok(Ready { session_ref })).is_err() {
+    if ready.send(Ok(())).is_err() {
         kill(child).await;
         return;
     }
