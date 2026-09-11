@@ -20,7 +20,7 @@ use htui_agent::event::{ToolCallEvent, ToolResultEvent, ToolResultStatus};
 use htui_agent::fake::FakeAdapter;
 use htui_agent::launch::{AgentLaunch, InstallSource, ToolMap, ToolProbe, resolve};
 use htui_agent::record::{Recorder, pump};
-use htui_agent::registry::{DriverFactory, caps_for};
+use htui_agent::registry::{DriverFactory, adapter_id, caps_for};
 use htui_core::model::{Agent, AgentId, ChatRunSpec, agent::seed_rows};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{MemStore, ReadStore, WriteStore};
@@ -195,6 +195,39 @@ fn the_factory_is_keyed_by_transport_not_by_agent() {
     match factory.driver_for(&claude, None) {
         Err(DriverError::UnknownAdapter(id)) => assert_eq!(id, "acp"),
         other => panic!("ACP lands in milestone 3, got {other:?}"),
+    }
+}
+
+/// The same rule asked of the factory production actually runs (plan D87, T52).
+///
+/// [`the_factory_is_keyed_by_transport_not_by_agent`] above interrogates a *test-local* factory
+/// holding one adapter, which proves routing but says nothing about cost: a build that registered
+/// one adapter per shipped agent would pass it untouched. This one asks
+/// [`DriverFactory::production`], and the number it pins is the number `R-AGT-5` actually
+/// measures — **two adapters for three registry rows**: `claude` and `agy` reach `acp`,
+/// `claude-cli` reaches the stream. A seeded fourth row must leave this list exactly as it is, so
+/// a `production()` that grew an entry beside a new seed fails here rather than in review.
+///
+/// Spelling `cli/claude_stream_json` is not the hard-coding the vendor sweeps below forbid:
+/// it is a **dialect** id a row declares in `settings.cli.stream`, so two unrelated agents may
+/// name it and nothing dispatches on either one's `name` — the same standing `cli/fake` has.
+#[test]
+fn the_production_factory_holds_one_adapter_per_transport_not_per_agent() {
+    let factory = DriverFactory::production();
+    let ids = factory.adapter_ids();
+
+    assert_eq!(ids, ["acp", "cli/claude_stream_json"]);
+
+    // The ratio only means anything if every shipped row is served by one of the two. The id is
+    // derived from the row the way `driver_for` derives it, rather than by building a driver:
+    // building one would spawn, and this is an assertion about the map, not about any process.
+    for agent in seed_rows(conformance::epoch()) {
+        let id = adapter_id(&agent);
+        assert!(
+            ids.contains(&id.as_str()),
+            "the seeded `{}` row asks for `{id}`, which production registers no builder for",
+            agent.name
+        );
     }
 }
 
