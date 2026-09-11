@@ -165,12 +165,14 @@ impl Quota {
 /// `raw` is the vendor blob **as scrubbed and persisted** on the `usage` row — never the wire
 /// message — so the latched document can carry nothing the row does not.
 ///
-/// For [`QuotaSource::AcpMetaRateLimit`]: `status` is `raw.status` as a string; `windows` is every
-/// entry of `raw.unifiedWindows` whose `utilization` is a number, `resets_at` from that entry's
-/// `resetsAt` read as epoch seconds (`None` when it is absent, not an integer, or out of range),
-/// sorted by id. Any other source, and `raw == None`, give no status, no windows and
+/// For [`QuotaSource::AcpMetaRateLimit`] and [`QuotaSource::CliRateLimitEvent`], which carry the
+/// same vendor document over two transports: `status` is `raw.status` as a string; `windows` is
+/// every entry of `raw.unifiedWindows` whose `utilization` is a number, `resets_at` from that
+/// entry's `resetsAt` read as epoch seconds (`None` when it is absent, not an integer, or out of
+/// range), sorted by id. Any other source, and `raw == None`, give no status, no windows and
 /// `exhausted: false` — a source with no reader yet reports nothing rather than guessing at a
-/// shape (milestone 8 owns the two CLI ones). `spend` is `session_micros` with `"USD"` iff `Some`.
+/// shape. [`QuotaSource::CliStatusLine`] is the one still in that state; milestone 8 took its
+/// sibling. `spend` is `session_micros` with `"USD"` iff `Some`.
 ///
 /// Every vendor key is read through `get` / `as_*`: a report with no `cost`, a `cost` in another
 /// currency, a missing `unifiedWindows` or a window without a numeric `utilization` each cost that
@@ -185,8 +187,12 @@ pub fn normalize(
 ) -> Quota {
     // The selection D66 asks for: on the row's declared source, never on the agent's name.
     let blob = match source {
-        QuotaSource::AcpMetaRateLimit => raw,
-        QuotaSource::CliRateLimitEvent | QuotaSource::CliStatusLine | QuotaSource::None => None,
+        // Two sources, one document. The `claude` CLI's `rate_limit_event` carries the same blob
+        // the ACP adapter puts under `_meta` — status, `unifiedWindows`, the same key spellings
+        // (ANA-4 §7 `:1086`, confirmed against a live transcript by MOD-2 milestone 8's F-13) — so
+        // reading it twice as one shape is the fact, not a convenience.
+        QuotaSource::AcpMetaRateLimit | QuotaSource::CliRateLimitEvent => raw,
+        QuotaSource::CliStatusLine | QuotaSource::None => None,
     };
     let status = blob
         .and_then(|raw| raw.get("status"))
@@ -528,18 +534,59 @@ mod tests {
         );
     }
 
+    /// The CLI's `rate_limit_event` carries the **same** document the ACP `_meta` key does, so it
+    /// normalizes the same way (MOD-2 milestone 8, F-13).
+    ///
+    /// Measured rather than assumed: the live blob recorded by `crates/htui-agent/tests/cli_live.rs`
+    /// reads `{ status, resetsAt, rateLimitType, utilization, isUsingOverage, surpassedThreshold,
+    /// unifiedWindows { five_hour, seven_day } }` — key for key the shape below, which is why
+    /// milestone 8 could turn the reader on rather than write one.
+    ///
+    /// Until it was turned on, D86's "`rate_limit_event` drives the quota latch through the
+    /// existing `normalize`" was a no-op: the blob arrived, rode the turn's `usage` row, and was
+    /// discarded here. No test in the tree failed, because every other quota test names
+    /// [`QuotaSource::AcpMetaRateLimit`].
+    #[test]
+    fn the_cli_rate_limit_event_reports_the_same_document_as_its_acp_twin() {
+        let cli = normalize(
+            QuotaSource::CliRateLimitEvent,
+            Billing::Subscription,
+            Some(&blob()),
+            Some(394_692),
+            at(),
+        );
+        let acp = normalize(
+            QuotaSource::AcpMetaRateLimit,
+            Billing::Subscription,
+            Some(&blob()),
+            Some(394_692),
+            at(),
+        );
+        assert_eq!(cli.status, acp.status, "one blob, one reading of it");
+        assert_eq!(cli.windows, acp.windows);
+        assert_eq!(cli.exhausted, acp.exhausted);
+        assert_eq!(cli.spend, acp.spend);
+        assert_eq!(
+            cli.source,
+            QuotaSource::CliRateLimitEvent,
+            "the document still records which source it came from — the two rows are not merged, \
+             they are read alike"
+        );
+    }
+
     /// A row that declares no source normalizes to spend and nothing else, whatever a blob it was
     /// handed happens to say: the source is the row's declaration and the only selector (D66).
     ///
     /// This is the seeded `agy` shape (`source: "none"`, `billing: subscription`), and it is why
     /// its quota column reads a spend figure or nothing at all (plan D65).
+    ///
+    /// [`QuotaSource::CliRateLimitEvent`] left this list in MOD-2 milestone 8 (F-13), which is the
+    /// milestone the doc comment on [`normalize`] said owned it. [`QuotaSource::CliStatusLine`]
+    /// stays: nothing parses a status line yet, and a source with no reader reports nothing rather
+    /// than guessing at a shape.
     #[test]
     fn a_source_that_reports_nothing_normalizes_to_spend_only() {
-        for source in [
-            QuotaSource::None,
-            QuotaSource::CliRateLimitEvent,
-            QuotaSource::CliStatusLine,
-        ] {
+        for source in [QuotaSource::None, QuotaSource::CliStatusLine] {
             let quota = normalize(
                 source,
                 Billing::Subscription,

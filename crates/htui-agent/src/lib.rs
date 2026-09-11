@@ -85,6 +85,7 @@ macro_rules! wire_enum {
 
 pub mod acp;
 pub mod auth;
+pub mod cli;
 #[cfg(feature = "test-support")]
 pub mod conformance;
 pub mod driver;

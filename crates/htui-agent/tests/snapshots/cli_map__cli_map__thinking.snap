@@ -1,0 +1,687 @@
+---
+source: crates/htui-agent/tests/cli_map.rs
+expression: events
+---
+[
+    Other(
+        OtherEvent {
+            update: "system/hook_started",
+            body: Object {
+                "session_id": String("<session>"),
+                "uuid": String("3e02ba3a-b8e0-4e0a-a15c-6579c052e49e"),
+                "hook_id": String("2ae1530b-fd89-4b5d-8133-0267f28cf835"),
+                "hook_name": String("SessionStart:startup"),
+                "hook_event": String("SessionStart"),
+            },
+        },
+    ),
+    Other(
+        OtherEvent {
+            update: "system/hook_started",
+            body: Object {
+                "session_id": String("<session>"),
+                "uuid": String("bc01621c-3a52-464a-be27-fa8d7ec27fcb"),
+                "hook_id": String("282d1f6b-1545-45a0-ac70-1c805553759f"),
+                "hook_name": String("SessionStart:startup"),
+                "hook_event": String("SessionStart"),
+            },
+        },
+    ),
+    Other(
+        OtherEvent {
+            update: "system/hook_started",
+            body: Object {
+                "session_id": String("<session>"),
+                "uuid": String("aaa2a5db-59a4-4794-8d9c-d28a6978175e"),
+                "hook_id": String("365d88e6-cd76-40dc-b814-fe2925b892c0"),
+                "hook_name": String("SessionStart:startup"),
+                "hook_event": String("SessionStart"),
+            },
+        },
+    ),
+    Other(
+        OtherEvent {
+            update: "system/hook_response",
+            body: Object {
+                "session_id": String("<session>"),
+                "uuid": String("90a50c84-9299-4b49-a4ad-71865c0aaa47"),
+                "hook_id": String("2ae1530b-fd89-4b5d-8133-0267f28cf835"),
+                "hook_name": String("SessionStart:startup"),
+                "hook_event": String("SessionStart"),
+                "output": String("{\n  \"hookSpecificOutput\": {\n    \"hookEventName\": \"SessionStart\",\n    \"additionalContext\": \"<EXTREMELY_IMPORTANT>\\nYou have superpowers.\\n\\n**Below is the full content of your 'superpowers:using-superpowers' skill - your introduction to using skills. For all other skills, use the 'Skill' tool:**\\n\\n---\\nname: using-superpowers\\ndescription: Use when starting any conversation - establishes how to find and use skills, requiring Skill tool invocation before ANY response including clarifying questions\\n---\\n\\n<SUBAGENT-STOP>\\nIf you were dispatched as a subagent to execute a specific task, skip this skill.\\n</SUBAGENT-STOP>\\n\\n<EXTREMELY-IMPORTANT>\\nIf you think there is even a 1% chance a skill might apply to what you are doing, you ABSOLUTELY MUST invoke the skill.\\n\\nIF A SKILL APPLIES TO YOUR TASK, YOU DO NOT HAVE A CHOICE. YOU MUST USE IT.\\n\\nThis is not negotiable. This is not optional. You cannot rationalize your way out of this.\\n</EXTREMELY-IMPORTANT>\\n\\n## Instruction Priority\\n\\nSuperpowers skills override default system prompt behavior, but **user instructions always take precedence**:\\n\\n1. **User's explicit instructions** (CLAUDE.md, GEMINI.md, AGENTS.md, direct requests) — highest priority\\n2. **Superpowers skills** — override default system behavior where they conflict\\n3. **Default system prompt** — lowest priority\\n\\nIf CLAUDE.md, GEMINI.md, or AGENTS.md says \\\"don't use TDD\\\" and a skill says \\\"always use TDD,\\\" follow the user's instructions. The user is in control.\\n\\n## How to Access Skills\\n\\n**In Claude Code:** Use the `Skill` tool. When you invoke a skill, its content is loaded and presented to you—follow it directly. Never use the Read tool on skill files.\\n\\n**In Copilot CLI:** Use the `skill` tool. Skills are auto-discovered from installed plugins. The `skill` tool works the same as Claude Code's `Skill` tool.\\n\\n**In Gemini CLI:** Skills activate via the `activate_skill` tool. Gemini loads skill metadata at session start and activates the full content on demand.\\n\\n**In other environments:** Check your platform's documentation for how skills are loaded.\\n\\n## Platform Adaptation\\n\\nSkills use Claude Code tool names. Non-CC platforms: see `references/copilot-tools.md` (Copilot CLI), `references/codex-tools.md` (Codex) for tool equivalents. Gemini CLI users get the tool mapping loaded automatically via GEMINI.md.\\n\\n# Using Skills\\n\\n## The Rule\\n\\n**Invoke relevant or requested skills BEFORE any response or action.** Even a 1% chance a skill might apply means that you should invoke the skill to check. If an invoked skill turns out to be wrong for the situation, you don't need to use it.\\n\\n```dot\\ndigraph skill_flow {\\n    \\\"User message received\\\" [shape=doublecircle];\\n    \\\"About to EnterPlanMode?\\\" [shape=doublecircle];\\n    \\\"Already brainstormed?\\\" [shape=diamond];\\n    \\\"Invoke brainstorming skill\\\" [shape=box];\\n    \\\"Might any skill apply?\\\" [shape=diamond];\\n    \\\"Invoke Skill tool\\\" [shape=box];\\n    \\\"Announce: 'Using [skill] to [purpose]'\\\" [shape=box];\\n    \\\"Has checklist?\\\" [shape=diamond];\\n    \\\"Create TodoWrite todo per item\\\" [shape=box];\\n    \\\"Follow skill exactly\\\" [shape=box];\\n    \\\"Respond (including clarifications)\\\" [shape=doublecircle];\\n\\n    \\\"About to EnterPlanMode?\\\" -> \\\"Already brainstormed?\\\";\\n    \\\"Already brainstormed?\\\" -> \\\"Invoke brainstorming skill\\\" [label=\\\"no\\\"];\\n    \\\"Already brainstormed?\\\" -> \\\"Might any skill apply?\\\" [label=\\\"yes\\\"];\\n    \\\"Invoke brainstorming skill\\\" -> \\\"Might any skill apply?\\\";\\n\\n    \\\"User message received\\\" -> \\\"Might any skill apply?\\\";\\n    \\\"Might any skill apply?\\\" -> \\\"Invoke Skill tool\\\" [label=\\\"yes, even 1%\\\"];\\n    \\\"Might any skill apply?\\\" -> \\\"Respond (including clarifications)\\\" [label=\\\"definitely not\\\"];\\n    \\\"Invoke Skill tool\\\" -> \\\"Announce: 'Using [skill] to [purpose]'\\\";\\n    \\\"Announce: 'Using [skill] to [purpose]'\\\" -> \\\"Has checklist?\\\";\\n    \\\"Has checklist?\\\" -> \\\"Create TodoWrite todo per item\\\" [label=\\\"yes\\\"];\\n    \\\"Has checklist?\\\" -> \\\"Follow skill exactly\\\" [label=\\\"no\\\"];\\n    \\\"Create TodoWrite todo per item\\\" -> \\\"Follow skill exactly\\\";\\n}\\n```\\n\\n## Red Flags\\n\\nThese thoughts mean STOP—you're rationalizing:\\n\\n| Thought | Reality |\\n|---------|---------|\\n| \\\"This is just a simple question\\\" | Questions are tasks. Check for skills. |\\n| \\\"I need more context first\\\" | Skill check comes BEFORE clarifying questions. |\\n| \\\"Let me explore the codebase first\\\" | Skills tell you HOW to explore. Check first. |\\n| \\\"I can check git/files quickly\\\" | Files lack conversation context. Check for skills. |\\n| \\\"Let me gather information first\\\" | Skills tell you HOW to gather information. |\\n| \\\"This doesn't need a formal skill\\\" | If a skill exists, use it. |\\n| \\\"I remember this skill\\\" | Skills evolve. Read current version. |\\n| \\\"This doesn't count as a task\\\" | Action = task. Check for skills. |\\n| \\\"The skill is overkill\\\" | Simple things become complex. Use it. |\\n| \\\"I'll just do this one thing first\\\" | Check BEFORE doing anything. |\\n| \\\"This feels productive\\\" | Undisciplined action wastes time. Skills prevent this. |\\n| \\\"I know what that means\\\" | Knowing the concept ≠ using the skill. Invoke it. |\\n\\n## Skill Priority\\n\\nWhen multiple skills could apply, use this order:\\n\\n1. **Process skills first** (brainstorming, debugging) - these determine HOW to approach the task\\n2. **Implementation skills second** (frontend-design, mcp-builder) - these guide execution\\n\\n\\\"Let's build X\\\" → brainstorming first, then implementation skills.\\n\\\"Fix this bug\\\" → debugging first, then domain-specific skills.\\n\\n## Skill Types\\n\\n**Rigid** (TDD, debugging): Follow exactly. Don't adapt away discipline.\\n\\n**Flexible** (patterns): Adapt principles to context.\\n\\nThe skill itself tells you which.\\n\\n## User Instructions\\n\\nInstructions say WHAT, not HOW. \\\"Add X\\\" or \\\"Fix Y\\\" doesn't mean skip workflows.\\n\\n\\n</EXTREMELY_IMPORTANT>\"\n  }\n}\n"),
+                "stdout": String("{\n  \"hookSpecificOutput\": {\n    \"hookEventName\": \"SessionStart\",\n    \"additionalContext\": \"<EXTREMELY_IMPORTANT>\\nYou have superpowers.\\n\\n**Below is the full content of your 'superpowers:using-superpowers' skill - your introduction to using skills. For all other skills, use the 'Skill' tool:**\\n\\n---\\nname: using-superpowers\\ndescription: Use when starting any conversation - establishes how to find and use skills, requiring Skill tool invocation before ANY response including clarifying questions\\n---\\n\\n<SUBAGENT-STOP>\\nIf you were dispatched as a subagent to execute a specific task, skip this skill.\\n</SUBAGENT-STOP>\\n\\n<EXTREMELY-IMPORTANT>\\nIf you think there is even a 1% chance a skill might apply to what you are doing, you ABSOLUTELY MUST invoke the skill.\\n\\nIF A SKILL APPLIES TO YOUR TASK, YOU DO NOT HAVE A CHOICE. YOU MUST USE IT.\\n\\nThis is not negotiable. This is not optional. You cannot rationalize your way out of this.\\n</EXTREMELY-IMPORTANT>\\n\\n## Instruction Priority\\n\\nSuperpowers skills override default system prompt behavior, but **user instructions always take precedence**:\\n\\n1. **User's explicit instructions** (CLAUDE.md, GEMINI.md, AGENTS.md, direct requests) — highest priority\\n2. **Superpowers skills** — override default system behavior where they conflict\\n3. **Default system prompt** — lowest priority\\n\\nIf CLAUDE.md, GEMINI.md, or AGENTS.md says \\\"don't use TDD\\\" and a skill says \\\"always use TDD,\\\" follow the user's instructions. The user is in control.\\n\\n## How to Access Skills\\n\\n**In Claude Code:** Use the `Skill` tool. When you invoke a skill, its content is loaded and presented to you—follow it directly. Never use the Read tool on skill files.\\n\\n**In Copilot CLI:** Use the `skill` tool. Skills are auto-discovered from installed plugins. The `skill` tool works the same as Claude Code's `Skill` tool.\\n\\n**In Gemini CLI:** Skills activate via the `activate_skill` tool. Gemini loads skill metadata at session start and activates the full content on demand.\\n\\n**In other environments:** Check your platform's documentation for how skills are loaded.\\n\\n## Platform Adaptation\\n\\nSkills use Claude Code tool names. Non-CC platforms: see `references/copilot-tools.md` (Copilot CLI), `references/codex-tools.md` (Codex) for tool equivalents. Gemini CLI users get the tool mapping loaded automatically via GEMINI.md.\\n\\n# Using Skills\\n\\n## The Rule\\n\\n**Invoke relevant or requested skills BEFORE any response or action.** Even a 1% chance a skill might apply means that you should invoke the skill to check. If an invoked skill turns out to be wrong for the situation, you don't need to use it.\\n\\n```dot\\ndigraph skill_flow {\\n    \\\"User message received\\\" [shape=doublecircle];\\n    \\\"About to EnterPlanMode?\\\" [shape=doublecircle];\\n    \\\"Already brainstormed?\\\" [shape=diamond];\\n    \\\"Invoke brainstorming skill\\\" [shape=box];\\n    \\\"Might any skill apply?\\\" [shape=diamond];\\n    \\\"Invoke Skill tool\\\" [shape=box];\\n    \\\"Announce: 'Using [skill] to [purpose]'\\\" [shape=box];\\n    \\\"Has checklist?\\\" [shape=diamond];\\n    \\\"Create TodoWrite todo per item\\\" [shape=box];\\n    \\\"Follow skill exactly\\\" [shape=box];\\n    \\\"Respond (including clarifications)\\\" [shape=doublecircle];\\n\\n    \\\"About to EnterPlanMode?\\\" -> \\\"Already brainstormed?\\\";\\n    \\\"Already brainstormed?\\\" -> \\\"Invoke brainstorming skill\\\" [label=\\\"no\\\"];\\n    \\\"Already brainstormed?\\\" -> \\\"Might any skill apply?\\\" [label=\\\"yes\\\"];\\n    \\\"Invoke brainstorming skill\\\" -> \\\"Might any skill apply?\\\";\\n\\n    \\\"User message received\\\" -> \\\"Might any skill apply?\\\";\\n    \\\"Might any skill apply?\\\" -> \\\"Invoke Skill tool\\\" [label=\\\"yes, even 1%\\\"];\\n    \\\"Might any skill apply?\\\" -> \\\"Respond (including clarifications)\\\" [label=\\\"definitely not\\\"];\\n    \\\"Invoke Skill tool\\\" -> \\\"Announce: 'Using [skill] to [purpose]'\\\";\\n    \\\"Announce: 'Using [skill] to [purpose]'\\\" -> \\\"Has checklist?\\\";\\n    \\\"Has checklist?\\\" -> \\\"Create TodoWrite todo per item\\\" [label=\\\"yes\\\"];\\n    \\\"Has checklist?\\\" -> \\\"Follow skill exactly\\\" [label=\\\"no\\\"];\\n    \\\"Create TodoWrite todo per item\\\" -> \\\"Follow skill exactly\\\";\\n}\\n```\\n\\n## Red Flags\\n\\nThese thoughts mean STOP—you're rationalizing:\\n\\n| Thought | Reality |\\n|---------|---------|\\n| \\\"This is just a simple question\\\" | Questions are tasks. Check for skills. |\\n| \\\"I need more context first\\\" | Skill check comes BEFORE clarifying questions. |\\n| \\\"Let me explore the codebase first\\\" | Skills tell you HOW to explore. Check first. |\\n| \\\"I can check git/files quickly\\\" | Files lack conversation context. Check for skills. |\\n| \\\"Let me gather information first\\\" | Skills tell you HOW to gather information. |\\n| \\\"This doesn't need a formal skill\\\" | If a skill exists, use it. |\\n| \\\"I remember this skill\\\" | Skills evolve. Read current version. |\\n| \\\"This doesn't count as a task\\\" | Action = task. Check for skills. |\\n| \\\"The skill is overkill\\\" | Simple things become complex. Use it. |\\n| \\\"I'll just do this one thing first\\\" | Check BEFORE doing anything. |\\n| \\\"This feels productive\\\" | Undisciplined action wastes time. Skills prevent this. |\\n| \\\"I know what that means\\\" | Knowing the concept ≠ using the skill. Invoke it. |\\n\\n## Skill Priority\\n\\nWhen multiple skills could apply, use this order:\\n\\n1. **Process skills first** (brainstorming, debugging) - these determine HOW to approach the task\\n2. **Implementation skills second** (frontend-design, mcp-builder) - these guide execution\\n\\n\\\"Let's build X\\\" → brainstorming first, then implementation skills.\\n\\\"Fix this bug\\\" → debugging first, then domain-specific skills.\\n\\n## Skill Types\\n\\n**Rigid** (TDD, debugging): Follow exactly. Don't adapt away discipline.\\n\\n**Flexible** (patterns): Adapt principles to context.\\n\\nThe skill itself tells you which.\\n\\n## User Instructions\\n\\nInstructions say WHAT, not HOW. \\\"Add X\\\" or \\\"Fix Y\\\" doesn't mean skip workflows.\\n\\n\\n</EXTREMELY_IMPORTANT>\"\n  }\n}\n"),
+                "stderr": String(""),
+                "exit_code": Number(0),
+                "outcome": String("success"),
+            },
+        },
+    ),
+    Other(
+        OtherEvent {
+            update: "system/hook_response",
+            body: Object {
+                "session_id": String("<session>"),
+                "uuid": String("54fb8c40-2daf-4b48-b14d-a701f7199ce4"),
+                "hook_id": String("365d88e6-cd76-40dc-b814-fe2925b892c0"),
+                "hook_name": String("SessionStart:startup"),
+                "hook_event": String("SessionStart"),
+                "output": String("CAVEMAN MODE ACTIVE — level: full\n\nRespond terse like smart caveman. All technical substance stay. Only fluff die.\n\n## Persistence\n\nACTIVE EVERY RESPONSE. No revert after many turns. No filler drift. Still active if unsure. Off only: \"stop caveman\" / \"normal mode\".\n\nCurrent level: **full**. Switch: `/caveman lite|full|ultra`.\n\n## Rules\n\nDrop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging. Fragments OK. Short synonyms (big not extensive, fix not \"implement a solution for\"). Technical terms exact. Code blocks unchanged. Errors quoted exact.\n\nPattern: `[thing] [action] [reason]. [next step].`\n\nNot: \"Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by...\"\nYes: \"Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:\"\n\n## Auto-Clarity\n\nDrop caveman for: security warnings, irreversible action confirmations, multi-step sequences where fragment order risks misread, user asks to clarify or repeats question. Resume caveman after clear part done.\n\n## Boundaries\n\nCode/commits/PRs: write normal. \"stop caveman\" or \"normal mode\": revert. Level persist until changed or session end.\n\nSTATUSLINE SETUP NEEDED: The caveman plugin includes a statusline badge showing active mode (e.g. [CAVEMAN], [CAVEMAN:ULTRA]). It is not configured yet. To enable, add this to ~/.claude/settings.json: \"statusLine\": { \"type\": \"command\", \"command\": \"bash \\\"~/.claude/plugins/cache/caveman/caveman/25d22f864ad6/src/hooks/caveman-statusline.sh\\\"\" } Proactively offer to set this up for the user on first interaction."),
+                "stdout": String("CAVEMAN MODE ACTIVE — level: full\n\nRespond terse like smart caveman. All technical substance stay. Only fluff die.\n\n## Persistence\n\nACTIVE EVERY RESPONSE. No revert after many turns. No filler drift. Still active if unsure. Off only: \"stop caveman\" / \"normal mode\".\n\nCurrent level: **full**. Switch: `/caveman lite|full|ultra`.\n\n## Rules\n\nDrop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging. Fragments OK. Short synonyms (big not extensive, fix not \"implement a solution for\"). Technical terms exact. Code blocks unchanged. Errors quoted exact.\n\nPattern: `[thing] [action] [reason]. [next step].`\n\nNot: \"Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by...\"\nYes: \"Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:\"\n\n## Auto-Clarity\n\nDrop caveman for: security warnings, irreversible action confirmations, multi-step sequences where fragment order risks misread, user asks to clarify or repeats question. Resume caveman after clear part done.\n\n## Boundaries\n\nCode/commits/PRs: write normal. \"stop caveman\" or \"normal mode\": revert. Level persist until changed or session end.\n\nSTATUSLINE SETUP NEEDED: The caveman plugin includes a statusline badge showing active mode (e.g. [CAVEMAN], [CAVEMAN:ULTRA]). It is not configured yet. To enable, add this to ~/.claude/settings.json: \"statusLine\": { \"type\": \"command\", \"command\": \"bash \\\"~/.claude/plugins/cache/caveman/caveman/25d22f864ad6/src/hooks/caveman-statusline.sh\\\"\" } Proactively offer to set this up for the user on first interaction."),
+                "stderr": String(""),
+                "exit_code": Number(0),
+                "outcome": String("success"),
+            },
+        },
+    ),
+    Other(
+        OtherEvent {
+            update: "system/hook_response",
+            body: Object {
+                "session_id": String("<session>"),
+                "uuid": String("a0032eeb-6aed-4c1e-8a54-a3c4323af9b4"),
+                "hook_id": String("282d1f6b-1545-45a0-ac70-1c805553759f"),
+                "hook_name": String("SessionStart:startup"),
+                "hook_event": String("SessionStart"),
+                "output": String("=== HANDOFF ===\nWrite next handoff to: /scratch/.remember/remember.md\n\n=== REMEMBER ===\nHistory in .remember/: now.md (buffer), today-*.md (daily), recent.md (7d), archive.md (old), core-memories.md (key moments). Search on user request.\n\n"),
+                "stdout": String("=== HANDOFF ===\nWrite next handoff to: /scratch/.remember/remember.md\n\n=== REMEMBER ===\nHistory in .remember/: now.md (buffer), today-*.md (daily), recent.md (7d), archive.md (old), core-memories.md (key moments). Search on user request.\n\n"),
+                "stderr": String(""),
+                "exit_code": Number(0),
+                "outcome": String("success"),
+            },
+        },
+    ),
+    Other(
+        OtherEvent {
+            update: "system/init",
+            body: Object {
+                "fast_mode_disabled_reason": String("sdk_opt_in_required"),
+                "fast_mode_state": String("off"),
+                "cwd": String("/scratch"),
+                "session_id": String("<session>"),
+                "tools": Array [
+                    String("Task"),
+                    String("Bash"),
+                    String("CronCreate"),
+                    String("CronDelete"),
+                    String("CronList"),
+                    String("Edit"),
+                    String("EnterWorktree"),
+                    String("ExitWorktree"),
+                    String("ListAgents"),
+                    String("ListMcpResourcesTool"),
+                    String("NotebookEdit"),
+                    String("Read"),
+                    String("ReadMcpResourceDirTool"),
+                    String("ReadMcpResourceTool"),
+                    String("RemoteTrigger"),
+                    String("ReportFindings"),
+                    String("ScheduleWakeup"),
+                    String("SendMessage"),
+                    String("Skill"),
+                    String("TaskOutput"),
+                    String("TaskStop"),
+                    String("ToolSearch"),
+                    String("WebFetch"),
+                    String("WebSearch"),
+                    String("Workflow"),
+                    String("Write"),
+                    String("mcp__claude_ai_Google_Drive__copy_file"),
+                    String("mcp__claude_ai_Google_Drive__create_file"),
+                    String("mcp__claude_ai_Google_Drive__download_file_content"),
+                    String("mcp__claude_ai_Google_Drive__get_file_metadata"),
+                    String("mcp__claude_ai_Google_Drive__get_file_permissions"),
+                    String("mcp__claude_ai_Google_Drive__list_recent_files"),
+                    String("mcp__claude_ai_Google_Drive__read_file_content"),
+                    String("mcp__claude_ai_Google_Drive__search_files"),
+                    String("mcp__fetch__fetch_html"),
+                    String("mcp__fetch__fetch_json"),
+                    String("mcp__fetch__fetch_markdown"),
+                    String("mcp__fetch__fetch_readable"),
+                    String("mcp__fetch__fetch_txt"),
+                    String("mcp__fetch__fetch_youtube_transcript"),
+                    String("mcp__headroom__headroom_compress"),
+                    String("mcp__headroom__headroom_retrieve"),
+                    String("mcp__headroom__headroom_stats"),
+                    String("mcp__kandev__archive_task_kandev"),
+                    String("mcp__kandev__create_agent_profile_kandev"),
+                    String("mcp__kandev__create_executor_profile_kandev"),
+                    String("mcp__kandev__create_task_kandev"),
+                    String("mcp__kandev__create_workflow_kandev"),
+                    String("mcp__kandev__create_workflow_step_kandev"),
+                    String("mcp__kandev__delete_agent_profile_kandev"),
+                    String("mcp__kandev__delete_executor_profile_kandev"),
+                    String("mcp__kandev__delete_task_kandev"),
+                    String("mcp__kandev__delete_workflow_kandev"),
+                    String("mcp__kandev__delete_workflow_step_kandev"),
+                    String("mcp__kandev__get_mcp_config_kandev"),
+                    String("mcp__kandev__get_task_conversation_kandev"),
+                    String("mcp__kandev__import_workflow_kandev"),
+                    String("mcp__kandev__list_agent_profiles_kandev"),
+                    String("mcp__kandev__list_agents_kandev"),
+                    String("mcp__kandev__list_executor_profiles_kandev"),
+                    String("mcp__kandev__list_executors_kandev"),
+                    String("mcp__kandev__list_repositories_kandev"),
+                    String("mcp__kandev__list_tasks_kandev"),
+                    String("mcp__kandev__list_workflow_steps_kandev"),
+                    String("mcp__kandev__list_workflows_kandev"),
+                    String("mcp__kandev__list_workspaces_kandev"),
+                    String("mcp__kandev__move_task_kandev"),
+                    String("mcp__kandev__reorder_workflow_steps_kandev"),
+                    String("mcp__kandev__update_agent_kandev"),
+                    String("mcp__kandev__update_agent_profile_kandev"),
+                    String("mcp__kandev__update_executor_profile_kandev"),
+                    String("mcp__kandev__update_mcp_config_kandev"),
+                    String("mcp__kandev__update_task_state_kandev"),
+                    String("mcp__kandev__update_workflow_kandev"),
+                    String("mcp__kandev__update_workflow_step_kandev"),
+                    String("mcp__semble__find_related"),
+                    String("mcp__semble__search"),
+                    String("mcp__sequential-thinking__sequentialthinking"),
+                    String("mcp__sequential-thinking-tools__clear_thinking_history"),
+                    String("mcp__sequential-thinking-tools__get_thinking_history"),
+                    String("mcp__sequential-thinking-tools__sequentialthinking_tools"),
+                    String("mcp__serena__activate_project"),
+                    String("mcp__serena__delete_memory"),
+                    String("mcp__serena__edit_memory"),
+                    String("mcp__serena__find_declaration"),
+                    String("mcp__serena__find_implementations"),
+                    String("mcp__serena__find_referencing_symbols"),
+                    String("mcp__serena__find_symbol"),
+                    String("mcp__serena__get_current_config"),
+                    String("mcp__serena__get_diagnostics_for_file"),
+                    String("mcp__serena__get_symbols_overview"),
+                    String("mcp__serena__initial_instructions"),
+                    String("mcp__serena__insert_after_symbol"),
+                    String("mcp__serena__insert_before_symbol"),
+                    String("mcp__serena__list_memories"),
+                    String("mcp__serena__onboarding"),
+                    String("mcp__serena__open_dashboard"),
+                    String("mcp__serena__read_memory"),
+                    String("mcp__serena__rename_memory"),
+                    String("mcp__serena__rename_symbol"),
+                    String("mcp__serena__replace_content"),
+                    String("mcp__serena__replace_in_files"),
+                    String("mcp__serena__replace_symbol_body"),
+                    String("mcp__serena__safe_delete_symbol"),
+                    String("mcp__serena__write_memory"),
+                    String("mcp__sigmap__create_checkpoint"),
+                    String("mcp__sigmap__explain_file"),
+                    String("mcp__sigmap__get_impact"),
+                    String("mcp__sigmap__get_map"),
+                    String("mcp__sigmap__get_routing"),
+                    String("mcp__sigmap__list_modules"),
+                    String("mcp__sigmap__query_context"),
+                    String("mcp__sigmap__read_context"),
+                    String("mcp__sigmap__search_signatures"),
+                ],
+                "mcp_servers": Array [
+                    Object {
+                        "name": String("sigmap"),
+                        "status": String("connected"),
+                    },
+                    Object {
+                        "name": String("sequential-thinking"),
+                        "status": String("connected"),
+                    },
+                    Object {
+                        "name": String("sequential-thinking-tools"),
+                        "status": String("connected"),
+                    },
+                    Object {
+                        "name": String("fetch"),
+                        "status": String("connected"),
+                    },
+                    Object {
+                        "name": String("kandev"),
+                        "status": String("connected"),
+                    },
+                    Object {
+                        "name": String("semble"),
+                        "status": String("connected"),
+                    },
+                    Object {
+                        "name": String("headroom"),
+                        "status": String("connected"),
+                    },
+                    Object {
+                        "name": String("serena"),
+                        "status": String("connected"),
+                    },
+                    Object {
+                        "name": String("claude.ai HyperFrames by HeyGen"),
+                        "status": String("needs-auth"),
+                    },
+                    Object {
+                        "name": String("claude.ai Canva"),
+                        "status": String("needs-auth"),
+                    },
+                    Object {
+                        "name": String("claude.ai Google Drive"),
+                        "status": String("connected"),
+                    },
+                ],
+                "model": String("claude-opus-5[1m]"),
+                "permissionMode": String("acceptEdits"),
+                "slash_commands": Array [
+                    String("find-skills"),
+                    String("deep-research"),
+                    String("superpowers:brainstorming"),
+                    String("superpowers:dispatching-parallel-agents"),
+                    String("superpowers:executing-plans"),
+                    String("superpowers:finishing-a-development-branch"),
+                    String("superpowers:receiving-code-review"),
+                    String("superpowers:requesting-code-review"),
+                    String("superpowers:subagent-driven-development"),
+                    String("superpowers:systematic-debugging"),
+                    String("superpowers:test-driven-development"),
+                    String("superpowers:using-git-worktrees"),
+                    String("superpowers:using-superpowers"),
+                    String("superpowers:verification-before-completion"),
+                    String("superpowers:writing-plans"),
+                    String("superpowers:writing-skills"),
+                    String("remember:remember"),
+                    String("caveman:cavecrew"),
+                    String("caveman:caveman"),
+                    String("caveman:caveman-commit"),
+                    String("caveman:caveman-compress"),
+                    String("caveman:caveman-help"),
+                    String("caveman:caveman-review"),
+                    String("caveman:caveman-stats"),
+                    String("dataviz"),
+                    String("update-config"),
+                    String("verify"),
+                    String("debug"),
+                    String("code-review"),
+                    String("simplify"),
+                    String("batch"),
+                    String("fewer-permission-prompts"),
+                    String("doctor"),
+                    String("loop"),
+                    String("schedule"),
+                    String("claude-api"),
+                    String("workflow-authoring"),
+                    String("run"),
+                    String("run-skill-generator"),
+                    String("agents"),
+                    String("auto-mode-setup"),
+                    String("autocompact"),
+                    String("clear"),
+                    String("color"),
+                    String("compact"),
+                    String("config"),
+                    String("context"),
+                    String("effort"),
+                    String("fast"),
+                    String("heapdump"),
+                    String("init"),
+                    String("mcp"),
+                    String("model"),
+                    String("__remote-workflow"),
+                    String("workflow-launch-exec"),
+                    String("reload-plugins"),
+                    String("reload-skills"),
+                    String("rename"),
+                    String("security-review"),
+                    String("usage-credits"),
+                    String("extra-usage"),
+                    String("usage"),
+                    String("insights"),
+                    String("recap"),
+                    String("goal"),
+                    String("list-agents"),
+                    String("team-onboarding"),
+                    String("mcp__sequential-thinking-tools__sequential-thinking-guidance"),
+                ],
+                "terminal_slash_commands": Array [
+                    String("doctor"),
+                    String("color"),
+                    String("reload-plugins"),
+                ],
+                "apiKeySource": String("none"),
+                "claude_code_version": String("2.1.267"),
+                "output_style": String("default"),
+                "agents": Array [
+                    String("caveman:cavecrew-builder"),
+                    String("caveman:cavecrew-investigator"),
+                    String("caveman:cavecrew-reviewer"),
+                    String("claude"),
+                    String("code-architect"),
+                    String("Explore"),
+                    String("general-purpose"),
+                    String("Plan"),
+                    String("rust-reviewer"),
+                    String("statusline-setup"),
+                ],
+                "skills": Array [
+                    String("find-skills"),
+                    String("deep-research"),
+                    String("superpowers:brainstorming"),
+                    String("superpowers:dispatching-parallel-agents"),
+                    String("superpowers:executing-plans"),
+                    String("superpowers:finishing-a-development-branch"),
+                    String("superpowers:receiving-code-review"),
+                    String("superpowers:requesting-code-review"),
+                    String("superpowers:subagent-driven-development"),
+                    String("superpowers:systematic-debugging"),
+                    String("superpowers:test-driven-development"),
+                    String("superpowers:using-git-worktrees"),
+                    String("superpowers:using-superpowers"),
+                    String("superpowers:verification-before-completion"),
+                    String("superpowers:writing-plans"),
+                    String("superpowers:writing-skills"),
+                    String("remember:remember"),
+                    String("caveman:cavecrew"),
+                    String("caveman:caveman"),
+                    String("caveman:caveman-commit"),
+                    String("caveman:caveman-compress"),
+                    String("caveman:caveman-help"),
+                    String("caveman:caveman-review"),
+                    String("caveman:caveman-stats"),
+                    String("dataviz"),
+                    String("update-config"),
+                    String("verify"),
+                    String("debug"),
+                    String("code-review"),
+                    String("simplify"),
+                    String("batch"),
+                    String("fewer-permission-prompts"),
+                    String("doctor"),
+                    String("loop"),
+                    String("schedule"),
+                    String("claude-api"),
+                    String("workflow-authoring"),
+                    String("run"),
+                    String("run-skill-generator"),
+                ],
+                "plugins": Array [
+                    Object {
+                        "name": String("superpowers"),
+                        "path": String("~/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0"),
+                        "source": String("superpowers@claude-plugins-official"),
+                        "version": String("5.1.0"),
+                    },
+                    Object {
+                        "name": String("remember"),
+                        "path": String("~/.claude/plugins/cache/claude-plugins-official/remember/0.7.3"),
+                        "source": String("remember@claude-plugins-official"),
+                        "version": String("0.7.3"),
+                    },
+                    Object {
+                        "name": String("caveman"),
+                        "path": String("~/.claude/plugins/cache/caveman/caveman/25d22f864ad6"),
+                        "source": String("caveman@caveman"),
+                    },
+                ],
+                "capabilities": Array [
+                    String("interrupt_receipt_v1"),
+                    String("interrupt_cancel_queued_v1"),
+                    String("msg_lifecycle_v1"),
+                ],
+                "analytics_disabled": Bool(true),
+                "product_feedback_disabled": Bool(true),
+                "uuid": String("586b4c7f-6100-4741-b902-ddf1eef6752a"),
+                "memory_paths": Object {
+                    "auto": String("~/.claude/projects/-tmp--tmpx52mC3/memory/"),
+                },
+                "messaging_socket_path": String("/run/user/1000/cc-socks/2090828.sock"),
+            },
+        },
+    ),
+    Other(
+        OtherEvent {
+            update: "system/status",
+            body: Object {
+                "uuid": String("0ad213f3-be1d-4aa0-b5e8-3bce4013da66"),
+                "session_id": String("<session>"),
+                "status": String("requesting"),
+            },
+        },
+    ),
+    Other(
+        OtherEvent {
+            update: "system/thinking_tokens",
+            body: Object {
+                "uuid": String("7c5c861d-f1c3-40e2-9536-92d25026ecfd"),
+                "session_id": String("<session>"),
+                "estimated_tokens": Number(50),
+                "estimated_tokens_delta": Number(50),
+            },
+        },
+    ),
+    ThoughtChunk(
+        TextChunk {
+            text: "",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#0",
+            ),
+        },
+    ),
+    ThoughtChunk(
+        TextChunk {
+            text: "",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#0",
+            ),
+        },
+    ),
+    Other(
+        OtherEvent {
+            update: "system/thinking_tokens",
+            body: Object {
+                "uuid": String("c2528712-8e08-4bf7-85bd-88af4793ac25"),
+                "session_id": String("<session>"),
+                "estimated_tokens": Number(113),
+                "estimated_tokens_delta": Number(63),
+            },
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "17 ×",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: " 23 = 17 ",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "× 20 + 17 ",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "× 3 = 340 ",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "+ 51 = **391**",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "\n\nSide note: ca",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "veman statusline bad",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "ge not",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: " configured. Want me add",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: " to",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: " `~",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: "/.claude/settings",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    AssistantChunk(
+        TextChunk {
+            text: ".json`?",
+            message_id: Some(
+                "msg_011CevdLxgT3W8F3cwtmkydk#1",
+            ),
+        },
+    ),
+    Other(
+        OtherEvent {
+            update: "rate_limit_event",
+            body: Object {
+                "session_id": String("<session>"),
+                "rate_limit_info": Object {
+                    "status": String("allowed_warning"),
+                    "resetsAt": Number(1789459200),
+                    "rateLimitType": String("seven_day"),
+                    "utilization": Number(0.77),
+                    "isUsingOverage": Bool(false),
+                    "surpassedThreshold": Number(0.75),
+                    "unifiedWindows": Object {
+                        "five_hour": Object {
+                            "utilization": Number(0.04),
+                            "resetsAt": Number(1789099200),
+                        },
+                        "seven_day": Object {
+                            "utilization": Number(0.77),
+                            "resetsAt": Number(1789459200),
+                        },
+                    },
+                },
+                "uuid": String("cdf4ad17-330e-45d6-87a1-98f3440ff535"),
+            },
+        },
+    ),
+    Usage(
+        UsageEvent {
+            input_tokens: Some(
+                2,
+            ),
+            output_tokens: Some(
+                148,
+            ),
+            cache_read_tokens: Some(
+                3809,
+            ),
+            cache_write_tokens: Some(
+                13625,
+            ),
+            cost_micros: Some(
+                141865,
+            ),
+            context_used: None,
+            context_size: None,
+            cost_micros_total: Some(
+                141865,
+            ),
+            cost_amount: None,
+            cost_currency: None,
+            usage_scope: Some(
+                "model_usage",
+            ),
+            quota: Some(
+                Object {
+                    "status": String("allowed_warning"),
+                    "resetsAt": Number(1789459200),
+                    "rateLimitType": String("seven_day"),
+                    "utilization": Number(0.77),
+                    "isUsingOverage": Bool(false),
+                    "surpassedThreshold": Number(0.75),
+                    "unifiedWindows": Object {
+                        "five_hour": Object {
+                            "utilization": Number(0.04),
+                            "resetsAt": Number(1789099200),
+                        },
+                        "seven_day": Object {
+                            "utilization": Number(0.77),
+                            "resetsAt": Number(1789459200),
+                        },
+                    },
+                },
+            ),
+        },
+    ),
+    Done(
+        DoneEvent {
+            stop_reason: EndTurn,
+        },
+    ),
+]
