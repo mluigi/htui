@@ -2698,11 +2698,23 @@ async fn record_answer(
     let frame = DriverEnvelope {
         event: DriverEvent::Other(htui_agent::event::OtherEvent {
             update: "permission_answer".to_owned(),
+            // The **same** key set the recorder writes, `denied` included (D94). A live frame and
+            // the row it replays as are read by one function
+            // (`chat/transcript.rs::resolve_permission`), so a key present in one and absent in the
+            // other is a transcript that renders differently depending on whether you are watching
+            // it or reopening it — which is the asymmetry D94 was raised to close, in its other
+            // direction.
+            //
+            // The expression is `record_permission_answer`'s own: `htui` authors exactly two
+            // answers, a picked option and a cancellation, so neither is ever a refusal. It is
+            // written out rather than defaulted so that the day a third kind of answer exists, this
+            // reads as a claim to re-check instead of as a `false` nobody chose.
             body: json!({
                 "request_id": request_id.as_str(),
                 "option_id": option_id,
                 "by": by.as_str(),
                 "cancelled": cancelled,
+                "denied": option_id.is_none() && !cancelled,
             }),
         }),
         raw: None,

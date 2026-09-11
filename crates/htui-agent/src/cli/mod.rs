@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use htui_core::model::{Agent as AgentRow, AgentBox};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -67,6 +67,13 @@ pub const EVENTS_CAPACITY: usize = 256;
 /// The grace window a session gets when its **handle** is dropped rather than cancelled;
 /// [`crate::acp::DROP_GRACE`]'s reason.
 pub const DROP_GRACE: Duration = Duration::from_secs(1);
+
+/// The most one stdout line may occupy before the reader forwards it unfinished.
+///
+/// One mebibyte, which is two orders of magnitude above the largest line any recorded transcript
+/// holds (a `system/init` listing this box's tools and commands) and small enough that a child
+/// writing without newlines cannot exhaust memory through it. See [`read_lines`].
+const MAX_LINE_BYTES: u64 = 1024 * 1024;
 
 /// `other.update` of a stdout line that is not JSON at all.
 ///
@@ -795,12 +802,25 @@ async fn run_session(
 /// child writes before its `\n` is stripped for the same reason — a CRLF line that reached the JSON
 /// parser with its carriage return still attached would parse, and then the *last* line of the
 /// stream would not.
+///
+/// **The line is capped** (review gate, LOW). `read_until` grows its buffer until it finds the
+/// delimiter, so a child that writes megabytes without a newline — a crash dump, a binary blob, a
+/// subprocess whose output got redirected into ours — would grow this buffer without limit inside
+/// a supervisor whose whole job is to survive the agent misbehaving. At the cap the partial line is
+/// forwarded as it stands and the reader keeps going, so the transcript records what arrived (it
+/// lands in `other` as unparsed, §6.2's rule) rather than either truncating in silence or holding
+/// the whole thing in memory. No recorded transcript comes near it: the largest real line in the
+/// fixtures is a `system/init` of a few kilobytes.
 async fn read_lines(reader: Box<dyn AsyncRead + Send + Unpin>, lines: mpsc::Sender<String>) {
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
     loop {
         buffer.clear();
-        match reader.read_until(b'\n', &mut buffer).await {
+        match (&mut reader)
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut buffer)
+            .await
+        {
             // End of stream.
             Ok(0) => break,
             Ok(_) => {}
