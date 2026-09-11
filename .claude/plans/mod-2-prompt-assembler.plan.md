@@ -169,6 +169,51 @@ token estimate for the same text.
 
 ---
 
+## Implementation findings — T59 and T61 (2026-09-11)
+
+Recorded here because each one is a decision a later task inherits, and two of them would otherwise
+be re-derived differently.
+
+**F-19 — `ParsedTemplate::literal_text` ships behind `#[expect(dead_code)]`, and T64 must delete the
+attribute.** B.2 gives it as `pub(crate)`, and its only caller is T64's `render.rs`; in the T59 tree
+it has none, so the non-test lib build fires `dead_code` and `-D warnings` fails. `expect` rather
+than `allow` is deliberate: a stale suppression then fails the build through
+`unfulfilled_lint_expectations` instead of rotting quietly. The corollary is load-bearing and was
+not in the blueprint: **no T59 test may call `literal_text`**, or the expectation goes unfulfilled
+in the `cfg(test)` build and `--all-targets` fails.
+
+**F-20 — a fence delimiter line is billed as code, in both directions.** §4.4 says the fence line
+"flips prose↔code" and does not say which rate the line itself pays. It is code, so a fenced block
+plus its two delimiters is one code span. `fenced_spans_use_the_code_rate` pins it.
+
+**F-21 — the `<file` and `</file>` toggles match the raw line; the fence toggle matches the trimmed
+line.** §4.5's render puts `<file …>` at column 0, and B.3 says "trimmed start" for the fence and
+plainly "a line starting with `<file `" for the excerpt block. T66's renderer must keep `<file>`
+blocks unindented or the estimator will bill them as prose — which is hazard H-23 arriving through
+the renderer instead of the estimator.
+
+**F-22 — `for_model`'s `o[0-9]` boundary means `opus-4` is the Claude row.** `o3` and `o1-preview`
+resolve to `WIDE`; `opus-*` and `codex` to `DEFAULT`, which is the `R-AGT-5` clause — the key is a
+model id and never an agent's name. Pinned by `for_model_keys_on_the_id_only`.
+
+**F-23 — three B.11 signatures moved, each because the blueprint's type could not carry what its own
+named test asserts.** `BoxProfile` gained `more_tools: usize` and `MAX_TOOLS` (a `Vec<(String,
+String)>` cannot express the `, +N more` count, and T64's renderer would otherwise re-derive it from
+a row count the projection has already discarded); `SkillBinding::version_in_force` was added, or the
+pinned-versus-latest rule would be written three times across `MemStore`, `PgStore` and `CacheStore`;
+`PromptScope`'s two constructors are `const fn`.
+
+**F-24 — two agents in one crate are coupled by the crate, not by their file sets.** T59 and T61
+touched disjoint files and still broke each other: for part of the run `model/skill.rs` referenced a
+`SkillBindingId` that `model/ids.rs` did not yet declare, so `htui-core` did not compile and T59's
+gates could not run at all. T59 validated its two modules in a throwaway crate outside the repo until
+T61 committed, then re-ran every gate on the real tree. The file-set intersection test (skill step
+3.5) is necessary and **not sufficient** for same-crate work: the parallel unit is a crate that
+compiles, not a file nobody else opens. Both commits are green together — `fmt --check`, workspace
+`clippy -D warnings` and `cargo test -p htui-core --all-features` were re-run on the merged tree.
+
+---
+
 ## Patterns to Mirror
 
 | Category | Source | Pattern |
