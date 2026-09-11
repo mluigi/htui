@@ -169,6 +169,37 @@ is placed where its files already are. Editing `record.rs` and `replay.rs` while
 implementers were running whole-workspace gates would have turned their runs red for a reason that
 was not theirs, which is a worse failure than waiting one stage.
 
+## Probe findings — what T55 and T56 actually measured (read 2026-09-11, before T51)
+
+The nine live cases landed as fourteen transcripts (`9cc0ca0`, `2b7863b`) but their *answers* were
+committed unread, by design: "committed before the answers are read, so the cases are the durable
+part". They are read here, against `crates/htui-agent/tests/fixtures/claude_stream_json_*.jsonl`,
+and this table is what T50 and T51 are written from. Where a finding contradicts a decision above,
+**the fixture wins** and the amendment is recorded in the last column.
+
+| # | Question | What the wire said | Consequence |
+|---|---|---|---|
+| **F-1** | **D81** — what does stdin close alone do? | `_stdin_close`: the turn runs to completion, `result/success`, `terminal_reason: "completed"`, exit 0. 76 lines, nothing truncated. | Stdin close is **not** a cancel, which is also case 5's answer (`_eof`, same shape). D81's first step is an end-of-input, not a stop. |
+| **F-2** | **D81** — SIGINT after the stdin close? | `_sigint`: a terminal `result` **does** arrive — `subtype: "error_during_execution"`, `is_error: true`, **`terminal_reason: "aborted_streaming"`**, `total_cost_usd: 0`, `modelUsage: {}`, **exit 0**. Preceded by the in-flight `assistant` message carrying **`aborted: true`** and a synthetic `user` message `"[Request interrupted by user]"`. | **D81 holds, §4.4's wording does not.** SIGINT ends the turn *with an envelope*, so the driver gets a real `done` — but the envelope is an error-shaped one. The mapper keys `done{stop_reason:"cancelled"}` on **`terminal_reason == "aborted_streaming"`**, not on the supervisor's memory of having sent the signal, and not on `subtype`. The cancelled turn reports **no usage at all**, so no `usage` row is written for it. |
+| **F-3** | **D81** — SIGTERM? | `_sigterm`: 13 lines, **no terminal `result`**, exit **143**. | §4.4's hypothesis confirmed on this half. D81's escalation order is right: SIGINT is the step that buys a clean turn end, and the group/job kill after the grace window is the honest last resort. |
+| **F-4** | **E-2 / D86** — are `modelUsage[*]` tokens per-turn or cumulative? | `_turns`, two turns in one process: `modelUsage` goes in 2→4, out 4→8, cacheRead 3809→21232, `total_cost_usd` 0.1381545→0.1480460. `result.usage` is 2/4 **both** times. | **Cumulative, decisively.** B.4's delta-for-all-five is correct and E-2's fallback is not needed. A mapper that summed `modelUsage` per `result` would have double-counted turn 1 into turn 2 and failed criterion 7 silently — the exact failure E-2 was raised to catch. Note the inversion worth keeping in the doc comment: `modelUsage` is cumulative, `result.usage` is per-turn. |
+| **F-5** | **D86** — do `result.usage` and `modelUsage` visibly disagree under a subagent? | `_subagent`, one subagent spawned, `num_turns: 3`: `result.usage` 6 in / 348 out, `modelUsage` **8 in / 352 out**. One model key, not two — the subagent ran on the same model. | D86's direction is confirmed (`modelUsage ≥ result.usage`, always) but the margin is **2 and 4 tokens**, not the dramatic gap the plan's wording implies. Recorded as measured; the choice of `modelUsage` stands on being a superset, not on the size of the difference. |
+| **F-6** | **D82** — what does a `thinking` block look like? | `_thinking`: `assistant.message.content[].type == "thinking"` as §6.2 predicted, **and its `thinking` field is the empty string** — the block carries `{signature, thinking: "", type}`. The `stream_event` deltas agree: `thinking_delta.thinking` is `""` with only `estimated_tokens` moving, and a third delta type §6.2 never named, **`signature_delta`**, carries a base64 blob. `system/thinking_tokens` (`estimated_tokens`, `estimated_tokens_delta`) is the only quantitative signal. | **§6.2's row is right about the shape and wrong about the payload.** Thinking is *signalled* but not *disclosed* on this box: a `thought` event over this transport has **no prose**. The mapper still maps it (the kind is real and the chat tab should show that the agent is thinking), carries the token estimate, and **never appends `signature_delta` to the thought text** — it is a cryptographic block signature, not words. An empty thought stays empty rather than being invented or dropped. |
+| **F-7** | **D82** — is `message.id` a safe coalescing key? | `_thinking`: the `thinking` envelope and the `text` envelope share **one** `message.id` (`msg_011CevdLxgT3W8F3cwtmkydk`). | **T51's stated coalescing key is wrong as written.** Coalescing `assistant_text` on `message.id` alone would fold the thought and the reply into one event. The key is **`(message.id, content-block index)`**, which is also what the `stream_event` deltas carry (`event.index`). |
+| **F-8** | **D92 / E-0** — does `--bare` break subscription auth? | `_bare`: `result` with `subtype: "success"` but **`is_error: true`**, `terminal_reason: "api_error"`, `result: "Not logged in · Please run /login"`, exit 1. The control (`_plain`) is `is_error: false`, `terminal_reason: "completed"`, `result: "ok"`. | **D92 confirmed by measurement rather than by `--help`.** `--bare` stays out of the seed. And a trap for the mapper, worth more than the decision it settles: **`subtype: "success"` does not mean success.** The terminal envelope is read through `is_error` and `terminal_reason`; `subtype` is a label, not a verdict. |
+| **F-9** | **E-0 / H-2** — do hook events precede `system/init`? | `_plain`: three `system/hook_started` and three `system/hook_response` arrive **before the first stdin line is even written**, and `system/init` arrives after it. 35 of each across the fixture set. | **D84's banner buffer is required, and D92's stated cost is real.** The supervisor buffers every pre-`init` envelope so the banner is still the step's *first* `other` row, then releases them in arrival order behind it. |
+| **F-10** | **D83** — what does a `--max-budget-usd` breach look like? | `_budget` at `0.000001`: `subtype: "error_max_budget_usd"`, `terminal_reason: "budget_exhausted"`, `errors: ["Reached maximum budget ($0.000001)"]`, `total_cost_usd: 0.1384545`, exit 1. `_budget_zero` at `0`: **no stdout at all**, exit 1 — two lines in the whole transcript. | D83's mapping to `error` + `done` holds, with `terminal_reason: "budget_exhausted"` as its discriminator. **New constraint**: the driver must never pass `--max-budget-usd 0` — zero is rejected before a byte is read, which would turn "no cap" into "no turn". An absent *or zero* `SessionSpec.budget_micros` passes no flag. |
+| **F-11** | **D84** — is `--session-id` honoured, and does `--resume` work? | Case 2 asserted `system/init.session_id == the minted UUIDv7` live and passed. `_session_id` replies `violet`; `_resume`, a **separate process** on the same id, answers "what colour did you just say?" with `violet`. | **D84 confirmed end to end.** The id is `htui`'s to mint, `session_ref` returns the mint, and `--resume` recovers context across processes. (Byte-equality is not re-provable from the committed fixture — the redaction rule collapses every session id to `<session>` — so the live assertion is the evidence, which is why it is an assertion and not a `println!`.) |
+| **F-12** | **D85** — what does a policy denial look like? | **Nothing did.** `_denied`'s `result.permission_denials` is `[]` and the tool ran (`"(Bash completed with no output)"`). No `system/permission_denied` envelope appears in any of the fourteen transcripts, and no `permission_denials` array is non-empty anywhere. | **D85 is the one decision this milestone implements unproven.** Case 9 did not reproduce a denial — `acceptEdits` let the `Bash` call through. T51 implements D85 as specified, from `result.permission_denials[]`, driven by a **hand-written** `cli_map.rs` line labelled synthetic in situ, and the gap is carried to close-out as an open item rather than counted as answered. Implementing it is still right: the array is a documented field and an empty one costs nothing; what is not allowed is to *claim* it verified. |
+| **F-13** | **D86** — does the quota latch actually fire? | `rate_limit_event.rate_limit_info` carries exactly the shape `AcpMetaRateLimit` already parses: `status: "allowed_warning"`, `unifiedWindows { five_hour {utilization, resetsAt}, seven_day {…} }`, `utilization: 0.77`. But `quota::normalize` **discards the blob for `CliRateLimitEvent`** (`quota.rs:189` routes it to `None`), so the latch would read nothing. | **A one-line gap between D86 and the code, invisible from the plan.** `quota.rs:189` moves `CliRateLimitEvent` onto the `raw` arm and its doc line ("milestone 8 owns the two CLI ones", `quota.rs:171`) comes true. Without it D86's "drives the quota latch through the existing `normalize`" is a no-op that no test would have caught, because every existing quota test is ACP-sourced. Adds `crates/htui-core/src/model/quota.rs` to T51's file set. |
+| **F-14** | Consequence of F-13, for the maintainer | With the reader on, this box's live blob is `status: "allowed_warning"` at 0.77 utilization, and `available()` skips every status that is not exactly `"allowed"` (§7 rule 3, pinned by `available_skips_an_allowed_warning_status`). | So the `claude-cli` row will report `Skip(Status("allowed_warning"))` to MOD-4 **the moment MOD-4 has a selection loop** — not a defect, and deliberately MOD-4's to loosen (`quota.rs:403-408` says so in as many words), but it is now a live fact about a real row rather than a hypothetical, and the phase note says so. |
+| **F-15** | §6.2 completeness | Envelope kinds across all fourteen transcripts: `system/{init,status,hook_started,hook_response,thinking_tokens,task_started,task_updated,task_notification}`, `assistant`, `user`, `rate_limit_event`, `result/{success,error_during_execution,error_max_budget_usd}`, `stream_event/{message_start,message_delta,message_stop,content_block_start,content_block_delta,content_block_stop}`. | **Six `system` subtypes §6.2 never names** (`status`, `thinking_tokens`, and the three `task_*` the subagent case produced, beside the two hook kinds). Every one lands in `other` verbatim — the wildcard arm is not a formality here, it is load-bearing on the first run. No non-JSON line appeared on stdout in any transcript. |
+
+**What none of the fixtures contain**, stated so T51 does not read absence as evidence: a
+`permission_request` of any kind (correct — this transport has none), a non-empty
+`permission_denials` (F-12), an `edit_proposal`-shaped write, a plan block, and any line stdout
+could not parse as JSON.
+
 ## Files to Change
 
 Per-task file sets are listed under each task and are what the fact-check step intersects; this
@@ -184,6 +215,7 @@ table is the union.
 | `crates/htui-store/src/pg/demo.rs` | UPDATE | the demo reset deletes seeded rows by name (`demo.rs:9`, `:141`) — a third name |
 | `crates/htui-agent/src/cli/mod.rs` | CREATE | supervisor, session task, stdin follow-ups, cancel, banner |
 | `crates/htui-agent/src/cli/claude.rs` | CREATE | §6.2 mapper |
+| `crates/htui-core/src/model/quota.rs` | UPDATE | F-13: `CliRateLimitEvent` reads its blob instead of discarding it |
 | `crates/htui-agent/src/lib.rs` | UPDATE | `pub mod cli;` |
 | `crates/htui-agent/src/registry.rs` | UPDATE | register `cli/claude_stream_json`; D87 rename |
 | `crates/htui-agent/src/error.rs` | UPDATE | only if a new named cause is needed (e.g. a malformed envelope) |
@@ -245,11 +277,15 @@ everything after T54 is serial on them.
 - **Action**: `ClaudeStreamAdapter: TransportBuilder`; a session task owning the child through a
   `ChildGuard`; the §4.4 invocation assembled from `agent.launch` + `settings.cli`
   (`--permission-mode` from the row, `extra_args` appended, `--add-dir` per `SessionSpec.extra_dirs`,
-  `--session-id` from D84's mint, `--max-budget-usd` from `SessionSpec.budget_micros` per D83/D90);
+  `--session-id` from D84's mint, `--max-budget-usd` from `SessionSpec.budget_micros` per D83/D90 —
+  **never at zero, which the CLI rejects before reading stdin, F-10**);
   an NDJSON line reader over stdout
   into `DriverEvent`s via T51's mapper; stderr captured to the run log as the ACP path does;
-  `send_follow_up` writing one NDJSON user message per line to stdin; `cancel` per D81; the banner
-  per D84; a `done` per turn, and a follow-up refused before it.
+  `send_follow_up` writing one NDJSON user message per line to stdin; `cancel` per D81 as **F-1/F-2/
+  F-3** measured it (stdin close is an end-of-input, SIGINT is what buys the terminal envelope,
+  the group/job kill is the last resort); the banner
+  per D84, behind the **pre-`init` buffer F-9 proves is required**; a `done` per turn, and a
+  follow-up refused before it.
 - **Mirror**: `acp/mod.rs`'s session-task shape; `probe.rs`'s `ChildGuard`/`run_bounded` for child
   ownership on every exit path.
 - **Files**: `crates/htui-agent/src/cli/mod.rs`, `crates/htui-agent/src/lib.rs`,
@@ -262,16 +298,23 @@ everything after T54 is serial on them.
 ### T51: The `claude` stream mapper — `src/cli/claude.rs` (D82, D85, D86)
 
 - **Action**: every row of §6.2's table, decoded against a wildcard-armed shape: `assistant` text
-  and `stream_event` `text_delta` → `assistant_text` coalesced on `message.id`; `thinking` →
-  `thought`; `tool_use` → `tool_call` with `tool_kind` derived from the tool **name** (`Read`→`read`,
+  and `stream_event` `text_delta` → `assistant_text` coalesced on **`(message.id, block index)`**
+  (**F-7** — the thought and the reply share one `message.id`); `thinking` →
+  `thought`, prose-less and signature-free (**F-6**); `tool_use` → `tool_call` with `tool_kind`
+  derived from the tool **name** (`Read`→`read`,
   `Edit`/`Write`→`edit`, `Bash`→`execute`, else `other`); `tool_result` joined on `tool_use_id`;
-  `result` → `usage` (D86) + `error` + `done`; `permission_denials` → `permission_answer` (D85);
-  `system/init`, hook events, `rate_limit_event` and plugin events → `other`, with `rate_limit_event`
-  additionally driving the quota latch.
+  `result` → `usage` (D86, **delta of the cumulative `modelUsage` per F-4**) + `error` + `done`,
+  read through **`is_error`/`terminal_reason` and never `subtype`** (**F-8**), with
+  `aborted_streaming` → `done{stop_reason:"cancelled"}` (**F-2**); `permission_denials` →
+  `permission_answer` (D85, **synthetic coverage only — F-12**);
+  `system/*` (eight subtypes, **F-15**), hook events, `rate_limit_event` and plugin events →
+  `other`, with `rate_limit_event` additionally driving the quota latch — which needs **F-13**'s
+  one-line fix in `quota.rs` to be anything but a no-op.
 - **Mirror**: `acp/map.rs` — mapping only, no process type imported, unit-testable from one line.
 - **Files**: `crates/htui-agent/src/cli/claude.rs`, `crates/htui-agent/tests/cli_map.rs`,
-  `crates/htui-agent/tests/fixtures/claude_stream_json*.jsonl`.
-- **Validate**: `cargo insta test -p htui-agent --test cli_map` (fixtures land in T56).
+  `crates/htui-agent/tests/fixtures/claude_stream_json*.jsonl`,
+  `crates/htui-core/src/model/quota.rs` (F-13).
+- **Validate**: `cargo insta test -p htui-agent --test cli_map`; `cargo test -p htui-core quota`.
 - **Note**: T50 and T51 share `src/cli/` and the `lib.rs` line. **They are not independent of each
   other** and run serial or as one agent's pair; they *are* independent of T49.
 
