@@ -107,6 +107,8 @@ id_newtype!(
     StepId,
     /// `skill.id` (§5.6).
     SkillId,
+    /// `skill_binding.id` (§5.6).
+    SkillBindingId,
     /// `command_run.id` (§5.8).
     CommandRunId,
 );

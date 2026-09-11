@@ -90,11 +90,12 @@ pub mod note;
 pub mod quota;
 pub mod run;
 pub mod scope;
+pub mod skill;
 pub mod usage;
 pub mod user;
 
 pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
-pub use box_::{BoxInfo, BoxRow, BoxTool, OsFamily};
+pub use box_::{BoxInfo, BoxProfile, BoxRow, BoxTool, OsFamily};
 pub use document::{Document, DocumentHead};
 pub use event::{EventKind, EventRole, SessionEvent};
 pub use hierarchy::{
@@ -103,13 +104,14 @@ pub use hierarchy::{
 };
 pub use ids::{
     AgentId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PhaseId, ProjectId,
-    PromptTemplateId, RepoId, RunId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
+    PromptTemplateId, RepoId, RunId, SkillBindingId, SkillId, StepGraphId, StepId, UserId,
+    WorkspaceId,
 };
 pub use item::{Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Status};
 pub use kind::{
     CommandQueue, Gate, Isolation, ItemKind, PhaseAgent, PromptTemplate, StepGraph, StepGraphPhase,
 };
-pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode};
+pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
 pub use note::Note;
 pub use quota::{
     Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
@@ -119,7 +121,8 @@ pub use run::{
     ChatRunSpec, GateOutcome, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
     RunStepSummary, RunSummary, StepStatus,
 };
-pub use scope::Scope;
+pub use scope::{PromptScope, Scope};
+pub use skill::{BoundSkill, Skill, SkillBinding, SkillVersion};
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
 
@@ -328,6 +331,7 @@ mod tests {
         check_id(RunId::from_uuid(u), u);
         check_id(StepId::from_uuid(u), u);
         check_id(SkillId::from_uuid(u), u);
+        check_id(SkillBindingId::from_uuid(u), u);
         check_id(CommandRunId::from_uuid(u), u);
     }
 
