@@ -405,12 +405,20 @@ impl Rig {
     }
 }
 
-/// Where `on this box` starts in a rendered row: the seven columns before it — MOD-2 D76's `name`
-/// 8, 9, 12, 6, D76's `default` 21, 7 and D73's `quota` 13 — plus one space of `column_spacing`
-/// after each. The eighth column therefore draws 15 inside the pane's border, and this file's
-/// progress cells are the ones that still do not fit it: `downloading 12.0 MB` is 19, and it
-/// exceeded the 17 the column drew before D76 as well.
-const ON_BOX_AT: usize = 83;
+/// Where `on this box` starts in a rendered row: the seven columns before it — MOD-2 D89's `name`
+/// 10, then 9, 12, 6, D76's `default` 21, 7 and D73's `quota` 13 — plus one space of
+/// `column_spacing` after each.
+///
+/// **D89 moved this by 2**, and the eighth column is now a fixed `Length(13)` rather than the one
+/// that absorbs the slack: `name` became `Constraint::Fill(1)` and takes every spare column, so
+/// inside the Settings pane's border — where the section draws 98 — `name` is 10 and everything
+/// after it starts two columns later than it used to.
+///
+/// This file's progress cells never fitted the eighth column and still do not:
+/// `downloading 12.0 MB` is 19 against 13, and it exceeded the 15 the column drew before D89 as
+/// well. No width was ever spent on them, which is why a clipped byte count is not a regression
+/// here — it is a figure that keeps ticking on the next frame.
+const ON_BOX_AT: usize = 85;
 
 /// The `on this box` cell of the installable row.
 ///
