@@ -13,12 +13,18 @@
 //! the transcript as [`DriverEvent::Other`], where it renders as a dim `<kind>` line instead of
 //! taking the rest of the conversation down with it. The UI calls the lossy form.
 //!
-//! Three kinds have no [`DriverEvent`] variant at all: `prompt`, `follow_up` and
-//! `permission_answer` are authored by `htui`, not by a driver
-//! (`event.rs:155`). They decode to `Other { update: "<kind>", body: <payload> }`, which is
-//! exactly the shape the live tab already receives for them (`chat/transcript.rs:275`) - so a
-//! replayed conversation renders like the one that was recorded, down to a resolved permission
-//! row.
+//! Two kinds have no [`DriverEvent`] variant at all: `prompt` and `follow_up` are authored by
+//! `htui`, not by a driver (`event.rs`). They decode to
+//! `Other { update: "<kind>", body: <payload> }`, which is exactly the shape the live tab already
+//! receives for them (`chat/transcript.rs`) - so a replayed conversation renders like the one that
+//! was recorded.
+//!
+//! `permission_answer` was a third until plan D94. It decodes to
+//! [`DriverEvent::PermissionAnswer`] like any other kind with a variant, because the alternative
+//! was one kind with **two shapes depending on direction** - typed when a transport reported it
+//! live (D93), `other` when the same row came back off disk - and a tab that read one kind two
+//! ways would have kept reading it two ways forever. The transcript resolves the parked request
+//! from either shape and always did; what moved is which arm a replayed row takes.
 //!
 //! Two adjustments make a decoded row set match what the live path saw, both stated in blueprint
 //! section E:
@@ -60,8 +66,7 @@ pub struct ReplayError {
 
 /// The strict decode: `Ok` for every row the recorder can have written, `Err` for one it cannot.
 ///
-/// The two `htui`-authored kinds, `permission_answer` and `other` are always `Ok`, as
-/// [`DriverEvent::Other`]. Tests
+/// The two `htui`-authored kinds and `other` are always `Ok`, as [`DriverEvent::Other`]. Tests
 /// and the round-trip regression net call this; the transcript calls [`envelope_or_other`],
 /// because a decode failure there would cost the reader the rest of the step.
 ///
@@ -105,11 +110,14 @@ pub fn envelopes(rows: &[SessionEvent]) -> Vec<DriverEnvelope> {
 /// The decode table of blueprint section E, one arm per [`EventKind`].
 fn event_from_row(row: &SessionEvent) -> Result<DriverEvent, ReplayError> {
     match row.kind {
-        // The rows `htui` itself authors reach the live tab as `other` carrying the payload, so
-        // this *is* the shape, not a fallback. `permission_answer` is on this list even though a
-        // transport can now report one (plan D93): what a **row** is replayed as is the tab's
-        // contract, and the tab reads an answer's payload the same way whoever wrote it.
-        EventKind::Prompt | EventKind::FollowUp | EventKind::PermissionAnswer => Ok(verbatim(row)),
+        // The two rows `htui` itself authors reach the live tab as `other` carrying the payload,
+        // so this *is* the shape, not a fallback.
+        EventKind::Prompt | EventKind::FollowUp => Ok(verbatim(row)),
+        // Not on the list above since plan D94, whatever wrote the row. The payload is the serde
+        // form of the event either way — `record_permission_answer` writes the same five keys the
+        // struct does — so decoding it is the table's ordinary arm and the tab gets one kind with
+        // one shape.
+        EventKind::PermissionAnswer => Ok(DriverEvent::PermissionAnswer(decode(row, filled(row))?)),
         EventKind::AssistantText => Ok(DriverEvent::AssistantChunk(chunk(row)?)),
         EventKind::Thought => Ok(DriverEvent::ThoughtChunk(chunk(row)?)),
         EventKind::ToolCall => Ok(DriverEvent::ToolCall(decode(row, filled(row))?)),
@@ -129,7 +137,7 @@ fn event_from_row(row: &SessionEvent) -> Result<DriverEvent, ReplayError> {
     }
 }
 
-/// The row as `Other { update: <kind>, body: <payload> }`: what the three kinds the tab reads as
+/// The row as `Other { update: <kind>, body: <payload> }`: what the two kinds the tab reads as
 /// `other` decode to, and what the lossy form falls back to for anything else.
 fn verbatim(row: &SessionEvent) -> DriverEvent {
     DriverEvent::Other(OtherEvent {

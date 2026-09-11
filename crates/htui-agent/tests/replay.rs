@@ -243,11 +243,12 @@ async fn every_recorded_kind_decodes_to_the_event_that_produced_it() {
         assert_eq!(decoded.raw, row.raw, "`raw` is the row's, seq {}", row.seq);
 
         match row.kind {
-            // These three reach the live transcript as `other` carrying the payload, and replay
-            // must be that shape. Two of them have no `DriverEvent` variant at all; the third,
-            // `permission_answer`, has had one since plan D93 and is still replayed as `other`,
-            // because the shape a *row* comes back as is what the tab reads.
-            EventKind::Prompt | EventKind::FollowUp | EventKind::PermissionAnswer => {
+            // These two reach the live transcript as `other` carrying the payload, and replay must
+            // be that shape: no `DriverEvent` variant maps to either. `permission_answer` was a
+            // third until plan D94 and now decodes to the variant D93 gave it, so it falls to the
+            // arm below with every other kind — which is the point: one kind, one shape, whichever
+            // direction the row travelled.
+            EventKind::Prompt | EventKind::FollowUp => {
                 let other = other_of(&decoded);
                 assert_eq!(other.update, row.kind.as_str());
                 assert_eq!(other.body, row.payload);
@@ -326,9 +327,12 @@ async fn rows_re_recorded_from_their_envelopes_are_the_same_rows() {
     let scrubber = scrubber();
     let mut recorder = Recorder::new(&second, &scrubber, fresh, true, None);
     for envelope in envelopes(&recorded) {
+        // `permission_answer` is **not** on this list since plan D94: it decodes to the typed
+        // variant, so the round trip for that row goes through `record` like a driver's row, and
+        // that it lands byte-identical is the check that the two encoders write one key set.
         let authored = match &envelope.event {
             DriverEvent::Other(other) => match other.update.as_str() {
-                "prompt" | "follow_up" | "permission_answer" => Some(other.clone()),
+                "prompt" | "follow_up" => Some(other.clone()),
                 _ => None,
             },
             _ => None,
@@ -358,7 +362,7 @@ async fn rows_re_recorded_from_their_envelopes_are_the_same_rows() {
     }
 }
 
-/// Re-records one of the three `htui`-authored rows through the call that wrote it.
+/// Re-records one of the two `htui`-authored rows through the call that wrote it.
 async fn replay_authored<S: WriteStore>(
     recorder: &mut Recorder<'_, S>,
     other: &OtherEvent,
@@ -374,22 +378,7 @@ async fn replay_authored<S: WriteStore>(
             .record_follow_up(text, at)
             .await
             .expect("the follow-up must record"),
-        _ => {
-            let by: AnsweredBy = serde_json::from_value(other.body["by"].clone())
-                .expect("the answer names its author");
-            recorder
-                .record_permission_answer(
-                    &PermissionRequestId::new(
-                        other.body["request_id"].as_str().unwrap_or_default(),
-                    ),
-                    other.body["option_id"].as_str(),
-                    by,
-                    other.body["cancelled"].as_bool().unwrap_or_default(),
-                    at,
-                )
-                .await
-                .expect("the answer must record");
-        }
+        update => panic!("`{update}` is not a kind `htui` authors through a call of its own"),
     }
 }
 

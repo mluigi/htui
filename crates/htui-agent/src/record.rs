@@ -665,6 +665,20 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// `cancelled` is an added key, not a renamed one: a cancellation answers every outstanding
     /// request with no option at all (`docs/ANA-4.md` §4.3), and the row has to say so.
     ///
+    /// **`denied` is derived here rather than asked for** (plan D94). It is the fifth key of the
+    /// payload, and writing it is what makes the row this call produces and the row a transport's
+    /// own [`DriverEvent::PermissionAnswer`] produces one key set rather than two that fork
+    /// forever — [`replay`](crate::replay) decodes both through
+    /// [`PermissionAnswerEvent`](crate::event::PermissionAnswerEvent), and a key the encoder omits
+    /// is a key the decoder has to default. It is not a parameter because there is nothing for a
+    /// caller to decide: the answers that reach *this* call are the ones `htui` authored, and
+    /// `htui` has exactly two — the user picked an option, or the session was cancelled. An answer
+    /// that picked something is not a refusal whoever picked it (a policy rule answering with a
+    /// reject option still *answered*, §6.2's distinction), and a cancellation says so in its own
+    /// key. What is left — no option and no cancellation — is the refusal, and that is the
+    /// expression. A sixth parameter beside `cancelled` would be a second adjacent `bool` at nine
+    /// call sites, every one of them passing the same constant.
+    ///
     /// `at` is the row's `session_event.at`, for the reason [`Recorder::record_prompt`] gives.
     ///
     /// # Errors
@@ -683,6 +697,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             "option_id": option_id,
             "by": by.as_str(),
             "cancelled": cancelled,
+            "denied": option_id.is_none() && !cancelled,
         });
         match self.scrubber.scrub(&mut payload) {
             Ok(()) => {}

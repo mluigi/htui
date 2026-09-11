@@ -403,6 +403,14 @@ pub struct PermissionAnswerEvent {
     pub cancelled: bool,
     /// `true` when the answer refused the call. An **added** key, not a renamed one: it is what
     /// tells a policy denial apart from an answer somebody actually gave (§6.2, plan D85).
+    ///
+    /// `#[serde(default)]`, and the default is the honest reading of a row written before this
+    /// milestone (plan D94): those rows carry no `denied` key at all, because `htui` only ever
+    /// wrote an answer a human gave or a cancellation, and neither is a refusal. Without it
+    /// [`replay`](crate::replay) could not decode a single `permission_answer` row `htui` itself
+    /// authored — the field is required, the recorder never wrote it — which is the blocker that
+    /// kept the kind on replay's `verbatim` arm.
+    #[serde(default)]
     pub denied: bool,
 }
 
