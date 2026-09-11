@@ -842,6 +842,15 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `shm_size: 1gb` on the service in `compose.yaml`. Host memory was **not** the cause and should not
   be blamed: 47 GB were available when this was checked, though an implementer saw swap saturated
   mid-build, so heavy cargo builds are a contributing load rather than the mechanism.
+  **Amended 2026-09-12 (MOD-2 milestone 9, T63): `shm_size: 1gb` shipped and the crashes continued,
+  so the shm diagnosis above is wrong — or at most was one of two causes. The measured cause is
+  the disk.** `/` was at **100%, 2.7 GB free of 455 GB**, with `target/debug` alone at **161 GB**;
+  deleting `target/debug/incremental` freed 57 GB and the crashes largely stopped. Both competing
+  explanations were checked and refuted at the time: `/dev/shm` was 8 GB with **28 KB** in use, and
+  the crash reproduced with **zero** leaked `htui_test_*` databases. One further crash occurred
+  afterwards at 86% disk during `htui::chat_usage_pg` and the re-run was clean, so a load-related
+  flake may remain underneath. **Diagnose with `df -h /` before anything else**; `target/` reaches
+  100 GB within days of normal work on this repo, so this recurs rather than being a one-off.
   **Until it is fixed, the workspace Postgres line must not be run by two agents at once** — telling
   each one not to does not work, since they cannot see each other; serialise the tasks instead.
   Found while landing T42 and T43 in parallel.

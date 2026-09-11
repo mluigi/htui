@@ -203,6 +203,50 @@ a row count the projection has already discarded); `SkillBinding::version_in_for
 pinned-versus-latest rule would be written three times across `MemStore`, `PgStore` and `CacheStore`;
 `PromptScope`'s two constructors are `const fn`.
 
+**F-29 — `MemStore::documents_of_kinds` recursed forever, and the preview is exactly the caller that
+would have hit it.** An empty `kinds` resolves to "every kind the item has"; for an item with **no**
+documents that resolves to an empty kind list and the method re-enters itself. `htui:FEAT-3` is such
+an item, and D103's preview passes no kinds by design. It presented as a stack-overflow `SIGABRT`
+that aborted a whole test binary, which is why it was first misdiagnosed as async-future size. Fixed
+with an `all.is_empty()` guard and pinned for all three backends inside
+`conformance::documents_of_kinds_latest_per_kind_in_order`. Found in T63, from T62's code — the
+`READ_CASES` harness D96 argued for is what caught it.
+
+**F-30 — the blueprint's §7.3 SQL had three defects, all found by running it.** (a) C.1's
+`ORDER BY best.depth, qualified_key, i.id` does not compile: the `!` nullability override is part of
+the output name Postgres sees, so the alias is `"qualified_key!"` and the bare name does not exist —
+the expression is spelled out instead. (b) Neither dialect clamped `hops`, and the CTE's anchor term
+has no depth guard, so `hops == 0` would have returned the whole depth-1 ring where `MemStore`
+returns nothing. Both backends now clamp in Rust against one shared constant. (c) C.2 gave no SQLite
+form for `documents_of_kinds` at all — there is no `DISTINCT ON` and no array type, so the mirror
+uses `ROW_NUMBER() OVER (PARTITION BY kind ORDER BY version DESC)` plus `json_each(?)` over a bound
+JSON array.
+
+**F-31 — H-29 overstated sqlx's nullability inference, measured rather than assumed.** Removing each
+override alone and recompiling against the live database shows only **three** are load-bearing, and
+all three are *computed* columns rather than CTE columns: `"qualified_key!"` (a `||`), `"depth!"`
+(a `MIN()`), `"in_scope!"` (an `IS NOT NULL`). `item_id`, `title` and `status` type as `NOT NULL`
+unaided through the inner join, and even `"summary?"` is redundant since the `CASE` is already
+inferred nullable. The full set is kept for the `links` precedent, with the three that matter named
+in the method doc.
+
+**F-32 — the two walks agree on the diamond, and the honest version of that claim is narrower than
+criterion 7's wording.** `pg_store_read_conformance` and `the_mirror_passes_the_read_cases` run the
+same six `READ_CASES` against `PgStore` and `CacheStore`, and `mirror_reads_equal_the_reference_store`
+compares `CacheStore` to `MemStore` over 36 `(root, bound, hops)` combinations — so the agreement is
+**transitive through the shared spec**, not one assertion holding a `PgStore` and a `CacheStore` side
+by side. And `sort_canonical` was **not** what made them agree on this fixture: the dev server's
+`en_US.utf8` collation does diverge from byte order for realistic keys (`agy:` vs `agy-x:` vs
+`Zed:`), but the fixture's three depth-1 keys sort identically either way. The re-sort is load-bearing
+insurance that this corpus does not exercise — worth knowing before someone deletes it as unused.
+
+**F-33 — `cargo doc --workspace` is red at HEAD and was before this milestone.** Fifteen errors,
+confirmed by stashing: ambiguous function-vs-module links on `install`/`plan` and thirteen
+`private_intra_doc_links` across `htui-agent`. That is **CLEAN-1**, still open. The consequence for
+this milestone is narrow and worth stating: `cargo doc --workspace` cannot be a gate here, so each
+task gates on `cargo doc -p <its crates> --no-deps` instead, and `htui-core` and `htui-store` do
+document cleanly.
+
 **F-28 — a per-crate gate is not a gate, and two tasks proved it in a row.** T59 and T60 each
 reported green and each left a failure that only the **workspace** suite sees, because their
 validation lines were `-p htui-core` and `-p htui`:

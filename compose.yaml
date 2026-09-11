@@ -30,6 +30,15 @@ services:
     # assertion failure in a summary line and is not one, which is what makes it worth a line here.
     # Host memory is **not** the cause and raising it does not help: this box has 61 GiB with 47
     # available while the crashes were happening.
+    #
+    # AMENDED 2026-09-12 (MOD-2 milestone 9, T63): the paragraph above is wrong, or at most half
+    # right. `shm_size: 1gb` is set and the crashes continued. The measured cause is the **disk**:
+    # `/` hit 100% (2.7 GB free of 455 GB) with `target/debug` at 161 GB, and deleting
+    # `target/debug/incremental` freed 57 GB and largely stopped them. Checked at the time:
+    # /dev/shm was 8 GB with 28 KB used, and the crash reproduced with zero leaked `htui_test_*`
+    # databases. Run `df -h /` before diagnosing anything else — `target/` reaches 100 GB within
+    # days of normal work here. The setting below stays: it is cheap and it is correct for the
+    # symptom it was written for.
     shm_size: 1gb
     volumes:
       - htui-pgdata:/var/lib/postgresql/data
