@@ -486,6 +486,63 @@ pub fn resolve(launch: &AgentLaunch, tools: &ToolMap) -> Result<ResolvedLaunch> 
     })
 }
 
+/// What a spawn in `cwd` would launch, before launching it: D58's rules, in one body.
+///
+/// The recorded launch when the probe left one **and** its `command` is still a file on disk;
+/// otherwise the row's tools are resolved now ([`crate::tools::resolve`] → [`resolve`]), which is
+/// the pre-milestone-6 path and carries no platform `args`. The disk check is not belt and braces:
+/// ANA-4 §4.6 records that `agy` self-updates in place, so a recorded path can name a
+/// version-numbered directory that is gone, and a chat must degrade *into* resolution rather than
+/// fail the request. A *file* and not merely an entry, because the same self-update can leave a
+/// directory where the binary used to be, and everything that is not spawnable belongs on the same
+/// side of this branch ([`crate::probe::is_file`]).
+///
+/// It runs on the caller's task, which is a session's own, for the same reason
+/// [`crate::tools::resolve`] does: this is filesystem I/O, and `AgentRuntime`'s worker loop must not
+/// do any (`R-NF-3`). The command is checked exactly as recorded, so a bare name — an `HTUI_TOOL_*`
+/// override the probe took on trust — is resolved against this process's own directory and almost
+/// always falls back. That costs nothing: the fallback's first tier is that same override, so both
+/// paths answer with the same string (blueprint H-3).
+///
+/// **Here rather than in a transport** (blueprint A row 3): the ACP driver and the CLI supervisor
+/// both owe D58's four rules, and two copies would be two places for the rules to rot — a second
+/// transport that applied only three of them would spawn something the probe never measured. The
+/// environment is the row's, exactly as it resolved; a caller with more to add — a session's
+/// `spec.env`, a login's browser policy — adds it to the value it is handed.
+///
+/// # Errors
+/// [`DriverError::Unresolved`] naming the first tool that resolves nowhere or the first placeholder
+/// with no entry; [`DriverError::Transport`] when the resolution machinery itself failed.
+pub(crate) async fn launch_from(
+    launch: &AgentLaunch,
+    recorded: Option<&ResolvedLaunch>,
+    cwd: &Path,
+) -> Result<ResolvedLaunch> {
+    match recorded {
+        Some(recorded) if crate::probe::is_file(Path::new(&recorded.command)).await => {
+            Ok(recorded.clone())
+        }
+        Some(recorded) => {
+            warn!(
+                command = %recorded.command,
+                "the probe's recorded command is gone or is not a file; resolving again"
+            );
+            resolve_now(launch, cwd).await
+        }
+        None => resolve_now(launch, cwd).await,
+    }
+}
+
+/// `tools::resolve` then [`resolve`]: the pre-milestone-6 path, and D58's fallback.
+///
+/// Its own function rather than two lines inside [`launch_from`] because it is reached from three
+/// conditions there — no recording, a stale recording, and a snapshot D58 refuses — and a reader
+/// should be able to see that all three land on the same code.
+async fn resolve_now(launch: &AgentLaunch, cwd: &Path) -> Result<ResolvedLaunch> {
+    let tools = crate::tools::resolve(launch.discovery.as_ref(), cwd).await?;
+    resolve(launch, &tools)
+}
+
 /// Replaces every `${name}` in one string.
 ///
 /// Hand written rather than a templating crate for the same reason ANA-5 gives for the prompt

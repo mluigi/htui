@@ -52,6 +52,11 @@ zip                   = { workspace = true }
 tar                   = { workspace = true }
 flate2                = { workspace = true }
 fs4                   = { workspace = true }
+# MOD-2 milestone 8 (T50, plan D84): the CLI supervisor mints its own session id and passes it as
+# `claude --session-id`, so a later step can `--resume` it. `Uuid::now_v7()`, the same call
+# `htui_core::model::ids` makes; the workspace pins `v7` + `serde` and this crate needs no other
+# feature.
+uuid                  = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

@@ -207,20 +207,6 @@ impl core::fmt::Debug for AcpDriver {
     }
 }
 
-/// `tools::resolve` then `launch::resolve`: the pre-milestone-6 path, and D58's fallback.
-///
-/// Its own function rather than two lines inside [`AcpDriver::launch_for`] because it is reached
-/// from three conditions there — no recording, a stale recording, and a snapshot D58 refuses — and
-/// a reader should be able to see that all three land on the same code.
-///
-/// # Errors
-/// [`DriverError::Unresolved`] naming the first tool that resolves nowhere or the first placeholder
-/// with no entry; [`DriverError::Transport`] when the resolution machinery itself failed.
-async fn resolve_now(launch: &AgentLaunch, cwd: &Path) -> Result<ResolvedLaunch> {
-    let tools = crate::tools::resolve(launch.discovery.as_ref(), cwd).await?;
-    crate::launch::resolve(launch, &tools)
-}
-
 impl AcpDriver {
     /// Builds a driver from a registry row.
     ///
@@ -282,23 +268,8 @@ impl AcpDriver {
         })
     }
 
-    /// What a spawn in `cwd` would launch, before launching it.
-    ///
-    /// The recorded launch when there is one **and** its `command` is still a file on disk;
-    /// otherwise the row's tools are resolved now (`tools::resolve` → `launch::resolve`), which is
-    /// the pre-milestone-6 path and carries no platform `args`. The disk check is not belt and
-    /// braces: ANA-4 §4.6 records that `agy` self-updates in place, so a recorded path can name a
-    /// version-numbered directory that is gone, and a chat must degrade *into* resolution rather
-    /// than fail the request. A *file* and not merely an entry, because the same self-update can
-    /// leave a directory where the binary used to be, and everything that is not spawnable belongs
-    /// on the same side of this branch ([`crate::probe::is_file`]).
-    ///
-    /// It runs here, on the session's own task, for the same reason `tools::resolve` does: this is
-    /// filesystem I/O, and `AgentRuntime`'s worker loop must not do any (`R-NF-3`). The command is
-    /// checked exactly as recorded, so a bare name — an `HTUI_TOOL_*` override the probe took on
-    /// trust — is resolved against this process's own directory and almost always falls back. That
-    /// costs nothing: the fallback's first tier is that same override, so both paths answer with
-    /// the same string (blueprint H-3).
+    /// What a spawn in `cwd` would launch, before launching it: D58's rules, applied by
+    /// [`crate::launch::launch_from`], which owns them for every transport that spawns.
     ///
     /// The environment is the row's, exactly as it resolved: a directory is all this takes,
     /// because the two callers that have more to add — a session's `spec.env`
@@ -321,19 +292,7 @@ impl AcpDriver {
                 ));
             }
         };
-        match recorded {
-            Some(recorded) if crate::probe::is_file(Path::new(&recorded.command)).await => {
-                Ok(recorded.clone())
-            }
-            Some(recorded) => {
-                tracing::info!(
-                    command = %recorded.command,
-                    "the probe's recorded command is gone or is not a file; resolving again"
-                );
-                resolve_now(launch, cwd).await
-            }
-            None => resolve_now(launch, cwd).await,
-        }
+        crate::launch::launch_from(launch, recorded.as_ref(), cwd).await
     }
 
     /// What this session would spawn, before spawning it: [`launch_in`](Self::launch_in) for the
