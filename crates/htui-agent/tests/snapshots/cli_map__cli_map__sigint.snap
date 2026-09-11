@@ -421,7 +421,7 @@ expression: events
                 "product_feedback_disabled": Bool(true),
                 "uuid": String("2c4f5b9c-5791-4193-a0b7-0045d29edf3f"),
                 "memory_paths": Object {
-                    "auto": String("~/.claude/projects/-tmp--tmpqbcgbd/memory/"),
+                    "auto": String("~/.claude/projects/-scratch/memory/"),
                 },
                 "messaging_socket_path": String("/run/user/1000/cc-socks/2087629.sock"),
             },

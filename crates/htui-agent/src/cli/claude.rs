@@ -77,6 +77,14 @@ pub struct Mapper {
     /// It cannot travel as a `usage` row of its own: that would be a usage report arriving
     /// mid-turn on the one transport whose `DriverCaps.usage_mid_turn` is `false` (D91).
     pending_quota: Option<Value>,
+    /// `tool_use_id`s already answered by a `permission_answer` row.
+    ///
+    /// The CLI reports a refusal **twice** — once as `system/permission_denied` when it happens,
+    /// and again in the terminal `result`'s `permission_denials[]` (measured, plan F-12b). Both are
+    /// the same refusal of the same call, so the second is suppressed: two rows would make the
+    /// transcript claim a tool was refused twice, and `idx_session_event_tool` joins on the id that
+    /// both carry.
+    answered: BTreeSet<String>,
 }
 
 /// The five cumulative figures a `result` carries.
@@ -99,6 +107,7 @@ impl Mapper {
             streamed: BTreeSet::new(),
             last: Totals::default(),
             pending_quota: None,
+            answered: BTreeSet::new(),
         }
     }
 
@@ -133,6 +142,18 @@ impl Mapper {
                 code: "api_retry".to_owned(),
                 message: text_at(line, "message").unwrap_or_default(),
             })],
+            // **The denial, where it happened.** D85 named two sources and this is the live one:
+            // the CLI announces the refusal mid-turn, in order, before whatever the agent does
+            // next. The terminal `result` repeats it in `permission_denials[]` (see
+            // [`Mapper::result`]), so the same refusal arrives twice and the second one is
+            // suppressed by [`Mapper::answered`] — one refusal is one row, and the one that is
+            // kept is the one in the position it actually occupied. A transcript that reported
+            // three denials at the end of a turn instead of at the three moments they happened
+            // would be a worse account of the same turn.
+            ("system", Some("permission_denied")) => self
+                .denial(line.get("tool_use_id").and_then(Value::as_str))
+                .into_iter()
+                .collect(),
             ("result", _) => self.result(line),
             // `system/init`, the two hook kinds, `status`, `thinking_tokens`, the three `task_*`,
             // `compact_boundary`, plugins, and every kind a future release ships ahead of this
@@ -251,7 +272,7 @@ impl Mapper {
     /// detected on the `usage` row finds the `done` **behind** it and can withhold it (milestone
     /// 7's D69, blueprint H-4); the reverse would let a turn close before its own cost was known.
     fn result(&mut self, line: &Value) -> Vec<DriverEvent> {
-        let mut events = denials_of(line);
+        let mut events = self.denials_of(line);
         let terminal = line.get("terminal_reason").and_then(Value::as_str);
         let cancelled = terminal == Some(ABORTED);
 
@@ -457,40 +478,52 @@ pub fn output_of(content: &Value) -> Option<Value> {
     }
 }
 
-/// `result.permission_denials[]` → one `permission_answer` each (D85).
-///
-/// **Unproven against a live run.** The probe written to provoke a denial did not produce one —
-/// the seed's `acceptEdits` mode let the call through, and `permission_denials` is empty in all
-/// fourteen recorded transcripts (plan F-12). The mapping is implemented from the documented field
-/// because an empty array costs nothing and the alternative is a transport that silently drops the
-/// only trace a denial leaves; its coverage is one hand-written line in `tests/cli_map.rs`, and the
-/// milestone's close-out carries it as open rather than counting it answered.
-///
-/// The answer is `by: Policy` — the transport's own `--permission-mode` refused, with no request
-/// `htui` could have answered (§4.3) — which is what makes the recorder stamp the row `role: htui`
-/// and keeps it distinguishable from an answer a human gave.
-#[must_use]
-pub fn denials_of(result: &Value) -> Vec<DriverEvent> {
-    let Some(entries) = result.get("permission_denials").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let id = entry.get("tool_use_id").and_then(Value::as_str)?;
-            Some(DriverEvent::PermissionAnswer(PermissionAnswerEvent {
-                // This transport announces no request, so the refused call's own id is what makes
-                // the pair joinable (`PermissionAnswerEvent::request_id`).
-                request_id: PermissionRequestId::new(id),
-                tool_call_id: Some(id.to_owned()),
-                option_id: None,
-                by: AnsweredBy::Policy,
-                // One call was refused, not every outstanding request settled at once.
-                cancelled: false,
-                denied: true,
-            }))
-        })
-        .collect()
+impl Mapper {
+    /// `result.permission_denials[]` → the refusals **not already reported** as they happened.
+    ///
+    /// The terminal `result` repeats every refusal of the turn, and the live
+    /// `system/permission_denied` envelope already produced a row for each at the moment it
+    /// occurred, so in practice this arm is usually empty. It is not redundant: it is the only
+    /// source for a refusal whose live envelope this build did not recognize, or that a future
+    /// release stops emitting, and an end-of-turn row is a great deal better than none.
+    fn denials_of(&mut self, result: &Value) -> Vec<DriverEvent> {
+        let Some(entries) = result.get("permission_denials").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter_map(|entry| self.denial(entry.get("tool_use_id").and_then(Value::as_str)))
+            .collect()
+    }
+
+    /// One refusal as a `permission_answer`, or nothing when this call was already answered.
+    ///
+    /// `by: Policy` — the transport's own `--permission-mode` refused, with no request `htui` could
+    /// have answered (§4.3) — which is what makes the recorder stamp the row `role: htui` and keeps
+    /// it distinguishable from an answer a human gave.
+    ///
+    /// The reason the CLI gives (`decision_reason`: "no approval surface in this session;
+    /// permission request denied automatically") is deliberately **not** squeezed into the typed
+    /// row: `PermissionAnswerEvent` has no free-text field, inventing one for a single dialect's
+    /// prose would be the agent-name coupling `R-AGT-5` forbids in another costume, and the whole
+    /// line survives as the row's `raw` under `retain_raw` where a reader can find it.
+    fn denial(&mut self, tool_use_id: Option<&str>) -> Option<DriverEvent> {
+        let id = tool_use_id?;
+        if !self.answered.insert(id.to_owned()) {
+            return None;
+        }
+        Some(DriverEvent::PermissionAnswer(PermissionAnswerEvent {
+            // This transport announces no request, so the refused call's own id is what makes the
+            // pair joinable (`PermissionAnswerEvent::request_id`).
+            request_id: PermissionRequestId::new(id),
+            tool_call_id: Some(id.to_owned()),
+            option_id: None,
+            by: AnsweredBy::Policy,
+            // One call was refused, not every outstanding request settled at once.
+            cancelled: false,
+            denied: true,
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -664,11 +664,13 @@ fn write_fixture(name: &str, records: &[Value], cwd: &Path) {
         needles.push((id, "<session>"));
     }
     if cwd.len() > 1 {
+        needles.push((slug_of(&cwd), "-scratch"));
         needles.push((cwd, "/scratch"));
     }
     if let Some(home) = &home
         && home.len() > 1
     {
+        needles.push((slug_of(home), "-home"));
         needles.push((home.clone(), "~"));
     }
 
@@ -709,6 +711,36 @@ fn write_fixture(name: &str, records: &[Value], cwd: &Path) {
     let path = directory.join(format!("claude_stream_json_{name}.jsonl"));
     std::fs::write(&path, text).expect("the fixture is writable");
     println!("  fixture: {} ({} records)", path.display(), records.len());
+}
+
+/// A path as the CLI slugs it into a directory name: every character that is not alphanumeric,
+/// `_` or `-` becomes `-`.
+///
+/// A second way a needle escapes a literal substitution, found the same way the first one was — by
+/// a later case reading a committed fixture (case 10, 2026-09-11). The CLI derives a per-project
+/// directory from the working directory and reports it on `system/init`, so
+/// `/tmp/.tmpAbCdEf` arrives as `memory_paths.auto: "~/.claude/projects/-tmp--tmpAbCdEf/memory/"`.
+/// The path *is* in the transcript; it is simply not spelled the way the filesystem spells it, and
+/// a `text.replace(cwd, …)` cannot see it.
+///
+/// The value that leaked this way is a tempdir name, which is worth nothing. The rule it broke —
+/// "the run's working directory → `/scratch`" — is worth stating truthfully, and the same
+/// transformation applies to the home directory, which carries a username.
+///
+/// This is not a general defence. A needle can be base64'd, URL-encoded, or split *and* slugged,
+/// and no substitution catches every form of a value the vendor is free to reshape. It covers the
+/// one transformation that was observed, names the class in the assertion, and the fixture review
+/// before a commit is what covers the rest.
+fn slug_of(path: &str) -> String {
+    path.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Every streamed text and thinking delta of a transcript, concatenated: the string the reader of
@@ -1790,4 +1822,141 @@ async fn case_9_a_denied_tool() {
              milestone 7's H-3 already covers: the first turn without a blob publishes nothing."
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Case 10 — the denial case 9 asked for and did not get
+// ---------------------------------------------------------------------------------------------
+
+/// **D85, measured.** What a policy denial looks like on the wire, which is what
+/// `cli/claude.rs`'s `denials_of` is mapped from.
+///
+/// # Why there is a tenth case
+///
+/// Case 9 was written to provoke a denial and did not. Its transcript
+/// (`claude_stream_json_denied.jsonl`) shows the `Bash` call **succeeding** —
+/// `"(Bash completed with no output)"` — and `result.permission_denials` empty, so D85 shipped
+/// implemented and unproven (plan F-12) on one hand-written line in `tests/cli_map.rs`.
+///
+/// The reason it failed is worth more than the case: case 9 asked for **`ls`**, and this box's
+/// `~/.claude/settings.json` carries `Bash(ls *)` in its allow list. It picked the one command the
+/// box pre-approves. That is not a flaw in the box — it is the hazard in probing a *policy*, which
+/// is per-machine state by definition, and any case that depends on a particular box's settings
+/// proves something about that box rather than about the dialect.
+///
+/// So this case does not depend on them. **`--permission-prompts none`** is documented by
+/// `claude --help` as "nobody: anything that would prompt is denied automatically; the permission
+/// mode still decides everything else", which makes the denial a property of the invocation rather
+/// than of the allow list. `--permission-mode default` keeps the mode from pre-approving edits the
+/// way the seed's `acceptEdits` would, and the tool asked for is one no plausible allow list
+/// carries.
+///
+/// # What it is allowed to conclude
+///
+/// A **non-empty** `result.permission_denials[]` proves the shape `denials_of` reads. An empty one
+/// after this invocation is itself a finding — it would mean the flag does not do what its help
+/// text says, and that `permission_denials` is not the channel §6.2 assigns it — so the case fails
+/// loudly rather than printing a shrug the way case 9 did. A probe that cannot fail cannot prove.
+#[tokio::test]
+#[ignore = "spawns the real claude CLI and spends model tokens"]
+async fn case_10_a_denial_that_does_not_depend_on_this_box() {
+    let _serial = ONE_AT_A_TIME.lock().await;
+    println!("\n=== case 10 / a denial that does not depend on this box ===");
+    let cwd = scratch();
+    let mut run = Run::start(
+        cwd.path(),
+        &args_with(&[
+            "--permission-mode",
+            "default",
+            // The lever. Without it the CLI waits for a "host" to answer the prompt — which over
+            // this transport is nobody, because §4.3 fixes `permission_requests: false` — and the
+            // turn's outcome would be a timeout rather than a denial.
+            "--permission-prompts",
+            "none",
+        ]),
+    )
+    .await;
+    run.send(
+        "use the Write tool to create a file called note.txt containing the word hello, then \
+         reply with the single word done",
+    )
+    .await;
+    let result = run.read_result(TURN_WINDOW).await;
+    run.close_stdin();
+    let _ = run.drain(EOF_WINDOW).await;
+    let status = run.wait(EOF_WINDOW).await;
+
+    let lines = run.json_lines();
+    let calls: Vec<(String, String)> = lines
+        .iter()
+        .filter(|line| line["type"] == json!("assistant"))
+        .filter_map(|line| line["message"]["content"].as_array())
+        .flatten()
+        .filter(|block| block["type"] == json!("tool_use"))
+        .map(|block| {
+            (
+                block["name"].as_str().unwrap_or_default().to_owned(),
+                block["id"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    println!("  tool calls: {calls:?}");
+
+    let denials = result
+        .as_ref()
+        .map(|result| result["permission_denials"].clone())
+        .unwrap_or(Value::Null);
+    println!(
+        "  result.permission_denials = {}",
+        serde_json::to_string_pretty(&denials).unwrap_or_default()
+    );
+    println!(
+        "  the file the tool was refused: exists = {}",
+        cwd.path().join("note.txt").exists()
+    );
+
+    run.finish("policy_denied", status).await;
+
+    let entries = denials.as_array().cloned().unwrap_or_default();
+    assert!(
+        !entries.is_empty(),
+        "D85 is unproven and this case exists to prove it. `--permission-prompts none` says \
+         anything that would prompt is denied automatically, and a `Write` under \
+         `--permission-mode default` is such a thing. An empty array here means the denial is \
+         **not** reported through `result.permission_denials[]`, which is the channel \
+         `docs/ANA-4.md` §6.2 assigns it and the one `cli/claude.rs::denials_of` reads — a finding \
+         for the maintainer, not a flake. The tool calls this turn made were: {calls:?}"
+    );
+
+    // The keys `denials_of` reads, asserted by name so a rename is a failure here rather than a
+    // silently empty column in the transcript.
+    let first = &entries[0];
+    println!(
+        "  the first denial, verbatim: {}",
+        serde_json::to_string_pretty(first).unwrap_or_default()
+    );
+    assert!(
+        first["tool_use_id"].is_string(),
+        "`tool_use_id` is what joins the answer to the call it settled, and is the only key \
+         `denials_of` cannot do without: {first}"
+    );
+    assert!(
+        first["tool_name"].is_string(),
+        "`tool_name` names what was refused: {first}"
+    );
+
+    let ids: BTreeSet<&str> = calls.iter().map(|(_, id)| id.as_str()).collect();
+    let denied_id = first["tool_use_id"].as_str().unwrap_or_default();
+    assert!(
+        ids.contains(denied_id),
+        "the denied id is one of the turn's own tool calls, which is what makes the row joinable \
+         at all — {denied_id} is not in {ids:?}"
+    );
+
+    println!(
+        "\n  D85 MEASURED: the denial is reported on the terminal `result`, in \
+         `permission_denials[]`, keyed by the call's own `tool_use_id`. `cli/claude.rs`'s \
+         `denials_of` reads exactly these keys, and `tests/cli_map.rs` can stop calling its \
+         coverage synthetic."
+    );
 }

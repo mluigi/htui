@@ -543,43 +543,39 @@ fn a_tool_input_naming_a_path_carries_it_as_a_location() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// F-12: the denial, which the probes did not reproduce
+// F-12: the denial, measured
 // ---------------------------------------------------------------------------------------------
 
-/// D85, on **synthetic** input, and labelled as such at the point of use.
+/// **D85, against a real refusal.**
 ///
-/// This is the one mapping in the file with no recorded evidence behind it (F-12). Case 9 was
-/// written to provoke a policy denial and did not: the seed's `acceptEdits` mode let the `Bash`
-/// call through, `result.permission_denials` is `[]` in all fourteen transcripts, and no
-/// `system/permission_denied` envelope was ever seen. The line below is therefore **hand-written
-/// from the documented field**, not captured, and it is the whole of D85's coverage.
+/// This mapping shipped unproven and did not stay that way. Case 9 was written to provoke a denial
+/// and failed to: it asked for `Bash(ls)`, and this box's settings carry `Bash(ls *)` in their
+/// allow list, so the one command it chose was the one the box pre-approves — and
+/// `permission_denials` was empty in all fourteen of the first transcripts (plan F-12).
 ///
-/// Implementing it anyway is right — the array is a documented key, an empty one costs nothing,
-/// and the alternative is a transport that silently drops the only trace a denial leaves. What is
-/// not allowed is to count it verified: close-out carries it as open.
+/// Case 10 does not depend on the box. `--permission-prompts none` is documented as "anything that
+/// would prompt is denied automatically", which makes the refusal a property of the invocation
+/// rather than of somebody's allow list, and a `Write` under `--permission-mode default` is such a
+/// thing. It produced `claude_stream_json_policy_denied.jsonl`, and the file it was refused was
+/// never created.
 #[test]
 fn a_policy_denial_is_a_permission_answer_by_policy() {
-    let mut mapper = Mapper::new(UsageScope::ModelUsage);
-    let events = mapper.map(&json!({
-        "type": "result",
-        "subtype": "success",
-        "is_error": false,
-        "terminal_reason": "completed",
-        "total_cost_usd": 0.5,
-        "permission_denials": [ {
-            "tool_use_id": "toolu_denied",
-            "tool_name": "Bash",
-            "tool_input": { "command": "rm -rf /" }
-        } ],
-        "modelUsage": {}
-    }));
-    let answer = events
+    let events = mapped("claude_stream_json_policy_denied.jsonl");
+    let answers: Vec<&htui_agent::event::PermissionAnswerEvent> = events
         .iter()
-        .find_map(|event| match event {
+        .filter_map(|event| match event {
             DriverEvent::PermissionAnswer(answer) => Some(answer),
             _ => None,
         })
-        .expect("the denial is a row, not a shrug");
+        .collect();
+    assert_eq!(
+        answers.len(),
+        1,
+        "one refusal, one row — and the CLI reported it **twice** (F-12b), live as \
+         `system/permission_denied` and again in the terminal `result`. A mapper that took both \
+         would make the transcript claim the tool was refused twice: {answers:?}"
+    );
+    let answer = answers[0];
     assert_eq!(
         answer.by,
         htui_agent::record::AnsweredBy::Policy,
@@ -592,28 +588,63 @@ fn a_policy_denial_is_a_permission_answer_by_policy() {
         "one call was refused, not every outstanding request settled at once"
     );
     assert_eq!(answer.option_id, None, "a denial picks nothing");
-    assert_eq!(answer.tool_call_id.as_deref(), Some("toolu_denied"));
+
+    // The join key, against the call it actually settled — read out of the same transcript rather
+    // than written into the test, which is what makes this a measurement.
+    let call = events
+        .iter()
+        .find_map(|event| match event {
+            DriverEvent::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .expect("the turn reached for a tool");
+    assert_eq!(call.title, "Write");
+    assert_eq!(
+        answer.tool_call_id.as_deref(),
+        Some(call.tool_call_id.as_str()),
+        "the answer names the call it refused"
+    );
     assert_eq!(
         answer.request_id.as_str(),
-        "toolu_denied",
+        call.tool_call_id,
         "this transport announces no request, so the call's own id is what makes the pair joinable \
          (`PermissionAnswerEvent::request_id`)"
     );
 
     assert!(
-        events
-            .iter()
-            .position(|event| matches!(event, DriverEvent::PermissionAnswer(_)))
-            < events
-                .iter()
-                .position(|event| matches!(event, DriverEvent::Done(_))),
-        "the answer precedes the turn's `done`, so a transcript reads in the order things happened"
-    );
-    assert!(
         !events
             .iter()
             .any(|event| matches!(event, DriverEvent::PermissionRequest(_))),
         "§4.3: this transport has no permission channel and must never claim to have asked"
+    );
+}
+
+/// F-12b: the refusal is announced **where it happened**, not only at the end of the turn.
+///
+/// D85 named two sources and the live run produced both. The order is the point: a transcript that
+/// reported a denial after the agent's closing remark would be a worse account of the same turn
+/// than one that reports it before. The end-of-turn copy is suppressed, not preferred.
+#[test]
+fn the_denial_is_recorded_in_the_position_it_occurred() {
+    let events = mapped("claude_stream_json_policy_denied.jsonl");
+    let answer_at = events
+        .iter()
+        .position(|event| matches!(event, DriverEvent::PermissionAnswer(_)))
+        .expect("the refusal is a row");
+    let usage_at = events
+        .iter()
+        .position(|event| matches!(event, DriverEvent::Usage(_)))
+        .expect("the turn reported its cost");
+    assert!(
+        answer_at < usage_at,
+        "the answer precedes the terminal `result`'s own rows, which is only possible if it came \
+         from the live `system/permission_denied` envelope rather than from \
+         `result.permission_denials[]`"
+    );
+    assert!(
+        !other_updates(&events).contains(&"system/permission_denied"),
+        "and it is a typed row rather than an `other` one: D93's rule is that a recognizable shape \
+         whose destination is an existing `EventKind` gets the typed variant"
     );
 }
 

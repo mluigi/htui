@@ -421,7 +421,7 @@ expression: events
                 "product_feedback_disabled": Bool(true),
                 "uuid": String("e53ccd52-6a6b-49ec-8322-aaf8a42d9fd9"),
                 "memory_paths": Object {
-                    "auto": String("~/.claude/projects/-tmp--tmpioahdh/memory/"),
+                    "auto": String("~/.claude/projects/-scratch/memory/"),
                 },
                 "messaging_socket_path": String("/run/user/1000/cc-socks/2089404.sock"),
             },
@@ -857,7 +857,7 @@ expression: events
                 "product_feedback_disabled": Bool(true),
                 "uuid": String("fd0e9531-a252-42eb-b760-44d9a9fd6bc6"),
                 "memory_paths": Object {
-                    "auto": String("~/.claude/projects/-tmp--tmpioahdh/memory/"),
+                    "auto": String("~/.claude/projects/-scratch/memory/"),
                 },
                 "messaging_socket_path": String("/run/user/1000/cc-socks/2089404.sock"),
             },
