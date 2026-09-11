@@ -263,6 +263,33 @@ allowance at all. The section says so on its hint line rather than leaving it to
 An offline chat latches nothing (the mirror holds no `agent_box` row); its usage rows are buffered
 and the figure re-derives after upload.
 
+### Agents that speak no ACP
+
+Most of what `htui` does with an agent it does over ACP, and an agent that does not speak it is not
+therefore unusable. `claude` also has a headless JSON stream — `claude -p --output-format
+stream-json` — and the registry carries a second row, **`claude-cli`**, that drives it. It is the
+same chat tab, the same recorder, the same rows in the store and the same replay.
+
+It is a **degraded** path, and the degradation is declared rather than discovered. Three event kinds
+the stream cannot carry are missing, and the chat tab says so in its banner before you type
+anything:
+
+| Missing | Why, and what happens instead |
+|---|---|
+| `permission_request` | The stream has no permission channel. The row's `settings.cli.permission_mode` decides, the CLI applies it, and a refusal arrives as a `permission_answer` row marked `by: policy` — a denial you can see in the transcript, but not one you can answer. Answering in-app needs an out-of-band MCP prompt tool, which is MOD-11. |
+| `edit_proposal` | No diff crosses this wire. An edit shows up as the `Edit` or `Write` tool call that made it, after the fact. |
+| `plan` | Not produced by this transport. |
+
+Cost also behaves differently and the difference is visible: over ACP an agent reports spend as it
+goes, so a per-run cap can stop a turn part-way. Here the whole turn's cost arrives **once**, on the
+terminal result, by which time the turn is over. So `htui` passes `--max-budget-usd` as well, and
+the cap is enforced by the CLI itself, server-side, while the turn runs.
+
+**Prefer the ACP row** (`claude`) when both work: it gives you inline permissions, diffs, plans and a
+live spending brake. Reach for `claude-cli` when the ACP adapter cannot be installed or run on a
+box, or when you want the CLI's own behaviour. Both rows are the same agent and the same
+credential — `claude-cli` requires the ordinary `claude` login, and nothing else.
+
 ## Installing an agent's adapter
 
 `claude` reaches ACP through an npm adapter the probe can find on its own. `agy` does not: Google
