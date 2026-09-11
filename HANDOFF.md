@@ -604,7 +604,10 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   environment); and that the job object reaps the auth child **with its loopback listener** — MOD-2
   §11 criterion 11, now with a socket and a child that lives for minutes rather than seconds.
 
-- [ ] **MOD-17 - Local-only mode: a writable local store** (from ANA-10). `R-STO-1`, `R-STO-3..6`,
+- [ ] **MOD-17 - Local-only mode: a writable local store** (from ANA-10).
+  **Superseded by MOD-25 (maintainer decision, 2026-09-11): `htui` is online-only, so there is no
+  writable local store. This line is deleted at MOD-25's close-out; nothing below it should be
+  started.** `R-STO-1`, `R-STO-3..6`,
   `R-ENT-7`, `R-TUI-1`, `R-TUI-8`, `R-NF-3`, `R-ID-3`, `R-ID-7`, `R-HIS-1`, `R-USR-2`, `R-BOX-1`.
   A box that has never been given a DSN becomes a complete box rather than an empty read-only
   shell. Design concluded in `docs/ANA-10.md` (ANA-10, `docs/decisions/ana/ana-10.md`): a fourth
@@ -625,7 +628,9 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   for a server-less box depend on it; MOD-15 owns the Settings connection *section*, this item owns
   the credential *field* inside it (§9.4). The requirement amendments of §6.1 are proposed, not
   applied — `docs/REQUIREMENTS.md` is maintainer-only.
-- [ ] **MOD-18 - Adoption of local rows into a server** (from ANA-10). `R-STO-1`, `R-STO-7`,
+- [ ] **MOD-18 - Adoption of local rows into a server** (from ANA-10).
+  **Superseded by MOD-25 (2026-09-11): with no local rows there is nothing to adopt. Deleted at
+  MOD-25's close-out.** `R-STO-1`, `R-STO-7`,
   `R-ENT-7`, `R-USR-2`, `R-HIS-1`. `docs/ANA-10.md` §9.1's M7. **Funded, not deferred** (§10.5, on
   §1.3's framing): local-only is a temporary lite mode and Postgres is the full product, so this is
   the exit the mode promises rather than an optional extra. **MOD-17 must not ship first-run copy
@@ -640,7 +645,9 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   it lands, local rows stay local and a local project is not runnable while a DSN is configured
   (`docs/ANA-10.md` §11 risk 22) — MOD-17's M3 export path is the floor. The `GREATEST` importer
   statement now has two consumers, MOD-8 and this item (`item.rs:145-148` reserves it to MOD-8).
-- [ ] **MOD-19 - In-process transition out of local-only** (from ANA-10, deferred). `R-TUI-8`,
+- [ ] **MOD-19 - In-process transition out of local-only** (from ANA-10, deferred).
+  **Superseded by MOD-25 (2026-09-11): there is no local-only mode to transition out of. Deleted at
+  MOD-25's close-out.** `R-TUI-8`,
   `R-NF-3`. `docs/ANA-10.md` §9.1's M9 and §10.13: `connect::reconnect_for` as a public factory
   (the DSN stays inside `connect.rs`, which is `connect.rs:66-70`'s real property — the existing
   `Reconnect` closure already captures a DSN by move), `let mut reconnect` at
@@ -705,6 +712,31 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   the cheaper shape than more columns. Out of scope: the caps editor (MOD-12), box-profile capability
   edits (MOD-7), and anything keyed on an agent's name (`R-AGT-5`). Raised by the maintainer on
   2026-09-10 while MOD-2 milestone 7 was in flight.
+- [ ] **MOD-25 - `htui` is online-only** (maintainer decision, 2026-09-11). `R-STO-1`, `R-STO-3..7`,
+  `R-ID-3`, `R-ENT-7`, `R-HIS-1`, `R-AGT-4`, `R-PRM-4`, `R-SKL-1`, `R-TUI-1`, `R-TUI-8`, `R-NF-2`.
+  **A box that cannot reach its configured Postgres shows a warning that the database is
+  unreachable and browses its read-only cache. It does not carry a second, writable life.** This
+  withdraws the verdict of ANA-10 (`docs/decisions/ana/ana-10.md`) — "a box with no DSN becomes a
+  *complete* box over a separate `local.sqlite`" — which is **concluded and therefore superseded
+  rather than edited**. Scope, in order: (1) `docs/REQUIREMENTS.md`, the only maintainer-owned file
+  here — withdraw **`R-STO-7`** outright and restate the eleven ANA-10 amended in place on
+  2026-09-08 (`R-ID-3`, `R-ENT-7`, `R-STO-1`, `R-STO-4`, `R-STO-5`, `R-HIS-1`, `R-AGT-4`, `R-PRM-4`,
+  `R-SKL-1`, `R-TUI-1`, `R-TUI-8`), of which `R-STO-4`'s offline-mode text changes meaning most;
+  (2) **disable, do not delete**, the offline buffered-write path MOD-2 milestone 4 shipped
+  (`Writer::Buffered`, `append_pending`, `upload_pending`, `crates/htui/tests/chat_offline.rs`) —
+  a chat on an unreachable box refuses with the warning instead of buffering, and the machinery
+  stays in the tree for one release so a reversal costs nothing; (3) a `CLEAN-N` minted at
+  **this** item's close-out to remove it once the decision has sat. **The read-only cache of
+  `R-STO-3` survives**: it is also the speed cache behind `R-STO-6`'s sub-second warm start, and
+  degraded read-only browsing is what the warning is shown *over*. **Supersedes MOD-17, MOD-18 and
+  MOD-19**, whose checklist lines this item's close-out deletes — they are not "done" and must not
+  archive as if they were; `docs/decisions/mod/mod-25.md` records them as withdrawn with their
+  reason. **Unblocks by removal**: MOD-4's build step 1 (ANA-10 §9.1 required MOD-17's M3 before
+  it), and MOD-13's, MOD-15's and MOD-23's create/edit paths for a server-less box, which no longer
+  exist. **MOD-2's close-out must restate, not silently drop, its claim on ANA-4 §11 criterion 12**
+  (an offline chat buffers and `upload_pending` lands exactly those rows): it was proven on
+  2026-09-08 and is being withdrawn with the mode, which is a different sentence from "unproven".
+  Not blocked. `docs/ANA-10.md` stays in the tree as the analysis that was done and not taken.
 - [ ] **MOD-24 - Fault Tolerance of Agent Processes.** Implement agent memory checkpointing to Postgres. If the daemon or TUI crashes mid-run, `htui` should be able to read the last `SessionEvent` from Postgres, re-hydrate the agent's context window, and resume the exact step it was on so that multi-hour runs can survive process restarts.
 
 ### Deferred backlog
@@ -855,6 +887,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-3 context tools, ANA-7 secrets, ANA-11 requirements/decisions models)              |
-| MOD-N   | 20 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 21 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
 | TOOL-N  | 6 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-4 `tests/auth.rs` whole-binary flake, TOOL-5 dev Postgres crashes under concurrent suites, TOOL-6 `tests/launch.rs` failed once unreproduced) |
