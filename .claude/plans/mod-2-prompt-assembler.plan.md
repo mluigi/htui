@@ -203,6 +203,26 @@ a row count the projection has already discarded); `SkillBinding::version_in_for
 pinned-versus-latest rule would be written three times across `MemStore`, `PgStore` and `CacheStore`;
 `PromptScope`'s two constructors are `const fn`.
 
+**F-25 — the fixture id collision E-5 predicted is real, and was measured before it was fixed.** With
+ten `TEMPLATE_NAMES` under the old `project_index * 8` stride the demo fixture minted **26 distinct
+ids for 30 rows** and `every_id_is_distinct` failed on
+`01a06490-eea0-7000-8000-000000000f08`. The stride is now derived from `TEMPLATE_NAMES.len()` rather
+than written as a literal `10`, so adding an eleventh body cannot reintroduce it, and the doc comment
+at the mint says it is a primary key rather than a formatting choice.
+
+**F-26 — "a phase body in the `Judge` role fails on `{{item}}`" is false as a general claim, and the
+test says what is true instead.** `parse` trips on the **first** out-of-role token in source order,
+which for `prd`/`plan`/`research` is `{{item_kind}}`, for `implement`/`fix` is `{{attempt}}`, and is
+`{{item}}` only for `review`/`verdict`/`reproduce`. Criterion 1's second half is therefore proved two
+ways: an `EXPECTED` table pinning the exact token and byte offset per body, plus the general property
+that the named token is in the body's own role set and outside the offered one. Asserting the
+convenient fiction would have passed for three bodies out of eight.
+
+**F-27 — none of the ten §5.4 bodies needed a single character changed** to parse in its role. The
+only normalisation imposed is structural and asserted: LF-only, exactly one trailing newline. Worth
+recording because the bodies are a maintainer-owned artifact under ANA-5 Open-4, and a silent edit to
+one would not have been acceptable.
+
 **F-24 — two agents in one crate are coupled by the crate, not by their file sets.** T59 and T61
 touched disjoint files and still broke each other: for part of the run `model/skill.rs` referenced a
 `SkillBindingId` that `model/ids.rs` did not yet declare, so `htui-core` did not compile and T59's
