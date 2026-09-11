@@ -1988,13 +1988,24 @@ async fn session_banner_is_first_other_row<H: CaseHarness, S: WriteStore>(harnes
         "session_banner_is_first_other_row: the row carries the id `session/load` needs \
          (ANA-2 §4.8)"
     );
-    assert_eq!(
-        banner
-            .payload
-            .get("body")
-            .and_then(|body| body.get("protocol_version")),
-        Some(&json!(1)),
-        "session_banner_is_first_other_row: the banner reports the negotiated protocol version"
+    // **Present, and `null` or a positive integer** (blueprint E-5). Not `== 1`, which is what this
+    // asserted while ACP was the only protocol in the tree: a transport that negotiates no version
+    // — a CLI dialect has none to negotiate (plan D84) — would have failed a case about the
+    // *banner*, for a key that is honestly absent. `null` is that transport saying so, which is a
+    // different fact from a transport that forgot the key, and the presence check is what still
+    // separates them. Both existing bindings report `1` and are unchanged by this.
+    let version = banner
+        .payload
+        .get("body")
+        .and_then(|body| body.get("protocol_version"))
+        .expect(
+            "session_banner_is_first_other_row: the banner carries `protocol_version`, whether or \
+             not this transport negotiated one",
+        );
+    assert!(
+        version.is_null() || version.as_i64().is_some_and(|version| version > 0),
+        "session_banner_is_first_other_row: the banner reports the negotiated protocol version, or \
+         `null` where the transport negotiates none: {version:?}"
     );
 }
 
