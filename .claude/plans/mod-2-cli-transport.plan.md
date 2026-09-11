@@ -507,13 +507,23 @@ step 3.5) extends this table before the maintainer sees the plan.
       and is pinned by a test that spawns nothing, so it is defended on days nobody spends tokens
 - [x] `claude-cli` renders whole in the Settings `name` column, and `name` absorbs the slack at
       wider widths (D89, amended to `Fill(1)`: no width to tune at all)
-- [ ] `rust-reviewer` gate run over the full change set, findings applied or deferred with the
-      maintainer
+- [x] `rust-reviewer` gate run over the full change set, findings applied or deferred with the
+      maintainer — **one HIGH** (a cumulative counter read backwards on an `api_error` result:
+      negative delta, reset baseline, and the next turn re-reporting the session total; criterion 7
+      broken in both directions by one envelope), **three MEDIUM** (rows lost when the task was
+      already gone — fixed in *both* transports, the shape pre-existed in `acp/`; a denial with no
+      `tool_use_id` vanishing instead of landing in `other`; a policy denial rendering **nothing**
+      in the chat tab, which is the whole of what D85 exists to surface), and **four LOW**, all
+      applied. One LOW **deferred deliberately**: restoring ACP's stronger `protocol_version == 1`
+      pin would mean widening the conformance suite's private API for a single per-transport
+      assertion, which costs more than it buys — the portable claim stays in the shared case.
 - [x] Validator green (0 errors); PRD milestone 8 row `complete`; `HANDOFF.md` phase note carries
       the **four** ANA-4 amendments (D79, D88's companion D92, D93, D94)
 
 ## Status
 
-**Complete**, pending the review gate's findings. Landed 2026-09-10..11 across `a3cbfff`..`42294d8`.
+**Complete.** Landed 2026-09-10..11 across `a3cbfff`..`3c49dcd`, review gate run and its findings
+applied. Final gate: `cargo test --workspace --all-features --no-fail-fast` — **51 binaries green,
+0 failed** — with `fmt --check` and workspace `clippy -D warnings` clean.
 The plan's own "Probe findings" table (F-1..F-15, F-12b) is the durable record of what the live
 probes measured, and five of those findings changed code that was about to be written.

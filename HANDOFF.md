@@ -435,8 +435,8 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   the pane border), not a screen — D76's ranking was tighter than it needed to be because it treated
   a fixture constant as a constraint.
   **Verified on Linux with Postgres live**: `cargo fmt --check` clean, workspace
-  `clippy --all-targets --all-features -D warnings` clean, and every binary of `htui-agent` (23) and
-  `htui` (16) green under **`--no-fail-fast`** — which is load-bearing rather than pedantic: `cargo
+  `clippy --all-targets --all-features -D warnings` clean, and
+  `cargo test --workspace --all-features --no-fail-fast` **51 binaries green, 0 failed** — which is load-bearing rather than pedantic: `cargo
   test` stops at the first failing binary, and a run that reported the `auth.rs` flake and exited is
   how two width-broken suites (`install.rs`, `probe.rs`) were briefly called green.
   **Live coordinates for the next session.** `claude` on this box is **2.1.267**; the seed passes no
@@ -813,14 +813,28 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   **Until it is fixed, the workspace Postgres line must not be run by two agents at once** — telling
   each one not to does not work, since they cannot see each other; serialise the tasks instead.
   Found while landing T42 and T43 in parallel.
-  **`shm_size: 1gb` landed (`287e7b8`) and did not close it.** During MOD-2 milestone 8 on
-  2026-09-11 the container crashed **twice more** on the 1 GiB shm: once with
-  `server process (PID 62737) exited with exit code 2` → `reinitializing` under a *single* live
-  cargo run, and once leaving every Postgres binary on `57P03 … in recovery mode` with
-  `syncing data directory (fsync), elapsed time: 110.65 s`. So the first fix reduced the trigger
-  but the crash is not shm-exhaustion alone, and the "serialise the suites" rule still stands. The
-  next thing to look at is the per-suite throwaway `htui_test_*` databases themselves — 17+ live
-  databases is the load, and dropping them eagerly may matter more than the shm figure.
+  **`shm_size: 1gb` landed (`287e7b8`) and did not close it — but the mechanism is now measured,
+  and it is a feedback loop rather than a single cause.** On 2026-09-11 (MOD-2 milestone 8) two
+  concurrent workspace runs put the container into a **crash-recovery loop**: it accepted
+  connections, the suite created its throwaway databases, it crashed, and recovery then spent
+  **630 s** in `syncing data directory (fsync)` before the next run re-triggered it. Three restarts
+  did not break the cycle.
+  What broke it: **dropping the 17 leaked `htui_test_*` databases (123 MB)**. The very next
+  `cargo test --workspace --all-features --no-fail-fast` was **51 binaries green, 0 failed**.
+  The loop, stated so it is not rediscovered: `htui-store`'s harness *does* drop its database, both
+  explicitly and through a `Drop` net (`crates/htui-store/src/testkit.rs:167`, `:181-202`) — but
+  **neither path runs when a run is killed**, and neither can run when the server is already in
+  recovery, because the cleanup thread cannot connect. So every crash leaks databases, and every
+  leaked database lengthens the next recovery (the fsync walks `./base/<oid>` per database), which
+  makes the next crash likelier. `shm_size` lowered the trigger rate without touching the loop.
+  **Recovery procedure**, which is the practical fix until the real one lands: wait for
+  `pg_isready`, then
+  `psql -U postgres -tAc "select 'DROP DATABASE IF EXISTS \"' || datname || '\" WITH (FORCE);' from pg_database where datname like 'htui\_test%'"`
+  piped back into `psql -f -`. Note a shell `while read` loop around `docker compose exec` does
+  **not** work — the exec consumes the loop's stdin and drops exactly one database.
+  **The real fix to try next** is an eager sweep of stale `htui_test_*` at harness start-up (the
+  same shape `install`'s staging sweep already has), so a killed run's leak is cleaned by the
+  following run instead of accumulating until the container falls over.
 
 - [ ] **TOOL-6 - `crates/htui-agent/tests/launch.rs` failed once under whole-crate load and has not
   been reproduced.** `R-NF-3`. Seen on 2026-09-11 during MOD-2 milestone 8's T52: one
