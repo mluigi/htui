@@ -321,15 +321,17 @@ fn str_at<'a>(row: &'a SessionEvent, key: &str) -> Option<&'a str> {
     row.payload.get(key).and_then(Value::as_str)
 }
 
-/// The rows a *driver* authored, i.e. the log minus the three kinds `htui` writes itself.
+/// The rows a *driver* authored, i.e. the log minus the two kinds only `htui` can write.
+///
+/// `permission_answer` used to be on that list and is not since plan D93: a transport whose own
+/// policy refused a call **reports** the answer ([`DriverEvent::PermissionAnswer`], `docs/ANA-4.md`
+/// §4.1 as amended), so a filter that drops the kind would hide the one row
+/// `rejected_tool_gets_failed_result`'s no-capability arm exists to assert, and would let a
+/// transport pass criterion 4 by writing an answer row with no wire message behind it.
+/// `prompt` and `follow_up` stay: no [`DriverEvent`] maps to either, so no driver can author one.
 fn driver_rows(log: &[SessionEvent]) -> Vec<&SessionEvent> {
     log.iter()
-        .filter(|row| {
-            !matches!(
-                row.kind,
-                EventKind::Prompt | EventKind::FollowUp | EventKind::PermissionAnswer
-            )
-        })
+        .filter(|row| !matches!(row.kind, EventKind::Prompt | EventKind::FollowUp))
         .collect()
 }
 
