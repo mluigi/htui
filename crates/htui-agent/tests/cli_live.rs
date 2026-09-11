@@ -44,8 +44,8 @@
 //! transcripts are **T51's inputs** — `src/cli/claude.rs` is mapped against them — so a fixture
 //! that does not faithfully record what arrived is worse than no fixture.
 //!
-//! **The redaction rule** (blueprint A.18, file-set row 18), applied to the whole file text just
-//! before it is written and asserted afterwards, because these transcripts are committed:
+//! **The redaction rule** (blueprint A.18, file-set row 18), applied just before the transcript is
+//! written and asserted afterwards, because these transcripts are committed:
 //!
 //! - every session id, ours and the CLI's, → `<session>`;
 //! - the run's working directory → `/scratch`;
@@ -53,6 +53,13 @@
 //! - and, belt and braces, the literal **value** of every environment variable whose name looks
 //!   like a credential ([`SECRET_NAMES`]) → `<redacted>`, so a hook that echoed one into the stream
 //!   cannot ride into git on the strength of nobody having thought of it.
+//!
+//! Each needle is applied **twice**: once to the serialised file text, and once to the reassembled
+//! run of streaming deltas, which is a different string. [`write_fixture`] says why at length; the
+//! short version is that the model chunks its reply wherever the tokeniser did, so a quoted path or
+//! token arrives split across six JSON strings and a substitution over the file cannot see it. The
+//! first version of this file redacted only the file text and asserted only the file text, and a
+//! home directory rode into git through that gap on 2026-09-10.
 //!
 //! Message `uuid`s and `tool_use_id`s are **not** redacted: they are the wire's own join keys, they
 //! name nothing outside the transcript, and T51 maps `tool_use_id` back to its call.
@@ -621,42 +628,79 @@ fn secret_values() -> Vec<String> {
 }
 
 /// Writes one transcript, redacted per the module doc, and checks the redaction held.
+///
+/// **Two passes, and the second one is not optional.** A plain text substitution over the
+/// serialised file redacts every occurrence that is *contiguous in the file* — which is every
+/// occurrence in a `system/init` or a `result`, and not every occurrence in the stream. The model
+/// emits its reply as `text_delta`s split wherever the tokeniser split it, so a path or a token it
+/// happens to quote arrives as `"…/"`, `"home/m"`, `"lu"`, `"ig"`, `"i/.claude…"` — six separate
+/// JSON strings on six separate lines, none of which contains the needle. The substitution cannot
+/// see it, and neither could this function's own assertion, because it re-checked the same
+/// unreassembled text it had just rewritten: **a green redaction check proved nothing about the
+/// stream**.
+///
+/// That is how `~` survived in the assembled `assistant` envelope of the thinking fixture while the
+/// deltas that built it still spelled the home directory out (found 2026-09-11, by T51's
+/// `text_streams_once_not_twice` comparing the two forms against each other). The leak that
+/// actually happened is a username in a path. The hole is the same size for [`SECRET_NAMES`],
+/// which is the half of the rule that exists so "a hook that echoed one into the stream cannot
+/// ride into git on the strength of nobody having thought of it" — a token quoted by a tool's
+/// output splits exactly as readily as a path.
+///
+/// So the needles are applied to the **reassembled** delta run as well
+/// ([`redact_across_deltas`]), and the assertions below re-check that form too.
 fn write_fixture(name: &str, records: &[Value], cwd: &Path) {
-    let mut text = String::new();
-    for record in records {
-        text.push_str(&serde_json::to_string(record).expect("a transcript record serialises"));
-        text.push('\n');
-    }
+    let home = dirs::home_dir().map(|home| home.display().to_string());
+    let cwd = cwd.display().to_string();
 
+    // Every needle with its replacement, in the order they must be applied: the working directory
+    // before the home directory, because the former lives inside the latter on a default box and
+    // replacing the home first would leave a half-rewritten `~/…/scratch` path.
+    let mut needles: Vec<(String, &str)> = Vec::new();
     for secret in secret_values() {
-        text = text.replace(&secret, "<redacted>");
+        needles.push((secret, "<redacted>"));
     }
     for id in session_ids(records) {
-        text = text.replace(&id, "<session>");
+        needles.push((id, "<session>"));
     }
-    // The working directory before the home directory: the former lives inside the latter on a
-    // default box, and replacing the home first would leave a half-rewritten `~/…/scratch` path.
-    let cwd = cwd.display().to_string();
     if cwd.len() > 1 {
-        text = text.replace(&cwd, "/scratch");
+        needles.push((cwd, "/scratch"));
     }
-    let home = dirs::home_dir().map(|home| home.display().to_string());
     if let Some(home) = &home
         && home.len() > 1
     {
-        text = text.replace(home.as_str(), "~");
+        needles.push((home.clone(), "~"));
     }
 
-    if let Some(home) = &home {
-        assert!(
-            !text.contains(home.as_str()),
-            "{name}: the home directory survived redaction"
-        );
+    // Pass one, over the records: the split-aware rewrite, which is the only one that can reach a
+    // needle the stream cut in half.
+    let mut records = records.to_vec();
+    for (needle, replacement) in &needles {
+        redact_across_deltas(&mut records, needle, replacement);
     }
-    for secret in secret_values() {
+
+    // Pass two, over the serialised text: every contiguous occurrence, everywhere else in the
+    // envelope — keys, ids, `cwd`, the assembled messages, the `result`.
+    let mut text = String::new();
+    for record in &records {
+        text.push_str(&serde_json::to_string(record).expect("a transcript record serialises"));
+        text.push('\n');
+    }
+    for (needle, replacement) in &needles {
+        text = text.replace(needle, replacement);
+    }
+
+    // And the check, in both forms. The reassembled one is the one that would have caught this.
+    let streamed = streamed_text(&records);
+    for (needle, _) in &needles {
         assert!(
-            !text.contains(&secret),
-            "{name}: an environment secret survived redaction"
+            !text.contains(needle),
+            "{name}: a redacted value survived in the transcript text"
+        );
+        assert!(
+            !streamed.contains(needle),
+            "{name}: a redacted value survived *reassembled* across delta boundaries — the \
+             transcript's own text is clean and the stream it encodes is not"
         );
     }
 
@@ -665,6 +709,86 @@ fn write_fixture(name: &str, records: &[Value], cwd: &Path) {
     let path = directory.join(format!("claude_stream_json_{name}.jsonl"));
     std::fs::write(&path, text).expect("the fixture is writable");
     println!("  fixture: {} ({} records)", path.display(), records.len());
+}
+
+/// Every streamed text and thinking delta of a transcript, concatenated: the string the reader of
+/// the stream actually sees, as opposed to the string the file happens to hold.
+fn streamed_text(records: &[Value]) -> String {
+    let mut joined = String::new();
+    for_each_delta(&mut records.to_vec(), |text| joined.push_str(text));
+    joined
+}
+
+/// Calls `visit` on every `text_delta` / `thinking_delta` payload, in arrival order.
+fn for_each_delta(records: &mut [Value], mut visit: impl FnMut(&str)) {
+    for record in records {
+        if record["direction"] != json!("stdout") {
+            continue;
+        }
+        let delta = &record["line"]["event"]["delta"];
+        for key in ["text", "thinking"] {
+            if let Some(text) = delta[key].as_str() {
+                visit(text);
+            }
+        }
+    }
+}
+
+/// Redacts a needle the stream split across delta boundaries, preserving the boundaries.
+///
+/// The deltas are the evidence — how a reply was chunked is a fact about the transport, and a
+/// redaction that collapsed a run into one string would edit that fact while claiming to edit a
+/// secret. So the occupied character range is blanked *in place*, across however many deltas it
+/// spans, and the replacement is inserted at the start of the first of them. The delta count and
+/// every other byte survive.
+///
+/// Loops until the needle is gone: one secret may be quoted twice in one reply.
+fn redact_across_deltas(records: &mut [Value], needle: &str, replacement: &str) {
+    if needle.is_empty() {
+        return;
+    }
+    loop {
+        let mut chunks: Vec<String> = Vec::new();
+        for_each_delta(records, |text| chunks.push(text.to_owned()));
+        let joined = chunks.concat();
+        let Some(at) = joined.find(needle) else {
+            return;
+        };
+        let end = at + needle.len();
+
+        let mut cursor = 0usize;
+        let mut inserted = false;
+        for chunk in &mut chunks {
+            let start = cursor;
+            cursor += chunk.len();
+            if cursor <= at || start >= end {
+                continue;
+            }
+            let from = at.saturating_sub(start);
+            let to = (end - start).min(chunk.len());
+            let mut next = String::with_capacity(chunk.len());
+            next.push_str(&chunk[..from]);
+            if !inserted {
+                next.push_str(replacement);
+                inserted = true;
+            }
+            next.push_str(&chunk[to..]);
+            *chunk = next;
+        }
+
+        let mut rewritten = chunks.into_iter();
+        for record in &mut *records {
+            if record["direction"] != json!("stdout") {
+                continue;
+            }
+            for key in ["text", "thinking"] {
+                if record["line"]["event"]["delta"][key].is_string() {
+                    let next = rewritten.next().unwrap_or_default();
+                    record["line"]["event"]["delta"][key] = Value::String(next);
+                }
+            }
+        }
+    }
 }
 
 /// A throwaway working directory, so the CLI reads no repository of the maintainer's and the
