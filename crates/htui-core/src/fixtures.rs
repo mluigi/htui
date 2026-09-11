@@ -545,8 +545,12 @@ const KIND_SPECS: [KindSpec; 5] = [
     },
 ];
 
-/// Distinct phase names across the five default graphs: one `prompt_template` v1 each (§5.10).
-const TEMPLATE_NAMES: [&str; 8] = [
+/// Distinct phase names across the five default graphs, plus the two reserved names: one
+/// `prompt_template` v1 each (§5.10 as amended by ANA-5 §5.4; plan D104).
+///
+/// The order is [`crate::prompt::DEFAULT_TEMPLATES`]'s, because the bodies come from there and the
+/// ids are minted from the position.
+const TEMPLATE_NAMES: [&str; 10] = [
     "prd",
     "plan",
     "implement",
@@ -555,13 +559,22 @@ const TEMPLATE_NAMES: [&str; 8] = [
     "verdict",
     "reproduce",
     "fix",
+    "judge",
+    "handoff",
 ];
 
 /// Kinds, their default graphs, the graphs' phases and one template version per phase name.
 ///
 /// Ids follow blueprint §G: kind and graph `n` are `project_index * 5 + kind_index`, phases are
 /// numbered across the whole project (15 per project), templates are
-/// `project_index * 8 + template_index`.
+/// `project_index * TEMPLATE_NAMES.len() + template_index`.
+///
+/// The template stride is [`TEMPLATE_NAMES`]`.len()` and not a literal, because it is a primary
+/// key and not a formatting choice: [`demo_uuid`] is a pure function of `(class, n)`, so a stride
+/// below the number of templates per project hands project *i*'s first template the id project
+/// *i−1*'s late templates already hold, and `load_demo` fails on the second insert. The stride was
+/// `8` while there were eight names and had to move with them (blueprint E-5); the same holds for
+/// the other two strides if a kind or a phase is ever added.
 fn catalogue() -> (
     Vec<ItemKind>,
     Vec<StepGraph>,
@@ -631,12 +644,14 @@ fn catalogue() -> (
             templates.push(PromptTemplate {
                 id: PromptTemplateId::from_uuid(demo_uuid(
                     class::PROMPT_TEMPLATE,
-                    project_index * 8 + template_index as u8,
+                    project_index * TEMPLATE_NAMES.len() as u8 + template_index as u8,
                 )),
                 project_id: *project_id,
                 name: (*name).to_owned(),
                 version: 1,
-                body: format!("You are running the `{name}` phase.\n\n{{{{item}}}}\n"),
+                body: crate::prompt::body_of(name)
+                    .expect("every TEMPLATE_NAMES entry is a DEFAULT_TEMPLATES name")
+                    .to_owned(),
                 created_by: ids::USER,
                 created_at: epoch(),
                 updated_at: epoch(),
@@ -1244,7 +1259,7 @@ fn events() -> Vec<SessionEvent> {
                 "text": "Plan the TUI scaffold against the store seam.",
                 "digest": PROMPT_DIGEST,
                 "sections": [
-                    { "name": "prd", "tokens": 800, "trimmed": false },
+                    { "name": "documents:prd", "tokens": 800, "trimmed": false },
                     { "name": "skills", "tokens": 300, "trimmed": false },
                 ],
             }),
@@ -1467,8 +1482,90 @@ mod tests {
         assert_eq!(data.phases.len(), 45, "fifteen phases per project");
         assert_eq!(
             data.templates.len(),
-            24,
-            "one template version per phase name per project"
+            30,
+            "one template version per default template name per project"
         );
+    }
+
+    /// The demo corpus is the shipped bodies, not a stand-in: `fixtures.rs` seeds from
+    /// [`crate::prompt::DEFAULT_TEMPLATES`] (plan D104).
+    ///
+    /// Before this, every fixture body was `"You are running the `{name}` phase.\n\n{{item}}\n"` —
+    /// one placeholder, so no fixture ever exercised a section and no golden prompt could.
+    #[test]
+    fn ten_templates_per_project_from_the_default_bodies() {
+        let data = demo_data();
+        assert_eq!(
+            super::TEMPLATE_NAMES.to_vec(),
+            crate::prompt::DEFAULT_TEMPLATES
+                .iter()
+                .map(|(name, ..)| *name)
+                .collect::<Vec<_>>(),
+            "the fixture's names are §5.4's names, in §5.4's order"
+        );
+
+        for (project_id, ..) in super::PROJECT_SPECS {
+            let names: Vec<&str> = data
+                .templates
+                .iter()
+                .filter(|template| template.project_id == project_id)
+                .map(|template| template.name.as_str())
+                .collect();
+            assert_eq!(names, super::TEMPLATE_NAMES, "ten per project, in order");
+        }
+
+        for template in &data.templates {
+            let role = crate::prompt::TemplateRole::of_name(&template.name);
+            assert_eq!(
+                Some(template.body.as_str()),
+                crate::prompt::body_of(&template.name),
+                "`{}` is not the shipped body",
+                template.name
+            );
+            crate::prompt::parse(role, &template.body)
+                .unwrap_or_else(|error| panic!("`{}` does not parse: {error}", template.name));
+            assert_eq!(template.version, 1, "one version each (§5.10)");
+        }
+    }
+
+    /// `demo_uuid` is a pure function of `(class, n)`, so the per-project stride **is** the id
+    /// space: a stride below the number of templates per project makes project *i*'s first
+    /// template share a primary key with project *i−1*'s last ones, and `load_demo` fails on the
+    /// second insert. At eight names the two numbers agreed by accident; at ten they only agree
+    /// because the stride is `TEMPLATE_NAMES.len()` (blueprint E-5).
+    #[test]
+    fn template_ids_are_distinct_across_projects() {
+        let data = demo_data();
+        let ids: HashSet<uuid::Uuid> = data
+            .templates
+            .iter()
+            .map(|template| template.id.as_uuid())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            data.templates.len(),
+            "three projects × ten templates is thirty distinct `prompt_template` ids"
+        );
+        assert_eq!(ids.len(), 30);
+    }
+
+    /// ANA-5 §5.2's `sections[]` names a section by its vocabulary — `documents:<kind>` for a
+    /// document block — not by the bare kind. The demo `prompt` payload is the only place in the
+    /// tree that spells one out, and MOD-2's assembler now owns the spelling.
+    #[test]
+    fn the_demo_prompt_payload_uses_the_section_vocabulary() {
+        let data = demo_data();
+        let prompt = data
+            .events
+            .iter()
+            .find(|event| event.kind == crate::model::EventKind::Prompt)
+            .expect("the fixture replay opens with the prompt");
+        let names: Vec<&str> = prompt.payload["sections"]
+            .as_array()
+            .expect("`sections` is an array")
+            .iter()
+            .map(|section| section["name"].as_str().expect("a name per section"))
+            .collect();
+        assert_eq!(names, ["documents:prd", "skills"]);
     }
 }

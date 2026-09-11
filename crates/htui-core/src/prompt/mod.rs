@@ -17,8 +17,10 @@
 //! [`template`], the `{{name}}` scanner and its closed per-role placeholder sets, and [`estimate`],
 //! the `chars-v2` token estimator every budget decision is measured with.
 
+pub mod defaults;
 pub mod estimate;
 pub mod template;
 
+pub use defaults::{COMMAND_QUEUE_TEXT, DEFAULT_TEMPLATES, body_of};
 pub use estimate::TokenEstimator;
 pub use template::{ParsedTemplate, Placeholder, Span, TemplateError, TemplateRole, parse};
