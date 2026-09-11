@@ -53,6 +53,33 @@
 //! pinned on real Postgres by `chat_usage_pg.rs` and transport-neutrally by the store conformance
 //! case `usage_deltas_sum_to_step_usage`. Blueprint F-T57 names this the route and puts the
 //! Postgres variant of *this* file outside the milestone's scope.
+//!
+//! ## What the first authorised run observed, and deliberately does not assert
+//!
+//! Two envelope shapes reached the log that the plan's `§6.2` mapping table does not name. Both
+//! landed in `other`, verbatim, which is the wildcard row working as designed — they are recorded
+//! here as findings rather than pinned as behaviour, per plan D62: a shape the mapper cannot
+//! classify is the maintainer's to rule on, not a test's to freeze.
+//!
+//! 1. **`system/init` arrives again on the second turn** (row 16 of the run below), after the
+//!    banner has long been written. The banner is built from the *first* `init` and consumes it
+//!    (`cli/mod.rs:905-930`); every later one is an ordinary `other` row. So the pre-`init` buffer
+//!    F-9 required is a **once-per-session** thing, not a once-per-turn thing, and D84's "the
+//!    banner is the step's first `other` row" survives a multi-turn session because later `init`s
+//!    cannot precede a banner that already exists. Worth saying out loud because the obvious wrong
+//!    fix — re-emitting the banner on every `init` — would break `session_banner_is_first_other_row`
+//!    only on the live path.
+//! 2. **`system/status`** (`{ uuid, session_id, status: "requesting" }`) precedes the assistant's
+//!    text on each turn. Harmless, one row per turn, and not a shape §6.2 anticipated.
+//!
+//! What the run *confirmed* rather than discovered: D92 (no `--bare`, and `system/init` reports
+//! `apiKeySource: "none"` — this box's subscription login, which `--bare` would have refused);
+//! F-9 (four `system/hook_started` and four `system/hook_response` ahead of `init`, released in
+//! arrival order **behind** the banner); D93's correction (`rate_limit_event` stayed an `other`
+//! row *and* its blob rode the turn's one `usage` row, where `latch_quota` reads it); and F-4,
+//! visibly — turn 1 reported `cache_read_tokens: 0` and turn 2 `16860`, which is the delta of a
+//! cumulative `0 → 16860`, while the two `cost_micros` deltas 168710 + 16745 meet the final
+//! `cost_micros_total` of 185455 exactly.
 
 #![cfg(feature = "testkit")]
 
