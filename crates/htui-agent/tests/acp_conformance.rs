@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use htui_agent::acp::map::RATE_LIMIT_META_KEY;
 use htui_agent::acp::{AcpDriver, AcpIo, Stamp};
 use htui_agent::conformance::{self, CaseHarness, Script, ScriptEvent};
-use htui_agent::driver::AgentDriver;
+use htui_agent::driver::{AgentDriver, DriverCaps};
 use htui_agent::event::{DriverEvent, PermissionRequestEvent};
 use htui_agent::registry::caps_for;
 use htui_core::model::Agent;
@@ -76,6 +76,12 @@ impl CaseHarness for AcpHarness {
                 epoch: conformance::epoch(),
             },
         ))
+    }
+
+    /// The row's own profile, which is where the driver above gets it too: the suite asserts the
+    /// two agree on every case it opens.
+    fn caps(&self) -> DriverCaps {
+        caps_for(&self.row)
     }
 }
 
@@ -157,6 +163,15 @@ async fn scripted_agent(stream: tokio::io::DuplexStream, script: Script, session
                     }
                     // The turn has no `done` of its own: only a cancel ends it.
                     ScriptEvent::ExpectCancel => waiting_for_cancel = true,
+                    // Refused by name, the way a scripted `permission_request` would be if this
+                    // harness had to invent one. ACP *asks* — `caps.permission_requests` is true
+                    // for this row — so a refusal arriving already decided is a message the
+                    // protocol has no shape for, and the cases that script the marker take their
+                    // no-capability arm and never reach here (plan D80).
+                    ScriptEvent::PolicyDenied(call) => panic!(
+                        "script marker `policy_denied({call})`: this transport has a permission \
+                         channel and asks rather than being told"
+                    ),
                 }
                 continue;
             }

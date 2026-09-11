@@ -13,14 +13,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use htui_agent::conformance::{self, CaseHarness, Script, ScriptEvent};
-use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
+use htui_agent::driver::{AgentDriver, DriverCaps, PermissionPolicy, SessionSpec, ToolExposure};
 use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk, ToolKind};
 use htui_agent::event::{ToolCallEvent, ToolResultEvent, ToolResultStatus};
 use htui_agent::fake::FakeAdapter;
 use htui_agent::launch::{AgentLaunch, InstallSource, ToolMap, ToolProbe, resolve};
 use htui_agent::record::{Recorder, pump};
-use htui_agent::registry::DriverFactory;
+use htui_agent::registry::{DriverFactory, caps_for};
 use htui_core::model::{Agent, AgentId, ChatRunSpec, agent::seed_rows};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{MemStore, ReadStore, WriteStore};
@@ -380,6 +380,13 @@ impl CaseHarness for ZetaHarness {
         self.factory
             .driver_for(&self.row, None)
             .expect("the row names a registered adapter")
+    }
+
+    /// From the **row**, exactly as the driver above gets it: the acceptance run is about an
+    /// unknown agent travelling the production path, and reading the capability profile anywhere
+    /// but the registry would be the one place this harness stopped doing that (`R-AGT-5`).
+    fn caps(&self) -> DriverCaps {
+        caps_for(&self.row)
     }
 }
 

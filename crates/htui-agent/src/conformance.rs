@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::driver::{
-    AgentDriver, AgentSession, AgentSessionRef, PermissionAnswer, PermissionPolicy,
+    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, PermissionAnswer, PermissionPolicy,
     PermissionRequestId, SessionSpec, ToolExposure,
 };
 use crate::error::DriverError;
@@ -112,6 +112,22 @@ pub enum ScriptEvent {
     /// marker while pulling is a transport error, so a case that forgets to cancel fails instead
     /// of hanging.
     ExpectCancel,
+    /// The named tool call was refused by the **transport's own** policy, with no request `htui`
+    /// could have answered: the CLI's `--permission-mode` declining a tool (`docs/ANA-4.md` §4.3,
+    /// §6.2, plan D85).
+    ///
+    /// A transport that *has* a permission channel never sees this marker — the cases that use it
+    /// take the no-capability arm of their `caps.permission_requests` gate — so a harness for one
+    /// refuses it by name, the way it refuses a scripted `permission_request`.
+    ///
+    /// What a harness owes for it is one [`DriverEvent::PermissionAnswer`] naming the refused call
+    /// (`by: policy`, `denied: true`, no option, not cancelled) followed by the synthesized
+    /// `failed` result harness rule 3 owes any settled call — the refusal is the answer, so the
+    /// call is closed and the protocol's own later result for it is dropped. The event is emitted
+    /// **directly**: since plan D93 the answer is a typed event, so nothing has to recognize a
+    /// string to turn it into the row (`record::PERMISSION_DENIED` names the vendor's verbatim
+    /// `other` shape, which is a different thing and rides beside it).
+    PolicyDenied(String),
 }
 
 /// How a transport is built from a [`Script`]. The only thing a binding has to supply.
@@ -121,6 +137,24 @@ pub enum ScriptEvent {
 pub trait CaseHarness {
     /// A driver that will put `script` on this transport's wire.
     fn driver(&self, script: Script) -> Box<dyn AgentDriver>;
+
+    /// What this transport can do, **before** there is a script to put on its wire.
+    ///
+    /// [`AgentDriver::caps`] answers the same question and [`open_case`] returns it, which is what
+    /// a case gates its *assertions* on. This method exists because three of the six
+    /// capability-gated cases (plan D80, D91) gate the **script** as well, and a script is what
+    /// [`driver`](Self::driver) takes: `cancel_answers_parked_permissions` cannot script a park a
+    /// transport would refuse by name, and `run_cap_breach_cancels_within_one_event` cannot end a
+    /// turn with `ExpectCancel` on a transport whose cost report *is* the end of the turn. Reading
+    /// the caps off a throwaway driver would mean building a second transport per case — a second
+    /// child process, for a binding that spawns one — to ask a question the registry row already
+    /// answers.
+    ///
+    /// No default body on purpose: a binding states this from the same place its driver gets it
+    /// (the `agent` row, or the fake's own profile), and [`open_case`] asserts the two agree, so a
+    /// declaration that drifts from the driver fails the first case rather than silently choosing
+    /// the wrong arm for the rest of the suite.
+    fn caps(&self) -> DriverCaps;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -265,16 +299,23 @@ fn session_spec(step: StepId, retain_raw: bool) -> SessionSpec {
     }
 }
 
-/// Mints a chat `run` / `run_step` pair and starts a session on it.
+/// Mints a chat `run` / `run_step` pair and starts a session on it, and reports what the transport
+/// said it can do.
 ///
 /// Two calls in one case give two independent steps of one store, which is how a case replays a
 /// fixture twice without a second store.
+///
+/// The [`DriverCaps`] are read off the driver **before** `start`, which is the only place a case
+/// can see them: `run_case` never holds a driver (blueprint P-7). They are what the six
+/// capability-gated cases of plan D80 and D91 branch their assertions on — a case without the
+/// capability asserts the *other* side of the contract rather than skipping, so `CASES` stays at
+/// fifteen names and a transport that started emitting a row it says it cannot produce fails.
 async fn open_case<H: CaseHarness, S: WriteStore>(
     harness: &H,
     store: &S,
     script: Script,
     retain_raw: bool,
-) -> (ChatRunSpec, Box<dyn AgentSession>) {
+) -> (ChatRunSpec, Box<dyn AgentSession>, DriverCaps) {
     let chat = ChatRunSpec::mint(
         ids::PROJECT_HTUI,
         ids::BOX,
@@ -287,11 +328,19 @@ async fn open_case<H: CaseHarness, S: WriteStore>(
         .await
         .expect("the chat run and step must mint");
     let driver = harness.driver(script);
+    let caps = driver.caps();
+    assert_eq!(
+        caps,
+        harness.caps(),
+        "a transport's capabilities are a property of its row, not of the session it is about to \
+         open: the harness declared one profile and its driver reports another, so the cases that \
+         chose a script from the declaration scripted the wrong thing"
+    );
     let session = driver
         .start(session_spec(chat.step_id, retain_raw), PROMPT.to_owned())
         .await
         .expect("the transport must start a session");
-    (chat, session)
+    (chat, session, caps)
 }
 
 /// The persisted log of a step, in `seq` order.
@@ -439,6 +488,41 @@ async fn pump_to_permission<S: WriteStore>(
         if let Some(id) = found {
             return id;
         }
+    }
+}
+
+/// Pulls and records envelopes until one of `kind` has been recorded.
+///
+/// [`pump_to_permission`]'s sibling for the transports that have no permission request to pump to
+/// (plan D80): a case that has to act *mid-turn* — cancel, answer, assert — has to stop the pull
+/// somewhere, and the kind is the only coordinate every binding shares.
+///
+/// # Panics
+///
+/// When the stream ends, errors, or reaches its `done` without one.
+async fn pump_to_kind<S: WriteStore>(
+    session: &mut dyn AgentSession,
+    recorder: &mut Recorder<'_, S>,
+    kind: EventKind,
+) {
+    loop {
+        let envelope = session
+            .next_event()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the transport must not fail before its `{kind}`: {error}")
+            })
+            .unwrap_or_else(|| panic!("the transport must reach its `{kind}`"));
+        let found = EventKind::from(&envelope.event) == kind;
+        let ended = matches!(envelope.event, DriverEvent::Done(_));
+        recorder
+            .record(envelope)
+            .await
+            .expect("recording must land");
+        if found {
+            return;
+        }
+        assert!(!ended, "the turn ended before its `{kind}`");
     }
 }
 
@@ -633,7 +717,7 @@ fn coalescing_script() -> Script {
 async fn coalesce_across_message_id<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
     let scrubber = scrubber();
 
-    let (first, mut session) = open_case(harness, store, coalescing_script(), false).await;
+    let (first, mut session, _caps) = open_case(harness, store, coalescing_script(), false).await;
     let first_ref = session.session_ref().cloned();
     let mut recorder = Recorder::new(store, &scrubber, first.step_id, false, None);
     recorder
@@ -677,7 +761,7 @@ async fn coalesce_across_message_id<H: CaseHarness, S: WriteStore>(harness: &H, 
          idx_session_event_tool joins on"
     );
 
-    let (second, mut session) = open_case(harness, store, coalescing_script(), false).await;
+    let (second, mut session, _caps) = open_case(harness, store, coalescing_script(), false).await;
     let second_ref = session.session_ref().cloned();
     let mut recorder = Recorder::new(store, &scrubber, second.step_id, false, None);
     recorder
@@ -716,7 +800,7 @@ async fn seq_gapless_and_turns<H: CaseHarness, S: WriteStore>(harness: &H, store
         vec![chunk("third answer", "m3"), done(StopReason::EndTurn)],
     ]);
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
     let mut recorder = Recorder::new(store, &scrubber, chat.step_id, false, None);
 
     recorder
@@ -812,7 +896,7 @@ async fn raw_iff_retain<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
 
     let mut logs = Vec::new();
     for retain_raw in [false, true] {
-        let (chat, mut session) = open_case(harness, store, script(), retain_raw).await;
+        let (chat, mut session, _caps) = open_case(harness, store, script(), retain_raw).await;
         let session_ref = session.session_ref().cloned();
         let mut recorder = Recorder::new(store, &scrubber, chat.step_id, retain_raw, None);
         recorder
@@ -867,7 +951,19 @@ async fn raw_iff_retain<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
 /// A cancel answers every parked permission request, writes a `permission_answer` row per parked
 /// request, and leaves no `tool_call` without a synthesized `tool_result`
 /// (`docs/ANA-4.md` §11 criterion 5, §4.3).
+///
+/// **Two arms, one case** (plan D80). The gate is `caps.permission_requests`, and the script is
+/// gated with the assertions: a transport with no permission channel would refuse a scripted park
+/// by name, and a harness that fabricated one would be proving the harness. Without the capability
+/// the case asserts the *negative* — no permission row of either kind reaches the log — and then
+/// every clause of criterion 5 that does not mention a permission, which is most of it. Skipping
+/// instead would keep the name in `CASES` and drop the coverage; this way `CASES` stays at fifteen
+/// and a transport that claims no permission channel but writes a permission row still fails.
 async fn cancel_answers_parked_permissions<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+    if !harness.caps().permission_requests {
+        cancel_without_a_permission_channel(harness, store).await;
+        return;
+    }
     let script = Script::one_turn(vec![
         chunk("about to read ", "m1"),
         tool_call("call-1"),
@@ -876,7 +972,7 @@ async fn cancel_answers_parked_permissions<H: CaseHarness, S: WriteStore>(harnes
         ScriptEvent::ExpectCancel,
     ]);
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
     let mut recorder = Recorder::new(store, &scrubber, chat.step_id, false, None);
     recorder
         .record_prompt(PROMPT, prompt_sections(), epoch())
@@ -970,11 +1066,121 @@ async fn cancel_answers_parked_permissions<H: CaseHarness, S: WriteStore>(harnes
     );
 }
 
+/// `cancel_answers_parked_permissions` over a transport that reports
+/// `caps.permission_requests: false` (plan D80, `docs/ANA-4.md` §4.3).
+///
+/// Nothing is parked, so nothing is answered — and that is the assertion, not the excuse: the log
+/// must carry **no** `permission_request` row and **no** `permission_answer` row, which is what
+/// turns the capability from a banner string into something the suite enforces. What survives of
+/// criterion 5 is everything else it says: a cancel still closes every open tool call with a
+/// synthesized `failed` result naming `cancelled`, and the turn still ends with exactly one
+/// `done { stop_reason: "cancelled" }` as the log's last row.
+async fn cancel_without_a_permission_channel<H: CaseHarness, S: WriteStore>(
+    harness: &H,
+    store: &S,
+) {
+    let script = Script::one_turn(vec![
+        chunk("about to read ", "m1"),
+        tool_call("call-1"),
+        // The turn has no `done` of its own: the cancel is what ends it. No park — a transport
+        // that cannot park has nothing to park, and scripting one would ask the harness to invent
+        // a request the dialect has no shape for.
+        ScriptEvent::ExpectCancel,
+    ]);
+    let scrubber = scrubber();
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
+    let mut recorder = Recorder::new(store, &scrubber, chat.step_id, false, None);
+    recorder
+        .record_prompt(PROMPT, prompt_sections(), epoch())
+        .await
+        .expect("cancel_answers_parked_permissions: the prompt row must land");
+
+    // Stopping on the `tool_call` is what leaves a call open for the cancel to close, which is the
+    // clause of criterion 5 this arm still measures.
+    pump_to_kind(session.as_mut(), &mut recorder, EventKind::ToolCall).await;
+    session
+        .cancel(Duration::from_millis(0))
+        .await
+        .expect("cancel_answers_parked_permissions: cancel must succeed");
+    let stop = pump(session.as_mut(), &mut recorder)
+        .await
+        .expect("cancel_answers_parked_permissions: the cancelled turn still reaches done");
+    recorder
+        .finish()
+        .await
+        .expect("cancel_answers_parked_permissions: the recorder must close cleanly");
+
+    assert_eq!(
+        stop.stop_reason,
+        StopReason::Cancelled,
+        "cancel_answers_parked_permissions: a cancelled turn ends `cancelled`"
+    );
+    let log = rows(store, chat.step_id).await;
+    assert!(
+        !log.iter().any(|row| matches!(
+            row.kind,
+            EventKind::PermissionRequest | EventKind::PermissionAnswer
+        )),
+        "cancel_answers_parked_permissions: a transport that reports no permission channel puts \
+         no permission row in the log, cancel included: {:?}",
+        kinds(&log)
+    );
+
+    let results: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::ToolResult)
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter_map(|row| row.tool_call_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["call-1"],
+        "cancel_answers_parked_permissions: the open call gets exactly one synthesized result"
+    );
+    assert_eq!(
+        str_at(results[0], "status"),
+        Some(ToolResultStatus::Failed.as_str()),
+        "cancel_answers_parked_permissions: a cancelled call fails"
+    );
+    assert_eq!(
+        str_at(results[0], "terminal_reason"),
+        Some(TerminalReason::Cancelled.as_str()),
+        "cancel_answers_parked_permissions: the synthesized row says why"
+    );
+
+    assert_eq!(
+        log.iter().filter(|row| row.kind == EventKind::Done).count(),
+        1,
+        "cancel_answers_parked_permissions: exactly one `done` per turn (§4.1): {:?}",
+        kinds(&log)
+    );
+    assert_eq!(
+        log.last().map(|row| row.kind),
+        Some(EventKind::Done),
+        "cancel_answers_parked_permissions: `done` closes the log"
+    );
+    assert_eq!(
+        log.last().and_then(|row| str_at(row, "stop_reason")),
+        Some(StopReason::Cancelled.as_str()),
+        "cancel_answers_parked_permissions: and it says `cancelled`"
+    );
+}
+
 /// A rejected permission answer terminates its tool call: the transport synthesizes one `failed`
 /// `tool_result` with `terminal_reason = "rejected"`, and the protocol's own result for that call
 /// never lands (`docs/ANA-4.md` §4.3 "Tool-call terminal states", §8 test strategy 2's "a tool call
 /// whose result is a rejection").
+///
+/// **Two arms, one case** (plan D80), gated on `caps.permission_requests`. The rule under test is
+/// about a *refusal* settling a call, and both transports have refusals — one asks `htui` and is
+/// told no, the other is told no by its own `--permission-mode` and reports it. The second arm is
+/// the same sentence with the refusal arriving already decided.
 async fn rejected_tool_gets_failed_result<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+    if !harness.caps().permission_requests {
+        policy_denial_gets_failed_result(harness, store).await;
+        return;
+    }
     let script = Script::one_turn(vec![
         tool_call("call-9"),
         park("req-9", "call-9"),
@@ -982,7 +1188,7 @@ async fn rejected_tool_gets_failed_result<H: CaseHarness, S: WriteStore>(harness
         done(StopReason::EndTurn),
     ]);
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
     let mut recorder = Recorder::new(store, &scrubber, chat.step_id, false, None);
     recorder
         .record_prompt(PROMPT, prompt_sections(), epoch())
@@ -1054,6 +1260,110 @@ async fn rejected_tool_gets_failed_result<H: CaseHarness, S: WriteStore>(harness
     );
 }
 
+/// `rejected_tool_gets_failed_result` over a transport that reports
+/// `caps.permission_requests: false` (plan D80, D85, `docs/ANA-4.md` §4.3, §6.2).
+///
+/// The refusal arrives already decided: the transport's own policy declined the call and reports
+/// the answer ([`ScriptEvent::PolicyDenied`], plan D93's typed event). Two negatives and two
+/// positives:
+///
+/// - **no** `permission_request` row — nothing was ever asked, and a transport that wrote one
+///   would be claiming a channel it says it does not have;
+/// - the protocol's own late result for the settled call is still dropped (§4.3's rule survives
+///   the change of who refused), which is what the `should never be recorded` string checks;
+/// - exactly one `tool_result` for the call, `failed` — a refusal closes a call whoever made it;
+/// - the denial is **in the log**, as `by: policy`, `role: htui`, no option, `denied: true`, and
+///   joinable to the call from either side. That row is the whole reason the degradation is
+///   visible in a transcript at all (D85), and `driver_rows` no longer filters the kind out.
+async fn policy_denial_gets_failed_result<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+    let script = Script::one_turn(vec![
+        tool_call("call-9"),
+        ScriptEvent::PolicyDenied("call-9".to_owned()),
+        tool_result("call-9", json!({ "text": "should never be recorded" })),
+        done(StopReason::EndTurn),
+    ]);
+    let scrubber = scrubber();
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
+    let mut recorder = Recorder::new(store, &scrubber, chat.step_id, false, None);
+    recorder
+        .record_prompt(PROMPT, prompt_sections(), epoch())
+        .await
+        .expect("rejected_tool_gets_failed_result: the prompt row must land");
+    pump(session.as_mut(), &mut recorder)
+        .await
+        .expect("rejected_tool_gets_failed_result: the turn must reach done");
+    recorder
+        .finish()
+        .await
+        .expect("rejected_tool_gets_failed_result: the recorder must close cleanly");
+
+    let log = rows(store, chat.step_id).await;
+    assert!(
+        !log.iter()
+            .any(|row| row.kind == EventKind::PermissionRequest),
+        "rejected_tool_gets_failed_result: a transport with no permission channel asks nothing: \
+         {:?}",
+        kinds(&log)
+    );
+    let results: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::ToolResult)
+        .collect();
+    assert_eq!(
+        results.len(),
+        1,
+        "rejected_tool_gets_failed_result: exactly one result per call, the synthesized one"
+    );
+    assert_eq!(results[0].tool_call_id.as_deref(), Some("call-9"));
+    assert_eq!(
+        str_at(results[0], "status"),
+        Some(ToolResultStatus::Failed.as_str())
+    );
+    assert!(
+        !serde_json::to_string(&log)
+            .expect("the log serialises")
+            .contains("should never be recorded"),
+        "rejected_tool_gets_failed_result: the transport's own result for a settled call is dropped"
+    );
+
+    let answers: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::PermissionAnswer)
+        .collect();
+    assert_eq!(
+        answers.len(),
+        1,
+        "rejected_tool_gets_failed_result: one refusal is one `permission_answer` row"
+    );
+    assert_eq!(str_at(answers[0], "by"), Some(AnsweredBy::Policy.as_str()));
+    assert_eq!(
+        answers[0].role,
+        EventRole::Htui,
+        "rejected_tool_gets_failed_result: a policy answer is `htui`'s row whoever reported it"
+    );
+    assert_eq!(
+        answers[0].payload.get("option_id"),
+        Some(&Value::Null),
+        "rejected_tool_gets_failed_result: a denial picks no option"
+    );
+    assert_eq!(
+        answers[0].payload.get("denied").and_then(Value::as_bool),
+        Some(true),
+        "rejected_tool_gets_failed_result: the key that tells a denial from an answer somebody gave"
+    );
+    assert_eq!(
+        str_at(answers[0], "request_id"),
+        Some("call-9"),
+        "rejected_tool_gets_failed_result: with no request to name, the refused call names itself"
+    );
+    assert_eq!(
+        answers[0].tool_call_id.as_deref(),
+        Some("call-9"),
+        "rejected_tool_gets_failed_result: and it reaches the column `idx_session_event_tool` joins \
+         on"
+    );
+}
+
 /// Exactly one `done` per turn precedes the next accepted follow-up (`docs/ANA-4.md` §4.1): a
 /// follow-up sent before it is a protocol error, not a queued prompt.
 async fn done_precedes_next_follow_up<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
@@ -1062,7 +1372,7 @@ async fn done_precedes_next_follow_up<H: CaseHarness, S: WriteStore>(harness: &H
         vec![chunk("second turn", "m2"), done(StopReason::EndTurn)],
     ]);
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
     let mut recorder = Recorder::new(store, &scrubber, chat.step_id, false, None);
     recorder
         .record_prompt(PROMPT, prompt_sections(), epoch())
@@ -1149,6 +1459,14 @@ async fn done_precedes_next_follow_up<H: CaseHarness, S: WriteStore>(harness: &H
 /// the case's store recorded - the device T4's `tests/recorder.rs` already uses. Every other case
 /// asserts on `step_events` rows; this exception is deliberate, and weakening it to something
 /// `step_events` happens to expose would assert nothing about `run_step`.
+///
+/// **Two arms, one case** (plan D91, blueprint E-4), gated on `caps.usage_mid_turn`, and the
+/// **script is the same**: what changes is how many rows the transport needs to report the same
+/// spend. A dialect whose cost exists only on the message that ends the turn (`docs/ANA-4.md` §7)
+/// reports it once, so the arm asserts **one** `usage` row instead of three — and then asserts the
+/// criterion in its strongest form, because with one row the sum has nowhere to hide: the row's
+/// own `cost_micros` *is* the total, and `cost_micros_total` must agree with it. Everything about
+/// `run_step.usage` and the digest is shared, which is the point: criterion 7 is one statement.
 async fn usage_deltas_sum_to_step_usage<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
     // **The script reports no token counts, on purpose** (amended in milestone 3). ANA-4 §7 is
     // explicit that ACP carries no per-turn token fields — `usage_update` has `used`, `size` and
@@ -1171,7 +1489,7 @@ async fn usage_deltas_sum_to_step_usage<H: CaseHarness, S: WriteStore>(harness: 
         done(StopReason::EndTurn),
     ]);
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, caps) = open_case(harness, store, script, false).await;
     let spy = UsageSpy::new(store);
     let mut recorder = Recorder::new(&spy, &scrubber, chat.step_id, false, None);
     recorder
@@ -1187,13 +1505,37 @@ async fn usage_deltas_sum_to_step_usage<H: CaseHarness, S: WriteStore>(harness: 
         .expect("usage_deltas_sum_to_step_usage: the recorder must close cleanly");
 
     let log = rows(store, chat.step_id).await;
-    assert_eq!(
-        log.iter()
-            .filter(|row| row.kind == EventKind::Usage)
-            .count(),
-        3,
-        "usage_deltas_sum_to_step_usage: each usage report is its own row"
-    );
+    let reports: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::Usage)
+        .collect();
+    if caps.usage_mid_turn {
+        assert_eq!(
+            reports.len(),
+            3,
+            "usage_deltas_sum_to_step_usage: each usage report is its own row"
+        );
+    } else {
+        assert_eq!(
+            reports.len(),
+            1,
+            "usage_deltas_sum_to_step_usage: a transport that reports cost once, on the message \
+             that ends the turn, writes one row for the turn (plan D91): {:?}",
+            kinds(&log)
+        );
+        assert_eq!(
+            reports[0].payload.get("cost_micros"),
+            Some(&json!(351)),
+            "usage_deltas_sum_to_step_usage: and that row's delta is the whole turn's spend"
+        );
+        assert_eq!(
+            reports[0].payload.get("cost_micros_total"),
+            Some(&json!(351)),
+            "usage_deltas_sum_to_step_usage: on a first turn the delta and the running total are \
+             the same number, and a transport that reported the vendor's cumulative figure as the \
+             delta would fail here rather than in a second turn nobody scripted"
+        );
+    }
 
     let expected = json!({
         "input_tokens": Value::Null,
@@ -1273,6 +1615,14 @@ fn rate_limit_blob() -> Value {
 /// Both are selected by `agent.settings.quota.source`, which the latch carries. Nothing here
 /// reads an agent's name (`R-AGT-5`), and the blob is a payload value both transports move
 /// unchanged.
+///
+/// **Two arms, one case** (plan D91, blueprint E-4), gated on `caps.usage_mid_turn`, with both
+/// scripts unchanged. A transport that reports cost once, at the end of the turn, has one row to
+/// carry the blob and one latch to make — so H-3's "says nothing until a blob arrives" has no
+/// second report to be visible in, and the first *costed* row is also the blob's row. What the arm
+/// still asserts is everything that makes the latch a latch: the blob reaches the row verbatim,
+/// the document carries the turn's whole spend, and `quota_at` is the capture time of the row that
+/// produced it.
 async fn quota_blob_latches_agent_box<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
     // The row the latch writes into. `quota` is NULL on a fresh row and is the narrow setter's
     // alone (plan D74), so there is nothing to plant: what this case pins is that the latch puts
@@ -1314,7 +1664,7 @@ async fn quota_blob_latches_agent_box<H: CaseHarness, S: WriteStore>(harness: &H
         usage(2_100, 1, None),
         done(StopReason::EndTurn),
     ]);
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, caps) = open_case(harness, store, script, false).await;
     let spy = UsageSpy::new(store);
     let mut recorder =
         Recorder::new(&spy, &scrubber, chat.step_id, false, None).with_quota_latch(QuotaLatch {
@@ -1340,66 +1690,113 @@ async fn quota_blob_latches_agent_box<H: CaseHarness, S: WriteStore>(harness: &H
         .iter()
         .filter(|row| row.kind == EventKind::Usage)
         .collect();
-    assert_eq!(
-        reports.len(),
-        3,
-        "quota_blob_latches_agent_box: each usage report is its own row"
-    );
-    assert_eq!(
-        reports
-            .iter()
-            .map(|row| row.payload.get("quota"))
-            .collect::<Vec<_>>(),
-        vec![None, Some(&rate_limit_blob()), None],
-        "quota_blob_latches_agent_box: the persisted row carries the blob exactly as the report \
-         did — verbatim where there was one, absent where there was not (plan D66)"
-    );
-
     let calls = spy.quota_calls();
-    assert_eq!(
-        calls.len(),
-        2,
-        "quota_blob_latches_agent_box: the first report has no allowance to publish and its spend \
-         alone would empty the column, so only the two rows after it latch (blueprint H-3), got \
-         {calls:?}"
-    );
+    if caps.usage_mid_turn {
+        assert_eq!(
+            reports.len(),
+            3,
+            "quota_blob_latches_agent_box: each usage report is its own row"
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .map(|row| row.payload.get("quota"))
+                .collect::<Vec<_>>(),
+            vec![None, Some(&rate_limit_blob()), None],
+            "quota_blob_latches_agent_box: the persisted row carries the blob exactly as the \
+             report did — verbatim where there was one, absent where there was not (plan D66)"
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "quota_blob_latches_agent_box: the first report has no allowance to publish and its \
+             spend alone would empty the column, so only the two rows after it latch (blueprint \
+             H-3), got {calls:?}"
+        );
+        assert_eq!(
+            calls[0].quota,
+            normalize(
+                QuotaSource::AcpMetaRateLimit,
+                Billing::Subscription,
+                Some(&rate_limit_blob()),
+                Some(350),
+                reports[1].at,
+            )
+            .to_value(),
+            "quota_blob_latches_agent_box: the blob's own row publishes it with the spend so far"
+        );
+        assert_eq!(
+            calls[1].quota,
+            normalize(
+                QuotaSource::AcpMetaRateLimit,
+                Billing::Subscription,
+                Some(&rate_limit_blob()),
+                Some(351),
+                reports[2].at,
+            )
+            .to_value(),
+            "quota_blob_latches_agent_box: and the report after it refreshes the spend while the \
+             windows stand"
+        );
+        assert_eq!(
+            calls[1].quota_at, reports[2].at,
+            "quota_blob_latches_agent_box: `quota_at` is the capture time of the row that produced \
+             the document, which its `observed_at` mirrors (§7)"
+        );
+    } else {
+        // The turn-end form (plan D91): one report, so the blob's row and the turn's only costed
+        // row are the same row and there is one latch to make. H-3's "publish nothing until a blob
+        // arrives" has no second report to be visible in — what is left of it is that the one call
+        // carries the blob, which a transport reporting spend with no allowance would fail.
+        assert_eq!(
+            reports.len(),
+            1,
+            "quota_blob_latches_agent_box: a transport that reports cost once writes one row for \
+             the turn (plan D91): {:?}",
+            kinds(&log)
+        );
+        assert_eq!(
+            reports[0].payload.get("quota"),
+            Some(&rate_limit_blob()),
+            "quota_blob_latches_agent_box: the persisted row carries the blob verbatim (plan D66)"
+        );
+        assert_eq!(
+            calls.len(),
+            1,
+            "quota_blob_latches_agent_box: one report that has something to say is one latch, got \
+             {calls:?}"
+        );
+        assert_eq!(
+            calls[0].quota,
+            normalize(
+                QuotaSource::AcpMetaRateLimit,
+                Billing::Subscription,
+                Some(&rate_limit_blob()),
+                Some(351),
+                reports[0].at,
+            )
+            .to_value(),
+            "quota_blob_latches_agent_box: the turn's one row publishes the blob with the turn's \
+             whole spend"
+        );
+        assert_eq!(
+            calls[0].quota_at, reports[0].at,
+            "quota_blob_latches_agent_box: `quota_at` is the capture time of the row that produced \
+             the document, which its `observed_at` mirrors (§7)"
+        );
+    }
     assert!(
         calls
             .iter()
             .all(|call| call.agent_id == ids::AGENT_CLAUDE && call.box_id == ids::BOX),
         "quota_blob_latches_agent_box: every latch names the row the chat runs on"
     );
-    assert_eq!(
-        calls[0].quota,
-        normalize(
-            QuotaSource::AcpMetaRateLimit,
-            Billing::Subscription,
-            Some(&rate_limit_blob()),
-            Some(350),
-            reports[1].at,
-        )
-        .to_value(),
-        "quota_blob_latches_agent_box: the blob's own row publishes it with the spend so far"
-    );
-    assert_eq!(
-        calls[1].quota,
-        normalize(
-            QuotaSource::AcpMetaRateLimit,
-            Billing::Subscription,
-            Some(&rate_limit_blob()),
-            Some(351),
-            reports[2].at,
-        )
-        .to_value(),
-        "quota_blob_latches_agent_box: and the report after it refreshes the spend while the \
-         windows stand"
-    );
-    assert_eq!(
-        calls[1].quota_at, reports[2].at,
-        "quota_blob_latches_agent_box: `quota_at` is the capture time of the row that produced \
-         the document, which its `observed_at` mirrors (§7)"
-    );
-    let document = Quota::from_value(&calls[1].quota)
+    // The document the *last* latch published, which is the one the Settings cell would read:
+    // whether it took two calls or one, it says the same thing about the same turn.
+    let last = calls
+        .last()
+        .expect("quota_blob_latches_agent_box: the blob's row latches");
+    let document = Quota::from_value(&last.quota)
         .expect("quota_blob_latches_agent_box: the latched document parses back");
     assert_eq!(
         document
@@ -1421,7 +1818,7 @@ async fn quota_blob_latches_agent_box<H: CaseHarness, S: WriteStore>(harness: &H
         usage(2_100, 1, None),
         done(StopReason::EndTurn),
     ]);
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
     let spy = UsageSpy::new(store);
     let mut recorder =
         Recorder::new(&spy, &scrubber, chat.step_id, false, None).with_quota_latch(QuotaLatch {
@@ -1452,17 +1849,34 @@ async fn quota_blob_latches_agent_box<H: CaseHarness, S: WriteStore>(harness: &H
         "quota_blob_latches_agent_box: a report that carried no blob persists none"
     );
     let calls = spy.quota_calls();
+    // One latch per costed row, whichever arm this is: over a mid-turn transport that is the three
+    // running spends, over a turn-end one the single report is the turn's whole spend. The
+    // expected list is built from `reports` rather than from a literal, so the only thing the two
+    // arms disagree about is how many rows carried the same money (plan D91).
+    let spends: &[i64] = if caps.usage_mid_turn {
+        &[100, 350, 351]
+    } else {
+        &[351]
+    };
+    assert_eq!(
+        reports.len(),
+        spends.len(),
+        "quota_blob_latches_agent_box: one costed row per report this transport makes: {:?}",
+        kinds(&log)
+    );
     assert_eq!(
         calls
             .iter()
             .map(|call| call.quota.clone())
             .collect::<Vec<_>>(),
-        (0..3)
-            .map(|index| normalize(
+        spends
+            .iter()
+            .enumerate()
+            .map(|(index, spend)| normalize(
                 QuotaSource::None,
                 Billing::PerToken,
                 None,
-                Some([100, 350, 351][index]),
+                Some(*spend),
                 reports[index].at,
             )
             .to_value())
@@ -1517,7 +1931,7 @@ async fn play_capped<H: CaseHarness, S: WriteStore>(
     script: Script,
 ) -> Played {
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
     let session_ref = session.session_ref().cloned();
     let spy = UsageSpy::new(store);
     let mut recorder = Recorder::new(&spy, &scrubber, chat.step_id, false, None);
@@ -1562,10 +1976,30 @@ async fn play_capped<H: CaseHarness, S: WriteStore>(
 /// *cancel* is [`crate::record::enforce_breach`]'s, and neither knows which transport is on the
 /// other side of the [`AgentSession`] it holds. Four runs, because a guard rail has to be provably
 /// off as well as on.
+///
+/// **Two arms, one case** (plan D91, blueprint E-4), gated on `caps.usage_mid_turn`, and this is
+/// the gate where the *script* changes and **not one assertion does**. Runs (a) and (d) end in
+/// [`ScriptEvent::ExpectCancel`] over a transport that reports cost mid-turn — the marker is what
+/// makes a build that detected the breach and forgot to cancel fail instead of hang. Over a
+/// transport whose cost report *is* the message that ends the turn there is nothing after the
+/// breach for the marker to guard: the report and the `done` arrive together, so the script ends
+/// in `done { end_turn }` and the cap still has to answer it. That the verdict is unchanged —
+/// `stop_reason: cancelled`, `error` then `done` as the last two rows, exactly one `done` — is the
+/// whole point of the arm: the transport's own `end_turn` is **withheld** by
+/// [`enforce_breach`](crate::record::enforce_breach) rather than recorded beside the cap's
+/// (milestone 7 H-4), and this is where a real transport exercises it.
 async fn run_cap_breach_cancels_within_one_event<H: CaseHarness, S: WriteStore>(
     harness: &H,
     store: &S,
 ) {
+    // Runs (b) and (c) are under their cap and end in a `done` already, so only (a) and (d) move.
+    let unfinished = || {
+        if harness.caps().usage_mid_turn {
+            ScriptEvent::ExpectCancel
+        } else {
+            done(StopReason::EndTurn)
+        }
+    };
     // The deltas `usage_deltas_sum_to_step_usage` uses, so the running spend is 100 then 350: a
     // cap of 300 is crossed by the second report and by no other number in the script.
     let usage = |used: i64, cost: i64| {
@@ -1585,11 +2019,7 @@ async fn run_cap_breach_cancels_within_one_event<H: CaseHarness, S: WriteStore>(
         harness,
         store,
         Some(300),
-        Script::one_turn(vec![
-            usage(1_000, 100),
-            usage(2_000, 250),
-            ScriptEvent::ExpectCancel,
-        ]),
+        Script::one_turn(vec![usage(1_000, 100), usage(2_000, 250), unfinished()]),
     )
     .await;
 
@@ -1716,7 +2146,7 @@ async fn run_cap_breach_cancels_within_one_event<H: CaseHarness, S: WriteStore>(
         harness,
         store,
         Some(50),
-        Script::one_turn(vec![usage(1_000, 100), ScriptEvent::ExpectCancel]),
+        Script::one_turn(vec![usage(1_000, 100), unfinished()]),
     )
     .await;
     assert_eq!(immediate.stop.stop_reason, StopReason::Cancelled);
@@ -1758,7 +2188,7 @@ async fn unknown_update_lands_in_other<H: CaseHarness, S: WriteStore>(harness: &
         done(StopReason::EndTurn),
     ]);
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
     let mut recorder = Recorder::new(store, &scrubber, chat.step_id, false, None);
     recorder
         .record_prompt(PROMPT, prompt_sections(), epoch())
@@ -1801,6 +2231,15 @@ async fn unknown_update_lands_in_other<H: CaseHarness, S: WriteStore>(harness: &
 /// content, at the *first* write's `seq` (plan D77 reserves the `seq` at announcement and holds only
 /// the row). `src/b.rs` is the control — a different path under the same call is a different key and
 /// keeps its own row.
+///
+/// **Two arms, one case** (plan D80), gated on `caps.edit_proposals`, and the **script is the
+/// same**: a transport that cannot propose an edit still sees the three writes, it just surfaces
+/// them the only way it can. §4.3 (`:545-546`) says what that is — "surfaces them only as post-hoc
+/// `Edit`/`Write` tool calls" — so the second arm asserts zero `edit_proposal` rows and three
+/// `tool_call` rows in script order. **Calls do not dedupe**, and that is the point of the arm:
+/// the same file written twice is two things that happened, where two *proposals* for one file are
+/// one pending change. A transport that deduped its calls to look like it had passed the first arm
+/// would be losing a row the user needs.
 async fn edit_proposal_deduped_per_call_and_path<H: CaseHarness, S: WriteStore>(
     harness: &H,
     store: &S,
@@ -1823,7 +2262,7 @@ async fn edit_proposal_deduped_per_call_and_path<H: CaseHarness, S: WriteStore>(
         done(StopReason::EndTurn),
     ]);
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, caps) = open_case(harness, store, script, false).await;
     let mut recorder = Recorder::new(store, &scrubber, chat.step_id, false, None);
     recorder
         .record_prompt(PROMPT, prompt_sections(), epoch())
@@ -1838,6 +2277,10 @@ async fn edit_proposal_deduped_per_call_and_path<H: CaseHarness, S: WriteStore>(
         .expect("edit_proposal_deduped_per_call_and_path: the recorder must close cleanly");
 
     let log = rows(store, chat.step_id).await;
+    if !caps.edit_proposals {
+        edits_surface_as_post_hoc_tool_calls(&log);
+        return;
+    }
     let edits: Vec<&SessionEvent> = log
         .iter()
         .filter(|row| row.kind == EventKind::EditProposal)
@@ -1888,6 +2331,102 @@ async fn edit_proposal_deduped_per_call_and_path<H: CaseHarness, S: WriteStore>(
     );
 }
 
+/// `edit_proposal_deduped_per_call_and_path` over a transport that reports
+/// `caps.edit_proposals: false` (plan D80, `docs/ANA-4.md` §4.3 `:545-546`).
+///
+/// The same three writes, surfaced the only way a transport with no proposal channel can surface
+/// them: as post-hoc `Edit`/`Write` tool calls, after the fact rather than before it. So the
+/// dedup rule has nothing to apply to — **zero** `edit_proposal` rows, the negative this arm owes
+/// — and what the log must carry instead is one `edit`-kinded call per write, in script order,
+/// each with its result. Three, not two: a write that already happened is not a pending change
+/// waiting to be superseded, so the second write to `src/a.rs` is its own row and a transport that
+/// collapsed it would be hiding an edit from the user.
+fn edits_surface_as_post_hoc_tool_calls(log: &[SessionEvent]) {
+    assert!(
+        !log.iter().any(|row| row.kind == EventKind::EditProposal),
+        "edit_proposal_deduped_per_call_and_path: a transport that reports no proposal channel \
+         writes no `edit_proposal` row: {:?}",
+        kinds(log)
+    );
+
+    let calls: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::ToolCall)
+        .collect();
+    assert_eq!(
+        calls.len(),
+        3,
+        "edit_proposal_deduped_per_call_and_path: one call per write, and calls do not dedupe: \
+         {:?}",
+        kinds(log)
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|row| str_at(row, "tool_kind") == Some(ToolKind::Edit.as_str())),
+        "edit_proposal_deduped_per_call_and_path: a write is an `edit`-kinded call: {:?}",
+        calls
+            .iter()
+            .map(|row| str_at(row, "tool_kind"))
+            .collect::<Vec<_>>()
+    );
+    let paths: Vec<Option<&str>> = calls
+        .iter()
+        .map(|row| {
+            row.payload
+                .get("locations")
+                .and_then(|locations| locations.get(0))
+                .and_then(|location| location.get("path"))
+                .and_then(Value::as_str)
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        vec![Some("src/a.rs"), Some("src/b.rs"), Some("src/a.rs")],
+        "edit_proposal_deduped_per_call_and_path: each call names the file it wrote, in script \
+         order"
+    );
+
+    let results: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::ToolResult)
+        .collect();
+    assert_eq!(
+        results.len(),
+        3,
+        "edit_proposal_deduped_per_call_and_path: every call is closed by its own result"
+    );
+    assert!(
+        calls.iter().all(|call| results
+            .iter()
+            .any(|result| result.tool_call_id == call.tool_call_id)),
+        "edit_proposal_deduped_per_call_and_path: and each result names the call it closed"
+    );
+
+    let flushed = log
+        .iter()
+        .find(|row| row.kind == EventKind::AssistantText)
+        .expect("edit_proposal_deduped_per_call_and_path: the chunk between the writes is a row");
+    assert!(
+        calls[1].seq < flushed.seq && flushed.seq < calls[2].seq,
+        "edit_proposal_deduped_per_call_and_path: the text the agent wrote between the second and \
+         third write sits between them: {} < {} < {}",
+        calls[1].seq,
+        flushed.seq,
+        calls[2].seq
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        (0..i32::try_from(log.len()).expect("a case's log is short")).collect::<Vec<_>>(),
+        "edit_proposal_deduped_per_call_and_path: and `seq` is still gapless 0..n"
+    );
+    assert_eq!(
+        log.last().map(|row| row.kind),
+        Some(EventKind::Done),
+        "edit_proposal_deduped_per_call_and_path: `done` closes the log"
+    );
+}
+
 /// Flush trigger 4: a coalesced run is cut at [`CHUNK_FLUSH_BYTES`] rather than buffered
 /// unboundedly, and the cut is a function of byte counts alone - no timer, so replay stays
 /// deterministic (`docs/ANA-4.md` §4.1, §11 criterion 2).
@@ -1896,7 +2435,8 @@ async fn chunk_flush_at_16kib<H: CaseHarness, S: WriteStore>(harness: &H, store:
     let mut events: Vec<ScriptEvent> = (0..17).map(|_| chunk(&piece, "m1")).collect();
     events.push(done(StopReason::EndTurn));
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, Script::one_turn(events), false).await;
+    let (chat, mut session, _caps) =
+        open_case(harness, store, Script::one_turn(events), false).await;
     let mut recorder = Recorder::new(store, &scrubber, chat.step_id, false, None);
     recorder
         .record_prompt(PROMPT, prompt_sections(), epoch())
@@ -1945,7 +2485,7 @@ async fn session_banner_is_first_other_row<H: CaseHarness, S: WriteStore>(harnes
         done(StopReason::EndTurn),
     ]);
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
     let session_ref = session
         .session_ref()
         .cloned()
@@ -2023,7 +2563,7 @@ async fn env_values_masked_in_rows<H: CaseHarness, S: WriteStore>(harness: &H, s
     ]);
     let scrubber = scrubber();
     // `retain_raw`, so the `raw` column is under the same rule as the payload.
-    let (chat, mut session) = open_case(harness, store, script, true).await;
+    let (chat, mut session, _caps) = open_case(harness, store, script, true).await;
     let mut recorder = Recorder::new(store, &scrubber, chat.step_id, true, None);
     recorder
         .record_prompt(PROMPT, prompt_sections(), epoch())
@@ -2077,7 +2617,7 @@ async fn scrub_residue_refuses_write<H: CaseHarness, S: WriteStore>(harness: &H,
         done(StopReason::EndTurn),
     ]);
     let scrubber = scrubber();
-    let (chat, mut session) = open_case(harness, store, script, false).await;
+    let (chat, mut session, _caps) = open_case(harness, store, script, false).await;
     let mut recorder = Recorder::new(store, &scrubber, chat.step_id, false, None);
     recorder
         .record_prompt(PROMPT, prompt_sections(), epoch())
@@ -2129,8 +2669,8 @@ async fn scrub_residue_refuses_write<H: CaseHarness, S: WriteStore>(harness: &H,
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, Script, run_case};
-    use crate::driver::AgentDriver;
-    use crate::fake::FakeDriver;
+    use crate::driver::{AgentDriver, DriverCaps};
+    use crate::fake::{FAKE_AGENT_NAME, FakeDriver};
     use htui_core::store::MemStore;
 
     /// The in-crate binding, so the guard below needs no integration test to exist.
@@ -2140,6 +2680,47 @@ mod tests {
     impl CaseHarness for FakeHarness {
         fn driver(&self, script: Script) -> Box<dyn AgentDriver> {
             Box::new(FakeDriver::scripted(script))
+        }
+
+        fn caps(&self) -> DriverCaps {
+            FakeDriver::full_caps()
+        }
+    }
+
+    /// The fake reporting the capability profile `docs/ANA-4.md` §4.3 gives the CLI transport, so
+    /// the second arm of every capability gate is **run** and not merely compiled (plan D80, D91).
+    ///
+    /// Not a fourth binding and not a case: it plays [`CASES`] through the same [`run_case`], and
+    /// its whole job is that the gate chooses the right column and the right column then holds.
+    /// The fake honours its own [`DriverCaps`] (`fake.rs` rule 6), so what it puts on the wire for
+    /// these three is the degradation the ANA describes rather than the script verbatim.
+    ///
+    /// `crates/htui-agent/tests/extensibility.rs` makes the same run from the other direction and
+    /// is the stronger statement — its profile comes from a **registry row** it read back out of a
+    /// store, so nothing in this file chose it.
+    #[derive(Debug)]
+    struct DegradedHarness;
+
+    impl DegradedHarness {
+        /// `full_caps` minus the three the CLI transport does not have. `permission_requests` and
+        /// `edit_proposals` are §4.3's; `usage_mid_turn` is D91's.
+        const fn profile() -> DriverCaps {
+            DriverCaps {
+                permission_requests: false,
+                edit_proposals: false,
+                usage_mid_turn: false,
+                ..FakeDriver::full_caps()
+            }
+        }
+    }
+
+    impl CaseHarness for DegradedHarness {
+        fn driver(&self, script: Script) -> Box<dyn AgentDriver> {
+            Box::new(FakeDriver::new(FAKE_AGENT_NAME, Self::profile(), script))
+        }
+
+        fn caps(&self) -> DriverCaps {
+            Self::profile()
         }
     }
 
@@ -2157,6 +2738,21 @@ mod tests {
         // running the list through it is what keeps `CASES` and the dispatcher in step.
         for name in CASES {
             run_case(name, &FakeHarness, &MemStore::demo()).await;
+        }
+    }
+
+    /// Every case again, over a transport missing three capabilities (plan D80, D91).
+    ///
+    /// Every name here is already in [`CASES`] and stays there: what this asserts is that the arm
+    /// a missing capability selects is a *statement that holds*, not an escape hatch — a transport
+    /// that says it has no permission channel writes no permission row, a refusal its own policy
+    /// made still closes the call it settled, a write it can only report after the fact is still
+    /// one row per write, and a per-run cap still cancels a turn whose cost arrives on the message
+    /// that ends it.
+    #[tokio::test]
+    async fn a_transport_without_a_capability_takes_the_other_arm() {
+        for name in CASES {
+            run_case(name, &DegradedHarness, &MemStore::demo()).await;
         }
     }
 }

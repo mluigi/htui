@@ -18,12 +18,34 @@
 //! 3. **A denied or cancelled call gets a synthesized result.** ACP emits no `tool_result` for a
 //!    rejected call, so the driver invents one - `failed` plus a `terminal_reason` - and the
 //!    scripted result for that call, if any, is dropped (`docs/ANA-4.md` §4.3 "Tool-call terminal
-//!    states", §11 criterion 5).
+//!    states", §11 criterion 5). It makes no difference *who* refused: a
+//!    [`ScriptEvent::PolicyDenied`] arrives already decided, with no request to answer, and
+//!    settles its call the same way (plan D85, D93).
 //! 4. **`cancel` answers everything.** Every parked request is answered `cancelled`, every tool
 //!    call still open gets its synthesized `failed` result, and the turn closes with
 //!    `done { stop_reason: "cancelled" }`.
 //! 5. **One `done` per turn precedes the next follow-up.** [`AgentSession::send_follow_up`]
 //!    before the turn's `done` is a protocol error, not a queued prompt.
+//! 6. **A transport plays the wire its [`DriverCaps`] declare**, wherever a capability changes the
+//!    *shape of the recorded rows*. The script says what the agent did; what reaches the wire is
+//!    what this transport is able to say about it. A driver built from a registry row carries that
+//!    row's profile (plan D12), so the same script degrades the way `docs/ANA-4.md` §4.3 and §7
+//!    say it does: with no `edit_proposals` a write is a post-hoc `Edit` tool call and its result
+//!    (§4.3 `:545-546`), and with no `usage_mid_turn` the turn's cost reports are held and leave as
+//!    one, ahead of the `done` they belong to (§7, plan D91). This is what makes
+//!    `tests/extensibility.rs` — which drives the whole conformance list over a **CLI** row — a
+//!    statement about the degraded contract rather than about a fake that ignores its own
+//!    capabilities.
+//!
+//!    `permission_requests` is deliberately **not** on that list. A scripted
+//!    [`ScriptEvent::ParkPermission`] is played whatever the profile says, because the pipeline it
+//!    drives is `htui`'s own (`crate::permission`'s three stages, `agent_worker`'s parking and
+//!    answering) and those cases must run over a `cli/fake` row — `R-AGT-5` leaves them no real
+//!    agent to name. A fake that refused to park would leave the code under test with no transport
+//!    at all, which is a worse falsehood than a script asking for a request this profile would not
+//!    have produced. The refusal that *is* enforced is the other direction: a
+//!    [`ScriptEvent::PolicyDenied`] on a transport that **has** a permission channel, because that
+//!    would write a row claiming a policy settled something nobody ever asked.
 //!
 //! **Deterministic by construction.** The capture time of the *n*-th envelope is
 //! [`crate::conformance::epoch`] plus *n* milliseconds and the agent-side session id is derived
@@ -46,9 +68,11 @@ use crate::driver::{
 };
 use crate::error::DriverError;
 use crate::event::{
-    DoneEvent, DriverEnvelope, DriverEvent, OtherEvent, PermissionOptionKind,
-    PermissionRequestEvent, StopReason, TerminalReason, ToolResultEvent, ToolResultStatus,
+    DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, OtherEvent, PermissionAnswerEvent,
+    PermissionOptionKind, PermissionRequestEvent, StopReason, TerminalReason, ToolCallEvent,
+    ToolKind, ToolLocation, ToolResultEvent, ToolResultStatus, UsageEvent,
 };
+use crate::record::AnsweredBy;
 use crate::registry::{DriverFactory, TransportBuilder};
 
 // The banner's `other.update`, published here too: the fake writes the same banner every transport
@@ -144,6 +168,7 @@ impl AgentDriver for FakeDriver {
                 DriverError::Transport("the fake's script slot is poisoned".to_owned())
             });
         let name = self.name.clone();
+        let caps = self.caps;
         Box::pin(async move {
             if prompt.is_empty() {
                 return Err(DriverError::Transport(
@@ -153,7 +178,7 @@ impl AgentDriver for FakeDriver {
             let script = taken?.ok_or_else(|| {
                 DriverError::Transport("the fake's script has already been played".to_owned())
             })?;
-            Ok(Box::new(FakeSession::open(&name, &spec, script)) as Box<dyn AgentSession>)
+            Ok(Box::new(FakeSession::open(&name, caps, &spec, script)) as Box<dyn AgentSession>)
         })
     }
 }
@@ -167,6 +192,11 @@ impl AgentDriver for FakeDriver {
 pub struct FakeSession {
     session_ref: AgentSessionRef,
     retain_raw: bool,
+    /// What this session's driver declared, and therefore what it is allowed to put on the wire
+    /// (rule 6). [`FakeDriver::scripted`] passes [`FakeDriver::full_caps`]; a registry row passes
+    /// its own, which is how `tests/extensibility.rs` drives the whole suite over a transport that
+    /// answers `false` to three of them.
+    caps: DriverCaps,
     /// Turns not yet opened; [`AgentSession::send_follow_up`] opens the next one.
     turns: VecDeque<Turn>,
     /// The open turn's remaining script.
@@ -186,11 +216,20 @@ pub struct FakeSession {
     turn_open: bool,
     /// Whether the session is finished: no further event, no further accepted call.
     ended: bool,
+    /// The open turn's cost, accumulated rather than reported, when `caps.usage_mid_turn` is
+    /// `false` (rule 6). Emitted as one report just before the turn's `done`.
+    held_usage: Option<UsageEvent>,
+    /// The session's cumulative cost in micros, which the held report carries as
+    /// `cost_micros_total`. A session total and not a turn's, because that is what the key means
+    /// (`docs/ANA-4.md` §7).
+    spent_micros: i64,
+    /// Ids minted for the tool calls a transport with no `edit_proposals` surfaces a write as.
+    edits: u32,
 }
 
 impl FakeSession {
     /// Opens a session on turn 0 of the script, with the banner already queued.
-    fn open(name: &str, spec: &SessionSpec, script: Script) -> Self {
+    fn open(name: &str, caps: DriverCaps, spec: &SessionSpec, script: Script) -> Self {
         // Derived from the step, never minted: two replays of one script must agree on every
         // persisted byte, and the banner carries this id into a row (§11 criterion 2).
         let session_ref = AgentSessionRef::new(format!("fake-{}", spec.step_id));
@@ -212,6 +251,7 @@ impl FakeSession {
         Self {
             session_ref,
             retain_raw: spec.retain_raw,
+            caps,
             turns,
             queue,
             pending: VecDeque::from(vec![banner]),
@@ -221,6 +261,9 @@ impl FakeSession {
             clock: 0,
             turn_open: true,
             ended: false,
+            held_usage: None,
+            spent_micros: 0,
+            edits: 0,
         }
     }
 
@@ -266,6 +309,64 @@ impl FakeSession {
         self.open_calls.retain(|open| open != call);
     }
 
+    /// Folds one scripted cost report into the turn's single held one (rule 6,
+    /// `caps.usage_mid_turn: false`).
+    ///
+    /// Deltas are summed, the running session total is carried, and the context figures are the
+    /// last report's — a context window is a level, not an increment. The vendor blob is the last
+    /// one the turn carried, which is the shape §7 describes and what the real dialect does with a
+    /// `rate_limit_event` that arrives before the turn's `result`.
+    fn hold_usage(&mut self, report: &UsageEvent) {
+        let held = self.held_usage.get_or_insert_with(UsageEvent::default);
+        let sum = |carried: Option<i64>, added: Option<i64>| match (carried, added) {
+            (None, None) => None,
+            (carried, added) => Some(carried.unwrap_or_default() + added.unwrap_or_default()),
+        };
+        held.input_tokens = sum(held.input_tokens, report.input_tokens);
+        held.output_tokens = sum(held.output_tokens, report.output_tokens);
+        held.cache_read_tokens = sum(held.cache_read_tokens, report.cache_read_tokens);
+        held.cache_write_tokens = sum(held.cache_write_tokens, report.cache_write_tokens);
+        held.cost_micros = sum(held.cost_micros, report.cost_micros);
+        held.context_used = report.context_used.or(held.context_used);
+        held.context_size = report.context_size.or(held.context_size);
+        held.quota = report.quota.clone().or_else(|| held.quota.take());
+        held.usage_scope = report
+            .usage_scope
+            .clone()
+            .or_else(|| held.usage_scope.take());
+        self.spent_micros += report.cost_micros.unwrap_or_default();
+        held.cost_micros_total = Some(self.spent_micros);
+    }
+
+    /// The `tool_call` a transport with no `edit_proposals` surfaces a write as (rule 6,
+    /// `docs/ANA-4.md` §4.3 `:545-546`: "surfaces them only as post-hoc `Edit`/`Write` tool
+    /// calls").
+    ///
+    /// A fresh id per write, because a write that already happened is not a pending change waiting
+    /// to be superseded: two writes to one path are two calls, and the id is what says so.
+    fn post_hoc_edit(&mut self, proposal: &EditProposalEvent) -> DriverEvent {
+        self.edits += 1;
+        let tool_call_id = format!("edit-{}", self.edits);
+        self.pending
+            .push_back(DriverEvent::ToolResult(ToolResultEvent {
+                tool_call_id: tool_call_id.clone(),
+                status: ToolResultStatus::Completed,
+                output: None,
+                locations: Vec::new(),
+                terminal_reason: None,
+            }));
+        DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id,
+            title: format!("Write {}", proposal.path),
+            tool_kind: ToolKind::Edit,
+            input: json!({ "path": proposal.path }),
+            locations: vec![ToolLocation {
+                path: proposal.path.clone(),
+                line: None,
+            }],
+        })
+    }
+
     /// Queues the `failed` result `htui` invents for a call the protocol will never answer
     /// (`docs/ANA-4.md` §4.3). A call that already has a result is left alone.
     fn synthesize_result(&mut self, call: &str, reason: TerminalReason) {
@@ -307,6 +408,20 @@ impl AgentSession for FakeSession {
                 return Ok(None);
             }
             loop {
+                // Rule 6: the turn's one held cost report leaves **ahead** of the `done` it belongs
+                // to and the `done` stays in the queue, so the recorder sees the figure while the
+                // turn is still open and a cancel that follows still has a turn to clear. That
+                // ordering is what lets a per-run cap answer a breach whose number only exists at
+                // the end of the turn (plan D91, `run_cap_breach_cancels_within_one_event`).
+                if self.held_usage.is_some()
+                    && matches!(
+                        self.queue.front(),
+                        Some(ScriptEvent::Emit(DriverEvent::Done(_)))
+                    )
+                {
+                    let held = self.held_usage.take().expect("the guard just checked it");
+                    return Ok(Some(self.envelope(DriverEvent::Usage(held))));
+                }
                 let Some(step) = self.queue.pop_front() else {
                     return Err(DriverError::Transport(
                         "the script's turn ran out before its `done`".to_owned(),
@@ -319,16 +434,57 @@ impl AgentSession for FakeSession {
                         // The call was already answered by a rejection or a cancel, and a
                         // protocol that then sent its own result would be sending a second one.
                     }
+                    // Rule 6, the two reshaping arms. Each is the degradation `docs/ANA-4.md` §4.3
+                    // and §7 *name*, played rather than described: a script says what the agent
+                    // did, and a transport puts on the wire what it is able to say about it.
+                    ScriptEvent::Emit(DriverEvent::Usage(report)) if !self.caps.usage_mid_turn => {
+                        self.hold_usage(&report);
+                    }
+                    ScriptEvent::Emit(DriverEvent::EditProposal(proposal))
+                        if !self.caps.edit_proposals =>
+                    {
+                        let call = self.post_hoc_edit(&proposal);
+                        return Ok(Some(self.envelope(call)));
+                    }
                     ScriptEvent::Emit(event) => return Ok(Some(self.envelope(event))),
                     ScriptEvent::ParkPermission(request) => {
                         self.parked.push(request.clone());
                         return Ok(Some(self.envelope(DriverEvent::PermissionRequest(request))));
+                    }
+                    ScriptEvent::PolicyDenied(call) if self.caps.permission_requests => {
+                        return Err(DriverError::Transport(format!(
+                            "script marker `policy_denied({call})`: this transport has a \
+                             permission channel and asks rather than being told"
+                        )));
                     }
                     ScriptEvent::ExpectCancel => {
                         return Err(DriverError::Transport(
                             "script marker `expect_cancel`: this turn ends only by `cancel`"
                                 .to_owned(),
                         ));
+                    }
+                    ScriptEvent::PolicyDenied(call) => {
+                        // Rule 3 by the other route (plan D85, D93). The refusal *is* the answer,
+                        // so the call is settled here and now: its synthesized `failed` result is
+                        // queued behind the answer, and the script's own later result for it is
+                        // dropped by the arm above. The answer is a typed event and goes on the
+                        // wire as itself — a transport whose policy refused a call has nothing to
+                        // ask and nobody to wait for, so there is no request to park and no string
+                        // for the recorder to recognize.
+                        self.synthesize_result(&call, TerminalReason::Rejected);
+                        return Ok(Some(self.envelope(DriverEvent::PermissionAnswer(
+                            PermissionAnswerEvent {
+                                // With no request to name, the refused call names itself: the two
+                                // ids are one string, which is what makes the pair joinable from
+                                // either side (`PermissionAnswerEvent::request_id`).
+                                request_id: PermissionRequestId::new(call.clone()),
+                                tool_call_id: Some(call),
+                                option_id: None,
+                                by: AnsweredBy::Policy,
+                                cancelled: false,
+                                denied: true,
+                            },
+                        ))));
                     }
                 }
             }
@@ -421,6 +577,11 @@ impl AgentSession for FakeSession {
             for call in core::mem::take(&mut self.open_calls) {
                 self.synthesize_result(&call, TerminalReason::Cancelled);
             }
+            // A cancelled turn reports no cost (rule 6; plan finding F-2 measured exactly this on
+            // the real binary — an aborted turn's envelope carries `total_cost_usd: 0` and an
+            // empty `modelUsage`). Held reports are dropped rather than flushed: the turn is over
+            // before the figure it would have carried was ever settled.
+            self.held_usage = None;
             self.queue.clear();
             self.turns.clear();
             // Only a turn that is **open** is owed a `done`. Cancelling between turns ends the

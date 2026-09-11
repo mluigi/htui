@@ -3426,9 +3426,23 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_chat_over_its_run_cap_is_cancelled_and_its_run_fails() {
         // 100 then 250 micros: the running spend is 350 against a cap of 300, crossed by the
-        // second report. The turn has no `done` of its own — only the cap's cancel can end it, so
-        // a build that read the cap and never enforced it hangs on `ExpectCancel` and fails.
-        let script = Script::one_turn(vec![usage(100), usage(250), ScriptEvent::ExpectCancel]);
+        // second report.
+        //
+        // The turn ends in the transport's own `done { end_turn }`, not in `ExpectCancel` (T53).
+        // The fixture's row is a **CLI** row, and since plan D91 the fake plays the profile its row
+        // declares (`fake.rs` rule 6): `usage_mid_turn` is `false` there, so the two reports are
+        // held and leave as one just ahead of the `done`, which is the shape `docs/ANA-4.md` §7
+        // measured on the real dialect. A turn whose cost only exists at its end cannot be stopped
+        // before it ends, so the marker has nothing left to guard — and the guard it used to give
+        // is not lost, it is stronger: if the cap were never enforced this turn would end
+        // `end_turn` and the match below would fail on the stop reason instead of hanging.
+        let script = Script::one_turn(vec![
+            usage(100),
+            usage(250),
+            ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                stop_reason: StopReason::EndTurn,
+            })),
+        ]);
         let (store, backend, mut runtime, agent_id) =
             fixture_with_project_settings(script, Some(json!({ "per_token_cap_run": 300 }))).await;
         let before = store.active_runs(&scope()).await.expect("count");
@@ -3492,8 +3506,10 @@ pub(crate) mod tests {
             log.iter()
                 .filter(|row| row.kind == EventKind::Usage)
                 .count(),
-            2,
-            "nothing after the breaching report was pulled: {:?}",
+            1,
+            "the turn reported its cost once, and nothing after that report was pulled — the \
+             transport's own `done {{end_turn}}` is withheld rather than recorded beside the cap's \
+             (plan D91, milestone 7 H-4): {:?}",
             log.iter().map(|row| row.kind).collect::<Vec<_>>()
         );
         assert_eq!(

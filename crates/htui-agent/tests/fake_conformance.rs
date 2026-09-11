@@ -8,7 +8,7 @@
 #![cfg(feature = "test-support")]
 
 use htui_agent::conformance::{self, CaseHarness, Script};
-use htui_agent::driver::AgentDriver;
+use htui_agent::driver::{AgentDriver, DriverCaps};
 use htui_agent::fake::FakeDriver;
 use htui_core::store::MemStore;
 
@@ -19,6 +19,13 @@ struct FakeHarness;
 impl CaseHarness for FakeHarness {
     fn driver(&self, script: Script) -> Box<dyn AgentDriver> {
         Box::new(FakeDriver::scripted(script))
+    }
+
+    /// Every predicate the fake advertises, which is every one there is: the reference transport
+    /// takes the left column of every capability gate, so a case is never skipped and no gate is
+    /// exercised here (plan D80, D91).
+    fn caps(&self) -> DriverCaps {
+        FakeDriver::full_caps()
     }
 }
 
