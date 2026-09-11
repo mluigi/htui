@@ -629,9 +629,22 @@ async fn a_session_over_a_scripted_agent_streams_a_turn_and_then_a_follow_up() {
     ));
 
     let argv = std::fs::read_to_string(&scripted.argv).expect("the script recorded its argv");
+    let seen: Vec<&str> = argv.lines().collect();
     assert!(
-        argv.contains("--output-format\nstream-json") && argv.contains("--session-id\n"),
+        seen.windows(2)
+            .any(|pair| pair == ["--output-format", "stream-json"]),
         "the argv the kernel saw is §4.4's line: {argv}"
+    );
+    let minted = session
+        .session_ref()
+        .expect("a CLI session has an id")
+        .as_str()
+        .to_owned();
+    assert!(
+        seen.windows(2)
+            .any(|pair| pair == ["--session-id", minted.as_str()]),
+        "D84 end to end: the id `session_ref` hands a later step's `--resume` is the one this \
+         process was started with, not one the agent reported back: {argv}"
     );
     assert!(
         !argv.contains("hello"),
