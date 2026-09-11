@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod model;
+pub mod prompt;
 pub mod scrub;
 pub mod store;
 

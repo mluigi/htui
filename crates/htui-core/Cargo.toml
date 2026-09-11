@@ -19,11 +19,13 @@ chrono     = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
+sha2       = { workspace = true }
 sqlx       = { version = "0.9.0", default-features = false, features = [
                "derive", "postgres", "sqlite", "uuid"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt"] }
+insta = { workspace = true }
 
 [lints]
 workspace = true
