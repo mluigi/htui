@@ -106,6 +106,10 @@ pub use acp::{
     AcpAdapter, AcpDriver, AcpIo, AcpSession, Handshake, SessionCommand, SessionOptions, Stamp,
     handshake, open_session,
 };
+// `CLI_ADAPTER_ID`, not `ADAPTER_ID`: at the crate root the bare name would claim to be *the*
+// adapter id, and there are two. The types keep their own names, which already say which transport
+// they belong to.
+pub use cli::{ADAPTER_ID as CLI_ADAPTER_ID, ClaudeStreamAdapter, CliDriver, CliSession};
 // `authenticate_acp`, not `authenticate`: at the crate root the bare name reads as the trait
 // method every transport has, and this one is the ACP driver's whole operation. The
 // `plan_install`/`resolve_tools` precedent below.
