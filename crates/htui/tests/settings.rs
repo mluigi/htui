@@ -405,34 +405,70 @@ async fn the_status_column_renders_each_probe_outcome() {
     insta::assert_snapshot!("agents_probed", rendered);
 }
 
-/// How wide the `name` column draws since D76's third donor: 8, the width every registry name in
-/// the tree fits in (`claude`, `agy`, `kappa`, `amp-acp`) and twice its own header.
+/// What the seven **fixed** columns cost together since D89: `transport` 9, `billing` 12, `models`
+/// 6, `default` 21, `enabled` 7, `quota` 13, `on this box` 13.
 ///
-/// The 4 characters it gave up are what took `on this box` back to the 15 `unauthenticated` needs.
-/// It is the one column here whose *fixture* names are longer than its content ever is in the
-/// registry — `needs-auth`, `spend-only`, `unparsable` and `loginable` are made-up row names — so
-/// [`row_line`] finds a row by the name **as drawn** rather than by the name as written.
-const NAME_WIDTH: usize = 8;
+/// Seven, not eight, because D89 made `name` the flexible one. Every other column sits at its own
+/// longest string, which is the arithmetic behind "widening `name` is never free": there is nothing
+/// in this figure that is not already being spent.
+const FIXED_TOTAL: usize = 81;
 
-/// Where the `default` column starts in a rendered row: `name`'s 8, `transport`'s 9, `billing`'s
-/// 12 and `models`' 6, plus one space of `column_spacing` after each.
-const DEFAULT_AT: usize = 39;
+/// The `column_spacing` this table draws: one column between each pair of eight, so seven.
+const GAPS: usize = 7;
+
+/// How wide the `name` column draws at a given section width — D89's reversal of D76's ranking.
+///
+/// `name` is `Constraint::Min(10)` and therefore the column that absorbs the slack, so its width
+/// is a **function of the render** rather than a constant, and so is the position of every column
+/// after it. 10 at [`SECTION_BORDERED`], which is exactly `claude-cli` and the reason the constraint
+/// is 10; 12 at [`SECTION_WIDE`]; 30 at a 120-column terminal. That growth is the whole of D89's
+/// "like 128" instruction made real.
+///
+/// It is also why [`row_line`] finds a row by the name **as drawn**: four of this file's made-up
+/// row names are longer than the narrow widths (`needs-auth`, `spend-only`, `unparsable`,
+/// `loginable`), and no registry name is.
+const fn name_width(section: usize) -> usize {
+    section - FIXED_TOTAL - GAPS
+}
+
+/// Where the `default` column starts: `name`'s own width, then `transport`'s 9, `billing`'s 12 and
+/// `models`' 6, plus one space of `column_spacing` after each.
+const fn default_at(section: usize) -> usize {
+    name_width(section) + 1 + 9 + 1 + 12 + 1 + 6 + 1
+}
 
 /// How wide the `default` column is since D76: exactly `gemini-3.7-flash-high`, the longest id the
-/// seeds carry.
+/// seeds carry. D89 did not touch it — it is D76's #1 and the one column D89's donor search was
+/// forbidden to reach.
 const DEFAULT_WIDTH: usize = 21;
 
-/// Where the `quota` column starts in a rendered row: the six fixed columns before it — 8, 9, 12,
-/// 6, 21, 7 — plus one space of `column_spacing` after each.
-const QUOTA_AT: usize = 69;
+/// Where the `quota` column starts: [`default_at`] plus `default`'s 21 and `enabled`'s 7, each with
+/// its space.
+const fn quota_at(section: usize) -> usize {
+    default_at(section) + DEFAULT_WIDTH + 1 + 7 + 1
+}
 
-/// Where `on this box` starts: [`QUOTA_AT`] plus the quota column's own 13 (D76) and its space.
-const ON_BOX_AT: usize = 83;
+/// Where `on this box` starts: [`quota_at`] plus the quota column's own 13 (D76) and its space.
+const fn on_box_at(section: usize) -> usize {
+    quota_at(section) + 13 + 1
+}
 
-/// How wide `on this box` draws at [`render_section`]'s [`SECTION_WIDE`] columns: whatever the
-/// seven fixed columns and their spacing leave it, which is what "the `Min` column absorbs what is
-/// left" amounts to. 17 here and 15 at [`SECTION_BORDERED`], and `unauthenticated` fits both.
-const ON_BOX_WIDE: usize = SECTION_WIDE as usize - ON_BOX_AT;
+/// How wide `on this box` draws — **13 at every width since D89**, which is the price D89 states.
+///
+/// It was the `Min` column under D76 and grew with the terminal; it is fixed now, because D89 made
+/// `name` the flexible one and `on this box` the donor that paid for it. So `unauthenticated` (15)
+/// and `choose a method` (15) clip at *every* width rather than at the narrow one only, which is
+/// what [`the_name_column_holds_the_whole_row_name_and_on_this_box_pays`] records.
+const ON_BOX_WIDTH: usize = 13;
+
+/// The `name` column at the width this file's snapshot suite renders in.
+const NAME_WIDTH: usize = name_width(SECTION_WIDE as usize);
+
+/// [`default_at`], [`quota_at`] and [`on_box_at`] at that same width, which is where all but one of
+/// this file's cases look.
+const DEFAULT_AT: usize = default_at(SECTION_WIDE as usize);
+const QUOTA_AT: usize = quota_at(SECTION_WIDE as usize);
+const ON_BOX_AT: usize = on_box_at(SECTION_WIDE as usize);
 
 /// The eight headers, in order.
 ///
@@ -484,6 +520,25 @@ fn quota_cell(rendered: &str, name: &str) -> String {
         .chars()
         .skip(QUOTA_AT)
         .take(ON_BOX_AT - QUOTA_AT)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+/// One cell of a row rendered at a width of this file's own choosing, for the one case whose
+/// subject *is* the width.
+///
+/// Needed since D89: `name` is the flexible column, so every column after it starts somewhere that
+/// depends on the render, and the constants above are only true at [`SECTION_WIDE`].
+fn cell_at(rendered: &str, name: &str, section: usize, from: usize, width: usize) -> String {
+    let drawn = name.chars().take(name_width(section)).collect::<String>();
+    rendered
+        .lines()
+        .find(|line| line.starts_with(&drawn))
+        .unwrap_or_else(|| panic!("the `{name}` row is rendered:\n{rendered}"))
+        .chars()
+        .skip(from)
+        .take(width)
         .collect::<String>()
         .trim_end()
         .to_owned()
@@ -551,24 +606,31 @@ async fn the_default_column_holds_the_whole_model_id() {
     }
 }
 
-/// D76's other half, and the one the third donor was needed for: the `on this box` column holds
-/// `unauthenticated` **whole**, at the [`SECTION_BORDERED`] width the running app draws in.
+/// D89's trade, both ends of it, at the [`SECTION_BORDERED`] width the running app draws in.
 ///
-/// `unauthenticated` is 15 characters and it is the verdict MOD-21's whole login flow starts from —
-/// `a` is offered on a row that says it, and `unauthentic` is not a shorter way of saying it but an
-/// unreadable one. Paying for the model id out of this column's slack alone left it 11 at 98, so
-/// `name` gave the missing 4: its own content never uses them (every registry name fits in 8), and
-/// it is the only one of the seven columns of which that is true.
+/// **This case inverts D76's.** It used to assert that `on this box` held `unauthenticated` whole,
+/// which is what `name`'s 12 → 8 narrowing had bought. D89 reverses the ranking: `name` is first
+/// now, `on this box` is the donor, and what this case pins is the new bargain rather than the old
+/// one.
 ///
-/// Asserted on the **same row and the same render** as the model id, because the two claims are the
-/// two ends of one trade: a fix for either that took width back off the other would pass one of
-/// these and fail the other, and this case is where that shows up as a test rather than as a
-/// screen.
+/// - `claude-cli` — the registry name MOD-2 milestone 8 adds, and the longest in the tree —
+///   renders **whole** at 98. That is what `Constraint::Min(10)` is for, and 10 is not a round
+///   number: it is that name's length, with nothing to spare.
+/// - `unauthenticated` renders `unauthenticat`, and this case **records that as accepted**. It is
+///   the stated price of D89 and not an accident. That verdict is where MOD-21's login flow starts
+///   — `a` is offered on a row that says it — and the reason it is the affordable loss is that this
+///   column carries status words, where `default` carries a selection coordinate and `quota`
+///   carries an exhaustion warning. A truncated status word is still legible as itself.
+/// - the model id still costs nothing, which is the half of D76 that D89 left standing.
+///
+/// Asserted on **one row and one render**, because the three claims are the ends of one trade: a
+/// change that took width back off any of them would pass one of these and fail another, and this
+/// is where that shows up as a test rather than as a screen.
 #[tokio::test]
-async fn the_on_box_column_holds_the_whole_unauthenticated_verdict() {
+async fn the_name_column_holds_the_whole_row_name_and_on_this_box_pays() {
     let bench = Bench::new().await;
     let mut row = probed_row(
-        "seeded",
+        "claude-cli",
         true,
         Some("1.1.26"),
         Some(json!({ "status": "unauthenticated", "source": "probe" })),
@@ -578,17 +640,69 @@ async fn the_on_box_column_holds_the_whole_unauthenticated_verdict() {
     let mut section = AgentsSection::new();
     bench.reply(&mut section, &StoreReply::Agents(vec![row]));
     let rendered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
+    let bordered = SECTION_BORDERED as usize;
 
     assert_eq!(
-        on_box_cell(&rendered, "seeded"),
-        "unauthenticated",
-        "the `on this box` column renders the probe's verdict whole:\n{rendered}"
+        cell_at(&rendered, "claude-cli", bordered, 0, name_width(bordered)),
+        "claude-cli",
+        "the `name` column renders the whole row name at the width the app actually \
+         draws:\n{rendered}"
     );
     assert_eq!(
-        default_cell(&rendered, "seeded"),
-        SEEDED_MODEL,
-        "and it did not cost the model id a character:\n{rendered}"
+        cell_at(
+            &rendered,
+            "claude-cli",
+            bordered,
+            on_box_at(bordered),
+            ON_BOX_WIDTH
+        ),
+        "unauthenticat",
+        "and `on this box` pays for it, which is D89's stated price and not a \
+         regression:\n{rendered}"
     );
+    assert_eq!(
+        cell_at(
+            &rendered,
+            "claude-cli",
+            bordered,
+            default_at(bordered),
+            DEFAULT_WIDTH
+        ),
+        SEEDED_MODEL,
+        "the model id still costs nothing — D76's #1 survives D89 untouched:\n{rendered}"
+    );
+}
+
+/// D89's other half: every character a wider terminal adds goes to `name` first.
+///
+/// This is the behaviour the maintainer asked for when they said "like 128", and the reason a
+/// literal `Length(128)` was refused rather than approximated — it is arithmetically impossible in
+/// a table that shares 91 columns, while `Min(10)` delivers the *growth* the instruction was
+/// actually about. At 160 columns `name` draws 72, which is a width no registry name will reach and
+/// is exactly the point: the column stops being the one that clips.
+#[tokio::test]
+async fn the_name_column_absorbs_every_character_a_wider_terminal_adds() {
+    let bench = Bench::new().await;
+    let row = probed_row("claude-cli", true, Some("1.1.26"), None);
+    let mut section = AgentsSection::new();
+    bench.reply(&mut section, &StoreReply::Agents(vec![row]));
+
+    for (width, expected) in [(98usize, 10usize), (100, 12), (120, 32), (160, 72)] {
+        assert_eq!(
+            name_width(width),
+            expected,
+            "the arithmetic D89 was decided on"
+        );
+        let rendered = render_section_at(
+            &section,
+            &bench.ctx(),
+            u16::try_from(width).expect("a terminal width"),
+        );
+        assert!(
+            rendered.lines().any(|line| line.starts_with("claude-cli")),
+            "and the name draws whole at {width} columns:\n{rendered}"
+        );
+    }
 }
 
 /// The `quota` column, one row per shape plan D73 names (`R-TUI-8`, `docs/ANA-4.md` §7).
@@ -922,20 +1036,22 @@ fn on_box_cell(rendered: &str, name: &str) -> String {
 
 /// One `on this box` expectation as the eighth column can actually draw it.
 ///
-/// D76 spent that column's slack on the whole model id and then bought 4 of it back from `name`,
-/// so the cell is [`ON_BOX_WIDE`] characters at this render and 15 at the bordered 98. Every
-/// *verdict* fits both — `unauthenticated` and `choose a method` are 15 exactly, and
-/// [`the_on_box_column_holds_the_whole_unauthenticated_verdict`] is what pins that. What is left
-/// over the line is the install progress cells (`downloading 12.0 MB` is 19), which exceeded the
-/// 17 this column drew before D76 as well: no width was ever spent on them and none is now.
+/// [`ON_BOX_WIDTH`] characters, at **every** render width since D89 made this the donor column and
+/// `name` the flexible one. That is a wider net than it used to be: under D76 this column grew with
+/// the terminal and only the bordered 98 clipped, so an expectation written whole passed at 100 and
+/// the one case that mattered was asserted at 98. Now `unauthenticated` and `choose a method` (15
+/// each) clip everywhere, and [`the_name_column_holds_the_whole_row_name_and_on_this_box_pays`] is
+/// where that is recorded as the price rather than as damage. The install progress cells
+/// (`downloading 12.0 MB`, 19) were already over the line before D76 and no width was ever spent on
+/// them.
 ///
 /// So the expectations stay written **whole**, because they are what the section computed and a
-/// test with `downloading 1` inlined in it would read as a bug rather than as a packing decision;
+/// test with `unauthenticat` inlined in it would read as a bug rather than as a packing decision;
 /// this clips them the way the frame does.
 fn as_drawn(expected: &str) -> String {
     expected
         .chars()
-        .take(ON_BOX_WIDE)
+        .take(ON_BOX_WIDTH)
         .collect::<String>()
         .trim_end()
         .to_owned()

@@ -34,16 +34,27 @@ use serde_json::{Value, json};
 /// before `a`: the cursor is what `a` acts on.
 const ROW: &str = "demo-login";
 
-/// Where `on this box` starts in a rendered row: the seven columns before it — MOD-2 D76's `name`
-/// 8, 9, 12, 6, D76's `default` 21, 7 and D73's `quota` 13 — plus one space of `column_spacing`
-/// after each. That leaves the eighth column 15 inside the pane's border, which is exactly what
-/// `unauthenticated` needs, and the 4 characters it needed came from `name`.
-const ON_BOX_AT: usize = 83;
+/// Where `on this box` starts in a rendered row: the seven columns before it — MOD-2 D89's `name`
+/// 10, then 9, 12, 6, D76's `default` 21, 7 and D73's `quota` 13 — plus one space of
+/// `column_spacing` after each.
+///
+/// **D89 moved this by 2.** `name` became the table's flexible column and `on this box` became the
+/// donor that paid for it, fixed at [`ON_BOX_WIDTH`]. Inside the Settings pane's border the section
+/// draws 98, so `name` draws 10 here.
+const ON_BOX_AT: usize = 85;
 
-/// How wide the `name` column draws (D76). [`ROW`] is 10 characters, so the first cell of this
-/// file's row reads `demo-log`: a made-up fixture name longer than any name the registry carries,
-/// and the only thing in the suite that column's donation clips.
-const NAME_WIDTH: usize = 8;
+/// How wide `on this box` draws since D89: 13 at every width, because it is no longer the column
+/// that absorbs the slack. `unauthenticated` is 15 and therefore clips — the stated price of D89,
+/// which [`the_name_column_holds_the_whole_row_name_and_on_this_box_pays`] in `tests/settings.rs`
+/// records as accepted rather than as damage.
+///
+/// [`the_name_column_holds_the_whole_row_name_and_on_this_box_pays`]: crate
+const ON_BOX_WIDTH: usize = 13;
+
+/// How wide the `name` column draws inside the pane's border (D89): 10, which is what
+/// `Constraint::Min(10)` guarantees at the narrowest width the app draws in. [`ROW`] is 10
+/// characters and now renders **whole**, where D76's 8 clipped it to `demo-log`.
+const NAME_WIDTH: usize = 10;
 
 /// The one method the fixture advertises. A made-up id: the chooser is fed by the agent's own live
 /// `initialize`, so a case only ever needs *an* id.
@@ -319,16 +330,19 @@ impl Rig {
     /// `a`, then the chooser the agent's own `initialize` fed.
     async fn start_login(&mut self) {
         self.harness.key("a");
-        self.until("offered a method", |frame| {
-            frame.contains("choose a method")
-        })
-        .await;
+        // `choose a meth`, not `choose a method`: D89 fixed the `on this box` column at
+        // [`ON_BOX_WIDTH`] and this prompt is 15 characters, so the frame carries the clipped form.
+        // Matching the whole string here would wait out [`PATIENCE`] on a screen that is doing
+        // exactly what it was asked to — which is the failure this comment exists to prevent
+        // somebody re-introducing.
+        self.until("offered a method", |frame| frame.contains("choose a meth"))
+            .await;
     }
 
     /// The login row's line, unbordered, found by the name **as the `name` column drew it**.
     ///
-    /// Clipped to [`NAME_WIDTH`]: [`ROW`] is this file's own made-up name and is longer than any
-    /// the registry carries, so it is the one place D76's donation is visible.
+    /// Taken at [`NAME_WIDTH`]: [`ROW`] is exactly that long, so since D89 it draws whole and this
+    /// is a prefix of the full name rather than a clip of it.
     fn row_line(&mut self) -> String {
         let frame = self.harness.render();
         let drawn = ROW.chars().take(NAME_WIDTH).collect::<String>();
@@ -402,7 +416,7 @@ async fn a_then_enter_logs_in_and_the_cell_reads_the_probes_verdict() {
     let mut rig = Rig::new(&[("FIXTURE_KEY", "set"), ("FIXTURE_CRED", CREDENTIAL)]).await;
     assert_eq!(
         rig.on_box_cell(),
-        "unauthenticated",
+        "unauthenticat",
         "the box starts where the probe left it"
     );
 
@@ -423,7 +437,7 @@ async fn a_then_enter_logs_in_and_the_cell_reads_the_probes_verdict() {
     );
     assert_ne!(
         rig.on_box_cell(),
-        "unauthenticated",
+        "unauthenticat",
         "the cell was re-read from that row: {}",
         rig.harness.render()
     );
@@ -453,7 +467,7 @@ async fn a_then_enter_into_no_credential_still_reads_unauthenticated() {
         rig.stored_status().await.as_deref(),
         Some("unauthenticated")
     );
-    assert_eq!(rig.on_box_cell(), "unauthenticated");
+    assert_eq!(rig.on_box_cell(), "unauthenticat");
 }
 
 /// `x` mid-login: the runtime is asked to stop, the stream ends `Cancelled`, and the row goes back
@@ -483,7 +497,7 @@ async fn x_mid_login_ends_cancelled_and_the_cell_goes_back() {
     assert!(frame.contains("login cancelled"), "{frame}");
     assert_eq!(
         rig.on_box_cell(),
-        "unauthenticated",
+        "unauthenticat",
         "a cancelled login leaves the box exactly as it found it: {frame}"
     );
     assert_eq!(

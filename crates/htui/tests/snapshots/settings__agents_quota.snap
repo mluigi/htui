@@ -2,11 +2,11 @@
 source: crates/htui/tests/settings.rs
 expression: rendered
 ---
-name     transport billing      models default               enabled quota         on this box
-windows  acp       subscription 0      —                     yes     62% to 09-08  0.48.0
-spend-on acp       subscription 0      —                     yes     $0.39 spent   0.48.0
-no-blob  acp       subscription 0      —                     yes     —             0.48.0
-unparsab acp       subscription 0      —                     yes     —             0.48.0
+name         transport billing      models default               enabled quota         on this box
+windows      acp       subscription 0      —                     yes     62% to 09-08  0.48.0
+spend-only   acp       subscription 0      —                     yes     $0.39 spent   0.48.0
+no-blob      acp       subscription 0      —                     yes     —             0.48.0
+unparsable   acp       subscription 0      —                     yes     —             0.48.0
 
 
 

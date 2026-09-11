@@ -1018,63 +1018,62 @@ impl AgentsSection {
         ])
         .style(ctx.theme.title);
 
-        // MOD-2 D76's packing. The eight columns want ~107 characters and the bordered section
-        // draws in 98 (hazard H-12), so the width does not divide and a **ranking** decides it
-        // rather than arithmetic. The maintainer's order, highest first: the whole `default_model`
-        // string; then the quota window's reset time; then `on this box`'s slack.
+        // MOD-2 D89's packing, which **reverses D76's ranking**. The eight columns want ~107
+        // characters and the bordered section draws in 98 (hazard H-12), so the width does not
+        // divide and a **ranking** decides it rather than arithmetic. D76's order put the whole
+        // `default_model` string first, the quota window's reset time second and `on this box`'s
+        // slack third, and paid the remainder out of `name`, which it narrowed 12 → 8. D89 puts
+        // `name` **first** and makes `on this box` the donor.
         //
-        // So `default` is 21 — `gemini-3.7-flash-high`, the longest id the seeds carry — because
-        // that id is the coordinate `docs/ANA-4.md` §4.4 selects a model by, and `gemini-3.` under
-        // the old `Length(9)` named nothing at all. The 12 characters it needed were bought as
-        // follows, and the last of the three donors was found only after the first two had left
-        // `on this box` too narrow for its own longest verdict:
+        // The instruction was "settings name should be wider, like 128". A literal `Length(128)`
+        // is arithmetically impossible and `Max(128)` would have delivered nothing: with
+        // `column_spacing` 1 across 7 gaps the eight columns share exactly **91** at the bordered
+        // 98, and 128 for one column exceeds the whole table. `Min(10)` is what makes the intent
+        // real instead of nominal — 10 is the longest registry name in the tree rendered whole at
+        // the narrow guard width, and **every character a wider terminal adds goes to `name`
+        // first**: 30 at a 120-column terminal, 70 at 160. That is the "like 128" behaviour without
+        // the impossible constant.
         //
-        // - `quota` gave 6, which is exactly the reset's ` %H:%M` (19 → 13): `62% to 09-08 08:00`
-        //   now reads `62% to 09-08`. [`reset_of`] drops the time by *format* rather than by clip,
-        //   so `100% to 09-08` — the exhausted window this column exists to warn about — still
-        //   fits whole in 13.
-        // - `on this box` gave 6 of slack, and that was 4 too many. `Min(11)` is its header, but
-        //   its *cells* are longer: `unauthenticated` is 15, and 15 is the width this column has to
-        //   have because that word is MOD-21's whole login flow written into one cell — `a` is
-        //   offered on an `unauthenticated` row, and `unauthentic` is not a shorter way of saying
-        //   so. `choose a method` is 15 for the same reason.
-        // - `name` gave the missing 4 (12 → 8), which is why it is the third donor rather than an
-        //   untouched column. It is the **only** one of the seven whose content is shorter than its
-        //   allowance, so it is the only one that can give width up without giving anything
-        //   observable up: its header is `name` (4) and every registry name in the tree fits in 8 —
-        //   the two seeded rows are 6 and 3, the demo fixture's is 5, and the longest is the 7 of
-        //   the vendor id MOD-20's live install proof registers, which this comment deliberately
-        //   does not spell: `tests/extensibility.rs`'s `R-AGT-5` sweep refuses a vendor name in a
-        //   production file, comments included, and it is right to. The other four are each already
-        //   at their own longest string:
-        //   `transport` (9), `models` (6) and `enabled` (7) at their headers, `billing` (12) at
-        //   `subscription`.
+        // Widening `name` is never free, and this is the arithmetic that says so. Each of the other
+        // seven already sits at its own floor: `transport` (9), `models` (6) and `enabled` (7) at
+        // their headers, `billing` (12) at `subscription`, `default` (21) at
+        // `gemini-3.7-flash-high` — the model id `docs/ANA-4.md` §4.4 selects by, and D76's own #1 —
+        // and `quota` (13) at `100% to 09-08`, the exhausted window that column exists to warn
+        // about. So the width had to come out of a column that was already spending it.
         //
-        // That leaves 8 + 9 + 12 + 6 + 21 + 7 + 13 = 76 fixed, plus 7 single-space gaps of
-        // `column_spacing`, so the `Min` column draws 15 at the bordered 98 and every character a
-        // wider terminal adds still goes to it first.
+        // **The donor is `on this box`, and its price is stated rather than discovered.** Fixed at
+        // 13, its two longest cells clip: `unauthenticated` (15) renders `unauthenticat` and
+        // `choose a method` (15) renders `choose a meth`. Both are MOD-21's login flow written into
+        // a cell, and clipping them is a real loss — the reason it is the affordable one is that
+        // `on this box` carries *status words*, where `default` carries a selection coordinate and
+        // `quota` carries an exhaustion warning, and a truncated status word is still legible as
+        // itself. D76 had already ranked this column's slack last for the same reason. The `a` key
+        // is still offered on the row.
         //
-        // What is *still* clipped at 15, and is not new damage: the install progress cells, whose
-        // longest is `downloading 12.0 MB` (19). That one exceeded the old 17 as well, so no width
-        // was ever spent on it; a clipped byte count is a figure that keeps ticking on the next
-        // frame, which is the one thing here that a status word is not.
+        // That leaves 9 + 12 + 6 + 21 + 7 + 13 + 13 = 81 fixed, plus 7 single-space gaps, so the
+        // `Min` column draws 10 at the bordered 98 — exactly a whole name at the guard width, with
+        // nothing to spare, which is the point.
+        //
+        // What is *still* clipped, and is not new damage: the install progress cells, whose longest
+        // is `downloading 12.0 MB` (19). That one exceeded D76's 15 as well, so no width was ever
+        // spent on it; a clipped byte count is a figure that keeps ticking on the next frame, which
+        // is the one thing here that a status word is not.
         //
         // The floor under the whole trade is that **all eight headers stay readable**, and above
-        // that floor a column may only donate what its own content does not use. A ninth column
-        // (MOD-23's editor, MOD-12's caps section) has to be paid for out of this same 98, and
-        // there is no slack of the `name` kind left to pay with — so it costs a ranking decision
-        // like D76's, not an adjustment.
+        // that floor a column may only donate what its own content does not use. There is no slack
+        // of the old `name` kind left anywhere in the row: a ninth column (MOD-23's editor,
+        // MOD-12's caps section) costs another ranking decision like this one, not an adjustment.
         let table = Table::new(
             rows,
             [
-                Constraint::Length(8),
+                Constraint::Min(10),
                 Constraint::Length(9),
                 Constraint::Length(12),
                 Constraint::Length(6),
                 Constraint::Length(21),
                 Constraint::Length(7),
                 Constraint::Length(13),
-                Constraint::Min(11),
+                Constraint::Length(13),
             ],
         )
         .header(header)
