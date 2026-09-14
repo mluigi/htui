@@ -1,0 +1,10 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: rendered
+---
+<section name="skills">
+<skill name="rust-style" version="2">
+Prefer `expect` with a reason over `unwrap`.
+No `unsafe`.
+</skill>
+</section>

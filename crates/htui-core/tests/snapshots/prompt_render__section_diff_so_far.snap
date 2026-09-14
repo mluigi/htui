@@ -1,0 +1,13 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::wrap(&render::diff(SectionName::DiffSoFar,\nhandoff.diff_so_far.as_ref().expect(\"a diff so far\"), false,))"
+---
+<section name="diff_so_far" range="abc1234..HEAD">
+ 2 files changed, 210 insertions(+)
+
+```
+--- a/trim.rs
++++ b/trim.rs
++fn run() {}
+```
+</section>

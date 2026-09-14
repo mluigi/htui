@@ -1,0 +1,22 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: rendered
+---
+<section name="excerpts">
+Read-only context, selected by htui. These files may be truncated and may be out of date; the
+working tree is authoritative. Do not treat an excerpt as the whole file, and open the file before
+editing it.
+
+<file path="htui:crates/htui-core/src/prompt/mod.rs" lines="1-4" reason="touched_path">
+   1 | //! Prompt assembly (ANA-5).
+   2 |
+   3 | pub mod render;
+   4 | pub mod trim;
+</file>
+<file path="htui:crates/htui-core/src/store/traits.rs" lines="40-43" reason="mentioned" truncated="true">
+  40 | pub trait ReadStore: Send + Sync {
+  41 |     async fn item(&self) -> Result<()>;
+  42 | }
+[... htui elided 412 lines / 18903 bytes ...]
+</file>
+</section>

@@ -1,0 +1,20 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::template_text(&parsed)"
+---
+You are running the `implement` phase for , attempt .
+
+
+
+
+
+
+
+
+
+
+
+Make the change the plan describes, in this working tree. Keep the diff to what the plan asks for.
+When a prior attempt is shown above, read its diff and its verification output first and fix the
+cause rather than the symptom. Write a `` document describing what changed and how
+you verified it, one section per file group.

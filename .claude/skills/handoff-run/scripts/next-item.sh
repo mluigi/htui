@@ -46,6 +46,7 @@ source "${SCRIPT_DIR}/workflow-patterns.sh"
 KNOWN_REPOS="workspace engine vfs settings logging VulkanTutorials"
 REPO_ALT="workspace|engine|vfs|settings|logging|VulkanTutorials"
 BLOCKED_PATTERN="[Bb]locked on[[:space:]]+(the[[:space:]]+)?(\\*\\*)?((${REPO_ALT})[[:space:]]+)?(\\*\\*)?((${PREFIX_ALT})-[0-9]+)"
+FOLLOW_PATTERN="^[,[:space:]]+(and[[:space:]]+)?(\\*\\*)?((${REPO_ALT})[[:space:]]+)?(\\*\\*)?((${PREFIX_ALT})-[0-9]+)"
 
 
 US=$'\x1e'  # item-body / blocker-record separator
@@ -191,23 +192,35 @@ get_blocked_refs() {
     # item's.
     REFS_REPO=(); REFS_ID=(); REFS_PARTIAL=(); REFS_TEXT=()
     local body="${ITEM_BODY[$1]}"
-    local -a lines=()
-    IFS="$US" read -ra lines <<< "$body"
-    local line
-    for line in "${lines[@]}"; do
-        local -a phase_spans=()
-        while IFS= read -r pspan; do
-            [[ -n "$pspan" ]] && phase_spans+=("$pspan")
-        done < <(printf '%s\n' "$line" | grep -oE 'Phase[[:space:]]+[0-9]+[[:space:]]*\([^)]*\)' 2>/dev/null || true)
-        local remaining="$line" matched repo id partial span
-        while [[ "$remaining" =~ $BLOCKED_PATTERN ]]; do
-            matched="${BASH_REMATCH[0]}"; repo="${BASH_REMATCH[4]}"; id="${BASH_REMATCH[6]}"
-            partial=0
+    local bodytext="${body//$US/ }"
+    local -a phase_spans=()
+    while IFS= read -r pspan; do
+        [[ -n "$pspan" ]] && phase_spans+=("$pspan")
+    done < <(printf '%s\n' "$bodytext" | grep -oE 'Phase[[:space:]]+[0-9]+[[:space:]]*\([^)]*\)' 2>/dev/null || true)
+    
+    local remaining="$bodytext" matched repo id partial span f_matched f_repo f_id f_partial
+    while [[ "$remaining" =~ $BLOCKED_PATTERN ]]; do
+        matched="${BASH_REMATCH[0]}"; repo="${BASH_REMATCH[4]}"; id="${BASH_REMATCH[6]}"
+        partial=0
+        for span in "${phase_spans[@]:-}"; do
+            case "$span" in *"$matched"*) partial=1; break ;; esac
+        done
+        REFS_REPO+=("$repo"); REFS_ID+=("$id"); REFS_PARTIAL+=("$partial"); REFS_TEXT+=("$(trim "$matched")")
+        remaining="${remaining#*"$matched"}"
+        
+        while [[ "$remaining" =~ $FOLLOW_PATTERN ]]; do
+            f_matched="${BASH_REMATCH[0]}"; f_repo="${BASH_REMATCH[4]}"; f_id="${BASH_REMATCH[6]}"
+            if [[ -z "$f_repo" ]]; then
+                f_repo="$repo"
+            else
+                repo="$f_repo"
+            fi
+            f_partial=0
             for span in "${phase_spans[@]:-}"; do
-                case "$span" in *"$matched"*) partial=1; break ;; esac
+                case "$span" in *"$f_matched"*) f_partial=1; break ;; esac
             done
-            REFS_REPO+=("$repo"); REFS_ID+=("$id"); REFS_PARTIAL+=("$partial"); REFS_TEXT+=("$(trim "$line")")
-            remaining="${remaining#*"$matched"}"
+            REFS_REPO+=("$f_repo"); REFS_ID+=("$f_id"); REFS_PARTIAL+=("$f_partial"); REFS_TEXT+=("$(trim "$f_matched")")
+            remaining="${remaining#*"$f_matched"}"
         done
     done
 }
@@ -513,6 +526,10 @@ run_self_test() {
 - [ ] **MOD-10 - Depends locally.** Body is blocked on MOD-11 landing first.
 - [ ] **MOD-11 - The unblocker.** body
 - [ ] **MOD-12 - Phase-scoped.** Phase 1 free. Phase 2 (blocked on vfs MOD-2) later.
+- [ ] **MOD-13 - Two ID blocker.** Blocked on MOD-11, MOD-14.
+- [ ] **MOD-14 - Wrapped blocker.** Blocked on
+MOD-11, and MOD-15 wrapping to the next line.
+- [ ] **MOD-15 - Just another.** body
 
 ## Analyses
 
@@ -531,15 +548,17 @@ EOF
     local -a saved_dep=("${ITEM_DEPENDENTS[@]}") saved_srank=("${ITEM_SECTIONRANK[@]}") saved_blockers=("${ITEM_BLOCKERS[@]}")
     idx_of() { local want="$1" i; for ((i = 0; i < ${#saved_id[@]}; i++)); do [[ "${saved_id[i]}" == "$want" ]] && { printf '%s' "$i"; return; }; done; printf -- '-1'; }
 
-    [[ "$BC_N" -ne 8 ]] && failures+=("parse: expected 8 open items, got $BC_N")
-    local i7 i8 i9 i12 i11 i1clean
-    i7="$(idx_of MOD-7)"; i8="$(idx_of MOD-8)"; i9="$(idx_of MOD-9)"; i12="$(idx_of MOD-12)"; i11="$(idx_of MOD-11)"; i1clean="$(idx_of CLEAN-1)"
+    [[ "$BC_N" -ne 11 ]] && failures+=("parse: expected 11 open items, got $BC_N")
+    local i7 i8 i9 i12 i11 i13 i14 i15 i1clean
+    i7="$(idx_of MOD-7)"; i8="$(idx_of MOD-8)"; i9="$(idx_of MOD-9)"; i12="$(idx_of MOD-12)"; i11="$(idx_of MOD-11)"; i13="$(idx_of MOD-13)"; i14="$(idx_of MOD-14)"; i15="$(idx_of MOD-15)"; i1clean="$(idx_of CLEAN-1)"
     [[ "${saved_elig[i7]}" != 'blocked' ]] && failures+=("E1-open: MOD-7 expected blocked, got ${saved_elig[i7]}")
     [[ "${saved_elig[i8]}" != 'eligible' ]] && failures+=("E1-closed: MOD-8 expected eligible, got ${saved_elig[i8]}")
     [[ "${saved_elig[i9]}" != 'blocked?' ]] && failures+=("E1-unverifiable: MOD-9 expected blocked?, got ${saved_elig[i9]}")
     [[ "${saved_elig[i12]}" != 'eligible' ]] && failures+=("phase-scoped: MOD-12 expected eligible, got ${saved_elig[i12]}")
     case "${saved_blockers[i12]}" in *"${FS}1${FS}"*) ;; *) failures+=('phase-scoped: MOD-12 blocker not marked Partial') ;; esac
-    [[ "${saved_dep[i11]}" -ne 1 ]] && failures+=("R2: MOD-11 expected 1 dependent, got ${saved_dep[i11]}")
+    [[ "${saved_dep[i11]}" -ne 3 ]] && failures+=("R2: MOD-11 expected 3 dependents, got ${saved_dep[i11]}")
+    [[ "${saved_dep[i14]}" -ne 1 ]] && failures+=("R2: MOD-14 expected 1 dependent, got ${saved_dep[i14]}")
+    [[ "${saved_dep[i15]}" -ne 1 ]] && failures+=("R2: MOD-15 expected 1 dependent, got ${saved_dep[i15]}")
     [[ "${saved_srank[i1clean]}" != '3' ]] && failures+=("R3: CLEAN-1 expected section rank 3, got ${saved_srank[i1clean]}")
     [[ "${saved_id[${RANKED_IDX[0]}]}" != 'MOD-11' ]] && failures+=("rank: expected MOD-11 first (R2), got ${saved_id[${RANKED_IDX[0]}]}")
     [[ "$RANK_DECIDEDBY" != 'R2 unblocks-others' ]] && failures+=("decidedBy: expected R2, got $RANK_DECIDEDBY")
@@ -567,7 +586,7 @@ EOF
     rm -rf "$tmp"
 
     if [[ ${#failures[@]} -eq 0 ]]; then
-        echo 'Self-test: 14/14 assertions PASS.'
+        echo 'Self-test: 17/17 assertions PASS.'
         return 0
     fi
     echo "Self-test FAIL (${#failures[@]}):"

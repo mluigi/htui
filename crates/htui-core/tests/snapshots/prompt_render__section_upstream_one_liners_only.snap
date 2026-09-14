@@ -1,0 +1,10 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::wrap(&render::upstream(&spec.upstream,\n&all_one_liners).expect(\"three rows\"))"
+---
+<section name="upstream">
+also upstream:
+- htui:ANA-9 - Postgres schema (closed) - no summary yet
+- htui:MOD-7 - Box registry and capabilities (in_progress) - no summary yet
+- auth-service:MOD-1 - Token rotation (done)
+</section>

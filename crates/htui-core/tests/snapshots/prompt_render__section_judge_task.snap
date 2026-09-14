@@ -1,0 +1,7 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::wrap(&render::judge_task(&judge.task))"
+---
+<section name="judge_task">
+You are running the `implement` phase for htui:MOD-2, attempt 1.
+</section>

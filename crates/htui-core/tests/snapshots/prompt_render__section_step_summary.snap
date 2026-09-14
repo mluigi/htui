@@ -1,0 +1,11 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::wrap(&render::step_summary(&handoff.step_summary))"
+---
+<section name="step_summary" turns="3" events="217">
+Tool calls, in order: read(6), edit(9), execute(6).
+Files edited: crates/htui-core/src/prompt/mod.rs, crates/htui-core/src/prompt/trim.rs.
+Errors: 1 - `command_failed` — `cargo test` exited 101 at turn 2
+Last assistant message (turn 3, tail):
+I cannot get the borrow checker past the trim loop.
+</section>

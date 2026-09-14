@@ -122,17 +122,40 @@ function Get-BlockedRefs {
     $refs = @()
     $repoAlt = ($KnownRepos -join '|')
     $refPattern = "blocked on\s+(?:the\s+)?(?:\*\*)?(?:(?<repo>$repoAlt)\s+)?(?:\*\*)?(?<id>$PrefixPattern-\d+)"
-    foreach ($line in $Item.Body) {
-        foreach ($m in [regex]::Matches($line, $refPattern, 'IgnoreCase')) {
-            $partial = [regex]::IsMatch(
-                $line.Substring(0, $m.Index),
-                'Phase\s+\d+\s*\([^)]*$', 'IgnoreCase')
+    $followPattern = "^[, \n\r\t]+(?:and\s+)?(?:\*\*)?(?:(?<repo>$repoAlt)\s+)?(?:\*\*)?(?<id>$PrefixPattern-\d+)"
+    
+    $bodyText = $Item.Body -join " "
+    
+    foreach ($m in [regex]::Matches($bodyText, $refPattern, 'IgnoreCase')) {
+        $partial = [regex]::IsMatch(
+            $bodyText.Substring(0, $m.Index),
+            'Phase\s+\d+\s*\([^)]*$', 'IgnoreCase')
+            
+        $repo = $m.Groups['repo'].Value
+        $refs += [pscustomobject]@{
+            Repo    = $repo  # '' = unqualified, resolved locally
+            Id      = $m.Groups['id'].Value
+            Partial = $partial
+            Text    = $m.Value.Trim()
+        }
+        
+        $idx = $m.Index + $m.Length
+        $remaining = $bodyText.Substring($idx)
+        $f_match = [regex]::Match($remaining, $followPattern, 'IgnoreCase')
+        while ($f_match.Success) {
+            $f_repo = $f_match.Groups['repo'].Value
+            if (-not $f_repo) { $f_repo = $repo } else { $repo = $f_repo }
+            
+            # Use the same partial status for the whole list
             $refs += [pscustomobject]@{
-                Repo    = $m.Groups['repo'].Value  # '' = unqualified, resolved locally
-                Id      = $m.Groups['id'].Value
+                Repo    = $f_repo
+                Id      = $f_match.Groups['id'].Value
                 Partial = $partial
-                Text    = $line.Trim()
+                Text    = $f_match.Value.Trim()
             }
+            $idx += $f_match.Length
+            $remaining = $bodyText.Substring($idx)
+            $f_match = [regex]::Match($remaining, $followPattern, 'IgnoreCase')
         }
     }
     return $refs
@@ -348,6 +371,10 @@ function Invoke-SelfTest {
 - [ ] **MOD-10 - Depends locally.** Body is blocked on MOD-11 landing first.
 - [ ] **MOD-11 - The unblocker.** body
 - [ ] **MOD-12 - Phase-scoped.** Phase 1 free. Phase 2 (blocked on vfs MOD-2) later.
+- [ ] **MOD-13 - Two ID blocker.** Blocked on MOD-11, MOD-14.
+- [ ] **MOD-14 - Wrapped blocker.** Blocked on
+MOD-11, and MOD-15 wrapping to the next line.
+- [ ] **MOD-15 - Just another.** body
 
 ## Analyses
 
@@ -362,13 +389,15 @@ function Invoke-SelfTest {
         $r = Rank-Candidates -Items $data.Items
         $byId = @{}; foreach ($i in $data.Items) { $byId[$i.Id] = $i }
 
-        if ($data.Items.Count -ne 8) { $failures += "parse: expected 8 open items, got $($data.Items.Count)" }
+        if ($data.Items.Count -ne 11) { $failures += "parse: expected 11 open items, got $($data.Items.Count)" }
         if ($byId['MOD-7'].Eligibility -ne 'blocked') { $failures += "E1-open: MOD-7 expected blocked, got $($byId['MOD-7'].Eligibility)" }
         if ($byId['MOD-8'].Eligibility -ne 'eligible') { $failures += "E1-closed: MOD-8 expected eligible, got $($byId['MOD-8'].Eligibility)" }
         if ($byId['MOD-9'].Eligibility -ne 'blocked?') { $failures += "E1-unverifiable: MOD-9 expected blocked?, got $($byId['MOD-9'].Eligibility)" }
         if ($byId['MOD-12'].Eligibility -ne 'eligible') { $failures += "phase-scoped: MOD-12 expected eligible, got $($byId['MOD-12'].Eligibility)" }
         if (@($byId['MOD-12'].Blockers | Where-Object Partial).Count -lt 1) { $failures += 'phase-scoped: MOD-12 blocker not marked Partial' }
-        if ($byId['MOD-11'].Dependents -ne 1) { $failures += "R2: MOD-11 expected 1 dependent, got $($byId['MOD-11'].Dependents)" }
+        if ($byId['MOD-11'].Dependents -ne 3) { $failures += "R2: MOD-11 expected 3 dependents, got $($byId['MOD-11'].Dependents)" }
+        if ($byId['MOD-14'].Dependents -ne 1) { $failures += "R2: MOD-14 expected 1 dependent, got $($byId['MOD-14'].Dependents)" }
+        if ($byId['MOD-15'].Dependents -ne 1) { $failures += "R2: MOD-15 expected 1 dependent, got $($byId['MOD-15'].Dependents)" }
         if ($byId['CLEAN-1'].SectionRank -ne 3) { $failures += "R3: CLEAN-1 expected section rank 3, got $($byId['CLEAN-1'].SectionRank)" }
         if ($r.Ranked[0].Id -ne 'MOD-11') { $failures += "rank: expected MOD-11 first (R2), got $($r.Ranked[0].Id)" }
         if ($r.DecidedBy -ne 'R2 unblocks-others') { $failures += "decidedBy: expected R2, got $($r.DecidedBy)" }
@@ -400,7 +429,7 @@ function Invoke-SelfTest {
     }
 
     if ($failures.Count -eq 0) {
-        Write-Host 'Self-test: 14/14 assertions PASS.'
+        Write-Host 'Self-test: 17/17 assertions PASS.'
         return 0
     }
     Write-Host "Self-test FAIL ($($failures.Count)):"

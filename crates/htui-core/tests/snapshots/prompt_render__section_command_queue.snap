@@ -1,0 +1,7 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: rendered
+---
+<section name="command_queue">
+Route builds, test suites and verification through the `command_run` tool rather than a shell: htui queues them per box under `R-MCP-4` and records their output on this step. Run everything else directly.
+</section>

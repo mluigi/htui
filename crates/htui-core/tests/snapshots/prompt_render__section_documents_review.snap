@@ -1,0 +1,11 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: rendered
+---
+<section name="documents:review" kind="review" version="1">
+---
+verdict: request-changes
+---
+
+The recorder never flushes.
+</section>

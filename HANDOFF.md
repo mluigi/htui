@@ -14,9 +14,8 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-14):** **CLEAN-1 shipped** (`docs/decisions/clean/clean-1.md`): Fixed rustdoc private and ambiguous links in htui-agent.
-Before it, **TOOL-6 shipped** (`docs/decisions/tool/tool-6.md`): Fixed shell-redirection race condition in tests/launch.rs. **TOOL-2 concluded** (`docs/decisions/tool/tool-2.md`): Fixed demo fixture username collision and made database test skips in CI distinguishable.
-Before it, **TOOL-4 concluded** (`docs/decisions/tool/tool-4.md`): Fixed TOCTOU race condition test flake in `tests/auth.rs`.
+**Current status (2026-09-14):** **TOOL-1 concluded** (`docs/decisions/tool/tool-1.md`): Fixed next-item blocked-on regex to count multiple IDs per phrase.
+Before it, **CLEAN-1 shipped** (`docs/decisions/clean/clean-1.md`): Fixed rustdoc private and ambiguous links in htui-agent. **TOOL-6 shipped** (`docs/decisions/tool/tool-6.md`): Fixed shell-redirection race condition in tests/launch.rs.
 **MOD-2 milestone 8 landed** (`a3cbfff`..`42294d8`, phase note
 below): an agent that speaks no ACP — only its own headless JSON stream — now reaches the same chat
 tab, recorder, store rows and replay as an ACP one, losing exactly three event kinds and saying so
@@ -732,14 +731,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 ### Tooling findings
 
-- [ ] **TOOL-1 - next-item blocked-on regex counts only the first ID per phrase.**
-  `next-item.ps1` / `.sh` (`$refPattern`, line ~124) match `blocked on <ID>` once, so
-  comma-separated blockers (`Blocked on ANA-4, ANA-5` on MOD-2; `Blocked on ANA-7, MOD-2` on
-  MOD-10, wrapping to the next line) drop every ID after the first: R2 dependent counts undercount,
-  and a wrapped blocker can hide entirely. Fix both twins identically (repeat-match the ID list
-  after the phrase, join across a line wrap), add a fixture with a two-ID and a wrapped case, keep
-  the `WORKFLOW_ALLOW_SH_ON_WINDOWS=1` parity check green. Found during `/handoff-run next` on
-  2026-09-04.
 - [ ] **TOOL-3 - The Windows lint target cannot be built on this box, and MOD-20 made that bite.**
   `R-NF-3`, `R-AGT-1`. `cargo clippy --target x86_64-pc-windows-msvc` dies in `ring`'s build script
   with `error occurred in cc-rs: failed to find tool "lib.exe"`: cross-compiling `ring`'s C needs an
@@ -769,4 +760,4 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | ANA-N   | 2 (ANA-3 context tools, ANA-11 requirements/decisions models)              |
 | MOD-N   | 24 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                        |
-| TOOL-N  | 2 (TOOL-1 next-item blocked-on regex, TOOL-3 Windows lint target unbuildable) |
+| TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

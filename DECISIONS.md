@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[TOOL-1](docs/decisions/tool/tool-1.md)** - next-item blocked-on regex counts only the first ID per phrase (concluded, 2026-09-14)
 - **[CLEAN-1](docs/decisions/clean/clean-1.md)** - `cargo doc` cannot build `htui-agent` (shipped, 2026-09-14)
 - **[TOOL-6](docs/decisions/tool/tool-6.md)** - `crates/htui-agent/tests/launch.rs` failed once under whole-crate load and has not been reproduced (shipped, 2026-09-14)
 - **[TOOL-2](docs/decisions/tool/tool-2.md)** - Demo fixture's app_user.name collides with the OS username (concluded, 2026-09-14)

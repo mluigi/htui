@@ -1,0 +1,10 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: rendered
+---
+<section name="verify_failure" exit_code="101">
+```
+running 3 tests
+test recorder::flushes ... FAILED
+```
+</section>

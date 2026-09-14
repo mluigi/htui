@@ -1,0 +1,23 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::wrap(&render::judge_candidate(candidate, false))"
+---
+<section name="judge_candidate:0" fanout_index="0" verify="pass" exit_code="0">
+<document kind="impl" version="1">
+Added the flush on turn end.
+</document>
+<diff range="aaa1111..bbb2222">
+ 1 file changed, 9 insertions(+)
+
+```
+--- a/record.rs
++++ b/record.rs
++self.flush();
+```
+</diff>
+<verification>
+```
+test result: ok. 41 passed; 0 failed
+```
+</verification>
+</section>

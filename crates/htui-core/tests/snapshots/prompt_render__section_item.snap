@@ -1,0 +1,9 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: rendered
+---
+<section name="item" key="htui:MOD-2" title="Agent driver and chat">
+Drive one agent session per run step, and record every event.
+
+The seam is `AgentDriver`.
+</section>

@@ -1,0 +1,9 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::wrap(&render::box_profile(&spec.box_profile))"
+---
+<section name="box">
+hostname: ci-linux-01
+os: linux 6.8.0 (x86_64)
+htui: 0.4.1
+</section>

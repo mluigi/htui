@@ -1,0 +1,8 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: rendered
+---
+<section name="documents:plan" kind="plan" version="3">
+1. Land the driver seam.
+2. Land the recorder.
+</section>

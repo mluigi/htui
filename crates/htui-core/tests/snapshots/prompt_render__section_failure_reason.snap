@@ -1,0 +1,7 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::wrap(&render::failure_reason(&handoff.failure_reason))"
+---
+<section name="failure_reason">
+The step exhausted its turn budget without a passing build.
+</section>

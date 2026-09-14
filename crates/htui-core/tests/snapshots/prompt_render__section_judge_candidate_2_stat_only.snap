@@ -1,0 +1,9 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::wrap(&render::judge_candidate(&judge.candidates[2], true))"
+---
+<section name="judge_candidate:2" fanout_index="2">
+<diff range="aaa1111..ddd4444">
+ 3 files changed, 140 insertions(+), 6 deletions(-)
+</diff>
+</section>

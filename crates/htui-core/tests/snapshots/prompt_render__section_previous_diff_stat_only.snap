@@ -1,0 +1,7 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: rendered
+---
+<section name="previous_diff" range="abc1234..def5678">
+ 2 files changed, 41 insertions(+), 8 deletions(-)
+</section>

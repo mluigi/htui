@@ -269,10 +269,9 @@ impl ParsedTemplate {
     }
 
     /// The literal spans joined — what the `template` section is estimated over.
-    #[expect(
-        dead_code,
-        reason = "T64's render.rs is its only caller; T59 ships the scanner alone"
-    )]
+    ///
+    /// `pub(crate)` and reached through [`crate::prompt::render::template_text`], which normalises
+    /// the line endings before anything measures the result (blueprint P-2).
     pub(crate) fn literal_text(&self) -> String {
         self.spans
             .iter()

@@ -1,0 +1,6 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::wrap(&render::item(&spec))"
+---
+<section name="item" key="htui:FEAT-3" title="A bare item">
+</section>

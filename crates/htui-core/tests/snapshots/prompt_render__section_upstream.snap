@@ -1,0 +1,13 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: rendered
+---
+<section name="upstream">
+### htui:ANA-9 - Postgres schema (closed, 1 hop)
+
+The schema is one database, six domains, and no soft deletes outside `item`.
+
+also upstream:
+- htui:MOD-7 - Box registry and capabilities (in_progress) - no summary yet
+- auth-service:MOD-1 - Token rotation (done)
+</section>

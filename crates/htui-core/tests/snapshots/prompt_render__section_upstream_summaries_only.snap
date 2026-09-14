@@ -1,0 +1,9 @@
+---
+source: crates/htui-core/tests/prompt_render.rs
+expression: "render::wrap(&render::upstream(&spec.upstream,\n&summaries_only).expect(\"one summary\"))"
+---
+<section name="upstream">
+### htui:ANA-9 - Postgres schema (closed, 1 hop)
+
+The schema is one database, six domains, and no soft deletes outside `item`.
+</section>
