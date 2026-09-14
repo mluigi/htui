@@ -532,9 +532,17 @@ async fn o_opens_the_link_through_the_injected_opener() {
     let frame = rig
         .until("opened the link", |frame| frame.contains("link opened"))
         .await;
+    let expected = vec![LINK.to_owned()];
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while std::time::Instant::now() < deadline {
+        if rig.opened() == expected {
+            break;
+        }
+        tokio::time::sleep(TICK).await;
+    }
     assert_eq!(
         rig.opened(),
-        vec![LINK.to_owned()],
+        expected,
         "the opener was handed the adapter's own link and nothing else: {frame}"
     );
     assert!(
