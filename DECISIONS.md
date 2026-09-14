@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[ANA-12](docs/decisions/ana/ana-12.md)** - Analyze rataflow implementation (concluded, 2026-09-14)
 - **[ANA-13](docs/decisions/ana/ana-13.md)** - Deep analysis on how oh-my-pi manages different agents and roles (concluded, 2026-09-13)
 - **[MOD-21](docs/decisions/mod/mod-21.md)** - In-app agent authentication (done, 2026-09-10)
 - **[MOD-20](docs/decisions/mod/mod-20.md)** - Registry-driven adapter install (done, 2026-09-09)

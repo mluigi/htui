@@ -14,7 +14,8 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-13):** **ANA-13 concluded** (`docs/decisions/ana/ana-13.md`): Deep analysis of `oh-my-pi` agent architecture completed. Decided to adopt declarative agent personas (MOD-26) and a `Swarm` RunKind with a `task` MCP tool (MOD-27) to enable dynamic subagent spawning without violating orchestrator state machine invariants.
+**Current status (2026-09-14):** **ANA-12 concluded** (`docs/decisions/ana/ana-12.md`): Analyzed rataflow integration for the orchestrator execution workflow. Decided to build an execution graph view in the Runs tab mapping RunStep and SessionEvent rows to nodes and chips, enabling visualization of dynamic tree execution (fan-outs, swarms) while preserving R-TUI-4 actions. Spawned MOD-28.
+Before it, **ANA-13 concluded** (`docs/decisions/ana/ana-13.md`): Deep analysis of `oh-my-pi` agent architecture completed. Decided to adopt declarative agent personas (MOD-26) and a `Swarm` RunKind with a `task` MCP tool (MOD-27) to enable dynamic subagent spawning without violating orchestrator state machine invariants.
 Before it, **MOD-2 milestone 8 landed** (`a3cbfff`..`42294d8`, phase note
 below): an agent that speaks no ACP — only its own headless JSON stream — now reaches the same chat
 tab, recorder, store rows and replay as an ACP one, losing exactly three event kinds and saying so
@@ -27,22 +28,6 @@ way would have double-counted a two-turn chat with **no test in the tree failing
 §11.14's two CLI items are answered from live runs, and the ANA is amended in four places (D79,
 D92, D93, D94) here rather than in the file, per the milestone-5 precedent. Milestone 9 (the prompt
 assembler and preview) is the last of the nine.
-Before it, **MOD-21 landed** (`docs/decisions/mod/mod-21.md`): an agent that
-reports itself installed-but-unauthenticated is logged in **from inside `htui`** — `Settings >
-Agents`, `j`/`k`, **`a`**, the agent's own methods in its own words, `Enter` to choose, `o` to open
-the link it prints, `x` to cancel, logout where advertised. `htui` triggers the flow and never
-reads, holds or stores the credential; what changes the row afterwards is a **re-probe**, so the
-cell is the probe's verdict and not the login's claim, and the `agent` row is byte-identical before
-and after. `R-AGT-9` is met and `docs/ANA-4.md` §4.5's "`htui` cannot log in non-interactively" is
-reversed **in fact**: `agy` went `unauthenticated` → `ready` through the app on this box on
-2026-09-10, and the seed's declared credential path (`~/.gemini/antigravity-acp/acp_token.json`) is
-**confirmed** rather than guessed. Live research settled three things a design would have got wrong:
-`authenticate` blocks for the whole human round trip, the URL comes back on **stderr** as prose and
-not through `elicitation/create` even when elicitation is advertised, and the adapter spawns a
-browser whose output lands in the **JSON-RPC stream** unless `BROWSER` is neutralised. 687 tests
-green on **Linux** with Postgres live. Its Windows half could not be lint-checked either (TOOL-3);
-MOD-16 inherits those runtime facts by name. **A box the browser cannot reach cannot finish the
-flow** — the agent's redirect listener is on `htui`'s own loopback — which is **MOD-22**.
 **MOD-2 milestone 6's T34 is unblocked and half answered.** The box is authenticated now, so
 `agy_live.rs` passes 4/4 against a logged-in server and `session/new` succeeds, reporting its
 `config_options` (permission modes `default`, `auto_edit`, `yolo` — MOD-2 D64's coordinate, now
@@ -79,9 +64,9 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   fail-open with a deadline, read-only (`R-ID-4`), non-LLM (`R-ID-6`); Serena's default `.serena/`
   directory must be configured outside every `repo_box_path`. Output: `docs/ANA-3.md`.
 - [ ] **ANA-11 - Models for requirements and decisions.** Evaluate database schema models to track product requirements (R-IDs) and architectural decisions (MOD/ANA items) inside `htui` itself instead of standalone markdown files.
-- [ ] **ANA-12 - Analyze rataflow implementation.** Analyze how https://github.com/furkankly/rataflow needs to be implemented regarding the workflow of the execution of an item and what it would touch in our project (example usage: https://github.com/furkankly/zoetrope).
 ### Next features
 
+- [ ] **MOD-28 - rataflow execution view (from ANA-12).** Add `rataflow` dependency, implement `ExecutionGraph` widget mapping `RunStep` and `SessionEvent` lists to a node graph, add view toggle to Runs tab (`R-TUI-4`), and wire mouse/keyboard events for standard run actions.
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees.
 - [ ] **MOD-2 - Agent driver + chat tab** (from ANA-4). `R-AGT-1..8`, `R-PRM-1..3`, `R-TUI-6`,
@@ -892,7 +877,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 4 (ANA-3 context tools, ANA-7 secrets, ANA-11 requirements/decisions models, ANA-12 rataflow)              |
-| MOD-N   | 23 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 3 (ANA-3 context tools, ANA-7 secrets, ANA-11 requirements/decisions models)              |
+| MOD-N   | 24 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
 | TOOL-N  | 6 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-4 `tests/auth.rs` whole-binary flake, TOOL-5 dev Postgres crashes under concurrent suites, TOOL-6 `tests/launch.rs` failed once unreproduced) |
