@@ -203,7 +203,7 @@ fn stdin_line(text: &str) -> String {
 /// Where a session's byte streams come from; `crate::acp`'s fork, for its reasons.
 enum IoSource {
     /// Spawn a child at `start`: what the probe recorded when there is a usable recording,
-    /// otherwise the row's tools resolved and substituted (D58, [`crate::launch::launch_from`]).
+    /// otherwise the row's tools resolved and substituted (D58, `crate::launch::launch_from`).
     Spawn {
         /// The row's `launch` document.
         launch: Box<AgentLaunch>,
@@ -312,7 +312,7 @@ impl CliDriver {
     /// here — [`argv`] needs the minted session id, which is `start`'s to make.
     ///
     /// # Errors
-    /// [`crate::launch::launch_from`]'s, unchanged; [`DriverError::Transport`] for a prepared
+    /// `crate::launch::launch_from`'s, unchanged; [`DriverError::Transport`] for a prepared
     /// transport, which spawns nothing and so has no launch to describe.
     pub async fn launch_for(&self, spec: &SessionSpec) -> Result<ResolvedLaunch> {
         let (launch, recorded) = match &self.io {
@@ -680,7 +680,7 @@ pub struct SessionOptions {
 /// kill already sent — `acp::open_session`'s three, for its reasons, with its one asymmetry:
 ///
 /// 1. **The agent never said anything.** The task is aborted and awaited, which resolves as soon as
-///    the runtime has dropped the future; the [`ChildGuard`]'s `Drop` has then signalled the tree.
+///    the runtime has dropped the future; the `ChildGuard`'s `Drop` has then signalled the tree.
 ///    Signalled but not *reaped* by us, because a `Drop` cannot await.
 /// 2. **The agent ended before `system/init`** — an unauthenticated CLI prints its refusal to
 ///    stderr and exits, which is EOF. Composed on the task's own timeline with the stderr tail
@@ -767,7 +767,7 @@ async fn run_session(
         child,
     } = io;
     // **The child is owned here**, by the task that outlives the `start` which created it, and
-    // through a [`ChildGuard`] rather than a bare `Spawned` for the one exit that runs no code of
+    // through a `ChildGuard` rather than a bare `Spawned` for the one exit that runs no code of
     // ours: an **aborted** task drops the guard, whose `Drop` signals the kill, which is what
     // [`open_session`]'s timeout arm relies on. `acp::run_session`'s shape, copied.
     let child = Arc::new(Mutex::new(ChildGuard::new(child)));

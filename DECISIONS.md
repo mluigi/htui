@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[CLEAN-1](docs/decisions/clean/clean-1.md)** - `cargo doc` cannot build `htui-agent` (shipped, 2026-09-14)
 - **[TOOL-6](docs/decisions/tool/tool-6.md)** - `crates/htui-agent/tests/launch.rs` failed once under whole-crate load and has not been reproduced (shipped, 2026-09-14)
 - **[TOOL-2](docs/decisions/tool/tool-2.md)** - Demo fixture's app_user.name collides with the OS username (concluded, 2026-09-14)
 - **[TOOL-4](docs/decisions/tool/tool-4.md)** - `crates/htui/tests/auth.rs` flakes as a whole binary, and the assertion is not yet captured (concluded, 2026-09-14)

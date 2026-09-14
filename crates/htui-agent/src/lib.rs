@@ -19,7 +19,7 @@
 //! `agent_box.probe`, and — over [`acp::handshake()`] — the tier-2 `initialize` that is the only
 //! proof the resolved binary actually runs.
 //!
-//! [`install`] is MOD-20's answer to "and what if this box does not have it": the registry a row
+//! [`mod@install`] is MOD-20's answer to "and what if this box does not have it": the registry a row
 //! *declares* a source in, read into a plan the user consents to before a single archive byte is
 //! requested. It knows no agent's name (`R-AGT-5`) — the row supplies an entry id, the registry
 //! supplies everything else, and [`probe`] supplies the root and, afterwards, the verdict.

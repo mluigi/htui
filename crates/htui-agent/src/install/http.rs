@@ -8,7 +8,7 @@
 //! seconds and a captive portal that accepts the socket and then says nothing still fails in a
 //! minute rather than never (hazard H-13).
 //!
-//! Everything above this module speaks in [`HeadInfo`], [`RegistryFetch`] and [`HttpError`], so
+//! Everything above this module speaks in `HeadInfo`, `RegistryFetch` and `HttpError`, so
 //! the day the client changes, the pre-flight and the fetch do not.
 
 use std::sync::Once;

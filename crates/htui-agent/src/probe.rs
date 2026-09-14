@@ -795,7 +795,7 @@ pub fn walk(root: &Path, segments: &[String]) -> Vec<GlobMatch> {
 /// The highest version first, then the newest `mtime`, then the path **descending** (plan MOD-20
 /// D14, amending MOD-2 plan D48).
 ///
-/// The version is [`version_key`] of the **last** capture — the segment the seeds put the version
+/// The version is `version_key` of the **last** capture — the segment the seeds put the version
 /// in. `None < Some` in Rust's `Ord for Option`, so every capture that parses as a version outranks
 /// every capture that does not, which is this crate's reading of "a directory named like a version
 /// is an install". Among the ones that parse, `semver` decides, and a prerelease sits below its

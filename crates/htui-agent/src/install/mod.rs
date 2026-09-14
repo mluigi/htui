@@ -1,6 +1,6 @@
 //! Plan MOD-20: a registry row's declared source made real.
 //!
-//! [`plan`] reads the ACP registry entry the row names and answers, **before consent**, what this
+//! [`mod@plan`] reads the ACP registry entry the row names and answers, **before consent**, what this
 //! box would fetch and how it can be verified: the archive URL and its size, the licence and its
 //! terms, the digest the registry publishes (or the sentence that says it publishes none), where
 //! the tree would land, and whether the disk can take it. [`install`] then executes exactly that

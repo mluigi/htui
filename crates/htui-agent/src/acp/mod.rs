@@ -269,7 +269,7 @@ impl AcpDriver {
     }
 
     /// What a spawn in `cwd` would launch, before launching it: D58's rules, applied by
-    /// [`crate::launch::launch_from`], which owns them for every transport that spawns.
+    /// `crate::launch::launch_from`, which owns them for every transport that spawns.
     ///
     /// The environment is the row's, exactly as it resolved: a directory is all this takes,
     /// because the two callers that have more to add — a session's `spec.env`
@@ -750,7 +750,7 @@ fn answer_from_connection(
 ///    code of ours, and the only one that leaves the reap to `tokio::process`'s orphan queue
 ///    (blueprint H-1, and the arm's own comment for why that is enough).
 /// 2. **The agent answered, and its answer was no.** The failure is composed on the task's own
-///    timeline — by the foreground future for `initialize`, by [`answer_from_connection`] for the
+///    timeline — by the foreground future for `initialize`, by `answer_from_connection` for the
 ///    `session/new` a connection actor refused — and the task is awaited afterwards, so the tree
 ///    is killed *and* reaped before this returns.
 /// 3. **Nobody answered at all**, the sender dropped with the task: the handshake got as far as an

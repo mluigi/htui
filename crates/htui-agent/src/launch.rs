@@ -826,7 +826,7 @@ impl Spawned {
     /// Blocking on it there is not an option either — a `Drop` running inside the runtime would be
     /// blocking a worker thread — so the child is signalled and left for the reaper.
     ///
-    /// **Two callers reach it the same way**: through a [`ChildGuard`]'s `Drop`, each with a
+    /// **Two callers reach it the same way**: through a `ChildGuard`'s `Drop`, each with a
     /// `kill_tree` on every path it can await instead. The probe's handshake (`acp::handshake`) is
     /// what makes an **aborted** probe task leave no live agent behind (the milestone-3 CRITICAL,
     /// `682a423`); since milestone 6 (plan D61) [`acp::open_session`]'s session task is the other,
@@ -924,7 +924,7 @@ impl core::fmt::Debug for ChildIo {
 /// the guard the abort drops. What differs between the three is only *where* the guard lives.
 ///
 /// [`open_session`]: crate::acp::open_session
-/// [`acp::handshake`]: crate::acp::handshake
+/// [`acp::handshake`]: crate::acp::handshake()
 pub(crate) struct ChildGuard {
     child: Option<Spawned>,
 }

@@ -72,7 +72,7 @@ impl ArchiveFormat {
 ///   stops: `JoinHandle::abort` does not reach one (blueprint P-3, hazard H-8).
 /// - The entry's path goes through `safe_target`, which is this crate's own check and not the
 ///   archive crate's (hazard H-16).
-/// - The path is then walked down from `into` one component at a time by [`descend`], which
+/// - The path is then walked down from `into` one component at a time by `descend`, which
 ///   refuses the moment a component that already exists is a symlink. That is what makes the
 ///   lexical check above enough: nothing is ever created, written or chmod'ed *through* a link an
 ///   earlier entry of the same archive planted.
@@ -304,7 +304,7 @@ fn link_stays_inside(into: &Path, link_at: &Path, target: &Path) -> bool {
     true
 }
 
-/// What [`descend`] does with the last component of the path it is given.
+/// What `descend` does with the last component of the path it is given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Last {
     /// A directory entry: create it like every component above it.

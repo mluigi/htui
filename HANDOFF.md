@@ -14,9 +14,9 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-14):** **TOOL-6 shipped** (`docs/decisions/tool/tool-6.md`): Fixed shell-redirection race condition in tests/launch.rs. **TOOL-2 concluded** (`docs/decisions/tool/tool-2.md`): Fixed demo fixture username collision and made database test skips in CI distinguishable.
+**Current status (2026-09-14):** **CLEAN-1 shipped** (`docs/decisions/clean/clean-1.md`): Fixed rustdoc private and ambiguous links in htui-agent.
+Before it, **TOOL-6 shipped** (`docs/decisions/tool/tool-6.md`): Fixed shell-redirection race condition in tests/launch.rs. **TOOL-2 concluded** (`docs/decisions/tool/tool-2.md`): Fixed demo fixture username collision and made database test skips in CI distinguishable.
 Before it, **TOOL-4 concluded** (`docs/decisions/tool/tool-4.md`): Fixed TOCTOU race condition test flake in `tests/auth.rs`.
-Before it, **ANA-7 concluded** (`docs/decisions/ana/ana-7.md`): Settled Infisical SDK integration, Universal Auth machine identity per box, OS keyring storage for `htui` credentials, and a two-pass fail-closed scrubber. Unblocked MOD-10.
 **MOD-2 milestone 8 landed** (`a3cbfff`..`42294d8`, phase note
 below): an agent that speaks no ACP — only its own headless JSON stream — now reaches the same chat
 tab, recorder, store rows and replay as an ACP one, losing exactly three event kinds and saying so
@@ -725,22 +725,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
-- [ ] **CLEAN-1 - `cargo doc` cannot build `htui-agent`, and has not been able to for some time.**
-  `R-NF-3`. `rustdoc::private_intra_doc_links` is `deny` in the workspace lint set, and **eight**
-  public doc comments link to private items, so `cargo doc -p htui-agent --no-deps` fails outright:
-  `acp/mod.rs:376` (`crate::probe::is_file`), `acp/mod.rs:862` (`answer_from_connection`),
-  `install/archive.rs:75` (`descend`), `install/http.rs:11` (`HeadInfo`, `RegistryFetch`,
-  `HttpError` - three on one line), `launch.rs:699` (`ChildGuard`) and `probe.rs:798`
-  (`version_key`), plus two "`install`/`plan` is both a function and a module" ambiguities
-  (`lib.rs:22`, `install/mod.rs:3`). Every one is a doc that should say `` `Name` `` or point at
-  something public; none is a code defect. Fix: demote the links, or make the item public where the
-  doc genuinely wants to link it. **Why it matters beyond tidiness:** because the command is red for
-  reasons nobody owns, a *new* error hides in the noise - MOD-21 shipped three of its own into
-  `crates/htui/` (`AUTH_ALREADY_CHOSEN`, `AuthCommand`, `drive_to_end`) and they were caught by a
-  reviewer's eye rather than by a gate, then fixed at that item's close-out. Consider adding
-  `cargo doc --workspace --no-deps --all-features` to the standing validation block once this is
-  green, which is the only thing that stops it rotting again. Found during MOD-21 T4/T5 on
-  2026-09-09 and confirmed at its close-out on 2026-09-10; predates MOD-21.
+
 - [ ] **MOD-8 - Legacy markdown import.** `R-LATER-3`. Map old prefixes to kinds per project,
   preserve keys, build links. Later tier; MOD-6 landed (`docs/decisions/mod/mod-6.md`, importer
   mint variant per ANA-9 §7.1 still to write).
@@ -783,5 +768,5 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-3 context tools, ANA-11 requirements/decisions models)              |
 | MOD-N   | 24 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
+| CLEAN-N | 0                                                                                        |
 | TOOL-N  | 2 (TOOL-1 next-item blocked-on regex, TOOL-3 Windows lint target unbuildable) |
