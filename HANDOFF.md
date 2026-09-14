@@ -14,9 +14,10 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-14):** **ANA-12 concluded** (`docs/decisions/ana/ana-12.md`): Analyzed rataflow integration for the orchestrator execution workflow. Decided to build an execution graph view in the Runs tab mapping RunStep and SessionEvent rows to nodes and chips, enabling visualization of dynamic tree execution (fan-outs, swarms) while preserving R-TUI-4 actions. Spawned MOD-28.
+**Current status (2026-09-14):** **ANA-7 concluded** (`docs/decisions/ana/ana-7.md`): Settled Infisical SDK integration, Universal Auth machine identity per box, OS keyring storage for `htui` credentials, and a two-pass fail-closed scrubber. Unblocked MOD-10.
+Before it, **ANA-12 concluded** (`docs/decisions/ana/ana-12.md`): Analyzed rataflow integration for the orchestrator execution workflow. Decided to build an execution graph view in the Runs tab mapping RunStep and SessionEvent rows to nodes and chips, enabling visualization of dynamic tree execution (fan-outs, swarms) while preserving R-TUI-4 actions. Spawned MOD-28.
 Before it, **ANA-13 concluded** (`docs/decisions/ana/ana-13.md`): Deep analysis of `oh-my-pi` agent architecture completed. Decided to adopt declarative agent personas (MOD-26) and a `Swarm` RunKind with a `task` MCP tool (MOD-27) to enable dynamic subagent spawning without violating orchestrator state machine invariants.
-Before it, **MOD-2 milestone 8 landed** (`a3cbfff`..`42294d8`, phase note
+**MOD-2 milestone 8 landed** (`a3cbfff`..`42294d8`, phase note
 below): an agent that speaks no ACP — only its own headless JSON stream — now reaches the same chat
 tab, recorder, store rows and replay as an ACP one, losing exactly three event kinds and saying so
 in its banner. `R-AGT-3` is met. The registry carries a second row, **`claude-cli`**; `CASES` is
@@ -54,9 +55,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 ### Analyses
 
-- [ ] **ANA-7 - Secret provider and scrubbing.** `R-SEC-1..4`, `R-ID-7`. Settle Infisical SDK vs
-  CLI, machine identity bootstrap per box, keyring usage for `htui`'s own credentials, scrub mask
-  construction and the fail-closed check. Output: `docs/ANA-7.md`. Gates MOD-10.
+
 - [ ] **ANA-3 - External context tools (later tier).** `R-LATER-7`. Headroom, Serena, Graphify and
   structural diff as optional excerpt providers for the prompt builder, fail-open when absent.
   Deferred until MOD-2 lands. The seam is fixed by ANA-5 (`docs/ANA-5.md` §4.5,
@@ -488,7 +487,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. Blocked on
-  ANA-7, MOD-2.
+  MOD-2.
 - [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
   `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
   per-box class limits; per-phase exposure. Per ANA-2 (`docs/ANA-2.md` §4.2, §8, risk 11):
@@ -877,7 +876,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-3 context tools, ANA-7 secrets, ANA-11 requirements/decisions models)              |
+| ANA-N   | 2 (ANA-3 context tools, ANA-11 requirements/decisions models)              |
 | MOD-N   | 24 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
 | TOOL-N  | 6 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-4 `tests/auth.rs` whole-binary flake, TOOL-5 dev Postgres crashes under concurrent suites, TOOL-6 `tests/launch.rs` failed once unreproduced) |
