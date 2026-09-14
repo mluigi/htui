@@ -830,11 +830,18 @@ async fn an_interrupt_lets_the_child_exit_on_its_own_terms() {
 
     // Not a sleep: the trap must be installed before the signal, or the shell dies by default
     // disposition and this case would pass for the wrong reason.
+    let mut ready_content = String::new();
     let deadline = Instant::now() + PATIENCE;
-    while !ready.exists() && Instant::now() < deadline {
+    while Instant::now() < deadline {
+        if let Ok(content) = std::fs::read_to_string(&ready) {
+            if !content.trim().is_empty() {
+                ready_content = content.trim().to_string();
+                break;
+            }
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(ready.exists(), "the fixture installed its trap");
+    assert_eq!(ready_content, "ready", "the fixture installed its trap");
 
     spawned
         .signal(StopSignal::Interrupt)
@@ -868,11 +875,18 @@ async fn a_signal_reaches_the_whole_process_group() {
     );
     let mut spawned = spawn_sh(&script, tmp.path()).await;
 
+    let mut helper = String::new();
     let deadline = Instant::now() + PATIENCE;
-    while !pidfile.exists() && Instant::now() < deadline {
+    while Instant::now() < deadline {
+        if let Ok(content) = std::fs::read_to_string(&pidfile) {
+            if !content.trim().is_empty() {
+                helper = content.trim().to_string();
+                break;
+            }
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let helper = std::fs::read_to_string(&pidfile).expect("the fixture recorded its helper's pid");
+    assert!(!helper.is_empty(), "the fixture recorded its helper's pid");
     assert!(
         alive(&helper).await,
         "the helper is running before the signal"

@@ -14,7 +14,7 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-14):** **TOOL-2 concluded** (`docs/decisions/tool/tool-2.md`): Fixed demo fixture username collision and made database test skips in CI distinguishable.
+**Current status (2026-09-14):** **TOOL-6 shipped** (`docs/decisions/tool/tool-6.md`): Fixed shell-redirection race condition in tests/launch.rs. **TOOL-2 concluded** (`docs/decisions/tool/tool-2.md`): Fixed demo fixture username collision and made database test skips in CI distinguishable.
 Before it, **TOOL-4 concluded** (`docs/decisions/tool/tool-4.md`): Fixed TOCTOU race condition test flake in `tests/auth.rs`.
 Before it, **ANA-7 concluded** (`docs/decisions/ana/ana-7.md`): Settled Infisical SDK integration, Universal Auth machine identity per box, OS keyring storage for `htui` credentials, and a two-pass fail-closed scrubber. Unblocked MOD-10.
 **MOD-2 milestone 8 landed** (`a3cbfff`..`42294d8`, phase note
@@ -775,18 +775,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   only Windows check. **This is a maintainer decision, and MOD-16 inherits the runtime half
   either way.** MOD-20's plan D21 and its Validation block both name lint lines that currently
   cannot run — whichever way this goes, they need amending. Found during MOD-20 T2 on 2026-09-09.
-- [ ] **TOOL-6 - `crates/htui-agent/tests/launch.rs` failed once under whole-crate load and has not
-  been reproduced.** `R-NF-3`. Seen on 2026-09-11 during MOD-2 milestone 8's T52: one
-  `cargo test -p htui-agent --features test-support --no-fail-fast` run reported
-  `20 passed; 1 failed` in `tests/launch.rs`, and **the failing case's name was not captured** — the
-  observing agent's `tail` cut it. **Not reproduced in 15 subsequent runs** (10 isolated
-  `--test launch`, 5 whole-crate), so there is no diagnosis here, only an observation recorded
-  rather than dropped. It is written down because of *where* it is: `launch.rs` holds the process
-  and signal timing cases — `a_signal_reaches_the_whole_process_group`,
-  `an_interrupt_lets_the_child_exit_on_its_own_terms` — which are exactly the paths MOD-2 D81's
-  cancel sequence depends on, and a rare timing failure there is the kind that reappears as a
-  hung session rather than as a red test. **First step:** re-run the whole crate under load with
-  the name captured (`--no-fail-fast 2>&1 | tee`), and if it reappears, check whether the child is
   being reaped before the assertion reads `/proc/<pid>`.
 
 ## Summary
@@ -796,4 +784,4 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | ANA-N   | 2 (ANA-3 context tools, ANA-11 requirements/decisions models)              |
 | MOD-N   | 24 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
-| TOOL-N  | 3 (TOOL-1 next-item blocked-on regex, TOOL-3 Windows lint target unbuildable, TOOL-6 `tests/launch.rs` failed once unreproduced) |
+| TOOL-N  | 2 (TOOL-1 next-item blocked-on regex, TOOL-3 Windows lint target unbuildable) |
