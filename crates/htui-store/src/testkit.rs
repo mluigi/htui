@@ -61,6 +61,8 @@ pub struct TestDb {
     dropped: bool,
 }
 
+static SWEEP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
 /// A fresh database with the migrations **not** applied - or `None` when [`ENV_URL`] is unset.
 ///
 /// The migration tests need a database in that state; every other test wants [`fresh_db`].
@@ -72,6 +74,34 @@ pub async fn bare_db() -> Option<TestDb> {
             return None;
         }
     };
+
+    SWEEP
+        .get_or_init(|| async {
+            let Ok(mut sweep_conn) = PgConnection::connect(&maint_url).await else {
+                return;
+            };
+            let stale: Vec<(String,)> = sqlx::query_as(
+                r#"
+                SELECT datname 
+                FROM pg_database 
+                WHERE datname LIKE 'htui_test_%' 
+                  AND (pg_stat_file('base/' || oid, true)).modification < now() - interval '1 hour'
+                "#,
+            )
+            .fetch_all(&mut sweep_conn)
+            .await
+            .unwrap_or_default();
+
+            for (stale_name,) in stale {
+                let _ = sqlx::raw_sql(AssertSqlSafe(format!(
+                    "DROP DATABASE IF EXISTS \"{stale_name}\" WITH (FORCE)"
+                )))
+                .execute(&mut sweep_conn)
+                .await;
+            }
+            let _ = sweep_conn.close().await;
+        })
+        .await;
 
     // The *tail* of a UUIDv7 is the random half; its head is a millisecond timestamp, which two
     // tests starting in the same millisecond share.

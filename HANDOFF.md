@@ -808,56 +808,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   Predates this branch: found by MOD-2 milestone 7's T41 implementer, which re-checked it with its
   own changes reverted. Not `o`-specific until the captured assertion says so.
 
-- [ ] **TOOL-5 - The dev Postgres crashes into recovery under two concurrent test suites; its
-  container has Docker's default 64 MiB `/dev/shm`.** `R-NF-3`. Observed **four times** on
-  2026-09-10 during MOD-2 milestone 7, every time with two `cargo test --workspace --all-features`
-  runs overlapping: the container logs `server process (PID …) exited with exit code 2` then
-  `all server processes terminated; reinitializing`, and every in-flight Postgres case fails
-  `57P03 the database system is in recovery mode` — **not** an assertion failure, but
-  indistinguishable from one in a summary line. Recovery costs ~3-4 minutes of
-  `syncing data directory (fsync)` per crash. `compose.yaml` declares no `shm_size` for the
-  `postgres:16` service, so the container runs the 64 MiB default (`docker inspect htui-postgres
-  --format '{{.HostConfig.ShmSize}}'` → `67108864`), which is the documented way to make a
-  containerised Postgres fall over once parallel workers and many databases are live — each suite
-  mints its own throwaway `htui_test_*`, so two suites is easily 17+. **First fix to try:**
-  `shm_size: 1gb` on the service in `compose.yaml`. Host memory was **not** the cause and should not
-  be blamed: 47 GB were available when this was checked, though an implementer saw swap saturated
-  mid-build, so heavy cargo builds are a contributing load rather than the mechanism.
-  **Amended 2026-09-12 (MOD-2 milestone 9, T63): `shm_size: 1gb` shipped and the crashes continued,
-  so the shm diagnosis above is wrong — or at most was one of two causes. The measured cause is
-  the disk.** `/` was at **100%, 2.7 GB free of 455 GB**, with `target/debug` alone at **161 GB**;
-  deleting `target/debug/incremental` freed 57 GB and the crashes largely stopped. Both competing
-  explanations were checked and refuted at the time: `/dev/shm` was 8 GB with **28 KB** in use, and
-  the crash reproduced with **zero** leaked `htui_test_*` databases. One further crash occurred
-  afterwards at 86% disk during `htui::chat_usage_pg` and the re-run was clean, so a load-related
-  flake may remain underneath. **Diagnose with `df -h /` before anything else**; `target/` reaches
-  100 GB within days of normal work on this repo, so this recurs rather than being a one-off.
-  **Until it is fixed, the workspace Postgres line must not be run by two agents at once** — telling
-  each one not to does not work, since they cannot see each other; serialise the tasks instead.
-  Found while landing T42 and T43 in parallel.
-  **`shm_size: 1gb` landed (`287e7b8`) and did not close it — but the mechanism is now measured,
-  and it is a feedback loop rather than a single cause.** On 2026-09-11 (MOD-2 milestone 8) two
-  concurrent workspace runs put the container into a **crash-recovery loop**: it accepted
-  connections, the suite created its throwaway databases, it crashed, and recovery then spent
-  **630 s** in `syncing data directory (fsync)` before the next run re-triggered it. Three restarts
-  did not break the cycle.
-  What broke it: **dropping the 17 leaked `htui_test_*` databases (123 MB)**. The very next
-  `cargo test --workspace --all-features --no-fail-fast` was **51 binaries green, 0 failed**.
-  The loop, stated so it is not rediscovered: `htui-store`'s harness *does* drop its database, both
-  explicitly and through a `Drop` net (`crates/htui-store/src/testkit.rs:167`, `:181-202`) — but
-  **neither path runs when a run is killed**, and neither can run when the server is already in
-  recovery, because the cleanup thread cannot connect. So every crash leaks databases, and every
-  leaked database lengthens the next recovery (the fsync walks `./base/<oid>` per database), which
-  makes the next crash likelier. `shm_size` lowered the trigger rate without touching the loop.
-  **Recovery procedure**, which is the practical fix until the real one lands: wait for
-  `pg_isready`, then
-  `psql -U postgres -tAc "select 'DROP DATABASE IF EXISTS \"' || datname || '\" WITH (FORCE);' from pg_database where datname like 'htui\_test%'"`
-  piped back into `psql -f -`. Note a shell `while read` loop around `docker compose exec` does
-  **not** work — the exec consumes the loop's stdin and drops exactly one database.
-  **The real fix to try next** is an eager sweep of stale `htui_test_*` at harness start-up (the
-  same shape `install`'s staging sweep already has), so a killed run's leak is cleaned by the
-  following run instead of accumulating until the container falls over.
-
 - [ ] **TOOL-6 - `crates/htui-agent/tests/launch.rs` failed once under whole-crate load and has not
   been reproduced.** `R-NF-3`. Seen on 2026-09-11 during MOD-2 milestone 8's T52: one
   `cargo test -p htui-agent --features test-support --no-fail-fast` run reported
@@ -879,4 +829,4 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | ANA-N   | 2 (ANA-3 context tools, ANA-11 requirements/decisions models)              |
 | MOD-N   | 24 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
-| TOOL-N  | 6 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-4 `tests/auth.rs` whole-binary flake, TOOL-5 dev Postgres crashes under concurrent suites, TOOL-6 `tests/launch.rs` failed once unreproduced) |
+| TOOL-N  | 5 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-4 `tests/auth.rs` whole-binary flake, TOOL-6 `tests/launch.rs` failed once unreproduced) |
