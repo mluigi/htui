@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[ANA-15](docs/decisions/ana/ana-15.md)** - checking if it is possible to implement bugsink trough the crate sentry (concluded, 2026-09-14)
 - **[ANA-3](docs/decisions/ana/ana-3.md)** - External context tools (concluded, 2026-09-14)
 - **[TOOL-1](docs/decisions/tool/tool-1.md)** - next-item blocked-on regex counts only the first ID per phrase (concluded, 2026-09-14)
 - **[CLEAN-1](docs/decisions/clean/clean-1.md)** - `cargo doc` cannot build `htui-agent` (shipped, 2026-09-14)
