@@ -70,6 +70,9 @@ pub async fn bare_db() -> Option<TestDb> {
     let maint_url = match std::env::var(ENV_URL) {
         Ok(url) if !url.trim().is_empty() => url,
         _ => {
+            if std::env::var("CI").is_ok() {
+                panic!("{} is not set but CI is running. Database tests must not be skipped in CI.", ENV_URL);
+            }
             println!("{SKIP}");
             return None;
         }

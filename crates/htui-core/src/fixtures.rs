@@ -117,7 +117,7 @@ pub mod ids {
     }
 
     demo_ids!(
-        /// `app_user` `luigi`.
+        /// `app_user` `htui-demo-user`.
         USER: UserId = (class::USER, 0),
         /// `box` `DESKTOP-HTUI`, the box `MemStore::this_box` points at.
         BOX: BoxId = (class::BOX, 0),
@@ -389,8 +389,8 @@ fn epoch() -> DateTime<Utc> {
 fn users() -> Vec<AppUser> {
     vec![AppUser {
         id: ids::USER,
-        name: "luigi".to_owned(),
-        email: Some("luigi@example.invalid".to_owned()),
+        name: "htui-demo-user".to_owned(),
+        email: Some("htui-demo-user@example.invalid".to_owned()),
         created_at: epoch(),
         updated_at: epoch(),
     }]

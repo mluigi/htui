@@ -14,9 +14,9 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-14):** **TOOL-4 concluded** (`docs/decisions/tool/tool-4.md`): Fixed TOCTOU race condition test flake in `tests/auth.rs`.
+**Current status (2026-09-14):** **TOOL-2 concluded** (`docs/decisions/tool/tool-2.md`): Fixed demo fixture username collision and made database test skips in CI distinguishable.
+Before it, **TOOL-4 concluded** (`docs/decisions/tool/tool-4.md`): Fixed TOCTOU race condition test flake in `tests/auth.rs`.
 Before it, **ANA-7 concluded** (`docs/decisions/ana/ana-7.md`): Settled Infisical SDK integration, Universal Auth machine identity per box, OS keyring storage for `htui` credentials, and a two-pass fail-closed scrubber. Unblocked MOD-10.
-Before it, **ANA-12 concluded** (`docs/decisions/ana/ana-12.md`): Analyzed rataflow integration for the orchestrator execution workflow. Decided to build an execution graph view in the Runs tab mapping RunStep and SessionEvent rows to nodes and chips, enabling visualization of dynamic tree execution (fan-outs, swarms) while preserving R-TUI-4 actions. Spawned MOD-28.
 **MOD-2 milestone 8 landed** (`a3cbfff`..`42294d8`, phase note
 below): an agent that speaks no ACP — only its own headless JSON stream — now reaches the same chat
 tab, recorder, store rows and replay as an ACP one, losing exactly three event kinds and saying so
@@ -775,19 +775,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   only Windows check. **This is a maintainer decision, and MOD-16 inherits the runtime half
   either way.** MOD-20's plan D21 and its Validation block both name lint lines that currently
   cannot run — whichever way this goes, they need amending. Found during MOD-20 T2 on 2026-09-09.
-- [ ] **TOOL-2 - Demo fixture's `app_user.name` collides with the OS username, failing every
-  Postgres test.** `R-NF-3`. `crates/htui-core/src/fixtures.rs:351` seeds `app_user.name =
-  "luigi"`, and `PgStore::seed_if_empty` derives the same name from the OS `USERNAME`, so
-  `common::demo_db()` hits `Constraint("app_user_name_key: duplicate key value violates unique
-  constraint \"app_user_name_key\"")` and every `--features demo` Postgres suite fails on any box
-  whose user is named `luigi`. Workaround in use: prefix `USERNAME=htui-ci`. This is worse than an
-  inconvenience - the failure mode is a *pass* elsewhere, because the suites' skip guard is an
-  early `return` that still reports `ok` when `HTUI_TEST_DATABASE_URL` is unset, so a run can look
-  green while proving nothing (it fooled MOD-2's reviewer, which reviewed the new SQL against
-  `.sqlx` alone and assumed the Postgres half passed). Fix: have `demo_db()` seed under a name the
-  fixture cannot hold (or parameterise the fixture's user), and consider making the skip path
-  distinguishable from a real pass. Found during MOD-2 milestone 1 on 2026-09-07; predates MOD-2.
-
 - [ ] **TOOL-6 - `crates/htui-agent/tests/launch.rs` failed once under whole-crate load and has not
   been reproduced.** `R-NF-3`. Seen on 2026-09-11 during MOD-2 milestone 8's T52: one
   `cargo test -p htui-agent --features test-support --no-fail-fast` run reported
@@ -809,4 +796,4 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | ANA-N   | 2 (ANA-3 context tools, ANA-11 requirements/decisions models)              |
 | MOD-N   | 24 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
-| TOOL-N  | 4 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-6 `tests/launch.rs` failed once unreproduced) |
+| TOOL-N  | 3 (TOOL-1 next-item blocked-on regex, TOOL-3 Windows lint target unbuildable, TOOL-6 `tests/launch.rs` failed once unreproduced) |
