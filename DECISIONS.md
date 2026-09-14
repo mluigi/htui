@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[TOOL-4](docs/decisions/tool/tool-4.md)** - `crates/htui/tests/auth.rs` flakes as a whole binary, and the assertion is not yet captured (concluded, 2026-09-14)
 - **[TOOL-5](docs/decisions/tool/tool-5.md)** - Dev Postgres crash fix (done, 2026-09-14)
 - **[ANA-7](docs/decisions/ana/ana-7.md)** - Secret provider and scrubbing (concluded, 2026-09-14)
 - **[ANA-12](docs/decisions/ana/ana-12.md)** - Analyze rataflow implementation (concluded, 2026-09-14)

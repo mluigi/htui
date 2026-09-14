@@ -14,9 +14,9 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-14):** **ANA-7 concluded** (`docs/decisions/ana/ana-7.md`): Settled Infisical SDK integration, Universal Auth machine identity per box, OS keyring storage for `htui` credentials, and a two-pass fail-closed scrubber. Unblocked MOD-10.
+**Current status (2026-09-14):** **TOOL-4 concluded** (`docs/decisions/tool/tool-4.md`): Fixed TOCTOU race condition test flake in `tests/auth.rs`.
+Before it, **ANA-7 concluded** (`docs/decisions/ana/ana-7.md`): Settled Infisical SDK integration, Universal Auth machine identity per box, OS keyring storage for `htui` credentials, and a two-pass fail-closed scrubber. Unblocked MOD-10.
 Before it, **ANA-12 concluded** (`docs/decisions/ana/ana-12.md`): Analyzed rataflow integration for the orchestrator execution workflow. Decided to build an execution graph view in the Runs tab mapping RunStep and SessionEvent rows to nodes and chips, enabling visualization of dynamic tree execution (fan-outs, swarms) while preserving R-TUI-4 actions. Spawned MOD-28.
-Before it, **ANA-13 concluded** (`docs/decisions/ana/ana-13.md`): Deep analysis of `oh-my-pi` agent architecture completed. Decided to adopt declarative agent personas (MOD-26) and a `Swarm` RunKind with a `task` MCP tool (MOD-27) to enable dynamic subagent spawning without violating orchestrator state machine invariants.
 **MOD-2 milestone 8 landed** (`a3cbfff`..`42294d8`, phase note
 below): an agent that speaks no ACP — only its own headless JSON stream — now reaches the same chat
 tab, recorder, store rows and replay as an ACP one, losing exactly three event kinds and saying so
@@ -787,26 +787,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `.sqlx` alone and assumed the Postgres half passed). Fix: have `demo_db()` seed under a name the
   fixture cannot hold (or parameterise the fixture's user), and consider making the skip path
   distinguishable from a real pass. Found during MOD-2 milestone 1 on 2026-09-07; predates MOD-2.
-- [ ] **TOOL-4 - `crates/htui/tests/auth.rs` flakes as a whole binary, and the assertion is not yet
-  captured.** `R-NF-3`. Measured on 2026-09-10 on this box: **1 failure in 43** runs of
-  `USERNAME=htui-ci cargo test -p htui --features testkit --test auth`, against **0 in 10** runs of
-  the single test `o_opens_the_link_through_the_injected_opener` filtered on its own — so the defect
-  is a **cross-test interaction inside the binary**, not that test in isolation. The one observed
-  failure finished in **0.15 s** while passing runs take 0.05-0.9 s, which **rules out deadline
-  exhaustion**: `Rig::until` retries against a 60 s `PATIENCE` (`tests/auth.rs:283-297`), so a
-  timeout would have cost 60 s. It is therefore an immediate assertion, and **its text was not
-  captured** — the failing run's output was consumed by a `grep` that did not match the failure
-  block, and 43 later runs (12 warm, 25 warm, 6 forced-relink) did not reproduce it. Hypotheses
-  already **ruled out**: the 10 ms `TICK` poll being too short (the loop is deadline-bounded, not
-  iteration-bounded); cold start (6/6 pass with a forced relink); and the `ETXTBSY` fd-inheritance
-  hazard, which is already mitigated by running the fixture as `/bin/sh <path>`
-  (`tests/auth.rs:100-102`). Still open as suspects: the `FIXTURE_HOLD` fixture's `sleep 3600`
-  child (`:84`) outliving its case under parallel test threads, and the two cases that share a
-  `FIXTURE_DIR` pid file (`:76`). **Reproduce under load** — the single failure occurred while a
-  concurrent `cargo` build and a 1.88 GB ACP adapter were running — and capture the whole `cargo
-  test` output (`--test-threads=1` versus the default is the first discriminator worth trying).
-  Predates this branch: found by MOD-2 milestone 7's T41 implementer, which re-checked it with its
-  own changes reverted. Not `o`-specific until the captured assertion says so.
 
 - [ ] **TOOL-6 - `crates/htui-agent/tests/launch.rs` failed once under whole-crate load and has not
   been reproduced.** `R-NF-3`. Seen on 2026-09-11 during MOD-2 milestone 8's T52: one
@@ -829,4 +809,4 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | ANA-N   | 2 (ANA-3 context tools, ANA-11 requirements/decisions models)              |
 | MOD-N   | 24 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-1 `cargo doc` red on `htui-agent`)                                                |
-| TOOL-N  | 5 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-4 `tests/auth.rs` whole-binary flake, TOOL-6 `tests/launch.rs` failed once unreproduced) |
+| TOOL-N  | 4 (TOOL-1 next-item blocked-on regex, TOOL-2 demo fixture username collision, TOOL-3 Windows lint target unbuildable, TOOL-6 `tests/launch.rs` failed once unreproduced) |
