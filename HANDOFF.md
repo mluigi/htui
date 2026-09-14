@@ -541,7 +541,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   §9.4): "Not blocked" above holds for the server-backed paths only — the create paths for a
   server-less box depend on MOD-17. This item builds and registers the Settings connection
   **section** (`SectionId("connection")`, named by ANA-10 M0 so neither item has to guess);
-  **MOD-17 owns the masked DSN field inside it** and must not have a second one built here. Also:
+  **MOD-25 owns the masked DSN field inside it** and must not have a second one built here. Also:
   no ad-hoc focus mechanism instead of M0's `TabAction::FocusSection` /
   `SettingsSection::captures_input` / `MaskedField` names; no second persistence location for a
   "shown once" marker or for local settings (ANA-10 §5.4's `local_setting` exists for that); and
@@ -717,7 +717,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   exist. **MOD-2's close-out must restate, not silently drop, its claim on ANA-4 §11 criterion 12**
   (an offline chat buffers and `upload_pending` lands exactly those rows): it was proven on
   2026-09-08 and is being withdrawn with the mode, which is a different sentence from "unproven".
-  Not blocked. `docs/ANA-10.md` stays in the tree as the analysis that was done and not taken.
+  Not blocked. `docs/ANA-10.md` stays in the tree as the analysis that was done and not taken. **This item also owns the masked DSN field inside the Settings connection section, replacing MOD-17.**
 - [ ] **MOD-24 - Fault Tolerance of Agent Processes.** Implement agent memory checkpointing to Postgres. If the daemon or TUI crashes mid-run, `htui` should be able to read the last `SessionEvent` from Postgres, re-hydrate the agent's context window, and resume the exact step it was on so that multi-hour runs can survive process restarts.
 
 ### Deferred backlog
