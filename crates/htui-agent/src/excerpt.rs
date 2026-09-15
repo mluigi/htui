@@ -583,12 +583,62 @@ enum Outcome {
     Panicked,
 }
 
+/// What [`run_providers`] names the thread it gives a provider, followed by the provider's name.
+///
+/// A convention a backtrace can be read against: an unwind line from `excerpt-provider:serena` says
+/// whose defect it is without the reader having to know this function exists.
+pub const PROVIDER_THREAD_PREFIX: &str = "excerpt-provider:";
+
+thread_local! {
+    /// Whether this thread is inside a [`propose_caught`] window right now.
+    static CONTAINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a panic on **this** thread, at this instant, is one [`run_providers`] is going to catch.
+///
+/// Review finding M1, and the one question a process-wide panic hook cannot answer for itself:
+/// [`std::panic::catch_unwind`] does not stop the hook, and the hook runs on the panicking thread
+/// before the unwind reaches the `catch_unwind` that swallows it. So `htui`'s hook — which leaves
+/// the alternate screen and disables raw mode — used to fire for a provider panic that the
+/// assembler had already decided to survive, tearing the terminal down under a running event loop.
+///
+/// A thread-local rather than a [`PROVIDER_THREAD_PREFIX`] name test, because since finding M2
+/// `providers[0]` runs on the **caller's** thread, and a name test would miss exactly that one.
+/// Both are set: the flag is the mechanism, the name is the diagnostic.
+///
+/// False on every thread that is not inside a provider call, which is every thread in the process
+/// for all of a normal run. A panic the process does not survive still gives the terminal back.
+#[must_use]
+pub fn panic_is_contained() -> bool {
+    CONTAINED.with(std::cell::Cell::get)
+}
+
+/// Sets [`CONTAINED`] for the lifetime of a provider call, restoring the **previous** value rather
+/// than clearing it, so a nested `run_providers` cannot un-contain its caller's window.
+struct Contained(bool);
+
+impl Contained {
+    fn enter() -> Self {
+        Self(CONTAINED.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for Contained {
+    fn drop(&mut self) {
+        CONTAINED.with(|flag| flag.set(self.0));
+    }
+}
+
 /// One `propose` call with its unwind caught, shared by the inline provider and the spawned ones.
 ///
 /// Inline too, and not only on a thread: `providers[0]` runs on the caller's thread since finding
 /// M2, so an unwind there would take the assembler down instead of being "dropped and recorded"
 /// (hazard H-20).
+///
+/// The [`Contained`] guard spans the `catch_unwind` and not just the `propose`, because the hook
+/// fires *during* the unwind — `panic_is_contained` has to still be true when it is asked.
 fn propose_caught(provider: &dyn ExcerptProvider, req: &ExcerptRequest<'_>) -> Outcome {
+    let _contained = Contained::enter();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| provider.propose(req))) {
         Ok(Ok(candidates)) => Outcome::Proposed(candidates),
         Ok(Err(error)) => Outcome::Failed(error),
@@ -633,19 +683,30 @@ pub fn run_providers(
     let (sender, receiver) = mpsc::channel::<(usize, Outcome)>();
     // The clone is paid for only when there is a thread to hand it to; the inline provider reads
     // the caller's own borrowed request.
-    let deadlined = providers.len().saturating_sub(1);
+    let mut deadlined = providers.len().saturating_sub(1);
     if deadlined > 0 {
         let owned = Arc::new(OwnedExcerptRequest::from_request(req));
         for (index, provider) in providers.iter().enumerate().skip(1) {
+            let name = format!("{PROVIDER_THREAD_PREFIX}{}", provider.name());
             let provider = Arc::clone(provider);
             let request = Arc::clone(&owned);
             let sender = sender.clone();
-            // Detached on purpose: see H-20 above.
-            std::thread::spawn(move || {
+            // Named so an unwind line says whose defect it is, and `Builder` rather than
+            // `thread::spawn` so a refused spawn is this provider's `:error` rather than a panic
+            // on the assembler's own thread.
+            let spawned = std::thread::Builder::new().name(name).spawn(move || {
+                // Detached on purpose: see H-20 above.
                 let outcome = propose_caught(provider.as_ref(), &request.as_request());
                 // The receiver may already have given up; that is the timeout case, not an error.
                 let _ = sender.send((index, outcome));
             });
+            if let Err(error) = spawned {
+                outcomes[index] = Some(Outcome::Failed(ProviderError::new(
+                    "excerpt",
+                    format!("no thread for this provider: {error}"),
+                )));
+                deadlined -= 1;
+            }
         }
     }
     drop(sender);

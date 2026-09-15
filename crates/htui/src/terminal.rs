@@ -35,9 +35,29 @@ pub fn init() -> TerminalGuard {
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
+        if restores_the_terminal() {
+            ratatui::restore();
+        }
         previous(info);
     }));
+}
+
+/// Whether a panic reaching the hook *right now* should give the terminal back.
+///
+/// Review finding M1. The hook fires on **any** panic on **any** thread, including one that a
+/// `catch_unwind` further down the stack is about to swallow — `catch_unwind` does not stop the
+/// hook, it only stops the unwind. `htui_agent::excerpt::run_providers` catches exactly such a
+/// panic on purpose (hazard H-20: a provider that panics is dropped and recorded, and the prompt
+/// is assembled without it), so restoring there left the process with no alternate screen and no
+/// raw mode while the event loop carried on drawing — the wedged-UI shape, caused by a defect the
+/// program had already decided to survive.
+///
+/// The question is asked of the agent crate because that is the crate that does the catching; this
+/// one does not get to guess which panics are fatal. Every other panic is fatal, so the answer is
+/// `true` for all of a normal run.
+#[must_use]
+pub fn restores_the_terminal() -> bool {
+    !htui_agent::excerpt::panic_is_contained()
 }
 
 impl TerminalGuard {
