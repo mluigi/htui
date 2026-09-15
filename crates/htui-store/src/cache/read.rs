@@ -672,8 +672,11 @@ impl ReadStore for CacheStore {
     ///
     /// The Postgres text of `pg/read.rs` with this file's three substitutions plus one more:
     /// SQLite has no `LATERAL`, so the latest-summary lookup is a correlated subquery in the
-    /// `SELECT` list. The workspace is bound **twice**, positionally, rather than reused through a
-    /// `?NNN` placeholder, because every statement in this file binds plain `?` in order.
+    /// `SELECT` list. The workspace and the root are each bound **twice**, positionally, rather
+    /// than reused through a `?NNN` placeholder, because every statement in this file binds plain
+    /// `?` in order — the root's second binding is the `WHERE best.item_id <> ?` that keeps a cycle
+    /// from rendering the root as its own entry (T68, F-52 review, H3), and it comes last because
+    /// that clause is the last placeholder in the text.
     async fn upstream_summaries(
         &self,
         id: ItemId,
@@ -711,6 +714,7 @@ impl ReadStore for CacheStore {
                JOIN item i    ON i.id = best.item_id \
                JOIN project p ON p.id = i.project_id \
                LEFT JOIN scope s ON s.project_id = i.project_id \
+              WHERE best.item_id <> ? \
               ORDER BY best.depth, qualified_key, i.id",
         )
         .bind(id.to_string())
@@ -718,6 +722,7 @@ impl ReadStore for CacheStore {
         .bind(workspace.clone())
         .bind(scope.project.to_string())
         .bind(workspace)
+        .bind(id.to_string())
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;

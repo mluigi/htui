@@ -548,6 +548,93 @@ async fn the_mirror_projects_a_malformed_trim_record_like_postgres() {
     teardown(db, &[&cache]).await;
 }
 
+/// The §7.3 walk never renders the root as its own upstream entry, even when the graph loops back
+/// to it (T68, F-52 review, H3).
+///
+/// `MemStore` seeds `seen` with the root and so cannot emit it; the two SQL backends have a
+/// recursive CTE whose anchor term starts at the root's *neighbours* and whose `best` aggregate has
+/// nothing that excludes the root, so a cycle that returns to it within `hops` emitted it as an
+/// ordinary entry. `migrations/0001_init.sql` forbids a self-loop only
+/// (`CHECK (from_item_id <> to_item_id)`), so the two-edge cycle this builds is storable — and the
+/// assembler would then feed an item its own summary as upstream context.
+///
+/// All three backends are asserted here rather than in `store::conformance::READ_CASES`, which is
+/// where a read-only case belongs: `READ_CASES` reads the fixture and writes nothing, and the
+/// fixture graph is acyclic. Giving it a cycle means editing `htui_core::fixtures`, whose edge
+/// count, ready list and `links_hops_*` sets are pinned across three crates. The mirror harness
+/// already has a Postgres handle, a mirror and the fixture data, so the cycle is built here and
+/// `MemStore::from_demo` gets the same edge appended.
+#[tokio::test]
+async fn a_cycle_never_renders_the_root_as_its_own_upstream() {
+    use htui_core::model::{ItemLink, LinkKind};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    // The fixture already has `agy:FIX-1 --blocked_by--> agy:ANA-1`; this closes the two-cycle, so
+    // the root is reachable from itself at depth 2 and the walk's ceiling is 2.
+    let back_edge = ItemLink {
+        from_item_id: ids::AGY_ANA_1,
+        to_item_id: ids::AGY_FIX_1,
+        kind: LinkKind::BlockedBy,
+        proposed_by_step_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        deleted_at: None,
+    };
+    sqlx::query(
+        "INSERT INTO item_link (from_item_id, to_item_id, kind, created_at, updated_at) \
+         VALUES ($1, $2, 'blocked_by', $3, $4)",
+    )
+    .bind(back_edge.from_item_id.as_uuid())
+    .bind(back_edge.to_item_id.as_uuid())
+    .bind(back_edge.created_at)
+    .bind(back_edge.updated_at)
+    .execute(&db.pool)
+    .await
+    .expect("the back-edge lands in Postgres");
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("a pass mirrors the back-edge");
+
+    let mut data = fixtures::demo_data();
+    data.links.push(back_edge);
+    let mem = MemStore::from_demo(data);
+
+    let scope = PromptScope::from_scope(&platform_scope().await, ids::PROJECT_AGY);
+    let pg = db
+        .store
+        .upstream_summaries(ids::AGY_FIX_1, 2, &scope)
+        .await
+        .expect("pg upstream_summaries");
+    let mirrored = cache
+        .upstream_summaries(ids::AGY_FIX_1, 2, &scope)
+        .await
+        .expect("cache upstream_summaries");
+    let reference = mem
+        .upstream_summaries(ids::AGY_FIX_1, 2, &scope)
+        .await
+        .expect("mem upstream_summaries");
+
+    for (backend, entries) in [("pg", &pg), ("mirror", &mirrored), ("mem", &reference)] {
+        assert!(
+            !entries.iter().any(|entry| entry.item_id == ids::AGY_FIX_1),
+            "{backend}: the root is the step's own item and is never an entry, got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|entry| entry.item_id == ids::AGY_ANA_1),
+            "{backend}: the cycle's other arm is still walked, got {entries:?}"
+        );
+    }
+    assert_eq!(pg, reference, "Postgres agrees with the reference store");
+    assert_eq!(mirrored, reference, "the mirror agrees with it too");
+
+    teardown(db, &[&cache]).await;
+}
+
 /// ANA-5 §12 criterion 19's second clause, as a **suite** rather than as pairwise comparisons:
 /// `store::conformance::READ_CASES` run over the mirror (plan D96).
 ///

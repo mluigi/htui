@@ -563,6 +563,13 @@ impl ReadStore for PgStore {
               LEFT JOIN LATERAL (SELECT body FROM document
                                   WHERE item_id = i.id AND kind = 'summary'
                                   ORDER BY version DESC LIMIT 1) d ON TRUE
+             -- The root is the step's own item and is never an entry, and the walk can arrive back
+             -- at it: the schema forbids a self-loop only, so `R blocked_by A, A blocked_by R` is
+             -- storable and reaches `R` at depth 2. `MemStore` seeds `seen` with the root and so
+             -- cannot emit it; the anchor term here starts at the root's *neighbours* and nothing
+             -- downstream excludes it, so without this the assembler would be handed the item's own
+             -- summary as upstream context (T68, F-52 review, H3).
+             WHERE best.item_id <> $1
              -- The key is spelled out rather than referenced as `qualified_key`: the `!` of the
              -- nullability override is part of the quoted output name Postgres sees, so the alias
              -- an `ORDER BY` could use is `"qualified_key!"` and not `qualified_key`.
