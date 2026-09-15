@@ -453,6 +453,197 @@ pub fn handoff_basic() -> PromptSpec {
     }
 }
 
+/// `lines` numbered lines of the same fixed sentence, LF, with a trailing LF.
+///
+/// Deterministic and parameterised rather than one 85 000-character literal: the oversize fixture
+/// needs section sizes that stand in a stated ratio to the budget, and a literal would hide that
+/// ratio in a wall of text nobody re-reads. Nothing here reads the environment, so the bytes are
+/// the same on every box, which is all a golden fixture owes.
+fn prose_block(topic: &str, lines: usize) -> String {
+    let mut out = String::with_capacity(lines * 72);
+    for n in 0..lines {
+        out.push_str(&format!(
+            "{topic} line {n}: the recorder buffers rows and flushes them on the turn boundary.\n"
+        ));
+    }
+    out
+}
+
+/// `lines` of unified-diff body, which the estimator bills at the code rate inside its fence.
+fn diff_block(lines: usize) -> String {
+    let mut out = String::with_capacity(lines * 72);
+    out.push_str("--- a/crates/htui-agent/src/record.rs\n+++ b/crates/htui-agent/src/record.rs\n");
+    for n in 0..lines {
+        out.push_str(&format!(
+            "+    self.rows.push(PendingRow::new({n})); // flush on the turn boundary\n"
+        ));
+    }
+    out
+}
+
+/// Criterion 9's fixture: an `implement` step half again over its budget.
+///
+/// Sized so the deficit is cleared **inside** the document group, which is the interesting case:
+/// §4.4's four lower-ranked sections are exhausted in order — `excerpts`, `upstream`,
+/// `previous_diff`, `verify_failure` — and `documents:plan` then gives up exactly the residual, so
+/// `documents:review` and `item` are never reached and the four protected sections carry
+/// `strategy: "none"` throughout. A fixture that cleared at the first rung would prove none of that.
+///
+/// "Exhausted" is §4.4 step 7 as written: a section reaching its floor without clearing the deficit
+/// **moves to the drop**, and the pass moves on only after it. The rungs a section passes through
+/// on the way are what `trim_record` records — the upstream row here keeps its `stubbed` and
+/// `dropped` counters even though the section itself went — and the intermediate states are proved
+/// by the three rung tests in `prompt_digest.rs`, which clear the deficit inside one ladder.
+///
+/// The budget is 40 000 rather than §5.3's 120 000 so the corpus stays a few hundred kilobytes;
+/// the ratio to `target` is what the trim reads, never the absolute number.
+#[must_use]
+pub fn phase_oversize() -> PromptSpec {
+    let mut spec = phase_implement_attempt2();
+    spec.budget = Budget {
+        tokens: 40_000,
+        source: BudgetSource::Project,
+        reserve_bp: 1_000,
+    };
+
+    spec.item_body = prose_block("item", 110);
+    spec.documents = vec![
+        InputDocument {
+            kind: "plan".to_owned(),
+            version: 3,
+            body: prose_block("plan", 950),
+        },
+        InputDocument {
+            kind: "review".to_owned(),
+            version: 1,
+            body: prose_block("review", 72),
+        },
+    ];
+    // Ten lines, well under the 200-line tail-cut floor: it cannot reclaim anything, so it reaches
+    // its floor immediately and the ladder moves to the drop. That is §4.4 step 7 as written.
+    spec.verify_failure = Some(VerifyFailure {
+        exit_code: 101,
+        output: prose_block("test recorder::flushes", 10),
+    });
+    spec.previous_diff = Some(DiffBlock {
+        range: "abc1234..def5678".to_owned(),
+        stat: " 2 files changed, 210 insertions(+), 8 deletions(-)".to_owned(),
+        diff: diff_block(210),
+    });
+    spec.upstream = vec![
+        upstream_entry(
+            0x9,
+            "htui:ANA-9",
+            "Postgres schema",
+            Status::Closed,
+            1,
+            true,
+            Some(&prose_block("ana-9 summary", 60)),
+        ),
+        upstream_entry(
+            0x7,
+            "htui:MOD-7",
+            "Box registry and capabilities",
+            Status::InProgress,
+            1,
+            true,
+            Some(&prose_block("mod-7 summary", 40)),
+        ),
+        upstream_entry(
+            0x4,
+            "htui:MOD-4",
+            "Orchestrator",
+            Status::Queued,
+            2,
+            true,
+            Some(&prose_block("mod-4 summary", 40)),
+        ),
+        upstream_entry(
+            0x1,
+            "auth-service:MOD-1",
+            "Token rotation",
+            Status::Done,
+            2,
+            false,
+            None,
+        ),
+    ];
+    for (index, excerpt) in spec.excerpts.files.iter_mut().enumerate() {
+        excerpt.first_line = 1;
+        excerpt.content = diff_block(170 + index * 10);
+        excerpt.last_line = u32::try_from(excerpt.content.lines().count()).unwrap_or(u32::MAX);
+    }
+    spec
+}
+
+/// Criterion 10's first half: a protected set that alone exceeds `target`.
+///
+/// The budget is a plausible typo — 1 000 tokens, an order of magnitude below anything a model
+/// takes — rather than an impossible one, because the refusal exists for a misconfigured row and
+/// its message is what a maintainer acts on.
+#[must_use]
+pub fn phase_protected_too_big() -> PromptSpec {
+    let mut spec = phase_implement_attempt2();
+    spec.budget = Budget {
+        tokens: 1_000,
+        source: BudgetSource::Project,
+        reserve_bp: 1_000,
+    };
+    spec.skills = vec![BoundSkill {
+        skill_id: SkillId::from_uuid(Uuid::from_u128(0x5111)),
+        name: "rust-style".to_owned(),
+        version: 2,
+        position: 0,
+        body: prose_block("rust-style", 60),
+    }];
+    spec
+}
+
+/// Criterion 10's second half: skills over `max_skill_tokens`.
+///
+/// The budget stays ample, so the only thing wrong with this spec is the aggregate skill text —
+/// §4.2 refuses the step rather than dropping a binding, because a silently dropped skill breaks
+/// `R-ID-5`'s identical-behaviour promise.
+#[must_use]
+pub fn phase_skills_over_cap() -> PromptSpec {
+    let mut spec = phase_implement_attempt2();
+    spec.max_skill_tokens = 100;
+    spec.skills = vec![
+        BoundSkill {
+            skill_id: SkillId::from_uuid(Uuid::from_u128(0x5111)),
+            name: "rust-style".to_owned(),
+            version: 2,
+            position: 0,
+            body: prose_block("rust-style", 30),
+        },
+        BoundSkill {
+            skill_id: SkillId::from_uuid(Uuid::from_u128(0x5222)),
+            name: "command-queue".to_owned(),
+            version: 1,
+            position: 1,
+            body: prose_block("command-queue", 30),
+        },
+    ];
+    spec
+}
+
+/// A real [`TrimRecord`](crate::prompt::TrimRecord) for the demo store's `implement` step (T68).
+///
+/// Built from [`phase_oversize`] rather than from [`phase_implement_attempt2`] because the Runs
+/// pane's two indicators are `~34k` and `!`: a record with nothing trimmed would render half of
+/// what T68 has to show. `budget_source` is `project` either way, which is the field D106's
+/// projection reads.
+///
+/// # Panics
+///
+/// If the oversize fixture stops assembling, which is a bug in this module rather than in a caller.
+#[must_use]
+pub fn demo_trim_record() -> crate::prompt::TrimRecord {
+    crate::prompt::assemble(&phase_oversize(), &crate::scrub::MinimalScrubber::new([]))
+        .expect("the oversize fixture assembles; it is over budget, not unassemblable")
+        .trim
+}
+
 /// Criterion 6: the same spec with every body re-encoded as CRLF.
 ///
 /// The template body is converted too, because a `prompt_template` row edited on Windows is
