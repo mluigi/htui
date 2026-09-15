@@ -302,6 +302,9 @@ struct Run {
     /// The working directory, kept for the redaction pass.
     cwd: PathBuf,
     started: Instant,
+    /// Whether [`Run::finish`] has already killed-or-waited the child, so [`Drop`] knows there is
+    /// nothing left to signal.
+    reaped: bool,
 }
 
 impl Run {
@@ -320,18 +323,28 @@ impl Run {
         let mut spawned = htui_agent::launch::spawn(&resolved, cwd)
             .await
             .expect("the CLI starts");
-        let pid = spawned.pid().expect("a live child reports a pid");
-        let stdin = spawned.take_stdin().expect("stdin is piped").into_inner();
-        let stdout = BufReader::new(spawned.take_stdout().expect("stdout is piped").into_inner());
+        let pid = spawned.pid();
+        let stdin = spawned.take_stdin();
+        let stdout = spawned.take_stdout();
+        let (Some(pid), Some(stdin), Some(stdout)) = (pid, stdin, stdout) else {
+            // Review finding M4. Nothing owns this child yet — `Run`'s `Drop` only starts once the
+            // struct exists — and `Spawned` has no killing `Drop` of its own; `ChildGuard`'s is
+            // `pub(crate)`. Three bare `expect`s here would each have left a live `claude` behind,
+            // which is the milestone 5/6 orphan shape. Kill and reap, *then* say what was missing.
+            let _ = spawned.kill_tree().await;
+            let _ = spawned.wait().await;
+            panic!("the CLI started but reported no pid or did not pipe its stdio");
+        };
         Self {
             spawned,
-            stdout: stdout.lines(),
-            stdin: Some(stdin),
+            stdout: BufReader::new(stdout.into_inner()).lines(),
+            stdin: Some(stdin.into_inner()),
             records: Vec::new(),
             lines: Vec::new(),
             pid,
             cwd: cwd.to_path_buf(),
             started: Instant::now(),
+            reaped: false,
         }
     }
 
@@ -502,12 +515,14 @@ impl Run {
             Some(status) => status,
             None => {
                 let _ = self.spawned.kill_tree().await;
-                self.spawned
-                    .wait()
-                    .await
-                    .expect("a killed child is waitable")
+                let status = self.spawned.wait().await;
+                // Set before the `expect`, because by this point the child is dead either way and
+                // the `Drop` below must not signal a pid the OS may have handed to someone else.
+                self.reaped = true;
+                status.expect("a killed child is waitable")
             }
         };
+        self.reaped = true;
         println!(
             "  exit: code={:?} signal={:?} success={}",
             status.code(),
@@ -525,6 +540,27 @@ impl Run {
         write_fixture(name, &self.records, &self.cwd);
         assert_not_running(self.pid, name).await;
         status
+    }
+}
+
+/// The kill a panicking case would otherwise skip (review finding M4).
+///
+/// Every case here is a run of `expect`s and `assert!`s between [`Run::start`] and [`Run::finish`],
+/// and `Spawned` has no killing `Drop` of its own — `ChildGuard`'s is `pub(crate)`. One failed
+/// assertion therefore used to leave a live `claude` behind, for the next case in the file to trip
+/// over and for the maintainer to find later: the milestone 5/6 orphan shape.
+///
+/// Signal only, for `ChildGuard::drop`'s reason: a `Drop` cannot await the reap, and dropping the
+/// inner `tokio::process::Child` hands it to tokio's orphan queue. On unix `start_kill` is a
+/// `killpg`, so it reaches the agent's own children too.
+impl Drop for Run {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        if let Err(error) = self.spawned.start_kill() {
+            println!("  !! the CLI survived its case and could not be signalled: {error}");
+        }
     }
 }
 

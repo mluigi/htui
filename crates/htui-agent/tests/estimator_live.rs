@@ -417,7 +417,11 @@ async fn assert_not_running(pid: u32, what: &str) {
 }
 
 /// Waits for the child, killing its group if the deadline passes; then asserts nothing survived.
-async fn finish(mut spawned: Spawned, pid: u32, label: &str) {
+///
+/// `pid` is an `Option` and is only unwrapped **after** the reap, so "the child never reported a
+/// pid" is a failure this function reports rather than one that leaves a child behind on the way to
+/// reporting it (finding M4).
+async fn finish(mut spawned: Spawned, pid: Option<u32>, label: &str) {
     if tokio::time::timeout(EOF_WINDOW, spawned.wait())
         .await
         .is_err()
@@ -429,7 +433,46 @@ async fn finish(mut spawned: Spawned, pid: u32, label: &str) {
     for line in spawned.stderr_tail() {
         println!("  stderr| {line}");
     }
+    let pid = pid.unwrap_or_else(|| panic!("{label}: a live child reports a pid"));
     assert_not_running(pid, label).await;
+}
+
+/// One turn's conversation with an already-spawned child: take its piped stdio, send the prompt,
+/// read the terminal `result`. `None` is "no `result` arrived in time".
+///
+/// **Every failure is a `String`, never an `expect`** — review finding M4. [`Spawned`] has no
+/// killing `Drop`; only `ChildGuard` has one and it is `pub(crate)`. So a panic anywhere between
+/// the spawn and [`finish`] unwinds past the reap and leaves a live `claude` and an unreaped
+/// child, which is exactly the milestone 5/6 orphan shape this repo has twice blocked on. The
+/// caller kills the child first and panics with the message afterwards.
+async fn drive(spawned: &mut Spawned, prompt: &str) -> Result<Option<Value>, String> {
+    let mut stdin = spawned
+        .take_stdin()
+        .ok_or("stdin is not piped")?
+        .into_inner();
+    let stdout = spawned
+        .take_stdout()
+        .ok_or("stdout is not piped")?
+        .into_inner();
+    let mut lines = BufReader::new(stdout).lines();
+
+    let mut payload = serde_json::to_string(&user_message(prompt))
+        .map_err(|error| format!("a user message serialises: {error}"))?;
+    payload.push('\n');
+    stdin
+        .write_all(payload.as_bytes())
+        .await
+        .map_err(|error| format!("the CLI accepts a user message on stdin: {error}"))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| format!("stdin flushes: {error}"))?;
+
+    let result = read_result(&mut lines, TURN_WINDOW).await;
+    // Dropping the handle closes stdin, which is the documented end-of-input. On the `?` paths
+    // above it drops here too, which is the same close for the same reason.
+    drop(stdin);
+    Ok(result)
 }
 
 /// Spawns one `claude`, sends one prompt, reads its `result`, and reaps the child.
@@ -445,33 +488,23 @@ async fn one_turn(resolved: &ResolvedLaunch, label: &'static str, prompt: &str) 
     let mut spawned = htui_agent::launch::spawn(resolved, cwd.path())
         .await
         .expect("the CLI starts");
-    let pid = spawned.pid().expect("a live child reports a pid");
-    let mut stdin = spawned.take_stdin().expect("stdin is piped").into_inner();
-    let mut lines =
-        BufReader::new(spawned.take_stdout().expect("stdout is piped").into_inner()).lines();
-
-    let mut payload =
-        serde_json::to_string(&user_message(prompt)).expect("a user message serialises");
-    payload.push('\n');
+    // Read before anything fallible runs, so the reap below always has a pid to check.
+    let pid = spawned.pid();
     let started = Instant::now();
-    stdin
-        .write_all(payload.as_bytes())
-        .await
-        .expect("the CLI accepts a user message on stdin");
-    stdin.flush().await.expect("stdin flushes");
-
-    let result = read_result(&mut lines, TURN_WINDOW).await;
-    // Dropping the handle closes stdin, which is the documented end-of-input.
-    drop(stdin);
+    // The whole window between the spawn and the reap is one `Result`: see [`drive`]. The child is
+    // killed and reaped **first**, and only then does a failure in it become a panic.
+    let attempt = drive(&mut spawned, prompt).await;
     finish(spawned, pid, label).await;
     drop(cwd);
 
-    let result = result.unwrap_or_else(|| {
-        panic!(
-            "{label}: no `result` arrived within {TURN_WINDOW:?}. Nothing downstream can be \
-             measured without it — this is a precondition, not a finding."
-        )
-    });
+    let result = attempt
+        .unwrap_or_else(|why| panic!("{label}: {why}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{label}: no `result` arrived within {TURN_WINDOW:?}. Nothing downstream can be \
+                 measured without it — this is a precondition, not a finding."
+            )
+        });
     let turn = Turn {
         label,
         added_chars,
@@ -560,8 +593,9 @@ fn drift(measured: f64, want: f64) -> f64 {
 /// Both are the length they claim to be, and the prose one is its own first half twice over (F-61).
 /// A fixture regenerated at a different length, or from a contiguous slice, would move every ratio
 /// in this file and would do it **silently** — the run would still print three plausible numbers.
-/// Not a `#[test]` of its own: this file spends money, so it stays one `#[ignore]`d case and a
-/// plain `cargo test` over it runs nothing at all.
+/// Not a `#[test]` of its own: this file spends money, so every case that *spends* is `#[ignore]`d
+/// and a plain `cargo test` over it reaches the vendor not at all. The one non-ignored case is
+/// [`a_failure_between_the_spawn_and_the_reap_still_reaps`], which spawns `/bin/sh`.
 fn assert_corpora_are_intact() {
     assert_eq!(
         PROSE.chars().count(),
@@ -583,6 +617,49 @@ fn assert_corpora_are_intact() {
          difference in the text rather than on a broken baseline subtraction — which is exactly \
          the ambiguity F-61 removed. Regenerate it as 20 000 characters written twice."
     );
+}
+
+/// Review finding M4: a failure between the spawn and the reap leaves no child behind.
+///
+/// `/bin/sh`, never `claude` — this case spends nothing and is therefore the one here that is not
+/// `#[ignore]`d. It is still in this file rather than in `tests/launch.rs` because what it pins is
+/// [`drive`] and [`finish`], which are this file's.
+///
+/// The premise is the finding's own: [`Spawned`] has no killing `Drop` — only `ChildGuard` has one
+/// and it is `pub(crate)` — so a panic anywhere in that window unwinds past the reap and leaves a
+/// live agent, which is the milestone 5/6 orphan shape this repo has twice blocked on. The five
+/// `expect`s that used to sit there are now `drive`'s `Result`, and this asserts the two halves of
+/// what that buys: the failure **returns** rather than unwinding, and the reap runs anyway.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failure_between_the_spawn_and_the_reap_still_reaps() {
+    const LABEL: &str = "a failure between the spawn and the reap";
+    // `cat` for the child's whole behaviour: alive while `drive` runs, and gone the moment stdin
+    // closes — which is what `drive` does to it on every exit path, including the failing ones.
+    let resolved = ResolvedLaunch {
+        command: "/bin/sh".to_owned(),
+        args: vec!["-c".to_owned(), "cat >/dev/null".to_owned()],
+        env: BTreeMap::new(),
+    };
+    let cwd = tempfile::tempdir().expect("a scratch working directory");
+    let mut spawned = htui_agent::launch::spawn(&resolved, cwd.path())
+        .await
+        .expect("/bin/sh spawns");
+    let pid = spawned.pid();
+    assert!(pid.is_some(), "a live child reports a pid");
+
+    // Stolen out from under `drive` so its third step fails with the child still running. That
+    // step is `take_stdout().expect("stdout is piped")` as the finding found it.
+    let stolen = spawned.take_stdout().expect("stdout is piped");
+    let attempt = drive(&mut spawned, "never read").await;
+    drop(stolen);
+    assert!(
+        attempt.is_err(),
+        "the window reports its failure rather than unwinding through the reap: {attempt:?}"
+    );
+
+    // And the reap runs regardless — `finish` asserts the pid is gone, which is the whole claim.
+    finish(spawned, pid, LABEL).await;
 }
 
 /// D99's differential, repeatable: the four turns, the three ratios, and the constants they defend.
