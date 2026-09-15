@@ -32,6 +32,11 @@ use crate::ui::tabs::TabId;
 /// Monotonic request counter, minted by `App::dispatch` (blueprint C.2).
 pub type Seq = u64;
 
+/// [`StoreRequest::name`] of the preview, named once so the deferred task's `Failed` replies carry
+/// the same string the request does (`preview::run_preview` cannot call `name()` — it no longer has
+/// the request).
+pub const PROMPT_PREVIEW: &str = "prompt_preview";
+
 /// Who asked, and therefore who the reply is addressed to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Origin {
@@ -90,6 +95,23 @@ pub enum StoreRequest {
     /// A read like any other, answered once: a replay is history, not a stream, so it costs one
     /// request rather than a subscription that could still be arriving when the user leaves.
     StepEvents(StepId),
+    /// Assemble the prompt one item would be given, and render nothing to the store (MOD-2 D102).
+    ///
+    /// Served as **deferred work on an owned [`Backend`] clone**, never in the worker's `select!`
+    /// arm and never on the UI task (`R-NF-3`): the assembly reads eight tables and renders the
+    /// whole prompt. The shape [`ProbeAgents`](Self::ProbeAgents) established, for the same reason.
+    ///
+    /// `template_name` is `None` on the read the Backlog tab issues with the other five, and
+    /// `Some` once the user has cycled the picker; `scope` bounds the upstream walk (plan D95).
+    /// **Nothing here writes**: no `set_step_prompt`, no `prompt` event, no run.
+    PromptPreview {
+        /// The item to preview.
+        item: ItemId,
+        /// Which template to render, or `None` for the project's default (blueprint D.4).
+        template_name: Option<String>,
+        /// The active workspace, which bounds the upstream walk.
+        scope: Scope,
+    },
     /// Start a chat: mint the `run` / `run_step` pair, open a session, send the first prompt
     /// (MOD-2 D27). Answered by [`StoreReply::ChatAccepted`] once the handshake is through, then
     /// by a [`StoreReply::Chat`] frame per event for the life of the session.
@@ -218,6 +240,7 @@ impl StoreRequest {
             Self::Runs(_) => "runs",
             Self::Agents => "agents",
             Self::StepEvents(_) => "step_events",
+            Self::PromptPreview { .. } => PROMPT_PREVIEW,
             Self::ChatStart { .. } => "chat_start",
             Self::ChatSend { .. } => "chat_send",
             Self::ChatAnswer { .. } => "chat_answer",
@@ -275,6 +298,16 @@ pub enum StoreReply {
         /// The step's rows, or `None` for "not on this box".
         events: Option<Vec<SessionEvent>>,
     },
+    /// Answer to [`StoreRequest::PromptPreview`] (MOD-2 D102), from the deferred task's own task.
+    ///
+    /// Boxed for the reason [`StoreReply::Item`] is: it carries a whole assembled prompt — the
+    /// text, its digest, the section rows and the trim record — and would otherwise set the size of
+    /// this enum for every other variant.
+    ///
+    /// A refusal is an answer too: `PromptPreview::outcome` is `Err` when the assembler declined
+    /// (`prompt budget too small`, `skills exceed max_skill_tokens`, an unknown placeholder), and
+    /// only a **store** failure comes back as [`StoreReply::Failed`].
+    PromptPreview(Box<crate::preview::PromptPreview>),
     /// One frame of an adapter install (MOD-20 D18).
     ///
     /// The plan answers a [`StoreRequest::InstallPlan`]; every frame of a confirm answers the
@@ -537,11 +570,12 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             events: backend.step_events(*step).await?,
         },
         // The four chat requests need the worker loop's own state (the live sessions), and the
-        // probe, the three install requests and MOD-21's four login ones need the runtime that
-        // owns their tasks, so all twelve are served ahead of this function, exactly as
-        // `ApplyMigrations` is. One of them that reaches here at all belongs to a caller with no
+        // probe, the preview, the three install requests and MOD-21's four login ones need the
+        // runtime that owns their tasks, so all thirteen are served ahead of this function, exactly
+        // as `ApplyMigrations` is. One of them that reaches here at all belongs to a caller with no
         // runtime — the test harness without one — and saying so is more use than a panic.
-        StoreRequest::ChatStart { .. }
+        StoreRequest::PromptPreview { .. }
+        | StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
         | StoreRequest::ChatAnswer { .. }
         | StoreRequest::ChatCancel { .. }
@@ -694,7 +728,8 @@ pub fn spawn_with(
                         // browser, so `Served::Deferred => continue` is the whole of `R-NF-3` for
                         // both: the arm returns having spawned a task and awaited nothing longer
                         // than `box_info()` (blueprint H-9).
-                        StoreRequest::ChatStart { .. }
+                        StoreRequest::PromptPreview { .. }
+                        | StoreRequest::ChatStart { .. }
                         | StoreRequest::ChatSend { .. }
                         | StoreRequest::ChatAnswer { .. }
                         | StoreRequest::ChatCancel { .. }

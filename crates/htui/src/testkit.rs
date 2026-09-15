@@ -190,7 +190,8 @@ impl Harness {
                         }
                     }
                     (
-                        StoreRequest::ChatStart { .. }
+                        StoreRequest::PromptPreview { .. }
+                        | StoreRequest::ChatStart { .. }
                         | StoreRequest::ChatSend { .. }
                         | StoreRequest::ChatAnswer { .. }
                         | StoreRequest::ChatCancel { .. }

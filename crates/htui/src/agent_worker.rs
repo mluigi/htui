@@ -46,8 +46,8 @@ use htui_agent::record::{
 };
 use htui_agent::registry::{DriverFactory, caps_for};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, PER_TOKEN_CAP_BATCH, ProjectCaps, ProjectId,
-    QuotaSource, RunStatus, StepId, Transport,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, ItemId, PER_TOKEN_CAP_BATCH, ProjectCaps,
+    ProjectId, QuotaSource, RunStatus, Scope, StepId, Transport,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{StoreError, WriteStore};
@@ -571,6 +571,18 @@ impl AgentRuntime {
                 Ok(served) => served,
                 Err(err) => Served::Reply(failed("probe_agents", &err)),
             },
+            StoreRequest::PromptPreview {
+                item,
+                template_name,
+                scope,
+            } => self.preview(
+                backend,
+                replies,
+                addr,
+                *item,
+                template_name.clone(),
+                scope.clone(),
+            ),
             StoreRequest::InstallPlan { agent_id } => {
                 match self.install_plan(backend, replies, addr, *agent_id).await {
                     Ok(served) => served,
@@ -734,6 +746,45 @@ impl AgentRuntime {
             },
         })));
         Ok(Served::Deferred)
+    }
+
+    /// The [`StoreRequest::PromptPreview`] path (MOD-2 D102, D103, D109).
+    ///
+    /// The probe's shape with one refusal instead of four, and **before anything is spawned**: an
+    /// offline backend has no `prompt_template` row to render — `prompt_template`, `skill*` and
+    /// `box_tool` are all outside the mirror — so the task could only fail on its first read
+    /// (blueprint H-16). Plan D109 makes that the product's direction rather than a milestone
+    /// expedient: `htui` is an online-only program, and the sentence names the real reason.
+    ///
+    /// Not `async` and not fallible: the two things it does are a `match` and a `tokio::spawn`, so
+    /// the worker's `select!` arm returns having awaited nothing at all (`R-NF-3`). The clone is a
+    /// snapshot of the backend, not the backend: it cannot perform the swap the worker owns
+    /// (blueprint E-10), and one that outlives a swap fails on its own arm and exits (H-17).
+    fn preview(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        item: ItemId,
+        template_name: Option<String>,
+        scope: Scope,
+    ) -> Served {
+        if matches!(backend, Backend::Offline { .. }) {
+            return Served::Reply(failed(
+                crate::store_worker::PROMPT_PREVIEW,
+                &StoreError::Unreachable(crate::preview::offline_refusal().to_owned()),
+            ));
+        }
+        self.background
+            .push(tokio::spawn(crate::preview::run_preview(
+                backend.clone(),
+                item,
+                template_name,
+                scope,
+                replies.clone(),
+                addr,
+            )));
+        Served::Deferred
     }
 
     /// The [`StoreRequest::InstallPlan`] path (MOD-20 D13, D18).

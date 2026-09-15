@@ -14,6 +14,7 @@ pub mod app;
 pub mod cli;
 pub mod event_loop;
 pub mod keymap;
+pub mod preview;
 pub mod store_worker;
 pub mod terminal;
 pub mod ui;
