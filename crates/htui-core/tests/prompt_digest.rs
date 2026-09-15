@@ -987,3 +987,52 @@ fn a_role_without_its_inputs_refuses() {
         Err(AssembleError::RoleInputs { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------------------------
+// One vocabulary, two spellings (T67)
+// ---------------------------------------------------------------------------------------------
+
+/// `as_str` and `Serialize` must produce the same word for every variant of the three closed
+/// vocabularies `trim_record` carries.
+///
+/// The Prompt sub-tab renders `as_str` and a reader compares what it renders against the stored
+/// row, which is the `Serialize` form. Two tables would be two spellings, and this is what keeps
+/// them one.
+#[test]
+fn the_record_vocabularies_spell_themselves_once() {
+    use htui_core::prompt::excerpt::RootSource;
+    use htui_core::prompt::settings::BudgetSource;
+
+    fn serialised(value: &impl serde::Serialize) -> String {
+        match serde_json::to_value(value).expect("a unit variant serialises") {
+            serde_json::Value::String(text) => text,
+            other => panic!("a unit variant serialises as a string, not {other}"),
+        }
+    }
+
+    for strategy in [
+        TrimStrategy::None,
+        TrimStrategy::HeadTail,
+        TrimStrategy::TailCut,
+        TrimStrategy::StatOnly,
+        TrimStrategy::StubLadder,
+        TrimStrategy::Dropped,
+    ] {
+        assert_eq!(strategy.as_str(), serialised(&strategy), "{strategy:?}");
+    }
+    for source in [
+        BudgetSource::Phase,
+        BudgetSource::Project,
+        BudgetSource::AppSetting,
+        BudgetSource::AppSettingDefault,
+    ] {
+        assert_eq!(source.as_str(), serialised(&source), "{source:?}");
+    }
+    for source in [
+        RootSource::RunStepTree,
+        RootSource::RepoBoxPath,
+        RootSource::NoPath,
+    ] {
+        assert_eq!(source.as_str(), serialised(&source), "{source:?}");
+    }
+}

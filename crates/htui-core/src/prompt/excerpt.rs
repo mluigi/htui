@@ -162,6 +162,22 @@ pub enum RootSource {
     NoPath,
 }
 
+impl RootSource {
+    /// The one spelling: the `roots[].source` value `trim_record` serialises.
+    ///
+    /// See [`TrimStrategy::as_str`](crate::prompt::TrimStrategy::as_str) for why a view gets this
+    /// rather than a table of its own. `no_path` in particular is the string ANA-5 §12 criterion 12
+    /// is written in terms of, so the pane and the row must say it identically.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunStepTree => "run_step_tree",
+            Self::RepoBoxPath => "repo_box_path",
+            Self::NoPath => "no_path",
+        }
+    }
+}
+
 /// Why a file was selected, as the `reason="…"` attribute and the audit key (§4.5 `:1113-1114`).
 ///
 /// A closed enum and not prose: a provider that could write the attribute would put a third

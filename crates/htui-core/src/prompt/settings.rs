@@ -134,6 +134,22 @@ pub enum BudgetSource {
     AppSettingDefault,
 }
 
+impl BudgetSource {
+    /// The one spelling: the `budget_source` value `trim_record` serialises.
+    ///
+    /// See [`TrimStrategy::as_str`](crate::prompt::TrimStrategy::as_str) for why a view gets this
+    /// rather than a table of its own.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Phase => "phase",
+            Self::Project => "project",
+            Self::AppSetting => "app_setting",
+            Self::AppSettingDefault => "app_setting_default",
+        }
+    }
+}
+
 /// A resolved token budget: the number, its provenance, and the reserve held back for the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {

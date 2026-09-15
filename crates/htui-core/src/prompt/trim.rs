@@ -72,6 +72,26 @@ pub enum TrimStrategy {
     Dropped,
 }
 
+impl TrimStrategy {
+    /// The one spelling: the `strategy` value `trim_record` serialises, as a `&'static str`.
+    ///
+    /// The shape [`TemplateRole::as_str`](crate::prompt::TemplateRole::as_str) already has, and for
+    /// the same reason: a view that renders this word must render *the row's* word, and a second
+    /// table in a view is a second spelling waiting to drift. `the_two_spellings_agree` below is
+    /// what holds the two in step.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::HeadTail => "head_tail",
+            Self::TailCut => "tail_cut",
+            Self::StatOnly => "stat_only",
+            Self::StubLadder => "stub_ladder",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
 /// One row of `trim_record.sections` (§5.1 `:1505-1517`).
 ///
 /// `tokens_before` and `tokens_after` are what the section costs **in this prompt**: a placeholder
