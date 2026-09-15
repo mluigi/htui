@@ -54,7 +54,7 @@ use htui_core::store::{StoreError, WriteStore};
 use htui_store::{Backend, Writer};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::store_worker::{
@@ -303,6 +303,20 @@ pub struct AgentRuntime {
     /// is a task this struct owns, the D60 one runs inside a chat task, and neither can see the
     /// other from where it lives.
     reprobe_claims: ReprobeClaims,
+    /// The in-flight [`StoreRequest::PromptPreview`] task per asking [`Origin`], so the next one
+    /// from that origin can cancel it (review finding M3).
+    ///
+    /// Keyed on the origin rather than held one deep, because two origins can each be waiting on a
+    /// preview of their own and neither supersedes the other. An entry names a task that is also in
+    /// [`background`](Self::background) — this map owns the *right to cancel*, not the task.
+    ///
+    /// Without it, holding `j` across thirty rows spawned thirty tasks, each doing eight store
+    /// reads against an eight-connection pool and assembling to the token budget. The shell's
+    /// staleness index dropped twenty-nine of the replies, but only *after* their reads were paid
+    /// for, and the worker's own `Item`/`Runs` reads queued behind them on `acquire`. Nothing was
+    /// ever blocked (`R-NF-3` held throughout); the UI simply waited on Postgres for work whose
+    /// answer was already known to be unwanted.
+    previews: HashMap<Origin, AbortHandle>,
     /// Where an install would read the registry from and write its tree to (MOD-20 D18).
     ///
     /// `None` until [`with_installer`](Self::with_installer) or [`production`](Self::production):
@@ -348,6 +362,7 @@ impl AgentRuntime {
             grace: CANCEL_GRACE,
             background: Vec::new(),
             reprobe_claims: ReprobeClaims::default(),
+            previews: HashMap::new(),
             installer: None,
             install: None,
             auth: None,
@@ -444,6 +459,9 @@ impl AgentRuntime {
     /// The token is tripped before the abort for the reason
     /// [`shutdown`](Self::shutdown) does it: an abort cannot stop a blocking unpack.
     pub async fn finish_background(&mut self, limit: Duration) {
+        // Every preview named here is one of the tasks about to be awaited, so the right to cancel
+        // it dies with the handle (review finding M3).
+        self.previews.clear();
         for handle in std::mem::take(&mut self.background) {
             let abort = handle.abort_handle();
             if tokio::time::timeout(limit, handle).await.is_err() {
@@ -506,6 +524,9 @@ impl AgentRuntime {
         // The same sweep for the tasks that answer their own request: a probe that has answered is
         // not a probe still running, and `background_len` is what a test reads.
         self.background.retain(|task| !task.is_finished());
+        // And for the right to cancel a preview, which must not outlive the task it names: an
+        // origin whose preview has answered has nothing left to supersede (review finding M3).
+        self.previews.retain(|_, preview| !preview.is_finished());
         // And for the install claim, which is one deep: an install that has answered must not go
         // on refusing the next `i` (blueprint H-10).
         self.install.take_if(|live| live.task.is_finished());
@@ -675,6 +696,7 @@ impl AgentRuntime {
                 );
             }
         }
+        self.previews.clear();
         for task in std::mem::take(&mut self.background) {
             task.abort();
         }
@@ -756,6 +778,13 @@ impl AgentRuntime {
     /// (blueprint H-16). Plan D109 makes that the product's direction rather than a milestone
     /// expedient: `htui` is an online-only program, and the sentence names the real reason.
     ///
+    /// **One preview per origin runs at a time** (review finding M3). A selection change issues six
+    /// reads and this is the expensive one, so holding `j` used to leave a task per row alive to the
+    /// end — eight store reads and an assembly each, against an eight-connection pool — for replies
+    /// the shell's staleness index had already decided to drop. The newest request from an origin
+    /// aborts that origin's previous one instead. Keyed per origin because two origins can each be
+    /// waiting on a preview and neither supersedes the other.
+    ///
     /// Not `async` and not fallible: the two things it does are a `match` and a `tokio::spawn`, so
     /// the worker's `select!` arm returns having awaited nothing at all (`R-NF-3`). The clone is a
     /// snapshot of the backend, not the backend: it cannot perform the swap the worker owns
@@ -775,15 +804,24 @@ impl AgentRuntime {
                 &StoreError::Unreachable(crate::preview::offline_refusal().to_owned()),
             ));
         }
-        self.background
-            .push(tokio::spawn(crate::preview::run_preview(
-                backend.clone(),
-                item,
-                template_name,
-                scope,
-                replies.clone(),
-                addr,
-            )));
+        let origin = addr.origin.clone();
+        let task = tokio::spawn(crate::preview::run_preview(
+            backend.clone(),
+            item,
+            template_name,
+            scope,
+            replies.clone(),
+            addr,
+        ));
+        // The previous preview for this origin, if it is still running, is work whose answer the
+        // staleness index is already committed to dropping (review finding M3). Aborting is safe at
+        // any await point the task is parked on: `run_preview` only reads — plan D102's "the preview
+        // writes nothing" — so there is no half-finished row to leave behind, and the reply it would
+        // have sent is one nobody would have rendered.
+        if let Some(superseded) = self.previews.insert(origin, task.abort_handle()) {
+            superseded.abort();
+        }
+        self.background.push(task);
         Served::Deferred
     }
 

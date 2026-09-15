@@ -424,6 +424,86 @@ async fn the_preview_is_deferred_onto_a_task_the_runtime_owns() {
     );
 }
 
+/// The preview request `seq` asks for, from `origin`.
+fn preview_request(seq: u64, origin: Origin, item: ItemId, scope: Scope) -> RequestEnvelope {
+    RequestEnvelope {
+        seq,
+        origin,
+        request: StoreRequest::PromptPreview {
+            item,
+            template_name: None,
+            scope,
+        },
+    }
+}
+
+#[tokio::test]
+async fn a_second_preview_from_one_origin_aborts_the_first() {
+    // Review finding M3: holding `j` across 30 rows used to spawn 30 preview tasks, each doing
+    // eight store reads against an eight-connection pool and assembling to the token budget. The
+    // shell's staleness index discarded 29 of the replies — *after* their work was finished — and
+    // the worker's own `Item`/`Runs` reads queued behind them on `acquire`. Only the newest
+    // selection's preview is wanted, so the older one is aborted rather than raced.
+    //
+    // Neither task is polled between the two `serve` calls: a preview's arm awaits nothing
+    // (`R-NF-3`), so the current-thread scheduler never gets control, which is exactly the shape of
+    // a held key — the worker drains the channel faster than a task can reach its first store read.
+    let mut runtime = AgentRuntime::new(DriverFactory::new());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let backend = Backend::memory(MemStore::demo());
+    let item = item_id("FEAT-1").await;
+    let scope = platform_scope().await;
+    let origin = Origin::Tab(BacklogTab::ID);
+
+    let first = preview_request(21, origin.clone(), item, scope.clone());
+    let second = preview_request(22, origin.clone(), item, scope);
+    runtime.serve(&backend, &tx, &first).await;
+    runtime.serve(&backend, &tx, &second).await;
+
+    runtime.finish_background(Duration::from_secs(5)).await;
+    let answer = rx.try_recv().expect("the newest preview still answers");
+    assert_eq!(
+        answer.seq, 22,
+        "the reply delivered is the second request's, not the first's"
+    );
+    assert_eq!(answer.origin, origin);
+    assert!(matches!(answer.reply, StoreReply::PromptPreview(_)));
+    assert!(
+        rx.try_recv().is_err(),
+        "the superseded preview was aborted, so it never finished its reads to answer"
+    );
+}
+
+#[tokio::test]
+async fn a_preview_abort_is_per_origin() {
+    // The abort is keyed on the asking `Origin`, so the Backlog tab superseding its own preview
+    // cannot cancel one an overlay or the shell is waiting on. Two origins, one request each, and
+    // both answer.
+    let mut runtime = AgentRuntime::new(DriverFactory::new());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let backend = Backend::memory(MemStore::demo());
+    let item = item_id("FEAT-1").await;
+    let scope = platform_scope().await;
+
+    let tab = preview_request(31, Origin::Tab(BacklogTab::ID), item, scope.clone());
+    let app = preview_request(32, Origin::App, item, scope);
+    runtime.serve(&backend, &tx, &tab).await;
+    runtime.serve(&backend, &tx, &app).await;
+
+    runtime.finish_background(Duration::from_secs(5)).await;
+    let mut answered: Vec<(u64, Origin)> = Vec::new();
+    while let Ok(reply) = rx.try_recv() {
+        assert!(matches!(reply.reply, StoreReply::PromptPreview(_)));
+        answered.push((reply.seq, reply.origin));
+    }
+    answered.sort_by_key(|(seq, _)| *seq);
+    assert_eq!(
+        answered,
+        vec![(31, Origin::Tab(BacklogTab::ID)), (32, Origin::App)],
+        "a second origin's preview is untouched by the first origin's supersession"
+    );
+}
+
 /// A `Backend::Offline` over a throwaway mirror: the arm plan D109 refuses.
 ///
 /// The mirror is empty and stays empty — the refusal happens before the first read, which is the
