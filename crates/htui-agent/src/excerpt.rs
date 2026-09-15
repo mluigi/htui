@@ -248,11 +248,18 @@ impl FsRepoReader {
                 if name == ".git" || self.skip(&child, ignores, None).is_some() {
                     continue;
                 }
-                if self.walk(base, &child, ignores, out, examined, cap)? {
-                    truncated = true;
-                    break;
+                // A subdirectory this box cannot open contributes nothing and does **not** fail the
+                // repo: §4.5 step 1's fail-open applies below the root as well as at it, and one
+                // unreadable directory losing a whole repo's excerpts would be a permission bit
+                // silently changing a prompt. Only the root itself is an error, because a root
+                // that cannot be read is the "resolve a readable root" step failing.
+                match self.walk(base, &child, ignores, out, examined, cap) {
+                    Ok(true) => {
+                        truncated = true;
+                        break;
+                    }
+                    Ok(false) | Err(_) => continue,
                 }
-                continue;
             }
             if !meta.is_file() {
                 continue;
