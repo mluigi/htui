@@ -14,6 +14,142 @@
 
 use serde::Serialize;
 
+/// The glob metacharacters ANA-2 §4.7 truncates a `touched_paths` entry at (`docs/ANA-2.md:1074`).
+const GLOB_META: [char; 4] = ['*', '?', '[', '{'];
+
+/// §4.5's secret denylist (`:1071`), split into the four match shapes it needs: whole file names.
+///
+/// A **selection** rule and not a scrubbing rule: `R-SEC-3` fails closed on residue at persist
+/// time, which is after the bytes reached the agent. Excluding the class at selection removes the
+/// class (§4.5 `:1077-1085`).
+const SECRET_EXACT: [&str; 7] = [
+    ".env",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "credentials.json",
+    "id_rsa",
+];
+/// Secret file names by prefix: `.env.*`, `id_rsa*`, `id_ed25519*`.
+const SECRET_PREFIX: [&str; 3] = [".env.", "id_rsa", "id_ed25519"];
+/// Secret file names by extension.
+const SECRET_EXT: [&str; 5] = [".pem", ".key", ".p12", ".pfx", ".kdbx"];
+/// The one secret extension that is not a suffix of the name but of the whole `*.keystore` form.
+const SECRET_KEYSTORE: &str = ".keystore";
+/// §4.5's last rule (`:1075`): high token cost, near-zero signal.
+const NOISE_SUFFIX: [&str; 4] = [".lock", ".min.js", ".min.css", ".map"];
+
+/// One repo-qualified, wildcard-free path prefix, derived from a `touched_paths` glob.
+///
+/// ANA-2 §4.7's truncation (`docs/ANA-2.md:1074-1077`): the glob is cut at its first `*?[{` and
+/// then at the last `/`, so `src/**/*.rs` becomes `src/` and a full path stays whole. `**` becomes
+/// the **empty** prefix, which is a prefix of everything — deliberately, because that is what makes
+/// a `**` declaration equivalent to no declaration.
+///
+/// Repo-qualified per `docs/ANA-2.md:1025`: `repo:glob`, a bare glob meaning the primary repo. Two
+/// repos each holding a `src/` therefore do not collide, which is the defect the qualifier exists
+/// to fix.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PathPrefix {
+    /// The repo slug the prefix is relative to.
+    pub repo: String,
+    /// The wildcard-free prefix, `/`-separated and possibly empty.
+    pub prefix: String,
+}
+
+impl PathPrefix {
+    /// Parse one `touched_paths` entry against the project's primary repo slug.
+    ///
+    /// The repo qualifier is the text before the **first** `:` when that text is non-empty and
+    /// holds no `/` — a `touched_paths` value is a repo-relative glob (`docs/ANA-9.md:591`), so a
+    /// `:` after a path separator is part of a file name rather than a qualifier.
+    #[must_use]
+    pub fn parse(touched: &str, primary_repo: &str) -> Self {
+        let (repo, glob) = match touched.split_once(':') {
+            Some((repo, rest)) if !repo.is_empty() && !repo.contains('/') => (repo, rest),
+            _ => (primary_repo, touched),
+        };
+        let prefix = match glob.find(GLOB_META) {
+            // No metacharacter: the whole path is the prefix and stays whole.
+            None => glob.to_owned(),
+            Some(cut) => {
+                let head = &glob[..cut];
+                match head.rfind('/') {
+                    Some(slash) => head[..=slash].to_owned(),
+                    None => String::new(),
+                }
+            }
+        };
+        Self {
+            repo: repo.to_owned(),
+            prefix,
+        }
+    }
+
+    /// Whether a repo-relative path sits under this prefix, on **raw bytes**.
+    ///
+    /// Bytes and not characters, and no case folding: a case-insensitive match would make the
+    /// selected set depend on the filesystem the walk ran on, which invariant 2 forbids.
+    #[must_use]
+    pub fn matches(&self, repo: &str, path: &str) -> bool {
+        self.repo == repo && path.as_bytes().starts_with(self.prefix.as_bytes())
+    }
+}
+
+/// One repo-qualified, repo-relative path: a changed file, or a listed candidate.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RepoPath {
+    /// The repo slug, never a path.
+    pub repo: String,
+    /// The repo-relative, `/`-separated path.
+    pub path: String,
+}
+
+/// One repo's readable root, and where it came from (§4.5 step 1).
+///
+/// [`root`](Self::root) is the one absolute path in this module and it is **never rendered**: §4.2
+/// rule 5 puts no absolute path in a digested byte, and [`Excerpt`] carries a slug and a relative
+/// path precisely so a renderer cannot reach this field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRoot {
+    /// The repo slug.
+    pub repo: String,
+    /// The absolute root the walk reads under.
+    pub root: std::path::PathBuf,
+    /// Which rung of §4.5 step 1 answered.
+    pub source: RootSource,
+}
+
+/// §4.5's path-only skip rules, applied by the ranker over the listing rather than only by the
+/// reader (hazard H-22).
+///
+/// Path-only so a [`RepoReader`] test double exercises them too: a rule that lived in
+/// `htui_agent::excerpt::FsRepoReader` alone would pass on the filesystem and be absent from every
+/// fake, which is exactly the hole ANA-5 §12 criterion 14 is written to catch.
+///
+/// Returns the **name** of the first rule that fired, in §4.5's own order (`:1066-1075`): `.git/`,
+/// then the secret denylist, then lockfiles and minified assets. The three content rules — the
+/// gitignore subset, the NUL test and `max_file_bytes` — need bytes and belong to the reader.
+#[must_use]
+pub fn skip_by_path(path: &str) -> Option<&'static str> {
+    if path == ".git" || path.starts_with(".git/") || path.contains("/.git/") {
+        return Some("git");
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if SECRET_EXACT.contains(&name)
+        || SECRET_PREFIX.iter().any(|head| name.starts_with(head))
+        || SECRET_EXT.iter().any(|ext| name.ends_with(ext))
+        || name.ends_with(SECRET_KEYSTORE)
+    {
+        return Some("secret_denylist");
+    }
+    if NOISE_SUFFIX.iter().any(|suffix| name.ends_with(suffix)) {
+        return Some("lockfile_or_minified");
+    }
+    None
+}
+
 /// Where the walk's root for a repo came from (§4.5; `trim_record.excerpts.roots[]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -228,6 +364,89 @@ mod tests {
         assert_eq!(audit["caps"]["max_files"], 0);
         assert_eq!(audit["files"], serde_json::json!([]));
         assert_eq!(audit["provider_set"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_touched_glob_truncates_at_its_first_wildcard_then_at_the_last_slash() {
+        // ANA-2 §4.7 `:1074-1077`, verbatim: `src/**/*.rs` becomes `src/`, a full path stays
+        // whole, and `**` becomes the empty prefix, which is a prefix of everything.
+        for (glob, prefix) in [
+            ("src/**/*.rs", "src/"),
+            (
+                "crates/htui-core/src/model/item.rs",
+                "crates/htui-core/src/model/item.rs",
+            ),
+            ("**", ""),
+            ("src/htui*.rs", "src/"),
+            ("a/b/c?.txt", "a/b/"),
+            ("a/b[0-9]/c", "a/"),
+            ("a/{x,y}/c", "a/"),
+        ] {
+            let parsed = PathPrefix::parse(glob, "htui");
+            assert_eq!(parsed.repo, "htui", "a bare glob means the primary repo");
+            assert_eq!(parsed.prefix, prefix, "`{glob}` truncates to `{prefix}`");
+        }
+    }
+
+    #[test]
+    fn a_touched_glob_may_name_its_repo() {
+        let parsed = PathPrefix::parse("agy:src/**", "htui");
+        assert_eq!(parsed.repo, "agy");
+        assert_eq!(parsed.prefix, "src/");
+        assert!(parsed.matches("agy", "src/main.rs"));
+        assert!(
+            !parsed.matches("htui", "src/main.rs"),
+            "the prefix is repo-qualified, so two repos' `src/` do not collide"
+        );
+        assert!(!parsed.matches("agy", "tests/main.rs"));
+        // The empty prefix is a prefix of everything, in its own repo only.
+        let all = PathPrefix::parse("**", "htui");
+        assert!(all.matches("htui", "anything/at/all"));
+        assert!(!all.matches("agy", "anything/at/all"));
+    }
+
+    #[test]
+    fn the_path_skip_rules_name_the_rule_that_fired() {
+        for path in [
+            ".git/config",
+            "crates/.git/HEAD",
+            ".env",
+            ".env.local",
+            "deploy/prod.pem",
+            "certs/server.key",
+            "a/b.p12",
+            "a/b.pfx",
+            "home/id_rsa",
+            "home/id_ed25519.pub",
+            "a/release.keystore",
+            ".netrc",
+            "sub/.npmrc",
+            ".pypirc",
+            "aws/credentials",
+            "gcp/credentials.json",
+            "vault/secrets.kdbx",
+            "Cargo.lock",
+            "web/app.min.js",
+            "web/app.min.css",
+            "web/app.js.map",
+        ] {
+            assert!(
+                skip_by_path(path).is_some(),
+                "`{path}` is excluded at selection, not at scrub time (§4.5 `:1077-1085`)"
+            );
+        }
+        assert_eq!(skip_by_path(".git/config"), Some("git"));
+        assert_eq!(skip_by_path(".env.production"), Some("secret_denylist"));
+        assert_eq!(skip_by_path("Cargo.lock"), Some("lockfile_or_minified"));
+        for path in [
+            "crates/htui-core/src/prompt/mod.rs",
+            "src/environment.rs",
+            "docs/keys.md",
+            "src/credentials_test.rs",
+            "web/app.js",
+        ] {
+            assert_eq!(skip_by_path(path), None, "`{path}` is ordinary source");
+        }
     }
 
     #[test]
