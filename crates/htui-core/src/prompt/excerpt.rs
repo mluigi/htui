@@ -1128,6 +1128,11 @@ pub fn select(
     sort_candidates(&mut candidates);
 
     // -- steps 7 and 8: take in rank order until a cap binds, windowing each file ----------------
+    // A candidate that does not fit the residual budget is **skipped**, not a stop: one oversized
+    // tier-1 file would otherwise block every smaller file behind it, and the order candidates are
+    // offered in is still rank order, so nothing is displaced and the result is still a pure
+    // function of the inputs. `rank` is assigned in selection order, so a skipped file costs no
+    // rank and the trimmer's "highest rank number is the worst file" stays true.
     let mut files: Vec<Excerpt> = Vec::new();
     let mut spent = 0i64;
     let max_files = req.caps.max_files as usize;

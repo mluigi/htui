@@ -333,6 +333,11 @@ fn has_nul(path: &Path) -> bool {
 }
 
 impl RepoReader for FsRepoReader {
+    /// The cap counts every regular file the walk **examines**, skipped ones included, because the
+    /// cap exists to bound the walk's cost and a stat of a lockfile costs what a stat of a source
+    /// file costs. A truncated listing is therefore always a prefix of the untruncated one, never a
+    /// different set — which is what makes `scan_truncated` mean "there is more below this", and
+    /// what `scan_cap_sets_truncated` pins.
     fn list(&self, root: &RepoRoot, cap: u32) -> Result<(Vec<String>, bool), ProviderError> {
         let mut out = Vec::new();
         let mut ignores = Vec::new();
