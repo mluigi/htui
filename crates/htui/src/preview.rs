@@ -347,7 +347,10 @@ pub async fn run_preview(
     let reply = match build(&backend, item, template_name.as_deref(), &scope).await {
         Ok(preview) => StoreReply::PromptPreview(Box::new(preview)),
         Err(error) => StoreReply::Failed {
-            request: "prompt_preview",
+            // The constant, not the literal: `store_worker::PROMPT_PREVIEW` exists because this
+            // task cannot call `StoreRequest::name()` — it no longer has the request — and the
+            // pane's `on_reply` compares against it (finding L4).
+            request: crate::store_worker::PROMPT_PREVIEW,
             message: error.to_string(),
         },
     };
