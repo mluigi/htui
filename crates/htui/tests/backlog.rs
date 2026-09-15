@@ -5,9 +5,11 @@
 //! size the whole snapshot suite is pinned to (plan risk row).
 #![cfg(feature = "testkit")]
 
+use htui::agent_worker::AgentRuntime;
 use htui::app::Action;
 use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
+use htui_agent::registry::DriverFactory;
 use htui_core::model::WorkspaceSummary;
 use htui_core::store::MemStore;
 
@@ -30,12 +32,17 @@ async fn workspace(slug: &str) -> WorkspaceSummary {
 /// `Harness::demo()` starts in `Graphics` (workspaces are ordered by name), so the scope is moved
 /// the only way it ever moves: an `Action::SetScope` (plan D10).
 async fn backlog() -> Harness {
-    let mut harness = Harness::demo().with_tab(Box::new(BacklogTab::new()));
-    harness.settle().await;
+    let mut harness = Harness::demo()
+        .with_tab(Box::new(BacklogTab::new()))
+        // MOD-2 milestone 9: the sixth read is the prompt preview, which the agent runtime owns
+        // and `store_worker::spawn` always has. Without one here every selection would answer
+        // `Failed` and take the status line, which is a harness artefact and not a shell state.
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    harness.drive_to_end().await;
     harness.app().update(Action::SetScope {
         workspace: workspace("platform").await,
     });
-    harness.settle().await;
+    harness.drive_to_end().await;
     harness
 }
 
@@ -43,7 +50,7 @@ async fn backlog() -> Harness {
 async fn down(harness: &mut Harness, n: usize) {
     for _ in 0..n {
         harness.key("j");
-        harness.settle().await;
+        harness.drive_to_end().await;
     }
 }
 
@@ -81,9 +88,9 @@ async fn the_list_groups_the_two_project_workspace_by_project() {
 async fn enter_folds_and_unfolds_a_project_group() {
     let mut harness = backlog().await;
     harness.key("k");
-    harness.settle().await;
+    harness.drive_to_end().await;
     harness.key("enter");
-    harness.settle().await;
+    harness.drive_to_end().await;
     let folded = harness.render();
     assert!(
         !folded.contains("TUI scaffold"),
@@ -93,7 +100,7 @@ async fn enter_folds_and_unfolds_a_project_group() {
     insta::assert_snapshot!("list_folded", folded);
 
     harness.key("enter");
-    harness.settle().await;
+    harness.drive_to_end().await;
     assert!(
         harness.render().contains("TUI scaffold"),
         "Enter unfolds it again"
@@ -112,11 +119,11 @@ async fn j_k_g_and_shift_g_move_the_selection() {
     assert!(harness.render().contains("┌ FEAT-1"), "three rows down");
 
     harness.key("k");
-    harness.settle().await;
+    harness.drive_to_end().await;
     assert!(harness.render().contains("┌ CLEAN-1"), "one row back up");
 
     harness.key("G");
-    harness.settle().await;
+    harness.drive_to_end().await;
     let last = harness.render();
     assert!(
         last.contains("┌ FIX-1"),
@@ -125,7 +132,7 @@ async fn j_k_g_and_shift_g_move_the_selection() {
     insta::assert_snapshot!("list_last_row", last);
 
     harness.key("g");
-    harness.settle().await;
+    harness.drive_to_end().await;
     let first = harness.render();
     assert!(
         first.contains("┌ Detail") && first.contains("No item selected"),
@@ -134,13 +141,17 @@ async fn j_k_g_and_shift_g_move_the_selection() {
 }
 
 #[tokio::test]
-async fn the_five_sub_tabs_render_the_selected_item() {
+async fn the_six_sub_tabs_render_the_selected_item() {
     for (steps, name) in [
         (0, "detail_body"),
         (1, "detail_runs"),
         (2, "detail_graph"),
         (3, "detail_documents"),
         (4, "detail_notes"),
+        // The sixth is MOD-2 milestone 9's preview (plan D102), assembled by a task the runtime
+        // spawned. Clipped to the pane's 43 columns here; `prompt_preview.rs` renders it wide
+        // enough to read and asserts its bytes.
+        (5, "detail_prompt"),
     ] {
         let mut harness = backlog().await;
         down(&mut harness, TO_FEAT_1).await;
@@ -157,6 +168,9 @@ async fn every_sub_tab_says_so_when_it_has_nothing() {
         (2, "empty_graph"),
         (3, "empty_documents"),
         (4, "empty_notes"),
+        // Not the Prompt sub-tab: htui `ANA-2` has no document and no link, but it still *has* a
+        // prompt — that is the whole point of the preview — so "this item has nothing" is not a
+        // state it can be in. Its own empty state is the next case.
     ] {
         let mut harness = backlog().await;
         down(&mut harness, TO_ANA_2).await;
@@ -175,13 +189,30 @@ async fn every_sub_tab_says_so_when_it_has_nothing() {
 }
 
 #[tokio::test]
+async fn the_prompt_sub_tab_says_so_with_no_item_selected() {
+    // The Prompt sub-tab's empty state is not "this item has no rows" — every item has a prompt —
+    // but "there is no item": the cursor is on a project header. Plan D11 all the same, a message
+    // and never a blank pane.
+    let mut harness = backlog().await;
+    harness.key("g");
+    harness.drive_to_end().await;
+    sub_tab(&mut harness, 5);
+    let frame = harness.render();
+    assert!(
+        frame.contains("┌ Detail") && frame.contains("No item selected"),
+        "g lands on the first project header:\n{frame}"
+    );
+    insta::assert_snapshot!("empty_prompt", frame);
+}
+
+#[tokio::test]
 async fn h_and_l_cycle_the_sub_tabs_both_ways() {
     let mut harness = backlog().await;
     down(&mut harness, TO_FEAT_1).await;
     harness.key("h");
     assert!(
-        harness.render().contains("Skeleton only"),
-        "h from Body wraps around to Notes"
+        harness.render().contains("digest"),
+        "h from Body wraps around to Prompt, the sixth since MOD-2 milestone 9"
     );
     harness.key("]");
     assert!(
@@ -210,7 +241,7 @@ async fn a_scope_change_clears_the_list_and_the_detail() {
     harness.app().update(Action::SetScope {
         workspace: workspace("graphics").await,
     });
-    harness.settle().await;
+    harness.drive_to_end().await;
 
     let frame = harness.render();
     assert!(

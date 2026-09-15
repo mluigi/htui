@@ -5,7 +5,7 @@ expression: frame
 Graphics · DESKTOP-HTUI · memory · 0 runs
  1 Backlog  2 Skills  3 Settings  4 Chat
 ┌ Backlog (2) ────────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
-│▾ Vulkan Tutorials (2)                               ││ Body  Runs  Graph  Documents  Notes       │
+│▾ Vulkan Tutorials (2)                               ││ Body  Runs  Graph  Documents  Notes  Promp│
 │  FEAT-1  in_progress  Chapter 12 parity             ││Chapter 12 parity                          │
 │  TOOL-1  open         Shader build script           ││FEAT-1  FEAT  in_progress                  │
 │                                                     ││gpu, vulkan · priority 0 · version 1       │

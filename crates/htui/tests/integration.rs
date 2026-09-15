@@ -5,15 +5,23 @@
 //! workspace switcher reachable and the two of them talking to the same scope. That is this file.
 #![cfg(feature = "testkit")]
 
+use htui::agent_worker::AgentRuntime;
 use htui::app::register_all;
 use htui::testkit::Harness;
 use htui::ui::overlay::WorkspaceSwitcher;
+use htui_agent::registry::DriverFactory;
 
 /// The registered shell over the demo fixture, settled into its startup workspace.
+///
+/// It carries an agent runtime because `store_worker::spawn` does (`AgentRuntime::production`):
+/// since MOD-2 milestone 9 the Backlog tab's sixth read is the prompt preview, which the runtime
+/// owns, and a harness without one would photograph a shell no user starts — the point of this
+/// file being that it renders the shell a user *does*. The empty factory is enough: a preview
+/// spawns no process.
 async fn demo_shell() -> Harness {
-    let mut harness = Harness::demo();
+    let mut harness = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
     register_all(harness.app());
-    harness.settle().await;
+    harness.drive_to_end().await;
     harness
 }
 
@@ -66,14 +74,14 @@ async fn the_backlog_tab_shows_the_scope_and_the_digits_reach_the_other_tabs() {
     );
 
     harness.key("2");
-    harness.settle().await;
+    harness.drive_to_end().await;
     assert_eq!(
         harness.app().tabs.active_id().map(|id| id.0),
         Some("skills")
     );
 
     harness.key("1");
-    harness.settle().await;
+    harness.drive_to_end().await;
     assert_eq!(
         harness.app().tabs.active_id().map(|id| id.0),
         Some("backlog"),
@@ -86,7 +94,7 @@ async fn w_opens_the_workspace_switcher_and_esc_closes_it_again() {
     let mut harness = demo_shell().await;
 
     harness.key("w");
-    harness.settle().await;
+    harness.drive_to_end().await;
     assert_eq!(
         harness.app().overlays.len(),
         1,
@@ -114,10 +122,10 @@ async fn the_switcher_reached_by_w_still_changes_the_scope() {
     let mut harness = demo_shell().await;
 
     harness.key("w");
-    harness.settle().await;
+    harness.drive_to_end().await;
     harness.key("j");
     harness.key("enter");
-    harness.settle().await;
+    harness.drive_to_end().await;
 
     assert!(harness.app().overlays.is_empty());
     assert_eq!(harness.app().top_bar.workspace, "Platform");
@@ -131,7 +139,7 @@ async fn the_switcher_reached_by_w_still_changes_the_scope() {
 async fn an_empty_store_starts_with_the_switcher_open_over_no_workspaces() {
     let mut harness = Harness::empty();
     register_all(harness.app());
-    harness.settle().await;
+    harness.drive_to_end().await;
     let frame = harness.render();
 
     assert_eq!(

@@ -1,4 +1,4 @@
-//! The detail pane: the [`DetailTab`] contract, the registry that holds the five sub-tabs, and
+//! The detail pane: the [`DetailTab`] contract, the registry that holds the six sub-tabs, and
 //! the scroll state they share.
 //!
 //! Sub-tabs are a registry for the same reason tabs are (plan D5): MOD-4's approve/reject and
@@ -10,6 +10,7 @@ pub mod body;
 pub mod documents;
 pub mod graph;
 pub mod notes;
+pub mod prompt;
 pub mod runs;
 
 use htui_core::model::ItemId;
@@ -28,6 +29,7 @@ pub use body::BodyTab;
 pub use documents::DocumentsTab;
 pub use graph::GraphTab;
 pub use notes::NotesTab;
+pub use prompt::PromptTab;
 pub use runs::RunsTab;
 
 /// How many rows `PageDown` / `PageUp` move.
@@ -49,9 +51,11 @@ impl core::fmt::Display for DetailId {
 
 /// One view of the selected item.
 ///
-/// A sub-tab holds no store handle either (`R-NF-3`): the Backlog tab issues the five reads when
+/// A sub-tab holds no store handle either (`R-NF-3`): the Backlog tab issues the six reads when
 /// the selection changes and hands every reply to every sub-tab, which keeps each one to "here is
-/// my variant, here is how it draws".
+/// my variant, here is how it draws". MOD-2 milestone 9's [`PromptTab`] is the worked example of
+/// how far that goes: its reply is assembled by a task the store worker spawned, and the sub-tab
+/// still only knows how to draw it.
 pub trait DetailTab {
     /// Stable identity.
     fn id(&self) -> DetailId;
@@ -167,7 +171,7 @@ impl DetailRegistry {
         }
     }
 
-    /// Hands a reply to every sub-tab: the five reads are issued together, so a sub-tab is
+    /// Hands a reply to every sub-tab: the six reads are issued together, so a sub-tab is
     /// populated before it is ever looked at.
     pub fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         for tab in &mut self.tabs {
@@ -213,7 +217,8 @@ pub fn render(
     }
 }
 
-/// Draws the sub-tab strip: `Body  Runs  Graph  Documents  Notes`, the active one accented.
+/// Draws the sub-tab strip: `Body  Runs  Graph  Documents  Notes  Prompt`, the active one
+/// accented.
 pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &DetailRegistry, theme: &Theme) {
     let active = registry.active_id();
     let spans: Vec<Span<'_>> = registry

@@ -7,10 +7,12 @@
 //! server.
 #![cfg(feature = "testkit")]
 
+use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, register_all};
 use htui::store_worker::{Origin, ReplyEnvelope, StoreReply};
 use htui::testkit::Harness;
 use htui::ui::overlay::workspace_switcher::WorkspaceSwitcher;
+use htui_agent::registry::DriverFactory;
 
 /// A `StoreState` reply addressed to the shell, as the fourth-tick refresh receives it.
 fn store_state(label: &str, migrations_pending: Option<usize>) -> Action {
@@ -26,17 +28,21 @@ fn store_state(label: &str, migrations_pending: Option<usize>) -> Action {
 
 /// The demo shell over a worker that reports this store state, settled and ready to render.
 async fn shell_reporting(label: &str, migrations_pending: Option<usize>) -> Harness {
-    let mut harness = Harness::demo().with_store_state(label, migrations_pending);
+    let mut harness = Harness::demo()
+        .with_store_state(label, migrations_pending)
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
     register_all(harness.app());
-    harness.settle().await;
+    harness.drive_to_end().await;
     harness
 }
 
 /// The demo shell with the switcher open over it, settled and ready to render.
 async fn open_over_demo() -> Harness {
-    let mut harness = Harness::demo().with_overlay(Box::new(WorkspaceSwitcher::new()));
+    let mut harness = Harness::demo()
+        .with_overlay(Box::new(WorkspaceSwitcher::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
     register_all(harness.app());
-    harness.settle().await;
+    harness.drive_to_end().await;
     harness
 }
 
@@ -110,7 +116,7 @@ async fn enter_switches_the_scope_and_the_top_bar_follows() {
 
     harness.key("j");
     harness.key("enter");
-    harness.settle().await;
+    harness.drive_to_end().await;
 
     assert!(
         harness.app().overlays.is_empty(),
@@ -147,7 +153,7 @@ async fn esc_closes_the_switcher_and_leaves_the_scope_alone() {
     let mut harness = open_over_demo().await;
     harness.key("j");
     harness.key("esc");
-    harness.settle().await;
+    harness.drive_to_end().await;
 
     assert!(
         harness.app().overlays.is_empty(),
@@ -171,7 +177,7 @@ async fn an_empty_store_shows_no_workspaces() {
     // second one out of reach of every reply, which `OverlayStack::by_id_mut` addresses by id.
     let mut harness = Harness::empty();
     register_all(harness.app());
-    harness.settle().await;
+    harness.drive_to_end().await;
     let frame = harness.render();
 
     assert!(
@@ -226,12 +232,12 @@ async fn a_pending_migration_opens_the_prompt() {
 async fn answering_n_does_not_reopen_the_prompt() {
     let mut harness = shell_reporting("online", Some(3)).await;
     harness.key("n");
-    harness.settle().await;
+    harness.drive_to_end().await;
     assert!(harness.app().overlays.is_empty(), "`n` closes the prompt");
 
     // The fourth-tick refresh reports the same count a second later.
     harness.app().update(store_state("online", Some(3)));
-    harness.settle().await;
+    harness.drive_to_end().await;
     assert!(
         harness.app().overlays.is_empty(),
         "one prompt per session: `n` is an answer, not a postponement"
@@ -246,7 +252,7 @@ async fn answering_y_asks_the_store_to_apply_them() {
     // `settle` serves the queued `ApplyMigrations` through the harness's memory backend, which
     // answers `MigrationsApplied { applied: 0 }` — nothing to migrate in memory — and the shell
     // puts that on the status line. The request having been issued is what this asserts.
-    harness.settle().await;
+    harness.drive_to_end().await;
 
     assert!(
         harness.app().overlays.is_empty(),
@@ -268,7 +274,7 @@ async fn esc_answers_the_prompt_like_n() {
     );
 
     harness.key("esc");
-    harness.settle().await;
+    harness.drive_to_end().await;
     assert!(
         harness.app().overlays.is_empty(),
         "`Esc` falls through to the wildcard overlay binding"

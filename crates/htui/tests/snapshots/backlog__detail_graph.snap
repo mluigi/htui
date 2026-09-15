@@ -5,7 +5,7 @@ expression: harness.render()
 Platform · DESKTOP-HTUI · memory · 1 run
  1 Backlog
 ┌ Backlog (11) ───────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
-│▾ htui (8)                                           ││ Body  Runs  Graph  Documents  Notes       │
+│▾ htui (8)                                           ││ Body  Runs  Graph  Documents  Notes  Promp│
 │  ANA-1    done               Data model, box regist…││  link       item     status               │
 │  ANA-2    open               Orchestrator step grap…││→ origin     ANA-1    done                 │
 │  CLEAN-1  failed             Drop the legacy markdo…││← blocked_by FEAT-2   blocked              │

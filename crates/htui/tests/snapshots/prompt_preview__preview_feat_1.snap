@@ -1,0 +1,64 @@
+---
+source: crates/htui/tests/prompt_preview.rs
+expression: frame
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog
+┌ Backlog (11) ──────────────────────────────────────────────────────────────────────────────────────────────┐┌ FEAT-1 ────────────────────────────────────────────────────────────────────────────────┐
+│▾ htui (8)                                                                                                  ││ Body  Runs  Graph  Documents  Notes  Prompt                                            │
+│  ANA-1    done               Data model, box registry and sync topology                                    ││template  prd v1                                                                        │
+│  ANA-2    open               Orchestrator step graphs and gates                                            ││picker    n / p · 8 template(s)                                                         │
+│  CLEAN-1  failed             Drop the legacy markdown exporter                                             ││digest    b9fb821faa4926cf5bfad8cd773e6ba769baccc3a37067c7f48354045f9cb915              │
+│  FEAT-1   in_progress        TUI scaffold                                                                  ││budget    120000 (project) · reserve 0.10 · target 108000                               │
+│  FEAT-2   blocked            Agent driver and chat tab                                                     ││tokens    1067 → 1067 · chars-v2                                                        │
+│  FEAT-3   queued             Postgres store and cache                                                      ││excerpts  builtin@1 · considered 0 · selected 0                                         │
+│  FIX-1    closed             Terminal left raw after panic                                                 ││roots     none · no_path (no run_step_tree, no repo_box_path)                           │
+│  TOOL-1   awaiting_approval  CI matrix for the three OSes                                                  ││                                                                                        │
+│▾ agy (3)                                                                                                   ││section                   before   after  strategy                                      │
+│  ANA-1    done               Prompt assembly survey                                                        ││template                     149     149  none                                          │
+│  FEAT-1   open               ACP transport upgrade                                                         ││item                         570     570  none                                          │
+│  FIX-1    open               Session leak on cancel                                                        ││documents:plan                57      57  none                                          │
+│                                                                                                            ││documents:prd                 52      52  none                                          │
+│                                                                                                            ││upstream                      71      71  none                                          │
+│                                                                                                            ││box                           80      80  none                                          │
+│                                                                                                            ││skills                        88      88  none                                          │
+│                                                                                                            ││                                                                                        │
+│                                                                                                            ││notes     preview: the template is chosen by name at its latest version and stands in fo│
+│                                                                                                            ││          preview: documents are latest-per-kind; ANA-2 input_kinds resolution arrives w│
+│                                                                                                            ││          preview: the `summary` kind is excluded from documents; §4.3 renders it as ups│
+│                                                                                                            ││          preview: project-level skill bindings only; a phase binding needs a phase id (│
+│                                                                                                            ││          preview: output_kind defaults to the template name; the phase row's value arri│
+│                                                                                                            ││          preview: command_queue exposure is a phase setting (R-MCP-4); absent until MOD│
+│                                                                                                            ││          preview: attempt 1, so verify_failure and previous_diff are absent; the real a│
+│                                                                                                            ││          preview: no run_step_tree row and no repo_box_path row, so no root resolves; t│
+│                                                                                                            ││────────────────────────────────────────                                                │
+│                                                                                                            ││You are running the `prd` phase for htui:FEAT-1 (feature).                              │
+│                                                                                                            ││                                                                                        │
+│                                                                                                            ││<section name="item" key="htui:FEAT-1" title="TUI scaffold">                            │
+│                                                                                                            ││Stand up the terminal application: a workspace-scoped shell with a tab strip, a top bar │
+│                                                                                                            ││backlog tab, all reading through the store seam.                                        │
+│                                                                                                            ││                                                                                        │
+│                                                                                                            ││Shape                                                                                   │
+│                                                                                                            ││- Two crates: `htui-core` holds the domain model and the store traits, `htui` holds the │
+│                                                                                                            ││  application. Nothing in the view layer holds a store handle.                          │
+│                                                                                                            ││- A store worker task owns the backend. The UI sends a request, the worker replies, the │
+│                                                                                                            ││  loop folds the reply into state. Three select arms: terminal events, store replies, a │
+│                                                                                                            ││- Tabs, detail sub-tabs and overlays are trait objects in registries, so a later module │
+│                                                                                                            ││  screen by registering it rather than by editing the loop.                             │
+│                                                                                                            ││                                                                                        │
+│                                                                                                            ││Scope                                                                                   │
+│                                                                                                            ││- Backlog list grouped by project and key prefix, with the five detail sub-tabs: body, r│
+│                                                                                                            ││  graph, documents, notes.                                                              │
+│                                                                                                            ││- A workspace switcher overlay, opened with `w`.                                        │
+│                                                                                                            ││- The top bar reads workspace, box, store label and the active run count.               │
+│                                                                                                            ││                                                                                        │
+│                                                                                                            ││Out of scope                                                                            │
+│                                                                                                            ││- Editing anything. Filters, actions and the item editor are MOD-13.                    │
+│                                                                                                            ││- Driving an agent; the chat tab is MOD-2.                                              │
+│                                                                                                            ││- Any real database. MOD-1 runs against the in-memory store and its demo fixture.       │
+│                                                                                                            ││                                                                                        │
+│                                                                                                            ││Done when                                                                               │
+│                                                                                                            ││- `cargo run -- --demo` opens on the backlog of the Platform workspace.                 │
+│                                                                                                            ││- The snapshot tests render at 100x30 and every sub-tab has an empty state.             │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

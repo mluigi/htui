@@ -5,7 +5,7 @@ expression: frame
 Platform · DESKTOP-HTUI · memory · 1 run
  1 Backlog
 ┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-2 ────────────────────────────────────┐
-│▾ htui (8)                                           ││ Body  Runs  Graph  Documents  Notes       │
+│▾ htui (8)                                           ││ Body  Runs  Graph  Documents  Notes  Promp│
 │  ANA-1    done               Data model, box regist…││Orchestrator step graphs and gates         │
 │  ANA-2    open               Orchestrator step grap…││ANA-2  ANA  open                           │
 │  CLEAN-1  failed             Drop the legacy markdo…││no tags · priority 0 · version 1           │

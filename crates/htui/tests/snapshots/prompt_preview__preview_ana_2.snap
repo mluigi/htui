@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/prompt_preview.rs
+expression: frame
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog
+┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-2 ────────────────────────────────────┐
+│▾ htui (8)                                           ││ Body  Runs  Graph  Documents  Notes  Promp│
+│  ANA-1    done               Data model, box regist…││template  prd v1                           │
+│  ANA-2    open               Orchestrator step grap…││picker    n / p · 8 template(s)            │
+│  CLEAN-1  failed             Drop the legacy markdo…││digest    d68f3503f0ce763a7c355f27ce5a99710│
+│  FEAT-1   in_progress        TUI scaffold           ││budget    120000 (project) · reserve 0.10 ·│
+│  FEAT-2   blocked            Agent driver and chat …││tokens    354 → 354 · chars-v2             │
+│  FEAT-3   queued             Postgres store and cac…││excerpts  builtin@1 · considered 0 · select│
+│  FIX-1    closed             Terminal left raw afte…││roots     none · no_path (no run_step_tree,│
+│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
+│▾ agy (3)                                            ││section                   before   after  s│
+│  ANA-1    done               Prompt assembly survey ││template                     149     149  n│
+│  FEAT-1   open               ACP transport upgrade  ││item                          37      37  n│
+│  FIX-1    open               Session leak on cancel ││box                           80      80  n│
+│                                                     ││skills                        88      88  n│
+│                                                     ││                                           │
+│                                                     ││notes     preview: the template is chosen b│
+│                                                     ││          preview: documents are latest-per│
+│                                                     ││          preview: the `summary` kind is ex│
+│                                                     ││          preview: project-level skill bind│
+│                                                     ││          preview: output_kind defaults to │
+│                                                     ││          preview: command_queue exposure i│
+│                                                     ││          preview: attempt 1, so verify_fai│
+│                                                     ││          preview: no run_step_tree row and│
+│                                                     ││────────────────────────────────────────   │
+│                                                     ││You are running the `prd` phase for htui:AN│
+└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

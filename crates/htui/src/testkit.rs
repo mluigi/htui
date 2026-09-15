@@ -455,7 +455,7 @@ mod tests {
     async fn an_empty_store_renders_the_shell_with_the_switcher_over_it() {
         let mut harness = Harness::empty();
         crate::app::register_all(harness.app());
-        harness.settle().await;
+        harness.drive_to_end().await;
         insta::assert_snapshot!("shell_empty", harness.render());
     }
 
