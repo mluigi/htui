@@ -812,6 +812,31 @@ fn a_dropped_excerpt_leaves_its_record_behind_and_nothing_else() {
 }
 
 #[test]
+fn a_body_that_never_places_excerpts_records_none_as_reaching_the_model() {
+    // **M-1.** §5.1 `:1536-1538` defines `files[]` as what reached the model. A body with no
+    // `{{excerpts}}` slot renders no `<file>` block at all, and `finish()` fell back to "every
+    // selected file survived" whenever the section was absent — so the record claimed two files the
+    // prompt never carried. Absent is not untouched; it is zero.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.body = "{{item}}\n{{box}}\n".to_owned();
+    let prompt = ok(&spec);
+    assert!(
+        !prompt.text.contains("<file "),
+        "no `{{{{excerpts}}}}` slot renders no `<file>` block:\n{}",
+        prompt.text
+    );
+    assert!(
+        prompt.trim.excerpts.files.is_empty(),
+        "and nothing reached the model: {:?}",
+        prompt.trim.excerpts.files
+    );
+    assert_eq!(
+        prompt.trim.excerpts.selected, 2,
+        "`selected` is still what the ranker chose and paid for"
+    );
+}
+
+#[test]
 fn reserve_target_is_integer_arithmetic() {
     let spec = fixtures::phase_implement_attempt2();
     let record = ok(&spec).trim;

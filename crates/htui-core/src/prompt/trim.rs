@@ -521,13 +521,14 @@ impl<'a> Trimmer<'a> {
             .entries
             .iter()
             .find(|entry| entry.record.name == SectionName::Excerpts)
-            .map_or_else(
-                || (0..self.inputs.spec.excerpts.files.len()).collect(),
-                |entry| match (&entry.source, entry.alive) {
-                    (Source::Excerpts(kept), true) => kept.clone(),
-                    _ => Vec::new(),
-                },
-            );
+            // No entry means the section was never rendered — a body with no `{{excerpts}}` slot,
+            // or no files to put in one — so **nothing** reached the model (§5.1 `:1536-1538`).
+            // The earlier fallback was "every selected file survived", which recorded two files a
+            // prompt carrying no `<file>` block never showed anybody (review finding M-1).
+            .map_or_else(Vec::new, |entry| match (&entry.source, entry.alive) {
+                (Source::Excerpts(kept), true) => kept.clone(),
+                _ => Vec::new(),
+            });
         let mut sections = Vec::with_capacity(self.entries.len());
         let mut live = Vec::with_capacity(self.entries.len());
         for entry in self.entries {
