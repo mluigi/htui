@@ -62,10 +62,9 @@
 //!
 //! ## The corpora are **committed**, not generated
 //!
-//! `tests/fixtures/estimator_prose.txt` (40 000 characters of `docs/ANA-5.md` with its fenced blocks
-//! stripped) and `tests/fixtures/estimator_code.txt` (40 000 characters of
-//! `crates/htui-core/src/store/conformance.rs`), frozen on 2026-09-11 and read by `include_str!`.
-//! Two rejected alternatives, and why:
+//! `tests/fixtures/estimator_prose.txt` (`docs/ANA-5.md` with its fenced blocks stripped) and
+//! `tests/fixtures/estimator_code.txt` (`crates/htui-core/src/store/conformance.rs`), 40 000
+//! characters each, frozen and read by `include_str!`. Two rejected alternatives, and why:
 //!
 //! * **reading those two source files live**, which is what the plan's probe did. The corpus then
 //!   changes whenever a doc is edited or `conformance.rs` gains a case — and when this file later
@@ -76,8 +75,33 @@
 //!   `chars-v2` is a claim about the second kind. The measurement would be repeatable and about the
 //!   wrong thing.
 //!
-//! The 20 000-character run is the **prefix** of the 40 000-character one, deliberately: the
-//! linearity check is then about the size of the text and nothing else.
+//! ### The prose corpus is a sample, doubled — and that is what makes the linearity check mean
+//! something (F-61)
+//!
+//! [`PROSE`] is **20 000 characters written twice**: its two halves are byte-identical, and
+//! [`assert_corpora_are_intact`] fails the run before a token is spent if a
+//! regeneration ever breaks that. The 20 000-character unit is itself 20 blocks of 1 000 characters
+//! spread evenly across the whole fence-stripped document, so it carries the document's real mix of
+//! paragraphs, tables, `R-PRM-4`-style ids and section numbers rather than one stretch of it.
+//!
+//! The first version of this file used the plain **prefix** of a contiguous 40 000-character slice,
+//! and the live run rejected it: 2.501 chars/token over the full slice against 2.393 over its first
+//! half, 4.4% apart and over the limit. Nothing was wrong with the baseline — the first 20 000
+//! characters of ANA-5 are simply denser than the rest (771 digits and 625 backticks against 247
+//! and 472; the header, the scope note and the requirement tables), and a denser half tokenizes to
+//! more tokens per character. A prefix is not a sample.
+//!
+//! That matters because of what the check is *for*. It asks "do two sizes of the same text give the
+//! same ratio", and answers "no" when the baseline subtraction is wrong. With a prefix it answers
+//! "no" when the baseline is wrong **or** when the two stretches of text differ, and the failure
+//! message cannot tell the reader which — a check with two causes and one message diagnoses
+//! neither. Doubling removes the second cause by construction: the halves *are* the same text, so a
+//! disagreement can only be arithmetic.
+//!
+//! The cost is that the prose rate is measured over 20 000 unique characters rather than 40 000,
+//! which is no cost at all: characters per token is a per-character property, the 2026-09-11 probe
+//! got 2.494 from 20 000 characters and 2.507 from 40 000, and the doubled corpus still puts 40 000
+//! characters on the wire.
 //!
 //! ## What it does *not* do
 //!
@@ -114,16 +138,23 @@ use tokio::process::ChildStdout;
 // ---------------------------------------------------------------------------------------------
 
 /// 40 000 characters of technical English: `docs/ANA-5.md` with its fenced blocks stripped, frozen.
+///
+/// **20 000 characters, twice** — the module doc's F-61 says why at length. The unit is 20 blocks
+/// of 1 000 characters spread evenly across the whole document, so it samples ANA-5's mix rather
+/// than one stretch of it, and [`assert_corpora_are_intact`] holds the doubling.
 const PROSE: &str = include_str!("fixtures/estimator_prose.txt");
 
-/// 40 000 characters of Rust: `crates/htui-core/src/store/conformance.rs`, frozen.
+/// 40 000 characters of Rust: `crates/htui-core/src/store/conformance.rs` from the top, frozen.
+///
+/// Contiguous, unlike [`PROSE`], because nothing differences it against a half of itself: it is
+/// read once, at one size, for the code rate.
 const CODE: &str = include_str!("fixtures/estimator_code.txt");
 
 /// Both corpora are exactly this many **characters** — not bytes; the prose one holds multi-byte
-/// punctuation and is 40 068 bytes long. Asserted at the top of the test, before a token is spent.
+/// punctuation and is 40 106 bytes long. Asserted at the top of the test, before a token is spent.
 const CORPUS_CHARS: usize = 40_000;
 
-/// The half-size prose run, as a prefix of [`PROSE`].
+/// The half-size prose run: the first half of [`PROSE`], which is the whole of [`PROSE`]'s text.
 const HALF_CHARS: usize = 20_000;
 
 /// The turn whose only job is to establish what the CLI's own system prompt costs.
@@ -507,12 +538,14 @@ fn drift(measured: f64, want: f64) -> f64 {
 // The measurement
 // ---------------------------------------------------------------------------------------------
 
-/// D99's differential, repeatable: the four turns, the three ratios, and the constants they defend.
-#[tokio::test]
-#[ignore = "spends model tokens against the credential this box holds"]
-async fn chars_v2_constants_hold_against_the_live_cli() {
-    // Before a token is spent: the corpora are the size they claim to be. A fixture that was
-    // regenerated at a different length would move every ratio below, and it would do it silently.
+/// Everything about the corpora the ratios below depend on, checked before a token is spent.
+///
+/// Both are the length they claim to be, and the prose one is its own first half twice over (F-61).
+/// A fixture regenerated at a different length, or from a contiguous slice, would move every ratio
+/// in this file and would do it **silently** — the run would still print three plausible numbers.
+/// Not a `#[test]` of its own: this file spends money, so it stays one `#[ignore]`d case and a
+/// plain `cargo test` over it runs nothing at all.
+fn assert_corpora_are_intact() {
     assert_eq!(
         PROSE.chars().count(),
         CORPUS_CHARS,
@@ -524,6 +557,22 @@ async fn chars_v2_constants_hold_against_the_live_cli() {
         CORPUS_CHARS,
         "the code corpus is not {CORPUS_CHARS} characters"
     );
+    let first: String = PROSE.chars().take(HALF_CHARS).collect();
+    let second: String = PROSE.chars().skip(HALF_CHARS).collect();
+    assert_eq!(
+        first, second,
+        "the prose corpus is no longer its own first half repeated, so the two prose runs are no \
+         longer two sizes of the *same* text and the linearity check below would fire on a \
+         difference in the text rather than on a broken baseline subtraction — which is exactly \
+         the ambiguity F-61 removed. Regenerate it as 20 000 characters written twice."
+    );
+}
+
+/// D99's differential, repeatable: the four turns, the three ratios, and the constants they defend.
+#[tokio::test]
+#[ignore = "spends model tokens against the credential this box holds"]
+async fn chars_v2_constants_hold_against_the_live_cli() {
+    assert_corpora_are_intact();
 
     let scratch = tempfile::tempdir().expect("a scratch working directory");
     let Some(resolved) = resolve_cli(scratch.path()).await else {
@@ -600,10 +649,12 @@ async fn chars_v2_constants_hold_against_the_live_cli() {
     assert!(
         spread <= PROSE_LINEARITY,
         "the two prose sizes disagree by {:.2}%, over the {:.0}% limit: {prose_ratio:.3} at \
-         {CORPUS_CHARS} characters against {half_ratio:.3} at {HALF_CHARS}. The relation is \
-         linear, so this is not the tokenizer — it is the baseline subtraction. Either the \
-         baseline turn ({} tokens) is not what the corpus turns paid on top of, or a turn was \
-         billed twice. Fix the differential before reading anything off it.",
+         {CORPUS_CHARS} characters against {half_ratio:.3} at {HALF_CHARS}. The two runs are the \
+         same 20 000 characters, once and twice over (F-61), so this is not the text and it is not \
+         the tokenizer — it is the arithmetic. Either the baseline turn ({} tokens) is not what \
+         the corpus turns paid on top of, or one of the four turns was billed for something the \
+         others were not. Fix the differential before reading anything off it, and do not touch \
+         the constants on the strength of a ratio this check has rejected.",
         spread * 100.0,
         PROSE_LINEARITY * 100.0,
         baseline.total_input,
