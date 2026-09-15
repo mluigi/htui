@@ -250,6 +250,74 @@ fn every_provider_failure_leaves_a_valid_prompt() {
 }
 
 #[test]
+fn no_deadline_however_short_can_drop_the_first_provider() {
+    // Review finding M2. `run_providers` documents "the built-in is never dropped because its
+    // `propose` is infallible and returns at once" — and then ran it on a spawned thread under the
+    // same `recv_timeout` as everything else. `excerpt_provider_deadline_ms` accepts any positive
+    // integer, so `1` is legal, and a thread spawn plus a scheduling slice on a loaded box exceeds
+    // it. That yields `builtin@1:timeout`, `select` then prepends the `builtin@1` its record must
+    // carry, and the **same inputs produce a different record on two runs** — a determinism break,
+    // which is the invariant this milestone rests on.
+    //
+    // `Duration::ZERO` is the deterministic form of the same defect: a 1 ms deadline is a race on
+    // the old code and would have made this test flaky in the wrong direction. Both are asserted,
+    // because 1 ms is the case that was reported and zero is the case that proves the rule has no
+    // floor. The fix is that `providers[0]` runs on the caller's thread, so the deadline governs
+    // only the providers that overlap with it.
+    let reader = FakeRepoReader::with(&[
+        ("htui", "src/a.rs", "fn a() {}\n"),
+        ("htui", "docs/too_late.rs", "fn late() {}\n"),
+    ]);
+    let providers: Vec<Arc<dyn ExcerptProvider>> = vec![
+        Arc::new(BuiltinRanker),
+        // Sleeps `deadline * 8`, so it misses every deadline here including the 40 ms baseline.
+        Arc::new(FakeExcerptProvider::new("serena", Behaviour::PastDeadline)),
+    ];
+
+    let baseline = base_request(&["src/"], vec![fake_root()]);
+    let (merged, baseline_set) = run_providers(&providers, &baseline.as_request());
+    let baseline_out = select(
+        &reader,
+        &baseline.as_request(),
+        merged,
+        baseline_set.clone(),
+        TokenEstimator::DEFAULT,
+    );
+
+    for millis in [1u64, 0] {
+        let mut owned = base_request(&["src/"], vec![fake_root()]);
+        owned.deadline = core::time::Duration::from_millis(millis);
+        let (merged, provider_set) = run_providers(&providers, &owned.as_request());
+        assert_eq!(
+            provider_set,
+            vec![BUILTIN_ID.to_owned(), "serena@0.1:timeout".to_owned()],
+            "a {millis} ms deadline dropped the provider that never runs under one"
+        );
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            merged,
+            provider_set,
+            TokenEstimator::DEFAULT,
+        );
+        assert!(
+            set.files.iter().any(|file| file.path == "src/a.rs"),
+            "a {millis} ms deadline cost the built-in its tier-1 file: {:?}",
+            set.files
+        );
+        // The whole point: same inputs, same record, whatever the deadline the operator set.
+        assert_eq!(
+            set.audit.provider_set, baseline_out.audit.provider_set,
+            "a {millis} ms deadline changed the record the 40 ms one produced"
+        );
+        assert_eq!(
+            set.files, baseline_out.files,
+            "a {millis} ms deadline changed the prompt the 40 ms one produced"
+        );
+    }
+}
+
+#[test]
 fn a_provider_set_of_one_is_the_same_path_as_every_provider_failing() {
     // §4.5 `:1201-1203`: the "no providers configured" path and the "every provider failed" path
     // are the same code path, which is what the built-in being a provider buys.

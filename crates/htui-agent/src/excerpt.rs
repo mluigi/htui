@@ -576,11 +576,24 @@ fn normalise(text: &str) -> String {
     out
 }
 
-/// What one provider's thread reported back.
+/// What one provider reported back.
 enum Outcome {
     Proposed(Vec<ExcerptCandidate>),
     Failed(ProviderError),
     Panicked,
+}
+
+/// One `propose` call with its unwind caught, shared by the inline provider and the spawned ones.
+///
+/// Inline too, and not only on a thread: `providers[0]` runs on the caller's thread since finding
+/// M2, so an unwind there would take the assembler down instead of being "dropped and recorded"
+/// (hazard H-20).
+fn propose_caught(provider: &dyn ExcerptProvider, req: &ExcerptRequest<'_>) -> Outcome {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| provider.propose(req))) {
+        Ok(Ok(candidates)) => Outcome::Proposed(candidates),
+        Ok(Err(error)) => Outcome::Failed(error),
+        Err(_) => Outcome::Panicked,
+    }
 }
 
 /// Run every provider concurrently under one wall-clock deadline (§4.5 rule 2).
@@ -600,37 +613,51 @@ enum Outcome {
 /// the provider.
 ///
 /// Every returned candidate's `reason` is rewritten to the provider's own name and its weight
-/// clamped to `0..=100`: a provider may propose, and it may not claim a tier — or another
-/// provider's name — by spelling one.
+/// clamped to [`MAX_PROVIDER_WEIGHT`]: a provider may propose, and it may not claim a tier — or
+/// another provider's name — by spelling one.
+///
+/// **`providers[0]` runs on the caller's thread and is not under the deadline** (review finding
+/// M2). The paragraph above says the built-in is never dropped; running it on a spawned thread
+/// under the same `recv_timeout` made that false, because `excerpt_provider_deadline_ms` accepts
+/// any positive integer and a thread spawn plus a scheduling slice exceeds `1`. A `builtin@1` that
+/// intermittently became `builtin@1:timeout` is the same inputs producing two different records —
+/// the determinism invariant, broken by a setting an operator is allowed to write. The others are
+/// spawned **first**, so they still overlap with it and the concurrency the deadline exists for is
+/// unchanged.
 #[must_use]
 pub fn run_providers(
     providers: &[Arc<dyn ExcerptProvider>],
     req: &ExcerptRequest<'_>,
 ) -> (Vec<ExcerptCandidate>, Vec<String>) {
-    let owned = Arc::new(OwnedExcerptRequest::from_request(req));
+    let mut outcomes: Vec<Option<Outcome>> = (0..providers.len()).map(|_| None).collect();
     let (sender, receiver) = mpsc::channel::<(usize, Outcome)>();
-    for (index, provider) in providers.iter().enumerate() {
-        let provider = Arc::clone(provider);
-        let request = Arc::clone(&owned);
-        let sender = sender.clone();
-        // Detached on purpose: see H-20 above.
-        std::thread::spawn(move || {
-            let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                provider.propose(&request.as_request())
-            })) {
-                Ok(Ok(candidates)) => Outcome::Proposed(candidates),
-                Ok(Err(error)) => Outcome::Failed(error),
-                Err(_) => Outcome::Panicked,
-            };
-            // The receiver may already have given up; that is the timeout case, not an error.
-            let _ = sender.send((index, outcome));
-        });
+    // The clone is paid for only when there is a thread to hand it to; the inline provider reads
+    // the caller's own borrowed request.
+    let deadlined = providers.len().saturating_sub(1);
+    if deadlined > 0 {
+        let owned = Arc::new(OwnedExcerptRequest::from_request(req));
+        for (index, provider) in providers.iter().enumerate().skip(1) {
+            let provider = Arc::clone(provider);
+            let request = Arc::clone(&owned);
+            let sender = sender.clone();
+            // Detached on purpose: see H-20 above.
+            std::thread::spawn(move || {
+                let outcome = propose_caught(provider.as_ref(), &request.as_request());
+                // The receiver may already have given up; that is the timeout case, not an error.
+                let _ = sender.send((index, outcome));
+            });
+        }
     }
     drop(sender);
 
-    let mut outcomes: Vec<Option<Outcome>> = (0..providers.len()).map(|_| None).collect();
+    // One wall clock over the whole concurrent set, started where the threads were: the inline
+    // provider runs inside that window rather than beside it, so the call is still bounded and
+    // `deadline` still means what §4.5 rule 2 says it means.
     let started = Instant::now();
-    let mut pending = providers.len();
+    if let Some(first) = providers.first() {
+        outcomes[0] = Some(propose_caught(first.as_ref(), req));
+    }
+    let mut pending = deadlined;
     while pending > 0 {
         let Some(left) = req.deadline.checked_sub(started.elapsed()) else {
             break;
