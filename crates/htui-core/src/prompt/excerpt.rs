@@ -549,6 +549,10 @@ pub trait RepoReader: Send + Sync + core::fmt::Debug {
     fn list(&self, root: &RepoRoot, cap: u32) -> Result<(Vec<String>, bool), ProviderError>;
     /// The file's text, LF-normalised.
     ///
+    /// An implementation is expected to re-apply the skip rules that need bytes rather than trust
+    /// the path it is given — [`select`] vets every candidate against [`list`](Self::list)'s output
+    /// first, but a reader is a public seam and the two defences are deliberately independent.
+    ///
     /// # Errors
     ///
     /// A path the reader cannot read is an error, never a panic.
@@ -1105,31 +1109,21 @@ pub fn select(
     }
     let considered = u32::try_from(listing.len()).unwrap_or(u32::MAX);
 
+    // Every provider candidate is vetted against the listing **here**, while the listing is still
+    // the only thing anything holds, and before a single `read` is issued (finding HIGH H1).
+    let merged = vetted(merged, &listing, &mut notes);
+
     // -- steps 3 to 5: the tiers. Heads are read only for the files tier 5 will actually score. --
     fill_lexical_heads(reader, req, &roots, &mut listing, &mut notes);
     let builtin = rank(req, &listing);
 
-    // -- step 6: merge the providers' candidates by `(repo, path)`, keeping the higher weight -----
+    // -- step 6: merge the vetted candidates by `(repo, path)`, keeping the higher weight ---------
     let mut by_path: std::collections::BTreeMap<(String, String), ExcerptCandidate> =
         std::collections::BTreeMap::new();
     for candidate in builtin {
         by_path.insert((candidate.repo.clone(), candidate.path.clone()), candidate);
     }
     for candidate in merged {
-        if !is_repo_relative(&candidate.path) {
-            notes.push(format!(
-                "excerpt: candidate `{}:{}` is not repo-relative; dropped",
-                candidate.repo, candidate.path
-            ));
-            continue;
-        }
-        if let Some(rule) = skip_by_path(&candidate.path) {
-            notes.push(format!(
-                "excerpt: candidate `{}:{}` is excluded by rule `{rule}`; never selected",
-                candidate.repo, candidate.path
-            ));
-            continue;
-        }
         let key = (candidate.repo.clone(), candidate.path.clone());
         match by_path.get(&key) {
             // A tie keeps the built-in's tier reason: two orders for one weight would make the
@@ -1239,6 +1233,75 @@ pub fn select(
         audit,
         notes,
     }
+}
+
+/// The provider candidates [`select`] will consider, in the order they arrived: repo-relative, past
+/// the path-only skip rules, and **in the listing the reader offered**.
+///
+/// The third test is review finding HIGH H1. `select` used to merge candidates after the first two
+/// alone and then call `reader.read` on them, which left the reader as the only thing between a
+/// provider's path and the bytes behind it — and the reader is the *impure* crate's. A provider
+/// proposing `docs/notes.md` where that is a symlink to a private key, or `vendor/x.rs` where
+/// `vendor` is a symlink to `/`, is a repo-relative path that names bytes outside the repository
+/// (hazard H-1), and neither `is_repo_relative` nor [`skip_by_path`] can see that: this crate names
+/// no `std::fs` and cannot know what a path resolves to.
+///
+/// What it *can* know is which paths the reader itself listed. That set is the walk's output, so
+/// it already carries all six skip rules — including the three that need bytes — and nothing that
+/// is not in it can have been offered by anything. The cost is stated rather than hidden: a
+/// candidate under a repo whose root would not resolve, whose listing failed, or that sits past
+/// `scan_cap`, is **refused**. That is the conservative direction, it is recorded as a note, and it
+/// is what "the pure crate does not depend on the impure one for a security property" costs.
+///
+/// Built only when there is something to vet: `merged` is empty in every path with no provider
+/// registered, which is every path until MOD-4 wires one, and the listing runs to `scan_cap`.
+fn vetted(
+    merged: Vec<ExcerptCandidate>,
+    listing: &[Listed],
+    notes: &mut Vec<String>,
+) -> Vec<ExcerptCandidate> {
+    if merged.is_empty() {
+        return merged;
+    }
+    let mut offered: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for entry in listing {
+        offered
+            .entry(entry.repo.as_str())
+            .or_default()
+            .insert(entry.path.as_str());
+    }
+    let mut kept = Vec::with_capacity(merged.len());
+    for candidate in merged {
+        if !is_repo_relative(&candidate.path) {
+            notes.push(format!(
+                "excerpt: candidate `{}:{}` is not repo-relative; dropped",
+                candidate.repo, candidate.path
+            ));
+            continue;
+        }
+        // The rule that fired is named before the listing is consulted, because a maintainer
+        // reading a note about `.env` wants "secret_denylist", not "not offered".
+        if let Some(rule) = skip_by_path(&candidate.path) {
+            notes.push(format!(
+                "excerpt: candidate `{}:{}` is excluded by rule `{rule}`; never selected",
+                candidate.repo, candidate.path
+            ));
+            continue;
+        }
+        if !offered
+            .get(candidate.repo.as_str())
+            .is_some_and(|paths| paths.contains(candidate.path.as_str()))
+        {
+            notes.push(format!(
+                "excerpt: candidate `{}:{}` is not in the repository listing; never selected",
+                candidate.repo, candidate.path
+            ));
+            continue;
+        }
+        kept.push(candidate);
+    }
+    kept
 }
 
 /// A candidate's `reason` string back into the closed enum, or into a provider attribution.
@@ -1532,21 +1595,36 @@ mod tests {
     #[derive(Debug, Default)]
     struct MapReader {
         files: std::collections::BTreeMap<(String, String), String>,
+        /// Readable through `read`, and never returned by `list`. On a real filesystem this is a
+        /// symlink the walk refused and a provider proposed anyway.
+        hidden: std::collections::BTreeMap<(String, String), String>,
         truncated: bool,
     }
 
     impl MapReader {
         fn with(files: &[(&str, &str, &str)]) -> Self {
             Self {
-                files: files
-                    .iter()
-                    .map(|(repo, path, body)| {
-                        (((*repo).to_owned(), (*path).to_owned()), (*body).to_owned())
-                    })
-                    .collect(),
+                files: entries(files),
+                hidden: std::collections::BTreeMap::new(),
                 truncated: false,
             }
         }
+
+        fn hiding(mut self, files: &[(&str, &str, &str)]) -> Self {
+            self.hidden = entries(files);
+            self
+        }
+    }
+
+    fn entries(
+        files: &[(&str, &str, &str)],
+    ) -> std::collections::BTreeMap<(String, String), String> {
+        files
+            .iter()
+            .map(|(repo, path, body)| {
+                (((*repo).to_owned(), (*path).to_owned()), (*body).to_owned())
+            })
+            .collect()
     }
 
     impl RepoReader for MapReader {
@@ -1562,8 +1640,10 @@ mod tests {
         }
 
         fn read(&self, root: &RepoRoot, path: &str) -> Result<String, ProviderError> {
+            let key = (root.repo.clone(), path.to_owned());
             self.files
-                .get(&(root.repo.clone(), path.to_owned()))
+                .get(&key)
+                .or_else(|| self.hidden.get(&key))
                 .cloned()
                 .ok_or_else(|| ProviderError::new("map", format!("no such path `{path}`")))
         }
@@ -1825,6 +1905,60 @@ mod tests {
             "and its exclusion is recorded: {:?}",
             set.notes
         );
+    }
+
+    #[test]
+    fn a_provider_candidate_the_listing_never_offered_is_refused() {
+        // Review finding HIGH H1, the pure half. `select` used to merge provider candidates after
+        // `is_repo_relative` and `skip_by_path` alone and then hand them straight to
+        // `reader.read`, which left the **reader** as the only thing between a proposed path and
+        // the bytes behind it — and the reader is the impure crate's. A security property of the
+        // pure crate does not get to be an implementation detail of `htui-agent`.
+        //
+        // The listing is the gate, because it is the one set of paths the walk actually offered:
+        // on a real filesystem `docs/notes.md` here is a symlink `list` refused and `read` would
+        // once have followed.
+        let mut owned = request("nothing\n", &[], &[]);
+        owned.roots = vec![root("htui")];
+        let reader = MapReader::with(&[("htui", "src/a.rs", "fn a() {}\n")]).hiding(&[(
+            "htui",
+            "docs/notes.md",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        )]);
+        let merged = vec![ExcerptCandidate {
+            repo: "htui".to_owned(),
+            path: "docs/notes.md".to_owned(),
+            lines: None,
+            weight: 100,
+            reason: "serena".to_owned(),
+        }];
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            merged,
+            vec![BUILTIN_ID.to_owned(), "serena@0.1".to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+        assert!(
+            set.files.iter().all(|file| file.path != "docs/notes.md"),
+            "a provider may propose; it may not name a path the walk never offered: {:?}",
+            set.files
+        );
+        assert!(
+            set.files
+                .iter()
+                .all(|file| !file.content.contains("PRIVATE KEY")),
+            "and no byte behind it reaches the prompt"
+        );
+        assert!(
+            set.notes
+                .iter()
+                .any(|note| note.contains("docs/notes.md") && note.contains("listing")),
+            "and the refusal is recorded rather than silent: {:?}",
+            set.notes
+        );
+        // The listed file is untouched: this is a gate, not a wall.
+        assert!(set.files.iter().any(|file| file.path == "src/a.rs"));
     }
 
     #[test]
