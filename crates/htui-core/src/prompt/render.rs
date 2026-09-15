@@ -31,7 +31,7 @@ use crate::model::link::UpstreamEntry;
 use crate::model::skill::BoundSkill;
 use crate::model::{EventKind, SessionEvent};
 use crate::prompt::defaults::COMMAND_QUEUE_TEXT;
-use crate::prompt::excerpt::Excerpt;
+use crate::prompt::excerpt::{Excerpt, RepoRoot};
 use crate::prompt::template::ParsedTemplate;
 use crate::prompt::{
     DiffBlock, InputDocument, JudgeCandidate, PromptSpec, SectionName, StepSummary, VerifyFailure,
@@ -723,13 +723,39 @@ impl StepSummary {
     /// else. Ordering is `events`' own, which is `seq` order by `docs/ANA-9.md:247`; nothing here
     /// sorts, so a caller that hands them out of order gets its own order back rather than a
     /// silently different summary.
+    ///
+    /// `roots` is what makes rule 5 true for the one section built from a transcript. An ACP `diff`
+    /// block and an `fs/write_text_file` carry **absolute** paths by protocol
+    /// (`crates/htui-agent/src/acp/fs.rs:57` admits them) and nothing between the wire and here
+    /// rewrote one, so a handoff prompt's `Files edited:` line shipped a tree root — an absolute
+    /// path, a run id and a step id in a digested byte, against §4.2 rule 5 and §4.7 rule 8 (review
+    /// finding H-2). Every path is now put through [`repo_relative`] against these roots, which is
+    /// the same `RepoRoot` list §4.5's excerpt pass resolved, and one that strips to nothing is
+    /// dropped rather than rendered.
+    ///
+    /// `errors[]` and `last_assistant_tail` are the same exposure class and are **not** rewritten:
+    /// §4.6c sanctions them as windowed transcript text, and a path inside an error message is part
+    /// of the message rather than a field.
     #[must_use]
-    pub fn from_events(events: &[SessionEvent]) -> Self {
+    pub fn from_events(events: &[SessionEvent], roots: &[RepoRoot]) -> Self {
         let mut tool_calls: Vec<(String, u32)> = Vec::new();
         let mut files_edited: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         let mut last_assistant = String::new();
         let mut max_turn = 0i32;
+
+        // Longest root first, so a repo checked out inside another resolves to the deeper one; the
+        // slug breaks a tie, so two roots of equal length resolve in one order on every box.
+        let mut roots: Vec<(&str, String)> = roots
+            .iter()
+            .map(|root| {
+                (
+                    root.repo.as_str(),
+                    root.root.to_string_lossy().replace('\\', "/"),
+                )
+            })
+            .collect();
+        roots.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
 
         for event in events {
             max_turn = max_turn.max(event.turn);
@@ -751,9 +777,12 @@ impl StepSummary {
                         .payload
                         .get("path")
                         .and_then(serde_json::Value::as_str)
-                        && !files_edited.iter().any(|seen| seen == path)
+                        && let Some(rendered) = repo_relative(path, &roots)
+                        && !files_edited.iter().any(|seen| seen == &rendered)
                     {
-                        files_edited.push(path.to_owned());
+                        // Deduped on the **rendered** form: two roots cannot make one file look
+                        // like two, and two files cannot collapse into one.
+                        files_edited.push(rendered);
                     }
                 }
                 EventKind::Error => {
@@ -778,7 +807,18 @@ impl StepSummary {
                         last_assistant = text.to_owned();
                     }
                 }
-                _ => {}
+                // Enumerated rather than `_ => {}`: a new `EventKind` must be considered for the
+                // summary deliberately, not be silently absent from it (review finding L-3).
+                EventKind::Prompt
+                | EventKind::FollowUp
+                | EventKind::Thought
+                | EventKind::ToolResult
+                | EventKind::PermissionRequest
+                | EventKind::PermissionAnswer
+                | EventKind::Plan
+                | EventKind::Usage
+                | EventKind::Done
+                | EventKind::Other => {}
             }
         }
 
@@ -799,6 +839,54 @@ impl StepSummary {
             ),
         }
     }
+}
+
+/// One `edit_proposal` payload path as `<repo_slug>:<repo-relative>` — or nothing at all.
+///
+/// §4.2 rule 5 admits no absolute filesystem path into a digested byte, and §4.7 rule 8 admits no
+/// run id or step id, so a path under `<config_dir>/trees/<run_id>/<step_id>/` violates both at
+/// once. §4.6c sanctions `edit_proposal` as a *source* for the handoff summary and writes its
+/// example repo-relative; this is the function that makes the payload match the example.
+///
+/// `roots` is `(slug, root)` with `/` separators, **longest root first**. The rules, in order:
+///
+/// * a path under a known root renders `<slug>:<rest>`, and one that strips to nothing — the root
+///   itself — is dropped, because "the repository was edited" names no file;
+/// * a path that escapes with a `..` segment is dropped: it is not repo-relative whatever it looks
+///   like;
+/// * a path under no root that is still absolute is dropped, because there is no slug to qualify it
+///   with and no rewrite that would make it safe;
+/// * anything else is already a repo-relative path — §4.6c's own example form — and is kept, with
+///   `\` normalised to `/` so a Windows step and a Linux step summarise identically.
+fn repo_relative(path: &str, roots: &[(&str, String)]) -> Option<String> {
+    let candidate = path.replace('\\', "/");
+    let escapes = |p: &str| p.split('/').any(|segment| segment == "..");
+    for (repo, root) in roots {
+        let root = root.trim_end_matches('/');
+        if root.is_empty() {
+            continue;
+        }
+        let Some(rest) = candidate.strip_prefix(root) else {
+            continue;
+        };
+        // `/a/b` must not match `/a/bc/d`: the remainder is a whole path segment or nothing.
+        if !rest.is_empty() && !rest.starts_with('/') {
+            continue;
+        }
+        let relative = rest.trim_start_matches('/');
+        if relative.is_empty() || escapes(relative) {
+            return None;
+        }
+        return Some(format!("{repo}:{relative}"));
+    }
+    let bytes = candidate.as_bytes();
+    let absolute = bytes.first() == Some(&b'/')
+        // A drive letter, after the separator normalisation above turned `C:\x` into `C:/x`.
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
+    if absolute || escapes(&candidate) || candidate.is_empty() {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// A fixed head+tail window over lines, with §4.4's marker between the halves.
@@ -840,7 +928,7 @@ mod tests {
     use crate::model::ids::{ItemId, StepId};
     use crate::model::item::Status;
     use crate::model::{EventRole, OsFamily};
-    use crate::prompt::excerpt::ExcerptReason;
+    use crate::prompt::excerpt::{ExcerptReason, RootSource};
     use chrono::{DateTime, Utc};
     use serde_json::json;
     use uuid::Uuid;
@@ -1344,7 +1432,7 @@ mod tests {
             event(EventKind::AssistantText, 1, json!({ "text": "first" })),
             event(EventKind::AssistantText, 2, json!({ "text": "last\n" })),
         ];
-        let summary = StepSummary::from_events(&events);
+        let summary = StepSummary::from_events(&events, &[]);
         assert_eq!(summary.turns, 3, "turns 0, 1 and 2 are three turns");
         assert_eq!(summary.events, 11);
         assert_eq!(
@@ -1388,9 +1476,81 @@ mod tests {
         );
 
         // Nothing to say is nothing rendered, not a line that says "none".
-        let empty = StepSummary::from_events(&[]);
+        let empty = StepSummary::from_events(&[], &[]);
         assert_eq!(empty.turns, 0);
         assert_eq!(step_summary(&empty).content, "");
+    }
+
+    #[test]
+    fn an_edit_proposal_path_is_repo_qualified_and_never_absolute() {
+        // **H-2.** ACP `diff` blocks and `fs/write_text_file` carry absolute paths by protocol, so
+        // `Files edited:` shipped `<config_dir>/trees/<run_id>/<step_id>/…` — an absolute path, a
+        // run id and a step id in a digested byte, against §4.2 rule 5 and §4.7 rule 8 at once.
+        let roots = vec![
+            RepoRoot {
+                repo: "htui".to_owned(),
+                root: std::path::PathBuf::from(
+                    "/home/htui/.local/share/htui/trees/01a0-aa/01a0-bb",
+                ),
+                source: RootSource::RunStepTree,
+            },
+            RepoRoot {
+                repo: "vendored".to_owned(),
+                root: std::path::PathBuf::from(
+                    "/home/htui/.local/share/htui/trees/01a0-aa/01a0-bb/vendor/agy",
+                ),
+                source: RootSource::RepoBoxPath,
+            },
+        ];
+        let edit = |path: &str| {
+            event(
+                EventKind::EditProposal,
+                0,
+                json!({ "path": path.to_owned() }),
+            )
+        };
+        let events = vec![
+            edit("/home/htui/.local/share/htui/trees/01a0-aa/01a0-bb/crates/htui-core/src/lib.rs"),
+            // The deeper root wins, so a repo checked out inside another is named as itself.
+            edit("/home/htui/.local/share/htui/trees/01a0-aa/01a0-bb/vendor/agy/src/main.rs"),
+            // The same file twice, spelled with `\`: one entry, not two.
+            edit(
+                "\\home\\htui\\.local\\share\\htui\\trees\\01a0-aa\\01a0-bb\\crates\\htui-core\\src\\lib.rs",
+            ),
+            // Already repo-relative: §4.6c's own example form, kept.
+            edit("crates/htui/src/main.rs"),
+            // Under no root and absolute: there is no slug to qualify it with, so it goes.
+            edit("/etc/shadow"),
+            edit("C:\\Users\\dev\\secret.rs"),
+            // The root itself strips to nothing, and `..` is not repo-relative whatever it looks
+            // like.
+            edit("/home/htui/.local/share/htui/trees/01a0-aa/01a0-bb"),
+            edit("../../etc/shadow"),
+        ];
+        let summary = StepSummary::from_events(&events, &roots);
+        assert_eq!(
+            summary.files_edited,
+            vec![
+                "htui:crates/htui-core/src/lib.rs".to_owned(),
+                "vendored:src/main.rs".to_owned(),
+                "crates/htui/src/main.rs".to_owned(),
+            ]
+        );
+        let rendered = step_summary(&summary);
+        for leak in ["/home/", "01a0-aa", "01a0-bb", "/etc/", "C:"] {
+            assert!(
+                !rendered.content.contains(leak),
+                "`{leak}` reached a digested byte:\n{}",
+                rendered.content
+            );
+        }
+        // No roots at all — a caller that resolved none — still refuses an absolute path rather
+        // than falling back to rendering it.
+        let bare = StepSummary::from_events(&events, &[]);
+        assert_eq!(
+            bare.files_edited,
+            vec!["crates/htui/src/main.rs".to_owned()]
+        );
     }
 
     #[test]
@@ -1401,7 +1561,7 @@ mod tests {
             0,
             json!({ "text": long.clone() }),
         )];
-        let summary = StepSummary::from_events(&events);
+        let summary = StepSummary::from_events(&events, &[]);
         let lines: Vec<&str> = summary.last_assistant_tail.lines().collect();
         assert_eq!(lines.len(), 41, "20 head + the marker + 20 tail");
         assert_eq!(lines[0], "line 1");

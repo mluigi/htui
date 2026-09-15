@@ -12,15 +12,15 @@
 
 use uuid::Uuid;
 
-use crate::model::OsFamily;
 use crate::model::box_::BoxProfile;
-use crate::model::ids::{ItemId, SkillId};
+use crate::model::ids::{ItemId, SkillId, StepId};
 use crate::model::item::Status;
 use crate::model::link::UpstreamEntry;
 use crate::model::skill::BoundSkill;
+use crate::model::{EventKind, EventRole, OsFamily, SessionEvent};
 use crate::prompt::excerpt::{
-    Excerpt, ExcerptAudit, ExcerptCaps, ExcerptReason, ExcerptSet, FileRecord, RootRecord,
-    RootSource,
+    Excerpt, ExcerptAudit, ExcerptCaps, ExcerptReason, ExcerptSet, FileRecord, RepoRoot,
+    RootRecord, RootSource,
 };
 use crate::prompt::settings::{Budget, BudgetSource};
 use crate::prompt::{
@@ -392,7 +392,105 @@ pub fn judge_three_candidates() -> PromptSpec {
     }
 }
 
+/// The run id and step id of the abandoned step the handoff fixture restarts.
+///
+/// Spelled out because the two are what a fan-out sibling differs by, and `prompt_digest.rs` greps
+/// the assembled handoff prompt for exactly these strings (§4.7 rule 8).
+const HANDOFF_RUN_ID: &str = "01a06490-eea0-7000-8000-0000000000aa";
+/// See [`HANDOFF_RUN_ID`].
+const HANDOFF_STEP_ID: &str = "01a06490-eea0-7000-8000-0000000000bb";
+
+/// The abandoned step's isolated tree, which is where its `edit_proposal` paths are rooted.
+fn handoff_root() -> RepoRoot {
+    RepoRoot {
+        repo: "htui".to_owned(),
+        root: std::path::PathBuf::from(format!(
+            "/home/htui/.local/share/htui/trees/{HANDOFF_RUN_ID}/{HANDOFF_STEP_ID}"
+        )),
+        source: RootSource::RunStepTree,
+    }
+}
+
+/// One `session_event` of the abandoned step, with a fixed id and a fixed timestamp.
+fn handoff_event(seq: i32, turn: i32, kind: EventKind, payload: serde_json::Value) -> SessionEvent {
+    SessionEvent {
+        run_step_id: StepId::from_uuid(
+            Uuid::parse_str(HANDOFF_STEP_ID).expect("a literal this module owns"),
+        ),
+        seq,
+        turn,
+        kind,
+        role: EventRole::Agent,
+        tool_call_id: None,
+        payload,
+        raw: None,
+        // A literal, never a clock: `at` is informational and nothing here orders by it.
+        at: chrono::DateTime::from_timestamp(1_788_393_600, 0).expect("a valid fixed timestamp"),
+    }
+}
+
+/// The abandoned step's own events, in `seq` order (`docs/ANA-9.md:247`).
+///
+/// The two `edit_proposal` rows carry **absolute** paths under the step's tree, because that is what
+/// ACP hands over (`crates/htui-agent/src/acp/fs.rs:57`) and a fixture that pre-relativised them
+/// would test the summariser against a world that does not exist. `StepSummary::from_events` is
+/// what turns them into `htui:crates/…` (review finding H-2), and the handoff golden is where that
+/// is visible.
+fn handoff_events() -> Vec<SessionEvent> {
+    let tree = format!("/home/htui/.local/share/htui/trees/{HANDOFF_RUN_ID}/{HANDOFF_STEP_ID}");
+    let mut events = vec![handoff_event(
+        0,
+        0,
+        EventKind::Prompt,
+        serde_json::json!({ "text": "restarting the implement phase" }),
+    )];
+    // Six reads, nine edits and six executes, in first-seen order, spread over the three turns.
+    for (kind, count, turn) in [("read", 6, 0), ("edit", 9, 1), ("execute", 6, 2)] {
+        for _ in 0..count {
+            let seq = i32::try_from(events.len()).unwrap_or(i32::MAX);
+            events.push(handoff_event(
+                seq,
+                turn,
+                EventKind::ToolCall,
+                serde_json::json!({ "tool_kind": kind }),
+            ));
+        }
+    }
+    for path in [
+        "crates/htui-core/src/prompt/mod.rs",
+        "crates/htui-core/src/prompt/trim.rs",
+    ] {
+        let seq = i32::try_from(events.len()).unwrap_or(i32::MAX);
+        events.push(handoff_event(
+            seq,
+            1,
+            EventKind::EditProposal,
+            serde_json::json!({ "path": format!("{tree}/{path}") }),
+        ));
+    }
+    let seq = i32::try_from(events.len()).unwrap_or(i32::MAX);
+    events.push(handoff_event(
+        seq,
+        2,
+        EventKind::Error,
+        serde_json::json!({ "code": "command_failed", "message": "`cargo test` exited 101" }),
+    ));
+    let seq = i32::try_from(events.len()).unwrap_or(i32::MAX);
+    events.push(handoff_event(
+        seq,
+        2,
+        EventKind::AssistantText,
+        serde_json::json!({ "text": "I cannot get the borrow checker past the trim loop.\n" }),
+    ));
+    events
+}
+
 /// Criterion 18's assembler half: a handoff after a step that edited two files and hit one error.
+///
+/// The summary is [`StepSummary::from_events`]'s own output over [`handoff_events`] rather than a
+/// literal, so the golden prompt proves the one rewrite §4.2 rule 5 needs from this role: the
+/// step's absolute `edit_proposal` paths reach the prompt as `htui:crates/…` and its tree root, run
+/// id and step id reach it not at all.
 #[must_use]
 pub fn handoff_basic() -> PromptSpec {
     PromptSpec {
@@ -425,22 +523,7 @@ pub fn handoff_basic() -> PromptSpec {
         previous_diff: None,
         judge: None,
         handoff: Some(HandoffInputs {
-            step_summary: StepSummary {
-                turns: 3,
-                events: 217,
-                tool_calls: vec![
-                    ("read".to_owned(), 6),
-                    ("edit".to_owned(), 9),
-                    ("execute".to_owned(), 6),
-                ],
-                files_edited: vec![
-                    "crates/htui-core/src/prompt/mod.rs".to_owned(),
-                    "crates/htui-core/src/prompt/trim.rs".to_owned(),
-                ],
-                errors: vec!["`command_failed` — `cargo test` exited 101 at turn 2".to_owned()],
-                last_assistant_tail: "I cannot get the borrow checker past the trim loop.\n"
-                    .to_owned(),
-            },
+            step_summary: StepSummary::from_events(&handoff_events(), &[handoff_root()]),
             diff_so_far: Some(DiffBlock {
                 range: "abc1234..HEAD".to_owned(),
                 stat: " 2 files changed, 210 insertions(+)".to_owned(),

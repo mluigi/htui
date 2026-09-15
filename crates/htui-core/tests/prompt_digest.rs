@@ -60,37 +60,47 @@ fn fan_out_siblings_get_identical_bytes() {
     // siblings are the same call three times — that *is* the design (§4.7 rule 8: the property is
     // enforced by the type, not by the code). The greps are what make the claim checkable rather
     // than tautological: they look for the values a caller could have leaked through a body.
-    let spec = fixtures::phase_implement_attempt2();
-    let siblings: Vec<AssembledPrompt> = (0..3).map(|_| ok(&spec)).collect();
-    assert_eq!(siblings[0].digest, siblings[1].digest);
-    assert_eq!(siblings[1].digest, siblings[2].digest);
-    assert_eq!(siblings[0].text, siblings[2].text);
+    //
+    // The **handoff** role is here too (review finding H-2). It is the one role built from a
+    // transcript, so it is the one role with a field a run id can reach: ACP hands `edit_proposal`
+    // an absolute path under `<config_dir>/trees/<run_id>/<step_id>/` and `handoff_basic`'s events
+    // carry exactly that. A Phase-only grep passed while the handoff prompt shipped all three.
+    for spec in [
+        fixtures::phase_implement_attempt2(),
+        fixtures::handoff_basic(),
+    ] {
+        let role = spec.role;
+        let siblings: Vec<AssembledPrompt> = (0..3).map(|_| ok(&spec)).collect();
+        assert_eq!(siblings[0].digest, siblings[1].digest);
+        assert_eq!(siblings[1].digest, siblings[2].digest);
+        assert_eq!(siblings[0].text, siblings[2].text);
 
-    let text = &siblings[0].text;
-    // The three values two siblings differ by, spelled the way a leak would spell them.
-    let run_id = "01a06490-eea0-7000-8000-0000000000aa";
-    let step_id = "01a06490-eea0-7000-8000-0000000000bb";
-    let tree_root = format!("/home/htui/.local/share/htui/trees/{run_id}/{step_id}");
-    for leak in [run_id, step_id, tree_root.as_str(), "fanout_index"] {
-        assert!(
-            !text.contains(leak),
-            "§4.7 rule 8: `{leak}` must not reach a Phase prompt"
-        );
-    }
-    // Absolute paths, POSIX and Windows, wherever they sit on a line.
-    for prefix in ["/home/", "/tmp/", "/var/", "/Users/", "\\\\?\\"] {
-        assert!(
-            !text.contains(prefix),
-            "§4.2 rule 5: no absolute path — found `{prefix}`"
-        );
-    }
-    for line in text.lines() {
-        let bytes = line.as_bytes();
-        let drive_letter = bytes.first().is_some_and(u8::is_ascii_alphabetic)
-            && bytes.get(1) == Some(&b':')
-            && bytes.get(2) == Some(&b'\\');
-        assert!(!drive_letter, "a Windows absolute path on `{line}`");
-        assert!(!line.starts_with('/'), "a POSIX absolute path on `{line}`");
+        let text = &siblings[0].text;
+        // The three values two siblings differ by, spelled the way a leak would spell them.
+        let run_id = "01a06490-eea0-7000-8000-0000000000aa";
+        let step_id = "01a06490-eea0-7000-8000-0000000000bb";
+        let tree_root = format!("/home/htui/.local/share/htui/trees/{run_id}/{step_id}");
+        for leak in [run_id, step_id, tree_root.as_str(), "fanout_index"] {
+            assert!(
+                !text.contains(leak),
+                "§4.7 rule 8: `{leak}` must not reach a {role:?} prompt:\n{text}"
+            );
+        }
+        // Absolute paths, POSIX and Windows, wherever they sit on a line.
+        for prefix in ["/home/", "/tmp/", "/var/", "/Users/", "\\\\?\\"] {
+            assert!(
+                !text.contains(prefix),
+                "§4.2 rule 5: no absolute path in a {role:?} prompt — found `{prefix}`"
+            );
+        }
+        for line in text.lines() {
+            let bytes = line.as_bytes();
+            let drive_letter = bytes.first().is_some_and(u8::is_ascii_alphabetic)
+                && bytes.get(1) == Some(&b':')
+                && bytes.get(2) == Some(&b'\\');
+            assert!(!drive_letter, "a Windows absolute path on `{line}`");
+            assert!(!line.starts_with('/'), "a POSIX absolute path on `{line}`");
+        }
     }
 }
 

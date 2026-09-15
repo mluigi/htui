@@ -6,9 +6,9 @@ You are continuing work already under way on htui:MOD-2, phase implement, attemp
 A previous session did the work below and could not be resumed, so this is a fresh context. The
 working tree is exactly as that session left it.
 
-<section name="step_summary" turns="3" events="217">
+<section name="step_summary" turns="3" events="26">
 Tool calls, in order: read(6), edit(9), execute(6).
-Files edited: crates/htui-core/src/prompt/mod.rs, crates/htui-core/src/prompt/trim.rs.
+Files edited: htui:crates/htui-core/src/prompt/mod.rs, htui:crates/htui-core/src/prompt/trim.rs.
 Errors: 1 - `command_failed` — `cargo test` exited 101 at turn 2
 Last assistant message (turn 3, tail):
 I cannot get the borrow checker past the trim loop.
