@@ -351,7 +351,7 @@ pub const TIER4_IDENTIFIER: u16 = 50;
 /// The highest weight any candidate may carry, provider or tier (§4.5 `:1164`).
 ///
 /// Tier 1's weight *is* the ceiling: a provider "may propose, and it may not claim a tier", so the
-/// most it can claim is as much as the strongest tier. [`select`] clamps to this in [`vetted`] —
+/// most it can claim is as much as the strongest tier. [`select`] clamps to this in `vetted` —
 /// in the pure crate, where the invariant is documented — rather than trusting
 /// `htui_agent::excerpt::run_providers` to have done it. That is review finding F-100: a candidate
 /// reaching [`select`] by any other route used to be able to carry `u16::MAX` and outrank every
