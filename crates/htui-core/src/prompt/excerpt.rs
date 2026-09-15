@@ -309,6 +309,554 @@ pub struct ExcerptAudit {
     pub files: Vec<FileRecord>,
 }
 
+// -------------------------------------------------------------------------------------------
+// The seam (§4.5 `:1141-1203`) and the five-tier ranker (§4.5 `:1020-1063`)
+// -------------------------------------------------------------------------------------------
+
+/// The built-in ranker's provider name. Never an agent's or a vendor's name (`R-AGT-5`).
+pub const BUILTIN_NAME: &str = "builtin";
+/// The built-in ranker's version. A tier change is a new version, because it changes the prompt.
+pub const BUILTIN_VERSION: &str = "1";
+/// `builtin@1`: the first entry of every `provider_set`, and the one that is never dropped.
+pub const BUILTIN_ID: &str = "builtin@1";
+
+/// Tier 1 (§4.5 `:1026`): a path under a `touched_paths` prefix.
+pub const TIER1_TOUCHED: u16 = 100;
+/// Tier 2 (`:1027`): a path the previous attempt changed.
+pub const TIER2_PREV_DIFF: u16 = 90;
+/// Tier 3 (`:1028`): a path-like token in the item body or a resolved input document.
+pub const TIER3_MENTIONED: u16 = 70;
+/// Tier 4 (`:1029`): a path component matching a mentioned identifier.
+pub const TIER4_IDENTIFIER: u16 = 50;
+/// Tier 5's floor (`:1030`): `10 + a 0..9 lexical score`.
+pub const TIER5_BASE: u16 = 10;
+/// Tier 5's span: the lexical score is quantised into `0..=9` before anything is compared.
+pub const TIER5_SPAN: u16 = 9;
+
+/// Aider's identifier filter (`repomap.py:493-494`): shorter tokens are noise.
+const MIN_IDENT_LEN: usize = 8;
+/// The shortest word part a split identifier contributes. `gpt` is three (§4.5 `:1029`).
+const MIN_PART_LEN: usize = 3;
+/// How many bytes of a file the lexical tier reads (§4.5 `:1030`).
+pub const LEXICAL_HEAD_BYTES: usize = 4_096;
+/// The scale the tier-5 float is quantised on before it becomes a weight (blueprint G rule 5).
+const LEXICAL_SCALE: f64 = 1_000.0;
+
+/// The extensions tier 3 accepts on a path-like token (§4.5 `:1028`), a closed list.
+///
+/// Closed and not "anything after the last dot" so a version string such as `1.2.3` or a sentence
+/// ending in `etc./foo.` cannot become a file mention.
+const SOURCE_EXTENSIONS: [&str; 30] = [
+    "c", "cc", "cfg", "cpp", "cs", "css", "go", "h", "hpp", "html", "java", "js", "json", "jsx",
+    "kt", "md", "mjs", "php", "py", "rb", "rs", "scss", "sh", "sql", "toml", "ts", "tsx", "txt",
+    "yaml", "yml",
+];
+
+/// Everything a provider is asked to propose against (§4.5 `:1147-1157`).
+///
+/// Borrowed rather than owned so the caller's `PromptSpec` inputs are not cloned per provider;
+/// [`OwnedExcerptRequest`] is the `'static` mirror `htui_agent::excerpt::run_providers` moves into
+/// a thread.
+#[derive(Debug, Clone, Copy)]
+pub struct ExcerptRequest<'a> {
+    /// `<project.slug>:<item.key>`.
+    pub item_key: &'a str,
+    /// `item.body`, verbatim. Tiers 3, 4 and 5 read it.
+    pub item_body: &'a str,
+    /// `ResolvedPhase.name`.
+    pub phase: &'a str,
+    /// The resolved input documents' bodies; tier 3 reads them too (§4.5 `:1028`).
+    pub document_bodies: &'a [String],
+    /// `item.touched_paths`, already truncated and repo-qualified.
+    pub touched_prefixes: &'a [PathPrefix],
+    /// The previous attempt's changed paths; empty on attempt 1.
+    pub changed_paths: &'a [RepoPath],
+    /// One per repo in scope, with the root §4.5 step 1 resolved.
+    pub roots: &'a [RepoRoot],
+    /// The residual budget from §4.4 step 6. `0` or less means "no room", and nothing is selected.
+    pub budget_tokens: i64,
+    /// The four `excerpt_*` caps, recorded verbatim in the audit.
+    pub caps: ExcerptCaps,
+    /// `app_setting.excerpt_max_scan_files`: the walk's cap, and the `scan_truncated` trigger.
+    pub scan_cap: u32,
+    /// How long a provider has to answer before it is dropped and recorded (§4.5 rule 2).
+    pub deadline: core::time::Duration,
+}
+
+/// An owned [`ExcerptRequest`], so a provider can run on a thread that outlives its deadline.
+///
+/// Hazard H-20: a provider that misses its deadline is *dropped*, not waited for, so the thread it
+/// runs on may outlive the call. A scoped thread cannot express that — it joins at the end of the
+/// scope — so the data a provider sees has to be `'static`, which is what this type is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedExcerptRequest {
+    /// See [`ExcerptRequest::item_key`].
+    pub item_key: String,
+    /// See [`ExcerptRequest::item_body`].
+    pub item_body: String,
+    /// See [`ExcerptRequest::phase`].
+    pub phase: String,
+    /// See [`ExcerptRequest::document_bodies`].
+    pub document_bodies: Vec<String>,
+    /// See [`ExcerptRequest::touched_prefixes`].
+    pub touched_prefixes: Vec<PathPrefix>,
+    /// See [`ExcerptRequest::changed_paths`].
+    pub changed_paths: Vec<RepoPath>,
+    /// See [`ExcerptRequest::roots`].
+    pub roots: Vec<RepoRoot>,
+    /// See [`ExcerptRequest::budget_tokens`].
+    pub budget_tokens: i64,
+    /// See [`ExcerptRequest::caps`].
+    pub caps: ExcerptCaps,
+    /// See [`ExcerptRequest::scan_cap`].
+    pub scan_cap: u32,
+    /// See [`ExcerptRequest::deadline`].
+    pub deadline: core::time::Duration,
+}
+
+impl OwnedExcerptRequest {
+    /// Clone every borrowed field, once, before the threads start.
+    #[must_use]
+    pub fn from_request(req: &ExcerptRequest<'_>) -> Self {
+        Self {
+            item_key: req.item_key.to_owned(),
+            item_body: req.item_body.to_owned(),
+            phase: req.phase.to_owned(),
+            document_bodies: req.document_bodies.to_vec(),
+            touched_prefixes: req.touched_prefixes.to_vec(),
+            changed_paths: req.changed_paths.to_vec(),
+            roots: req.roots.to_vec(),
+            budget_tokens: req.budget_tokens,
+            caps: req.caps,
+            scan_cap: req.scan_cap,
+            deadline: req.deadline,
+        }
+    }
+
+    /// Borrow it back as the request every provider is called with.
+    #[must_use]
+    pub fn as_request(&self) -> ExcerptRequest<'_> {
+        ExcerptRequest {
+            item_key: &self.item_key,
+            item_body: &self.item_body,
+            phase: &self.phase,
+            document_bodies: &self.document_bodies,
+            touched_prefixes: &self.touched_prefixes,
+            changed_paths: &self.changed_paths,
+            roots: &self.roots,
+            budget_tokens: self.budget_tokens,
+            caps: self.caps,
+            scan_cap: self.scan_cap,
+            deadline: self.deadline,
+        }
+    }
+}
+
+/// One proposed file, before `htui` ranks, windows, caps, renders and digests it (§4.5 `:1159-1166`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcerptCandidate {
+    /// The repo slug, never a path.
+    pub repo: String,
+    /// The repo-relative path.
+    pub path: String,
+    /// The window the proposer wants, 1-based and inclusive; `None` means "no opinion".
+    pub lines: Option<(u32, u32)>,
+    /// `0..=100`. `htui` re-normalises against its own tiers.
+    pub weight: u16,
+    /// One of the five tier names, or the proposing provider's name — which
+    /// [`select`] renders as `reason="provider:<name>"`.
+    pub reason: String,
+}
+
+/// A provider that declined, in the one shape `provider_set` can record.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("excerpt provider `{provider}`: {message}")]
+pub struct ProviderError {
+    /// The provider's [`name`](ExcerptProvider::name), or the reader's own.
+    pub provider: String,
+    /// What went wrong, already free of secrets: it lands in `trim_record.notes`.
+    pub message: String,
+}
+
+impl ProviderError {
+    /// The two-field constructor, so a caller does not spell the struct out per call site.
+    #[must_use]
+    pub fn new(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// A source of excerpt candidates (`R-LATER-7`), with §4.5's five rules (`:1177-1199`).
+///
+/// 1. **Providers propose candidates; `htui` renders.** Otherwise the prompt bytes, and therefore
+///    the digest, depend on a third party's formatting.
+/// 2. **Fail-open with a deadline.** Absent, erroring, panicking or slow means drop the provider,
+///    record it in `provider_set` with its status, and continue (`R-NF-2`).
+/// 3. **A provider's participation is recorded and is allowed to change the digest.** A provider
+///    that changes the excerpt set genuinely changes the prompt, so pretending otherwise would make
+///    the digest a lie.
+/// 4. **Read-only, `R-ID-4`.** The trait has no write method and [`RepoRoot`] carries no writable
+///    handle. A provider that writes a directory into the project breaks `R-ID-4` itself.
+/// 5. **Non-LLM, `R-ID-6`.** Stated here, unenforceable by the type system, and therefore an ANA-3
+///    review criterion rather than a compile error.
+///
+/// Synchronous by design: a provider is a lookup, and the deadline runner
+/// (`htui_agent::excerpt::run_providers`) is what gives it a thread.
+pub trait ExcerptProvider: Send + Sync + core::fmt::Debug {
+    /// The provider's stable name, as it appears in `provider_set` and in `reason="provider:…"`.
+    fn name(&self) -> &str;
+    /// The provider's version, as it appears in `provider_set`.
+    fn version(&self) -> &str;
+    /// Propose candidates. Never a model call (rule 5), never a write (rule 4).
+    ///
+    /// # Errors
+    ///
+    /// Anything at all: the caller drops the provider and records it, which is rule 2.
+    fn propose(&self, req: &ExcerptRequest<'_>) -> Result<Vec<ExcerptCandidate>, ProviderError>;
+}
+
+/// Read-only by type (ANA-5 invariant 6): list and read, nothing else.
+///
+/// The filesystem implementation is `htui_agent::excerpt::FsRepoReader`; this crate names no
+/// `std::fs` (§4.8), so a `htui-core` test drives [`select`] through a double and touches no disk.
+pub trait RepoReader: Send + Sync + core::fmt::Debug {
+    /// Repo-relative `/`-separated paths in byte order at every level, content-skip rules already
+    /// applied. The `bool` is `scan_truncated`: the cap bit and the listing is partial.
+    ///
+    /// # Errors
+    ///
+    /// An unreadable root. A repo that cannot be listed contributes nothing and is noted, which is
+    /// §4.5 step 1's fail-open.
+    fn list(&self, root: &RepoRoot, cap: u32) -> Result<(Vec<String>, bool), ProviderError>;
+    /// The file's text, LF-normalised.
+    ///
+    /// # Errors
+    ///
+    /// A path the reader cannot read is an error, never a panic.
+    fn read(&self, root: &RepoRoot, path: &str) -> Result<String, ProviderError>;
+}
+
+/// One listed candidate as the **pure** ranker sees it (§4.5 step 2's output).
+///
+/// [`head`](Self::head) is the first [`LEXICAL_HEAD_BYTES`] of the file when tier 5 will be asked
+/// about it, and empty otherwise — which is what keeps [`rank`] a pure function over a supplied
+/// listing rather than something that needs a reader.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Listed {
+    /// The repo slug.
+    pub repo: String,
+    /// The repo-relative path.
+    pub path: String,
+    /// The file's first bytes, for tier 5; empty when unread.
+    pub head: String,
+}
+
+/// The built-in ranker, `builtin@1` (§4.5 `:1201-1203`).
+///
+/// Registered first and never removable, so "no providers configured" and "every provider failed"
+/// are the same code path and are exercised by the same tests. Its `propose` returns nothing on
+/// purpose: the built-in's candidates come from the **listing**, which only [`select`] holds, and
+/// [`ExcerptRequest`] deliberately carries no reader (rule 4 — a provider is given signals, never a
+/// handle). The impl exists so registration, ordering and the `provider_set` grammar have exactly
+/// one implementation; the tiers themselves are [`rank`], which is pure and unit-tested.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinRanker;
+
+impl ExcerptProvider for BuiltinRanker {
+    fn name(&self) -> &str {
+        BUILTIN_NAME
+    }
+
+    fn version(&self) -> &str {
+        BUILTIN_VERSION
+    }
+
+    fn propose(&self, _req: &ExcerptRequest<'_>) -> Result<Vec<ExcerptCandidate>, ProviderError> {
+        Ok(Vec::new())
+    }
+}
+
+/// The signals tiers 3, 4 and 5 read, derived once from the item body and its documents.
+#[derive(Debug, Default)]
+struct Signals {
+    /// Path-like tokens: `[A-Za-z0-9_./-]+` containing `/`, ending in a known source extension.
+    mentioned: std::collections::BTreeSet<String>,
+    /// Lowercase word parts of every identifier of at least [`MIN_IDENT_LEN`] characters.
+    idents: std::collections::BTreeSet<String>,
+}
+
+impl Signals {
+    /// §4.5 step 3, over the item body and every resolved input document.
+    fn of(req: &ExcerptRequest<'_>) -> Self {
+        let mut signals = Self::default();
+        signals.absorb(req.item_body);
+        for body in req.document_bodies {
+            signals.absorb(body);
+        }
+        signals
+    }
+
+    fn absorb(&mut self, text: &str) {
+        for token in tokens(text) {
+            if token.contains('/') && has_source_extension(token) {
+                self.mentioned.insert(token.to_owned());
+            }
+            if is_identifier(token) {
+                for part in word_parts(token) {
+                    self.idents.insert(part);
+                }
+            }
+        }
+    }
+}
+
+/// Every `[A-Za-z0-9_./-]+` run in `text`, with trailing punctuation trimmed.
+fn tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-')))
+        .map(|token| token.trim_matches(|c| matches!(c, '.' | '-' | '/')))
+        .filter(|token| !token.is_empty())
+}
+
+/// Whether a path-like token ends in one of [`SOURCE_EXTENSIONS`].
+fn has_source_extension(token: &str) -> bool {
+    token
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| SOURCE_EXTENSIONS.contains(&ext))
+}
+
+/// Aider's filter (`repomap.py:493-494`): at least [`MIN_IDENT_LEN`] characters **and** snake,
+/// kebab or camel case, so a long ordinary word is not an identifier.
+fn is_identifier(token: &str) -> bool {
+    if token.chars().count() < MIN_IDENT_LEN {
+        return false;
+    }
+    if token.contains(['_', '-', '/', '.']) {
+        return true;
+    }
+    token
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase())
+}
+
+/// Split on `_`, `-`, `/`, `.` and on every lower→upper transition, lowercased (Sweep's rule, so
+/// `ChatGPT`, `chat_gpt` and `chatGPT` all yield `chat` and `gpt`).
+fn word_parts(token: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut previous_lower = false;
+    for ch in token.chars() {
+        if matches!(ch, '_' | '-' | '/' | '.') {
+            if current.chars().count() >= MIN_PART_LEN {
+                parts.push(core::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+            previous_lower = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && previous_lower {
+            if current.chars().count() >= MIN_PART_LEN {
+                parts.push(core::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        }
+        current.push(ch.to_ascii_lowercase());
+        previous_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    if current.chars().count() >= MIN_PART_LEN {
+        parts.push(current);
+    }
+    parts
+}
+
+/// Every suffix of a path at a `/` boundary, longest first — what tier 3 tests membership of.
+fn path_suffixes(path: &str) -> Vec<&str> {
+    let mut out = vec![path];
+    let mut rest = path;
+    while let Some((_, tail)) = rest.split_once('/') {
+        out.push(tail);
+        rest = tail;
+    }
+    out
+}
+
+/// Tiers 1–4, which need no file bytes at all.
+fn tier_of(
+    req: &ExcerptRequest<'_>,
+    signals: &Signals,
+    entry: &Listed,
+) -> Option<(u16, &'static str)> {
+    if req
+        .touched_prefixes
+        .iter()
+        .any(|prefix| prefix.matches(&entry.repo, &entry.path))
+    {
+        return Some((TIER1_TOUCHED, "touched_path"));
+    }
+    if req
+        .changed_paths
+        .iter()
+        .any(|changed| changed.repo == entry.repo && changed.path == entry.path)
+    {
+        return Some((TIER2_PREV_DIFF, "prev_diff"));
+    }
+    if path_suffixes(&entry.path)
+        .into_iter()
+        .any(|suffix| signals.mentioned.contains(suffix))
+    {
+        return Some((TIER3_MENTIONED, "mentioned"));
+    }
+    if entry
+        .path
+        .split('/')
+        .flat_map(word_parts)
+        .any(|part| signals.idents.contains(&part))
+    {
+        return Some((TIER4_IDENTIFIER, "identifier"));
+    }
+    None
+}
+
+/// The five tiers as one pure function over a supplied listing (§4.5 steps 3–5).
+///
+/// **Max, not sum** (`:1020-1022`): a file takes the highest tier it qualifies for, so one file
+/// cannot outrank another by accumulating weak evidence. Tier 5 runs only when tiers 1–4 leave
+/// `max_files` unspent and never contributes more than a third of it (`:1032-1033`). The result is
+/// sorted `(weight desc, repo asc, path asc)` on raw bytes, with tier 5's float quantised to an
+/// integer **before** anything is compared (`:1048-1051`).
+///
+/// Pure over `listing`: no reader, no filesystem, no clock. [`Listed::head`] is what tier 5 scores,
+/// and a listing with empty heads simply scores every tier-5 candidate on its path.
+#[must_use]
+pub fn rank(req: &ExcerptRequest<'_>, listing: &[Listed]) -> Vec<ExcerptCandidate> {
+    let signals = Signals::of(req);
+    let mut out = Vec::new();
+    let mut leftovers = Vec::new();
+    for entry in listing {
+        match tier_of(req, &signals, entry) {
+            Some((weight, reason)) => out.push(ExcerptCandidate {
+                repo: entry.repo.clone(),
+                path: entry.path.clone(),
+                lines: None,
+                weight,
+                reason: reason.to_owned(),
+            }),
+            None => leftovers.push(entry),
+        }
+    }
+    let max_files = req.caps.max_files as usize;
+    let tier5_cap = (max_files / 3).min(max_files.saturating_sub(out.len()));
+    if tier5_cap > 0 {
+        out.extend(lexical(&signals, &leftovers, tier5_cap));
+    }
+    sort_candidates(&mut out);
+    out
+}
+
+/// §4.5 step 5's composite key: `(weight desc, repo asc, path asc)` on raw bytes.
+fn sort_candidates(candidates: &mut [ExcerptCandidate]) {
+    candidates.sort_by(|a, b| {
+        b.weight
+            .cmp(&a.weight)
+            .then_with(|| a.repo.as_bytes().cmp(b.repo.as_bytes()))
+            .then_with(|| a.path.as_bytes().cmp(b.path.as_bytes()))
+    });
+}
+
+/// Tier 5: a hand-rolled TF-IDF over the candidate set, quantised to `0..=9` (§4.5 `:1030`).
+///
+/// No crate and nothing learned: Repoformer found that neither UniXCoder nor CodeBLEU outperformed
+/// Jaccard similarity (<https://arxiv.org/html/2403.10059v1>), which removes the argument for
+/// anything heavier. The one float in the whole module lives here and dies here — the score is
+/// multiplied by [`LEXICAL_SCALE`], truncated to an integer, and only integers are ever compared.
+fn lexical(signals: &Signals, leftovers: &[&Listed], cap: usize) -> Vec<ExcerptCandidate> {
+    if signals.idents.is_empty() || leftovers.is_empty() {
+        // No query terms: every candidate scores zero, so the floor weight and path order decide.
+        return leftovers
+            .iter()
+            .take(cap)
+            .map(|entry| lexical_candidate(entry, 0))
+            .collect();
+    }
+    // One term-frequency map per candidate, restricted to the query terms.
+    let mut frequencies: Vec<std::collections::BTreeMap<&str, u32>> = Vec::new();
+    let mut document_frequency: std::collections::BTreeMap<&str, u32> =
+        std::collections::BTreeMap::new();
+    for entry in leftovers {
+        let mut counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+        for part in document_terms(entry) {
+            if let Some(term) = signals.idents.get(&part) {
+                *counts.entry(term.as_str()).or_default() += 1;
+            }
+        }
+        for term in counts.keys() {
+            *document_frequency.entry(term).or_default() += 1;
+        }
+        frequencies.push(counts);
+    }
+    let total = leftovers.len() as f64;
+    let scores: Vec<u64> = frequencies
+        .iter()
+        .map(|counts| {
+            let score: f64 = counts
+                .iter()
+                .map(|(term, count)| {
+                    let df = f64::from(document_frequency.get(term).copied().unwrap_or(1)).max(1.0);
+                    (1.0 + f64::from(*count).ln()) * (1.0 + total / df).ln()
+                })
+                .sum();
+            // The one quantisation: everything downstream is integer arithmetic.
+            if score.is_finite() && score > 0.0 {
+                (score * LEXICAL_SCALE) as u64
+            } else {
+                0
+            }
+        })
+        .collect();
+    let peak = scores.iter().copied().max().unwrap_or(0);
+    let mut candidates: Vec<ExcerptCandidate> = leftovers
+        .iter()
+        .zip(&scores)
+        .map(|(entry, score)| {
+            let lex = (score * u64::from(TIER5_SPAN))
+                .checked_div(peak)
+                .map_or(0, |scaled| u16::try_from(scaled).unwrap_or(TIER5_SPAN));
+            lexical_candidate(entry, lex.min(TIER5_SPAN))
+        })
+        .collect();
+    sort_candidates(&mut candidates);
+    candidates.truncate(cap);
+    candidates
+}
+
+/// One tier-5 candidate at a quantised `0..=9` lexical score.
+fn lexical_candidate(entry: &Listed, lex: u16) -> ExcerptCandidate {
+    ExcerptCandidate {
+        repo: entry.repo.clone(),
+        path: entry.path.clone(),
+        lines: None,
+        weight: TIER5_BASE + lex,
+        reason: "lexical".to_owned(),
+    }
+}
+
+/// A tier-5 document's terms: the path's word parts plus the head's, the same split both sides.
+fn document_terms(entry: &Listed) -> Vec<String> {
+    let mut terms: Vec<String> = entry.path.split('/').flat_map(word_parts).collect();
+    let head = &entry.head[..entry.head.len().min(LEXICAL_HEAD_BYTES)];
+    // A truncation at 4 KB can land inside a multi-byte character; the lossy tail is one term at
+    // most and the score is a ranking signal, not a checksum.
+    for token in tokens(head) {
+        terms.extend(word_parts(token));
+    }
+    terms
+}
+
 /// The excerpt half of a [`PromptSpec`](crate::prompt::PromptSpec): the files and their audit.
 ///
 /// `Default` is the empty set, which is what a caller that resolved no readable root passes — the
@@ -329,6 +877,204 @@ pub struct ExcerptSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listing entry with no head bytes: tiers 1–4 need none.
+    fn listed(repo: &str, path: &str) -> Listed {
+        Listed {
+            repo: repo.to_owned(),
+            path: path.to_owned(),
+            head: String::new(),
+        }
+    }
+
+    /// A request carrying only the signals a tier test needs.
+    fn request(body: &str, touched: &[&str], changed: &[&str]) -> OwnedExcerptRequest {
+        OwnedExcerptRequest {
+            item_key: "htui:MOD-2".to_owned(),
+            item_body: body.to_owned(),
+            phase: "implement".to_owned(),
+            document_bodies: Vec::new(),
+            touched_prefixes: touched
+                .iter()
+                .map(|glob| PathPrefix::parse(glob, "htui"))
+                .collect(),
+            changed_paths: changed
+                .iter()
+                .map(|path| RepoPath {
+                    repo: "htui".to_owned(),
+                    path: (*path).to_owned(),
+                })
+                .collect(),
+            roots: Vec::new(),
+            budget_tokens: 100_000,
+            caps: ExcerptCaps {
+                max_files: 12,
+                file_line_cap: 400,
+                head_lines: 200,
+                max_file_bytes: 524_288,
+            },
+            scan_cap: 20_000,
+            deadline: core::time::Duration::from_millis(1_500),
+        }
+    }
+
+    fn weight_of(candidates: &[ExcerptCandidate], path: &str) -> Option<u16> {
+        candidates
+            .iter()
+            .find(|candidate| candidate.path == path)
+            .map(|candidate| candidate.weight)
+    }
+
+    #[test]
+    fn tier_weights_are_max_not_sum() {
+        // §4.5 `:1020-1022`: "the **maximum** tier weight it qualifies for, not a sum, so one file
+        // cannot outrank another by accumulating weak evidence."
+        let owned = request(
+            "Rework the prompt_assembler over crates/htui-core/src/prompt/mod.rs.\n",
+            &["crates/htui-core/src/prompt/**"],
+            &["crates/htui-core/src/prompt/mod.rs"],
+        );
+        let req = owned.as_request();
+        let listing = [
+            // Qualifies for tiers 1, 2, 3 and 4 at once.
+            listed("htui", "crates/htui-core/src/prompt/mod.rs"),
+            // Tier 2 only: changed but outside the prefix and unmentioned.
+            listed("htui", "crates/htui-store/src/pg/read.rs"),
+            // Tier 4 only: a path component matches the `prompt_assembler` identifier.
+            listed("agy", "src/assembler/main.rs"),
+        ];
+        let ranked = rank(&req, &listing);
+        assert_eq!(
+            weight_of(&ranked, "crates/htui-core/src/prompt/mod.rs"),
+            Some(100),
+            "four signals still weigh 100, not 310"
+        );
+        assert!(
+            ranked.iter().all(|candidate| candidate.weight <= 100),
+            "no weight may exceed tier 1's: {ranked:?}"
+        );
+        assert_eq!(
+            weight_of(&ranked, "src/assembler/main.rs"),
+            Some(50),
+            "a path component matching a mentioned identifier is tier 4"
+        );
+    }
+
+    #[test]
+    fn ties_break_on_path_bytes() {
+        // §4.5 step 5: `(weight desc, repo_slug asc, path asc)` on raw bytes.
+        let owned = request("nothing in particular\n", &["**"], &[]);
+        let req = owned.as_request();
+        let listing = [
+            listed("htui", "b.rs"),
+            listed("agy", "z.rs"),
+            listed("htui", "a.rs"),
+            listed("agy", "a.rs"),
+        ];
+        let ranked = rank(&req, &listing);
+        // `**` is the empty prefix, so all four are tier 1 in the primary repo only; `agy` gets
+        // whatever the lexical tier gives it, which is strictly less than 100.
+        let keys: Vec<(u16, &str, &str)> = ranked
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.weight,
+                    candidate.repo.as_str(),
+                    candidate.path.as_str(),
+                )
+            })
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
+                .then_with(|| a.2.as_bytes().cmp(b.2.as_bytes()))
+        });
+        assert_eq!(
+            keys, sorted,
+            "weight desc, then repo bytes, then path bytes"
+        );
+        assert_eq!(
+            keys.first().map(|key| (key.1, key.2)),
+            Some(("htui", "a.rs")),
+            "the two tier-1 files lead, in path byte order"
+        );
+    }
+
+    #[test]
+    fn tier_five_scores_are_quantised_before_the_sort() {
+        // §4.5 step 5: "Float scores from tier 5 are quantised to integers before sorting, so
+        // ordering never depends on `f64` comparison."
+        let owned = request(
+            "Fix the token_estimator and the prompt_digest of the recorder_pump.\n",
+            &[],
+            &[],
+        );
+        let req = owned.as_request();
+        let listing: Vec<Listed> = [
+            ("src/aaa.txt", "token estimator estimator estimator\n"),
+            ("src/bbb.txt", "token estimator digest\n"),
+            ("src/ccc.txt", "unrelated prose about nothing at all\n"),
+            ("src/ddd.txt", "digest digest pump pump recorder\n"),
+        ]
+        .into_iter()
+        .map(|(path, head)| Listed {
+            repo: "htui".to_owned(),
+            path: path.to_owned(),
+            head: head.to_owned(),
+        })
+        .collect();
+        let ranked = rank(&req, &listing);
+        assert!(!ranked.is_empty(), "the lexical tier produced nothing");
+        for candidate in &ranked {
+            assert!(
+                (TIER5_BASE..=TIER5_BASE + TIER5_SPAN).contains(&candidate.weight),
+                "a tier-5 weight is `10 + a 0..9 lexical score`, got {candidate:?}"
+            );
+            assert_eq!(candidate.reason, "lexical");
+        }
+        // The order is the composite integer key and nothing else.
+        let keys: Vec<(u16, &str)> = ranked
+            .iter()
+            .map(|candidate| (candidate.weight, candidate.path.as_str()))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
+        });
+        assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn tier_five_never_exceeds_a_third_of_max_files() {
+        // §4.5 `:1032-1033`: tier 5 "never contributes more than a third of `max_files`", and runs
+        // only when tiers 1 to 4 leave budget unspent.
+        let mut owned = request("a body naming nothing\n", &[], &[]);
+        owned.caps.max_files = 12;
+        let listing: Vec<Listed> = (0..40)
+            .map(|n| listed("htui", &format!("src/f{n:02}.rs")))
+            .collect();
+        let ranked = rank(&owned.as_request(), &listing);
+        assert_eq!(ranked.len(), 4, "12 / 3 = 4, and every file is tier 5");
+
+        // Tiers 1–4 filling `max_files` leave tier 5 nothing to do.
+        let mut full = request("a body naming nothing\n", &["src/"], &[]);
+        full.caps.max_files = 3;
+        let ranked = rank(&full.as_request(), &listing);
+        assert!(
+            ranked.iter().all(|candidate| candidate.weight == 100),
+            "tier 1 already fills `max_files`, so tier 5 does not run: {ranked:?}"
+        );
+    }
+
+    #[test]
+    fn the_builtin_is_registered_as_builtin_at_1() {
+        let builtin = BuiltinRanker;
+        assert_eq!(builtin.name(), "builtin");
+        assert_eq!(builtin.version(), "1");
+        assert_eq!(BUILTIN_ID, "builtin@1");
+    }
 
     #[test]
     fn the_reason_vocabulary_is_closed_and_provider_carries_its_name() {
