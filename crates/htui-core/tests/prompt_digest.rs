@@ -422,6 +422,57 @@ fn the_upstream_ladder_degrades_before_it_drops() {
 }
 
 #[test]
+fn the_drop_that_empties_the_upstream_section_is_counted() {
+    // **L-1.** The ladder assigned `stubbed` and `dropped` only *after* `render::upstream` returned
+    // a section. The drop that empties the section renders `None`, so the row that ended the
+    // section was the one row the record never counted — `dropped` was always one short of the
+    // truth on exactly the path a reader most needs it.
+    use htui_core::model::ids::ItemId;
+    use htui_core::model::item::Status;
+    use htui_core::model::link::UpstreamEntry;
+
+    let depth_two = |id: u128, key: &str| UpstreamEntry {
+        item_id: ItemId::from_uuid(uuid::Uuid::from_u128(id)),
+        qualified_key: key.to_owned(),
+        title: format!("{key} title"),
+        status: Status::Closed,
+        depth: 2,
+        in_scope: true,
+        summary: Some(format!("{key} summary\n")),
+    };
+    let mut spec = fixtures::phase_oversize();
+    // Every row at depth 2, so rung (b) drops them all and the last drop empties the section.
+    spec.upstream = vec![
+        depth_two(0x21, "htui:MOD-21"),
+        depth_two(0x22, "htui:MOD-22"),
+    ];
+    spec.budget = htui_core::prompt::Budget {
+        tokens: 3_000,
+        source: htui_core::prompt::BudgetSource::Project,
+        reserve_bp: 0,
+    };
+
+    let prompt = ok(&spec);
+    let upstream = prompt
+        .trim
+        .sections
+        .iter()
+        .find(|section| section.name == SectionName::Upstream)
+        .expect("an upstream entry survives the drop");
+    assert_eq!(upstream.strategy, TrimStrategy::Dropped);
+    assert_eq!(
+        upstream.dropped,
+        Some(2),
+        "both rows went, and both are counted"
+    );
+    assert_eq!(
+        upstream.stubbed,
+        Some(2),
+        "and the rung they passed through on the way is still recorded"
+    );
+}
+
+#[test]
 fn a_diff_falls_to_its_stat_before_it_is_dropped() {
     let spec = oversize_at(untrimmed_total() - 20_000);
     let prompt = ok(&spec);

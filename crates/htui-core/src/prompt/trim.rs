@@ -671,13 +671,16 @@ impl<'a> Trimmer<'a> {
                 };
                 states[row] = next;
                 let states = states.clone();
+                // The counters go in **before** the render is asked for. The drop that empties the
+                // section is the one that renders `None`, so counting after the render always lost
+                // exactly that row and left `dropped` one short (review finding L-1).
+                self.entries[index].record.stubbed = (stubbed > 0).then_some(stubbed);
+                self.entries[index].record.dropped = (dropped > 0).then_some(dropped);
+                self.mark(index, TrimStrategy::StubLadder);
                 let Some(rendered) = render::upstream(self.inputs.upstream, &states) else {
                     break;
                 };
                 self.entries[index].rendered = rendered;
-                self.entries[index].record.stubbed = (stubbed > 0).then_some(stubbed);
-                self.entries[index].record.dropped = (dropped > 0).then_some(dropped);
-                self.mark(index, TrimStrategy::StubLadder);
                 self.re_estimate(index);
             }
         }
@@ -692,14 +695,29 @@ impl<'a> Trimmer<'a> {
         let Some(index) = self.live_index(name) else {
             return;
         };
+        // Enumerated rather than `_ =>`: a section name added to §4.2's vocabulary must be placed
+        // in this ladder deliberately, not silently fall through to the handoff's diff (L-3).
         let block = match name {
             SectionName::PreviousDiff => self.inputs.spec.previous_diff.as_ref(),
-            _ => self
+            SectionName::DiffSoFar => self
                 .inputs
                 .spec
                 .handoff
                 .as_ref()
                 .and_then(|handoff| handoff.diff_so_far.as_ref()),
+            SectionName::Template
+            | SectionName::Item
+            | SectionName::Documents(_)
+            | SectionName::Upstream
+            | SectionName::Box
+            | SectionName::Skills
+            | SectionName::Excerpts
+            | SectionName::VerifyFailure
+            | SectionName::CommandQueue
+            | SectionName::JudgeTask
+            | SectionName::JudgeCandidate(_)
+            | SectionName::StepSummary
+            | SectionName::FailureReason => None,
         };
         if let (Some(block), Source::Diff(false)) = (block, &self.entries[index].source) {
             self.entries[index].rendered = render::diff(name.clone(), block, true);
