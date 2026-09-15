@@ -34,7 +34,7 @@ pub mod fixtures;
 pub use defaults::{COMMAND_QUEUE_TEXT, DEFAULT_TEMPLATES, body_of};
 pub use estimate::TokenEstimator;
 pub use excerpt::ExcerptSet;
-pub use settings::{Budget, BudgetSource};
+pub use settings::{Budget, BudgetSource, DEFAULTS, Defaults};
 pub use template::{ParsedTemplate, Placeholder, Span, TemplateError, TemplateRole, parse};
 
 use serde::{Serialize, Serializer};

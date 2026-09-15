@@ -1,12 +1,116 @@
 //! The resolved prompt budget and where it came from (ANA-5 §4.4 step 1–2, §5.1; plan D101).
 //!
-//! T64 lands the two value types [`PromptSpec`](crate::prompt::PromptSpec) carries — a budget is an
-//! **input** to the assembler, not something it resolves. T65 lands the resolution chain itself
-//! (`DEFAULTS`, `resolve_budget`, `resolve_hops`, `resolve_excerpt_caps`) in this same file,
-//! because the chain reads `app_setting` and `project.settings` and belongs beside the constants it
-//! falls back to.
+//! T64 landed the two value types [`PromptSpec`](crate::prompt::PromptSpec) carries — a budget is
+//! an **input** to the assembler, not something it resolves. T65 lands the resolution chain itself,
+//! here rather than in `assemble()`, because [`crate::prompt::assemble`] is pure by contract
+//! (ANA-5 invariant 2) and a settings read inside it would end that: the caller reads the rungs and
+//! hands down a [`Budget`].
+//!
+//! [`DEFAULTS`] is plan D101's compiled-in table and is not a duplicate for its own sake.
+//! `app_setting` has **no cache mirror** (`cache_migrations/0001_mirror.sql` declares no such
+//! table) and **no generic reader** (`connect.rs:292-302` reads two hard-coded keys), so a box that
+//! cannot reach its Postgres has no other way to learn `token_budget`; and `SEEDED_SETTINGS` is
+//! typed `[(&str, i32); 2]`, which cannot express `prompt_reserve_fraction = 0.10` at all. The two
+//! are pinned equal by `tests::the_defaults_are_migration_0002s_ten_rows_verbatim`, which reads the
+//! migration file itself and so needs no database.
+//!
+//! Every rung follows one rule, `connect.rs:299-302`'s: a key that is absent, `null`, non-numeric
+//! or non-positive is **not a value** and falls through to the next rung. That is why
+//! [`BudgetSource`] is recorded — "the compiled-in table answered" and "the row said so" are
+//! different facts, and a surprising number is then traceable in one field rather than by
+//! re-deriving the chain.
+
+use std::collections::BTreeMap;
 
 use serde::Serialize;
+use serde_json::Value;
+
+/// ANA-5 §5.3's ten reserved `app_setting` keys, with the defaults migration `0002` seeds
+/// (`0002_agent_probe.sql:68-79`).
+///
+/// The reserve is held in **basis points** rather than as an `f64` so the whole table is `Eq` and
+/// the target is exact integer arithmetic on every box (see [`Budget::target`]).
+pub const DEFAULTS: Defaults = Defaults {
+    token_budget: 120_000,
+    prompt_reserve_fraction_bp: 1_000,
+    prompt_upstream_hops: 2,
+    max_skill_tokens: 20_000,
+    excerpt_max_files: 12,
+    excerpt_file_line_cap: 400,
+    excerpt_head_lines: 200,
+    excerpt_max_file_bytes: 524_288,
+    excerpt_max_scan_files: 20_000,
+    excerpt_provider_deadline_ms: 1_500,
+};
+
+/// §4.3's permitted upstream hop range; a stored value outside it is clamped and noted.
+const HOPS_RANGE: (u8, u8) = (1, 2);
+/// The largest reserve the resolver will honour: half the budget. A row claiming more would leave
+/// the prompt less space than the response, which is a typo rather than a policy.
+const MAX_RESERVE_BP: u32 = 5_000;
+
+/// The compiled-in `app_setting` table of plan D101 (ANA-5 §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Defaults {
+    /// `token_budget`: the last rung of `docs/ANA-2.md:284`'s chain.
+    pub token_budget: i64,
+    /// `prompt_reserve_fraction`, ×10 000: `1_000` is the seeded `0.10`.
+    pub prompt_reserve_fraction_bp: u32,
+    /// `prompt_upstream_hops`, clamped to `1..=2`.
+    pub prompt_upstream_hops: u8,
+    /// `max_skill_tokens`: the aggregate skills cap that refuses rather than degrades.
+    pub max_skill_tokens: i64,
+    /// `excerpt_max_files`.
+    pub excerpt_max_files: u32,
+    /// `excerpt_file_line_cap`.
+    pub excerpt_file_line_cap: u32,
+    /// `excerpt_head_lines`.
+    pub excerpt_head_lines: u32,
+    /// `excerpt_max_file_bytes`.
+    pub excerpt_max_file_bytes: u64,
+    /// `excerpt_max_scan_files`.
+    pub excerpt_max_scan_files: u32,
+    /// `excerpt_provider_deadline_ms`.
+    pub excerpt_provider_deadline_ms: u64,
+}
+
+impl Defaults {
+    /// The ten rows as `(key, value)` in **key byte order**, which is the order migration `0002`'s
+    /// `INSERT` is compared against and the order a seeder must write them in.
+    #[must_use]
+    pub fn as_rows(&self) -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "excerpt_file_line_cap",
+                Value::from(self.excerpt_file_line_cap),
+            ),
+            ("excerpt_head_lines", Value::from(self.excerpt_head_lines)),
+            (
+                "excerpt_max_file_bytes",
+                Value::from(self.excerpt_max_file_bytes),
+            ),
+            ("excerpt_max_files", Value::from(self.excerpt_max_files)),
+            (
+                "excerpt_max_scan_files",
+                Value::from(self.excerpt_max_scan_files),
+            ),
+            (
+                "excerpt_provider_deadline_ms",
+                Value::from(self.excerpt_provider_deadline_ms),
+            ),
+            ("max_skill_tokens", Value::from(self.max_skill_tokens)),
+            (
+                "prompt_reserve_fraction",
+                Value::from(f64::from(self.prompt_reserve_fraction_bp) / 10_000.0),
+            ),
+            (
+                "prompt_upstream_hops",
+                Value::from(self.prompt_upstream_hops),
+            ),
+            ("token_budget", Value::from(self.token_budget)),
+        ]
+    }
+}
 
 /// Which rung of `docs/ANA-2.md:284`'s chain produced the budget, so a surprising number is
 /// traceable in one field (§5.1).
@@ -67,9 +171,338 @@ impl Budget {
     }
 }
 
+/// A rung's value when it is a usable positive integer, `None` when it is anything else.
+///
+/// One rule for every integer key, taken from the only generic-ish reader the tree already has
+/// (`connect.rs:299-302`, which "skips any non-positive or non-numeric value"): absent, `null`,
+/// a string, a bool, zero and negative all mean "this rung did not answer".
+fn positive_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(Value::as_i64).filter(|n| *n > 0)
+}
+
+/// One key out of a `project.settings` object, which may be absent or may not be an object at all.
+fn project_key<'a>(project: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    project?.get(key)
+}
+
+/// `docs/ANA-2.md:284`'s chain with plan D101's fourth rung: phase, project, `app_setting`, table.
+///
+/// The reserve is resolved independently of the budget and always from `app_setting`: ANA-5 §4.4
+/// step 2 gives it no per-phase or per-project rung, and inventing one would make two boxes
+/// disagree about how much of the same budget is spendable.
+#[must_use]
+pub fn resolve_budget(
+    phase: Option<i32>,
+    project: Option<&Value>,
+    app: &BTreeMap<String, Value>,
+) -> Budget {
+    let reserve_bp = resolve_reserve_bp(app);
+    let (tokens, source) = if let Some(tokens) = phase.filter(|n| *n > 0) {
+        (i64::from(tokens), BudgetSource::Phase)
+    } else if let Some(tokens) = positive_i64(project_key(project, "token_budget")) {
+        (tokens, BudgetSource::Project)
+    } else if let Some(tokens) = positive_i64(app.get("token_budget")) {
+        (tokens, BudgetSource::AppSetting)
+    } else {
+        (DEFAULTS.token_budget, BudgetSource::AppSettingDefault)
+    };
+    Budget {
+        tokens,
+        source,
+        reserve_bp,
+    }
+}
+
+/// `app_setting.prompt_reserve_fraction` as basis points, clamped to `0..=5_000`.
+///
+/// The one fractional key of §5.3, and the reason §9's seed is SQL rather than an extension of
+/// `SEEDED_SETTINGS`. Read as `f64` and rounded once, here, so no other code ever holds the float:
+/// a budget compared with float tolerance would make the trim — and therefore the prompt bytes — a
+/// function of rounding.
+fn resolve_reserve_bp(app: &BTreeMap<String, Value>) -> u32 {
+    let Some(fraction) = app
+        .get("prompt_reserve_fraction")
+        .and_then(Value::as_f64)
+        .filter(|f| f.is_finite())
+    else {
+        return DEFAULTS.prompt_reserve_fraction_bp;
+    };
+    let bp = (fraction * 10_000.0).round();
+    if bp <= 0.0 {
+        0
+    } else if bp >= f64::from(MAX_RESERVE_BP) {
+        MAX_RESERVE_BP
+    } else {
+        // Exact: `bp` is a rounded float in `0 .. 5_000`, so the cast cannot lose a digit.
+        bp as u32
+    }
+}
+
+/// §4.3 step 2: `project.settings.upstream_hops`, then `app_setting.prompt_upstream_hops`, then 2.
+///
+/// A resolved value outside `1..=2` is **clamped and noted**, never an error: `R-PRM-1` permits one
+/// or two hops, and a project that stored seven has a stale row rather than a broken step. The note
+/// lands in `trim_record.notes`, which is where ANA-5 §5.1 puts conditions that are not errors.
+#[must_use]
+pub fn resolve_hops(
+    project: Option<&Value>,
+    app: &BTreeMap<String, Value>,
+    notes: &mut Vec<String>,
+) -> u8 {
+    let raw = positive_i64(project_key(project, "upstream_hops"))
+        .or_else(|| positive_i64(app.get("prompt_upstream_hops")))
+        .unwrap_or_else(|| i64::from(DEFAULTS.prompt_upstream_hops));
+    let (low, high) = HOPS_RANGE;
+    let clamped = raw.clamp(i64::from(low), i64::from(high));
+    if clamped != raw {
+        notes.push(format!(
+            "upstream hops clamped from {raw} to {clamped} (ANA-5 §4.3 allows {low}..={high})"
+        ));
+    }
+    u8::try_from(clamped).unwrap_or(high)
+}
+
+/// §4.2's aggregate skills cap: `app_setting.max_skill_tokens`, then the table.
+///
+/// Resolved by the caller and carried on [`PromptSpec`](crate::prompt::PromptSpec) because
+/// exceeding it **refuses the step** ([`AssembleError::SkillsExceedCap`](crate::prompt::AssembleError))
+/// rather than dropping a binding — a silently dropped skill would break `R-ID-5`'s
+/// identical-behaviour promise.
+#[must_use]
+pub fn resolve_max_skill_tokens(app: &BTreeMap<String, Value>) -> i64 {
+    positive_i64(app.get("max_skill_tokens")).unwrap_or(DEFAULTS.max_skill_tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// Migration `0002_agent_probe.sql`, read at compile time so the assertion below needs no
+    /// database. The Postgres-side twin is
+    /// `htui-store/tests/migrations.rs::the_ten_ana5_defaults_land_with_their_values`.
+    const MIGRATION_0002: &str =
+        include_str!("../../../htui-store/migrations/0002_agent_probe.sql");
+
+    /// The `('key', 'value'::jsonb)` pairs of `0002`'s `app_setting` INSERT, in file order.
+    ///
+    /// A five-line parser rather than a regex, because `htui-core` takes no regex dependency and
+    /// the shape is fixed by the file this test exists to pin.
+    fn migration_rows() -> Vec<(String, Value)> {
+        let insert = MIGRATION_0002
+            .split_once("INSERT INTO app_setting (key, value) VALUES")
+            .expect("0002 seeds app_setting")
+            .1;
+        let insert = insert
+            .split_once("ON CONFLICT")
+            .expect("the INSERT is idempotent")
+            .0;
+        let mut rows = Vec::new();
+        for line in insert.lines() {
+            let Some(rest) = line.trim().strip_prefix('(') else {
+                continue;
+            };
+            let (key, rest) = rest
+                .trim_start_matches('\'')
+                .split_once('\'')
+                .expect("a quoted key");
+            let value = rest
+                .split_once('\'')
+                .expect("a quoted value")
+                .1
+                .split_once('\'')
+                .expect("a quoted value")
+                .0;
+            rows.push((
+                key.to_owned(),
+                serde_json::from_str(value).expect("a JSON literal"),
+            ));
+        }
+        rows
+    }
+
+    #[test]
+    fn the_defaults_are_migration_0002s_ten_rows_verbatim() {
+        // D101: `app_setting` has no cache mirror and no generic reader, so the compiled-in table
+        // is the only thing an offline box can fall back to. This is what stops the two drifting.
+        let rows = migration_rows();
+        assert_eq!(rows.len(), 10, "ANA-5 §5.3 reserves ten keys, got {rows:?}");
+        let mut expected = rows.clone();
+        expected.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        assert_eq!(
+            DEFAULTS.as_rows(),
+            expected
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.clone()))
+                .collect::<Vec<_>>(),
+            "`DEFAULTS` and migration 0002 carry the same ten keys and the same ten values"
+        );
+    }
+
+    #[test]
+    fn as_rows_is_key_byte_order() {
+        let keys: Vec<&str> = DEFAULTS.as_rows().into_iter().map(|(key, _)| key).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(keys, sorted, "byte order, never a map's iteration order");
+    }
+
+    fn app(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn chain_phase_project_app_default() {
+        let app_rows = app(&[("token_budget", json!(90_000))]);
+        let project = json!({ "token_budget": 60_000 });
+
+        let phase = resolve_budget(Some(30_000), Some(&project), &app_rows);
+        assert_eq!((phase.tokens, phase.source), (30_000, BudgetSource::Phase));
+
+        let project_rung = resolve_budget(None, Some(&project), &app_rows);
+        assert_eq!(
+            (project_rung.tokens, project_rung.source),
+            (60_000, BudgetSource::Project)
+        );
+
+        let app_rung = resolve_budget(None, None, &app_rows);
+        assert_eq!(
+            (app_rung.tokens, app_rung.source),
+            (90_000, BudgetSource::AppSetting)
+        );
+
+        let floor = resolve_budget(None, None, &BTreeMap::new());
+        assert_eq!(
+            (floor.tokens, floor.source),
+            (DEFAULTS.token_budget, BudgetSource::AppSettingDefault),
+            "the compiled-in table answers, and says so"
+        );
+    }
+
+    #[test]
+    fn a_non_positive_rung_falls_through() {
+        // The `connect.rs:299-302` rule: absent, null, non-numeric or non-positive is not a value.
+        let app_rows = app(&[("token_budget", json!(90_000))]);
+        for dud in [json!(0), json!(-1), json!("120000"), json!(null)] {
+            let project = json!({ "token_budget": dud });
+            let resolved = resolve_budget(None, Some(&project), &app_rows);
+            assert_eq!(
+                (resolved.tokens, resolved.source),
+                (90_000, BudgetSource::AppSetting),
+                "a project rung of {dud} is not a budget"
+            );
+        }
+        for dud in [json!(0), json!(-5), json!(true)] {
+            let resolved = resolve_budget(None, None, &app(&[("token_budget", dud.clone())]));
+            assert_eq!(
+                (resolved.tokens, resolved.source),
+                (DEFAULTS.token_budget, BudgetSource::AppSettingDefault),
+                "an app rung of {dud} is not a budget"
+            );
+        }
+        assert_eq!(
+            resolve_budget(Some(0), None, &app_rows).source,
+            BudgetSource::AppSetting,
+            "a phase budget of zero is not a budget either"
+        );
+    }
+
+    #[test]
+    fn reserve_is_basis_points() {
+        assert_eq!(
+            resolve_budget(None, None, &BTreeMap::new()).reserve_bp,
+            DEFAULTS.prompt_reserve_fraction_bp
+        );
+        for (value, bp) in [
+            (json!(0.10), 1_000),
+            (json!(0.0), 0),
+            (json!(0.125), 1_250),
+            (json!(0.333_33), 3_333),
+            (json!(0.9), 5_000),
+            (json!(-0.5), 0),
+        ] {
+            assert_eq!(
+                resolve_budget(
+                    None,
+                    None,
+                    &app(&[("prompt_reserve_fraction", value.clone())])
+                )
+                .reserve_bp,
+                bp,
+                "{value} is {bp} basis points, clamped to 0..=5000"
+            );
+        }
+        for dud in [json!("0.10"), json!(null)] {
+            assert_eq!(
+                resolve_budget(
+                    None,
+                    None,
+                    &app(&[("prompt_reserve_fraction", dud.clone())])
+                )
+                .reserve_bp,
+                DEFAULTS.prompt_reserve_fraction_bp,
+                "{dud} is not a fraction"
+            );
+        }
+    }
+
+    #[test]
+    fn hops_clamp_notes() {
+        let mut notes = Vec::new();
+        assert_eq!(resolve_hops(None, &BTreeMap::new(), &mut notes), 2);
+        assert!(notes.is_empty(), "the default is not a clamp");
+
+        let project = json!({ "upstream_hops": 1 });
+        assert_eq!(
+            resolve_hops(
+                Some(&project),
+                &app(&[("prompt_upstream_hops", json!(2))]),
+                &mut notes
+            ),
+            1,
+            "the project rung wins"
+        );
+        assert!(notes.is_empty());
+
+        let dense = json!({ "upstream_hops": 7 });
+        assert_eq!(resolve_hops(Some(&dense), &BTreeMap::new(), &mut notes), 2);
+        assert_eq!(
+            notes,
+            vec!["upstream hops clamped from 7 to 2 (ANA-5 §4.3 allows 1..=2)".to_owned()],
+            "§4.3 step 2: clamped and noted, never an error"
+        );
+
+        notes.clear();
+        assert_eq!(
+            resolve_hops(
+                None,
+                &app(&[("prompt_upstream_hops", json!(0))]),
+                &mut notes
+            ),
+            2,
+            "a non-positive rung falls through rather than clamping up"
+        );
+        assert!(notes.is_empty(), "falling through is not a clamp");
+    }
+
+    #[test]
+    fn max_skill_tokens_falls_through_to_the_table() {
+        assert_eq!(
+            resolve_max_skill_tokens(&BTreeMap::new()),
+            DEFAULTS.max_skill_tokens
+        );
+        assert_eq!(
+            resolve_max_skill_tokens(&app(&[("max_skill_tokens", json!(500))])),
+            500
+        );
+        assert_eq!(
+            resolve_max_skill_tokens(&app(&[("max_skill_tokens", json!(-1))])),
+            DEFAULTS.max_skill_tokens
+        );
+    }
 
     fn budget(tokens: i64, reserve_bp: u32) -> Budget {
         Budget {
@@ -104,7 +537,7 @@ mod tests {
         ] {
             assert_eq!(
                 serde_json::to_value(source).expect("a string"),
-                serde_json::Value::String(text.to_owned())
+                Value::String(text.to_owned())
             );
         }
     }
