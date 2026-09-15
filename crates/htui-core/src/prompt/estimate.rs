@@ -18,13 +18,30 @@
 pub struct TokenEstimator {
     /// The stable id. One id never carries two arithmetics.
     pub id: &'static str,
-    /// Characters per token for prose, ×10.
+    /// Characters per token for prose, ×10. `0` is read as `1` (see [`TokenEstimator::new`]).
     pub prose_cpt: u16,
-    /// Characters per token for code, ×10.
+    /// Characters per token for code, ×10. `0` is read as `1`.
     pub code_cpt: u16,
 }
 
 impl TokenEstimator {
+    /// A rate pair with both rates clamped to at least `1` (review finding L-2).
+    ///
+    /// The fields stay public because `htui-agent`'s estimator differential reads them to print the
+    /// measured ratio against the constant, so the divide-by-zero is closed where the division is —
+    /// in [`span_tokens`](Self::span_tokens) — rather than by privatising a surface outside this
+    /// crate. This constructor is the honest way to build a third pair: `PromptSpec.estimator` is a
+    /// public field and `TokenEstimator { prose_cpt: 0, .. }` would otherwise be a plausible typo
+    /// that turned every budget decision into a panic inside `assemble()`.
+    #[must_use]
+    pub const fn new(id: &'static str, prose_cpt: u16, code_cpt: u16) -> Self {
+        Self {
+            id,
+            prose_cpt: if prose_cpt == 0 { 1 } else { prose_cpt },
+            code_cpt: if code_cpt == 0 { 1 } else { code_cpt },
+        }
+    }
+
     /// `chars-v2`: 2.5 prose / 2.4 code — **measured** (plan D108) on this box against `claude`
     /// 2.1.267 (`claude-opus-5[1m]`), by summing `input_tokens + cache_creation_input_tokens +
     /// cache_read_input_tokens` on the `result` event and differencing against a minimal-prompt
@@ -131,8 +148,14 @@ impl TokenEstimator {
     }
 
     /// `ceil(chars × 10 / cpt)` for one span, in integer arithmetic.
+    ///
+    /// `.max(1)` because [`prose_cpt`](Self::prose_cpt) and [`code_cpt`](Self::code_cpt) are public
+    /// fields on a type `PromptSpec` carries as a public field: a `0` here is a typo in a caller,
+    /// and a typo must not be a panic in the middle of `assemble()` (review finding L-2). One
+    /// character per token is nonsense, but it is *loud* nonsense a budget refusal reports rather
+    /// than an arithmetic abort.
     fn span_tokens(self, chars: i64, code: bool) -> i64 {
-        let cpt = i64::from(if code { self.code_cpt } else { self.prose_cpt });
+        let cpt = i64::from(if code { self.code_cpt } else { self.prose_cpt }).max(1);
         (chars * 10 + cpt - 1) / cpt
     }
 }
@@ -171,6 +194,37 @@ mod tests {
             TokenEstimator::DEFAULT.id,
             TokenEstimator::WIDE.id,
             "one id may never carry two arithmetics"
+        );
+    }
+
+    #[test]
+    fn a_zero_rate_is_a_wrong_number_and_never_a_panic() {
+        // L-2: `PromptSpec.estimator` is a public field of a struct with public rates, so
+        // `TokenEstimator { prose_cpt: 0, .. }` is a typo a caller can write — and it used to abort
+        // `assemble()` with a divide-by-zero in the middle of the budget arithmetic.
+        let broken = TokenEstimator {
+            id: "typo",
+            prose_cpt: 0,
+            code_cpt: 0,
+        };
+        assert_eq!(
+            broken.estimate("ab\n```\ncd\n```\n"),
+            "ab\n```\ncd\n```\n".chars().count() as i64 * 10,
+            "one character per token: nonsense, but arithmetic rather than a panic"
+        );
+        // And the constructor is the honest way to say it: a zero rate clamps on the way in.
+        assert_eq!(
+            TokenEstimator::new("clamped", 0, 0),
+            TokenEstimator {
+                id: "clamped",
+                prose_cpt: 1,
+                code_cpt: 1,
+            }
+        );
+        assert_eq!(
+            TokenEstimator::new("chars-v2", 25, 24),
+            TokenEstimator::DEFAULT,
+            "a legal pair passes through untouched"
         );
     }
 
