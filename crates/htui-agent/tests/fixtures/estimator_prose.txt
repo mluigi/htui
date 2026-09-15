@@ -1,0 +1,445 @@
+# ANA-5 - Prompt assembly: template contract, section model, upstream walk, trim order, file excerpts
+
+> **Scope note:** Design authority for how `htui` turns a resolved step into the one self-contained
+> initial prompt an agent receives: the prompt template placeholder contract and its validation, the
+> ordered section model and its rendering, the upstream-summary walk within the workspace bound, the
+> token budget and the fixed trim order, deterministic file excerpt selection with no external tool,
+> the three named templates ANA-2 requires (`judge`, the review-loop forwarded set, the promotion
+> handoff prompt), and the byte-exact serialisation that makes `run_step.prompt_digest` reproducible.
+> Governed by `.claude/rules/workflow-docs.md`, `CONCEPTS.md`, `docs/REQUIREMENTS.md`,
+> `docs/ANA-9.md` (§4.3, §5.4, §5.5, §5.6, §5.8, §5.9, §5.10, §6.1, §7.3), `docs/ANA-2.md`
+> (§4.1, §4.2, §4.4, §4.5, §4.7, §4.8, §5.1) and `docs/ANA-4.md` (§4.1, §8, §9).
+>
+> **Requirements addressed:** `R-PRM-1..4`, `R-ID-5`.
+> Touched at their seams only, and settled elsewhere: `R-ID-4` and `R-ID-6` (excerpt selection reads
+> and never writes, and is deterministic code with no model in the loop), `R-SKL-1..3` (MOD-9 owns
+> the library and the editor; this document owns the resolution and the render), `R-ORCH-3` (ANA-2
+> owns the review loop; this document renders its forwarded set), `R-ORCH-7` (ANA-2 owns fan-out and
+> the judge protocol; this document owns the judge prompt and the identical-prompt guarantee),
+> `R-ORCH-5` (ANA-2 owns promotion; this document owns the handoff prompt), `R-HIS-1` (ANA-4 owns
+> the recorder; this document owns what the `prompt` row contains), `R-SEC-3` (ANA-7 owns the
+> scrubber; this document owns where it runs relative to the digest), `R-LATER-7` (ANA-3 supplies
+> providers; this document owns the seam they plug into).
+>
+> **Status (2026-09-06): concluded.** Implementation tracked as MOD-2 (prompt builder) in
+> `HANDOFF.md`, with template editing in MOD-9 and seeded templates in MOD-15. No new migration
+> file: §9 folds this document's schema-side needs into MOD-2's `0002_agent_probe.sql`.
+
+---
+
+## 1. Context and problem statement
+
+`docs/REQUIREMENTS.md` §8 fixes the contract in four sentences and hands every mechanism to this
+document. `R-PRM-1` (`docs/REQUIREMENTS.md:202-206`) enumerates seven prompt contents and one
+prohibition; `R-PRM-2` (`:207`) gives out-of-bound upstream items a one-line stub; `R-PRM-3`
+(`:208-210`) names a per-step budget and a five-entry priority order; `R-PRM-4` (`:211-212`) makes
+templates versioned Postgres rows with "a documented placeholder contract, editable in the TUI".
+`docs/ANA-9.md:544` points the database itself at this document, in a column comment:
+
+
+`docs/ANA-9.md:11-13` repeats the delegation: "ANA-2, ANA-4, **ANA-5** and ANA-7 amend this schema
+by forward-only migration where their verdicts need columns this document only reserves."
+
+`docs/ANA-4.md:1257-1260` states the seam from the other side, verbatim:
+
+> "**What ANA-5 must provide** (it gates step 1's `prompt` row): the assembled prompt text, the
+> `sections[] { name, tokens, trimmed }` array, the token budget accounting that produces
+> `run_step.trim_record`, and a stable serialization order so `prompt_digest` is reproducible for
+> the same inputs. The driver computes the digest; ANA-5 owns what is digested."
+
+`docs/ANA-2.md:1842` adds three templates and a stable serialisation to the same list, and
+`docs/ANA-2.md:385` puts the work at stage 3 of the six-stage step lifecycle:
+
+
+This document settles the eight questions the `HANDOFF.md` ANA-5 item and its two upstream ANAs
+name, in this order:
+
+1. the template placeholder contract (`R-PRM-4`): syntax, the closed set, escaping, conditionals,
+   version pinning per phase, the default body per seeded phase name, validation on save, and what
+   happens when a template names a placeholder the phase cannot supply,
+2. the section model (`R-PRM-1`): the ordered sections, their rendering, the `sections[]` array, and
+   the rule that raw transcripts of other items never appear,
+3. the upstream-summary walk (`R-PRM-1`, `R-PRM-2`): edge kinds, direction, hops, the workspace
+   bound, stubs, ordering, dedup, the summary document, and the store-trait methods,
+4. the token budget and the trim order (`R-PRM-3`): counting, budget resolution, the reading of
+   "first", per-section strategies, the `trim_record` shape and its writer, and the TUI surface,
+5. file excerpt selection without an external tool (`R-PRM-1`, `R-ID-4`, `R-ID-6`, `R-LATER-7`),
+6. the three templates ANA-2 names: `judge`, the review-loop forwarded set, the handoff prompt,
+7. the byte-exact serialisation that makes `prompt_digest` reproducible,
+8. crate and module placement for the prompt builder.
+
+Six premises that were current when the item was written are now false or stale, and each of them
+changes an answer. They are recorded here so the next reader does not re-derive them.
+
+| Stale premise | State on 2026-09-06 |
+|---|---|
+| ANA-5 needs a migration for `run_step.trim_record` | False. The column ships today: `docs/ANA-9.md:765`, `crates/htui-store/migrations/0001_init.sql:488`, mirrored at `cache_migrations/0001_mirror.sql:117`, modelled at `crates/htui-core/src/model/run.rs:156-158`. Only its JSON shape is missing. §9 therefore adds no DDL. |
+| ANA-5's migration is the next free number | Stale. ANA-4 took `0002_agent_probe.sql` (`docs/ANA-4.md:1267-1273`) and ANA-2 took `0003_orchestration.sql` (`docs/ANA-2.md:1848-1851`); neither exists on disk. MOD-2 lands `0002` before MOD-4 writes `0003`, so anything ANA-5 needs at MOD-2 time rides inside `0002`. §9 argues the three options. |
+| `app_setting.token_budget` is the last link of a working chain | False. `docs/ANA-2.md:284` terminates the chain there, but the key is absent from ANA-2 §5.4's reserved table (`:1509-1522`), from `0003`'s seed INSERT (`:1986-1999`), from ANA-9 §5.9's key list and from `SEEDED_SETTINGS`, which ships two cache keys. §5.3 reserves, defaults and seeds it. |
+| ANA-9 §7.3's SQL can express `R-PRM-2` | False. `CASE WHEN s.project_id IS NOT NULL THEN d.body END` (`docs/ANA-9.md:933`) yields NULL both for an out-of-scope item and for an in-scope item with no `summary` document, and the caller cannot tell them apart. The recursive term also dedups `(item_id, depth)` rather than `item_id`, so a diamond renders one summary twice. §4.3 amends both. |
+| The template placeholder syntax is open | Mostly. One artefact exists and it is demo data: `crates/htui-core/src/fixtures.rs:637` writes a body whose rendered text contains the literal `{{item}}`. No templating crate is in `Cargo.lock` (`minijinja`, `tera`, `handlebars`, `liquid`, `askama` all absent). §4.1 adopts the shipped shape rather than inventing a second one. |
+| A `summary` document is usually available for an upstream item | False, and this is the common case rather than the edge case. `document.kind = 'summary'` is written only by close-out, in the transaction that moves the item to `closed` (`docs/ANA-2.md:1380-1391`); `done` and `closed` are "genuinely different" (`:592-594`); none of the five seeded graphs has a `summary` phase (`crates/htui-core/src/fixtures.rs:508-544`) and §5.10 seeds no `summary` template. §4.3 gives that case its own render. |
+
+Three facts shape every answer and are stated once here rather than repeated.
+
+**The prompt is one `String` and nothing downstream re-parses it.** `AgentDriver::start` takes
+`prompt: String` (`docs/ANA-4.md:238-243`); the recorder hashes it once and writes it as
+`payload.text` of the `prompt` event at `seq = 0, turn = 0` (`docs/ANA-4.md:338-340`,
+`docs/ANA-9.md:233`). Every delimiter this document chooses is therefore for the model's benefit and
+for a human reading the Runs tab, never for a machine that must parse the prompt back. The one
+exception is the judge's `task` section, which replays a stored prompt verbatim (§4.6).
+
+**Nothing behavioural exists and almost nothing readable exists.** `ReadStore` is seven methods and
+`WriteStore` is three plus a comment naming this gap (`crates/htui-core/src/store/traits.rs:50`).
+There is no reader that returns a `PromptTemplate`, no reader that returns a `Document` body, no
+`Skill`, `SkillVersion` or `SkillBinding` Rust type anywhere in the tree, no reader for
+`repo_box_path`, and no code that walks a working tree: `htui-core` contains no `std::fs` at all,
+and every filesystem call in the workspace is either under `dirs::config_dir()/htui`
+(`htui-store/src/cache/*`, `htui-store/src/identity.rs`) or is the log file at
+`crates/htui/src/lib.rs:120`. `MemStore` holds templates behind
+`#[expect(dead_code, reason = "loaded now, read by MOD-2 / MOD-4 / MOD-15")]` and holds no skills at
+all. §8 names every method and every type MOD-2 must add.
+
+**Two of the three prompts this document defines depend on data that does not exist until after
+MOD-2 ships.** The judge's `candidates` section needs `run_step.verify_outcome`,
+`verify_exit_code` and `run_step_tree`, all of which arrive in ANA-2's `0003_orchestration.sql`
+authored by MOD-4 (`docs/ANA-2.md:1926-1948`); the review loop's `previous_diff` needs the same
+tables plus a git library that enters the workspace at MOD-4 build step 5 (`docs/ANA-2.md:1805-1807`).
+This is not a defect: §9 splits the build order so MOD-2 ships the assembler, the step prompt and the
+seam, and MOD-4 fills the two orchestration-only sections through the seam MOD-2 defines.
+
+---
+
+## 2. Invariants
+
+Restated from `CONCEPTS.md`, `docs/REQUIREMENTS.md`, `docs/ANA-2.md` and `docs/ANA-4.md`; each has a
+mechanical enforcement point in this design.
+
+1. **No raw transcript of another item ever enters a prompt.** `R-PRM-1`'s last clause. Enforced by
+   `PromptSpec` (§8) having no field that can carry a `SessionEvent`, and by the one legitimate
+   transcript-derived section, the handoff `step_summary`, being built by deterministic code from
+   the step's **own** stored events (§4.6) and rendered as a summary rather than a replay.
+2. **The prompt is a pure function of its inputs.** Same template version, same item version, same
+   resolved documents, same upstream rows, same base commit, same budget: same bytes, on any box,
+   under any scheduling. Enforced by §4.7's ordering rules, by the ban on wall-clock values and
+   absolute paths inside the digested text, and by the token estimator being a pure function.
+3. **Fan-out siblings receive byte-identical prompts.** `R-ORCH-7` says N candidates run "on the
+   same prompt", so their `prompt_digest` values must be equal. Enforced by the assembler running
+   **once per (position, attempt)** rather than once per candidate - which is what makes the rule
+   hold even for `shared_serialized`, whose siblings run one after another in one tree
+   (`docs/ANA-2.md:916`) - by excerpts being read once at stage 3 before any sibling starts, and by
+   every rendered path being repo-relative (§4.5).
+4. **Skills and the phase template are never trimmed.** `R-ID-5` requires that inlining skill text
+   makes "behavior identical on every box"; a skill that shrinks under budget pressure makes
+   behaviour a function of how much other context happened to be present. Enforced by §4.4's
+   protected set and by a step that cannot fit the protected set failing before a token is spent.
+5. **The scrubber runs before the digest, not after.** `R-HIS-1` stores the prompt "after
+   scrubbing" and `R-SEC-3` fails closed. Enforced by §4.7: every section's content passes the
+   ANA-7 scrubber during assembly, so the bytes sent, the bytes digested and the bytes persisted are
+   one string; the recorder's own scrub pass over the `prompt` payload must find nothing.
+6. **`htui` writes nothing into a managed repository while building a prompt.** `R-ID-4`. Enforced
+   by the excerpt path being read-only by type: `RepoReader` (§8) exposes `list` and `read` and no
+   write operation, and no excerpt provider is given a write surface.
+7. **No model chooses what enters a prompt.** `R-ID-6`. Enforced by the built-in excerpt ranker
+   being a fixed-weight deterministic function and by `ExcerptProvider` being documented as
+   non-LLM; a provider that calls a model is out of contract, which is what makes ANA-3's providers
+   (Serena's LSP index, Graphify's graph) the right shape and an embedding reranker the wrong one.
+8. **A missing required input fails loudly; a missing optional section renders empty.** ANA-2
+   already fixed the first half at stage 3: a missing `input_kinds` document fails the step with
+   `missing input document: <kind>` because "a phase silently running without its plan produces an
+   artefact that looks valid and is not" (`docs/ANA-2.md:413-416`). Enforced by §4.1 leaving that
+   rule untouched and by an absent optional section (no upstream links, no excerpts, attempt 1)
+   rendering as the empty string with no `sections[]` entry.
+9. **An unknown placeholder is never silently literal.** `R-PRM-4` requires a documented contract,
+   which is worthless if an unrecognised token passes through as text. Enforced by §4.1's validator
+   rejecting it at save in MOD-9's editor, and by the assembler failing the step at stage 3 with
+   `unknown prompt placeholder: {{...}}` when a row reaches it that the editor did not write.
+10. **The template version in force is the one pinned in the snapshot.** ANA-2 invariant 2 already
+    makes a mid-run template edit invisible to a live run (`docs/ANA-2.md:109-113`, `:321-323`,
+    `:1461`). Enforced by the assembler taking `TemplateRef { name, version }` from
+    `graph_snapshot.phases[].template` and never resolving `latest` at assembly time for a graph
+    run.
+
+---
+
+## 3. Surface as read
+
+Read from the working tree on 2026-09-06, HEAD `f989da5`.
+
+**`prompt_template`, eight columns** (`crates/htui-store/migrations/0001_init.sql:266-276` =
+`docs/ANA-9.md:539-549`): `id`, `project_id`, `name` ("phase name; defaults are copied into each new
+project"), `version` (`CHECK (version >= 1)`), `body` ("placeholder contract per ANA-5"),
+`created_by`, `created_at`, `updated_at`, `UNIQUE (project_id, name, version)`. There is no
+`is_builtin` column, no `kind` column, and no `CHECK` on `name`. `PromptTemplate` exists as a Rust
+type (`crates/htui-core/src/model/kind.rs:139-157`) and no store method returns one.
+
+**`step_graph_phase` carries the three fields this document resolves against**
+(`0001_init.sql:242-244`): `template_name TEXT NOT NULL` ("prompt_template.name, defaults to phase
+name"), `template_version INTEGER` ("NULL = follow latest"), `token_budget INTEGER` ("NULL =
+project.settings.token_budget"). ANA-2 §4.1 fixes the resolution chains (`docs/ANA-2.md:284-285`)
+and snapshots the results into `ResolvedPhase` (`:325-348`) with `template: TemplateRef` rendered as
+`"template": { "name": "plan", "version": 3 }` (`:1461`) and covered by the topology hash
+(`:1478-1479`).
+
+**Skills exist in SQL and nowhere else.** `skill`, `skill_version` and `skill_binding` ship
+(`0001_init.sql:406-441` = `docs/ANA-9.md:660-689`), `skill_binding` carries
+`pinned_version INTEGER` ("NULL = follow latest"), `position INTEGER NOT NULL DEFAULT 0` and
+`UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)`, and `docs/ANA-9.md:691-692` fixes
+resolution: "project-level bindings of the item's project, overridden per `skill_id` by a binding
+whose `phase_id` is the current phase (`R-SKL-2`)". A workspace grep finds no `Skill`,
+`SkillVersion` or `SkillBinding` Rust type; the only `skill` symbol is `SkillsTab`, a stub
+(`crates/htui/src/ui/tabs/skills.rs`). `MemStore::State` has no skill field.
+
+**`document` is append-only with an open kind set** (`0001_init.sql:389-400`): `kind` is "open set:
+phase output kinds plus 'summary'", `UNIQUE (item_id, kind, version)`, `produced_by_step_id`
+nullable, `created_at` only. `ReadStore::documents` returns `DocumentHead`, and its body says
+"`body` is **deliberately not** in the `SELECT` list" (`crates/htui-store/src/pg/read.rs:230-231`).
+There is no document-body reader anywhere in the workspace.
+
+**`item_link` is directed and tombstoned** (`0001_init.sql:357-368`): header comment
+"`from --kind--> to; 'blocked_by': from is blocked by to`", `PRIMARY KEY (from_item_id, to_item_id,
+kind)`, `kind IN ('blocked_by','origin','relates','supersedes')`, `deleted_at` tombstone,
+`idx_item_link_to ... WHERE deleted_at IS NULL`. The shipped `ReadStore::links(id, hops)` is
+**undirected, un-kind-filtered and unscoped** in all three backends
+(`crates/htui-store/src/pg/read.rs:163-169`, `crates/htui-core/src/store/mem.rs:344-397`,
+`crates/htui-store/src/cache/read.rs:312`), and a conformance case pins that behaviour: "the link
+traversal of §7.3: live edges only, **both directions**, across projects"
+(`crates/htui-core/src/store/conformance.rs:552`). It cannot be narrowed.
+
+**`run_step` already has both columns this document writes** (`0001_init.sql:487-488`):
+
+
+Both are mirrored (`cache_migrations/0001_mirror.sql:117`) and modelled
+(`crates/htui-core/src/model/run.rs:154-158`). `RunStepSummary` (`run.rs:184-209`) carries neither,
+so the Runs tab cannot report a trim today. `trim_record` is `None` on every fixture step;
+`prompt_digest` is `Some(PROMPT_DIGEST)` on the `plan` step (`fixtures.rs:1157`) and `None` on the
+others (`:1179-1180`, `:1213-1214`).
+
+**The `prompt` payload shape is already committed.** `crates/htui-core/src/fixtures.rs:1237-1249`
+ships `{"text", "digest", "sections":[{"name","tokens","trimmed"}]}` with two entries named `prd`
+and `skills`, mixing a document kind with a section name. `docs/ANA-9.md:229` says the payload keys
+"are the minimum; the driver may add keys, never rename these". `PROMPT_DIGEST`
+(`fixtures.rs:1223-1226`) is "a fixed literal, because a real sha256 of a fixture body would move
+whenever the body is reworded".
+
+**The budget chain's rows exist and its last link does not.** `step_graph_phase.token_budget` and
+`project.settings.token_budget` both exist, the demo project sets `"token_budget": 120_000`
+(`fixtures.rs:489`), `app_setting(key TEXT PRIMARY KEY, value JSONB)` exists
+(`0001_init.sql:557-561`), and `SEEDED_SETTINGS` is
+`[("cache_refresh_seconds", 30), ("cache_overlap_seconds", 300)]`
+(`crates/htui-store/src/pg/mod.rs:44-48`). No reader returns a `Project` with its `settings`:
+`PgStore::projects` returns `ProjectRef`, which has no settings field
+(`crates/htui-core/src/model/hierarchy.rs:111-122`).
+
+**Nothing supports excerpt selection.** `item.touched_paths TEXT[]` exists (`0001_init.sql:323`) and
+every demo item writes `Vec::new()` (`fixtures.rs:924`), so ANA-2 §4.7's "backward compatible with
+every existing value" is vacuous rather than wrong. `repo_box_path` has zero readers and zero
+writers: a workspace grep for `repo_box_path|RepoBoxPath|local_path` returns the type definition,
+its re-export, the demo loader's "no such field" note and a table-existence test. Neither
+`repo_box_path` nor `workspace_box_path` is mirrored. `globset`, `ignore`, `walkdir`, `git2`, `gix`,
+`tree-sitter`, `tiktoken-rs` and every templating crate are absent from `Cargo.lock`;
+`similar 2.7.0` and `regex 1.13.1` are present transitively only. ANA-2 §8 refuses a glob crate:
+"No glob crate: §4.7's prefix rule is deliberately matcher-free" (`docs/ANA-2.md:1783`).
+Two crates a later revision might want **are** already in the lock transitively and would cost a new
+*direct* edge rather than a new build-graph node: `unicode-normalization 0.1.25` (§4.7's deferred NFC
+rule) and `insta 1.48` (§8's golden prompts).
+
+**`serde_json 1.0.151` is built without `preserve_order`**, so `serde_json::Map` is a `BTreeMap` and
+object keys serialise in sorted order. That is free determinism for `trim_record` and for the
+`prompt` payload, and §4.7 relies on it.
+
+**Workspace shape.** `Cargo.toml:3` `resolver = "3"`, `:7` `rust-version = "1.85"` (ANA-4 moves it
+to 1.88 inside MOD-2), `rust-toolchain.toml` pins 1.98.1, `unsafe_code = "forbid"`,
+`clippy::pedantic` deliberately off. `sha2 0.10` is already a workspace dependency. `insta 1.48` is
+a dev-dependency of `crates/htui` only; `htui-core`'s only dev-dependency is `tokio`.
+
+---
+## 4. Settled questions
+
+### 4.1 Template placeholder contract (`R-PRM-4`, `R-ID-5`)
+
+**The constraint.** `R-PRM-4` (`docs/REQUIREMENTS.md:211-212`), verbatim:
+
+> "Prompt templates per phase are versioned rows in Postgres with a documented placeholder
+> contract, editable in the TUI."
+
+`R-ID-5` (`:36-38`) constrains what a template may leave out:
+
+> "Agents run with their own system skills disabled. `htui` owns every prompt and every skill text
+> and inlines them into the initial prompt, so behavior is identical on every box and agents never
+> spend turns reading instruction files."
+
+**Options for the syntax and the engine.**
+
+| Option | Verdict | Reason |
+|---|---|---|
+| `minijinja` with `UndefinedBehavior::SemiStrict` | Rejected | Technically the best runtime engine surveyed: four undefined tiers, `add_template_owned` for a body loaded out of Postgres, `AutoEscape::None` by default for extension-less names, fuel and recursion caps, one required dependency (https://docs.rs/minijinja/latest/minijinja/enum.UndefinedBehavior.html). It loses on placement, not on quality. The validator must live where MOD-9 can call it, MOD-9 is not blocked on this document (`HANDOFF.md:79-82`), and MOD-9's editor lives in `crates/htui`, which depends on `htui-core` and `htui-store` and on neither `htui-agent` nor `htui-orch` (`crates/htui/Cargo.toml`). `htui-core` is therefore the only crate both MOD-2 and MOD-9 can reach without a new edge, and putting a template engine behind it is exactly the dependency-weight test ANA-4 §8 applied to the JSON-RPC SDK (`docs/ANA-4.md:1156-1161`). Its strict mode also does not name the offending variable (https://github.com/mitsuhiko/minijinja/issues/871), so `htui` would own the naming pass anyway. |
+| `tera` | Rejected | Strict-only with no lenient tier and no way to test an unsupplied name in `{% if %}` (https://github.com/Keats/tera/issues/120); slower on both compile and render; a divergent Jinja dialect. |
+| `handlebars-rust` | Rejected | Escapes `&"<>'`=_` by default (https://docs.rs/handlebars/latest/handlebars/), which mangles every markdown fence and every snake_case identifier in a prompt. `register_escape_fn(no_escape)` fixes it, but it is opt-out: forgetting it corrupts every prompt silently and the corruption still digests cleanly. |
+| `liquid` | Rejected | An allow-list parser by construction, which is attractive, but no undefined-variable contract is documented on the Rust side (`strict_variables` is a Ruby gem option). `R-PRM-4` demands a documented contract, so an undocumented one is disqualifying. |
+| `askama` / `rinja` | Rejected | Compile-time only. Template bodies are Postgres rows edited at runtime, so this is structurally impossible. |
+| A general mustache/Jinja-shaped hand parser with `{% if %}` and `{% for %}` | Rejected | Loops and conditionals in a user-editable body mean the section layout, and therefore the trim accounting and the digest, are decided by data the trimmer must reason about. It also invites the Roo Code failure: its `.roo/system-prompt-*` full override was documented under the name "Footgun Prompting" and then removed, because "This feature bypassed safeguards" (https://github.com/RooCodeInc/Roo-Code/pull/11387). |
+| **`{{name}}` substitution over a closed, typed, per-role placeholder set, hand-scanned in `htui-core`; every section pre-rendered in Rust; no conditionals and no loops** | **Adopted** | It is the shipped shape: `crates/htui-core/src/fixtures.rs:637` already seeds `{{item}}` into all eight templates of all three demo projects (`TEMPLATE_NAMES`, `PROJECT_SPECS`), so any other syntax makes the seeded fixture bodies invalid on the day the validator lands. No snapshot renders a template body today - `MemStore::State.templates` is `#[expect(dead_code)]` - so the cost is the fixture alone, which is exactly why it is cheap to keep rather than to change. It adds zero dependencies, so it can live in `htui-core` where MOD-9 reaches it. Conditionality is not lost: it is moved into Rust, where a section whose data is absent renders the empty string. That is the same shape Cline ships in production, a skeleton of `{{TOOL_USE_SECTION}}`-style markers with per-model component overrides (https://github.com/cline/cline/tree/main/src/core/prompts/system-prompt), and the same shape Claude Code's `$ARGUMENTS` uses with a fully documented degenerate case (https://code.claude.com/docs/en/skills). |
+
+**Options for the unknown-placeholder policy.**
+
+| Option | Verdict | Reason |
+|---|---|---|
+| Unknown token passes through as literal text | Rejected | It makes the "documented contract" unenforceable and ships a prompt containing `{{itme}}` to a model. |
+| Unknown token renders empty | Rejected | Silent omission is exactly what ANA-2 refused for a missing input document: "a phase silently running without its plan produces an artefact that looks valid and is not" (`docs/ANA-2.md:415-416`). |
+| **Rejected at save with the token and its byte offset; a hard step failure at stage 3 if a row reaches the assembler anyway** | **Adopted** | Two gates, because there are two ways a body arrives: MOD-9's editor, and a row written by a future `htui` or by hand. The stage-3 failure mirrors ANA-2's missing-input rule verbatim in shape, so the two failure modes read the same in the Runs tab. |
+
+**Verdict: `{{name}}`, a closed per-role set, pre-rendered sections, no control flow.**
+
+*Syntax.* The scanner walks the body left to right over `char_indices`:
+
+- `{{{{` emits a literal `{{` and advances four bytes. This is the only escape.
+- `{{` followed by `[a-z][a-z0-9_]*` followed by `}}` is a placeholder.
+- `{{` in any other position is a **validation error**, not literal text.
+- `}}` outside a placeholder is literal text.
+- Placeholder names are lowercase ASCII with underscores. There is no whitespace tolerance inside
+  the braces: `{{ item }}` is an error, so one body has exactly one spelling and the digest cannot
+  drift on whitespace inside a marker.
+
+*The closed placeholder set.* Three roles, three sets. A `phase` template may use the phase set; a
+`judge` template the judge set; a `handoff` template the handoff set. `TemplateRole` is derived from
+the row's `name`: `judge` and `handoff` are reserved names (§4.6), everything else is a phase
+template.
+
+Phase set, in the order §4.2 renders them:
+
+| Placeholder | Type | Source | Renders empty when |
+|---|---|---|---|
+| `{{item_key}}` | scalar | `project.slug` + `:` + `item.key` | never |
+| `{{item_title}}` | scalar | `item.title`, newlines collapsed to spaces | never |
+| `{{item_kind}}` | scalar | `item_kind.name` of the item's kind | never |
+| `{{phase}}` | scalar | `ResolvedPhase.name` | never |
+| `{{output_kind}}` | scalar | `ResolvedPhase.output_kind` | the phase declares none |
+| `{{attempt}}` | scalar | `run_step.attempt`, 1-based per `docs/ANA-2.md:1939-1941` | never |
+| `{{item}}` | section | `item.body` | never; an empty body still emits the section with an empty content block, because "this item has no body" is information |
+| `{{documents}}` | section | the `input_kinds` resolution of `docs/ANA-2.md:395-406`, one block per kind in `input_kinds` order | `input_kinds` is empty |
+| `{{upstream}}` | section | §4.3's walk | the walk returns no rows |
+| `{{box}}` | section | §4.2's box profile projection | never |
+| `{{skills}}` | section | `R-SKL-2` resolution, ordered by `skill_binding.position` | no binding resolves |
+| `{{excerpts}}` | section | §4.5 | no excerpt survives selection or the budget |
+| `{{verify_failure}}` | section | the previous attempt's `verify_exit_code` and stored `command_run.output` (`docs/ANA-2.md:730`) | `attempt == 1`, or the previous attempt had no verification output |
+| `{{previous_diff}}` | section | the previous attempt's `before_hash..after_hash` (`docs/ANA-2.md:731`) | `attempt == 1`, or the previous attempt produced no commit |
+| `{{command_queue}}` | section | the `R-MCP-4` note telling the agent to route heavy commands through `command_run` | the resolved `command_queue` is `off`, or is `fan_out_only` and neither `fan_out > 1` nor the item's `heavy_build` tag applies (`docs/ANA-2.md:496-500`) |
+
+Judge set: `{{item_key}}`, `{{phase}}`, `{{task}}`, `{{candidates}}`.
+Handoff set: `{{item_key}}`, `{{phase}}`, `{{attempt}}`, `{{step_summary}}`, `{{documents}}`,
+`{{diff_so_far}}`, `{{failure_reason}}`.
+
+*Why no conditionals.* Three cases genuinely need conditionality and all three are handled by the
+empty-section rule rather than by syntax: a position-0 phase has `input_kinds = []`
+(`crates/htui-core/src/fixtures.rs:611-614`), a root item has no upstream links, and `command_run`
+exposure is conditional per `R-MCP-4`. In each case the placeholder resolves to the empty string,
+the surrounding blank lines collapse (§4.7), and no `sections[]` entry is emitted. Headings live in
+the renderer, not in the template, precisely so an absent section takes its heading with it.
+
+*Type sketch.* Design notation, not code.
+
+
+*Validation on save (MOD-9).* `parse(role, body)` runs on every save, before the row is written.
+Four checks, in order: syntax, closed-set membership, role membership, and required placeholders.
+A `judge` body must contain `{{candidates}}`; a `handoff` body must contain `{{step_summary}}` and
+`{{failure_reason}}`; a phase body has no required placeholder, because a phase whose prompt is pure
+instruction is legitimate. The editor also **warns**, without refusing, when a phase body omits
+`{{item}}`, because that is almost always a mistake and never illegal. Duplicate placeholders are
+legal and each occurrence substitutes; §4.4 counts a duplicated section's tokens once per occurrence
+and §4.7's ordering is source order, so nothing about duplication is undefined.
+
+*Version pinning per phase.* Unchanged from ANA-2 §4.1 and restated so MOD-2 does not re-derive it:
+`template_name` defaults to the phase name, `template_version` is the phase's pin and NULL means the
+latest version in the project, and both are resolved **at snapshot time** into
+`graph_snapshot.phases[].template` (`docs/ANA-2.md:285`, `:321-323`, `:1461`). The assembler for a
+graph run takes `TemplateRef` off the snapshot and never resolves `latest`. This document adds the
+rule for the two name-keyed templates, which have no phase to hang a pin on: `judge` pins alongside
+the judged phase in the same snapshot entry as `judge_template: TemplateRef`, resolved by the same
+chain at snapshot time; `handoff` resolves to the latest version **at promotion time**, because a
+handoff is a human action taken after the run started and the maintainer expects the edit they just
+made to take effect. That asymmetry is deliberate and is recorded in `trim_record.template`.
+
+*Free-standing chat prompts.* `R-STO-4` starts no graph run offline, and `prompt_template`,
+`skill*` and `step_graph*` are not mirrored (`docs/ANA-9.md:309-311`), so a graph step never needs a
+template offline. The one exception is MOD-2's free-standing chat, whose prompt is the user's typed
+text with no template, no sections, no trim record and no digest obligation beyond ANA-4's own. It
+is out of this document's scope and is named here so the gap is not read as an oversight.
+
+*What happens when a template names a placeholder the phase cannot supply.* Three distinct cases,
+deliberately given three different answers:
+
+| Case | Answer |
+|---|---|
+| A section placeholder whose data is legitimately absent (`{{documents}}` on a position-0 phase, `{{upstream}}` on a root item, `{{previous_diff}}` on attempt 1) | Renders the empty string. No section, no `sections[]` entry, no error. This is the normal path and is why no conditional syntax is needed. |
+| A **required input document** named in `input_kinds` that does not resolve | Unchanged from ANA-2: the step fails at stage 3, before a token is spent, with `run.failure = "missing input document: <kind>"`, the run parks and the item goes to `blocked` (`docs/ANA-2.md:413-416`). This is not a template question and this document does not touch it. |
+| A placeholder outside the closed set, or outside the role's set, in a body the assembler is asked to render | Hard failure at stage 3, symmetrically: `run.failure = "unknown prompt placeholder: {{foo}}"`, step `failed`, item `blocked`. It is reachable only when a row bypassed MOD-9's validator, which is a bug, and a bug that silently produces a degraded prompt is worse than one that stops. |
+
+---
+
+### 4.2 Section model of the assembled prompt (`R-PRM-1`, `R-ID-5`)
+
+**The constraint.** `R-PRM-1` (`docs/REQUIREMENTS.md:202-206`), verbatim:
+
+> "Each step receives one self-contained initial prompt built by `htui`: phase template, item body,
+> input documents from prior steps, summaries of upstream items reached by `blocked_by` and
+> `origin` edges within one to two hops and inside the active workspace (or current project when no
+> workspace), box profile, bound skill text, and any `htui`-selected file excerpts. Never raw
+> transcripts of other items."
+
+**Options for the render order.**
+
+| Option | Verdict | Reason |
+|---|---|---|
+| Bulk first, instruction last, ignoring `R-PRM-1`'s order | Rejected as a whole-prompt rule | The guidance is real and quantified: "Place your long documents and inputs near the top of your prompt, above your query, instructions, and examples", and "Queries at the end can improve response quality by up to 30 percent in tests" (https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices). But `docs/REQUIREMENTS.md` is the contract and its list is an order. Overriding it wholesale is a requirement change. |
+| `R-PRM-1`'s literal order, template first, with the instruction inside the template at the top | Rejected | It obeys the requirement and throws away the measured gain for nothing. |
+| **`R-PRM-1`'s literal order for the sections, with the template as the frame rather than a leading section, so the default bodies of §5.4 open with one line of role and close with the instruction block** | **Adopted** | The template is not a section that sits before the others; it is the document the others are substituted into, so `R-PRM-1`'s ordering of *sections* is preserved exactly while the instruction lands last, where the evidence wants it. It also gives the byte-stable prefix prompt caching rewards: the frame's opening line, the skills and the box profile are the sections that change least, and "The cache key is derived from the exact bytes of the rendered prompt" (https://github.com/anthropics/skills/blob/main/skills/claude-api/shared/prompt-caching.md). |
+
+**Options for the section delimiter.**
+
+| Option | Verdict | Reason |
+|---|---|---|
+| Markdown headings (`## Item body`) | Rejected | Item bodies, documents and excerpts all contain markdown headings, so the boundary is not distinguishable from content. |
+| Triple-backtick fences as the section boundary | Rejected | Excerpts and diffs contain fences. |
+| DSPy-style `[[ ## name ## ]]` field markers | Rejected as the section boundary, adopted as the reasoning | The rationale is the right one: "chosen for low collision and clean regex. The brackets-plus-hashes shape is unlikely to appear in real text or code" (https://dspy.ai/diving-deeper/adapters/). But it has no closing form, so a section's end is implicit. |
+| **`<section name="...">` ... `</section>`, one uniform tag, name and metadata as attributes** | **Adopted** | Anthropic's own guidance is explicit: "When using multiple documents, wrap each document in `<document>` tags with `<document_content>` and `<source>` (and other metadata) subtags for clarity" and "XML tags help Claude parse complex prompts unambiguously". One tag name keeps the rendered text uniform, the closing tag makes every boundary explicit, and `htui` never parses the prompt back so a body containing a literal `<section>` line is inert. |
+
+**Verdict: ten named step-prompt sections plus five role-specific ones, one wrapper, one closed name
+vocabulary.**
+
+*The ordered section table.* The table lists the sections in `R-PRM-1`'s canonical order, which is
+the order §5.4's default bodies place their placeholders in, except that the two review-loop sections
+sit where the `implement` and `fix` bodies put them. The *rendered* order of any one prompt is the
+order the placeholders appear in that template body (§4.7 rule 1), because the template is the frame;
+`sections[]` follows the same order. Trim rank 0 means protected: the section never loses a token.
+Ranks count upward in the order sections are trimmed, so rank 1 is trimmed first (§4.4 argues the
+direction).
+
+| Section name | Source | Rendering | Trim strategy | Trim rank |
+|---|---|---|---|---|
+| `template` | the literal spans of the parsed body | inline; no wrapper. It is the frame. | none | 0 (protected) |
+| `item` | `item.body` | `<section name="item" key="htui:MOD-2" title="...">` then the body verbatim | head+tail | 4 |
+| `documents:<kind>` | one per resolved `input_kinds` entry, in `input_kinds` order | `<section name="documents:plan" kind="plan" version="3">` then the body verbatim | drop whole documents, oldest kind position last, then head+tail the survivors | 3 |
+| `upstream` | §4.3 | `<section name="upstream">` then one block or one stub line per item | the depth ladder of §4.3 | 2 |
+| `box` | `box` row plus `box_tool` rows | `<section name="box">` then the fixed field list below | none | 0 (protected) |
+| `skills` | `R-SKL-2` resolution | `<section name="skills">` then one `<skill name=".." version="N">` block per binding | none; an aggregate cap refuses the step instead | 0 (protected) |
+| `excerpts` | §4.5 | `<section name="excerpts">` then one `<file>` block per excerpt | budget-derived, not trimmed: drop whole files lowest rank first | 1 |
+| `verify_failure` | previous attempt's verification output | `<section name="verify_failure" exit_code="1">` then a fence | tail-cut, keeping the tail | 3 |
+| `previous_diff` | previous attempt's `before_hash..after_hash` | `<section name="previous_diff" range="abc1234..def5678">` then a diff stat, then a fenced unified diff | full diff, then diff stat only, then dropped | 2 |
+| `command_queue` | `R-MCP-4` exposure | `<section name="command_queue">` then two sentences | none | 0 (protected) |
+| `judge_task` | the judged step's stored `prompt` text | `<section name="judge_task">` then the text verbatim | head+tail | 2 (judge prompt only) |
+| `judge_candidate:<i>` | one per surviving candidate | `<section name="judge_candidate:0" fanout_index="0" verify="pass" exit_code="0">` then document body, diff stat, diff, verification tail | per-candidate isolate cap, then diff-stat-only | 1 (judge prompt only) |
+| `step_summary` | the step's own stored events, deterministically summarised | `<section name="step_summary" turns="3">` | head+tail | 2 (handoff only) |
+| `diff_so_far` | this step's `before_hash..HEAD` | as `previous_diff` | full, then stat, then dropped | 1 (handoff only) |
+| `failure_reason` | `run.failure` or the gate note | `<section name="failure_reason">` one paragraph | none | 0 (handoff only) |
+
+*Content rendering rules, uniform across sections.*
+
+1. The opening tag is on its own line; the closing tag is on its own line; there is exactly one LF
+   between the opening tag and the first content byte and exactly one between the last content byte
+   and the closing tag.
+2. Content that is prose or markdown is emitted verbatim, with no re-indentation, no trailing
+   whitespace stripping and no reflow. Modifying content bytes would change meaning in
+   whitespace-sensitive languages and would make the digest a function of a cosmetic rule.
+3. Content that is code, a diff or command output is wrapped in a fence whose length is one more
+   backtick than the longest backtick run in the content,
