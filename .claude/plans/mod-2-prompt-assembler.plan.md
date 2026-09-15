@@ -296,6 +296,181 @@ compiles, not a file nobody else opens. Both commits are green together — `fmt
 
 ---
 
+## Implementation findings — T65 to T70 and the review gate (2026-09-11..15)
+
+Recorded at T70. The numbering runs F-16..F-122 across ten task agents, three reviewers and five fix
+agents; `git log a601931..HEAD` carries the detail for each commit named below.
+
+**A numbering collision, resolved here.** Two different findings were issued as **F-50**. The one
+**pinned in the tree** keeps the number: "the plan's `Validate` command names
+`--features demo,test-support`, and `htui` declares exactly one feature, `testkit`" — cited at
+`crates/htui/tests/prompt_preview.rs:5` beside blueprint E-1. The other — "an unreadable
+subdirectory must not cost a repo its excerpts" (`f3b96d6`) — is **renumbered F-122**. Renumbering
+the tree-pinned one would mean editing source to fix bookkeeping, which is the wrong direction.
+
+**Two ANA-amendment questions stay open for the maintainer** and must not be read as resolved:
+**F-34** (below) and **L-5** — `render.rs` renders `hostname:`, a machine identifier, into digested
+bytes. L-5 is *sanctioned* by ANA-5 §4.2's closed field list, but it makes identical inputs digest
+differently on another box, which is a weaker guarantee than §4.7 reads as promising.
+
+### Trim, record and estimator
+
+**F-34 — ANA-5 §4.4 step 7 and §5.1's worked example disagree, and the example is arithmetically
+impossible. MAINTAINER DECISION STILL OPEN.** Step 7 says a section reaching its floor without
+clearing the deficit moves to the drop and the pass advances only after it; §5.1's example keeps
+`upstream` at 1300 and `previous_diff` at 1180 while `documents:plan` pays the residual, which its
+own arithmetic cannot produce under step 7. **Step 7 is what the code implements**, per blueprint
+D.2, because it is what the keep-priority means; the rungs a section passed through are still
+recorded, and three tests clear the deficit inside one ladder to prove the intermediate states
+(`254fe92`). Which of the two the ANA meant is still the maintainer's to say.
+
+**F-35 — `serde_json/preserve_order` is feature-unified *in* from `agent-client-protocol`, so key
+order differs between a per-crate and a workspace build.** The plan's verified claim "`serde_json::Map`
+is a `BTreeMap` here, so object keys serialise sorted — no `preserve_order` feature anywhere" is
+false under `--workspace`: Cargo unifies features, so one unchanged `#[derive(Serialize)]` emits
+sorted keys under `-p htui-core` and *field declaration order* under `--workspace`. H-19's
+`to_value_keys_are_sorted` passed per-crate and failed on the workspace suite — F-28's lesson
+arriving a third time. What §5.1 needs survives: the serialisation is deterministic under either map
+type, `prompt_digest` is over the prompt text and never over this record, and the column is `JSONB`,
+which reorders keys on the way in. The test now asserts **byte stability** and §5.1's twelve keys
+rather than their order (`03e5008`).
+
+**F-37 — the separator between the N blocks of `{{documents}}` and `{{candidates}}` is undecided in
+the ANA. MAINTAINER DECISION STILL OPEN.** A **blank line** was chosen so the milestone could render
+something. It is a digest input, so changing it later invalidates every golden snapshot — which is
+the same argument D111 used to settle `COMMAND_QUEUE_TEXT` before T64 accepted one.
+
+**F-38 — `{{item_title}}` uses `one_line_title`, not attribute escaping.** The placeholder collapses
+the title to one line rather than escaping it as an XML attribute value; the escape and the 120-byte
+cut are a separate pass, and after the review gate's C-1 fix they operate on already-masked bytes
+(`f48b82b`).
+
+**F-61 — a prefix is not a sample, and the corpus was rejected before the constants were.** The
+first live estimator run gave 2.501 chars/token over the full 40 000-character slice of ANA-5 against
+2.393 over its first 20 000 — 4.4% apart, over the 2% limit — and the baseline was fine. The first
+20 000 characters of ANA-5 are simply denser (771 digits and 625 backticks against 247 and 472: the
+header and the requirement tables). The check then had two causes and one message. The prose corpus
+is now 20 000 characters written **twice**, the unit being 20 blocks of 1 000 characters spread
+evenly across the whole fence-stripped document, so the halves are the same text by construction and
+a disagreement can only be arithmetic (`a952989`).
+
+**F-90 — a `trimmed` of `[true]` reads as `true` under lax jsonpath.** Found while measuring the
+reviewer's two Postgres projection findings; folded into the same fix (`65c65d7`).
+
+**F-100 — the provider weight ceiling belongs to the pure crate.** `ExcerptCandidate.weight` is
+documented `0..=100` and only `htui-agent`'s `run_providers` enforced it, so a candidate built any
+other way could carry `u16::MAX` and outrank every tier-1 file. `MAX_PROVIDER_WEIGHT` is now
+`htui-core`'s and `vetted()` clamps on entry (`d0d627e`).
+
+**F-101 — the reader's `max_file_bytes` and the pass's are one number now.** Two independent
+enforcements are deliberate; nothing tied the two *values*. A reader whose limit sat below
+`caps.max_file_bytes` bound first and invisibly — the walk never listed the file — while
+`audit.caps` went on recording a cap that had stopped nothing. `FsRepoReader::new` now takes an
+`ExcerptCaps`, and `select` records the minimum of the two and names both when they differ
+(`8f1b19a`).
+
+### Store, SQL and the projections
+
+**F-52 — the two D106 SQL projections must be total, like `prompt_summary`.** `trim_record` is an
+untyped JSON column and T62's casts raised on four shapes it can legally hold. A raising projection
+is worse than a wrong one: it fails the whole `runs()` read over one bad row (`0f0c31a`).
+
+**F-39 — the excerpt record hashes the *rendered* block.** §4.5 defines `FileRecord.sha256` over the
+excerpt's rendered bytes, and those are the bytes **after** the scrub; `render::file_block` had been
+private, so the recorded hash was whatever the ranker had put there (`3633cbf`, `ed7079e`).
+
+**F-122 (was F-50) — an unreadable subdirectory loses its subtree, not the repo.** The walk
+propagated a nested `read_dir` failure out of `list`, so one directory this box cannot open would
+have cost a whole repo its excerpts — a permission bit silently changing a prompt. §4.5 step 1's
+fail-open applies below the root as well as at it (`f3b96d6`).
+
+### Gates, tooling and the tree
+
+**F-36 — `prompt_golden.rs` was missing.** T64's plan entry names it and T64 shipped only the
+per-section goldens, so criterion 4 was proved at section level and nowhere else. Four whole-prompt
+goldens landed in T67, with the structural assertions ahead of every snapshot so a re-accepted
+`.snap` cannot absorb a regression in them (`133f6cd`).
+
+**F-50 — the plan's `Validate` commands name features `htui` does not have.** `--features
+demo,test-support` names two; `htui` declares exactly one, `testkit`. Pinned at
+`crates/htui/tests/prompt_preview.rs:5` (blueprint E-1).
+
+**F-60 — `clippy -p htui-agent` had been red since `e65820b`.** The two TOOL-6 race-fix wait loops
+nest an `if` inside an `if let`, which `collapsible_if` denies on the pinned 1.98.1 toolchain; edition
+2024 let-chains say it in one condition (`0fd62e5`). Fixed separately from T69 on purpose — someone
+else's gate to reopen, revertable on its own.
+
+**F-72 and F-120 — the last two of F-33's fifteen `cargo doc --workspace --no-deps` errors.** A
+module's own documentation is public, so an intra-doc link from it to a private item is the one
+`rustdoc` rejects. `cargo doc --workspace --no-deps` is **green for the first time since F-33**
+(`3e34610`, `32e516d`, and `0712cee`/`4552069` for the same shape earlier).
+
+**F-71 — the sixth detail sub-tab overflows the strip by two columns at the pinned 100×30.**
+` Body ` + ` Runs ` + ` Graph ` + ` Documents ` + ` Notes ` + ` Prompt ` is 45 columns against a
+43-column inner pane, so `Prompt` renders clipped and all 21 re-accepted snapshots carry the clip.
+Two candidate fixes, both cross-cutting — single-space separators in `render_strip` (→ 40 columns) or
+`DETAIL_PERCENT` 45 → 47 — so it is the maintainer's choice. **Minted as MOD-30**, which states both.
+
+**F-121 — a running prompt preview makes an adapter install refuse, with a message about a probe.**
+`AgentRuntime::serve` pushes the deferred preview into `self.background` (`agent_worker.rs:824`) and
+the install guard refuses on `!self.background.is_empty()` (`:1116`). `background` mixes tasks that
+**write** `agent_box` with tasks that only **read**; it should be split by what a task writes.
+**Minted as MOD-31.**
+
+**F-80 — `trim_record`'s own strings are persisted unscrubbed.** The scrub covers every digested
+byte; the record's notes and audit paths are generated strings written to `run_step.trim_record`
+beside them. Small by construction, but `R-SEC-3` gates the persist path rather than the prompt path.
+**Deferred and minted as MOD-32** rather than left as a note.
+
+**F-81 — `rendered` is stale after the upstream ladder's `break`.** Adjacent to the L-1 fix
+(`bb1cfb7`), which moved the `stubbed`/`dropped` counters and the `stub_ladder` mark *in front of*
+the render so the drop that empties the section is counted. Left as a sentence rather than an item:
+it is internal to one function and the counters it feeds are now assigned before the render is asked
+for.
+
+**F-83 — `render::template_text` is no longer on the assembler's path.** Step 7 became its own walk
+inside `substitute` (`fd9e752`), so nothing in `assemble()` calls it. Kept, not deleted: it is for
+**MOD-9's** editor, which has a `ParsedTemplate` and no scrubber, and its doc now says so. Noted on
+MOD-9's `HANDOFF.md` line; no item minted.
+
+**F-102 — the excerpt walk's root-level symlink gap.** `FsRepoReader` refuses a symlink at any
+component *below* the root; a `RepoRoot` whose own path is a link is resolved by whoever writes
+`repo_box_path`, which is **MOD-7** and does not exist yet. Noted on MOD-7's line; no item minted.
+
+**F-104 — `scan_cap` can veto a legitimate provider candidate.** `vetted()` refuses any candidate the
+listing never offered, and a listing truncated by `scan_cap` is only a prefix. The conservative
+direction, and the price of not leaning on `htui-agent` for a security property. Loosening it is
+**MOD-4's** call; noted on its line, no item minted.
+
+**Not individually recoverable at close-out.** Several numbers in the F-40..F-49, F-51, F-53, F-54,
+F-70, F-73..F-75, F-82 and F-103 ranges were issued inside task-agent reports and never reached a
+commit message, a source comment or this plan. They are recorded as *spent* so the numbering stays
+monotone and nothing is minted over them; their substance, where it changed code, is in the commits
+in `git log a601931..HEAD` regardless of which number carried it. Say this plainly rather than
+inventing content for a number: a findings ledger that guesses is worse than one with a gap.
+
+### Review gate — 1 CRITICAL, 7 HIGH, 11 MEDIUM, all applied
+
+**CRITICAL — the trim rungs re-rendered from unscrubbed inputs, undoing D100** (`f48b82b`). D100 put
+the scrub between the render and the estimate; every trim rung then re-rendered from `PromptSpec`, so
+a masked byte came back at step 6 while `surviving_audit` went on hashing a masked block the prompt
+no longer carried. Proven, not suspected. Fixed at the **input layer**: `scrubbed_inputs` masks every
+digested string once, before the first render, so a rung added later inherits the property.
+
+The seven HIGH: raw template literals reaching digested bytes unscrubbed; `edit_proposal.path`
+absolute in digested bytes (`da65e6a`); the Pg `prompt_tokens` projection raising on an integral
+float (`98090a7`); Pg `trimmed` diverging under lax-jsonpath auto-wrap (`65c65d7`); the upstream walk
+returning the root on a `blocked_by` cycle (`459f080`); and the two halves of one filesystem hole —
+`FsRepoReader::read` following symlinks with no size cap (`4b24420`, `4ea2f8b`) while `select` never
+intersected provider candidates with the listing (`ab67ee1`).
+
+The eleven MEDIUM, by commit: `f3f474f`, `1633be9` (M1, M2 on T68); `98090a7`-adjacent shape work;
+`e01a569` (M-1), `f48b82b` (M-2), `e54616b` (M-3), `d4b7bb4` (M2), `6f98318` (M1), `3fe5c79` (M3),
+`158836b` (M4), `1a34fff` (M5). The LOW set is `bb1cfb7`, `cacdad7`, `c854af5`, `142494a`, `63f411e`,
+`331eeb6`, `b9c95ec`, `fd9e752`, `84e5e04`, `273c5d8`.
+
+---
+
 ## Patterns to Mirror
 
 | Category | Source | Pattern |
@@ -688,29 +863,44 @@ working tree, or a documented migration/test assertion.
 
 ## Acceptance
 
-- [ ] All tasks complete — T59, T60, T61, T62, T63, T64, T65, T66, T67, T68, T69, T70
-- [ ] ANA-5 §12 criteria **1–20** pass, each with a named test in the sweep table
-- [ ] ANA-5 §12 criterion **21**: all five items closed by decision and evidence — D95 (`PromptScope`),
+- [x] All tasks complete — T59, T60, T61, T62, T63, T64, T65, T66, T67, T68, T69, T70
+- [x] ANA-5 §12 criteria **1–20** pass, each with a named test in the sweep table
+      (`docs/decisions/mod/mod-2.md`). Every name was resolved against
+      `cargo test --workspace --all-features -- --list` at close-out. Criterion **20** is the one row
+      that is a command rather than a test name, and is written as such rather than given a
+      plausible-looking one
+- [x] ANA-5 §12 criterion **21**: all five items closed by decision and evidence — D95 (`PromptScope`),
       D96 (`READ_CASES`, not a relaxed bound), D97 (`set_step_usage` keeps its parameter, with the
-      reason), D98 (one excerpt rendering for both families), D99 (the constants measured, not
-      assumed)
-- [ ] `assemble()` is pure: same `PromptSpec`, same bytes, and the fan-out assertion greps the text
+      reason), D98 (one excerpt rendering for both families), D99 → **D108** (the constants measured,
+      not assumed, and changed because the measurement fired D99's own rule)
+- [x] `assemble()` is pure: same `PromptSpec`, same bytes, and the fan-out assertion greps the text
       for absolute paths, run ids and step ids rather than only comparing digests
-- [ ] The preview renders a real item's prompt, sections, trim record and digest from the running
+- [x] The preview renders a real item's prompt, sections, trim record and digest from the running
       binary, and **writes nothing**
-- [ ] Store conformance: `CASES` 22 → 23 with both literals moved, `READ_CASES` green over `MemStore`,
-      `PgStore` and `CacheStore`
-- [ ] `cargo tree` shows no new workspace dependency (criterion 20); `htui-core` gains `sha2` and a
-      dev-dep `insta`, both already in the lock
-- [ ] No migration added — `0002_agent_probe.sql` already carries every ANA-5 section, and MOD-4's
+- [x] Store conformance: `CASES` 22 → 23 with both literals moved, `READ_CASES` (6) green over
+      `MemStore`, `PgStore` and `CacheStore`
+- [x] `cargo tree` shows no new workspace dependency (criterion 20); `htui-core` gains `sha2` and a
+      dev-dep `insta`, both already workspace entries and already in the lock
+- [x] No migration added — `0002_agent_probe.sql` already carries every ANA-5 section, and MOD-4's
       `0003_orchestration.sql` is still unheld
-- [ ] `rust-reviewer` gate run over the full change set, findings applied or deferred with the
-      maintainer (ultracode: one adversarial verifier per finding before applying)
-- [ ] Validator green (0 errors); **MOD-2 closed out in full** — checklist line deleted,
+- [x] `rust-reviewer` gate run over the full change set: **1 CRITICAL, 7 HIGH, 11 MEDIUM, all
+      applied**; the CRITICAL was proven rather than argued and is fixed at the input layer
+- [x] Validator green (0 errors); **MOD-2 closed out in full** — checklist line deleted,
       `docs/decisions/mod/mod-2.md` written across all nine phases, `DECISIONS.md` index line
       prepended, summary table and top status line updated; PRD milestone 9 row `complete` and its
-      five open questions answered
+      open questions answered
 
 ## Status
 
-**Drafted 2026-09-11, fact-checked, awaiting CONFIRM.**
+**Complete, 2026-09-15.** Drafted 2026-09-11, confirmed with D95–D108, landed over `b8c62aa`..the
+T70 close-out. `MOD-2` is archived at `docs/decisions/mod/mod-2.md`.
+
+At close-out, on **Linux** with Postgres live (`USERNAME=htui-ci`, TOOL-2):
+`cargo test --workspace --all-features --no-fail-fast` → **1017 passed, 0 failed, 25 ignored**;
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo doc --workspace --no-deps` and `cargo sqlx prepare --check` all clean;
+`validate-workflow-docs.sh` → 0 errors.
+
+Three items were minted from this milestone's findings — **MOD-30** (F-71, the strip overflow),
+**MOD-31** (F-121, a preview blocking an install) and **MOD-32** (F-80, the unscrubbed trim record).
+Three questions are left open for the maintainer: **F-34**, **F-37** and **L-5**.

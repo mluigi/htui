@@ -1432,6 +1432,19 @@ the `HANDOFF.md` MOD-4 line.
 
 ### The criteria map (the T70 table, pre-filled)
 
+> **Superseded at close-out — cite `docs/decisions/mod/mod-2.md` instead.** This table was written
+> before the tests existed and five of its names do not resolve in the shipped tree: `prompt_all_empty`
+> and `prompt_judge_three_candidates` are `insta` **snapshot** names, not test functions (the
+> functions are `the_all_empty_prompt_omits_every_optional_section` and
+> `the_judge_prompt_renders_its_golden_bytes`); `upstream_diamond_dedup` is a `READ_CASES` **case**
+> name, executed by three binding tests; `set_step_prompt_writes_both_columns_and_only_them` shipped
+> split in two (`store::mem::tests::set_step_prompt_writes_both_columns` and
+> `pg_criteria.rs::set_step_prompt_writes_only_the_digest_and_the_record`); and
+> `record_prompt_over_an_assembled_prompt_recomputes_the_same_digest` was never written under that
+> name — the two-writer identity is `prompt::digest::tests::sha256_matches_the_recorder_call`. Every
+> name in the close-out table was resolved against
+> `cargo test --workspace --all-features -- --list` on 2026-09-15.
+
 | §12 | Test |
 |---|---|
 | 1 | `defaults::tests::every_default_body_parses_in_its_role`, `…wrong_role_for_judge_and_handoff_and_vice_versa` |

@@ -14,39 +14,51 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-14):** **ANA-15 concluded** (`docs/decisions/ana/ana-15.md`): Verified Bugsink integration feasibility via standard Sentry SDK and spawned MOD-29. Before it, **ANA-3 concluded** (`docs/decisions/ana/ana-3.md`): Designed integration for external context tools and enforced constraint against manual grepping.
-Before it, **TOOL-1 concluded** (`docs/decisions/tool/tool-1.md`): Fixed next-item blocked-on regex to count multiple IDs per phrase. **CLEAN-1 shipped** (`docs/decisions/clean/clean-1.md`): Fixed rustdoc private and ambiguous links in htui-agent.
-**MOD-2 milestone 8 landed** (`a3cbfff`..`42294d8`, phase note
-below): an agent that speaks no ACP — only its own headless JSON stream — now reaches the same chat
-tab, recorder, store rows and replay as an ACP one, losing exactly three event kinds and saying so
-in its banner. `R-AGT-3` is met. The registry carries a second row, **`claude-cli`**; `CASES` is
-still **15** with **three** bindings reporting every one (§11 criterion 1 in fact, not by
-assertion); criterion 7 is proven live over two real turns. **Nine probes ran before a line of
-`src/cli/` was written**, and five of their findings changed code that was about to ship — most
-sharply that `modelUsage` is *cumulative* while `result.usage` is per-turn, which written the other
-way would have double-counted a two-turn chat with **no test in the tree failing**. `docs/ANA-4.md`
-§11.14's two CLI items are answered from live runs, and the ANA is amended in four places (D79,
-D92, D93, D94) here rather than in the file, per the milestone-5 precedent. Milestone 9 (the prompt
-assembler and preview) is the last of the nine.
-**MOD-2 milestone 6's T34 is unblocked and half answered.** The box is authenticated now, so
-`agy_live.rs` passes 4/4 against a logged-in server and `session/new` succeeds, reporting its
-`config_options` (permission modes `default`, `auto_edit`, `yolo` — MOD-2 D64's coordinate, now
-learnable). The **three ANA-4 §11.14 questions still need a live turn**, which is MOD-2's own work:
-whether `agy_acp_server` emits `usage_update` and in what field, whether it issues
-`session/request_permission` in `default` mode and with what option ids, and whether its edits
-arrive as a standard `tool_call` + `diff` or in a vendor shape.
+**Current status (2026-09-15):** **MOD-2 is done, all nine milestones**
+(`docs/decisions/mod/mod-2.md`, `5c717d0`..`32e516d`): `htui` starts agent sessions, streams them
+into a chat tab, answers permissions inline, persists and replays every event, tracks quota and
+cancels on a cap — over **three transports** that pass **one** conformance list — and assembles the
+prompt a step will be given, previewed read-only from the running binary. `R-AGT-5` is a passing
+test, not a claim. Milestone 9 added the whole of `htui_core::prompt`, `htui-agent::excerpt`, five
+store-seam methods (`CASES` 22 → **23**, `READ_CASES` 6), the sixth Backlog detail sub-tab
+**Prompt**, and the Runs pane's `~36k`/`!` indicators. ANA-5 §12 criteria 1–20 each carry a named
+test and criterion 21's five items are closed by D95–D99; criterion 18's `follow_up` persistence
+half is **re-deferred to MOD-4 by name** (D107). `docs/ANA-5.md` §4.4/§5.1 are **amended in the
+write-up, not in the file** (D108, maintainer-only per the milestone-5 precedent): the estimator is
+`chars-v2`, Claude prose **2.5** / code **2.4** chars per token, *measured* — ANA-5's 3.5/3.0 was
+28.4% off in the overflow direction and would have shipped silently. **1017 passed, 0 failed, 25
+ignored** workspace-wide with Postgres live.
+Before it, **ANA-15 concluded** (`docs/decisions/ana/ana-15.md`): Bugsink integration is feasible
+via the standard Sentry SDK; spawned MOD-29. **ANA-3 concluded**
+(`docs/decisions/ana/ana-3.md`): external context tools designed, manual grepping constrained.
 **Live coordinates.** Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql`
-is no longer held (`docs/ANA-2.md` §9) and is **still the next migration** — MOD-20 deliberately
-added none. Adapters install under `HTUI_AGENTS_ROOT`, default `dirs::data_local_dir()/htui/agents`;
-`HTUI_TOOL_<NAME>` still overrides everything. Dev Postgres via `compose.yaml` (port 5439); tests
-need `HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres` and the
+is no longer held (`docs/ANA-2.md` §9) and is **still the next migration** — MOD-2 milestone 9 and
+MOD-20 both deliberately added none. Adapters install under `HTUI_AGENTS_ROOT`, default
+`dirs::data_local_dir()/htui/agents`; `HTUI_TOOL_<NAME>` still overrides everything. Dev Postgres
+via `compose.yaml` (port 5439); tests need
+`HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres` and the
 `USERNAME=htui-ci` prefix of TOOL-2 (`docs/decisions/mod/mod-6.md`).
+**Live coordinates the agent work left, kept here because open items depend on them.** `claude` on
+this box is **2.1.267** (2.1.272 at the last estimator re-measure); the seed passes no `--bare`;
+`--permission-prompts none` is the deterministic way to provoke a policy denial, and
+`~/.claude/settings.json`'s allow list (`Bash(ls *)`) is why the obvious way does not. The CLI
+reports `claude_code_version` on `system/init` (there is no `version` key), re-emits `system/init`
+on **every turn** of a multi-turn session, and emits a `system/status` row per turn that
+`docs/ANA-4.md` §6.2 does not name. This box's live quota blob is `status: "allowed_warning"` at
+0.77 utilization and `available()` skips every status that is not exactly `"allowed"`, so the
+`claude-cli` row will report `Skip(Status("allowed_warning"))` the moment **MOD-4** has a selection
+loop — deliberately MOD-4's to loosen (`quota.rs:403-408`), and a live fact about a real row rather
+than a hypothesis. `agy_acp_server` **1.1.1** is installed here and emits **no `usage_update`
+whatsoever**, which is why its seed keeps `quota.source: "none"` and why the GPT/Gemini estimator
+row cannot be measured on this box (MOD-2 F-17). `--uid=` is **mandatory** for it. Its credentials
+live in `$GEMINI_HOME/antigravity-acp/acp_token.json`, a sibling of and separate from the `agy`
+CLI's own directory (MOD-21).
 **Concluded analyses the open items lean on:** ANA-10 (`docs/decisions/ana/ana-10.md`) — a box with
 no DSN becomes a *complete* box over a separate `local.sqlite`, spawning MOD-17, MOD-18 and MOD-19,
 and `docs/REQUIREMENTS.md` was amended for it on 2026-09-08 (new `R-STO-7`, eleven amended in
 place); ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration;
 ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
-`htui-orch`. MOD-2, MOD-7, MOD-9, MOD-13, MOD-14, MOD-15 and MOD-17 can start now.
+`htui-orch`. MOD-7, MOD-9, MOD-13, MOD-14, MOD-15 and MOD-17 can start now.
 
 ---
 
@@ -57,376 +69,48 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 - [ ] **ANA-11 - Models for requirements and decisions.** Evaluate database schema models to track product requirements (R-IDs) and architectural decisions (MOD/ANA items) inside `htui` itself instead of standalone markdown files.
 - [ ] **ANA-14 - Research whether using Redis could be beneficial.**
+- [ ] **ANA-16 - Research agent execution environments (Docker, remote shell).** Research how to implement ways to run an agent in a Docker container (local and remote) and in a remote shell. Note this would require a central server with htui as just the interface.
 
 ### Next features
+- [ ] **MOD-30 - The detail sub-tab strip overflows at the pinned width** (from MOD-2, finding
+  F-71). `R-TUI-3`. The sixth sub-tab took the strip past the pane: ` Body ` + ` Runs ` + ` Graph ` +
+  ` Documents ` + ` Notes ` + ` Prompt ` is **45 columns** against a **43-column** inner pane at the
+  harness's pinned 100×30, so `Prompt` renders clipped to ` Promp` and all 21 re-accepted snapshots
+  carry the clip. Two candidate fixes, both cross-cutting, and **this is the maintainer's choice**:
+  single-space separators in `detail/mod.rs::render_strip` (45 → **40** columns, and it changes every
+  snapshot in `crates/htui/tests/snapshots/` plus the Settings and top-level strips if the rule is
+  applied uniformly), or `DETAIL_PERCENT` 45 → 47 in `ui/tabs/backlog/mod.rs:30` (which widens the
+  detail pane and narrows the backlog list, moving every backlog snapshot instead). A seventh sub-tab
+  breaks whichever is chosen, so the fix should also pin the strip width against the pane in a test
+  rather than leaving it to a re-accepted snapshot. Found during MOD-2 T67, 2026-09-14.
+- [ ] **MOD-31 - A running prompt preview makes an adapter install refuse** (from MOD-2, finding
+  F-121). `R-AGT-10`, `R-TUI-8`, `R-NF-3`. `AgentRuntime::serve` pushes the deferred preview task
+  into `self.background` (`agent_worker.rs:824`), and the install guard refuses whenever
+  `!self.background.is_empty()` with *"a probe is already running on this box; install once it has
+  finished"* (`agent_worker.rs:1116`). Selecting a Backlog row therefore blocks `i` in Settings for
+  the life of a preview, with a message about a probe that is not running. The guard's reason is real
+  — a probe and an install's re-probe race on the same `agent_box` row — but it keys on the wrong
+  set: `background` mixes tasks that **write** `agent_box` (the probe, the re-probe) with tasks that
+  only **read** (the preview, plan D102's "the preview writes nothing"). Split `background` by what a
+  task writes, and let the install guard consult the writing half only. `background_len` is read by
+  tests, so the split has to keep an answer for them. Found at MOD-2 close-out, 2026-09-15.
+- [ ] **MOD-32 - `trim_record`'s own strings reach the store unscrubbed** (from MOD-2, finding
+  F-80). `R-SEC-3`, `R-PRM-3`. MOD-2's assembler scrubs every **digested** byte at the input layer
+  (D100 as corrected by the milestone-9 CRITICAL, `f48b82b`), so nothing unmasked reaches the model
+  or `prompt_digest`. The record written beside it does not get the same pass: `trim_record.notes`,
+  the `excerpts` audit's paths and root strings, and `budget_source`/`estimator` text are generated
+  strings serialised straight into `run_step.trim_record` by `set_step_prompt`. The exposure is small
+  by construction — the strings are repo-relative paths and enum spellings — but `R-SEC-3` gates the
+  **persist** path rather than the prompt path, and a fail-closed scrubber that is not called is not
+  fail-closed. Decide between scrubbing `TrimRecord::to_value()`'s output before the write and
+  refusing the write on residue, the way the assembler refuses. **Not MOD-10's**: MOD-10 replaces the
+  `Scrubber` implementation behind an unchanged trait; this is a missing call site. Found at MOD-2
+  close-out, 2026-09-15.
 - [ ] **MOD-29 - Bugsink integration via Sentry crate (from ANA-15).** Add `sentry` and `sentry-anyhow` dependencies, configure DSN to Bugsink instance, and wire initialization.
 
 - [ ] **MOD-28 - rataflow execution view (from ANA-12).** Add `rataflow` dependency, implement `ExecutionGraph` widget mapping `RunStep` and `SessionEvent` lists to a node graph, add view toggle to Runs tab (`R-TUI-4`), and wire mouse/keyboard events for standard run actions.
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees.
-- [ ] **MOD-2 - Agent driver + chat tab** (from ANA-4). `R-AGT-1..8`, `R-PRM-1..3`, `R-TUI-6`,
-  `R-TUI-8`, `R-HIS-1..2`. ACP client, CLI adapter, agent registry with its Settings tab section
-  (agents and quota), autodiscovery, quota tracking, streamed chat tab with follow-ups and inline
-  permissions, event persistence and replay. Driver design concluded in `docs/ANA-4.md` (ANA-4,
-  `docs/decisions/ana/ana-4.md`). Prompt builder concluded in `docs/ANA-5.md` (ANA-5,
-  `docs/decisions/ana/ana-5.md`): `htui-core::prompt` (template scanner and validator, render,
-  `chars-v1` estimator, kept-first trim, digest, `ExcerptProvider`/`RepoReader` traits, ranker) and
-  `htui-agent::excerpt` (`FsRepoReader`, walk, skip rules) per §8; six store methods plus
-  `WriteStore::set_step_prompt` (the pre-flight `prompt_digest` and `trim_record` writer); the
-  ANA-5 sections of `0002_agent_probe.sql` (five `COMMENT ON COLUMN`, ten `app_setting` keys, §9);
-  `insta` as an `htui-core` dev-dependency for golden prompts; the five "Unverified - MOD-2 must
-  confirm" items of §12 criterion 21 (the no-workspace `Scope` bound first). MOD-4 consumes
-  `DriverCaps`, `SessionSpec.cwd`/`extra_dirs`, `session_ref` and the `session_started` row
-  (`docs/ANA-2.md` §4.2, §4.8), and `0002_agent_probe.sql` must land before ANA-2's `0003`. Not
-  blocked (ANA-4 and ANA-5 concluded).
-  **Phase 1 landed (uncommitted, 2026-09-07):** PRD `.claude/prds/mod-2-agent-driver-chat.prd.md`
-  (nine milestones), plan `.claude/plans/mod-2-driver-seam-registry.plan.md` (milestones 1-2).
-  Milestone 1 complete: new `htui-agent` crate (ANA-4 §4.1 `AgentDriver`/`AgentSession` seam,
-  11-variant `DriverEvent`, recorder, `FakeDriver`, 13-case transport-neutral conformance suite),
-  `htui-core::scrub` (`Scrubber` + fail-closed `MinimalScrubber`, the ANA-7 stand-in MOD-10
-  replaces), six `WriteStore` methods incl. `start_chat_run`/`finish_chat_run`, inherent `agents()`
-  over three `Backend` arms, `append_pending`, `conformance::CASES` 15 -> 20. `rust-reviewer` ran
-  over the whole change set: 23 findings adjudicated by an adversarial pass (12 real, 5 partly,
-  6 refuted), 10 fixed with bite-proven tests, 7 deferred (see the plan's amendments).
-  **Phase 2 landed (2026-09-07, `5c717d0`..`1e7de4d`):** workspace MSRV 1.85 -> **1.98** with
-  `clippy.toml` moved with it (maintainer override of ANA-4 §4.2's 1.88; `sqlx-core 0.9.0` already
-  floors at 1.94, plan X9); the milestone-2 dependency set (`agent-client-protocol =2.1.0`,
-  `tokio-util`, `process-wrap` incl. the `process-group` feature the plan omitted, `which`,
-  `similar` declared only, and `windows` on Windows targets for `CREATE_NO_WINDOW`);
-  `htui-agent::launch` (`AgentLaunch`/`AgentSettings` serde types, `${tool}` resolution,
-  `to_acp_config` through the SDK builder, supervised `spawn` with a job object on Windows and a
-  process group on unix); `htui_core::model::agent::seed_rows` from `crates/htui-core/seeds/*.json`
-  with `PgStore::seed_if_empty_as` inserting them and the demo fixture derived from the same
-  source; `DriverFactory` keyed by transport (`acp`, `cli/<stream>`) with the `R-AGT-5` proof in
-  `crates/htui-agent/tests/extensibility.rs`; and the Settings tab's `SettingsRegistry` plus its
-  agent section (`StoreRequest::Agents`, `Harness::over` made public). Nine findings, all fixed
-  (plan "Milestone 2 close-out"). Verified on **Linux** with Postgres live (243 tests, no skipped
-  Postgres case, `USERNAME=htui-ci` per TOOL-2); the Windows spawn path is unverified here and
-  milestone 3 is the first to run it. `rust-reviewer` ran and blocked on one HIGH - `spawn`
-  resolved its command with a blocking `which` inside async code - plus three MEDIUM; three are
-  fixed in `34d5f04` (`spawn` is now `async` over `spawn_blocking`, the registry parses
-  `agent.settings` once, and the `R-AGT-5` token sweep T9 promised now exists and is bite-proven),
-  the fourth accepted with its reason (plan "Review gate").
-  **Phase 3 landed (2026-09-07, `a142fbf`..`682a423`):** live `claude` over ACP and the chat tab,
-  planned in `.claude/plans/mod-2-live-acp-chat.plan.md` with the `code-architect` blueprint beside
-  it. `htui-agent` gained its first real transport (`acp/{mod,map,client,fs}.rs`): one task per
-  session owning the whole `connect_with` future, the §6.1 mapper over raw JSON (the adapter ships
-  five update kinds the schema does not know), `fs/write_text_file` intercepted into an
-  `edit_proposal` with a `similar` unified diff, model selection by config-option **id**, the
-  session banner, and the three-stage permission pipeline with `permission.rs` deciding stages 1-2
-  where the recorder is. `htui-store` gained `Writer` (an owned `WriteStore` handle; `Offline` still
-  hands out none) and `Backend::{writer, this_user}`; `htui` gained `agent_worker.rs`
-  (`AgentRuntime`, `run_chat`), the four chat `StoreRequest` variants with `StoreReply::Chat`
-  frames, and the Chat tab (`R-TUI-6`: streamed text, folded thoughts, tool calls, diffs, inline
-  permission answers, capability banner). **The thirteen `conformance::CASES` now pass over a real
-  ACP wire and no case was added** (§11 criterion 1); two case *scripts* were amended because ACP
-  reports no per-turn tokens (§7) and carries no verbatim diff (§4.3). Recorded transcript fixtures
-  come from a live turn against adapter **0.48.0**, and they close two §11.14 items: the rate-limit
-  blob does arrive under `_meta["_claude/rateLimit"]`, on a later `usage_update` than the first, and
-  `cost` appears only once the turn has produced output. Live on this box: the seeded row resolves,
-  spawns the adapter, completes a `protocolVersion 1` handshake and dies with its process tree
-  (`tests/acp_live.rs`), and a whole chat streams into the store through the production runtime
-  (`crates/htui/tests/chat_live.rs`) — §11 criterion 9's first half and criterion 11's
-  process-group half. `rust-reviewer` blocked on one CRITICAL and seven HIGH findings, all fixed in
-  `682a423`: the SDK drops the foreground future when a connection actor fails, which orphaned the
-  agent process; a stream ending before its `done` was recorded as a finished turn; the path guard
-  admitted everything when a root was relative; and `edit_proposal.accepted` defaulted to `true`
-  before the user had seen the request. Verified on **Linux** with Postgres live. **Windows is compile- and
-  lint-checked but not run**: `cargo clippy --target x86_64-pc-windows-msvc -p htui-agent
-  --all-targets --all-features` is green (README "Checking the Windows-only code from Linux") and
-  caught two defects a Linux build cannot see, but the job object's kill-on-close guarantee, the
-  `.cmd` shim `CreateProcess` refuses and `CREATE_NO_WINDOW` are runtime facts that need a Windows
-  box; milestone 5 is the next to touch that path.
-  **Phase 4 landed (2026-09-08, `81d247b`):** durable history and replay, planned in
-  `.claude/plans/mod-2-durable-history-replay.plan.md` with the `code-architect` blueprint beside it.
-  An offline chat is no longer refused: the mirror gained the `agent` table (an unscoped full replace
-  beside `app_user`, `cache_migrations/0002_agent_mirror.sql` — **so MOD-4's cache migration is now
-  `0003_orchestration.sql`**, amending `docs/ANA-2.md` §9) plus `CacheStore::{agents, this_user,
-  user_named}`, and `Writer::Buffered` records through `append_pending` into
-  `<cache_dir>/pending/<project>.<run>.jsonl` while `is_writable()` still answers `false`.
-  `upload_pending` now fills `run_step.prompt_digest` and `run_step.usage`, the summing rule having
-  moved to `htui_core::model::UsageTotals` so the recorder and the uploader cannot drift (the
-  recorder also sums a masked `usage` payload now, which is what makes them agree in every row
-  shape). A live buffer is `<…>.jsonl.open` until `finish_chat_run` seals it, and a name collision
-  seals to `<project>.<run>.<n>.jsonl` rather than appending — every site tagged `[H-1]`, a
-  deviation from the plan's D35 kept cheap to revert, because the refresher would otherwise upload a
-  chat mid-flight and freeze its usage at a partial sum. Replay decodes rather than re-renders:
-  `htui_agent::replay` inverts the recorder's encode, `StoreRequest::StepEvents` answers with the
-  persisted rows (`None` = not on this box, distinct from "recorded nothing"), the Runs pane selects
-  a step with `J`/`K` and `Enter` emits `Action::Replay`, and the Chat tab's replay mode is
-  read-only structurally — `on_key_replay` takes no `Ctx`, so it cannot request. **§11 criterion 12
-  is proven end to end** (`crates/htui/tests/chat_offline.rs`): an offline chat driven by the
-  production runtime writes the buffer and `upload_pending` lands exactly those rows, second pass a
-  no-op. 410 tests green on **Linux** with Postgres live; `rust-reviewer` returned no CRITICAL and no
-  HIGH, and its two MEDIUM findings (both in the `[H-1]` sealing fallback) are fixed in this commit.
-  Known and accepted: an uploaded offline chat has `run_step.agent_id` and `model` NULL, the line
-  format carrying `session_event` columns only. **Windows verification of every phase is MOD-16**,
-  which owns the runtime facts a Linux box cannot answer.
-  **Phase 5 landed (2026-09-08, `fb626a8`):** autodiscovery and the box probe, planned in
-  `.claude/plans/mod-2-probe-autodiscovery.plan.md` with the `code-architect` blueprint beside it.
-  **`migrations/0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql` is no longer
-  held** (`docs/ANA-2.md` §9): it carries ANA-4 §9's `agent_box.probe JSONB` plus ANA-5 §9's five
-  `COMMENT ON COLUMN` contracts and ten `app_setting` defaults. Two **ANA amendments** were needed
-  and are recorded here rather than in the ANAs (maintainer-only): ANA-4 §9's
-  `COMMENT ON COLUMN agent.name IS NULL` is a **no-op** — `0001_init.sql` carries no database
-  comment at all and its stale text is a source comment (`0001_init.sql:96`) the forward-only rule
-  forbids editing — so `0002` writes a real comment naming `seed_rows`/`seed_if_empty_as` (plan
-  D43); and ANA-4 §4.6's snapshot gains one key, `source` (`probe` | `manual`), because "a manual
-  entry is never overwritten by a probe that finds nothing" (§4.6) needs a recorded origin (plan
-  D45). `htui-agent` gained `probe.rs` (tier 1: one resolver `tools::resolve` now shares, `glob`
-  through a hand-rolled `*`-per-segment walker with no new crate, versions from the seeds' own
-  regexes and semver floors) and `acp/handshake.rs` (tier 2: `initialize` and nothing else, the
-  child owned by a `ChildGuard` so timeout, actor failure, garbage, success and a dropped future
-  all kill it). `htui` gained `StoreRequest::ProbeAgents`, served through `AgentRuntime::serve` as
-  `Served::Deferred` with an owned `Writer` — never in the worker's `select!` arm, never on the UI
-  task (`R-NF-3`) — `Settings > r` with its `probing…` column, and a 24 h `PROBE_TTL` re-probe at
-  `ChatStart` that cannot block or fail the chat. **§11 criterion 9 is proven live on this box**
-  (`crates/htui-agent/tests/probe_live.rs`: `status: ready`, `protocol_version: 1`, no surviving
-  children); **criterion 10's live half is milestone 6's** — there is no `agy` on this box, so the
-  glob resolution, its `--uid=` platform append and the `unauthenticated` mapping are proven by
-  fixtures only. 463 tests green on **Linux** with Postgres live. `rust-reviewer` **blocked** on two
-  HIGH findings, both in the orphan-process class this milestone was gated on: `npm root -g` ran
-  through a bare `Command::output()` with no timeout and no process group, and an aborted
-  `capture_version` left its child running. Both are fixed by one bounded-spawn path (`run_bounded`)
-  and the lifted `ChildGuard`; five MEDIUM and four LOW followed, and the gate then cleared.
-  Known and accepted: `open_session`'s own timeout arm still orphans its adapter the same way
-  (blueprint H-2) and is **milestone 6's**; `unauthenticated` is auth-methods-only until milestone 6
-  can check a credential; on the probe's *success* path the process group is not swept, because the
-  leader has just been reaped and a late `killpg` could land on a reused pgid, so a tool that
-  daemonises a helper can outlive its probe (none in the seeds does). Also landed:
-  `crates/htui-store/build.rs`, because `sqlx::migrate!` registers rerun-if-changed **per file**,
-  so adding `0002` did not invalidate a warm `target/` and the suite failed against a schema the
-  binary did not know it had — the same trap awaits MOD-4's `0003`. **First launch after this lands
-  rebuilds every box's mirror**: `PgStore::schema_version()` is now 2 and `CacheStore::open` treats
-  a mismatch as a rebuild (MOD-6 plan D8).
-  **Phase 6 landed (2026-09-09, `acf16f7`), one task short:** `agy` over ACP, planned in
-  `.claude/plans/mod-2-agy-acp.plan.md` with the `code-architect` blueprint beside it. Google's
-  first-party `agy_acp_server` **1.1.1 is installed on this box** (plan D57; `htui` does not
-  download it, the README now carries the steps) and **§11 criterion 10 is proven live**
-  (`crates/htui-agent/tests/agy_live.rs`): the unmodified seed row resolves the server through the
-  glob, appends `--uid=`, completes `initialize` at `protocolVersion 1` in ~1.2 s against a 60 s
-  timeout, records `unauthenticated`, and leaves no surviving process. Four decisions landed with
-  it. **D58** makes the driver spawn `agent_box.probe.resolved` rather than resolving a second time
-  (`AcpAdapter::build` stops ignoring `on_box`), which is the only path that carries a glob tool's
-  per-platform `args`; milestone 5's H-3 was therefore not cosmetic — **`--uid=` is mandatory**, and
-  without it the server aborts in `ChangeRootAndUser` (`Check failed: LookupGIDByGroupName(…) Group
-  nobody not found`) before reading stdin. **D59** gives `unauthenticated` a declarative
-  `discovery.credential { env, files }` block resolved by the probe (files through the existing glob
-  expander, then variables) feeding `status_for`, so an authenticated box reads `ready`; nothing is
-  keyed on an agent name (`R-AGT-5`), the probe never opens the file and records only the tier.
-  **D60** re-probes the row when a chat fails to *spawn*, inline from that chat's own task and under
-  a runtime-wide claim so two chats cannot probe one row at once; there is **no transport fallback**
-  — by maintainer decision a CLI agent is its own registry row, so milestone 8 builds a row, not a
-  degraded mode. **D61** stops `open_session`'s handshake timeout orphaning the adapter (the session
-  task holds a `ChildGuard`; `SessionOptions` carries an injectable timeout). Beyond the plan, the
-  review gate found and this commit fixes a message the SDK swallows: `start_session` sends from an
-  actor whose failure **drops the foreground future**, so `session_main`'s error arm is unreachable
-  for a JSON-RPC error and the vendor's `Authentication required` — the first thing an `agy` user on
-  a fresh box meets — was replaced by "the session task ended before the handshake". `rust-reviewer`
-  returned no CRITICAL and no HIGH; its three MEDIUM and five LOW are all applied. 485 tests green
-  on **Linux** with Postgres live.
-  **Two ANA-4 amendments are needed and are recorded here rather than in the ANA** (maintainer-only,
-  the milestone-5 precedent): §4.5's and §4.6's premise that `agentInfo.version` is a build tag
-  *disagreeing* with the registry semver is **false on the Linux 1.1.1 build**, which reports
-  `agy_acp_server_1.1.1` — D57's "the registry value is a download coordinate only" still holds, its
-  stated reason does not; and §4.5's protocol-echo warning is **confirmed live** (the server echoed
-  `protocolVersion 99` when sent 99, so the echo is no evidence of support).
-  **What milestone 6 still owes** (`T34`) — **no longer blocked**: the live `agy` chat.
-  `agy_acp_server` keeps its credentials in `$GEMINI_HOME/antigravity-acp/`, a sibling of and
-  separate from the `agy` CLI's own directory, so the CLI's login does not count — and **MOD-21
-  logged it in from the app on 2026-09-10** (`docs/decisions/mod/mod-21.md`), which is what
-  unblocked this. `agy_live.rs` now passes 4/4 against the logged-in server and `session/new`
-  succeeds, reporting `config_options` (`default`, `auto_edit`, `yolo` — the D64 coordinate).
-  What remains is **a live turn**, which none of the four existing cases drives, and with it
-  **three ANA-4 §11.14 items** — whether `agy_acp_server` emits
-  `usage_update` and in what field, whether it issues `session/request_permission` in `default` mode
-  and with what option ids, and whether its edits arrive as a standard `tool_call` + `diff` or in a
-  vendor shape. Two of the six closed here: the `.par` mechanics (the `--uid=` finding above;
-  `localharness_external` ships beside the server on Linux too and the handshake does **not** need
-  it, checked by moving it aside) and the `session/new` model list, which is **not learnable while
-  unauthenticated**, so D64 leaves `models: []` and `model_config_id: null` as seeded. Milestone 7
-  (quota and caps) can start without any of this.
-  **Phase 7 landed (2026-09-10, `142beb1`..`acec1b8`), complete:** the live `agy` turn plus
-  quota and caps, planned in `.claude/plans/mod-2-quota-caps.plan.md` with the `code-architect`
-  blueprint beside it. **Milestone 6's `T34` is closed and all three remaining ANA-4 §11.14 `agy`
-  items are answered live** (`crates/htui/tests/chat_live_agy.rs`, transcript fixture recorded, two
-  runs agreeing): `agy_acp_server` emits **no `usage_update` whatsoever** — so §7's unverified row
-  for `agy` resolves to *nothing*, its seed keeps `quota.source: "none"` and its quota column reads
-  `—` by design; it **does** issue `session/request_permission` in `default` mode for a write but not
-  for a read, offering exactly `allow`/`deny` with kinds `allow_once`/`reject_once` and no
-  `*_always`; and its edits arrive as a **standard** `tool_call` with `kind: "edit"` and a `diff`,
-  the vendor's own names riding inside schema fields, so **no mapper change was demanded** and the
-  eleven `DriverEvent` variants stand. **D64 resolved the other way from milestone 6's fallback**:
-  `session/new` does return `configOptions` with eleven model ids, so the seed now carries them,
-  `default_model: "gemini-3.7-flash-high"` and `model_config_id: "model"`, and ANA-4 §4.4's
-  selection-by-option-id is exercised end to end for the first time.
-  Milestone 7 itself: `htui_core::model::quota` holds §7's document (`normalize`, `Quota`,
-  `ProjectCaps`, and `available` — `R-AGT-8`'s skip predicate, which **MOD-4 consumes and MOD-2 only
-  tests**), `QuotaSource` moved there with it; the ACP mapper lifts `_meta["_claude/rateLimit"]`
-  verbatim onto `UsageEvent.quota`; the recorder **latches** the document passively after every
-  `usage` row through a new narrow `WriteStore::set_agent_box_quota`; the **per-run cap** is detected
-  in the recorder and cancelled by the loop that holds the session, leaving `error{cap_exceeded}`
-  then `done{stop_reason:cancelled}` as a step's last two rows (§11 criterion 8); and
-  `Settings > Agents` gained a `quota` column that states `r` cannot refresh it. **§11 criterion 7 is
-  proven both clauses on live Postgres** (`crates/htui/tests/chat_usage_pg.rs`), and by construction
-  rather than fixture luck — the mapper's delta is `round(total) − previous round(total)`, so a sum
-  of deltas *is* the last rounded total. Caps are **USD micros** in `project.settings`
-  (`per_token_cap_run` enforced, `per_token_cap_batch` read and logged — **MOD-12 enforces it**,
-  ANA-4:1283); absent means unbounded, `0` cancels on the first costed row, and a malformed value
-  refuses the chat. **No migration**: `agent_box.quota`/`quota_at` have existed since `0001`, so
-  MOD-4's `0003` is still unheld. 738 tests green on **Linux** with Postgres live (46 targets).
-  **Three ANA-4 amendments, maintainer-approved and recorded here rather than in the ANA** (the
-  milestone-5 precedent): **D69** — §7's "the recorder … calls `AgentSession::cancel()`" is not
-  implementable, since `Recorder` holds no session and must not; detection stays in the recorder and
-  the cancel moved to a shared `enforce_breach` called by **both** `pump` and the production
-  `run_turn` (`pump` is not the binary's loop, which the plan originally got wrong). **D74** —
-  `agent_box.quota`/`quota_at` are now **single-writer**: `upsert_agent_box` can no longer write them
-  on either path and the probe no longer carries them forward, because a probe read-modify-writing a
-  column the latch owns discarded every latch in between — a lost update by construction, fixed at
-  the maintainer's instruction rather than accepted. **D76** — the `default` column shows a model id
-  **whole**, since the id is §4.4's selection coordinate and `gemini-3.` names nothing; the table was
-  rebalanced for it and **has no width slack left** (each of eight columns now sits at its own longest
-  string), which MOD-23 and MOD-12 inherit.
-  `rust-reviewer` returned **no CRITICAL and no HIGH**; its four MEDIUM and six LOW were adjudicated
-  — eight applied (`bf2cd2e`, `4742ce3`, `44e6743`), one **rejected on evidence** (L-5 claimed the
-  `R-AGT-5` sweep does not read comments; it does — `the_installer_names_no_vendor` sweeps
-  `production_half()` for four vendor strings and fired on one in a comment earlier the same day —
-  the finding had read the *other* sweep, the `zeta` one), and one left with the maintainer
-  (**M-2**: a `per_token` row whose `quota.source` is still `acp_meta_rate_limit` never publishes
-  spend, because the H-3 rule waits for a blob that will never arrive).
-  **`T46` closed and ANA-4 §11 criterion 6 now holds across a flush** (`2deb7f8`, `acec1b8`, both
-  maintainer-decided after the review gate). The defect was real and live: `Recorder.edits` was
-  cleared by `flush()`, so §4.3's "one `edit_proposal` row per `(tool_call_id, path)` per step" held
-  only inside one flush window, and one `agy` file write left **three** rows — `agy` re-announces
-  `tool_call` verbatim where the spec's example sends `tool_call_update`, and answering the
-  permission prompt flushes in between. Measured from the committed fixture, the same write now
-  leaves **1** row (3 → 1 with the live interleaving, 2 → 1 without). **D77** is how, and it adds no
-  store seam: an `edit_proposal` **reserves its `seq` at announcement** and only its *write* waits,
-  so a re-announcement updates the held row in place and the row is written when its tool call
-  closes. Nothing the user sees moved — the recorder's UI frame already goes out at announcement, so
-  only the database write is deferred, and replay reads by `seq`, which was never given up. Held rows
-  are released on four paths (a `tool_result` or terminal `tool_call_update`, the turn's `done`, a
-  cancel including the cap's `enforce_breach`, and `finish()` as the backstop), because a held row
-  that was never written would be a `seq` gap — worse than the duplicate it replaced. `next_seq` now
-  advances at numbering rather than at commit, since the flush is no longer the only allocator, and a
-  refused batch keeps the numbers already on its rows. The three rejected options are recorded in the
-  plan: a store `update_event_payload` across six impls would have forced a choice between "criterion
-  6 online only" and making `upload_pending` last-line-wins, which is the rule protecting
-  `UsageTotals::from_rows` from double-counting; deferring the `seq` too would have reordered the
-  transcript; and suppressing byte-identical repeats would have fixed this `agy` case and none of the
-  general one. The accepted price, knowingly: a process death mid-tool-call loses a proposal row that
-  was durable before. **The amended conformance case is the lasting fix** — its script now flushes
-  between two *differing* writes, because the fake never flushed mid-tool-call and that is precisely
-  why a transport-neutral suite could not see a live defect. **D78** closed the review gate's last
-  finding with it: a `per_token` row publishes its spend on the first costed row instead of waiting
-  for an allowance blob that a per-token agent never sends (§7 gives it no `windows`, so the H-3
-  guard had nothing to protect). 742 tests green on **Linux** with Postgres live, 46 targets.
-  **Phase 8 landed (2026-09-10..11, `a3cbfff`..`42294d8`), complete:** the **degraded CLI
-  transport**, planned in `.claude/plans/mod-2-cli-transport.plan.md` with the `code-architect`
-  blueprint beside it. An agent that speaks only its own headless JSON stream now reaches the same
-  chat tab, recorder, store rows and replay as an ACP one — losing exactly three event kinds, and
-  saying so on screen. `R-AGT-3` is met.
-  New: the **`claude-cli`** registry row (D79 — a second row, not a degradation inside the `claude`
-  one; D88's name-keyed `seed_missing_agents` top-up rather than a migration, so **MOD-4's `0003` is
-  still unheld**); `htui-agent::cli::{mod,claude}` (supervisor and §6.2 mapper); a **third**
-  conformance binding; `DriverFactory::with_acp` → `production`, registering two adapters for three
-  rows (D87, `R-AGT-5`).
-  **§11 criterion 1 holds in fact, not by assertion**: `CASES` is still **15**, and three transports
-  report all fifteen. D80 and D91 are why — six cases gained a *capability-gated second arm* rather
-  than a skip, so a transport without a capability must prove the **negative** (no `permission_request`
-  row, no `edit_proposal` row, one turn-end `usage` row). `DriverCaps` gained `usage_mid_turn` to say
-  which. **That change immediately caught a real defect** in the place the suite is strongest:
-  `tests/extensibility.rs` drives all fifteen cases over a **CLI** row, and the fake was replaying a
-  script its own declared capabilities said it could not have produced. `fake.rs` gained a sixth
-  harness rule — *a transport plays the wire its `DriverCaps` declare* — so all six arms execute today.
-  **§11 criterion 7 proven live over the CLI row** (`crates/htui/tests/chat_live_cli.rs`, two turns,
-  real binary, real store): `168710 + 16745 = 185455` = the last `cost_micros_total`, exactly.
-  Criterion 11's CLI half holds on **Linux**; the Windows half is **MOD-16's** and is not claimed —
-  the Windows lint target still cannot build here (TOOL-3).
-  **Nine live probes ran before a line of `src/cli/` was written** (`tests/cli_live.rs`, fourteen
-  committed transcripts), and their answers are the plan's **"Probe findings" F-1..F-15**. Five
-  changed code that was about to be written, and three of those would have shipped silently:
-  **F-4** — `modelUsage[*]` tokens are **cumulative** across a session while `result.usage` is
-  per-turn, the inversion of what the names suggest, so every figure the mapper reports is a delta;
-  written as planned, a two-turn chat would have double-counted into `run_step.usage` and **no test
-  in the tree would have failed**. **F-7** — a turn's thinking block and its reply share one
-  `message.id`, so the coalescing key is `(message.id, block index)`; the plan's `message.id` alone
-  would have folded a thought into a reply. **F-13** — `quota::normalize` **discarded** the blob for
-  `CliRateLimitEvent`, so D86's "drives the quota latch through the existing `normalize`" was a
-  no-op; every quota test in the tree is ACP-sourced, so nothing would have caught it. Also **F-8**
-  (`result.subtype: "success"` arrives with `is_error: true` on an unauthenticated run — the verdict
-  is `is_error`/`terminal_reason`, never `subtype`) and **F-10** (`--max-budget-usd 0` is refused
-  before stdin is read, so "no cap" must pass no flag).
-  **D81 survives its own probe, with §4.4's wording corrected** (F-1..F-3): stdin close alone is an
-  end-of-input and **not** a cancel (the turn completes, exit 0); SIGINT after it *does* bring a
-  terminal envelope — but an error-shaped one, `subtype: error_during_execution`, `is_error: true`,
-  carrying **`terminal_reason: "aborted_streaming"`**, which is what the mapper keys `cancelled` on
-  so a turn cancelled from elsewhere still reports honestly; SIGTERM leaves exit **143** and no
-  `result` at all. **D82 survives with its payload gone** (F-6): thinking is *signalled and not
-  disclosed* here — `thinking` is the empty string beside a `signature` — so a `thought` over this
-  transport carries no prose, and the signature never becomes its text.
-  **D85 was proven, after failing to be** (F-12): the first denial probe asked for `Bash(ls)` and
-  this box's settings carry `Bash(ls *)`, so it chose the one command the box pre-approves and read
-  the empty array as though it said something about the dialect. A tenth case using
-  `--permission-prompts none` makes the refusal a property of the *invocation* instead, and it
-  fires. That run also caught a gap: D85 named **two** sources and only one was implemented — the
-  CLI announces a refusal live as `system/permission_denied` **and** repeats it on the terminal
-  `result`, so the mapper takes the live one (the denial lands where it happened) and deduplicates
-  the repeat by `tool_use_id` (**F-12b**).
-  **Four ANA-4 amendments, maintainer-approved and recorded here rather than in the ANA** (the
-  milestone-5 precedent): **D79** — §5.3/§4.4's "one `claude` row with the CLI as an in-row
-  degradation" becomes two rows, and `settings.cli` leaves the `acp` row. **D92** — §4.4's
-  recommendation of `--bare` is **withdrawn**: `claude --help` on 2.1.267 says `--bare` reads auth
-  *strictly* from `ANTHROPIC_API_KEY`, and the probe measured it — a `--bare` run answers
-  `terminal_reason: "api_error"`, `"Not logged in · Please run /login"` on this subscription box. The
-  price is a pre-`init` buffer, because hook envelopes then precede `system/init` (**F-9**, measured:
-  four pairs on this box), and D84's banner must still be the step's first `other` row. **D93** —
-  §4.1's `permission_answer` moves from "htui-authored only" to "authored by `htui` *or* reported by
-  a transport that answered by policy"; it is a real twelfth `DriverEvent` variant, and
-  `driver_contract.rs`'s identity is now `14 − 2 = 12`. **D94** — replay decodes it to that typed
-  variant, closing the asymmetry D93 opened (it had been typed live and `other` on replay);
-  `PermissionAnswerEvent::denied` gains `#[serde(default)]` for rows written before this milestone,
-  and `record_permission_answer` writes the key from now on.
-  **`docs/ANA-4.md` §11.14's two CLI items are answered from live runs**, which is what this
-  milestone owed: the cancellation semantics (F-1..F-3) and the thinking-block shape (F-6), both
-  recorded as committed fixtures rather than as prose.
-  **Two holes in the fixtures' own redaction were found and closed**, each by a *later* probe reading
-  an *earlier* one's committed transcript — an argument for keeping fixtures under test rather than
-  merely under version control. The rule was applied to the serialised file, and a needle only had to
-  arrive spelled differently to walk through it: **split across streaming deltas** (the model chunks
-  wherever the tokeniser did, so a quoted path arrives as five JSON strings and none holds the
-  needle — *and the self-check re-read the same unreassembled text*, so a green redaction check
-  proved nothing about the stream), and **slugged** (the CLI derives a project directory from the
-  cwd, so `/tmp/.tmpAbCdEf` is reported as `-tmp--tmpAbCdEf`; thirteen of fourteen transcripts
-  carried it). What leaked was a tempdir name and a username already in every commit, so the exposure
-  is nil — the hole is the same size for the `SECRET_NAMES` half, which exists so a token echoed by a
-  hook cannot ride into git. Neither fix is a general defence and the code says so: a needle can be
-  base64'd, URL-encoded, or split *and* slugged.
-  Also landed: **D89** re-ranks the Settings agents table — `name` became `Constraint::Fill(1)`, with
-  no width to tune, after measuring that the literal instruction (`Min(256)`) does not widen that
-  column but **deletes the other seven** (`[91, 0, 0, 0, 0, 0, 0, 0]` at the bordered 98). `name` now
-  takes every spare column — 10 at 98, 32 at 120, 112 at 200 — and `on this box` is the donor, fixed
-  at 13, which clips `unauthenticated` to `unauthenticat` and `choose a method` to `choose a meth` as
-  the stated price. **A correction for whoever packs this table next**: the 98 that D76's and D89's
-  arithmetic both argue from is the **test harness** (`testkit.rs`'s `DEFAULT_SIZE`, 100×30, minus
-  the pane border), not a screen — D76's ranking was tighter than it needed to be because it treated
-  a fixture constant as a constraint.
-  **Verified on Linux with Postgres live**: `cargo fmt --check` clean, workspace
-  `clippy --all-targets --all-features -D warnings` clean, and
-  `cargo test --workspace --all-features --no-fail-fast` **51 binaries green, 0 failed** — which is load-bearing rather than pedantic: `cargo
-  test` stops at the first failing binary, and a run that reported the `auth.rs` flake and exited is
-  how two width-broken suites (`install.rs`, `probe.rs`) were briefly called green.
-  **Live coordinates for the next session.** `claude` on this box is **2.1.267**; the seed passes no
-  `--bare`; `--permission-prompts none` is the deterministic way to provoke a policy denial, and
-  `~/.claude/settings.json`'s allow list (`Bash(ls *)`) is why the obvious way does not. The CLI
-  reports `claude_code_version` on `system/init` (there is no `version` key), re-emits `system/init`
-  on **every turn** of a multi-turn session (the banner consumes the first; re-emitting it would
-  break `session_banner_is_first_other_row` on the live path only), and emits a `system/status`
-  row per turn that §6.2 does not name. **Once F-13's reader is on, this box's live blob is
-  `status: "allowed_warning"` at 0.77 utilization, and `available()` skips every status that is not
-  exactly `"allowed"`** — so the `claude-cli` row will report `Skip(Status("allowed_warning"))` to
-  MOD-4 the moment MOD-4 has a selection loop. That is deliberately MOD-4's to loosen
-  (`quota.rs:403-408`), but it is now a live fact about a real row rather than a hypothetical.
 - [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
   `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
   modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
@@ -457,9 +141,24 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `PgStore`-inherent reads of ANA-2 §8 become `Backend`-inherent with a four-arm `match self`
   (`agents()` precedent, `backend.rs:292-298`); §8's split rule itself is unchanged. Two
   prohibitions: never `CHECK (fanout_index >= 0)` on any of the three schemas (ANA-2 risk 12), and
-  no local `shared_serialized` before ANA-10 §10.17 is answered. Blocked on MOD-2 **and on MOD-17's
-  M3** (ANA-10 §9.1's ordering rule: `LocalStore` must exist before build step 1, or this item
-  inherits eighteen unbudgeted methods) (MOD-6 landed, `docs/decisions/mod/mod-6.md`).
+  no local `shared_serialized` before ANA-10 §10.17 is answered. **No longer blocked on MOD-2**
+  (done, `docs/decisions/mod/mod-2.md`); still blocked on **MOD-17's M3** (ANA-10 §9.1's ordering
+  rule: `LocalStore` must exist before build step 1, or this item inherits eighteen unbudgeted
+  methods), which MOD-25 removes when it closes (MOD-6 landed,
+  `docs/decisions/mod/mod-6.md`). **Three things MOD-2 handed over by name.** (1) ANA-5 §12
+  **criterion 18's persistence half** is this item's (MOD-2 D107): a handoff prompt must be
+  persisted as a `follow_up` event at the next `turn`, not as a second `prompt` row, leaving
+  `run_step.prompt_digest` unchanged — it needs a promotion, which is `R-ORCH-5`. The assembler half
+  is proved by `prompt_digest.rs::a_handoff_summary_carries_only_the_windowed_tail`. (2) ANA-5 §12
+  **criterion 3's `blocked` transition** and **criterion 16's front-matter parser** are likewise
+  MOD-2-adjacent and this item's. (3) MOD-2 finding **F-104**: `excerpt::select`'s `vetted()` refuses
+  any provider candidate the reader's listing never offered, and a listing truncated by `scan_cap` is
+  only a prefix — so on a very large repository a legitimate provider candidate is refused and noted.
+  That is the conservative direction and the price of not leaning on `htui-agent` for a security
+  property; loosening it (a per-candidate stat under the same symlink discipline) is this item's
+  call, not the assembler's. Also inherited: `available()` skips every quota status that is not
+  exactly `"allowed"`, so this box's `claude-cli` row reports `Skip(Status("allowed_warning"))` the
+  moment there is a selection loop (`quota.rs:403-408`).
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
   per-box paths, agent autodiscovery hook. Not blocked (MOD-6 landed,
@@ -472,26 +171,46 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   registry-driven installation, and it is now built and `R-AGT-10`-backed - so this item *calls*
   `htui_agent::install` from its box registration and probe hook rather than growing one, and that
   hook is the natural second caller of the action `Settings > i` already exposes (MOD-20 D7 kept
-  the MVP to Settings deliberately).
+  the MVP to Settings deliberately). **MOD-2 shipped the consumer and left one gap here by name**
+  (finding F-102): `htui_agent::excerpt::FsRepoReader` refuses a symlink at any component *below*
+  the root, but a `RepoRoot` whose **own** path is a link is resolved by whoever writes
+  `repo_box_path` — which is this item — and nothing writes it yet. Whatever writes those rows must
+  canonicalise or refuse a root that is a link, or the excerpt walk's symlink discipline starts one
+  component too late.
 - [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
   project and phase bindings, template rows, Skills tab editor with version diff, import of
   existing skill markdown files. Per ANA-5 (`docs/ANA-5.md` §4.1, §5.4): template save validation
   calls `htui_core::prompt::template::parse`; `judge` and `handoff` are reserved names whose
   `TemplateRole` derives from the row name; the closed placeholder tables are the editor's inline
-  help. Not blocked (MOD-6 landed, `docs/decisions/mod/mod-6.md`); the validator is MOD-2 build
-  step 1, so MOD-9 must not ship the editor ahead of it (ANA-5 risk 11).
+  help. Not blocked, and the dependency is now satisfied: **MOD-2 shipped the validator**
+  (`docs/decisions/mod/mod-2.md`), so ANA-5 risk 11 is closed. Three things are waiting here by
+  name. `htui_core::prompt::template::parse` refuses with a **byte offset**, so the editor can put
+  the cursor on the mistake rather than reporting "invalid". `htui_core::prompt::render::template_text`
+  is deliberately kept though the assembler no longer calls it (MOD-2 finding F-83, `fd9e752`): it is
+  for exactly this editor, which has a `ParsedTemplate` and no scrubber, and its doc says so. And the
+  skill model layer is here already, read-only (MOD-2 D105) — `Skill`, `SkillVersion`,
+  `SkillBinding`, `BoundSkill` with the `R-SKL-2` collapse and the `max_skill_tokens` cap — so this
+  item owns only the writers `upsert_skill`, `add_skill_version` and `set_skill_binding`, plus the
+  editor. `htui_core::prompt::defaults::DEFAULT_TEMPLATES` is the ten bodies to seed *from*; seeding
+  them into a project's `prompt_template` rows is MOD-15's (ANA-5 §4.6).
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
-  pattern masks, fail-closed persistence gate, Settings tab secret provider section. Blocked on
-  MOD-2.
+  pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
+  blocked** — MOD-2 is done (`docs/decisions/mod/mod-2.md`) and shipped the `Scrubber` seam with the
+  fail-closed `MinimalScrubber` this item replaces *behind an unchanged trait*. Its call sites are
+  already fail-closed on every digested byte (MOD-2 D100 as corrected by that milestone's CRITICAL);
+  the one **missing** call site is **MOD-32**, not this item.
 - [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
   `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
   per-box class limits; per-phase exposure. Per ANA-2 (`docs/ANA-2.md` §4.2, §8, risk 11):
   `document_write` calls `WriteStore::write_document` (orchestrator-allocated version), `command_run`
   accepts class `verify` for `verify_command`, and an `item_status` request is recorded as an
   `item_note` with `via_step_id`, never a transition. The `box_profile` read tool returns ANA-5's
-  box profile projection (`docs/ANA-5.md` §4.2) so the tool and the prompt section agree. Blocked
-  on MOD-2, MOD-4.
+  box profile projection (`docs/ANA-5.md` §4.2) so the tool and the prompt section agree — MOD-2
+  shipped that projection as `htui_core::prompt::BoxProfile::project`, which drops `box_tool.path`
+  (ANA-5 §4.2 rule 5), so the tool must not re-add it. **Blocked on MOD-4 only** now that MOD-2 is
+  done (`docs/decisions/mod/mod-2.md`); MOD-2's own `permission_request` gap over the CLI transport
+  stays declared until this item lands, since the `--permission-prompt-tool` contract is its route.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
@@ -559,7 +278,15 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   cache is SQLite on a different filesystem, and `append_pending`'s `OpenOptions::append` and the
   `.jsonl.open` sealing have never met a Windows file lock. Needs a Windows box with `node` and
   `claude-agent-acp` installed; milestone 5 is the first milestone whose own work touches the
-  spawn path, so this can run before or beside it. Not blocked.
+  spawn path, so this can run before or beside it. Not blocked, and **MOD-2 is now done across all
+  nine milestones** (`docs/decisions/mod/mod-2.md`), so the full Windows surface is here rather than
+  accumulating. Milestone 9 added one more runtime fact to the list: `htui_agent::excerpt::FsRepoReader`
+  is the **first `htui-agent` code that traverses arbitrary repositories**, and its guarantees are
+  `symlink_metadata` per component, `.git` pruned as a path component at any depth, and a scan cap
+  counting every entry — none of which has met an NTFS junction, a reparse point or a case-insensitive
+  path. Paths are repo-relative by contract (ANA-5 §4.2 rule 5) and the digest LF-normalises before
+  any byte is counted (criterion 6), which is the Windows hazard that would otherwise change a
+  `prompt_digest` between boxes. Criterion 11's CLI half also holds on **Linux only**.
   **MOD-20 added a second body of Windows-only code** (`docs/decisions/mod/mod-20.md`), and it is
   the first that could not be lint-checked from Linux at all (**TOOL-3**), so it was reviewed by eye
   only. The runtime facts it defers here, by name: that `Layout::promote`'s three-attempt
@@ -710,9 +437,12 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   archive as if they were; `docs/decisions/mod/mod-25.md` records them as withdrawn with their
   reason. **Unblocks by removal**: MOD-4's build step 1 (ANA-10 §9.1 required MOD-17's M3 before
   it), and MOD-13's, MOD-15's and MOD-23's create/edit paths for a server-less box, which no longer
-  exist. **MOD-2's close-out must restate, not silently drop, its claim on ANA-4 §11 criterion 12**
-  (an offline chat buffers and `upload_pending` lands exactly those rows): it was proven on
-  2026-09-08 and is being withdrawn with the mode, which is a different sentence from "unproven".
+  exist. **MOD-2's close-out restated rather than silently dropped its claim on ANA-4 §11 criterion
+  12** (an offline chat buffers and `upload_pending` lands exactly those rows), as this item asked:
+  `docs/decisions/mod/mod-2.md`, "Known, accepted, and handed on" — it was proven end to end on
+  2026-09-08 by `crates/htui/tests/chat_offline.rs` and is being withdrawn **with the mode**, which
+  is a different sentence from "unproven". Disabling that path, and the CLEAN item that later
+  deletes it, are still this item's.
   Not blocked. `docs/ANA-10.md` stays in the tree as the analysis that was done and not taken. **This item also owns the masked DSN field inside the Settings connection section, replacing MOD-17.**
 - [ ] **MOD-24 - Fault Tolerance of Agent Processes.** Implement agent memory checkpointing to Postgres. If the daemon or TUI crashes mid-run, `htui` should be able to read the last `SessionEvent` from Postgres, re-hydrate the agent's context window, and resume the exact step it was on so that multi-hour runs can survive process restarts.
 
@@ -754,7 +484,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 2 (ANA-11 requirements/decisions models, ANA-14 Redis research)                                 |
-| MOD-N   | 25 (MOD-2 driver, MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-29 Bugsink integration; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 3 (ANA-11 requirements/decisions models, ANA-14 Redis research, ANA-16 execution environments)                                 |
+| MOD-N   | 27 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-29 Bugsink integration, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                        |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

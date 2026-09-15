@@ -155,7 +155,7 @@ Concretely in scope:
 | 6 | `agy` over ACP | A second agent works through the same code paths as the first, differing only by registry row and capability banner. | complete | [plan](../plans/mod-2-agy-acp.plan.md), [T34 close-out](../plans/mod-2-quota-caps.plan.md) |
 | 7 | Quota and caps | Remaining allowance is visible per agent per box; a per-token cap breach cancels the session rather than being noticed on the invoice. | complete | [plan](../plans/mod-2-quota-caps.plan.md) |
 | 8 | Degraded CLI transport | An agent without ACP is still usable, with the capability banner stating exactly what it cannot do. | complete | [plan](../plans/mod-2-cli-transport.plan.md) |
-| 9 | Prompt assembler + preview | The maintainer can see the exact prompt a step would receive — sections, trim record, digest — and confirm the ten default template bodies before MOD-4 depends on them. | pending | — |
+| 9 | Prompt assembler + preview | The maintainer can see the exact prompt a step would receive — sections, trim record, digest — and confirm the ten default template bodies before MOD-4 depends on them. | complete | [plan](../plans/mod-2-prompt-assembler.plan.md) |
 
 Milestone 6 went `complete` when `T34` closed inside milestone 7's plan. Milestone 7 also carried
 `T46`, which was **not** in its original scope: the review gate's live evidence showed ANA-4 §11
@@ -164,25 +164,52 @@ had passed only because the fake transport never flushed mid-tool-call. It is fi
 no new store seam, so criterion 6 is now honest for MOD-2's close-out.
 
 Milestones 1–8 follow `docs/ANA-4.md` §9's build order; milestone 9 is `docs/ANA-5.md` §8's, and is
-independent of 3–8 (it shares only milestone 1's store work). Milestone 9 may run in parallel with
-3–8 or land last; the plan decides.
+independent of 3–8 (it shares only milestone 1's store work). Milestone 9 ran last, over the plan
+`.claude/plans/mod-2-prompt-assembler.plan.md` and its blueprint, in twelve tasks T59–T70.
+
+**All nine milestones are complete.** MOD-2 is closed out at `docs/decisions/mod/mod-2.md`
+(2026-09-15).
 
 ## Open Questions
 
-Carried from the concluded analyses. None blocks the start; each must be closed or explicitly
-re-deferred before MOD-2 is marked done.
+Carried from the concluded analyses. None blocked the start; each is closed below, with the decision
+that closed it. Two **new** questions this item opened and did **not** close are listed after them.
 
-- [ ] How is `R-PRM-1`'s "current project when no workspace" bound expressed, given the shipped
-      `Scope` mandates a `workspace_id`? (`Scope::single_project` vs a separate `PromptScope`;
-      `docs/ANA-5.md` §4.3 step 1)
-- [ ] Can `conformance::run_case` be generalised over `ReadStore` so the four `ReadStore` additions
-      run against `CacheStore`, or does the mirror comparison need its own harness? Generalising
-      touches a shipped signature. (`docs/ANA-5.md` §8)
-- [ ] Can `set_step_usage`'s `prompt_digest` parameter be dropped once `set_step_prompt` exists, or
-      does the chat path still need it? (`docs/ANA-5.md` §4.4)
-- [ ] Do `agy` and `claude` want different excerpt renderings (line numbers on or off)? If yes,
-      `prompt_digest` becomes agent-dependent. (`docs/ANA-5.md` §10 item 9)
-- [ ] The remaining `ANA-4 §11.14` items — `claude-agent-acp` model config ids and empty-option
+- [x] **How is `R-PRM-1`'s "current project when no workspace" bound expressed, given the shipped
+      `Scope` mandates a `workspace_id`?** (`docs/ANA-5.md` §4.3 step 1) — **Closed by D95: neither
+      option as posed; a new type.** `PromptScope { workspace: Option<WorkspaceId>, project:
+      ProjectId }` lands in `model/scope.rs` with `from_scope` and `project_only`, and the shipped
+      `Scope` is not touched. `Scope::single_project` would have had to invent a `workspace_id`,
+      and `R-ENT-2` says there are no implicit workspace rows while `scope.rs` documents itself as
+      "always one workspace, never a bare project list" — 20+ sites across five crates mean "the
+      active workspace" by it. The amended §7.3 SQL already binds `$workspace` and `$project`
+      separately, so the second type costs nothing at the query. It also surfaced a **third ANA-5
+      staleness**: `docs/ANA-5.md:753-758`'s store-trait snippet still declares
+      `upstream_summaries(.., scope: &Scope)`, contradicting §4.3 step 1 of the same document; the
+      signature was taken from the blueprint.
+- [x] **Can `conformance::run_case` be generalised over `ReadStore`?** (`docs/ANA-5.md` §8) —
+      **Closed by D96: the question has a sharper answer than it expected.** `run_case` is *already*
+      generic (`run_case<S: WriteStore>`), and the bound cannot be relaxed because eleven of the
+      twenty-two existing cases call write methods — relaxing it means splitting every one, which is
+      exactly the shipped-signature cost the question flagged. A second, **additive** harness lands
+      beside it instead: `READ_CASES` + `run_read_case<S: ReadStore>` + `run_all_reads`, six cases,
+      with `CacheStore` bound to that one. No existing case changed a byte, and criterion 19's
+      second clause became a test rather than a claim.
+- [x] **Can `set_step_usage`'s `prompt_digest` parameter be dropped once `set_step_prompt` exists?**
+      (`docs/ANA-5.md` §4.4) — **Closed by D97: it keeps it, and this is not a deferral.** ANA-5 §9
+      listed it as superseded; the tree says otherwise. Its only production caller is
+      `record.rs`'s **free-standing chat** path, whose prompt has no template, no sections and no
+      assembler — ANA-5 §4.4 puts that path out of scope by name — so its digest is computed in the
+      recorder and has nowhere else to be written. Dropping the parameter would delete the chat
+      path's only digest writer in order to tidy a signature. The assembler path passes `None` and
+      writes through `set_step_prompt`, which is the split ANA-5 actually wanted.
+- [x] **Do `agy` and `claude` want different excerpt renderings?** (`docs/ANA-5.md` §10 item 9) —
+      **Closed by D98: no. One rendering, line numbers on, `N | ` form, for both families, and
+      `prompt_digest` stays agent-independent.** Nothing measured across milestones 3–8 argues for
+      divergence — both families' edit tools address content the same way — and an agent-dependent
+      digest would break invariant 3's fan-out identity the moment MOD-4 mixed families across one
+      fan-out. It is also one golden snapshot per fixture instead of two.
+- [x] The remaining `ANA-4 §11.14` items — `claude-agent-acp` model config ids and empty-option
       behaviour, `rate_limit_event` ordering, the `--permission-prompt-tool` contract (deferred to
       MOD-11), and the `agy` CLI `statusLine` quota payload. **Milestone 8 closed the two CLI ones
       from live runs** (`crates/htui-agent/tests/cli_live.rs`, ten probes, fifteen committed
@@ -191,10 +218,45 @@ re-deferred before MOD-2 is marked done.
       leaves exit 143 and no `result` (findings F-1..F-3); and the *CLI thinking block shape* —
       §6.2's shape is right and its payload is empty, `thinking` being the empty string beside a
       signature, so a `thought` over this transport carries no prose (F-6). Milestone 7 closed the
-      four `agy` ones and its `.par` mechanics.
-- [ ] Per-family `chars-v1` estimator constants are reasoned interpolations, not measurements.
+      four `agy` ones and its `.par` mechanics. **Milestone 9 closed the last of them**: the
+      `--permission-prompt-tool` contract stays **re-deferred to MOD-11 by name**, which is its only
+      route, and the `agy` CLI `statusLine` quota payload is moot — `agy_acp_server` emits no usage
+      of any kind, so its seed keeps `quota.source: "none"` and its quota column reads `—` by
+      design.
+- [x] **Per-family `chars-v1` estimator constants are reasoned interpolations, not measurements.
       Calibration against real `run_step.usage` is deferred — confirm deferral survives MOD-2's
-      first live runs. (`docs/ANA-5.md` §4.4)
+      first live runs.** (`docs/ANA-5.md` §4.4) — **Closed by D99 then D108: the deferral did not
+      survive, and it was measured rather than repeated.** D99 scheduled a two-point differential
+      against the live `claude` CLI *before* `estimate.rs` was finalised, with a stated rule: the
+      constants change only outside ±25%. It fired. Measured 2026-09-11 against `claude` 2.1.267:
+      prose **2.507** and **2.494** chars/token at two corpus sizes (0.5% apart, so linear), code
+      **2.440** — against §4.4's shipped 3.5 / 3.0. Prose is 28.4% off, and off in the **overflow**
+      direction: assuming 3.5 under-counts prose by 40%, so a prompt the assembler believes is
+      108 000 tokens is 151 000, against a 10% reserve sized for a rounding error. It would have
+      shipped silently, because every trim assertion checks internal arithmetic a wrong constant
+      satisfies perfectly. **D108** therefore ships the estimator as **`chars-v2`, prose 25 / code
+      24** (×10 integers) — a *new id*, not new constants under the old one, because
+      `trim_record.estimator` is what makes a stored record interpretable. The GPT/Gemini row keeps
+      ANA-5's 40 / 33 under `chars-v1-gpt` and keeps its "Unverified" status, because it would be
+      measured against `agy` and `agy_acp_server` emits no `usage_update` to difference (F-17). The
+      measurement is committed as a repeatable `#[ignore]`d live test,
+      `crates/htui-agent/tests/estimator_live.rs`, not as a table in a plan. **This amends
+      `docs/ANA-5.md` §4.4's constants and §5.1's example `estimator` value; the amendment is
+      recorded in `docs/decisions/mod/mod-2.md`, not in the ANA** (maintainer-only, the milestone-5
+      precedent).
+
+**Opened by this item and left open for the maintainer** — recorded so they are not mistaken for
+closed:
+
+- [ ] **F-34 — `docs/ANA-5.md` §4.4 step 7 and §5.1's worked example disagree, and the example is
+      arithmetically impossible.** Step 7 is what the code implements (blueprint D.2); which of the
+      two the ANA meant is a maintainer decision.
+- [ ] **F-37 — the separator between the N blocks of `{{documents}}` / `{{candidates}}` is undecided
+      in the ANA.** A blank line was chosen so the milestone could render something. It is a digest
+      input, so changing it invalidates every golden snapshot.
+- [ ] **L-5 — `render.rs` renders `hostname:` into digested bytes.** Sanctioned by §4.2's closed
+      field list, but it is a machine identifier, so identical inputs digest differently on another
+      box.
 
 ## Risks
 
@@ -210,4 +272,6 @@ re-deferred before MOD-2 is marked done.
 | Nine milestones is a long single item; a session limit lands mid-flight | High | Low | Milestones are independently completable and each is a plan of its own; `HANDOFF.md` phase notes per `lifecycle.md` P1 carry state between sessions |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: **DELIVERED, 2026-09-15.** All nine milestones complete; all six open questions closed
+(three new ones opened for the maintainer and listed above). Closed out at
+`docs/decisions/mod/mod-2.md`.*

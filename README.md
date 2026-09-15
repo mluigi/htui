@@ -183,9 +183,44 @@ pending migrations, and never by the user.
 | `J` / `K` | Scroll the detail pane one row down / up — in **Runs**, move the cursor over the runs and their steps |
 | `PageDown` / `PageUp` | Scroll the detail pane ten rows |
 | `Enter` (in **Runs**) | Replay the selected step in the Chat tab, read-only |
+| `n` / `p` (in **Prompt**) | Preview the next / previous template of this item's project |
 
-The five detail sub-tabs are **Body**, **Runs**, **Graph**, **Documents** and **Notes**
+The six detail sub-tabs are **Body**, **Runs**, **Graph**, **Documents**, **Notes** and **Prompt**
 (`R-TUI-3`). The Skills tab is still a placeholder; the Settings tab lists the agent registry.
+
+A step row in **Runs** shows a second line whenever a prompt was assembled for it: the estimated
+token count (`~36k`) and a `!` when any section was trimmed to fit the budget.
+
+### The prompt preview
+
+The **Prompt** sub-tab shows the exact prompt a step on this item would be given (`R-PRM-1..3`) —
+assembled by the same code a run uses, and **read-only**: it writes no row, records no event and
+starts no session.
+
+It renders four things, in order:
+
+- the **digest** — the `sha256` of the canonical prompt text, which is what `run_step.prompt_digest`
+  stores and what makes two fan-out siblings provably identical;
+- the **budget and section table** — the token budget, which setting answered it
+  (`budget_source`: a phase override, a project setting, an `app_setting` row, or the compiled-in
+  default), the estimator id, and one row per section with its tokens before and after trimming, the
+  trim strategy that was applied and whether it fired;
+- the **excerpt audit** — which repository roots resolved, which files were selected and at what
+  size, which were skipped and under which rule, and which excerpt providers answered;
+- the **canonical text** itself, verbatim, scrolled with `J` / `K`.
+
+Nothing in the header is parsed out of the text: every line comes from the trim record's own fields,
+so a `</section>` inside a document body is inert.
+
+`n` and `p` cycle through the templates the item's project has, so the same item can be previewed as
+`prd`, `plan`, `implement` and so on. Three inputs a real run gets from the orchestrator are not
+available yet and are **declared rather than defaulted** — they appear in the record's `notes` —
+namely the attempt number (the preview assumes 1), which documents a phase would receive (the
+preview takes the latest version of each kind), and the repository working trees (the preview
+resolves none, so the excerpt section is absent and each repo records `no_path`).
+
+The preview needs the database: on a box that cannot reach its Postgres it refuses with one sentence
+rather than showing a prompt assembled from partial data.
 
 ### Chat tab
 
