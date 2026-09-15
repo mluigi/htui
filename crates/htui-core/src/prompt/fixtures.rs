@@ -142,6 +142,9 @@ pub fn phase_implement_attempt2() -> PromptSpec {
         considered: 143,
         selected: 2,
         caps: demo_caps(),
+        // §5.1's example row verbatim, `"5f0a..."` included. It is a **shape**, not a hash, and
+        // nothing reads it: `assemble()` rebuilds `files[]` from the surviving excerpts and hashes
+        // each one's rendered block itself (plan F-39), so a fixture cannot pin a wrong digest.
         files: vec![FileRecord {
             repo: "htui".to_owned(),
             path: "crates/htui-core/src/prompt/mod.rs".to_owned(),

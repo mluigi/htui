@@ -537,6 +537,77 @@ fn every_marker_matches_its_record() {
 }
 
 #[test]
+fn the_record_hashes_the_rendered_excerpt_block() {
+    // ANA-5 §4.5 `:1136-1137`: "`sha256` is over the excerpt's rendered content bytes, not the
+    // whole file, so a reader can prove which bytes the model saw without storing them."
+    //
+    // Plan F-39 recorded that T65 narrowed `files[]` from the ranker's own records instead,
+    // because `render::file_block` was private. This is that hole closed: the record is rebuilt
+    // from the surviving excerpts and hashed over the bytes the prompt actually carries.
+    let prompt = ok(&fixtures::phase_implement_attempt2());
+    let files = &prompt.trim.excerpts.files;
+    assert_eq!(files.len(), 2, "both fixture excerpts survived: {files:?}");
+    for file in files {
+        let open = format!("<file path=\"{}:{}\" ", file.repo, file.path);
+        let at = prompt
+            .text
+            .find(&open)
+            .unwrap_or_else(|| panic!("`{open}` is not in the prompt:\n{}", prompt.text));
+        let end = prompt.text[at..]
+            .find("</file>")
+            .expect("every block closes")
+            + "</file>".len();
+        let block = &prompt.text[at..at + end];
+        assert_eq!(
+            file.bytes,
+            block.len() as u64,
+            "`{}` records {} bytes and the rendered block is {}",
+            file.path,
+            file.bytes,
+            block.len()
+        );
+        assert_eq!(
+            file.sha256,
+            htui_core::prompt::digest::sha256_hex(block),
+            "`{}`'s recorded digest is not its rendered block's",
+            file.path
+        );
+        assert_eq!(file.sha256.len(), 64, "lowercase sha256 hex, all 64");
+        assert!(
+            block.contains(&format!(" lines=\"{}\"", file.lines)),
+            "the record's `lines` is the attribute's"
+        );
+    }
+    // The audit's own `selected` is the ranker's and is allowed to differ from `files`.
+    assert_eq!(prompt.trim.excerpts.selected, 2);
+}
+
+#[test]
+fn a_dropped_excerpt_leaves_its_record_behind_and_nothing_else() {
+    // §5.1 `:1536-1538`: `selected` is what the ranker paid for, `files` is what reached the
+    // model, and the trimmer is allowed to make the two disagree.
+    let prompt = ok(&fixtures::phase_oversize());
+    let excerpts = &prompt.trim.excerpts;
+    assert!(
+        excerpts.selected > 0,
+        "the oversize fixture selected excerpts"
+    );
+    assert!(
+        excerpts.files.len() < excerpts.selected as usize,
+        "the trim dropped at least one: {excerpts:?}"
+    );
+    for file in &excerpts.files {
+        assert!(
+            prompt
+                .text
+                .contains(&format!("<file path=\"{}:{}\" ", file.repo, file.path)),
+            "`{}` is recorded and is not in the prompt",
+            file.path
+        );
+    }
+}
+
+#[test]
 fn reserve_target_is_integer_arithmetic() {
     let spec = fixtures::phase_implement_attempt2();
     let record = ok(&spec).trim;

@@ -17,11 +17,12 @@
 //! [`template`], the `{{name}}` scanner and its closed per-role placeholder sets, and [`estimate`],
 //! the `chars-v2` token estimator every budget decision is measured with. T60 landed [`defaults`].
 //! T64 landed the input surface — [`PromptSpec`] and everything it owns — plus [`render`], the
-//! per-section renderers, and [`digest`], the canonical form and its hash. T65 lands [`assemble`]
-//! itself, [`trim`]'s five-step order and its record, and [`settings`]'s budget chain. The excerpt
-//! ranker behind [`excerpt`] is T66's: until it lands, a caller supplies an
-//! [`ExcerptSet`] it resolved itself, and the preview supplies an empty one
-//! by design (plan D103).
+//! per-section renderers, and [`digest`], the canonical form and its hash. T65 landed [`assemble`]
+//! itself, [`trim`]'s five-step order and its record, and [`settings`]'s budget chain. T66 lands
+//! [`excerpt`]'s five-tier ranker, its [`ExcerptProvider`](excerpt::ExcerptProvider) seam and
+//! [`excerpt::select`], whose filesystem half is `htui_agent::excerpt`. A caller that resolved no
+//! readable root still supplies an empty [`ExcerptSet`], which is what the preview does by design
+//! (plan D103).
 
 pub mod defaults;
 pub mod digest;
@@ -519,7 +520,7 @@ pub fn assemble(
         &spec.template,
         template_tokens,
         sections,
-        surviving_audit(spec, &kept_excerpts),
+        surviving_audit(spec, &kept_excerpts, scrubber)?,
         notes(spec),
     );
     Ok(AssembledPrompt {
@@ -683,22 +684,48 @@ fn scrub_text(
     })
 }
 
-/// §4.5's audit with `files[]` narrowed to what survived the trim (§5.1 `:1536-1538`).
+/// §4.5's audit with `files[]` **rebuilt** from what survived the trim (§5.1 `:1536-1538`).
 ///
 /// `selected` and `files` are deliberately allowed to disagree: `selected` is what the ranker chose
 /// and paid for, `files` is what reached the model. A dropped section therefore leaves `selected:
 /// 3` beside an empty `files`, and a reader can see the difference.
-fn surviving_audit(spec: &PromptSpec, kept: &[usize]) -> excerpt::ExcerptAudit {
-    let surviving: Vec<(&str, &str)> = kept
-        .iter()
-        .filter_map(|index| spec.excerpts.files.get(*index))
-        .map(|file| (file.repo.as_str(), file.path.as_str()))
-        .collect();
+///
+/// Rebuilt rather than narrowed, which closes plan **F-39**. T65 retained the ranker's own
+/// [`FileRecord`](excerpt::FileRecord)s because `render::file_block` was private, so the recorded
+/// `sha256` was whatever the ranker had put there. §4.5 `:1136-1137` defines it over the excerpt's
+/// **rendered** bytes, and those are the bytes after the scrub (plan D100) — so each surviving
+/// block is rendered, scrubbed with the same scrubber the section was, and hashed. A record whose
+/// digest described the pre-scrub rendering would name a string nobody was sent.
+///
+/// Scrubbing block by block rather than slicing the scrubbed section is deliberate and is the same
+/// operation: `MinimalScrubber` masks string leaves, so the mask of a concatenation is the
+/// concatenation of the masks, and the alternative would be locating each block inside text the
+/// masking may have shortened.
+///
+/// # Errors
+///
+/// [`AssembleError::Unmasked`] cannot fire here in practice — the whole section scrubbed clean at
+/// step 3, and each block is a substring of it — but it is propagated rather than swallowed, so a
+/// future scrubber that is not substring-stable fails loudly instead of recording a wrong hash.
+fn surviving_audit(
+    spec: &PromptSpec,
+    kept: &[usize],
+    scrubber: &dyn Scrubber,
+) -> Result<excerpt::ExcerptAudit, AssembleError> {
     let mut audit = spec.excerpts.audit.clone();
-    audit
-        .files
-        .retain(|file| surviving.contains(&(file.repo.as_str(), file.path.as_str())));
-    audit
+    audit.files = Vec::new();
+    for index in kept {
+        let Some(file) = spec.excerpts.files.get(*index) else {
+            continue;
+        };
+        let block = scrub_text(
+            scrubber,
+            &render::file_block(file),
+            &SectionName::Excerpts.render(),
+        )?;
+        audit.files.push(excerpt::file_record(file, &block));
+    }
+    Ok(audit)
 }
 
 /// `trim_record.notes`: the caller's first (plan D103's declared stand-ins), then the excerpt
