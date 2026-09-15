@@ -29,6 +29,23 @@
 //! | prose, half | 20 000 chars | that the relation is *linear*, i.e. the baseline subtraction is sound |
 //! | code | 40 000 chars | the code rate |
 //!
+//! What it measured when it was committed, against `claude` **2.1.272**, model `claude-opus-5[1m]`
+//! — the first run of this file as a file, and the confirmation D108 asked for:
+//!
+//! | run | chars | total input tokens | delta | chars/token | F-16, 2026-09-11 |
+//! |---|---|---|---|---|---|
+//! | baseline | — | 17 327 | — | — | 17 150 |
+//! | prose | 40 002 | 33 672 | 16 345 | **2.447** | 2.507 |
+//! | prose, half | 20 002 | 25 494 | 8 167 | **2.449** | 2.494 |
+//! | code | 40 002 | 33 492 | 16 165 | **2.475** | 2.440 |
+//!
+//! `chars-v2` holds: prose 2.1% under its 2.5 and code 3.1% over its 2.4, both far inside the
+//! ±[`TOLERANCE`] this file allows, and the two prose sizes 0.07% apart. The prose figure sits
+//! below F-16's because the corpus is a different sample of ANA-5 (see F-61 below), not because
+//! anything moved; the code corpus is unchanged from the probe's and 2.475 against 2.440 is 1.4%.
+//! The baseline rose 17 150 → 17 327 with the CLI's own five patch versions, which is exactly what
+//! the subtraction exists to absorb: it moves the baseline and not one ratio.
+//!
 //! The reply is pinned to one word ([`BASELINE_PROMPT`]) so the model's own production cannot move
 //! an input figure, and each turn runs in its own throwaway working directory and its own process,
 //! so no turn inherits another's context.
