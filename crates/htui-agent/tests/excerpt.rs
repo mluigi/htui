@@ -662,6 +662,30 @@ fn the_binary_probe_covers_the_whole_first_8_kb() {
 }
 
 #[test]
+fn the_scan_cap_counts_directories_too() {
+    // L2: the cap exists to bound the walk's *cost*, and a `read_dir` plus a `.gitignore` open per
+    // level is what a tree of nested directories costs without ever presenting a regular file. A
+    // cap that counted only files walked such a tree unbounded.
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    let mut deep = std::path::PathBuf::new();
+    for _ in 0..40 {
+        deep.push("d");
+    }
+    write(
+        dir.path(),
+        &format!("{}/leaf.rs", deep.to_string_lossy()),
+        b"fn x() {}\n",
+    );
+    let reader = FsRepoReader::default();
+    let (paths, truncated) = reader.list(&fs_root(dir.path()), 5).expect("readable");
+    assert!(truncated, "forty directories is well past a cap of five");
+    assert!(
+        paths.is_empty(),
+        "and the walk stopped long before the leaf: {paths:?}"
+    );
+}
+
+#[test]
 fn scan_cap_sets_truncated() {
     // §4.5 step 2: "Cap the walk at `app_setting.excerpt_max_scan_files` … and record
     // `scan_truncated` when the cap bites."
@@ -676,10 +700,15 @@ fn scan_cap_sets_truncated() {
 
     let (capped, truncated) = reader.list(&fs_root(dir.path()), 5).expect("readable");
     assert!(truncated, "the cap bit");
-    assert_eq!(capped.len(), 5);
+    assert_eq!(
+        capped.len(),
+        4,
+        "five entries: the `src/` directory, then four of its files (see \
+         `the_scan_cap_counts_directories_too`)"
+    );
     assert_eq!(
         capped,
-        all[..5].to_vec(),
+        all[..4].to_vec(),
         "a truncated listing is a prefix of the full one, never a different set"
     );
 

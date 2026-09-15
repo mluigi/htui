@@ -242,6 +242,17 @@ impl FsRepoReader {
             } else {
                 format!("{relative}/{name}")
             };
+            // The cap is charged **here**, for every entry and before it is stat-ed, because the
+            // cap bounds the walk's *cost* and a `read_dir` plus a `.gitignore` open per level is
+            // what a directory costs. Counting only regular files let a tree of nested directories
+            // walk unbounded while presenting nothing to count. Charging skipped entries too keeps
+            // the truncated listing a **prefix** of the untruncated one, which is what makes
+            // `scan_truncated` mean "there is more below this".
+            *examined += 1;
+            if *examined > cap {
+                truncated = true;
+                break;
+            }
             let path = base.join(&child);
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 continue;
@@ -271,11 +282,6 @@ impl FsRepoReader {
             }
             if !meta.is_file() {
                 continue;
-            }
-            *examined += 1;
-            if *examined > cap {
-                truncated = true;
-                break;
             }
             if self.skip(&child, ignores, Some(&path)).is_none() {
                 out.push(child);
@@ -452,9 +458,13 @@ fn probe(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
 }
 
 impl RepoReader for FsRepoReader {
-    /// The cap counts every regular file the walk **examines**, skipped ones included, because the
-    /// cap exists to bound the walk's cost and a stat of a lockfile costs what a stat of a source
-    /// file costs. A truncated listing is therefore always a prefix of the untruncated one, never a
+    /// The cap counts every **entry** the walk examines — files, directories and skipped ones
+    /// alike — because the cap exists to bound the walk's cost, a stat of a lockfile costs what a
+    /// stat of a source file costs, and a directory costs a `read_dir` and a `.gitignore` open on
+    /// top. A cap that counted only regular files walked a tree of nested empty directories
+    /// unbounded, which is what `the_scan_cap_counts_directories_too` pins.
+    ///
+    /// A truncated listing is therefore still always a prefix of the untruncated one, never a
     /// different set — which is what makes `scan_truncated` mean "there is more below this", and
     /// what `scan_cap_sets_truncated` pins.
     fn list(&self, root: &RepoRoot, cap: u32) -> Result<(Vec<String>, bool), ProviderError> {
