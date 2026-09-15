@@ -978,7 +978,7 @@ fn joined(lines: &[&str]) -> String {
 /// Pure over `reader`: with an in-memory double no filesystem is touched, which is what makes the
 /// tier, denylist and windowing cases unit tests rather than integration tests (hazard H-22).
 ///
-/// `providers` is the `provider_set` [`htui_agent::excerpt::run_providers`] produced, in P-11's
+/// `providers` is the `provider_set` `htui_agent::excerpt::run_providers` produced, in P-11's
 /// grammar; [`BUILTIN_ID`] is forced to the front if the caller left it out, because §4.5 `:1201`
 /// makes the built-in un-removable and a record that omitted it would claim a prompt no code path
 /// can produce.
