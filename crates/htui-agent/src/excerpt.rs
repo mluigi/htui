@@ -40,7 +40,12 @@ pub const BINARY_PROBE_BYTES: usize = 8_192;
 
 /// The highest weight a provider may claim; `htui` re-normalises against its own tiers
 /// (§4.5 `:1164`).
-const MAX_PROVIDER_WEIGHT: u16 = 100;
+///
+/// Re-exported from `htui-core` rather than spelled again here. The ceiling is a property of
+/// [`ExcerptCandidate`], which that crate owns, and
+/// [`select`](htui_core::prompt::excerpt::select) clamps to it as well — two independent `100`s
+/// were how finding F-100 arrived, with the invariant enforced only by the impure crate.
+pub use htui_core::prompt::excerpt::MAX_PROVIDER_WEIGHT;
 
 /// §4.5's six skip rules (`:1066-1075`), in the order they are evaluated.
 ///

@@ -348,6 +348,16 @@ pub const TIER2_PREV_DIFF: u16 = 90;
 pub const TIER3_MENTIONED: u16 = 70;
 /// Tier 4 (`:1029`): a path component matching a mentioned identifier.
 pub const TIER4_IDENTIFIER: u16 = 50;
+/// The highest weight any candidate may carry, provider or tier (§4.5 `:1164`).
+///
+/// Tier 1's weight *is* the ceiling: a provider "may propose, and it may not claim a tier", so the
+/// most it can claim is as much as the strongest tier. [`select`] clamps to this in [`vetted`] —
+/// in the pure crate, where the invariant is documented — rather than trusting
+/// `htui_agent::excerpt::run_providers` to have done it. That is review finding F-100: a candidate
+/// reaching [`select`] by any other route used to be able to carry `u16::MAX` and outrank every
+/// tier-1 file, because step 5 sorts on `weight desc`.
+pub const MAX_PROVIDER_WEIGHT: u16 = TIER1_TOUCHED;
+
 /// Tier 5's floor (`:1030`): `10 + a 0..9 lexical score`.
 pub const TIER5_BASE: u16 = 10;
 /// Tier 5's span: the lexical score is quantised into `0..=9` before anything is compared.
@@ -1257,6 +1267,14 @@ pub fn select(
 /// `scan_cap`, is **refused**. That is the conservative direction, it is recorded as a note, and it
 /// is what "the pure crate does not depend on the impure one for a security property" costs.
 ///
+/// Every kept candidate's weight is **clamped to [`MAX_PROVIDER_WEIGHT`]** on the way through, and
+/// that clamp is here rather than only in `run_providers` for the reason the listing test is here:
+/// `0..=100` is this crate's documented invariant on [`ExcerptCandidate::weight`], step 5 sorts on
+/// `weight desc` and step 6 keeps the higher weight, so a candidate carrying `u16::MAX` outranks
+/// every tier-1 file. A caller that builds a candidate without `run_providers` — a future
+/// in-process provider, a test double, a row read back — must not be able to do that (finding
+/// F-100).
+///
 /// Built only when there is something to vet: `merged` is empty in every path with no provider
 /// registered, which is every path until MOD-4 wires one, and the listing runs to `scan_cap`.
 fn vetted(
@@ -1276,7 +1294,7 @@ fn vetted(
             .insert(entry.path.as_str());
     }
     let mut kept = Vec::with_capacity(merged.len());
-    for candidate in merged {
+    for mut candidate in merged {
         if !is_repo_relative(&candidate.path) {
             notes.push(format!(
                 "excerpt: candidate `{}:{}` is not repo-relative; dropped",
@@ -1303,6 +1321,10 @@ fn vetted(
             ));
             continue;
         }
+        // Silently, and not as a note: an over-weight candidate is a defect in whatever built it,
+        // not a fact about this item, and a note here would appear in the record of every prompt
+        // that provider touched.
+        candidate.weight = candidate.weight.min(MAX_PROVIDER_WEIGHT);
         kept.push(candidate);
     }
     kept
@@ -1908,6 +1930,62 @@ mod tests {
             set.notes.iter().any(|note| note.contains("/etc/passwd")),
             "and its exclusion is recorded: {:?}",
             set.notes
+        );
+    }
+
+    #[test]
+    fn an_over_weight_provider_candidate_cannot_outrank_a_tier_1_file() {
+        // Review finding F-100, the same shape as HIGH H1 one field over: `ExcerptCandidate.weight`
+        // is documented `0..=100` and only `htui_agent::excerpt::run_providers` was clamping it. A
+        // candidate built without that call — a future in-process provider, a test double, a
+        // deserialised row — could carry `u16::MAX` and sort ahead of every tier-1 file, because
+        // step 5 orders on `weight desc` and step 6 keeps the higher weight. The clamp belongs
+        // where the candidate enters the pure crate.
+        let mut owned = request("nothing\n", &["src/a.rs"], &[]);
+        owned.roots = vec![root("htui")];
+        let reader = MapReader::with(&[
+            ("htui", "src/a.rs", "fn a() {}\n"),
+            ("htui", "src/b.rs", "fn b() {}\n"),
+        ]);
+        let merged = vec![ExcerptCandidate {
+            repo: "htui".to_owned(),
+            path: "src/b.rs".to_owned(),
+            lines: None,
+            weight: u16::MAX,
+            reason: "serena".to_owned(),
+        }];
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            merged,
+            vec![BUILTIN_ID.to_owned(), "serena@0.1".to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+        let b = set
+            .files
+            .iter()
+            .find(|file| file.path == "src/b.rs")
+            .expect("the provider's candidate is kept, only clamped");
+        assert_eq!(
+            b.weight, MAX_PROVIDER_WEIGHT,
+            "a provider weight is clamped to the documented ceiling, not taken verbatim"
+        );
+        let a = set
+            .files
+            .iter()
+            .find(|file| file.path == "src/a.rs")
+            .expect("the tier-1 file is selected");
+        assert_eq!(
+            a.rank, 1,
+            "a touched path still ranks first: {:?}",
+            set.files
+        );
+        assert!(
+            set.files
+                .iter()
+                .all(|file| file.weight <= MAX_PROVIDER_WEIGHT),
+            "no weight in the audit exceeds tier 1's: {:?}",
+            set.files
         );
     }
 
