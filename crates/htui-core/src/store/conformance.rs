@@ -1588,6 +1588,63 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
         "set_step_prompt_writes_digest_and_trim: the second record replaces the first, trim and all"
     );
 
+    // `trim_record` is an untyped JSON column, so "the three projections agree" has to hold for
+    // documents no assembler would write as well as for the one it does (T68, F-52). Each of
+    // these made one backend disagree with `prompt_summary` before T68: the SQL casts raised, and
+    // an error is not a projection — it fails the whole Runs read over one bad row.
+    for (label, record) in [
+        (
+            "a string where a number belongs",
+            json!({ "estimated_after": "34000" }),
+        ),
+        ("a float", json!({ "estimated_after": 35_988.5 })),
+        (
+            "a number past i32",
+            json!({ "estimated_after": 3_000_000_000_i64 }),
+        ),
+        (
+            "a number past -i32",
+            json!({ "estimated_after": -3_000_000_000_i64 }),
+        ),
+        (
+            "sections as an object",
+            json!({ "sections": { "a": { "trimmed": true } } }),
+        ),
+        (
+            "a trimmed that is a string",
+            json!({ "sections": [{ "trimmed": "nope" }] }),
+        ),
+        (
+            "a trimmed that is the integer 1",
+            json!({ "sections": [{ "trimmed": 1 }] }),
+        ),
+        ("sections of scalars", json!({ "sections": [5, "x"] })),
+        ("an empty record", json!({})),
+    ] {
+        store
+            .set_step_prompt(ids::STEP_IMPL, "dead", &record)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("set_step_prompt_writes_digest_and_trim: writing {label} must land: {error}")
+            });
+        let read = store.runs(ids::HTUI_FEAT_1).await.unwrap_or_else(|error| {
+            panic!(
+                "set_step_prompt_writes_digest_and_trim: {label} must project, not fail the \
+                 whole read: {error}"
+            )
+        });
+        assert_eq!(
+            tokens_of(&read, ids::STEP_IMPL),
+            Some(crate::model::prompt_summary(Some(&record))),
+            "set_step_prompt_writes_digest_and_trim: {label} projects as `prompt_summary` does"
+        );
+        assert_eq!(
+            tokens_of(&read, ids::STEP_IMPL),
+            Some((None, false)),
+            "set_step_prompt_writes_digest_and_trim: and that answer is `no figure, no trim`"
+        );
+    }
+
     let unknown = store
         .set_step_prompt(StepId::new(), "9f8e", &json!({}))
         .await;

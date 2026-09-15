@@ -336,9 +336,22 @@ impl ReadStore for PgStore {
                    -- §6.1 exposes neither it nor `prompt_digest`. `htui_core::model::prompt_summary`
                    -- is the same derivation in Rust, and `MemStore` uses it, so the two agree by
                    -- the `set_step_prompt` conformance case rather than by luck.
-                   (s.trim_record->>'estimated_after')::int          AS "prompt_tokens?",
-                   COALESCE((SELECT bool_or((e->>'trimmed')::bool)
-                               FROM jsonb_array_elements(s.trim_record->'sections') e),
+                   --
+                   -- Lax jsonpath rather than casts (T68, F-52): `trim_record` is an untyped
+                   -- `JSONB` column, and `(…->>'estimated_after')::int` *raises* on a string, a
+                   -- float or a number outside `i32`, as `jsonb_array_elements` does on a
+                   -- `sections` that is not an array and `::bool` on a `trimmed` that is not one.
+                   -- Any of those would fail the whole Runs read over one bad row, where
+                   -- `prompt_summary` answers `(None, false)`; a jsonpath that matches nothing
+                   -- yields SQL `NULL`, which is the same answer. The filter spells out what
+                   -- `Value::as_i64` accepts: a number, integral, in range.
+                   (jsonb_path_query_first(
+                        s.trim_record,
+                        '$.estimated_after ? (@.type() == "number" && @.floor() == @
+                                              && @ >= -2147483648 && @ <= 2147483647)'
+                    ) #>> '{}')::int                                 AS "prompt_tokens?",
+                   COALESCE(jsonb_path_exists(s.trim_record,
+                                              '$.sections[*] ? (@.trimmed == true)'),
                             false)                                   AS "trimmed!"
               FROM run_step s
              WHERE s.run_id = ANY($1)

@@ -459,6 +459,64 @@ async fn mirror_reads_equal_the_reference_store() {
     teardown(db, &[&cache]).await;
 }
 
+/// Plan D106's two `RunStepSummary` fields are derived by three different projections — Rust in
+/// `MemStore`, `jsonb` path in Postgres, `json_extract` in SQLite — over an **untyped** column, so
+/// the third of them needs a malformed record put through it (T68, F-52).
+///
+/// `store::conformance::set_step_prompt_writes_digest_and_trim` covers the other two, but
+/// `CacheStore` is not a `WriteStore`: the only way a record reaches the mirror is by writing it to
+/// Postgres and refreshing, which is what this does. Every one of these made SQLite raise or decode
+/// to the wrong type before T68 — and a raising projection fails the whole Runs read, not one row.
+#[tokio::test]
+async fn the_mirror_projects_a_malformed_trim_record_like_postgres() {
+    use htui_core::store::WriteStore as _;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    for record in [
+        json!({ "estimated_after": 35_988, "sections": [{ "trimmed": false }, { "trimmed": true }] }),
+        json!({ "estimated_after": "34000" }),
+        json!({ "estimated_after": 35_988.5 }),
+        json!({ "estimated_after": 3_000_000_000_i64 }),
+        json!({ "sections": { "a": { "trimmed": true } } }),
+        json!({ "sections": [{ "trimmed": "nope" }] }),
+        json!({ "sections": [{ "trimmed": 1 }] }),
+        json!({ "sections": [5, "x"] }),
+        json!({}),
+    ] {
+        db.store
+            .set_step_prompt(ids::STEP_IMPL, "dead", &record)
+            .await
+            .expect("the Postgres write lands");
+        run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+            .await
+            .expect("a pass re-mirrors the step");
+
+        let figures = |runs: &[htui_core::model::RunSummary]| {
+            runs.iter()
+                .flat_map(|run| run.steps.iter())
+                .find(|step| step.id == ids::STEP_IMPL)
+                .map(|step| (step.prompt_tokens, step.trimmed))
+        };
+        let mirrored = figures(&cache.runs(ids::HTUI_FEAT_1).await.expect("cache runs"));
+        assert_eq!(
+            mirrored,
+            figures(&db.store.runs(ids::HTUI_FEAT_1).await.expect("pg runs")),
+            "the mirror and Postgres project {record} alike"
+        );
+        assert_eq!(
+            mirrored,
+            Some(htui_core::model::prompt_summary(Some(&record))),
+            "and both project it as `prompt_summary` does"
+        );
+    }
+
+    teardown(db, &[&cache]).await;
+}
+
 /// ANA-5 §12 criterion 19's second clause, as a **suite** rather than as pairwise comparisons:
 /// `store::conformance::READ_CASES` run over the mirror (plan D96).
 ///

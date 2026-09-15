@@ -502,12 +502,24 @@ impl ReadStore for CacheStore {
             // statement makes and `htui_core::model::prompt_summary` makes in Rust. `max` over
             // `json_each` is SQLite's `bool_or`: there is no such aggregate, and the values are
             // the integers 0 and 1.
+            //
+            // The `json_type` guards are what make it total (T68, F-52), because `trim_record` is
+            // untyped: a `"34000"` or a `35988.5` decodes as neither `i64` nor `NULL`, a
+            // `sections` that is not an array makes `json_each` walk an object's members, and a
+            // non-object member of one makes it raise `malformed JSON` — which would fail the
+            // whole Runs read over a single bad row. `prompt_summary` answers `(None, false)` to
+            // every one of them, and `'true'` rather than a truthy `json_extract` is its
+            // `Value::as_bool`: the integer `1` is not the JSON `true`.
             "SELECT run_id, id, position, attempt, fanout_index, phase_name, agent_id, model, \
                     status, gate_outcome, started_at, finished_at, \
-                    json_extract(trim_record, '$.estimated_after') AS prompt_tokens, \
-                    COALESCE((SELECT max(json_extract(e.value, '$.trimmed')) \
-                                FROM json_each(run_step.trim_record, '$.sections') e), 0) \
-                        AS trimmed \
+                    CASE WHEN json_type(trim_record, '$.estimated_after') = 'integer' \
+                         THEN json_extract(trim_record, '$.estimated_after') END AS prompt_tokens, \
+                    CASE WHEN json_type(trim_record, '$.sections') = 'array' \
+                         THEN COALESCE((SELECT max(CASE WHEN e.type = 'object' \
+                                                     AND json_type(e.value, '$.trimmed') = 'true' \
+                                                    THEN 1 ELSE 0 END) \
+                                          FROM json_each(run_step.trim_record, '$.sections') e), 0) \
+                         ELSE 0 END AS trimmed \
                FROM run_step WHERE run_id IN ({}) \
               ORDER BY run_id, position, attempt, fanout_index",
             placeholders(ids.len()),
