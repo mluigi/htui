@@ -13,7 +13,7 @@ use htui_core::model::ItemId;
 use htui_core::prompt::{Section, TrimRecord};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::Text;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
@@ -83,11 +83,20 @@ impl PromptTab {
     }
 
     /// Rebuilds [`lines`](Self::lines) from the reply.
+    ///
+    /// The `join` and the re-split are what [`render`](DetailTab::render) used to do **every
+    /// frame**, on the UI task, over up to a whole token budget of text — review finding M5. They
+    /// are the same two operations, run once per reply, so every row is byte-for-byte the one
+    /// `Text::raw(lines.join("\n"))` produced, including the rows a note with an embedded newline
+    /// would have contributed. What it buys is that one element of [`lines`](Self::lines) is now
+    /// exactly one rendered row, which is what the field's doc already claimed and what makes
+    /// [`Scroll`]'s clamp against `lines.len()` true rather than a lower bound.
     fn rebuild(&mut self) {
-        self.lines = match self.preview.as_ref() {
+        let rows = match self.preview.as_ref() {
             Some(preview) => render_lines(preview),
             None => Vec::new(),
         };
+        self.lines = rows.join("\n").lines().map(str::to_owned).collect();
     }
 }
 
@@ -309,9 +318,75 @@ impl DetailTab for PromptTab {
         }
         // No wrap: a wrapped prompt would renumber every line of the audit above it, and the pane
         // is scrolled rather than reflowed.
-        frame.render_widget(
-            Paragraph::new(Text::raw(self.lines.join("\n"))).scroll((self.scroll.offset(), 0)),
-            area,
+        //
+        // Only the window, and therefore no `scroll`: `Paragraph::scroll` still needs the whole
+        // `Text` built before it can throw all but `area.height` rows of it away, and building it
+        // meant copying and re-parsing the prompt — up to ~400 KB for a 100 k-token one — on the UI
+        // task, once per frame (finding M5). Skipping the rows here instead renders the identical
+        // cells, because the pane does not wrap and one element of `lines` is one row.
+        let window: Vec<Line<'_>> = self
+            .lines
+            .iter()
+            .skip(self.scroll.skip())
+            .take(usize::from(area.height))
+            .map(|row| Line::raw(row.as_str()))
+            .collect();
+        frame.render_widget(Paragraph::new(Text::from(window)), area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Widget as _;
+
+    #[test]
+    fn the_window_renders_the_cells_the_scrolled_whole_used_to() {
+        // Finding M5 is a **cost** change and must not be a behaviour change, and the snapshot
+        // suite only ever renders this pane at offset zero. So the claim is pinned here, directly:
+        // for every offset — including the two past the end, where `Paragraph::scroll` quietly
+        // renders nothing — the window this pane now builds paints the identical cells that
+        // `Text::raw(lines.join("\n")).scroll((offset, 0))` painted.
+        let rows: Vec<String> = (0..40)
+            .map(|n| format!("row {n} with enough text to reach the right edge"))
+            .collect();
+        let area = Rect::new(0, 0, 20, 8);
+        for offset in [0u16, 1, 7, 33, 39, 40, 100] {
+            let mut whole = Buffer::empty(area);
+            Paragraph::new(Text::raw(rows.join("\n")))
+                .scroll((offset, 0))
+                .render(area, &mut whole);
+
+            let window: Vec<Line<'_>> = rows
+                .iter()
+                .skip(usize::from(offset))
+                .take(usize::from(area.height))
+                .map(|row| Line::raw(row.as_str()))
+                .collect();
+            let mut only = Buffer::empty(area);
+            Paragraph::new(Text::from(window)).render(area, &mut only);
+
+            assert_eq!(whole, only, "the two disagree at offset {offset}");
+        }
+    }
+
+    #[test]
+    fn one_element_of_lines_is_one_rendered_row() {
+        // The other half of M5: `rebuild` now does the split `Text::raw` used to do per frame, so
+        // a note carrying a newline still contributes two rows and a blank separator still
+        // contributes one. Without the `join`/`lines()` round trip this is where they would part.
+        let rows = [
+            "template  prd v1".to_owned(),
+            String::new(),
+            "notes     first\nsecond".to_owned(),
+            "last".to_owned(),
+        ];
+        let split: Vec<String> = rows.join("\n").lines().map(str::to_owned).collect();
+        assert_eq!(
+            split,
+            ["template  prd v1", "", "notes     first", "second", "last",],
+            "the blank line survives and the embedded newline becomes its own row"
         );
     }
 }
