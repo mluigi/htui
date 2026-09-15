@@ -1523,8 +1523,10 @@ async fn upsert_agent_box_cannot_write_quota<S: WriteStore>(store: &S) {
 /// fields plan D106 put on `RunStepSummary` — `prompt_tokens` and `trimmed` — are the read seam's
 /// whole trace of the record, so this case pins the projection and the write at once. That the
 /// **only** columns written are those two is asserted per backend, where the columns can be read
-/// back: `mem.rs::set_step_prompt_writes_both_columns` here, and a raw `SELECT` in
-/// `pg_criteria.rs` for Postgres.
+/// back: `mem.rs::set_step_prompt_writes_both_columns` here, and
+/// `pg_criteria.rs::set_step_prompt_writes_only_the_digest_and_the_record` for Postgres, which
+/// diffs the whole row as `jsonb` either side of the write. The names are checked by
+/// `every_cross_referenced_test_name_exists` in this module's `tests`.
 ///
 /// The second write is what makes it an overwrite rather than an append: a re-run of the same step
 /// assembles a new prompt, and a record that kept the first `trimmed` would report a trim that no

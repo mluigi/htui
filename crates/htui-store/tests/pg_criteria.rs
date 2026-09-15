@@ -1262,6 +1262,105 @@ async fn set_step_usage_keeps_the_digest_a_none_call_does_not_supply() {
     db.drop_db().await;
 }
 
+/// `set_step_prompt` writes `prompt_digest` and `trim_record` and **nothing else** on the row, the
+/// `updated_at` trigger aside (`docs/ANA-5.md` §4.4).
+///
+/// `store::conformance::set_step_prompt_writes_digest_and_trim` observes the write through
+/// `ReadStore::runs`, which §6.1 gives two derived figures and neither column, so it cannot say
+/// what was *not* written; `store::mem`'s `set_step_prompt_writes_both_columns` is the memory half
+/// of that claim and this is the Postgres half its doc comment names (T68, F-52 review, M2).
+///
+/// The whole row is compared as `jsonb` rather than a chosen column list, so a column added to
+/// `run_step` later is covered without anyone remembering to extend this: the assertion is the
+/// **set of keys that changed**, and a new column that `set_step_prompt` learns to write shows up
+/// in it. The pre-write state is deliberately non-empty — a usage write and a first prompt write —
+/// because a column that is `NULL` on both sides proves nothing about whether it was touched.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_step_prompt_writes_only_the_digest_and_the_record() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let step = ids::STEP_IMPL;
+
+    /// The `run_step` row as a JSON object, so two of them can be diffed key by key.
+    async fn row(pool: &PgPool, step: StepId) -> serde_json::Map<String, serde_json::Value> {
+        let row = sqlx::query("SELECT to_jsonb(s) AS row FROM run_step s WHERE s.id = $1")
+            .bind(step.as_uuid())
+            .fetch_one(pool)
+            .await
+            .expect("the fixture step is there");
+        match row.get::<serde_json::Value, _>("row") {
+            serde_json::Value::Object(map) => map,
+            other => panic!("to_jsonb of a row is an object, got {other}"),
+        }
+    }
+
+    // Something in every column the write must not disturb, so "unchanged" is a real claim.
+    db.store
+        .set_step_usage(step, serde_json::json!({ "input_tokens": 7 }), None)
+        .await
+        .expect("the usage write lands");
+    db.store
+        .set_step_prompt(step, "9f8e", &serde_json::json!({ "v": 1 }))
+        .await
+        .expect("the first prompt write lands");
+
+    let before = row(&db.pool, step).await;
+    let record = serde_json::json!({ "estimated_after": 34_000, "sections": [], "v": 1 });
+    db.store
+        .set_step_prompt(step, "0a1b", &record)
+        .await
+        .expect("the second prompt write lands");
+    let after = row(&db.pool, step).await;
+
+    let mut changed: Vec<&str> = before
+        .keys()
+        .chain(after.keys())
+        .map(String::as_str)
+        .filter(|key| before.get(*key) != after.get(*key))
+        .collect();
+    changed.sort_unstable();
+    changed.dedup();
+    assert_eq!(
+        changed,
+        vec!["prompt_digest", "trim_record", "updated_at"],
+        "the two columns §4.4 names, plus the migration's `BEFORE UPDATE` trigger's own"
+    );
+
+    assert_eq!(
+        after.get("prompt_digest"),
+        Some(&serde_json::json!("0a1b")),
+        "the digest is overwritten unconditionally, unlike `set_step_usage`'s optional one"
+    );
+    assert_eq!(
+        after.get("trim_record"),
+        Some(&record),
+        "the record is stored whole, not a projection of it"
+    );
+    assert_eq!(
+        after.get("usage"),
+        Some(&serde_json::json!({ "input_tokens": 7 })),
+        "the pre-flight audit does not touch the post-flight figure"
+    );
+
+    let unknown = db
+        .store
+        .set_step_prompt(StepId::new(), "9f8e", &serde_json::json!({}))
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(htui_core::store::StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "a step no row has is NotFound, not a silent no-op, got {unknown:?}"
+    );
+
+    db.drop_db().await;
+}
+
 /// `PgStore::upsert_agent` read back through the inherent `agents()` (MOD-2 plan D3): a second
 /// write of the same `agent.id` updates the row **in place** - one row, the new column values - and
 /// `created_at` survives it, because the insert supplies it and the `DO UPDATE SET` list does not
