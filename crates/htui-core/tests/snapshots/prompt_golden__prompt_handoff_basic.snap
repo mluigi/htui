@@ -1,0 +1,34 @@
+---
+source: crates/htui-core/tests/prompt_golden.rs
+expression: prompt.text
+---
+You are continuing work already under way on htui:MOD-2, phase implement, attempt 1.
+A previous session did the work below and could not be resumed, so this is a fresh context. The
+working tree is exactly as that session left it.
+
+<section name="step_summary" turns="3" events="217">
+Tool calls, in order: read(6), edit(9), execute(6).
+Files edited: crates/htui-core/src/prompt/mod.rs, crates/htui-core/src/prompt/trim.rs.
+Errors: 1 - `command_failed` — `cargo test` exited 101 at turn 2
+Last assistant message (turn 3, tail):
+I cannot get the borrow checker past the trim loop.
+</section>
+<section name="documents:plan" kind="plan" version="3">
+1. Land the driver seam.
+2. Land the recorder.
+</section>
+<section name="diff_so_far" range="abc1234..HEAD">
+ 2 files changed, 210 insertions(+)
+
+```
+--- a/trim.rs
++++ b/trim.rs
++fn run() {}
+```
+</section>
+<section name="failure_reason">
+The step exhausted its turn budget without a passing build.
+</section>
+
+Read the diff before changing anything: the work already done is real and must not be redone or
+reverted. Continue from where it stopped, address the failure reason, and finish the phase.

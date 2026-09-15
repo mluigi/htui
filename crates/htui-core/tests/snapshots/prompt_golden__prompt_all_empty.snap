@@ -1,0 +1,19 @@
+---
+source: crates/htui-core/tests/prompt_golden.rs
+expression: prompt.text
+---
+You are running the `prd` phase for htui:FEAT-3 (feature).
+
+<section name="item" key="htui:FEAT-3" title="A bare item">
+</section>
+
+<section name="box">
+hostname: ci-linux-01
+os: linux 6.8.0 (x86_64)
+htui: 0.4.1
+</section>
+
+Write a `prd` document: the problem in the user's terms, who has it, what "done" looks like, and
+the open questions a reader must answer before design can start. State what is explicitly out of
+scope. Do not design a solution and do not name files. If a requirement id in docs/REQUIREMENTS.md
+governs this work, cite it.

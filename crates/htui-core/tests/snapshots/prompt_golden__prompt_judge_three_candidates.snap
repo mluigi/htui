@@ -1,0 +1,77 @@
+---
+source: crates/htui-core/tests/prompt_golden.rs
+expression: prompt.text
+---
+You are judging implement candidates for htui:MOD-2. You did not write any of them.
+
+<section name="judge_task">
+You are running the `implement` phase for htui:MOD-2, attempt 1.
+</section>
+
+<section name="judge_candidate:0" fanout_index="0" verify="pass" exit_code="0">
+<document kind="impl" version="1">
+Added the flush on turn end.
+</document>
+<diff range="aaa1111..bbb2222">
+ 1 file changed, 9 insertions(+)
+
+```
+--- a/record.rs
++++ b/record.rs
++self.flush();
+```
+</diff>
+<verification>
+```
+test result: ok. 41 passed; 0 failed
+```
+</verification>
+</section>
+
+<section name="judge_candidate:1" fanout_index="1" verify="fail" exit_code="101">
+<document kind="impl" version="1">
+Flushed from the drop handler.
+</document>
+<diff range="aaa1111..ccc3333">
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+```
+--- a/record.rs
++++ b/record.rs
++impl Drop for Recorder {}
+```
+</diff>
+<verification>
+```
+test recorder::flushes ... FAILED
+test result: FAILED. 40 passed; 1 failed
+```
+</verification>
+</section>
+
+<section name="judge_candidate:2" fanout_index="2">
+<diff range="aaa1111..ddd4444">
+ 3 files changed, 140 insertions(+), 6 deletions(-)
+
+```
+--- a/record.rs
++++ b/record.rs
++// a rewrite
+```
+</diff>
+</section>
+
+Pick the candidate that best satisfies the task above. Weigh, in order: correctness against the
+task, evidence from verification, the smallest change that does the job, and fit with the
+surrounding code. Ignore candidate order, prose confidence and length; a longer answer is not a
+better one.
+
+Write one paragraph per candidate saying why it wins or loses, then end the document with exactly
+one fenced json block, and nothing after it:
+
+```json
+{ "winner": 0, "reasons": { "0": "one line", "1": "one line" } }
+```
+
+`winner` must be one of the `fanout_index` values shown above, and `reasons` must have one entry
+per candidate shown, keyed by its index as a string.

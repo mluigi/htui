@@ -1,0 +1,90 @@
+---
+source: crates/htui-core/tests/prompt_golden.rs
+expression: prompt.text
+---
+You are running the `implement` phase for htui:MOD-2, attempt 2.
+
+<section name="item" key="htui:MOD-2" title="Agent driver and chat">
+Drive one agent session per run step, and record every event.
+
+The seam is `AgentDriver`.
+</section>
+<section name="documents:plan" kind="plan" version="3">
+1. Land the driver seam.
+2. Land the recorder.
+</section>
+
+<section name="documents:review" kind="review" version="1">
+---
+verdict: request-changes
+---
+
+The recorder never flushes.
+</section>
+<section name="verify_failure" exit_code="101">
+```
+running 3 tests
+test recorder::flushes ... FAILED
+```
+</section>
+<section name="previous_diff" range="abc1234..def5678">
+ 2 files changed, 41 insertions(+), 8 deletions(-)
+
+```
+--- a/record.rs
++++ b/record.rs
+@@ -1,2 +1,3 @@
++// flush
+```
+</section>
+<section name="upstream">
+### htui:ANA-9 - Postgres schema (closed, 1 hop)
+
+The schema is one database, six domains, and no soft deletes outside `item`.
+
+also upstream:
+- htui:MOD-7 - Box registry and capabilities (in_progress) - no summary yet
+- auth-service:MOD-1 - Token rotation (done)
+</section>
+<section name="box">
+hostname: dev-win-01
+os: windows 10.0.26200 (x86_64)
+cpu: AMD Ryzen 9 7950X, 32 threads
+ram: 65536 MB
+gpu: nvidia
+htui: 0.4.1
+tools: cargo 1.98.1, git 2.47.0, node 22.12.0, python 3.13.1, rustc 1.98.1
+quirks: MSVC toolchain only; no WSL; long paths enabled.
+</section>
+<section name="skills">
+<skill name="rust-style" version="2">
+Prefer `expect` with a reason over `unwrap`.
+No `unsafe`.
+</skill>
+</section>
+<section name="excerpts">
+Read-only context, selected by htui. These files may be truncated and may be out of date; the
+working tree is authoritative. Do not treat an excerpt as the whole file, and open the file before
+editing it.
+
+<file path="htui:crates/htui-core/src/prompt/mod.rs" lines="1-4" reason="touched_path">
+   1 | //! Prompt assembly (ANA-5).
+   2 |
+   3 | pub mod render;
+   4 | pub mod trim;
+</file>
+<file path="htui:crates/htui-core/src/store/traits.rs" lines="40-43" reason="mentioned" truncated="true">
+  40 | pub trait ReadStore: Send + Sync {
+  41 |     async fn item(&self) -> Result<()>;
+  42 | }
+[... htui elided 412 lines / 18903 bytes ...]
+</file>
+</section>
+<section name="command_queue">
+Route builds, test suites and verification through the `command_run` tool rather than a shell: htui queues them per box under `R-MCP-4` and records their output on this step. Run everything else directly.
+</section>
+
+Make the change the plan describes, in this working tree. Keep the diff to what the plan asks for.
+When a prior attempt is shown above, read its diff and its verification output first and fix the
+cause rather than the symptom. Write a `impl` document describing what changed and how
+you verified it, one section per file group.

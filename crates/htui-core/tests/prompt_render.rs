@@ -2,10 +2,10 @@
 //!
 //! One accepted snapshot per section kind, plus the two upstream render states and a truncated
 //! excerpt. They are **per section** rather than per assembled prompt because `assemble()` is T65's
-//! and a whole-prompt golden cannot exist before it does; T65 adds `prompt_golden.rs` beside this
-//! file for that, and these stay as the finer-grained contract. A diff in one of these files is a
-//! change to what a model is shown and to every `prompt_digest` taken after it, so every hunk is
-//! read before it is accepted.
+//! and a whole-prompt golden cannot exist before it does; `prompt_golden.rs` beside this file holds
+//! those — landed by T67, which is finding F-36 — and these stay as the finer-grained contract. A
+//! diff in one of these files is a change to what a model is shown and to every `prompt_digest`
+//! taken after it, so every hunk is read before it is accepted.
 //!
 //! What the non-snapshot tests hold that a snapshot cannot: that CRLF input renders the same bytes
 //! as LF input (criterion 6, at the section level), that criterion 4's three greps hold on a spec
