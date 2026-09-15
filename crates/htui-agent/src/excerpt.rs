@@ -318,11 +318,17 @@ impl FsRepoReader {
             }
         }
         let path = path?;
-        let Ok(meta) = std::fs::metadata(path) else {
+        // Rules 4 and 5 from **one** open descriptor. Two `stat`s and a separate `File::open` used
+        // to answer them, so a name swapped between the walk's `symlink_metadata` and either of
+        // them was decided about as one file and read as another; `open_regular` refuses that.
+        // An unreadable file, and a name that changed underneath, both read as binary.
+        let Some((mut file, meta)) = open_regular(path) else {
             return Some(SkipRule::Binary);
         };
-        if has_nul(path) {
-            return Some(SkipRule::Binary);
+        match probe(&mut file) {
+            Ok(head) if head.contains(&0) => return Some(SkipRule::Binary),
+            Err(_) => return Some(SkipRule::Binary),
+            Ok(_) => {}
         }
         if meta.len() > self.max_file_bytes {
             return Some(SkipRule::TooLarge);
@@ -331,19 +337,6 @@ impl FsRepoReader {
             return Some(SkipRule::LockfileOrMinified);
         }
         None
-    }
-}
-
-/// §4.5's binary test: a NUL in the first [`BINARY_PROBE_BYTES`]. An unreadable file reads as one.
-fn has_nul(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return true;
-    };
-    let mut buffer = [0u8; BINARY_PROBE_BYTES];
-    match file.read(&mut buffer) {
-        Ok(read) => buffer[..read].contains(&0),
-        Err(_) => true,
     }
 }
 
@@ -442,10 +435,13 @@ const fn is_same_file(_before: &std::fs::Metadata, _after: &std::fs::Metadata) -
     true
 }
 
-/// The first [`BINARY_PROBE_BYTES`] of an already-open file, for §4.5's binary test.
+/// The first [`BINARY_PROBE_BYTES`] of an already-open file, for §4.5's binary test (a NUL in
+/// them).
 ///
 /// Loops to the cap or to EOF rather than trusting one `read` to fill the buffer: a short read is
-/// not an end of file, and the bytes are kept because [`FsRepoReader::read`] needs them anyway.
+/// not an end of file, and a single `read` that returned sixteen bytes used to declare a whole file
+/// NUL-free. The bytes are returned rather than a verdict because [`FsRepoReader::read`] needs them
+/// anyway and re-reading them from the same handle is not possible.
 fn probe(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut head = Vec::with_capacity(BINARY_PROBE_BYTES);

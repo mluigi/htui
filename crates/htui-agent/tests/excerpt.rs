@@ -631,6 +631,37 @@ fn fs_reader_read_refuses_an_oversized_a_binary_and_a_non_file() {
 }
 
 #[test]
+fn the_binary_probe_covers_the_whole_first_8_kb() {
+    // L1: the probe used to accept one short `read` as the whole 8 KB. It reads to the cap or to
+    // EOF now, which this pins from the outside the only way a regular file can be asked to: a NUL
+    // at the last byte of the window is binary, and the first byte past it is not.
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    let mut inside = vec![b'x'; htui_agent::excerpt::BINARY_PROBE_BYTES];
+    let last = inside.len() - 1;
+    inside[last] = 0;
+    write(dir.path(), "inside.dat", &inside);
+    let mut outside = vec![b'x'; htui_agent::excerpt::BINARY_PROBE_BYTES + 1];
+    let last = outside.len() - 1;
+    outside[last] = 0;
+    write(dir.path(), "outside.dat", &outside);
+
+    let reader = FsRepoReader::default();
+    let (paths, _) = reader.list(&fs_root(dir.path()), 20_000).expect("readable");
+    assert_eq!(
+        paths,
+        vec!["outside.dat".to_owned()],
+        "the NUL inside the window is binary; the one past it is not the probe's business"
+    );
+    assert!(
+        reader
+            .read(&fs_root(dir.path()), "inside.dat")
+            .expect_err("binary")
+            .message
+            .contains("NUL")
+    );
+}
+
+#[test]
 fn scan_cap_sets_truncated() {
     // §4.5 step 2: "Cap the walk at `app_setting.excerpt_max_scan_files` … and record
     // `scan_truncated` when the cap bites."
