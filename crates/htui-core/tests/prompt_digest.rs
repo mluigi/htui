@@ -812,6 +812,42 @@ fn a_dropped_excerpt_leaves_its_record_behind_and_nothing_else() {
 }
 
 #[test]
+fn the_audit_lists_files_in_the_order_the_prompt_renders_them() {
+    // **L-4.** `render::excerpts` emits `<file>` blocks in `(repo, path)` byte order (§4.7 rule 5)
+    // while `surviving_audit` walked the *ranker's* order, so a reader lining the record up against
+    // the prompt read row 1 against block 2 the moment the two orders disagreed.
+    let mut spec = fixtures::phase_implement_attempt2();
+    // Rank 1 sits last in path order and rank 2 first, so the two orders are each other's reverse.
+    spec.excerpts.files[0].path = "crates/zz.rs".to_owned();
+    spec.excerpts.files[1].path = "crates/aa.rs".to_owned();
+    let prompt = ok(&spec);
+
+    let rendered: Vec<String> = prompt
+        .text
+        .lines()
+        .filter_map(|line| line.strip_prefix("<file path=\""))
+        .filter_map(|rest| rest.split_once('"'))
+        .map(|(path, _)| path.to_owned())
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![
+            "htui:crates/aa.rs".to_owned(),
+            "htui:crates/zz.rs".to_owned()
+        ],
+        "the prompt renders `(repo, path)` byte order, not rank order"
+    );
+    let recorded: Vec<String> = prompt
+        .trim
+        .excerpts
+        .files
+        .iter()
+        .map(|file| format!("{}:{}", file.repo, file.path))
+        .collect();
+    assert_eq!(recorded, rendered, "and `files[]` is that same order");
+}
+
+#[test]
 fn a_body_that_never_places_excerpts_records_none_as_reaching_the_model() {
     // **M-1.** §5.1 `:1536-1538` defines `files[]` as what reached the model. A body with no
     // `{{excerpts}}` slot renders no `<file>` block at all, and `finish()` fell back to "every

@@ -901,23 +901,26 @@ fn scrub_text(
 /// and paid for, `files` is what reached the model. A dropped section therefore leaves `selected:
 /// 3` beside an empty `files`, and a reader can see the difference.
 ///
+/// `files[]` is in **`(repo, path)` byte order**, which is the order [`render::excerpts`] emits the
+/// blocks in (§4.7 rule 5) and not the ranker's. The two disagree whenever rank order is not path
+/// order, and a reader lining the record up against the prompt then reads row 1 against block 2
+/// (review finding L-4). `rank` is still on every row, so nothing is lost by not ordering on it.
+///
 /// Rebuilt rather than narrowed, which closes plan **F-39**. T65 retained the ranker's own
 /// [`FileRecord`](excerpt::FileRecord)s because `render::file_block` was private, so the recorded
 /// `sha256` was whatever the ranker had put there. §4.5 `:1136-1137` defines it over the excerpt's
 /// **rendered** bytes, and those are the bytes after the scrub (plan D100) — so each surviving
-/// block is rendered, scrubbed with the same scrubber the section was, and hashed. A record whose
-/// digest described the pre-scrub rendering would name a string nobody was sent.
+/// block is rendered and hashed. A record whose digest described the pre-scrub rendering would name
+/// a string nobody was sent.
 ///
-/// Scrubbing block by block rather than slicing the scrubbed section is deliberate and is the same
-/// operation: `MinimalScrubber` masks string leaves, so the mask of a concatenation is the
-/// concatenation of the masks, and the alternative would be locating each block inside text the
-/// masking may have shortened.
+/// `spec` here is [`scrubbed_inputs`]'s output, so the blocks are already over masked bytes; the
+/// `scrub_text` call is the same idempotent residue check the sections get, kept so a future
+/// scrubber that is not substring-stable fails loudly instead of recording a wrong hash.
 ///
 /// # Errors
 ///
 /// [`AssembleError::Unmasked`] cannot fire here in practice — the whole section scrubbed clean at
-/// step 3, and each block is a substring of it — but it is propagated rather than swallowed, so a
-/// future scrubber that is not substring-stable fails loudly instead of recording a wrong hash.
+/// step 3, and each block is a substring of it — but it is propagated rather than swallowed.
 fn surviving_audit(
     spec: &PromptSpec,
     kept: &[usize],
@@ -925,10 +928,17 @@ fn surviving_audit(
 ) -> Result<excerpt::ExcerptAudit, AssembleError> {
     let mut audit = spec.excerpts.audit.clone();
     audit.files = Vec::new();
-    for index in kept {
-        let Some(file) = spec.excerpts.files.get(*index) else {
-            continue;
-        };
+    let mut surviving: Vec<&excerpt::Excerpt> = kept
+        .iter()
+        .filter_map(|index| spec.excerpts.files.get(*index))
+        .collect();
+    surviving.sort_by(|a, b| {
+        a.repo
+            .as_bytes()
+            .cmp(b.repo.as_bytes())
+            .then_with(|| a.path.as_bytes().cmp(b.path.as_bytes()))
+    });
+    for file in surviving {
         let block = scrub_text(
             scrubber,
             &render::file_block(file),
