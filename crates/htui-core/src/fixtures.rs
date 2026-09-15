@@ -1364,6 +1364,12 @@ fn steps() -> Vec<RunStep> {
             "cache_write_tokens": 0,
         }));
     }
+    if let Some(implement) = steps.get_mut(2) {
+        implement.trim_record = Some(
+            serde_json::from_str(IMPL_TRIM_RECORD)
+                .expect("`IMPL_TRIM_RECORD` is a literal this module owns"),
+        );
+    }
     steps.push(RunStep {
         id: ids::STEP_R2_PRD,
         run_id: ids::RUN_2,
@@ -1426,6 +1432,55 @@ fn done_step(
 /// fixed literal, because a real sha256 of a fixture body would move whenever the body is
 /// reworded (§4.3).
 const PROMPT_DIGEST: &str = "9f2c1b7e4a08d3556c9e1af0b74d28e63c05a91f7d4b8e2016a3c5d7f908b1e2";
+
+/// `run_step.trim_record` of [`ids::STEP_IMPL`] (`docs/ANA-5.md` §5.1; plan D106, T68).
+///
+/// Not a plausible-looking literal: this is byte for byte what
+/// `prompt::fixtures::demo_trim_record()` produces — `assemble()` run over the oversize `implement`
+/// spec — and `tests::step_impl_carries_the_golden_trim_record` fails the moment the two drift.
+/// It is spelled out here because this module is the `demo` feature and `crate::prompt::fixtures`
+/// is `test-support`: the `htui` binary builds the first without the second, and the Runs pane's
+/// `~36k !` has to render in the binary rather than only under a test profile.
+///
+/// The `implement` step rather than `plan` because a record with nothing trimmed would exercise
+/// half of what the pane renders: this one drops four sections and head-tails a fifth, so both
+/// indicators have something to say.
+const IMPL_TRIM_RECORD: &str = r#"{
+  "v": 1,
+  "template": { "name": "implement", "version": 3, "role": "phase" },
+  "budget": 40000,
+  "budget_source": "project",
+  "reserve": 0.1,
+  "target": 36000,
+  "estimator": "chars-v2",
+  "estimated_before": 60406,
+  "estimated_after": 35988,
+  "sections": [
+    { "name": "template",         "tokens_before": 156,   "tokens_after": 156,   "strategy": "none",      "trimmed": false },
+    { "name": "item",             "tokens_before": 3508,  "tokens_after": 3508,  "strategy": "none",      "trimmed": false },
+    { "name": "documents:plan",   "tokens_before": 30383, "tokens_after": 29696, "strategy": "head_tail", "trimmed": true,
+      "elided_lines": 22, "elided_bytes": 1760 },
+    { "name": "documents:review", "tokens_before": 2357,  "tokens_after": 2357,  "strategy": "none",      "trimmed": false },
+    { "name": "verify_failure",   "tokens_before": 428,   "tokens_after": 0,     "strategy": "dropped",   "trimmed": true },
+    { "name": "previous_diff",    "tokens_before": 6425,  "tokens_after": 0,     "strategy": "dropped",   "trimmed": true },
+    { "name": "upstream",         "tokens_before": 5023,  "tokens_after": 0,     "strategy": "dropped",   "trimmed": true,
+      "stubbed": 3, "dropped": 2 },
+    { "name": "box",              "tokens_before": 116,   "tokens_after": 116,   "strategy": "none",      "trimmed": false },
+    { "name": "skills",           "tokens_before": 56,    "tokens_after": 56,    "strategy": "none",      "trimmed": false },
+    { "name": "excerpts",         "tokens_before": 11855, "tokens_after": 0,     "strategy": "dropped",   "trimmed": true,
+      "dropped": 2 },
+    { "name": "command_queue",    "tokens_before": 99,    "tokens_after": 99,    "strategy": "none",      "trimmed": false }
+  ],
+  "excerpts": {
+    "provider_set": ["builtin@1"],
+    "roots": [{ "repo": "htui", "source": "run_step_tree", "scan_truncated": false }],
+    "considered": 143,
+    "selected": 2,
+    "caps": { "max_files": 12, "file_line_cap": 400, "head_lines": 200, "max_file_bytes": 524288 },
+    "files": []
+  },
+  "notes": []
+}"#;
 
 /// The `tool_call_id` pairing seq 3 with seq 4 (§4.3).
 const TOOL_CALL_ID: &str = "call_1";
@@ -1732,6 +1787,62 @@ mod tests {
             "three projects × ten templates is thirty distinct `prompt_template` ids"
         );
         assert_eq!(ids.len(), 30);
+    }
+
+    /// The `implement` step is the one fixture step with a `run_step.trim_record`, and plan
+    /// D106's two projection fields are what the Runs pane renders from it (T68).
+    ///
+    /// Pinned as a pair rather than as two numbers because the pane renders them as one string:
+    /// a record that lost its trimmed sections would still show `~36k` and look right.
+    #[test]
+    fn step_impl_carries_a_trim_record_the_runs_pane_can_render() {
+        let data = demo_data();
+        let with_record: Vec<_> = data
+            .steps
+            .iter()
+            .filter(|step| step.trim_record.is_some())
+            .map(|step| step.id)
+            .collect();
+        assert_eq!(
+            with_record,
+            [ids::STEP_IMPL],
+            "exactly one fixture step carries a record, so the Runs snapshot shows the marker \
+             on one row and the absence of one on the other three"
+        );
+        let step = data
+            .steps
+            .iter()
+            .find(|step| step.id == ids::STEP_IMPL)
+            .expect("the demo run has an `implement` step");
+        assert_eq!(
+            crate::model::prompt_summary(step.trim_record.as_ref()),
+            (Some(35_988), true),
+            "D106's projection of the golden record: `~36k` and the `!`"
+        );
+    }
+
+    /// The fixture record **is** `prompt::fixtures::demo_trim_record()`, byte for byte.
+    ///
+    /// It is spelled out as a literal rather than computed because `crate::fixtures` is the
+    /// `demo` feature and `crate::prompt::fixtures` is `test-support`, and the `htui` binary
+    /// builds the first without the second (`htui/Cargo.toml`). This test is the seam between
+    /// the two: it fails the moment `assemble()`, the oversize spec or the estimator move, which
+    /// is the only thing that keeps the demo's `~36k` an assembler output rather than a number
+    /// somebody typed.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn step_impl_carries_the_golden_trim_record() {
+        let data = demo_data();
+        let step = data
+            .steps
+            .iter()
+            .find(|step| step.id == ids::STEP_IMPL)
+            .expect("the demo run has an `implement` step");
+        assert_eq!(
+            step.trim_record.as_ref(),
+            Some(&crate::prompt::fixtures::demo_trim_record().to_value()),
+            "the fixture literal and the assembler's own record must not drift"
+        );
     }
 
     /// ANA-5 §5.2's `sections[]` names a section by its vocabulary — `documents:<kind>` for a
