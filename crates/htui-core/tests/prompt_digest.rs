@@ -550,18 +550,61 @@ fn reserve_target_is_integer_arithmetic() {
 }
 
 #[test]
-fn to_value_keys_are_sorted() {
-    // Blueprint H-19: `serde_json::Map` is a `BTreeMap` in this workspace, so the record is
-    // byte-stable without a second rule. This is the test that notices if that ever changes.
-    let record = ok(&fixtures::phase_implement_attempt2()).trim;
-    let value = record.to_value();
-    let keys: Vec<&String> = value.as_object().expect("an object").keys().collect();
-    let mut sorted = keys.clone();
-    sorted.sort();
-    assert_eq!(keys, sorted);
-    assert_eq!(value["v"], serde_json::json!(1));
-    assert_eq!(value["template"]["role"], serde_json::json!("phase"));
-    assert_eq!(value["template"]["version"], serde_json::json!(3));
+fn to_value_is_byte_stable_and_carries_the_documented_keys() {
+    // Blueprint H-19 asks for sorted keys, on the plan's verified claim that "`serde_json::Map` is
+    // a `BTreeMap` here — no `preserve_order` feature anywhere". **That claim is false in a
+    // workspace build** (finding F-35): `agent-client-protocol` turns on
+    // `serde_json/preserve_order`, and Cargo unifies features across the workspace, so
+    // `htui-core`'s own `Map` is an `IndexMap` whenever `htui-agent` is in the same build and a
+    // `BTreeMap` when it is not. Key order is therefore sorted under `-p htui-core` and field
+    // declaration order under `--workspace`, from one unchanged `#[derive(Serialize)]`.
+    //
+    // What §5.1 actually needs survives that, which is why this test asserts it instead: the
+    // serialisation is **byte-stable** — deterministic under either map type — and the column is
+    // `JSONB`, which reorders keys on the way in regardless. Nothing in the assembler reads a key
+    // order, and `prompt_digest` is over the text and never over this record.
+    let first = ok(&fixtures::phase_implement_attempt2()).trim.to_value();
+    let second = ok(&fixtures::phase_implement_attempt2()).trim.to_value();
+    assert_eq!(
+        serde_json::to_string(&first).expect("plain data"),
+        serde_json::to_string(&second).expect("plain data"),
+        "two assemblies of one spec serialise to the same bytes"
+    );
+
+    let keys: BTreeSet<&str> = first
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "v",
+            "template",
+            "budget",
+            "budget_source",
+            "reserve",
+            "target",
+            "estimator",
+            "estimated_before",
+            "estimated_after",
+            "sections",
+            "excerpts",
+            "notes",
+        ]),
+        "§5.1's twelve keys, no more and no fewer"
+    );
+    assert_eq!(first["v"], serde_json::json!(1));
+    assert_eq!(first["template"]["role"], serde_json::json!("phase"));
+    assert_eq!(first["template"]["version"], serde_json::json!(3));
+    assert_eq!(first["estimator"], serde_json::json!("chars-v2"));
+    // A section row omits the four optional counters rather than spelling them `null`.
+    let template_row = &first["sections"][0];
+    assert_eq!(template_row["name"], serde_json::json!("template"));
+    assert_eq!(template_row["strategy"], serde_json::json!("none"));
+    assert!(template_row.get("elided_lines").is_none());
+    assert!(template_row.get("stubbed").is_none());
 }
 
 // ---------------------------------------------------------------------------------------------

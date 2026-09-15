@@ -150,8 +150,13 @@ pub struct TemplateRecord {
 
 /// `run_step.trim_record`, version 1 (ANA-5 §5.1).
 ///
-/// Byte-stable without an extra rule: `serde_json::Map` is a `BTreeMap` in this workspace, so
-/// [`TrimRecord::to_value`]'s object keys serialise sorted.
+/// Byte-stable, but **not** by the route §5.1 assumed. §5.1 says "`serde_json::Map` is a `BTreeMap`
+/// in this workspace, so object keys serialise sorted"; that is false in a workspace build
+/// (milestone-9 finding F-35). `agent-client-protocol` enables `serde_json/preserve_order` and
+/// Cargo unifies features across the workspace, so this same `#[derive(Serialize)]` emits sorted
+/// keys under `-p htui-core` and field declaration order under `--workspace`. Determinism is
+/// unaffected — both orders are a pure function of the type — and nothing reads a key order:
+/// `prompt_digest` is over the prompt text, and the column is `JSONB`, which reorders keys anyway.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TrimRecord {
     /// Schema version, first.
