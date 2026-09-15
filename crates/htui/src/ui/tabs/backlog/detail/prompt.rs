@@ -113,10 +113,14 @@ fn render_lines(preview: &PromptPreview) -> Vec<String> {
         &format!("n / p \u{b7} {} template(s)", preview.available.len()),
     ));
 
-    let record = match &preview.outcome {
+    // Bound once, and used again at the bottom for the text. The second `match` that used to read
+    // `preview.outcome` there needed an `unreachable!` arm to say what this binding says by
+    // construction — and an `unreachable!` in a render path is a panic in the event loop if the
+    // reasoning behind it ever stops holding (finding L5).
+    let assembled = match &preview.outcome {
         Ok(assembled) => {
             lines.push(labelled("digest", &assembled.digest));
-            &assembled.trim
+            assembled
         }
         Err(message) => {
             // A refusal is a preview: it is what the run would have said, in the words it would
@@ -126,6 +130,7 @@ fn render_lines(preview: &PromptPreview) -> Vec<String> {
             return lines;
         }
     };
+    let record = &assembled.trim;
 
     lines.push(labelled(
         "budget",
@@ -153,11 +158,7 @@ fn render_lines(preview: &PromptPreview) -> Vec<String> {
         lines.push(labelled(label, note));
     }
     lines.push(RULE.to_owned());
-
-    match &preview.outcome {
-        Ok(assembled) => lines.extend(assembled.text.lines().map(str::to_owned)),
-        Err(_) => unreachable!("the `Err` arm returned above"),
-    }
+    lines.extend(assembled.text.lines().map(str::to_owned));
     lines
 }
 
