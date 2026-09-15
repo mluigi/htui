@@ -486,7 +486,13 @@ pub fn excerpts(files: &[Excerpt]) -> Option<Rendered> {
 ///
 /// The gutter is as wide as the file's **last** line number, minimum four, so a file never
 /// re-aligns when the trimmer takes lines off its tail.
-fn file_block(excerpt: &Excerpt) -> String {
+///
+/// `pub(crate)` rather than private (plan F-39, closed by T66): `FileRecord.sha256` is defined over
+/// **these** bytes (§4.5 `:1136-1137`), so the audit has to hash the same function the prompt
+/// renders — and [`excerpt::select`](crate::prompt::excerpt::select) has to price a candidate
+/// against the residual budget before it takes it. Two renderings of one block is exactly the drift
+/// the record exists to make impossible.
+pub(crate) fn file_block(excerpt: &Excerpt) -> String {
     let truncated = if excerpt.truncated {
         " truncated=\"true\""
     } else {

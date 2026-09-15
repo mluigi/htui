@@ -857,6 +857,444 @@ fn document_terms(entry: &Listed) -> Vec<String> {
     terms
 }
 
+// -------------------------------------------------------------------------------------------
+// §4.5 steps 1–10, over a reader (`:1035-1064`)
+// -------------------------------------------------------------------------------------------
+
+/// How many file heads the lexical tier will read before it scores the rest on their paths alone.
+///
+/// ANA-5 bounds the *walk* (`excerpt_max_scan_files`, 20 000) and does not bound the tier-5
+/// **read**, which would be 20 000 file opens for a signal worth `10 + 0..9`. The cap is recorded
+/// in `notes` when it bites, so a thin lexical tier is visible rather than inferred.
+pub const LEXICAL_HEAD_READS: usize = 400;
+
+/// How many per-file denylist notes `select` writes before it falls back to the aggregate count.
+const DENIED_NOTE_CAP: usize = 20;
+
+/// One audit row for a rendered excerpt, hashing the bytes the model was given (§4.5 `:1136-1137`).
+///
+/// `rendered` is the excerpt's `<file>` block exactly as it lands in the prompt — which is why this
+/// takes it rather than re-deriving it: [`crate::prompt::assemble`] scrubs before it digests, so the
+/// bytes a reader can prove are the scrubbed ones (plan D100), and a record that hashed the
+/// pre-scrub rendering would describe a string nobody was sent.
+#[must_use]
+pub fn file_record(excerpt: &Excerpt, rendered: &str) -> FileRecord {
+    FileRecord {
+        repo: excerpt.repo.clone(),
+        path: excerpt.path.clone(),
+        lines: format!("{}-{}", excerpt.first_line, excerpt.last_line),
+        rank: excerpt.rank,
+        weight: excerpt.weight,
+        reason: excerpt.reason,
+        truncated: excerpt.truncated,
+        bytes: rendered.len() as u64,
+        sha256: crate::prompt::digest::sha256_hex(rendered),
+    }
+}
+
+/// Whether a candidate path is repo-relative, as §4.2 rule 5 requires (hazard H-1).
+///
+/// A provider that proposed `/etc/passwd` or `C:\secrets` would put an absolute path into a
+/// digested byte, so the guard lives here rather than in a renderer that has no way to refuse.
+fn is_repo_relative(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if path.is_empty() || bytes[0] == b'/' || bytes[0] == b'\\' {
+        return false;
+    }
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    !path.split('/').any(|segment| segment == "..")
+}
+
+/// §4.5 step 8: the window one file contributes, and what it cost to cut it.
+///
+/// Returns `(content, first_line, last_line, truncated, elided_lines, elided_bytes)`. `want` is a
+/// provider's window opinion; `None` means the whole file, and either way the line cap applies.
+fn window(text: &str, caps: ExcerptCaps, want: Option<(u32, u32)>) -> Option<Windowed> {
+    let text = crate::prompt::render::normalise_newlines(text);
+    let all: Vec<&str> = text.lines().collect();
+    if all.is_empty() {
+        return None;
+    }
+    let total = u32::try_from(all.len()).unwrap_or(u32::MAX);
+    let (first, last) = match want {
+        Some((from, to)) => (from.max(1).min(total), to.max(1).min(total)),
+        None => (1, total),
+    };
+    let (first, last) = if first > last {
+        (1, total)
+    } else {
+        (first, last)
+    };
+    let slice = &all[(first as usize - 1)..(last as usize)];
+    let cap = caps.file_line_cap.max(1) as usize;
+    if slice.len() <= cap {
+        return Some(Windowed {
+            content: joined(slice),
+            first_line: first,
+            last_line: last,
+            truncated: false,
+            elided_lines: 0,
+            elided_bytes: 0,
+        });
+    }
+    let head = (caps.head_lines.max(1) as usize).min(slice.len().saturating_sub(1));
+    let dropped = &slice[head..];
+    Some(Windowed {
+        content: joined(&slice[..head]),
+        first_line: first,
+        last_line: first + u32::try_from(head).unwrap_or(u32::MAX) - 1,
+        truncated: true,
+        elided_lines: u32::try_from(dropped.len()).unwrap_or(u32::MAX),
+        // `+ 1` per line for the LF the split removed, the same arithmetic `trim.rs` bills a
+        // head+tail elision with, so the two markers mean one thing.
+        elided_bytes: dropped.iter().map(|line| line.len() as u64 + 1).sum(),
+    })
+}
+
+/// [`window`]'s six results, named rather than positional.
+struct Windowed {
+    content: String,
+    first_line: u32,
+    last_line: u32,
+    truncated: bool,
+    elided_lines: u32,
+    elided_bytes: u64,
+}
+
+/// Lines back into text, LF-terminated, which is what [`Excerpt::content`] is.
+fn joined(lines: &[&str]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// §4.5 steps 1–10 over a reader and a candidate list already merged from every provider.
+///
+/// Pure over `reader`: with an in-memory double no filesystem is touched, which is what makes the
+/// tier, denylist and windowing cases unit tests rather than integration tests (hazard H-22).
+///
+/// `providers` is the `provider_set` [`htui_agent::excerpt::run_providers`] produced, in P-11's
+/// grammar; [`BUILTIN_ID`] is forced to the front if the caller left it out, because §4.5 `:1201`
+/// makes the built-in un-removable and a record that omitted it would claim a prompt no code path
+/// can produce.
+///
+/// Every failure here is a **note**, never an error (§4.5 step 1's fail-open): an unresolved root,
+/// an unlistable repo, a denied file, an unreadable candidate and an exhausted budget all leave a
+/// valid prompt with a smaller excerpt section and a record that says why.
+#[must_use]
+pub fn select(
+    reader: &dyn RepoReader,
+    req: &ExcerptRequest<'_>,
+    merged: Vec<ExcerptCandidate>,
+    providers: Vec<String>,
+    est: crate::prompt::TokenEstimator,
+) -> ExcerptSet {
+    let mut notes = Vec::new();
+    let mut provider_set = providers;
+    if !provider_set.iter().any(|entry| entry == BUILTIN_ID) {
+        provider_set.insert(0, BUILTIN_ID.to_owned());
+    }
+
+    // -- steps 1 and 2: resolve a root per repo, list under it, apply the path-only skip rules --
+    let mut roots: Vec<&RepoRoot> = req.roots.iter().collect();
+    roots.sort_by(|a, b| a.repo.as_bytes().cmp(b.repo.as_bytes()));
+    let mut root_records = Vec::new();
+    let mut listing: Vec<Listed> = Vec::new();
+    let mut skipped: std::collections::BTreeMap<&'static str, u32> =
+        std::collections::BTreeMap::new();
+    let mut denied_notes = Vec::new();
+    for root in &roots {
+        if root.source == RootSource::NoPath {
+            root_records.push(RootRecord {
+                repo: root.repo.clone(),
+                source: RootSource::NoPath,
+                scan_truncated: false,
+            });
+            notes.push(format!(
+                "excerpt: no readable root for repo `{}`; nothing was scanned",
+                root.repo
+            ));
+            continue;
+        }
+        let (paths, truncated) = match reader.list(root, req.scan_cap) {
+            Ok(listed) => listed,
+            Err(error) => {
+                root_records.push(RootRecord {
+                    repo: root.repo.clone(),
+                    source: root.source,
+                    scan_truncated: false,
+                });
+                notes.push(format!(
+                    "excerpt: repo `{}` could not be listed: {}",
+                    root.repo, error.message
+                ));
+                continue;
+            }
+        };
+        root_records.push(RootRecord {
+            repo: root.repo.clone(),
+            source: root.source,
+            scan_truncated: truncated,
+        });
+        if truncated {
+            notes.push(format!(
+                "excerpt: repo `{}` hit the scan cap of {} files; the listing is partial",
+                root.repo, req.scan_cap
+            ));
+        }
+        for path in paths {
+            if let Some(rule) = skip_by_path(&path) {
+                *skipped.entry(rule).or_default() += 1;
+                let declared = req
+                    .touched_prefixes
+                    .iter()
+                    .any(|prefix| prefix.matches(&root.repo, &path))
+                    || req
+                        .changed_paths
+                        .iter()
+                        .any(|changed| changed.repo == root.repo && changed.path == path);
+                if declared && denied_notes.len() < DENIED_NOTE_CAP {
+                    // ANA-5 §12 criterion 14: a denied file that was *declared* is the case a
+                    // maintainer has to be told about, because otherwise the declaration looks
+                    // honoured and is not.
+                    denied_notes.push(format!(
+                        "excerpt: `{}:{path}` is declared but excluded by rule `{rule}`; never selected",
+                        root.repo
+                    ));
+                }
+                continue;
+            }
+            if !is_repo_relative(&path) {
+                notes.push(format!(
+                    "excerpt: listed path `{}:{path}` is not repo-relative; dropped",
+                    root.repo
+                ));
+                continue;
+            }
+            listing.push(Listed {
+                repo: root.repo.clone(),
+                path,
+                head: String::new(),
+            });
+        }
+    }
+    notes.extend(denied_notes);
+    for (rule, count) in &skipped {
+        notes.push(format!("excerpt: {count} path(s) skipped by rule `{rule}`"));
+    }
+    let considered = u32::try_from(listing.len()).unwrap_or(u32::MAX);
+
+    // -- steps 3 to 5: the tiers. Heads are read only for the files tier 5 will actually score. --
+    fill_lexical_heads(reader, req, &roots, &mut listing, &mut notes);
+    let builtin = rank(req, &listing);
+
+    // -- step 6: merge the providers' candidates by `(repo, path)`, keeping the higher weight -----
+    let mut by_path: std::collections::BTreeMap<(String, String), ExcerptCandidate> =
+        std::collections::BTreeMap::new();
+    for candidate in builtin {
+        by_path.insert((candidate.repo.clone(), candidate.path.clone()), candidate);
+    }
+    for candidate in merged {
+        if !is_repo_relative(&candidate.path) {
+            notes.push(format!(
+                "excerpt: candidate `{}:{}` is not repo-relative; dropped",
+                candidate.repo, candidate.path
+            ));
+            continue;
+        }
+        if let Some(rule) = skip_by_path(&candidate.path) {
+            notes.push(format!(
+                "excerpt: candidate `{}:{}` is excluded by rule `{rule}`; never selected",
+                candidate.repo, candidate.path
+            ));
+            continue;
+        }
+        let key = (candidate.repo.clone(), candidate.path.clone());
+        match by_path.get(&key) {
+            // A tie keeps the built-in's tier reason: two orders for one weight would make the
+            // rendered `reason=` depend on the order providers happened to answer in.
+            Some(existing) if existing.weight >= candidate.weight => {}
+            _ => {
+                by_path.insert(key, candidate);
+            }
+        }
+    }
+    let mut candidates: Vec<ExcerptCandidate> = by_path.into_values().collect();
+    sort_candidates(&mut candidates);
+
+    // -- steps 7 and 8: take in rank order until a cap binds, windowing each file ----------------
+    let mut files: Vec<Excerpt> = Vec::new();
+    let mut spent = 0i64;
+    let max_files = req.caps.max_files as usize;
+    if req.budget_tokens <= 0 && !candidates.is_empty() {
+        notes.push("excerpt: the residual budget is zero; no file was taken".to_owned());
+    }
+    let mut not_taken = 0u32;
+    for candidate in candidates {
+        if files.len() >= max_files || req.budget_tokens <= 0 {
+            not_taken += 1;
+            continue;
+        }
+        let Some(root) = roots.iter().find(|root| root.repo == candidate.repo) else {
+            notes.push(format!(
+                "excerpt: candidate `{}:{}` names a repo with no root; dropped",
+                candidate.repo, candidate.path
+            ));
+            continue;
+        };
+        let text = match reader.read(root, &candidate.path) {
+            Ok(text) => text,
+            Err(error) => {
+                notes.push(format!(
+                    "excerpt: `{}:{}` could not be read: {}",
+                    candidate.repo, candidate.path, error.message
+                ));
+                continue;
+            }
+        };
+        let bytes = text.len() as u64;
+        if bytes > req.caps.max_file_bytes {
+            // §4.5 step 8: skipped rather than windowed — a file this large that is not tier 1 or
+            // 2 is almost always generated.
+            notes.push(format!(
+                "excerpt: `{}:{}` is {bytes} bytes, over max_file_bytes ({}); skipped",
+                candidate.repo, candidate.path, req.caps.max_file_bytes
+            ));
+            continue;
+        }
+        let Some(windowed) = window(&text, req.caps, candidate.lines) else {
+            continue;
+        };
+        let (reason, provider) = reason_of(&candidate.reason);
+        let excerpt = Excerpt {
+            repo: candidate.repo,
+            path: candidate.path,
+            first_line: windowed.first_line,
+            last_line: windowed.last_line,
+            truncated: windowed.truncated,
+            elided_lines: windowed.elided_lines,
+            elided_bytes: windowed.elided_bytes,
+            rank: u32::try_from(files.len() + 1).unwrap_or(u32::MAX),
+            weight: candidate.weight,
+            reason,
+            provider,
+            content: windowed.content,
+        };
+        let cost = est.estimate(&crate::prompt::render::file_block(&excerpt));
+        if spent + cost > req.budget_tokens {
+            not_taken += 1;
+            continue;
+        }
+        spent += cost;
+        files.push(excerpt);
+    }
+    if not_taken > 0 {
+        notes.push(format!(
+            "excerpt: {not_taken} candidate(s) not taken; the residual budget of {} tokens and \
+             max_files of {max_files} bound first",
+            req.budget_tokens
+        ));
+    }
+
+    // -- step 10: the audit ---------------------------------------------------------------------
+    let audit = ExcerptAudit {
+        provider_set,
+        roots: root_records,
+        considered,
+        selected: u32::try_from(files.len()).unwrap_or(u32::MAX),
+        caps: req.caps,
+        files: files
+            .iter()
+            .map(|file| file_record(file, &crate::prompt::render::file_block(file)))
+            .collect(),
+    };
+    ExcerptSet {
+        files,
+        audit,
+        notes,
+    }
+}
+
+/// A candidate's `reason` string back into the closed enum, or into a provider attribution.
+///
+/// A string that is not one of the five tier names **is** a provider name: `run_providers` rewrites
+/// every returned candidate's reason to the provider that returned it, so a provider cannot claim
+/// a tier — or another provider's name — by spelling one.
+fn reason_of(reason: &str) -> (ExcerptReason, Option<String>) {
+    match reason {
+        "touched_path" => (ExcerptReason::TouchedPath, None),
+        "prev_diff" => (ExcerptReason::PrevDiff, None),
+        "mentioned" => (ExcerptReason::Mentioned, None),
+        "identifier" => (ExcerptReason::Identifier, None),
+        "lexical" => (ExcerptReason::Lexical, None),
+        other => (ExcerptReason::Provider, Some(other.to_owned())),
+    }
+}
+
+/// Read the first [`LEXICAL_HEAD_BYTES`] of the files tier 5 is going to score, and no others.
+///
+/// Bounded by [`LEXICAL_HEAD_READS`] and noted when the bound bites. Files past it keep an empty
+/// head and are scored on their path alone, which is a weaker tier-5 signal rather than an absent
+/// candidate.
+fn fill_lexical_heads(
+    reader: &dyn RepoReader,
+    req: &ExcerptRequest<'_>,
+    roots: &[&RepoRoot],
+    listing: &mut [Listed],
+    notes: &mut Vec<String>,
+) {
+    let max_files = req.caps.max_files as usize;
+    if max_files / 3 == 0 {
+        return;
+    }
+    let signals = Signals::of(req);
+    let leftovers: Vec<usize> = listing
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| tier_of(req, &signals, entry).is_none())
+        .map(|(index, _)| index)
+        .collect();
+    if listing.len() - leftovers.len() >= max_files {
+        // Tiers 1–4 already fill `max_files`, so tier 5 will not run and no head is worth reading.
+        return;
+    }
+    let mut read = 0usize;
+    for index in &leftovers {
+        if read >= LEXICAL_HEAD_READS {
+            break;
+        }
+        let entry = &listing[*index];
+        let Some(root) = roots.iter().find(|root| root.repo == entry.repo) else {
+            continue;
+        };
+        if let Ok(text) = reader.read(root, &entry.path) {
+            // Cut on a character boundary at or below the byte cap, so the head is still UTF-8.
+            let cut = if text.len() <= LEXICAL_HEAD_BYTES {
+                text.len()
+            } else {
+                (0..=LEXICAL_HEAD_BYTES)
+                    .rev()
+                    .find(|at| text.is_char_boundary(*at))
+                    .unwrap_or(0)
+            };
+            listing[*index].head = text[..cut].to_owned();
+        }
+        read += 1;
+    }
+    if leftovers.len() > read {
+        notes.push(format!(
+            "excerpt: the lexical tier read {read} file head(s); {} candidate(s) were scored on \
+             their path alone",
+            leftovers.len() - read
+        ));
+    }
+}
+
 /// The excerpt half of a [`PromptSpec`](crate::prompt::PromptSpec): the files and their audit.
 ///
 /// `Default` is the empty set, which is what a caller that resolved no readable root passes — the
@@ -1065,6 +1503,306 @@ mod tests {
         assert!(
             ranked.iter().all(|candidate| candidate.weight == 100),
             "tier 1 already fills `max_files`, so tier 5 does not run: {ranked:?}"
+        );
+    }
+
+    /// A [`RepoReader`] over an in-memory tree: no filesystem, so every `select` case below is a
+    /// unit test (§4.8 — `htui-core` names no `std::fs`).
+    #[derive(Debug, Default)]
+    struct MapReader {
+        files: std::collections::BTreeMap<(String, String), String>,
+        truncated: bool,
+    }
+
+    impl MapReader {
+        fn with(files: &[(&str, &str, &str)]) -> Self {
+            Self {
+                files: files
+                    .iter()
+                    .map(|(repo, path, body)| {
+                        (((*repo).to_owned(), (*path).to_owned()), (*body).to_owned())
+                    })
+                    .collect(),
+                truncated: false,
+            }
+        }
+    }
+
+    impl RepoReader for MapReader {
+        fn list(&self, root: &RepoRoot, _cap: u32) -> Result<(Vec<String>, bool), ProviderError> {
+            Ok((
+                self.files
+                    .keys()
+                    .filter(|(repo, _)| *repo == root.repo)
+                    .map(|(_, path)| path.clone())
+                    .collect(),
+                self.truncated,
+            ))
+        }
+
+        fn read(&self, root: &RepoRoot, path: &str) -> Result<String, ProviderError> {
+            self.files
+                .get(&(root.repo.clone(), path.to_owned()))
+                .cloned()
+                .ok_or_else(|| ProviderError::new("map", format!("no such path `{path}`")))
+        }
+    }
+
+    fn root(repo: &str) -> RepoRoot {
+        RepoRoot {
+            repo: repo.to_owned(),
+            root: std::path::PathBuf::from("/nowhere"),
+            source: RootSource::RunStepTree,
+        }
+    }
+
+    #[test]
+    fn render_order_is_path_order_not_rank_order() {
+        // §4.5 step 9: the rank decides what survives, the path decides where it sits.
+        let mut owned = request("nothing\n", &["src/z.rs", "src/a.rs"], &[]);
+        owned.roots = vec![root("htui")];
+        let reader = MapReader::with(&[
+            ("htui", "src/a.rs", "fn a() {}\n"),
+            ("htui", "src/z.rs", "fn z() {}\n"),
+        ]);
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            Vec::new(),
+            vec![BUILTIN_ID.to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+        assert_eq!(set.files.len(), 2);
+        // `src/z.rs` is the first declared prefix, so it ranks first...
+        assert_eq!(set.files[0].path, "src/a.rs", "the ranker is path-ordered");
+        let rendered = crate::prompt::render::excerpts(&set.files).expect("two files");
+        let a = rendered.content.find("src/a.rs").expect("a is rendered");
+        let z = rendered.content.find("src/z.rs").expect("z is rendered");
+        assert!(a < z, "...and the render is `(repo, path)` byte order");
+    }
+
+    #[test]
+    fn a_file_over_the_line_cap_is_head_windowed_with_the_marker() {
+        // §4.5 step 8: whole file at or under `file_line_cap`, otherwise the first `head_lines`
+        // with §4.4's elision marker.
+        let mut owned = request("nothing\n", &["src/"], &[]);
+        owned.roots = vec![root("htui")];
+        owned.caps.file_line_cap = 4;
+        owned.caps.head_lines = 2;
+        let long: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        let reader = MapReader::with(&[
+            ("htui", "src/long.rs", &long),
+            ("htui", "src/short.rs", "one\ntwo\n"),
+        ]);
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            Vec::new(),
+            vec![BUILTIN_ID.to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+        let long = set
+            .files
+            .iter()
+            .find(|file| file.path == "src/long.rs")
+            .expect("the long file survived");
+        assert_eq!((long.first_line, long.last_line), (1, 2));
+        assert!(long.truncated);
+        assert_eq!(long.elided_lines, 8);
+        assert_eq!(long.content, "line 1\nline 2\n");
+        // `line 3\n` .. `line 10\n` is eight lines: seven of seven bytes and one of eight, the LF
+        // billed per line exactly as `trim.rs` bills a head+tail elision.
+        assert_eq!(long.elided_bytes, 7 * 7 + 8);
+        let block = crate::prompt::render::file_block(long);
+        assert!(
+            block.contains(&crate::prompt::render::elision_marker(
+                long.elided_lines,
+                long.elided_bytes
+            )),
+            "the marker's two numbers are the record's: {block}"
+        );
+        let short = set
+            .files
+            .iter()
+            .find(|file| file.path == "src/short.rs")
+            .expect("the short file survived");
+        assert!(!short.truncated);
+        assert_eq!((short.first_line, short.last_line), (1, 2));
+    }
+
+    #[test]
+    fn no_roots_means_no_section_and_a_no_path_root_per_repo() {
+        // ANA-5 §12 criterion 12, and plan D103's preview: an unresolved root is a fact, not a
+        // failure.
+        let mut owned = request("nothing\n", &["**"], &[]);
+        owned.roots = vec![
+            RepoRoot {
+                repo: "htui".to_owned(),
+                root: std::path::PathBuf::new(),
+                source: RootSource::NoPath,
+            },
+            RepoRoot {
+                repo: "agy".to_owned(),
+                root: std::path::PathBuf::new(),
+                source: RootSource::NoPath,
+            },
+        ];
+        let reader = MapReader::default();
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            Vec::new(),
+            vec![BUILTIN_ID.to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+        assert!(set.files.is_empty(), "nothing was scanned, so nothing is");
+        assert!(crate::prompt::render::excerpts(&set.files).is_none());
+        assert_eq!(
+            set.audit
+                .roots
+                .iter()
+                .map(|record| (record.repo.as_str(), record.source))
+                .collect::<Vec<_>>(),
+            vec![("agy", RootSource::NoPath), ("htui", RootSource::NoPath)],
+            "one `no_path` record per repo, in repo byte order"
+        );
+        assert_eq!(set.audit.considered, 0);
+        assert_eq!(set.audit.selected, 0);
+        assert_eq!(set.audit.provider_set, vec![BUILTIN_ID.to_owned()]);
+        assert_eq!(
+            set.notes.len(),
+            2,
+            "each skipped repo says so: {:?}",
+            set.notes
+        );
+    }
+
+    #[test]
+    fn sha256_is_over_the_rendered_block() {
+        // §4.5 `:1136-1137`: over the excerpt's rendered content bytes, not the whole file, so a
+        // reader can prove which bytes the model saw without the record storing them.
+        let mut owned = request("nothing\n", &["src/"], &[]);
+        owned.roots = vec![root("htui")];
+        let body = "fn a() {}\nfn b() {}\n";
+        let reader = MapReader::with(&[("htui", "src/a.rs", body)]);
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            Vec::new(),
+            vec![BUILTIN_ID.to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+        let excerpt = &set.files[0];
+        let block = crate::prompt::render::file_block(excerpt);
+        let record = &set.audit.files[0];
+        assert_eq!(record.sha256, crate::prompt::digest::sha256_hex(&block));
+        assert_eq!(record.bytes, block.len() as u64);
+        assert_eq!(record.lines, "1-2");
+        assert_ne!(
+            record.sha256,
+            crate::prompt::digest::sha256_hex(body),
+            "the whole file's hash is not the rendered block's"
+        );
+        assert_eq!(record.sha256.len(), 64);
+    }
+
+    #[test]
+    fn the_residual_budget_binds_before_max_files() {
+        // §4.5 step 7: `max_files`, the per-file caps, or the residual budget — whichever binds.
+        let mut owned = request("nothing\n", &["src/"], &[]);
+        owned.roots = vec![root("htui")];
+        owned.budget_tokens = 40;
+        let body: String = (1..=20).map(|n| format!("a line of prose {n}\n")).collect();
+        let files: Vec<(&str, String, String)> = (0..6)
+            .map(|n| ("htui", format!("src/f{n}.rs"), body.clone()))
+            .collect();
+        let reader = MapReader::with(
+            &files
+                .iter()
+                .map(|(repo, path, body)| (*repo, path.as_str(), body.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            Vec::new(),
+            vec![BUILTIN_ID.to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+        assert!(
+            set.files.len() < 6,
+            "the budget bound before `max_files` did"
+        );
+        assert!(
+            set.notes
+                .iter()
+                .any(|note| note.contains("residual budget")),
+            "a cap that bit is recorded: {:?}",
+            set.notes
+        );
+        let est = crate::prompt::TokenEstimator::DEFAULT;
+        let spent: i64 = set
+            .files
+            .iter()
+            .map(|file| est.estimate(&crate::prompt::render::file_block(file)))
+            .sum();
+        assert!(spent <= 40, "{spent} tokens is over the residual budget");
+    }
+
+    #[test]
+    fn a_provider_candidate_merges_by_repo_and_path_keeping_the_higher_weight() {
+        // §4.5 step 6, and rule 3: a provider that changes the excerpt set changes the prompt.
+        let mut owned = request("nothing\n", &[], &[]);
+        owned.roots = vec![root("htui")];
+        let reader = MapReader::with(&[
+            ("htui", "src/a.rs", "fn a() {}\n"),
+            ("htui", "src/b.rs", "fn b() {}\n"),
+        ]);
+        let merged = vec![
+            ExcerptCandidate {
+                repo: "htui".to_owned(),
+                path: "src/b.rs".to_owned(),
+                lines: None,
+                weight: 95,
+                reason: "serena".to_owned(),
+            },
+            // An absolute path from a provider is dropped, never rendered (hazard H-1).
+            ExcerptCandidate {
+                repo: "htui".to_owned(),
+                path: "/etc/passwd".to_owned(),
+                lines: None,
+                weight: 100,
+                reason: "serena".to_owned(),
+            },
+        ];
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            merged,
+            vec![BUILTIN_ID.to_owned(), "serena@0.1".to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+        let b = set
+            .files
+            .iter()
+            .find(|file| file.path == "src/b.rs")
+            .expect("the provider's candidate was taken");
+        assert_eq!(b.weight, 95);
+        assert_eq!(b.reason, ExcerptReason::Provider);
+        assert_eq!(b.provider.as_deref(), Some("serena"));
+        assert_eq!(b.rank, 1, "95 outranks the lexical tier");
+        assert!(
+            crate::prompt::render::file_block(b).contains("reason=\"provider:serena\""),
+            "§4.5 `:1114` renders a provider's reason qualified"
+        );
+        assert!(
+            set.files.iter().all(|file| !file.path.starts_with('/')),
+            "an absolute path never reaches a rendered byte"
+        );
+        assert!(
+            set.notes.iter().any(|note| note.contains("/etc/passwd")),
+            "and its exclusion is recorded: {:?}",
+            set.notes
         );
     }
 
