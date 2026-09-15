@@ -456,6 +456,18 @@ fn write(root: &std::path::Path, path: &str, body: &[u8]) {
     std::fs::write(full, body).expect("write");
 }
 
+/// A reader whose `max_file_bytes` is `limit`, the rest of its caps the default ones.
+///
+/// An `ExcerptCaps` rather than a bare number because that is the whole of finding F-101: the
+/// reader's limit and `req.caps.max_file_bytes` are one `resolve_excerpt_caps` result or they are a
+/// mismatch the audit cannot describe.
+fn capped(limit: u64) -> FsRepoReader {
+    FsRepoReader::new(ExcerptCaps {
+        max_file_bytes: limit,
+        ..base_request(&[], Vec::new()).caps
+    })
+}
+
 fn fs_root(dir: &std::path::Path) -> RepoRoot {
     RepoRoot {
         repo: "htui".to_owned(),
@@ -561,7 +573,7 @@ fn fs_reader_skips_git_gitignored_binary_large_and_lockfiles_in_order() {
     write(dir.path(), "web/app.js.map", b"{}\n");
 
     // 5 — `max_file_bytes` bites at 1 KB, so `src/big.rs` goes and `src/keep.rs` stays.
-    let reader = FsRepoReader::new(1_024);
+    let reader = capped(1_024);
     let (paths, truncated) = reader
         .list(&fs_root(dir.path()), 20_000)
         .expect("the root is readable");
@@ -664,7 +676,7 @@ fn fs_reader_read_refuses_an_oversized_a_binary_and_a_non_file() {
     write(dir.path(), "image.dat", b"PNG\x00\x01\x02binary\n");
     write(dir.path(), "src/keep.rs", b"fn keep() {}\n");
 
-    let reader = FsRepoReader::new(1_024);
+    let reader = capped(1_024);
     let too_large = reader
         .read(&fs_root(dir.path()), "big.rs")
         .expect_err("over the cap");
@@ -856,6 +868,106 @@ fn an_unreadable_root_is_a_note_and_not_an_error() {
             .iter()
             .any(|note| note.contains("could not be listed")),
         "{:?}",
+        set.notes
+    );
+}
+
+#[test]
+fn the_reader_and_the_pass_run_under_one_max_file_bytes() {
+    // Review finding F-101. There were two unrelated enforcements of `max_file_bytes`: this reader
+    // applied its own in the walk (skip rule 5) and again in `read` — it has to, because a file has
+    // to be refused before it is allocated — and `select` applied `req.caps.max_file_bytes` to the
+    // bytes it got back. Nothing tied them.
+    //
+    // A reader limit *below* the configured cap therefore bound first and invisibly: the walk never
+    // listed the file, so it was never considered, and `audit.caps` went on recording the
+    // configured number — a cap that had stopped nothing. The record claimed a pass that did not
+    // happen.
+    //
+    // The reader is now built from an `ExcerptCaps`, so the one `resolve_excerpt_caps` call that
+    // mints `req.caps` mints the reader's limit too, and `select` records the minimum of the two so
+    // that no other `RepoReader` can reintroduce the gap either.
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/keep.rs", b"fn keep() {}\n");
+    write(dir.path(), "src/big.rs", &vec![b'x'; 4_096]);
+
+    let app = BTreeMap::from([(
+        "excerpt_max_file_bytes".to_owned(),
+        serde_json::json!(1_024),
+    )]);
+    let (caps, scan_cap, _deadline) = htui_core::prompt::settings::resolve_excerpt_caps(&app);
+    assert_eq!(caps.max_file_bytes, 1_024, "the row this case turns on");
+
+    let reader = FsRepoReader::new(caps);
+    assert_eq!(
+        RepoReader::max_file_bytes(&reader),
+        caps.max_file_bytes,
+        "the reader reports the caps' number, so `select` can reconcile against it"
+    );
+
+    let mut owned = base_request(&["src/"], vec![fs_root(dir.path())]);
+    owned.caps = caps;
+    owned.scan_cap = scan_cap;
+    let set = select(
+        &reader,
+        &owned.as_request(),
+        Vec::new(),
+        vec![BUILTIN_ID.to_owned()],
+        TokenEstimator::DEFAULT,
+    );
+
+    assert_eq!(
+        set.audit.caps.max_file_bytes, 1_024,
+        "the audit records the cap that bound"
+    );
+    assert!(
+        set.files.iter().any(|file| file.path == "src/keep.rs"),
+        "the file under the cap is in the prompt"
+    );
+    assert!(
+        set.files.iter().all(|file| file.path != "src/big.rs"),
+        "the 4 KB file is over it and is not"
+    );
+    assert!(
+        !set.notes
+            .iter()
+            .any(|note| note.contains("the reader's max_file_bytes")),
+        "one number, so nothing to reconcile and nothing to say: {:?}",
+        set.notes
+    );
+}
+
+#[test]
+fn a_reader_limit_below_the_configured_cap_is_the_one_the_audit_names() {
+    // The same finding from the other side: a caller that hands `select` caps the reader was not
+    // built from can no longer make `audit.caps` name a number that never bound. The reader's lower
+    // limit is what the record carries, and a note gives both numbers so the difference is legible
+    // rather than silent.
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/keep.rs", b"fn keep() {}\n");
+    write(dir.path(), "src/big.rs", &vec![b'x'; 4_096]);
+
+    let reader = capped(1_024);
+    let mut owned = base_request(&["src/"], vec![fs_root(dir.path())]);
+    owned.caps.max_file_bytes = 1_000_000;
+    let set = select(
+        &reader,
+        &owned.as_request(),
+        Vec::new(),
+        vec![BUILTIN_ID.to_owned()],
+        TokenEstimator::DEFAULT,
+    );
+
+    assert_eq!(
+        set.audit.caps.max_file_bytes, 1_024,
+        "the reader's limit bound in the walk, so it is the one recorded — not the 1000000 the \
+         caller asked for"
+    );
+    assert!(
+        set.notes.iter().any(|note| {
+            note.contains("max_file_bytes") && note.contains("1024") && note.contains("1000000")
+        }),
+        "and the mismatch is named rather than hidden: {:?}",
         set.notes
     );
 }

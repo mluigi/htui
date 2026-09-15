@@ -30,10 +30,10 @@ use std::time::Instant;
 use tracing::warn;
 
 use htui_core::prompt::excerpt::{
-    ExcerptCandidate, ExcerptProvider, ExcerptRequest, OwnedExcerptRequest, ProviderError,
-    RepoReader, RepoRoot, skip_by_path,
+    ExcerptCandidate, ExcerptCaps, ExcerptProvider, ExcerptRequest, OwnedExcerptRequest,
+    ProviderError, RepoReader, RepoRoot, skip_by_path,
 };
-use htui_core::prompt::settings::DEFAULTS;
+use htui_core::prompt::settings::resolve_excerpt_caps;
 
 /// How many bytes of a file the binary test reads (§4.5 `:1073`).
 pub const BINARY_PROBE_BYTES: usize = 8_192;
@@ -175,28 +175,49 @@ impl GitignoreSubset {
 /// before it is descended, because `read_dir` order is the filesystem's and two boxes would
 /// otherwise list the same tree differently and assemble different prompts (invariant 2).
 ///
-/// `max_file_bytes` is carried on the reader rather than passed to `list`, because
+/// The size limit is carried on the reader rather than passed to `list`, because
 /// [`RepoReader::list`] takes only the scan cap and §4.5's fifth skip rule needs the size limit at
-/// the same moment the file is stat-ed. [`Default`] is `DEFAULTS.excerpt_max_file_bytes`.
+/// the same moment the file is stat-ed.
+///
+/// It is carried as the whole [`ExcerptCaps`] rather than as a loose `u64`, which is review finding
+/// F-101. There are two enforcements of `max_file_bytes` and there always will be: this reader has
+/// to refuse a file *before* it allocates it, and `select` re-measures what it gets back — "a
+/// reader is a public seam and the two defences are deliberately independent"
+/// ([`RepoReader::read`]). What went wrong was that nothing tied the two **numbers**: a reader built
+/// with a limit below `caps.max_file_bytes` bound first and silently, because the walk simply never
+/// listed the file, and `audit.caps` went on naming the configured cap — one that had stopped
+/// nothing.
+///
+/// Taking an [`ExcerptCaps`] means the one `resolve_excerpt_caps` call that mints the caps the pass
+/// records is the same call that mints the reader's limit; there is no second number to get wrong.
+/// [`RepoReader::max_file_bytes`] then reports it, so `select` records the cap that actually bound
+/// even for a reader built some other way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsRepoReader {
-    /// `app_setting.excerpt_max_file_bytes`: skip rule 5.
-    pub max_file_bytes: u64,
+    /// The caps this reader was resolved under. Only `max_file_bytes` is a rule of the walk's
+    /// (skip rule 5); the rest are the pass's and are carried so the two cannot be resolved apart.
+    pub caps: ExcerptCaps,
 }
 
 impl Default for FsRepoReader {
+    /// The reader for the caps an empty `app_setting` table resolves to — from
+    /// `resolve_excerpt_caps`, not from a second reading of [`DEFAULTS`], so even the default is
+    /// the one resolver's answer (F-101).
+    ///
+    /// [`DEFAULTS`]: htui_core::prompt::settings::DEFAULTS
     fn default() -> Self {
-        Self {
-            max_file_bytes: DEFAULTS.excerpt_max_file_bytes,
-        }
+        Self::new(resolve_excerpt_caps(&std::collections::BTreeMap::new()).0)
     }
 }
 
 impl FsRepoReader {
-    /// A reader with an explicit size limit, as `settings::resolve_excerpt_caps` resolved it.
+    /// A reader for the caps `settings::resolve_excerpt_caps` resolved.
+    ///
+    /// The **same** value must reach `ExcerptRequest::caps`; that is the whole point of the
+    /// argument being an [`ExcerptCaps`] rather than a number (F-101).
     #[must_use]
-    pub const fn new(max_file_bytes: u64) -> Self {
-        Self { max_file_bytes }
+    pub const fn new(caps: ExcerptCaps) -> Self {
+        Self { caps }
     }
 
     /// One directory level: sorted entries, the nested `.gitignore` read once, then recursion.
@@ -349,7 +370,7 @@ impl FsRepoReader {
             Err(_) => return Some(SkipRule::Binary),
             Ok(_) => {}
         }
-        if meta.len() > self.max_file_bytes {
+        if meta.len() > self.caps.max_file_bytes {
             return Some(SkipRule::TooLarge);
         }
         if skip_by_path(relative) == Some("lockfile_or_minified") {
@@ -476,6 +497,18 @@ fn probe(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
 }
 
 impl RepoReader for FsRepoReader {
+    /// The limit skip rule 5 and [`Self::read`] enforce, so `select` records the cap that actually
+    /// bound rather than one it merely asked for (review finding F-101).
+    ///
+    /// `caps.max_file_bytes` and nothing else: a reader built by [`FsRepoReader::new`] from the
+    /// caller's own `resolve_excerpt_caps` result reports exactly the number that call resolved, so
+    /// the reconciliation in `select` is a no-op and `audit.caps` is the caps verbatim. It stops
+    /// being a no-op only when a caller resolved the two apart, which is the case the finding
+    /// describes and the one this method makes visible.
+    fn max_file_bytes(&self) -> u64 {
+        self.caps.max_file_bytes
+    }
+
     /// The cap counts every **entry** the walk examines — files, directories and skipped ones
     /// alike — because the cap exists to bound the walk's cost, a stat of a lockfile costs what a
     /// stat of a source file costs, and a directory costs a `read_dir` and a `.gitignore` open on
@@ -513,13 +546,13 @@ impl RepoReader for FsRepoReader {
         };
         // Rule 5 before the allocation, not after it: `select` measured `text.len()` only once the
         // file was already in memory, so a multi-gigabyte file cost its own size to refuse.
-        if meta.len() > self.max_file_bytes {
+        if meta.len() > self.caps.max_file_bytes {
             return Err(ProviderError::new(
                 "fs",
                 format!(
                     "`{path}` is {} bytes, over max_file_bytes ({})",
                     meta.len(),
-                    self.max_file_bytes
+                    self.caps.max_file_bytes
                 ),
             ));
         }
@@ -534,16 +567,16 @@ impl RepoReader for FsRepoReader {
         // `meta.len()` is a promise from before the read, so the read is bounded again by one byte
         // past the cap: a file that grew under the reader is refused, never quietly truncated into
         // a prompt whose digest would then describe bytes nobody chose.
-        let room = self.max_file_bytes.saturating_sub(bytes.len() as u64) + 1;
+        let room = self.caps.max_file_bytes.saturating_sub(bytes.len() as u64) + 1;
         file.take(room)
             .read_to_end(&mut bytes)
             .map_err(read_failed)?;
-        if bytes.len() as u64 > self.max_file_bytes {
+        if bytes.len() as u64 > self.caps.max_file_bytes {
             return Err(ProviderError::new(
                 "fs",
                 format!(
                     "`{path}` grew past max_file_bytes ({}) while it was read",
-                    self.max_file_bytes
+                    self.caps.max_file_bytes
                 ),
             ));
         }

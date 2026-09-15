@@ -571,6 +571,25 @@ pub trait RepoReader: Send + Sync + core::fmt::Debug {
     ///
     /// A path the reader cannot read is an error, never a panic.
     fn read(&self, root: &RepoRoot, path: &str) -> Result<String, ProviderError>;
+
+    /// The size limit this reader applies on its own, or [`u64::MAX`] when it applies none.
+    ///
+    /// [`select`] enforces `caps.max_file_bytes` itself, but it cannot be the *only* enforcement: a
+    /// reader that measures a file has to refuse it before it allocates, which is earlier than any
+    /// pure code can look. `htui_agent::excerpt::FsRepoReader` does exactly that, in its walk (skip
+    /// rule 5) and again in `read`.
+    ///
+    /// Two independent limits is how review finding F-101 arrived. A reader whose limit is *lower*
+    /// than `caps.max_file_bytes` binds first and silently: the walk never lists the file, so it is
+    /// never considered, and the audit went on recording the caps' number — a cap that never bound.
+    /// Reporting it here lets [`select`] record **the cap that actually bound** and say so in a
+    /// note, so `audit.caps` is never a claim about a pass that did not happen.
+    ///
+    /// The default is the honest answer for an in-memory reader and for every test double: it
+    /// enforces nothing, so `caps.max_file_bytes` is the only limit and the audit is already right.
+    fn max_file_bytes(&self) -> u64 {
+        u64::MAX
+    }
 }
 
 /// One listed candidate as the **pure** ranker sees it (§4.5 step 2's output).
@@ -1020,6 +1039,13 @@ fn joined(lines: &[&str]) -> String {
 /// Every failure here is a **note**, never an error (§4.5 step 1's fail-open): an unresolved root,
 /// an unlistable repo, a denied file, an unreadable candidate and an exhausted budget all leave a
 /// valid prompt with a smaller excerpt section and a record that says why.
+///
+/// `caps.max_file_bytes` is **reconciled against the reader's own** before anything is listed, and
+/// the reconciled value is both the one enforced at step 8 and the one `audit.caps` records (review
+/// finding F-101). A reader that refuses large files itself — every filesystem reader must, since a
+/// file has to be refused before it is allocated — binds earlier than this function can see, in its
+/// walk. Recording the configured number when the reader's was lower made the audit name a cap that
+/// had stopped nothing.
 #[must_use]
 pub fn select(
     reader: &dyn RepoReader,
@@ -1032,6 +1058,24 @@ pub fn select(
     let mut provider_set = providers;
     if !provider_set.iter().any(|entry| entry == BUILTIN_ID) {
         provider_set.insert(0, BUILTIN_ID.to_owned());
+    }
+
+    // The one `max_file_bytes` this pass runs under, reconciled before the first listing (review
+    // finding F-101). A reader that enforces a limit of its own enforces it *earlier* than anything
+    // here can — in the walk, so the file is never listed, and again in `read`, before the bytes are
+    // allocated — so the smaller of the two is the only number that can bind. Recording the caps'
+    // number when the reader's was lower made `audit.caps` a claim about a pass that did not
+    // happen; recording the minimum makes it the record §4.5 `:1127` asks for.
+    let caps = ExcerptCaps {
+        max_file_bytes: req.caps.max_file_bytes.min(reader.max_file_bytes()),
+        ..req.caps
+    };
+    if caps.max_file_bytes < req.caps.max_file_bytes {
+        notes.push(format!(
+            "excerpt: the reader's max_file_bytes ({}) is below the configured \
+             excerpt_max_file_bytes ({}); the reader's is the cap that bound and the one recorded",
+            caps.max_file_bytes, req.caps.max_file_bytes
+        ));
     }
 
     // -- steps 1 and 2: resolve a root per repo, list under it, apply the path-only skip rules --
@@ -1159,7 +1203,7 @@ pub fn select(
     // rank and the trimmer's "highest rank number is the worst file" stays true.
     let mut files: Vec<Excerpt> = Vec::new();
     let mut spent = 0i64;
-    let max_files = req.caps.max_files as usize;
+    let max_files = caps.max_files as usize;
     if req.budget_tokens <= 0 && !candidates.is_empty() {
         notes.push("excerpt: the residual budget is zero; no file was taken".to_owned());
     }
@@ -1187,16 +1231,20 @@ pub fn select(
             }
         };
         let bytes = text.len() as u64;
-        if bytes > req.caps.max_file_bytes {
+        if bytes > caps.max_file_bytes {
             // §4.5 step 8: skipped rather than windowed — a file this large that is not tier 1 or
             // 2 is almost always generated.
+            //
+            // `caps`, not `req.caps`: the number named here is the one that bound and the one the
+            // audit records, so a reader with a lower limit of its own can no longer make this note
+            // and `audit.caps` disagree (finding F-101).
             notes.push(format!(
                 "excerpt: `{}:{}` is {bytes} bytes, over max_file_bytes ({}); skipped",
-                candidate.repo, candidate.path, req.caps.max_file_bytes
+                candidate.repo, candidate.path, caps.max_file_bytes
             ));
             continue;
         }
-        let Some(windowed) = window(&text, req.caps, candidate.lines) else {
+        let Some(windowed) = window(&text, caps, candidate.lines) else {
             continue;
         };
         let (reason, provider) = reason_of(&candidate.reason);
@@ -1236,7 +1284,8 @@ pub fn select(
         roots: root_records,
         considered,
         selected: u32::try_from(files.len()).unwrap_or(u32::MAX),
-        caps: req.caps,
+        // The reconciled caps: every cap here is one that could bind on this pass (F-101).
+        caps,
         files: files
             .iter()
             .map(|file| file_record(file, &crate::prompt::render::file_block(file)))
@@ -1618,13 +1667,25 @@ mod tests {
 
     /// A [`RepoReader`] over an in-memory tree: no filesystem, so every `select` case below is a
     /// unit test (§4.8 — `htui-core` names no `std::fs`).
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct MapReader {
         files: std::collections::BTreeMap<(String, String), String>,
         /// Readable through `read`, and never returned by `list`. On a real filesystem this is a
         /// symlink the walk refused and a provider proposed anyway.
         hidden: std::collections::BTreeMap<(String, String), String>,
         truncated: bool,
+        /// A limit of the reader's own, as `htui_agent::excerpt::FsRepoReader` carries one:
+        /// `list` hides anything over it and `read` refuses. [`u64::MAX`] enforces nothing.
+        max_file_bytes: u64,
+    }
+
+    impl Default for MapReader {
+        /// An empty tree that enforces no limit of its own — **not** `#[derive(Default)]`, which
+        /// would make `max_file_bytes` zero and hide every file behind a reader limit no case asked
+        /// for.
+        fn default() -> Self {
+            Self::with(&[])
+        }
     }
 
     impl MapReader {
@@ -1633,11 +1694,19 @@ mod tests {
                 files: entries(files),
                 hidden: std::collections::BTreeMap::new(),
                 truncated: false,
+                max_file_bytes: u64::MAX,
             }
         }
 
         fn hiding(mut self, files: &[(&str, &str, &str)]) -> Self {
             self.hidden = entries(files);
+            self
+        }
+
+        /// A reader that refuses over `limit`, in both `list` and `read`, before the caps are ever
+        /// consulted — which is what a filesystem reader has to do (finding F-101).
+        fn refusing_over(mut self, limit: u64) -> Self {
+            self.max_file_bytes = limit;
             self
         }
     }
@@ -1657,9 +1726,11 @@ mod tests {
         fn list(&self, root: &RepoRoot, _cap: u32) -> Result<(Vec<String>, bool), ProviderError> {
             Ok((
                 self.files
-                    .keys()
-                    .filter(|(repo, _)| *repo == root.repo)
-                    .map(|(_, path)| path.clone())
+                    .iter()
+                    .filter(|((repo, _), body)| {
+                        *repo == root.repo && body.len() as u64 <= self.max_file_bytes
+                    })
+                    .map(|((_, path), _)| path.clone())
                     .collect(),
                 self.truncated,
             ))
@@ -1667,11 +1738,27 @@ mod tests {
 
         fn read(&self, root: &RepoRoot, path: &str) -> Result<String, ProviderError> {
             let key = (root.repo.clone(), path.to_owned());
-            self.files
+            let body = self
+                .files
                 .get(&key)
                 .or_else(|| self.hidden.get(&key))
                 .cloned()
-                .ok_or_else(|| ProviderError::new("map", format!("no such path `{path}`")))
+                .ok_or_else(|| ProviderError::new("map", format!("no such path `{path}`")))?;
+            if body.len() as u64 > self.max_file_bytes {
+                return Err(ProviderError::new(
+                    "map",
+                    format!(
+                        "`{path}` is {} bytes, over max_file_bytes ({})",
+                        body.len(),
+                        self.max_file_bytes
+                    ),
+                ));
+            }
+            Ok(body)
+        }
+
+        fn max_file_bytes(&self) -> u64 {
+            self.max_file_bytes
         }
     }
 
@@ -1681,6 +1768,81 @@ mod tests {
             root: std::path::PathBuf::from("/nowhere"),
             source: RootSource::RunStepTree,
         }
+    }
+
+    #[test]
+    fn the_audit_records_the_cap_that_bound_not_the_one_that_was_asked_for() {
+        // Review finding F-101: two unrelated `max_file_bytes` enforcements. `select` checks
+        // `req.caps.max_file_bytes`; a filesystem reader checks one of its own, in the walk and
+        // again in `read`, because it has to refuse a file before it allocates it. Nothing tied the
+        // two, so a reader whose limit was the lower one bound *first* and silently — the file was
+        // never listed, never considered, and `audit.caps` went on naming a number that had not
+        // stopped anything. A record of a pass that did not happen.
+        //
+        // The reader's limit is now reported and `select` records the minimum, which is the cap
+        // that actually bound, and says so.
+        let mut owned = request("nothing\n", &["src/a.rs"], &[]);
+        owned.roots = vec![root("htui")];
+        owned.caps.max_file_bytes = 1_000_000;
+        let big = "x".repeat(64);
+        let reader = MapReader::with(&[
+            ("htui", "src/a.rs", "fn a() {}\n"),
+            ("htui", "src/b.rs", &big),
+        ])
+        .refusing_over(16);
+
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            Vec::new(),
+            vec![BUILTIN_ID.to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+
+        assert_eq!(
+            set.audit.caps.max_file_bytes, 16,
+            "the audit names the reader's limit, which is the one that bound, not the caps' \
+             1000000, which never stopped a file"
+        );
+        assert!(
+            set.files.iter().all(|file| file.path != "src/b.rs"),
+            "the 64-byte file is over the cap that bound and is not in the prompt"
+        );
+        assert!(
+            set.notes.iter().any(|note| {
+                note.contains("max_file_bytes") && note.contains("16") && note.contains("1000000")
+            }),
+            "the note names both numbers, so a reader limit below the caps is legible rather than \
+             invisible: {:?}",
+            set.notes
+        );
+        assert_eq!(
+            set.audit.caps.max_files, owned.caps.max_files,
+            "only `max_file_bytes` is reconciled; the other three caps are the pass's own"
+        );
+    }
+
+    #[test]
+    fn a_reader_that_enforces_nothing_leaves_the_caps_alone() {
+        // The default `max_file_bytes` is `u64::MAX`, so an in-memory reader and every double are
+        // unaffected by the reconciliation above: `caps` is the only limit and the audit records it
+        // verbatim, which is what §4.5 `:1127` asks for.
+        let mut owned = request("nothing\n", &["src/a.rs"], &[]);
+        owned.roots = vec![root("htui")];
+        let reader = MapReader::with(&[("htui", "src/a.rs", "fn a() {}\n")]);
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            Vec::new(),
+            vec![BUILTIN_ID.to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+        assert_eq!(set.audit.caps, owned.caps);
+        assert!(
+            !set.notes.iter().any(|note| note.contains("max_file_bytes")),
+            "nothing to reconcile, so nothing to say: {:?}",
+            set.notes
+        );
     }
 
     #[test]
