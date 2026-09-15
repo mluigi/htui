@@ -71,7 +71,10 @@ pub async fn bare_db() -> Option<TestDb> {
         Ok(url) if !url.trim().is_empty() => url,
         _ => {
             if std::env::var("CI").is_ok() {
-                panic!("{} is not set but CI is running. Database tests must not be skipped in CI.", ENV_URL);
+                panic!(
+                    "{} is not set but CI is running. Database tests must not be skipped in CI.",
+                    ENV_URL
+                );
             }
             println!("{SKIP}");
             return None;
