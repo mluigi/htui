@@ -5,7 +5,7 @@
 //! it. The pane does not read the step's rows itself — it holds no store handle (`R-NF-3`) — and
 //! it does not know which tab will show them either; naming the step is its whole part.
 
-use htui_core::model::{ItemId, RunStatus, RunSummary, StepId, StepStatus};
+use htui_core::model::{ItemId, RunStatus, RunStepSummary, RunSummary, StepId, StepStatus};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Style};
@@ -30,6 +30,16 @@ const PENDING: &str = "\u{2014}";
 /// Marks the step the cursor is on. Unselected step rows carry a space of the same width, so the
 /// columns do not shift as the cursor moves.
 const CURSOR: &str = "\u{25b8}";
+
+/// Marks a step whose prompt was trimmed (D106). One character, because it shares the phase cell
+/// with the token figure; the record that says *what* was trimmed is the `Prompt` sub-tab's.
+const TRIMMED: &str = "!";
+
+/// Width of the phase column, which D106's second line shares with the phase name (hazard H-26).
+///
+/// Named because it is the bound [`indicator`] has to fit in: a fifth column does not exist at 43
+/// columns, so a figure too wide for this cell clips instead of wrapping.
+const PHASE_WIDTH: u16 = 12;
 
 /// The `Runs` reply as a table of kind, mode, status, box, started and finished, with one line
 /// per step under each run.
@@ -128,6 +138,42 @@ fn step_style(theme: &Theme, status: StepStatus) -> Style {
     }
 }
 
+/// D106's token figure in the seven characters B.17's second line has room for.
+///
+/// Under a thousand is exact (`~812`), thousands are whole and **rounded** (`~36k`), and a million
+/// or more takes one decimal (`~1.2M`). The `~` is not decoration: every number in a `trim_record`
+/// is an estimate by a named estimator, and a step row has no room to say which one.
+///
+/// Total over the whole of `i32`, including the negatives a malformed `JSONB` document can put in
+/// `estimated_after`: a list must render a nonsense figure, not panic on it.
+fn figure(tokens: i32) -> String {
+    let tokens = i64::from(tokens);
+    let thousands = (tokens + 500 * tokens.signum()) / 1_000;
+    if tokens.abs() < 1_000 {
+        format!("~{tokens}")
+    } else if thousands.abs() < 1_000 {
+        format!("~{thousands}k")
+    } else {
+        // Rounded tenths of a million, so `999 500` reads `~1.0M` rather than `~1000k`.
+        let tenths = (tokens + 50_000 * tokens.signum()) / 100_000;
+        format!("~{}.{}M", tenths / 10, (tenths % 10).abs())
+    }
+}
+
+/// The second line of a step row, or `None` for a step that stays one line (B.17).
+///
+/// The two `RunStepSummary` fields are independent — a record can carry a trim and no readable
+/// `estimated_after` — so the marker renders alone rather than suppressing itself for want of a
+/// number it never needed.
+fn indicator(step: &RunStepSummary) -> Option<String> {
+    match (step.prompt_tokens, step.trimmed) {
+        (None, false) => None,
+        (None, true) => Some(TRIMMED.to_owned()),
+        (Some(tokens), false) => Some(figure(tokens)),
+        (Some(tokens), true) => Some(format!("{} {TRIMMED}", figure(tokens))),
+    }
+}
+
 impl DetailTab for RunsTab {
     fn id(&self) -> DetailId {
         Self::ID
@@ -223,15 +269,30 @@ impl DetailTab for RunsTab {
                 let started = step
                     .started_at
                     .map_or_else(|| PENDING.to_owned(), |at| at.format(STAMP).to_string());
-                rows.push(Row::new(vec![
+                // D106's two indicators fold into the phase cell rather than taking a fifth
+                // column: four columns and their spacing already fill the 41 of a 43-wide pane.
+                let indicator = indicator(step);
+                let phase = match &indicator {
+                    Some(line) => Cell::from(Text::from(vec![
+                        Line::styled(step.phase_name.clone(), label),
+                        Line::styled(line.clone(), ctx.theme.dim),
+                    ])),
+                    None => Cell::from(Line::styled(step.phase_name.clone(), label)),
+                };
+                let row = Row::new(vec![
                     Cell::from(Line::styled(format!("{mark} {}", step.position), label)),
                     Cell::from(Line::styled(
                         step.status.as_str(),
                         step_style(ctx.theme, step.status),
                     )),
-                    Cell::from(Line::styled(step.phase_name.clone(), label)),
+                    phase,
                     Cell::from(Line::styled(started, ctx.theme.dim)),
-                ]));
+                ]);
+                rows.push(if indicator.is_some() {
+                    row.height(ROW)
+                } else {
+                    row
+                });
             }
         }
 
@@ -252,7 +313,7 @@ impl DetailTab for RunsTab {
             [
                 Constraint::Length(6),
                 Constraint::Length(9),
-                Constraint::Length(12),
+                Constraint::Length(PHASE_WIDTH),
                 Constraint::Length(11),
             ],
         )
@@ -400,6 +461,132 @@ mod tests {
         assert!(shell.emit.is_empty());
         pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
         assert_eq!(pane.selected_step(), None, "nothing to move over");
+    }
+
+    /// The width a detail pane has at the 100x30 the snapshots render at: hazard H-26 is that the
+    /// second line clips, and a narrower or wider test area would not see it.
+    const PANE_WIDTH: u16 = 43;
+
+    /// The pane drawn at [`PANE_WIDTH`], one `String` per row, trailing blanks trimmed.
+    fn lines(pane: &RunsTab, shell: &Shell) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(PANE_WIDTH, 16))
+            .expect("the test backend is constructible");
+        term.draw(|frame| pane.render(frame, frame.area(), &shell.ctx()))
+            .expect("the pane draws");
+        let buffer = term.backend().buffer();
+        (buffer.area.top()..buffer.area.bottom())
+            .map(|y| {
+                let row: String = (buffer.area.left()..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect();
+                row.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    /// D106: the fixture's `implement` step is the one with a `trim_record`, so it is the one step
+    /// that grows a second line, and the line sits under its phase name.
+    #[tokio::test]
+    async fn a_step_with_a_trim_record_takes_two_lines() {
+        let shell = Shell::new();
+        let pane = pane(&shell).await;
+        let lines = lines(&pane, &shell);
+        let at = lines
+            .iter()
+            .position(|line| line.contains("implement"))
+            .expect("the `implement` step is listed");
+        let second = lines
+            .get(at + 1)
+            .expect("the `implement` row has a second line");
+        assert!(
+            second.contains("~36k"),
+            "the figure sits in the phase cell under the phase name, not on the row above: \
+             {second:?}"
+        );
+        assert_eq!(
+            second.find("~36k"),
+            lines[at].find("implement"),
+            "and in the same column, because it is the same cell"
+        );
+    }
+
+    /// The `!` is `trimmed`, the figure is `estimated_after`, and neither clips at [`PANE_WIDTH`]
+    /// (hazard H-26).
+    #[tokio::test]
+    async fn the_figure_is_thousands_with_a_bang_when_trimmed() {
+        let shell = Shell::new();
+        let pane = pane(&shell).await;
+        assert!(
+            lines(&pane, &shell)
+                .iter()
+                .any(|line| line.contains("~36k !")),
+            "the demo record is 35 988 tokens with four dropped sections"
+        );
+
+        assert_eq!(figure(812), "~812", "under a thousand is exact");
+        assert_eq!(figure(999), "~999");
+        assert_eq!(figure(1_000), "~1k");
+        assert_eq!(
+            figure(35_988),
+            "~36k",
+            "thousands round rather than truncate"
+        );
+        assert_eq!(figure(35_499), "~35k");
+        assert_eq!(figure(999_499), "~999k");
+        assert_eq!(figure(999_500), "~1.0M", "and never render as `~1000k`");
+        assert_eq!(figure(1_234_567), "~1.2M");
+        assert_eq!(figure(0), "~0");
+        assert_eq!(
+            figure(-7),
+            "~-7",
+            "a malformed record renders, it does not panic"
+        );
+        assert_eq!(figure(35_988), "~36k");
+
+        // Hazard H-26 over the whole domain, not just the plausible part of it: `estimated_after`
+        // is an untyped `JSONB` number and the cell it lands in does not grow.
+        for tokens in [0, 999, 1_000, 999_500, 35_988, i32::MAX, i32::MIN] {
+            let step = RunStepSummary {
+                prompt_tokens: Some(tokens),
+                trimmed: true,
+                ..MemStore::demo()
+                    .runs(ids::HTUI_FEAT_1)
+                    .await
+                    .expect("the memory store never fails")[0]
+                    .steps[0]
+                    .clone()
+            };
+            let rendered = indicator(&step).expect("a step with a figure has a second line");
+            assert!(
+                u16::try_from(rendered.chars().count()).expect("a short string") <= PHASE_WIDTH,
+                "`{rendered}` does not fit the phase cell"
+            );
+        }
+    }
+
+    /// The other three fixture steps have no record, so the pane is one line per step for them —
+    /// which is what keeps `backlog__detail_runs.snap` one line longer rather than four.
+    #[tokio::test]
+    async fn a_step_without_one_stays_one_line() {
+        let shell = Shell::new();
+        let pane = pane(&shell).await;
+        let lines = lines(&pane, &shell);
+        for phase in ["prd", "plan", "review"] {
+            let at = lines
+                .iter()
+                .position(|line| line.contains(phase))
+                .unwrap_or_else(|| panic!("the `{phase}` step is listed"));
+            let next = lines.get(at + 1).map_or("", String::as_str);
+            assert!(
+                !next.contains('~') && !next.contains('!'),
+                "`{phase}` has no record and so no second line, but got {next:?}"
+            );
+        }
+        assert_eq!(
+            lines.iter().filter(|line| line.contains('~')).count(),
+            1,
+            "exactly one step row carries an indicator"
+        );
     }
 
     /// A new item's reply re-seats the cursor instead of leaving it on an index of the old one.

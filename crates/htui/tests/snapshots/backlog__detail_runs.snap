@@ -13,8 +13,8 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │  FEAT-2   blocked            Agent driver and chat …││▸ 0    done      prd          09-02 08:00  │
 │  FEAT-3   queued             Postgres store and cac…││  1    done      plan         09-02 09:00  │
 │  FIX-1    closed             Terminal left raw afte…││  2    done      implement    09-02 10:00  │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││  3    done      review       09-02 11:00  │
-│▾ agy (3)                                            ││                                           │
+│  TOOL-1   awaiting_approval  CI matrix for the thre…││                 ~36k !                    │
+│▾ agy (3)                                            ││  3    done      review       09-02 11:00  │
 │  ANA-1    done               Prompt assembly survey ││                                           │
 │  FEAT-1   open               ACP transport upgrade  ││                                           │
 │  FIX-1    open               Session leak on cancel ││                                           │
