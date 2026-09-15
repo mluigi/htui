@@ -9,6 +9,14 @@
 //! Both halves are **read-only by type** (ANA-5 invariant 6, `R-ID-4`): [`RepoReader`] has `list`
 //! and `read` and nothing else, and `htui` writes no file into a managed repository.
 //!
+//! Read-only is not the same as safe, and [`FsRepoReader::read`] does **not** trust its caller:
+//! `htui_core::prompt::excerpt::select` hands it *provider* candidates, which never went through
+//! the walk. So `read` re-runs the rules the listing ran — it descends one component at a time and
+//! refuses a symlink at any of them, refuses anything over `max_file_bytes` before it allocates,
+//! and refuses a NUL in the first [`BINARY_PROBE_BYTES`] — because a repo-relative path that
+//! reaches a symlink is exactly how hazard H-1 arrives through a filesystem, and the listing alone
+//! was never the gate it looked like.
+//!
 //! No new dependency (§4.5 `:1007`): the walk is `std::fs` plus a hand matcher, in the shape
 //! [`crate::probe`]'s glob walker already established, and the `.gitignore` matcher is a declared
 //! **subset** rather than a glob crate.
@@ -339,6 +347,114 @@ fn has_nul(path: &Path) -> bool {
     }
 }
 
+/// The real path a repo-relative string names under `root`, with **no symlink at any component**.
+///
+/// `std::fs::read(root.join(path))` follows a symlink at *every* component, so the walk's "symlinks
+/// are never followed" protected only the listing. A provider proposing `docs/notes.md` where that
+/// is a link to `~/.ssh/id_rsa`, or `vendor/x.rs` where `vendor` is a link to `/`, would put bytes
+/// from outside the repository into a prompt under a repo-relative path — hazard H-1, arriving
+/// through the filesystem rather than through a rendered string. So the descent is one component at
+/// a time with a `symlink_metadata` at each, the shape [`crate::install::archive`]'s own `descend`
+/// already established in this crate.
+///
+/// A link is refused rather than resolved-and-compared: where it points can change between the
+/// check and the open, and "inside the root" is not a property this reader can hold still.
+///
+/// The **root itself** is deliberately not checked. It is a maintainer-configured path rather than
+/// repository content, `list` reads through it the same way, and `/tmp` is a symlink on more than
+/// one box — refusing it would refuse a legitimate checkout without closing anything.
+fn descend(root: &Path, path: &str) -> Result<std::path::PathBuf, ProviderError> {
+    let bytes = path.as_bytes();
+    let rooted = bytes.first().is_some_and(|c| *c == b'/' || *c == b'\\');
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if path.is_empty() || rooted || drive {
+        return Err(not_repo_relative(path));
+    }
+    let mut at = root.to_path_buf();
+    for segment in path.split('/') {
+        // An empty, `.` or `..` segment is refused rather than normalised: the caller named a path
+        // it cannot have listed, and normalising one is how a `..` survives a textual check.
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(not_repo_relative(path));
+        }
+        at.push(segment);
+        let Ok(meta) = std::fs::symlink_metadata(&at) else {
+            return Err(ProviderError::new(
+                "fs",
+                format!("`{path}` does not exist under this root"),
+            ));
+        };
+        if meta.is_symlink() {
+            return Err(ProviderError::new(
+                "fs",
+                // The link's target is never named: it is an absolute path outside the root, and
+                // this message becomes a note on the excerpt set.
+                format!("`{path}` is reached through a symlink, which is never followed"),
+            ));
+        }
+    }
+    Ok(at)
+}
+
+/// The one spelling of §4.2 rule 5's refusal, so every caller says it identically.
+fn not_repo_relative(path: &str) -> ProviderError {
+    ProviderError::new("fs", format!("`{path}` is not repo-relative"))
+}
+
+/// An `io::Error` from a read, as a `ProviderError`. `std` names no path in its `Display`, and this
+/// message ends up in `ExcerptSet::notes`, so none is added.
+fn read_failed(error: std::io::Error) -> ProviderError {
+    ProviderError::new("fs", format!("read: {error}"))
+}
+
+/// Open `path` for reading, refusing anything that is not the regular file just stat-ed.
+///
+/// Returns the handle **and** the metadata taken from the descriptor, so the size, the binary probe
+/// and the bytes are all answered by one open file. That is what closes the `symlink_metadata` →
+/// `metadata` / `File::open` window: a name swapped for a symlink between the two used to be
+/// stat-ed as a file and opened as its target.
+fn open_regular(path: &Path) -> Option<(std::fs::File, std::fs::Metadata)> {
+    let before = std::fs::symlink_metadata(path).ok()?;
+    if before.is_symlink() || !before.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let after = file.metadata().ok()?;
+    if !after.is_file() || !is_same_file(&before, &after) {
+        // The name was swapped between the stat and the open. Whatever is behind it now is not
+        // what was decided about, so it is refused rather than read.
+        return None;
+    }
+    Some((file, after))
+}
+
+/// Whether two [`std::fs::Metadata`] describe the same file, for [`open_regular`]'s re-check.
+#[cfg(unix)]
+fn is_same_file(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    before.dev() == after.dev() && before.ino() == after.ino()
+}
+
+/// Elsewhere there is no `std` equivalent of `(dev, ino)`. The `symlink_metadata` refusal above
+/// stands on its own; only the race window between it and the open stays open.
+#[cfg(not(unix))]
+const fn is_same_file(_before: &std::fs::Metadata, _after: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// The first [`BINARY_PROBE_BYTES`] of an already-open file, for §4.5's binary test.
+///
+/// Loops to the cap or to EOF rather than trusting one `read` to fill the buffer: a short read is
+/// not an end of file, and the bytes are kept because [`FsRepoReader::read`] needs them anyway.
+fn probe(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut head = Vec::with_capacity(BINARY_PROBE_BYTES);
+    file.by_ref()
+        .take(BINARY_PROBE_BYTES as u64)
+        .read_to_end(&mut head)?;
+    Ok(head)
+}
+
 impl RepoReader for FsRepoReader {
     /// The cap counts every regular file the walk **examines**, skipped ones included, because the
     /// cap exists to bound the walk's cost and a stat of a lockfile costs what a stat of a source
@@ -353,17 +469,60 @@ impl RepoReader for FsRepoReader {
         Ok((out, truncated))
     }
 
+    /// `read` re-runs the rules the listing ran, because its caller is not the listing.
+    ///
+    /// `select` reaches this method with **provider** candidates, which never went through
+    /// [`Self::list`]. A textual `..`-and-leading-`/` test was therefore the only thing between a
+    /// proposed path and `std::fs::read`, which follows a symlink at every component, allocates the
+    /// whole file before anything measures it, and refuses only non-UTF-8 — and a NUL is UTF-8. So
+    /// the order here is §4.5's: repo-relative, then no symlink at any component (rule 1's spirit),
+    /// then `max_file_bytes` (rule 5) and the NUL probe (rule 4) **before** the bytes are taken.
     fn read(&self, root: &RepoRoot, path: &str) -> Result<String, ProviderError> {
-        // Repo-relative by contract: a caller that reached outside the root would be rendering an
-        // absolute path, which §4.2 rule 5 forbids and hazard H-1 names.
-        if path.split('/').any(|segment| segment == "..") || path.starts_with('/') {
+        use std::io::Read as _;
+
+        let full = descend(&root.root, path)?;
+        let Some((mut file, meta)) = open_regular(&full) else {
             return Err(ProviderError::new(
                 "fs",
-                format!("`{path}` is not repo-relative"),
+                format!("`{path}` is not a readable regular file"),
+            ));
+        };
+        // Rule 5 before the allocation, not after it: `select` measured `text.len()` only once the
+        // file was already in memory, so a multi-gigabyte file cost its own size to refuse.
+        if meta.len() > self.max_file_bytes {
+            return Err(ProviderError::new(
+                "fs",
+                format!(
+                    "`{path}` is {} bytes, over max_file_bytes ({})",
+                    meta.len(),
+                    self.max_file_bytes
+                ),
             ));
         }
-        let bytes = std::fs::read(root.root.join(path))
-            .map_err(|error| ProviderError::new("fs", format!("read: {error}")))?;
+        // Rule 4, from the same handle, before the rest of the file is read.
+        let mut bytes = probe(&mut file).map_err(read_failed)?;
+        if bytes.contains(&0) {
+            return Err(ProviderError::new(
+                "fs",
+                format!("`{path}` has a NUL in its first {BINARY_PROBE_BYTES} bytes; binary"),
+            ));
+        }
+        // `meta.len()` is a promise from before the read, so the read is bounded again by one byte
+        // past the cap: a file that grew under the reader is refused, never quietly truncated into
+        // a prompt whose digest would then describe bytes nobody chose.
+        let room = self.max_file_bytes.saturating_sub(bytes.len() as u64) + 1;
+        file.take(room)
+            .read_to_end(&mut bytes)
+            .map_err(read_failed)?;
+        if bytes.len() as u64 > self.max_file_bytes {
+            return Err(ProviderError::new(
+                "fs",
+                format!(
+                    "`{path}` grew past max_file_bytes ({}) while it was read",
+                    self.max_file_bytes
+                ),
+            ));
+        }
         let text = String::from_utf8(bytes)
             .map_err(|_| ProviderError::new("fs", format!("`{path}` is not UTF-8")))?;
         Ok(normalise(&text))

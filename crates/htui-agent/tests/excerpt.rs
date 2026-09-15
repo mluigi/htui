@@ -512,6 +512,124 @@ fn fs_reader_skips_git_gitignored_binary_large_and_lockfiles_in_order() {
     assert!(!paths.iter().any(|path| path == "target/keep.rs"));
 }
 
+#[cfg(unix)]
+#[test]
+fn fs_reader_never_lists_or_reads_through_a_symlink() {
+    // Hazard H-1 in its filesystem form, and review finding HIGH H1. A symlink is the one way a
+    // *repo-relative* path can name bytes outside the root, and `read` is reached by `select` with
+    // **provider** candidates, which never went through the walk. So the listing refusing one is
+    // not the gate it looks like: `read` refuses a symlink at every component of its own.
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().expect("somewhere that is not the repository");
+    std::fs::write(
+        outside.path().join("id_rsa"),
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+    )
+    .expect("write");
+    std::fs::create_dir_all(outside.path().join("etc")).expect("mkdir");
+    std::fs::write(outside.path().join("etc/shadow"), "root:$6$leak\n").expect("write");
+
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/keep.rs", b"fn keep() {}\n");
+    // A symlinked **file**, under a name a provider would plausibly propose.
+    std::fs::create_dir_all(dir.path().join("docs")).expect("mkdir");
+    symlink(
+        outside.path().join("id_rsa"),
+        dir.path().join("docs/notes.md"),
+    )
+    .expect("symlink");
+    // A symlinked **directory**: every path under it leaves the root at its first component.
+    symlink(outside.path(), dir.path().join("vendor")).expect("symlink");
+    // And a symlink that stays inside the root is refused too: the reader does not litigate where
+    // a link points, because the answer can change between the check and the open.
+    symlink(dir.path().join("src/keep.rs"), dir.path().join("alias.rs")).expect("symlink");
+
+    let reader = FsRepoReader::default();
+    let (paths, truncated) = reader
+        .list(&fs_root(dir.path()), 20_000)
+        .expect("the root is readable");
+    assert!(!truncated);
+    assert_eq!(
+        paths,
+        vec!["src/keep.rs".to_owned()],
+        "no symlink is listed, and nothing under a symlinked directory is either: {paths:?}"
+    );
+
+    for path in [
+        "docs/notes.md",
+        "vendor/id_rsa",
+        "vendor/etc/shadow",
+        "alias.rs",
+    ] {
+        let error = reader
+            .read(&fs_root(dir.path()), path)
+            .expect_err("a symlink is never followed");
+        assert!(
+            error.message.contains("symlink"),
+            "`{path}` was refused for the wrong reason: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("PRIVATE KEY") && !error.message.contains("root:"),
+            "and the refusal carries none of the bytes it refused: {}",
+            error.message
+        );
+    }
+
+    // The real file under the real directory still reads, so this is a gate and not a wall.
+    assert_eq!(
+        reader
+            .read(&fs_root(dir.path()), "src/keep.rs")
+            .expect("readable"),
+        "fn keep() {}\n"
+    );
+}
+
+#[test]
+fn fs_reader_read_refuses_an_oversized_a_binary_and_a_non_file() {
+    // HIGH H1's other half: skip rules 4 and 5 lived on the *listing* only, so `select` calling
+    // `read` on a candidate the walk never offered read a multi-gigabyte file into memory before
+    // anything measured it, and refused only non-UTF-8 rather than a NUL.
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "big.rs", &vec![b'x'; 4_096]);
+    write(dir.path(), "image.dat", b"PNG\x00\x01\x02binary\n");
+    write(dir.path(), "src/keep.rs", b"fn keep() {}\n");
+
+    let reader = FsRepoReader::new(1_024);
+    let too_large = reader
+        .read(&fs_root(dir.path()), "big.rs")
+        .expect_err("over the cap");
+    assert!(
+        too_large.message.contains("max_file_bytes"),
+        "{}",
+        too_large.message
+    );
+    let binary = reader
+        .read(&fs_root(dir.path()), "image.dat")
+        .expect_err("a NUL in the first 8 KB");
+    assert!(binary.message.contains("NUL"), "{}", binary.message);
+    let directory = reader
+        .read(&fs_root(dir.path()), "src")
+        .expect_err("a directory is not a file");
+    assert!(
+        directory.message.contains("regular file"),
+        "{}",
+        directory.message
+    );
+    let absent = reader
+        .read(&fs_root(dir.path()), "src/nothing.rs")
+        .expect_err("not there");
+    assert!(absent.message.contains("nothing.rs"), "{}", absent.message);
+
+    assert_eq!(
+        reader
+            .read(&fs_root(dir.path()), "src/keep.rs")
+            .expect("readable"),
+        "fn keep() {}\n"
+    );
+}
+
 #[test]
 fn scan_cap_sets_truncated() {
     // §4.5 step 2: "Cap the walk at `app_setting.excerpt_max_scan_files` … and record
