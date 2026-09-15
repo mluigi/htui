@@ -619,14 +619,16 @@ impl State {
     /// 4. **Canonical order**, by [`UpstreamEntry::sort_canonical`], so this backend and the two
     ///    SQL ones hand the assembler the same bytes.
     ///
-    /// `hops` above 2 is clamped to 2; `hops == 0` returns nothing at all, which is the one place
-    /// this differs from `link_graph`'s "hops 0 is the root alone" — the root is the step's own
-    /// item and is never an upstream entry.
+    /// `hops` above [`MAX_UPSTREAM_HOPS`] is clamped to it; `hops == 0` returns nothing at all,
+    /// which is the one place this differs from `link_graph`'s "hops 0 is the root alone" — the
+    /// root is the step's own item and is never an upstream entry. `seen` is seeded with the root
+    /// for that second reason as much as for the first: a cycle that returns to the root within
+    /// the ceiling must not render it as an entry either.
     ///
     /// `in_scope` and the summary lookup are separate: an out-of-scope item's `summary` is not
     /// read, an in-scope one's is read and may still be `None`.
     fn upstream(&self, root: ItemId, hops: u8, scope: &PromptScope) -> Vec<UpstreamEntry> {
-        let hops = hops.min(2);
+        let hops = hops.min(crate::store::MAX_UPSTREAM_HOPS);
         let mut entries: Vec<UpstreamEntry> = Vec::new();
         let mut seen = vec![root];
         let mut frontier = vec![root];

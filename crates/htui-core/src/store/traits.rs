@@ -37,6 +37,21 @@ use crate::model::{
 };
 use crate::store::error::Result;
 
+/// The hop ceiling of [`ReadStore::upstream_summaries`], the amended §7.3 upstream walk
+/// (`docs/ANA-5.md` §4.3).
+///
+/// `R-PRM-1` says "one to two hops", so `2` is the ceiling and `0` is answered without a round
+/// trip: the anchor term of the SQL backends' recursive CTE has no depth guard of its own, and
+/// unlike [`ReadStore::links`]`(id, 0)` the root is the step's own item and is never an upstream
+/// entry.
+///
+/// It lives beside the trait rather than in a backend because all three backends clamp and they
+/// must clamp alike — a caller that did not sanitise `hops` gets the same answer from
+/// `MemStore`, `PgStore` and `CacheStore` (T68, F-52 review, L2: the memory backend used to spell
+/// it as a literal `2` while `htui-store` had the named constant, so the two could drift without
+/// anything failing).
+pub const MAX_UPSTREAM_HOPS: u8 = 2;
+
 /// Everything a view can ask for. Implemented by every backend, online or offline.
 #[allow(async_fn_in_trait)] // D2 / plan V3: rustc 1.98 warns on async fn in public traits; the
 // signatures are ANA-9 §6.1 verbatim and `Backend` is concrete, so

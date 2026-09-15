@@ -29,14 +29,14 @@ pub use identity::Identity;
 pub use pg::{Connected, MigrationState, PgStore};
 pub use writer::{BufferedWriter, PROMPT_ON_SERVER_ONLY, REGISTRY_ON_SERVER_ONLY, Writer};
 
-/// The hop ceiling of the amended §7.3 upstream walk (`docs/ANA-5.md` §4.3).
+/// The hop ceiling of the amended §7.3 upstream walk, re-exported from where the trait it belongs
+/// to is defined.
 ///
-/// `R-PRM-1` says "one to two hops", so `2` is the ceiling and `0` is answered without a round
-/// trip: the anchor term of the recursive CTE has no depth guard of its own, and unlike
-/// `ReadStore::links(id, 0)` the root is the step's own item and is never an upstream entry.
-/// `MemStore` clamps identically (`store::mem`), which is what lets the three backends agree on a
-/// `hops` the caller did not sanitise.
-pub(crate) const MAX_UPSTREAM_HOPS: u8 = 2;
+/// It was declared here as well as spelled `2` in `htui_core::store::mem`, so the two clamps that
+/// have to agree could drift with nothing to catch it (T68, F-52 review, L2). One definition, next
+/// to [`htui_core::store::ReadStore::upstream_summaries`]; this re-export keeps `htui_store::MAX_UPSTREAM_HOPS`
+/// resolving for anything that already named it.
+pub use htui_core::store::MAX_UPSTREAM_HOPS;
 
 /// [`htui_core::store::ReadStore::documents_of_kinds`]' ordering, applied in Rust by both SQL
 /// backends over the latest-per-kind rows their statement returned.
