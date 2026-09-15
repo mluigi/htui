@@ -245,12 +245,17 @@ pub fn wrap(section: &Rendered) -> String {
     out
 }
 
-/// The `template` section's estimated content: the frame's literal spans, LF-normalised.
+/// The `template` section's content: the frame's literal spans, LF-normalised and joined.
 ///
 /// Not a [`Rendered`]: the template is the frame the other sections are substituted into, not a
 /// wrapped section (§4.2's first table row). It still gets a `sections[]` entry — always the first
 /// one, by P-9 — because its literal spans surround every other section and a reader needs to know
 /// what they cost.
+///
+/// `assemble()` does **not** call this: it normalises and scrubs each span on its own and estimates
+/// over the concatenation, so the frame's estimate and the frame's substituted bytes are the same
+/// strings (review finding H-1). This remains the one-call answer to "what is the frame" for a
+/// caller — MOD-9's editor — that has a [`ParsedTemplate`] and no scrubber.
 #[must_use]
 pub fn template_text(parsed: &ParsedTemplate) -> String {
     normalise_newlines(&parsed.literal_text())

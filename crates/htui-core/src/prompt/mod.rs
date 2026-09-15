@@ -490,35 +490,8 @@ pub fn assemble(
     trimmer.run();
     let (sections, live, kept_excerpts) = trimmer.finish();
 
-    // 7. Substitute in span order: the frame's literals verbatim, each slot's sections wrapped.
-    let mut blocks: BTreeMap<Placeholder, Vec<String>> = BTreeMap::new();
-    for (placeholder, section) in &live {
-        blocks
-            .entry(*placeholder)
-            .or_default()
-            .push(render::wrap(section));
-    }
-    let mut text = String::with_capacity(spec.body.len() * 4);
-    let mut literal = masked.literals.iter();
-    for span in &parsed.spans {
-        match span {
-            // The **scrubbed** literal, and the same string the estimate above was over (H-1): a
-            // frame is a `prompt_template.body` row like any other and its bytes are digested.
-            Span::Literal(_) => text.push_str(literal.next().map_or("", String::as_str)),
-            Span::Slot(placeholder) if placeholder.is_section() => {
-                if let Some(rendered) = blocks.get(placeholder) {
-                    // A blank line between two sections under one placeholder: `{{documents}}`
-                    // stands for a list of blocks, and §4.7 step 5 collapses any run this leaves.
-                    text.push_str(&rendered.join("\n\n"));
-                }
-            }
-            Span::Slot(placeholder) => {
-                if let Some(scalar) = scalars.get(placeholder) {
-                    text.push_str(scalar);
-                }
-            }
-        }
-    }
+    // 7. Substitute in span order: the frame's literals, each slot's sections wrapped.
+    let text = substitute(&parsed, &masked.literals, &live, &scalars);
 
     // 8. Canonicalise and digest. 9. Record.
     let text = digest::canonical(&text);
@@ -537,6 +510,46 @@ pub fn assemble(
         sections: record.sections.clone(),
         trim: record,
     })
+}
+
+/// §4.7 step 7: walk the frame's spans once, in source order, and put each one's bytes in.
+///
+/// `literals` is the frame's literal spans, already LF-normalised and masked, in the same order the
+/// spans appear — so the iterator and the walk stay in step and the estimate at step 4 was over the
+/// very strings this substitutes (H-1).
+fn substitute(
+    parsed: &ParsedTemplate,
+    literals: &[String],
+    live: &[(Placeholder, Rendered)],
+    scalars: &BTreeMap<Placeholder, String>,
+) -> String {
+    let mut blocks: BTreeMap<Placeholder, Vec<String>> = BTreeMap::new();
+    for (placeholder, section) in live {
+        blocks
+            .entry(*placeholder)
+            .or_default()
+            .push(render::wrap(section));
+    }
+    let mut text = String::new();
+    let mut literal = literals.iter();
+    for span in &parsed.spans {
+        match span {
+            Span::Literal(_) => text.push_str(literal.next().map_or("", String::as_str)),
+            Span::Slot(placeholder) if placeholder.is_section() => {
+                if let Some(rendered) = blocks.get(placeholder) {
+                    // A blank line between two sections under one placeholder: `{{documents}}`
+                    // stands for a list of blocks, and §4.7 step 5 collapses any run this leaves.
+                    text.push_str(&rendered.join("\n\n"));
+                }
+            }
+            Span::Slot(placeholder) => {
+                if let Some(scalar) = scalars.get(placeholder) {
+                    text.push_str(scalar);
+                }
+            }
+        }
+    }
+    text
 }
 
 /// How many times the body places this placeholder. Duplicates are legal (§4.1) and each
