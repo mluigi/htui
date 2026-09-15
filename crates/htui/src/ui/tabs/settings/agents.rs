@@ -10,7 +10,10 @@
 //! What `r` does **not** do is refresh that column. Quota is latched from the usage a run reports,
 //! never polled: a probe handshake reports no allowance at all, so a re-probe moves every other
 //! column and this one on no row. `docs/ANA-4.md` §7 asks for that limit to be stated rather than
-//! implied, and [`QUOTA_NOTE`] on the hint line is where this section states it.
+//! implied, and `QUOTA_NOTE` on the hint line is where this section states it. (A code span, not
+//! an intra-doc link: this is the **module**'s documentation and the constant is private, so the
+//! link is the one `rustdoc` rejects without `--document-private-items`. The two references further
+//! down are inside private items' own docs and stay links.)
 //!
 //! Since MOD-20 it is also where an adapter is **installed**: `i` on the highlighted row asks for
 //! a pre-flight, the plan that comes back is drawn as a consent pane under the table, and only `y`
