@@ -570,10 +570,21 @@ impl<'a> Trimmer<'a> {
         record.trimmed = true;
     }
 
-    /// How many tokens this section must give up, in its own unweighted terms.
-    fn reclaim_for(&self, index: usize) -> i64 {
-        let weight = self.entries[index].weight.max(1);
-        self.deficit().div_euclid(weight) + i64::from(self.deficit().rem_euclid(weight) > 0)
+    /// What one candidate *content* for the section at `index` would cost the whole prompt.
+    ///
+    /// The same arithmetic [`Trimmer::re_estimate`] records with — wrap the section, estimate it,
+    /// multiply by the weight — handed to the window search so the two cannot disagree (M-3).
+    fn section_yardstick(&self, index: usize) -> impl Fn(&str) -> i64 + use<> {
+        let est = self.est;
+        let weight = self.entries[index].weight;
+        let shape = self.entries[index].rendered.clone();
+        move |content: &str| {
+            let candidate = Rendered {
+                content: content.to_owned(),
+                ..shape.clone()
+            };
+            est.estimate(&render::wrap(&candidate)) * weight
+        }
     }
 
     // -- the per-section strategies ------------------------------------------------------------
@@ -735,14 +746,24 @@ impl<'a> Trimmer<'a> {
         let Some(index) = self.live_index(&SectionName::VerifyFailure) else {
             return;
         };
-        if let Some(failure) = self.inputs.spec.verify_failure.as_ref() {
-            let reclaim = self.reclaim_for(index);
+        if let Some(failure) = self.inputs.spec.verify_failure.clone() {
+            let reclaim = self.deficit();
+            let est = self.est;
+            let weight = self.entries[index].weight;
+            // The section is **re-rendered** from the cut output — the fence is a function of the
+            // content and can change width as lines go — so the yardstick has to re-render too,
+            // or the search would price a string the record never measures (M-3).
+            let measure = |output: &str| {
+                let mut candidate = failure.clone();
+                candidate.output = output.to_owned();
+                est.estimate(&render::wrap(&render::verify_failure(&candidate))) * weight
+            };
             let normalised = render::normalise_newlines(&failure.output);
             if let Some((cut, lines, bytes)) = tail_cut(
                 normalised.trim_end_matches('\n'),
                 VERIFY_FLOOR_LINES,
                 reclaim,
-                self.est,
+                &measure,
             ) {
                 let mut trimmed = failure.clone();
                 trimmed.output = cut;
@@ -834,11 +855,17 @@ impl<'a> Trimmer<'a> {
 
     /// Head+tail the section at `index`, recording the floor state even when it did not clear the
     /// deficit (§4.4 step 7).
+    ///
+    /// The search is handed [`Trimmer::re_estimate`]'s own arithmetic — the wrapped section times
+    /// its weight — so "this cut reclaims the deficit" and "this section now costs that much less"
+    /// are one statement rather than two that differ by a ceiling (M-3). `reclaim` is therefore the
+    /// raw deficit rather than a per-weight share: the yardstick already carries the weight.
     fn head_tail_at(&mut self, index: usize, floor_lines: usize, percent: usize) {
-        let reclaim = self.reclaim_for(index);
+        let reclaim = self.deficit();
         let content = self.entries[index].rendered.content.clone();
         let floor = floor_for(&content, floor_lines, percent);
-        let Some((cut, lines, bytes)) = head_tail(&content, floor, reclaim, self.est) else {
+        let measure = self.section_yardstick(index);
+        let Some((cut, lines, bytes)) = head_tail(&content, floor, reclaim, &measure) else {
             return;
         };
         self.entries[index].rendered.content = cut;
@@ -864,16 +891,24 @@ fn floor_for(content: &str, floor_lines: usize, percent: usize) -> usize {
 /// regardless of size ... TAIL IS COMPLETELY LOST - error messages invisible to model"
 /// (<https://github.com/openai/codex/pull/6476>).
 ///
+/// `measure` is the caller's own yardstick and is what makes the reclaim honest (review finding
+/// M-3). This search used to price a candidate cut over the **bare content** while
+/// [`Trimmer::re_estimate`] recorded `est(wrap(section)) × weight`: two ceil-divisions and a fence
+/// parity apart, so a cut the search believed reclaimed exactly the deficit could land a token
+/// short. A 1-token residual after the last document's head+tail is precisely what sends
+/// [`Trimmer::trim_documents`] into its drop loop, removing a section whole that never reached its
+/// floor — which is not §4.4 step 7's "floor and then the drop", and is recorded as neither.
+///
 /// The search is binary because the cost is monotone in `k`: a 4 000-line document costs about
-/// twelve estimates rather than 4 000. Returns `None` when the content is already at or under its
+/// twelve measurements rather than 4 000. Returns `None` when the content is already at or under its
 /// floor, or when the marker would cost more than the lines it replaces.
 pub(crate) fn head_tail(
     content: &str,
     floor_lines: usize,
     reclaim: i64,
-    est: TokenEstimator,
+    measure: &dyn Fn(&str) -> i64,
 ) -> Option<(String, u32, u64)> {
-    window(content, floor_lines, reclaim, est, false)
+    window(content, floor_lines, reclaim, measure, false)
 }
 
 /// The same search keeping the **tail**, with the marker first: command output puts the failure at
@@ -882,9 +917,9 @@ pub(crate) fn tail_cut(
     content: &str,
     floor_lines: usize,
     reclaim: i64,
-    est: TokenEstimator,
+    measure: &dyn Fn(&str) -> i64,
 ) -> Option<(String, u32, u64)> {
-    window(content, floor_lines, reclaim, est, true)
+    window(content, floor_lines, reclaim, measure, true)
 }
 
 /// The shared search. `tail_only` picks between the two shapes.
@@ -892,7 +927,7 @@ fn window(
     content: &str,
     floor_lines: usize,
     reclaim: i64,
-    est: TokenEstimator,
+    measure: &dyn Fn(&str) -> i64,
     tail_only: bool,
 ) -> Option<(String, u32, u64)> {
     let lines: Vec<&str> = content.split('\n').collect();
@@ -900,13 +935,13 @@ fn window(
     if total <= floor_lines || floor_lines == 0 && total < 2 {
         return None;
     }
-    let full = est.estimate(content);
+    let full = measure(content);
     let budget = full - reclaim.max(0);
     let mut best: Option<usize> = None;
     let (mut low, mut high) = (floor_lines, total - 1);
     while low <= high {
         let mid = low + (high - low) / 2;
-        if est.estimate(&rebuild(&lines, mid, tail_only)) <= budget {
+        if measure(&rebuild(&lines, mid, tail_only)) <= budget {
             best = Some(mid);
             low = mid + 1;
         } else if mid == 0 {
@@ -917,7 +952,7 @@ fn window(
     }
     let kept = best.unwrap_or(floor_lines);
     let text = rebuild(&lines, kept, tail_only);
-    if est.estimate(&text) >= full {
+    if measure(&text) >= full {
         // The marker costs more than the lines it replaced: leave the content alone rather than
         // record a trim that made the prompt bigger.
         return None;
@@ -1047,11 +1082,91 @@ mod tests {
         );
     }
 
+    /// The bare-content yardstick the window's own tests measure with.
+    fn bare(est: TokenEstimator) -> impl Fn(&str) -> i64 {
+        move |text: &str| est.estimate(text)
+    }
+
+    /// The yardstick the trimmer uses: the wrapped section, times how often the body places it.
+    ///
+    /// `item` rather than `documents:plan` on purpose. The wrapper adds a fixed 33 characters here
+    /// (`<section name="item">\n` and `\n</section>`), and 33 is **not** a multiple of the
+    /// estimator's 5-character prose quantum — so the two ceil-divisions genuinely drift apart. A
+    /// wrapper whose length happened to be a multiple of 5 would make the bare and the wrapped
+    /// difference agree by arithmetic accident, which is exactly why this defect is a lurker: it
+    /// shows up on some sections and not on others.
+    fn wrapped(est: TokenEstimator, weight: i64) -> impl Fn(&str) -> i64 {
+        move |text: &str| {
+            let section = Rendered {
+                name: SectionName::Item,
+                attrs: Vec::new(),
+                content: text.to_owned(),
+            };
+            est.estimate(&render::wrap(&section)) * weight
+        }
+    }
+
+    #[test]
+    fn the_window_reclaims_in_the_units_the_record_re_measures() {
+        // **M-3.** The search used to price a candidate over the **bare** content while
+        // `re_estimate` recorded `est(wrap(section)) × weight`. Two ceil-divisions and a fence
+        // parity apart, so a cut the search believed cleared the deficit exactly could land a token
+        // short — and a 1-token residual after the last document's head+tail is what sends
+        // `trim_documents` into its drop loop and removes a section that never reached its floor.
+        //
+        // The first half of this test *is* the defect: the same code, searched with one yardstick
+        // and measured with the other, really does come up short. The second half is the fix.
+        //
+        // Short lines deliberately. A line is worth about one token here, so the search's chosen
+        // `k` lands on the reclaim exactly rather than overshooting it by a 72-character line —
+        // which is what makes the ±1 between the two ceil-divisions observable at all. A document
+        // of short lines is not a contrived shape: a stat block, a checklist and a `--stat` summary
+        // are all of them.
+        let content: String = (0..400)
+            .map(|n| format!("{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let est = TokenEstimator::DEFAULT;
+        let by_content = bare(est);
+        let by_section = wrapped(est, 1);
+
+        // A cut sitting on the floor — 40 kept lines plus the one marker line — gave everything it
+        // has and is §4.4 step 7's legitimate "floor, and then the drop". Only a cut *above* its
+        // floor that came up short is the defect.
+        let at_floor = |cut: &str| cut.split('\n').count() <= 41;
+
+        let mut short = 0usize;
+        for reclaim in 1..=600 {
+            if let Some((cut, _, _)) = head_tail(&content, 40, reclaim, &by_content)
+                && !at_floor(&cut)
+                && by_section(&content) - by_section(&cut) < reclaim
+            {
+                short += 1;
+            }
+        }
+        assert!(
+            short > 0,
+            "the two yardsticks must really disagree above the floor, or this test proves nothing"
+        );
+
+        for reclaim in 1..=600 {
+            let Some((cut, _, _)) = head_tail(&content, 40, reclaim, &by_section) else {
+                continue;
+            };
+            let given = by_section(&content) - by_section(&cut);
+            assert!(
+                given >= reclaim || at_floor(&cut),
+                "asked for {reclaim}, the section gave up {given} and was not at its floor"
+            );
+        }
+    }
+
     #[test]
     fn head_tail_keeps_both_ends_and_counts_what_it_took() {
         let content = body(400);
         let est = TokenEstimator::DEFAULT;
-        let (cut, lines, bytes) = head_tail(&content, 40, 2_000, est).expect("400 lines can cut");
+        let (cut, lines, bytes) =
+            head_tail(&content, 40, 2_000, &bare(est)).expect("400 lines can cut");
         assert!(cut.starts_with("line 0:"), "the head survives");
         assert!(cut.ends_with("line 399: the recorder buffers rows and flushes on the boundary."));
         assert!(cut.contains(&render::elision_marker(lines, bytes)));
@@ -1073,19 +1188,21 @@ mod tests {
         let content = body(400);
         let est = TokenEstimator::DEFAULT;
         // Ask for more than the section can ever give: it returns the floor, not `None`.
-        let (cut, lines, _) = head_tail(&content, 100, 1_000_000, est).expect("the floor cut");
+        let (cut, lines, _) =
+            head_tail(&content, 100, 1_000_000, &bare(est)).expect("the floor cut");
         assert_eq!(lines, 300, "400 lines down to the 100-line floor");
         assert_eq!(cut.split('\n').count(), 101, "100 lines plus one marker");
         // And a section already at or under its floor is left alone rather than marked.
-        assert!(head_tail(&body(40), 40, 10, est).is_none());
-        assert!(head_tail("", 0, 10, est).is_none());
+        assert!(head_tail(&body(40), 40, 10, &bare(est)).is_none());
+        assert!(head_tail("", 0, 10, &bare(est)).is_none());
     }
 
     #[test]
     fn tail_cut_keeps_the_tail_and_puts_the_marker_first() {
         let content = body(400);
         let est = TokenEstimator::DEFAULT;
-        let (cut, lines, _) = tail_cut(&content, 200, 1_000_000, est).expect("the floor cut");
+        let (cut, lines, _) =
+            tail_cut(&content, 200, 1_000_000, &bare(est)).expect("the floor cut");
         assert_eq!(lines, 200);
         assert!(cut.starts_with("[... htui elided 200 lines /"));
         assert!(cut.ends_with("line 399: the recorder buffers rows and flushes on the boundary."));
