@@ -444,24 +444,30 @@ pub fn assemble(
         _ => {}
     }
 
-    // 2. Render every section at full size, from inputs in canonical order (§4.7 rules 2, 4, 6).
-    let mut upstream = spec.upstream.clone();
-    UpstreamEntry::sort_canonical(&mut upstream);
-    let skills = BoundSkill::collapse(spec.skills.clone(), Vec::new());
-    let candidates = judge_candidates(spec);
+    // 2. Scrub the **inputs**, once, before anything renders (plan D100, §4.7 step 2).
+    let masked = scrubbed_inputs(spec, &parsed, scrubber)?;
+    let spec = &masked.spec;
+    let upstream = &masked.upstream;
+    let skills = &masked.skills;
+    let candidates = &masked.candidates;
 
+    // 3. Render every section at full size, from inputs in canonical order (§4.7 rules 2, 4, 6).
     let mut rendered: Vec<(Placeholder, Rendered, i64)> = Vec::new();
     for placeholder in &parsed.used {
         if !placeholder.is_section() {
             continue;
         }
         let weight = weight_of(&parsed, *placeholder);
-        for section in render_sections(*placeholder, spec, &upstream, &skills, &candidates) {
+        for section in render_sections(*placeholder, spec, upstream, skills, candidates) {
             rendered.push((*placeholder, section, weight));
         }
     }
 
-    // 3. Scrub per section, before anything is measured or hashed (plan D100, §4.7 step 2).
+    // The fail-closed half of `R-SEC-3`, over the bytes the model will see. Step 2 already masked
+    // every input, so this pass masks nothing new — it is the residue *scan*, and it runs on the
+    // rendered form because that is where a rule could fire on something an input did not spell.
+    // Every trim rung produces a subset of these bytes, so scanning the full render covers the
+    // ladder too.
     for (_, section, _) in &mut rendered {
         let name = section.name.render();
         section.content = scrub_text(scrubber, &section.content, &name)?;
@@ -469,16 +475,15 @@ pub fn assemble(
             *value = scrub_text(scrubber, value, &name)?;
         }
     }
-    let template_text = scrub_text(scrubber, &render::template_text(&parsed), "template")?;
-    let scalars = scalar_substitutions(spec, scrubber)?;
+    let scalars = scalar_substitutions(spec);
 
     // 4. Estimate, 5. refuse, 6. trim — all three inside the trimmer, which owns the arithmetic.
     let est = spec.estimator;
-    let template_tokens = est.estimate(&template_text);
+    let template_tokens = est.estimate(&masked.literals.concat());
     let inputs = Inputs {
         spec,
-        upstream: &upstream,
-        candidates: &candidates,
+        upstream,
+        candidates,
     };
     let mut trimmer = Trimmer::new(inputs, est, spec.budget.target(), template_tokens, rendered);
     trimmer.refusals()?;
@@ -494,9 +499,12 @@ pub fn assemble(
             .push(render::wrap(section));
     }
     let mut text = String::with_capacity(spec.body.len() * 4);
+    let mut literal = masked.literals.iter();
     for span in &parsed.spans {
         match span {
-            Span::Literal(literal) => text.push_str(&render::normalise_newlines(literal)),
+            // The **scrubbed** literal, and the same string the estimate above was over (H-1): a
+            // frame is a `prompt_template.body` row like any other and its bytes are digested.
+            Span::Literal(_) => text.push_str(literal.next().map_or("", String::as_str)),
             Span::Slot(placeholder) if placeholder.is_section() => {
                 if let Some(rendered) = blocks.get(placeholder) {
                     // A blank line between two sections under one placeholder: `{{documents}}`
@@ -632,12 +640,12 @@ fn render_sections(
 /// `item_title` is collapsed and truncated by [`render::one_line_title`] rather than
 /// attribute-escaped: a scalar lands in a line of the frame, so a title carrying a newline would
 /// break the frame's own structure, while `&amp;` in running prose would be an escape for a syntax
-/// that is not there. Every one of them is scrubbed, because every one of them is a digested byte.
-fn scalar_substitutions(
-    spec: &PromptSpec,
-    scrubber: &dyn Scrubber,
-) -> Result<BTreeMap<Placeholder, String>, AssembleError> {
-    let raw = [
+/// that is not there.
+///
+/// Takes no scrubber: `spec` is already [`scrubbed_inputs`]'s output, so the collapse and the
+/// truncation here run on masked text rather than on a secret (review finding M-2).
+fn scalar_substitutions(spec: &PromptSpec) -> BTreeMap<Placeholder, String> {
+    BTreeMap::from([
         (Placeholder::ItemKey, spec.item_key.clone()),
         (
             Placeholder::ItemTitle,
@@ -650,13 +658,216 @@ fn scalar_substitutions(
             spec.output_kind.clone().unwrap_or_default(),
         ),
         (Placeholder::Attempt, spec.attempt.to_string()),
-    ];
-    let mut out = BTreeMap::new();
-    for (placeholder, value) in raw {
-        let scrubbed = scrub_text(scrubber, &value, placeholder.token())?;
-        out.insert(placeholder, scrubbed);
+    ])
+}
+
+/// Every digested input, masked **once**, before the first render (review finding C-1).
+///
+/// D100 put the scrub between the render and the estimate, which was right for the bytes that got
+/// rendered once and wrong for every byte the trim ladder re-renders: each rung replaced a
+/// section's content with `render::*` over [`PromptSpec`], so a secret masked at step 2 came back at
+/// step 6 — a `stat_only` diff, a stubbed upstream row, a tail-cut verification block and a
+/// surviving excerpt were all rendered from the caller's structs. `surviving_audit` then hashed the
+/// masked block while the prompt carried the raw one, so the record and the text disagreed.
+///
+/// Masking the **inputs** dissolves the class rather than patching the five rungs: the first render
+/// and every re-render read the same masked data, and a rung added later inherits the property
+/// without knowing it exists. It also fixes the ordering M-2 named — `render::attr` escapes `&` and
+/// `"`, and `render::title_attr` cuts at 120 bytes, so a scrub that ran *after* them missed a secret
+/// containing either byte and shipped the head of one longer than the cut. Here the mask is first
+/// and the escape and the cut operate on `[REDACTED]`.
+///
+/// Every string is reported under the section that would render it, so [`AssembleError::Unmasked`]
+/// still names a fact a maintainer can act on and never the text. The scalars keep their
+/// placeholder tokens (`item_key`, `phase`, …) because that is the name a caller fixes them by.
+///
+/// # Errors
+///
+/// [`AssembleError::Unmasked`] for the first string the scrubber could not mask.
+fn scrubbed_inputs(
+    spec: &PromptSpec,
+    parsed: &ParsedTemplate,
+    scrubber: &dyn Scrubber,
+) -> Result<ScrubbedInputs, AssembleError> {
+    let mut spec = spec.clone();
+
+    for (value, section) in [
+        (&mut spec.item_key, Placeholder::ItemKey.token()),
+        (&mut spec.item_title, Placeholder::ItemTitle.token()),
+        (&mut spec.item_kind, Placeholder::ItemKind.token()),
+        (&mut spec.phase, Placeholder::Phase.token()),
+    ] {
+        mask(scrubber, value, section)?;
     }
-    Ok(out)
+    if let Some(output_kind) = &mut spec.output_kind {
+        mask(scrubber, output_kind, Placeholder::OutputKind.token())?;
+    }
+    mask(scrubber, &mut spec.item_body, &SectionName::Item.render())?;
+
+    for document in &mut spec.documents {
+        mask_document(scrubber, document)?;
+    }
+
+    let upstream_name = SectionName::Upstream.render();
+    for entry in &mut spec.upstream {
+        mask(scrubber, &mut entry.qualified_key, &upstream_name)?;
+        mask(scrubber, &mut entry.title, &upstream_name)?;
+        if let Some(summary) = &mut entry.summary {
+            mask(scrubber, summary, &upstream_name)?;
+        }
+    }
+
+    // `box` and `skills` are protected and are never re-rendered, but they are digested bytes and
+    // the one scrub is here now, so they are masked here too rather than in two places.
+    let box_name = SectionName::Box.render();
+    let profile = &mut spec.box_profile;
+    for value in [
+        &mut profile.hostname,
+        &mut profile.os_version,
+        &mut profile.arch,
+        &mut profile.cpu,
+        &mut profile.htui_version,
+        &mut profile.quirks,
+    ] {
+        mask(scrubber, value, &box_name)?;
+    }
+    for (name, version) in &mut profile.tools {
+        mask(scrubber, name, &box_name)?;
+        mask(scrubber, version, &box_name)?;
+    }
+
+    let skills_name = SectionName::Skills.render();
+    for skill in &mut spec.skills {
+        mask(scrubber, &mut skill.name, &skills_name)?;
+        mask(scrubber, &mut skill.body, &skills_name)?;
+    }
+
+    let excerpts_name = SectionName::Excerpts.render();
+    for file in &mut spec.excerpts.files {
+        mask(scrubber, &mut file.repo, &excerpts_name)?;
+        mask(scrubber, &mut file.path, &excerpts_name)?;
+        mask(scrubber, &mut file.content, &excerpts_name)?;
+        if let Some(provider) = &mut file.provider {
+            mask(scrubber, provider, &excerpts_name)?;
+        }
+    }
+
+    if let Some(failure) = &mut spec.verify_failure {
+        mask(
+            scrubber,
+            &mut failure.output,
+            &SectionName::VerifyFailure.render(),
+        )?;
+    }
+    if let Some(diff) = &mut spec.previous_diff {
+        mask_diff(scrubber, diff, &SectionName::PreviousDiff.render())?;
+    }
+
+    if let Some(judge) = &mut spec.judge {
+        mask(scrubber, &mut judge.task, &SectionName::JudgeTask.render())?;
+        for candidate in &mut judge.candidates {
+            let name = SectionName::JudgeCandidate(candidate.fanout_index).render();
+            if let Some(document) = &mut candidate.document {
+                mask(scrubber, &mut document.kind, &name)?;
+                mask(scrubber, &mut document.body, &name)?;
+            }
+            if let Some(diff) = &mut candidate.diff {
+                mask_diff(scrubber, diff, &name)?;
+            }
+            if let Some(tail) = &mut candidate.verification_tail {
+                mask(scrubber, tail, &name)?;
+            }
+        }
+    }
+
+    if let Some(handoff) = &mut spec.handoff {
+        let summary_name = SectionName::StepSummary.render();
+        let summary = &mut handoff.step_summary;
+        for (kind, _) in &mut summary.tool_calls {
+            mask(scrubber, kind, &summary_name)?;
+        }
+        for path in &mut summary.files_edited {
+            mask(scrubber, path, &summary_name)?;
+        }
+        for error in &mut summary.errors {
+            mask(scrubber, error, &summary_name)?;
+        }
+        mask(scrubber, &mut summary.last_assistant_tail, &summary_name)?;
+        if let Some(diff) = &mut handoff.diff_so_far {
+            mask_diff(scrubber, diff, &SectionName::DiffSoFar.render())?;
+        }
+        mask(
+            scrubber,
+            &mut handoff.failure_reason,
+            &SectionName::FailureReason.render(),
+        )?;
+    }
+
+    // The frame's literals, LF-normalised per span and masked (H-1). One `Vec` in span order, so
+    // the estimate and the substitution are over the same strings and cannot drift.
+    let mut literals = Vec::new();
+    for span in &parsed.spans {
+        if let Span::Literal(text) = span {
+            let mut normalised = render::normalise_newlines(text);
+            mask(scrubber, &mut normalised, &SectionName::Template.render())?;
+            literals.push(normalised);
+        }
+    }
+
+    let mut upstream = spec.upstream.clone();
+    UpstreamEntry::sort_canonical(&mut upstream);
+    let skills = BoundSkill::collapse(spec.skills.clone(), Vec::new());
+    let candidates = judge_candidates(&spec);
+    Ok(ScrubbedInputs {
+        spec,
+        upstream,
+        skills,
+        candidates,
+        literals,
+    })
+}
+
+/// [`scrubbed_inputs`]'s output: a masked [`PromptSpec`] and the three orderings derived from it.
+struct ScrubbedInputs {
+    /// The spec with every digested string masked in place.
+    spec: PromptSpec,
+    /// `spec.upstream` in §4.7 rule 2's canonical order.
+    upstream: Vec<UpstreamEntry>,
+    /// `spec.skills` collapsed into `R-SKL-2`'s resolution.
+    skills: Vec<BoundSkill>,
+    /// The judge's candidates in the order **this** call renders them (§4.7 rule 6).
+    candidates: Vec<JudgeCandidate>,
+    /// The frame's literal spans, LF-normalised and masked, in span order.
+    literals: Vec<String>,
+}
+
+/// Masks one string in place under `section`'s name.
+fn mask(scrubber: &dyn Scrubber, value: &mut String, section: &str) -> Result<(), AssembleError> {
+    *value = scrub_text(scrubber, value, section)?;
+    Ok(())
+}
+
+/// Masks a document's `kind` — which is half its section name — and then its body under that name.
+fn mask_document(
+    scrubber: &dyn Scrubber,
+    document: &mut InputDocument,
+) -> Result<(), AssembleError> {
+    // The bare vocabulary word, because the payload of the name is the very field being masked and
+    // an `Unmasked` that spelled it would put the secret in the error.
+    mask(scrubber, &mut document.kind, "documents")?;
+    let name = SectionName::Documents(document.kind.clone()).render();
+    mask(scrubber, &mut document.body, &name)
+}
+
+/// Masks a diff's three strings: the `range` attribute, the stat and the unified body.
+fn mask_diff(
+    scrubber: &dyn Scrubber,
+    diff: &mut DiffBlock,
+    section: &str,
+) -> Result<(), AssembleError> {
+    mask(scrubber, &mut diff.range, section)?;
+    mask(scrubber, &mut diff.stat, section)?;
+    mask(scrubber, &mut diff.diff, section)
 }
 
 /// Plan D100's two lines: wrap the content in a `Value::String`, scrub it, unwrap it.

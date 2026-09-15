@@ -498,6 +498,210 @@ fn verify_failure_keeps_its_tail() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// D100 under the trim ladder — review finding C-1
+// ---------------------------------------------------------------------------------------------
+
+/// The maskable secret the C-1 corpus plants in every trimmable input.
+const SECRET: &str = "hunter2";
+
+/// The oversize corpus with `SECRET` in every input a trim rung re-renders from.
+///
+/// One string in every field the ladder reaches: the excerpt bodies (whole-file drop), the upstream
+/// titles and summaries (stub ladder), the diff's stat and body (stat-only), the verification output
+/// (tail cut), both document bodies and the item body (head+tail). If any rung re-renders from
+/// [`PromptSpec`] rather than from the scrubbed inputs, the secret comes back.
+fn oversize_with_secrets() -> PromptSpec {
+    let mut spec = fixtures::phase_oversize();
+    spec.item_body = format!("the item body says {SECRET}\n{}", spec.item_body);
+    for doc in &mut spec.documents {
+        doc.body = format!("the {} body says {SECRET}\n{}", doc.kind, doc.body);
+    }
+    for entry in &mut spec.upstream {
+        entry.title = format!("{} {SECRET}", entry.title);
+        entry.summary = entry
+            .summary
+            .as_deref()
+            .map(|summary| format!("the summary says {SECRET}\n{summary}"));
+    }
+    for excerpt in &mut spec.excerpts.files {
+        excerpt.content = format!("// {SECRET}\n{}", excerpt.content);
+    }
+    if let Some(diff) = &mut spec.previous_diff {
+        diff.stat = format!("{} {SECRET}", diff.stat);
+        diff.diff = format!("+// {SECRET}\n{}", diff.diff);
+    }
+    // 400 lines, well over the 200-line floor, so the tail cut has something to reclaim and the
+    // rung re-renders `verify_failure` from its own input rather than cutting the section in place.
+    spec.verify_failure = Some(htui_core::prompt::VerifyFailure {
+        exit_code: 101,
+        output: (0..400)
+            .map(|n| format!("test recorder::case_{n} says {SECRET} ... ok\n"))
+            .collect(),
+    });
+    spec
+}
+
+/// `spec` at `target` tokens with no reserve, so the test's arithmetic is the target's.
+fn at_target(spec: &PromptSpec, target: i64) -> PromptSpec {
+    let mut out = spec.clone();
+    out.budget = htui_core::prompt::Budget {
+        tokens: target,
+        source: htui_core::prompt::BudgetSource::Project,
+        reserve_bp: 0,
+    };
+    out
+}
+
+#[test]
+fn no_trim_rung_re_renders_an_unscrubbed_input() {
+    // **C-1.** `assemble()` scrubs the *rendered* sections (D100) and then hands them to the
+    // trimmer, whose rungs re-render from `PromptSpec` — so every masked byte the ladder touched
+    // reappeared in the prompt while `trim_record` went on describing the scrubbed text. The fix is
+    // to mask at the input layer, once, before anything renders: then the first render and every
+    // re-render are over the same masked data and there is no rung left to forget.
+    let base = oversize_with_secrets();
+    let scrubber = MinimalScrubber::new([SECRET.to_owned()]);
+    let untrimmed = assemble(&at_target(&base, i64::MAX / 4), &scrubber)
+        .expect("the corpus assembles")
+        .trim
+        .estimated_before;
+
+    let mut strategies: BTreeSet<&'static str> = BTreeSet::new();
+    for cut in [
+        0, 4_000, 8_000, 12_000, 16_000, 20_000, 24_000, 28_000, 32_000,
+    ] {
+        let spec = at_target(&base, untrimmed - cut);
+        let prompt = assemble(&spec, &scrubber)
+            .unwrap_or_else(|error| panic!("the corpus assembles at -{cut}: {error}"));
+        assert!(
+            !prompt.text.contains(SECRET),
+            "the scrub survived neither the render nor the trim at -{cut}"
+        );
+        assert!(
+            prompt.text.contains("[REDACTED]"),
+            "and the mask is what took its place at -{cut}"
+        );
+        for section in &prompt.trim.sections {
+            strategies.insert(section.strategy.as_str());
+        }
+    }
+    // Every rung that re-renders is proved reached, or the sweep above proves nothing.
+    for strategy in [
+        TrimStrategy::HeadTail,
+        TrimStrategy::TailCut,
+        TrimStrategy::StatOnly,
+        TrimStrategy::StubLadder,
+        TrimStrategy::Dropped,
+    ] {
+        assert!(
+            strategies.contains(strategy.as_str()),
+            "the sweep never reached `{}`: {strategies:?}",
+            strategy.as_str()
+        );
+    }
+}
+
+#[test]
+fn the_judge_candidate_rung_re_renders_scrubbed_too() {
+    // C-1's judge half: `trim_candidates` re-renders a candidate stat-only from
+    // `inputs.candidates[i]`, which is the caller's struct.
+    let mut spec = fixtures::judge_three_candidates();
+    let Some(judge) = &mut spec.judge else {
+        panic!("the judge fixture carries judge inputs");
+    };
+    for candidate in &mut judge.candidates {
+        if let Some(diff) = &mut candidate.diff {
+            diff.stat = format!("{} {SECRET}", diff.stat);
+            diff.diff = format!("+// {SECRET}\n{}", diff.diff);
+        }
+        if let Some(doc) = &mut candidate.document {
+            doc.body = format!("{SECRET}\n{}", doc.body);
+        }
+        candidate.verification_tail = candidate
+            .verification_tail
+            .as_deref()
+            .map(|tail| format!("{SECRET}\n{tail}"));
+    }
+    let scrubber = MinimalScrubber::new([SECRET.to_owned()]);
+    let untrimmed = assemble(&at_target(&spec, i64::MAX / 4), &scrubber)
+        .expect("the judge corpus assembles")
+        .trim
+        .estimated_before;
+
+    let mut saw_stat_only = false;
+    for percent in [90, 75, 60, 50, 40] {
+        // Floored above the protected set, which is what a judge frame plus its box and skills
+        // cost: below it the call is a refusal rather than a trim and proves nothing.
+        let target = (untrimmed * percent / 100).max(400);
+        let prompt = assemble(&at_target(&spec, target), &scrubber)
+            .unwrap_or_else(|error| panic!("the judge corpus assembles at {target}: {error}"));
+        assert!(
+            !prompt.text.contains(SECRET),
+            "a candidate re-rendered stat-only from an unscrubbed input at {target}"
+        );
+        saw_stat_only |= prompt
+            .trim
+            .sections
+            .iter()
+            .any(|section| section.strategy == TrimStrategy::StatOnly);
+    }
+    assert!(saw_stat_only, "the isolate cap was never reached");
+}
+
+#[test]
+fn the_frame_literals_are_scrubbed_like_every_other_digested_byte() {
+    // **H-1.** Step 7 substituted `render::normalise_newlines(literal)` — the raw span — while only
+    // the *estimate* ran over a scrubbed copy, so a secret written into a `prompt_template.body`
+    // reached the model and the digest.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.body = format!("Use the key {SECRET}.\n\n{}", spec.body);
+    let prompt = assemble(&spec, &MinimalScrubber::new([SECRET.to_owned()]))
+        .expect("a maskable secret in the frame is masked, not refused");
+    assert!(
+        !prompt.text.contains(SECRET),
+        "§4.7 step 2: the frame's literals are digested bytes like any other"
+    );
+    assert!(prompt.text.contains("Use the key [REDACTED]."));
+
+    // And a secret the scrubber cannot mask refuses, naming the frame rather than the text.
+    let mut residue = fixtures::phase_implement_attempt2();
+    residue.body = format!("Use the key sk-ant-api03-DEADBEEF.\n\n{}", residue.body);
+    let error = assemble(&residue, &scrubber()).expect_err("`R-SEC-3` fails closed on the frame");
+    let AssembleError::Unmasked { ref section, .. } = error else {
+        panic!("expected an unmasked refusal, got {error:?}");
+    };
+    assert_eq!(section, "template");
+    assert!(!error.to_string().contains("sk-ant-api03-DEADBEEF"));
+}
+
+#[test]
+fn an_attribute_is_masked_before_it_is_escaped_and_cut() {
+    // **M-2.** The scrub ran on values `render::attr` had already rewritten and `title_attr` had
+    // already cut at 120 bytes, so an exact-match mask missed a secret carrying `&` or `"` and a
+    // long secret shipped its first 120 bytes. Masking at the input layer puts the mask first.
+    let long_secret = format!("SEKRIT-{}-TAIL", "x".repeat(200));
+    let amp_secret = "MOD & 2";
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.item_title = format!("Ship it: {long_secret}");
+    spec.item_key = format!("htui:{amp_secret}");
+    let prompt = assemble(
+        &spec,
+        &MinimalScrubber::new([long_secret.clone(), amp_secret.to_owned()]),
+    )
+    .expect("both secrets are maskable");
+    assert!(
+        !prompt.text.contains("SEKRIT-xxxxxxxxxx"),
+        "the 120-byte `title` cut must not ship the head of a masked secret:\n{}",
+        prompt.text
+    );
+    assert!(
+        !prompt.text.contains("MOD &amp; 2"),
+        "a secret carrying `&` is masked before `attr` rewrites it:\n{}",
+        prompt.text
+    );
+}
+
 #[test]
 fn every_marker_matches_its_record() {
     // Criterion 9's last clause, and blueprint rule 11: the prompt and the record never disagree.
