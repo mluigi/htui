@@ -734,7 +734,7 @@ impl StepSummary {
     /// (`crates/htui-agent/src/acp/fs.rs:57` admits them) and nothing between the wire and here
     /// rewrote one, so a handoff prompt's `Files edited:` line shipped a tree root — an absolute
     /// path, a run id and a step id in a digested byte, against §4.2 rule 5 and §4.7 rule 8 (review
-    /// finding H-2). Every path is now put through [`repo_relative`] against these roots, which is
+    /// finding H-2). Every path is now put through `repo_relative` against these roots, which is
     /// the same `RepoRoot` list §4.5's excerpt pass resolved, and one that strips to nothing is
     /// dropped rather than rendered.
     ///

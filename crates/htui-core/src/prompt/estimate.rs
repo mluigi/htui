@@ -29,7 +29,7 @@ impl TokenEstimator {
     ///
     /// The fields stay public because `htui-agent`'s estimator differential reads them to print the
     /// measured ratio against the constant, so the divide-by-zero is closed where the division is —
-    /// in [`span_tokens`](Self::span_tokens) — rather than by privatising a surface outside this
+    /// in `span_tokens` — rather than by privatising a surface outside this
     /// crate. This constructor is the honest way to build a third pair: `PromptSpec.estimator` is a
     /// public field and `TokenEstimator { prose_cpt: 0, .. }` would otherwise be a plausible typo
     /// that turned every budget decision into a panic inside `assemble()`.
