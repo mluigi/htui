@@ -1635,6 +1635,29 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
             json!({ "sections": { "a": { "trimmed": true } } }),
             (None, false),
         ),
+        // `sections` as the section itself, and `sections` nested one array too deep. Both are
+        // `false`: `Value::as_array` refuses the first outright, and the second's one element is an
+        // array, whose `trimmed` is absent. They are here because a *lax* jsonpath `$.sections[*]`
+        // auto-wraps a non-array and unwraps a nested one, so both used to read `true` on Postgres
+        // alone (T68, F-52 review, H2).
+        (
+            "sections as the section",
+            json!({ "sections": { "trimmed": true } }),
+            (None, false),
+        ),
+        (
+            "sections nested one array too deep",
+            json!({ "sections": [[{ "trimmed": true }]] }),
+            (None, false),
+        ),
+        // The mixed array, the one shape in this loop whose answer is `true`: a projection that
+        // walks the elements finds the trimmed one past the scalar, and one that gives up on the
+        // first non-object does not. The three agree today and nothing pinned it.
+        (
+            "a scalar beside a trimmed section",
+            json!({ "sections": [5, { "trimmed": true }] }),
+            (None, true),
+        ),
         (
             "a trimmed that is a string",
             json!({ "sections": [{ "trimmed": "nope" }] }),
@@ -1643,6 +1666,13 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
         (
             "a trimmed that is the integer 1",
             json!({ "sections": [{ "trimmed": 1 }] }),
+            (None, false),
+        ),
+        // `[true]` is not `true`, and it is the third shape lax auto-unwrapping used to admit:
+        // `@.trimmed == true` unwrapped the one-element array before comparing (F-90).
+        (
+            "a trimmed that is a one-element array",
+            json!({ "sections": [{ "trimmed": [true] }] }),
             (None, false),
         ),
         (

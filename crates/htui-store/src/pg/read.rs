@@ -361,9 +361,26 @@ impl ReadStore for PgStore {
                              BETWEEN -2147483648 AND 2147483647
                         THEN (s.trim_record->>'estimated_after')::int
                    END                                              AS "prompt_tokens?",
-                   COALESCE(jsonb_path_exists(s.trim_record,
-                                              '$.sections[*] ? (@.trimmed == true)'),
-                            false)                                   AS "trimmed!"
+                   -- An `EXISTS` over the elements and not `jsonb_path_exists`, for the same
+                   -- reason: SQL/JSON's **lax** mode (the default) auto-wraps a non-array before
+                   -- `[*]` and unwraps a nested one, so `$.sections[*] ? (@.trimmed == true)`
+                   -- answered `true` for a `sections` that is one section rather than a list of
+                   -- them, for one nested an array too deep, and — because `==` unwraps its
+                   -- operand too — for a `trimmed` of `[true]`. Rust reads all three as `false`
+                   -- (`Value::as_array`, then `as_bool`), and so does the mirror (T68, F-52
+                   -- review, H2 and F-90).
+                   --
+                   -- The `jsonb_typeof` guard keeps this total where a bare
+                   -- `jsonb_array_elements` would raise on a non-array, and `e->'trimmed'` is
+                   -- `NULL` on a scalar element rather than an error. `jsonb` equality against
+                   -- `'true'` is exact — it rejects `1`, `"true"` and `[true]` — which is
+                   -- `Value::as_bool() == Some(true)` exactly.
+                   CASE WHEN jsonb_typeof(s.trim_record->'sections') = 'array'
+                        THEN EXISTS (SELECT 1
+                                       FROM jsonb_array_elements(s.trim_record->'sections') e
+                                      WHERE e->'trimmed' = 'true'::jsonb)
+                        ELSE false
+                   END                                              AS "trimmed!"
               FROM run_step s
              WHERE s.run_id = ANY($1)
              ORDER BY s.run_id, s.position, s.attempt, s.fanout_index

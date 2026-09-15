@@ -492,11 +492,24 @@ async fn the_mirror_projects_a_malformed_trim_record_like_postgres() {
             json!({ "sections": { "a": { "trimmed": true } } }),
             (None, false),
         ),
+        (json!({ "sections": { "trimmed": true } }), (None, false)),
+        (
+            json!({ "sections": [[{ "trimmed": true }]] }),
+            (None, false),
+        ),
+        (
+            json!({ "sections": [5, { "trimmed": true }] }),
+            (None, true),
+        ),
         (
             json!({ "sections": [{ "trimmed": "nope" }] }),
             (None, false),
         ),
         (json!({ "sections": [{ "trimmed": 1 }] }), (None, false)),
+        (
+            json!({ "sections": [{ "trimmed": [true] }] }),
+            (None, false),
+        ),
         (json!({ "sections": [5, "x"] }), (None, false)),
         (json!({}), (None, false)),
     ] {
