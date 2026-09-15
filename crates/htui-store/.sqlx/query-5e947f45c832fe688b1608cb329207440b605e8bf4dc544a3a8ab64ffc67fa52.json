@@ -1,0 +1,174 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT s.run_id       AS \"run_id: RunId\",\n                   s.id           AS \"id: StepId\",\n                   s.position,\n                   s.attempt,\n                   s.fanout_index,\n                   s.phase_name,\n                   s.agent_id     AS \"agent_id: htui_core::model::AgentId\",\n                   s.model,\n                   s.status       AS \"status: htui_core::model::StepStatus\",\n                   s.gate_outcome AS \"gate_outcome: htui_core::model::GateOutcome\",\n                   s.started_at,\n                   s.finished_at,\n                   -- Plan D106's two figures, derived from `trim_record` in SQL rather than\n                   -- returned whole: the record is a document the Runs pane has no room for, and\n                   -- §6.1 exposes neither it nor `prompt_digest`. `htui_core::model::prompt_summary`\n                   -- is the same derivation in Rust, and `MemStore` uses it, so the two agree by\n                   -- the `set_step_prompt` conformance case rather than by luck.\n                   --\n                   -- Guarded casts rather than casts (T68, F-52): `trim_record` is an untyped\n                   -- `JSONB` column, and a bare `(…->>'estimated_after')::int` *raises* on a\n                   -- string, a float or a number outside `i32`, as `jsonb_array_elements` does on\n                   -- a `sections` that is not an array and `::bool` on a `trimmed` that is not\n                   -- one. Any of those would fail the whole Runs read over one bad row, where\n                   -- `prompt_summary` answers `(None, false)`; a `CASE` whose guard fails yields\n                   -- SQL `NULL`, which is the same answer.\n                   --\n                   -- The guard is a **text** test and not a numeric one, because `Value::as_i64`\n                   -- rejects a float by its *type* and no numeric predicate can see that: `35988.0`\n                   -- is integral, is in `i32` range, and satisfies `@.floor() == @`, so the\n                   -- jsonpath this replaces admitted it and then handed `::int` the text\n                   -- `35988.0`, which raises (T68, F-52 review, H1). `jsonb` preserves the trailing\n                   -- `.0` a float was written with, so the regex sees the difference the numeric\n                   -- predicates cannot, and it also bounds the digits so the `::bigint` that\n                   -- range-checks cannot itself overflow. (A record whose wire text says `1e3`\n                   -- would normalise to `1000` and project as an integer where Rust reads a float;\n                   -- `set_step_prompt` takes a `serde_json::Value`, which never writes that form.)\n                   CASE WHEN jsonb_typeof(s.trim_record->'estimated_after') = 'number'\n                         AND (s.trim_record->>'estimated_after') ~ '^-?[0-9]{1,10}$'\n                         AND (s.trim_record->>'estimated_after')::bigint\n                             BETWEEN -2147483648 AND 2147483647\n                        THEN (s.trim_record->>'estimated_after')::int\n                   END                                              AS \"prompt_tokens?\",\n                   COALESCE(jsonb_path_exists(s.trim_record,\n                                              '$.sections[*] ? (@.trimmed == true)'),\n                            false)                                   AS \"trimmed!\"\n              FROM run_step s\n             WHERE s.run_id = ANY($1)\n             ORDER BY s.run_id, s.position, s.attempt, s.fanout_index\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "run_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "attempt",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "attempt"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "fanout_index",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "fanout_index"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "phase_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "phase_name"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "agent_id: htui_core::model::AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "model"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "status: htui_core::model::StepStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "gate_outcome: htui_core::model::GateOutcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "gate_outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "finished_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "finished_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "prompt_tokens?",
+        "type_info": "Int4",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 13,
+        "name": "trimmed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      null,
+      null
+    ]
+  },
+  "hash": "5e947f45c832fe688b1608cb329207440b605e8bf4dc544a3a8ab64ffc67fa52"
+}

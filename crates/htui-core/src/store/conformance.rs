@@ -1611,6 +1611,15 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
             json!({ "estimated_after": 35_988.5 }),
             (None, false),
         ),
+        // The float whose fractional part is zero, which is not the same shape as the one above:
+        // it satisfies every numeric predicate an integer does — `floor(v) == v`, in `i32` range —
+        // and is still a float, so `Value::as_i64` rejects it. A backend that tests the *value*
+        // rather than the *type* admits it and then has `35988.0` to turn into an integer.
+        (
+            "an integral float",
+            json!({ "estimated_after": 35_988.0_f64 }),
+            (None, false),
+        ),
         (
             "a number past i32",
             json!({ "estimated_after": 3_000_000_000_i64 }),

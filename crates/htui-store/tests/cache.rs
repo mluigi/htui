@@ -483,6 +483,7 @@ async fn the_mirror_projects_a_malformed_trim_record_like_postgres() {
         ),
         (json!({ "estimated_after": "34000" }), (None, false)),
         (json!({ "estimated_after": 35_988.5 }), (None, false)),
+        (json!({ "estimated_after": 35_988.0_f64 }), (None, false)),
         (
             json!({ "estimated_after": 3_000_000_000_i64 }),
             (None, false),

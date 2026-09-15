@@ -337,19 +337,30 @@ impl ReadStore for PgStore {
                    -- is the same derivation in Rust, and `MemStore` uses it, so the two agree by
                    -- the `set_step_prompt` conformance case rather than by luck.
                    --
-                   -- Lax jsonpath rather than casts (T68, F-52): `trim_record` is an untyped
-                   -- `JSONB` column, and `(…->>'estimated_after')::int` *raises* on a string, a
-                   -- float or a number outside `i32`, as `jsonb_array_elements` does on a
-                   -- `sections` that is not an array and `::bool` on a `trimmed` that is not one.
-                   -- Any of those would fail the whole Runs read over one bad row, where
-                   -- `prompt_summary` answers `(None, false)`; a jsonpath that matches nothing
-                   -- yields SQL `NULL`, which is the same answer. The filter spells out what
-                   -- `Value::as_i64` accepts: a number, integral, in range.
-                   (jsonb_path_query_first(
-                        s.trim_record,
-                        '$.estimated_after ? (@.type() == "number" && @.floor() == @
-                                              && @ >= -2147483648 && @ <= 2147483647)'
-                    ) #>> '{}')::int                                 AS "prompt_tokens?",
+                   -- Guarded casts rather than casts (T68, F-52): `trim_record` is an untyped
+                   -- `JSONB` column, and a bare `(…->>'estimated_after')::int` *raises* on a
+                   -- string, a float or a number outside `i32`, as `jsonb_array_elements` does on
+                   -- a `sections` that is not an array and `::bool` on a `trimmed` that is not
+                   -- one. Any of those would fail the whole Runs read over one bad row, where
+                   -- `prompt_summary` answers `(None, false)`; a `CASE` whose guard fails yields
+                   -- SQL `NULL`, which is the same answer.
+                   --
+                   -- The guard is a **text** test and not a numeric one, because `Value::as_i64`
+                   -- rejects a float by its *type* and no numeric predicate can see that: `35988.0`
+                   -- is integral, is in `i32` range, and satisfies `@.floor() == @`, so the
+                   -- jsonpath this replaces admitted it and then handed `::int` the text
+                   -- `35988.0`, which raises (T68, F-52 review, H1). `jsonb` preserves the trailing
+                   -- `.0` a float was written with, so the regex sees the difference the numeric
+                   -- predicates cannot, and it also bounds the digits so the `::bigint` that
+                   -- range-checks cannot itself overflow. (A record whose wire text says `1e3`
+                   -- would normalise to `1000` and project as an integer where Rust reads a float;
+                   -- `set_step_prompt` takes a `serde_json::Value`, which never writes that form.)
+                   CASE WHEN jsonb_typeof(s.trim_record->'estimated_after') = 'number'
+                         AND (s.trim_record->>'estimated_after') ~ '^-?[0-9]{1,10}$'
+                         AND (s.trim_record->>'estimated_after')::bigint
+                             BETWEEN -2147483648 AND 2147483647
+                        THEN (s.trim_record->>'estimated_after')::int
+                   END                                              AS "prompt_tokens?",
                    COALESCE(jsonb_path_exists(s.trim_record,
                                               '$.sections[*] ? (@.trimmed == true)'),
                             false)                                   AS "trimmed!"
