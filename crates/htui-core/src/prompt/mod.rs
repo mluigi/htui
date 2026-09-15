@@ -16,9 +16,12 @@
 //! Milestone 9 builds this module in pieces. T59 landed the two leaves that depend on nothing:
 //! [`template`], the `{{name}}` scanner and its closed per-role placeholder sets, and [`estimate`],
 //! the `chars-v2` token estimator every budget decision is measured with. T60 landed [`defaults`].
-//! T64 lands the input surface — [`PromptSpec`] and everything it owns — plus [`render`], the
-//! per-section renderers, and [`digest`], the canonical form and its hash. `assemble()`, the trim
-//! and the settings chain are T65's; the excerpt ranker is T66's.
+//! T64 landed the input surface — [`PromptSpec`] and everything it owns — plus [`render`], the
+//! per-section renderers, and [`digest`], the canonical form and its hash. T65 lands [`assemble`]
+//! itself, [`trim`]'s five-step order and its record, and [`settings`]'s budget chain. The excerpt
+//! ranker behind [`excerpt`] is T66's: until it lands, a caller supplies an
+//! [`ExcerptSet`] it resolved itself, and the preview supplies an empty one
+//! by design (plan D103).
 
 pub mod defaults;
 pub mod digest;

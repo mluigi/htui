@@ -6,9 +6,9 @@
 //! reached for the environment would make an accepted snapshot a statement about the box that
 //! accepted it, which is precisely the property ANA-5 invariant 2 exists to deny.
 //!
-//! T64 lands the four shapes the section renders are proved against. T65 adds the budget cases
-//! (`phase_oversize`, `phase_protected_too_big`, `phase_skills_over_cap`) and `demo_trim_record`,
-//! which cannot exist before `assemble()` does.
+//! T64 landed the four shapes the section renders are proved against. T65 adds the three budget
+//! cases — [`phase_oversize`], [`phase_protected_too_big`], [`phase_skills_over_cap`] — and
+//! [`demo_trim_record`], none of which could exist before `assemble()` did.
 
 use uuid::Uuid;
 
