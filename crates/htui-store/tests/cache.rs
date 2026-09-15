@@ -476,16 +476,28 @@ async fn the_mirror_projects_a_malformed_trim_record_like_postgres() {
     };
     let cache = open_cache(&db).await;
 
-    for record in [
-        json!({ "estimated_after": 35_988, "sections": [{ "trimmed": false }, { "trimmed": true }] }),
-        json!({ "estimated_after": "34000" }),
-        json!({ "estimated_after": 35_988.5 }),
-        json!({ "estimated_after": 3_000_000_000_i64 }),
-        json!({ "sections": { "a": { "trimmed": true } } }),
-        json!({ "sections": [{ "trimmed": "nope" }] }),
-        json!({ "sections": [{ "trimmed": 1 }] }),
-        json!({ "sections": [5, "x"] }),
-        json!({}),
+    for (record, expected) in [
+        (
+            json!({ "estimated_after": 35_988, "sections": [{ "trimmed": false }, { "trimmed": true }] }),
+            (Some(35_988), true),
+        ),
+        (json!({ "estimated_after": "34000" }), (None, false)),
+        (json!({ "estimated_after": 35_988.5 }), (None, false)),
+        (
+            json!({ "estimated_after": 3_000_000_000_i64 }),
+            (None, false),
+        ),
+        (
+            json!({ "sections": { "a": { "trimmed": true } } }),
+            (None, false),
+        ),
+        (
+            json!({ "sections": [{ "trimmed": "nope" }] }),
+            (None, false),
+        ),
+        (json!({ "sections": [{ "trimmed": 1 }] }), (None, false)),
+        (json!({ "sections": [5, "x"] }), (None, false)),
+        (json!({}), (None, false)),
     ] {
         db.store
             .set_step_prompt(ids::STEP_IMPL, "dead", &record)
@@ -509,8 +521,13 @@ async fn the_mirror_projects_a_malformed_trim_record_like_postgres() {
         );
         assert_eq!(
             mirrored,
+            Some(expected),
+            "and both project {record} as {expected:?}"
+        );
+        assert_eq!(
+            mirrored,
             Some(htui_core::model::prompt_summary(Some(&record))),
-            "and both project it as `prompt_summary` does"
+            "and that is what `prompt_summary` answers too"
         );
     }
 

@@ -1592,34 +1592,56 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
     // documents no assembler would write as well as for the one it does (T68, F-52). Each of
     // these made one backend disagree with `prompt_summary` before T68: the SQL casts raised, and
     // an error is not a projection — it fails the whole Runs read over one bad row.
-    for (label, record) in [
+    //
+    // Every shape carries its **expected** pair rather than sharing one hard-coded `(None, false)`
+    // (T68, F-52 review, M1). The old shape of this loop could only hold shapes that project to
+    // nothing, and "projects to nothing" is exactly the answer a backend gives by accident: a
+    // jsonpath that matches the wrong thing and a jsonpath that matches nothing are told apart only
+    // by a shape whose right answer is `true`. The `prompt_summary` equality below is kept as the
+    // second assertion, so a shape pins the projection against the reference *and* against a
+    // literal, and a wrong `prompt_summary` cannot make a wrong backend look right.
+    for (label, record, expected) in [
         (
             "a string where a number belongs",
             json!({ "estimated_after": "34000" }),
+            (None, false),
         ),
-        ("a float", json!({ "estimated_after": 35_988.5 })),
+        (
+            "a fractional float",
+            json!({ "estimated_after": 35_988.5 }),
+            (None, false),
+        ),
         (
             "a number past i32",
             json!({ "estimated_after": 3_000_000_000_i64 }),
+            (None, false),
         ),
         (
             "a number past -i32",
             json!({ "estimated_after": -3_000_000_000_i64 }),
+            (None, false),
         ),
         (
             "sections as an object",
             json!({ "sections": { "a": { "trimmed": true } } }),
+            (None, false),
         ),
         (
             "a trimmed that is a string",
             json!({ "sections": [{ "trimmed": "nope" }] }),
+            (None, false),
         ),
         (
             "a trimmed that is the integer 1",
             json!({ "sections": [{ "trimmed": 1 }] }),
+            (None, false),
         ),
-        ("sections of scalars", json!({ "sections": [5, "x"] })),
-        ("an empty record", json!({})),
+        (
+            "sections of scalars",
+            json!({ "sections": [5, "x"] }),
+            (None, false),
+        ),
+        ("an empty record", json!({}), (None, false)),
     ] {
         store
             .set_step_prompt(ids::STEP_IMPL, "dead", &record)
@@ -1635,13 +1657,13 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
         });
         assert_eq!(
             tokens_of(&read, ids::STEP_IMPL),
-            Some(crate::model::prompt_summary(Some(&record))),
-            "set_step_prompt_writes_digest_and_trim: {label} projects as `prompt_summary` does"
+            Some(expected),
+            "set_step_prompt_writes_digest_and_trim: {label} projects as {expected:?}"
         );
         assert_eq!(
             tokens_of(&read, ids::STEP_IMPL),
-            Some((None, false)),
-            "set_step_prompt_writes_digest_and_trim: and that answer is `no figure, no trim`"
+            Some(crate::model::prompt_summary(Some(&record))),
+            "set_step_prompt_writes_digest_and_trim: {label} projects as `prompt_summary` does"
         );
     }
 
