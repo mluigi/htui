@@ -133,7 +133,11 @@ pub struct RepoRoot {
 /// gitignore subset, the NUL test and `max_file_bytes` — need bytes and belong to the reader.
 #[must_use]
 pub fn skip_by_path(path: &str) -> Option<&'static str> {
-    if path == ".git" || path.starts_with(".git/") || path.contains("/.git/") {
+    // A `.git` **component** at any depth, not a `.git/` prefix: a submodule's `sub/.git` is a
+    // file holding `gitdir: /abs/path`, which the narrower test let through as ordinary source
+    // (review finding L3). `htui_agent::excerpt`'s walk prunes the same name at the same breadth,
+    // so the ranker and the reader cannot disagree about it (H-22).
+    if path.split('/').any(|segment| segment == ".git") {
         return Some("git");
     }
     let name = path.rsplit('/').next().unwrap_or(path);

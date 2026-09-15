@@ -662,6 +662,32 @@ fn the_binary_probe_covers_the_whole_first_8_kb() {
 }
 
 #[test]
+fn a_submodule_dot_git_file_is_never_listed() {
+    // L3: rule 1 is "inside `.git`", not "inside a `.git` *directory*". A submodule's `sub/.git` is
+    // a **file** holding `gitdir: /abs/path` — an absolute path, which is hazard H-1 — and the
+    // prune used to run only on the `is_dir` branch.
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(
+        dir.path(),
+        "sub/.git",
+        b"gitdir: /home/someone/repo/.git/modules/sub\n",
+    );
+    write(dir.path(), "sub/src/a.rs", b"fn a() {}\n");
+    let reader = FsRepoReader::default();
+    let (paths, _) = reader.list(&fs_root(dir.path()), 20_000).expect("readable");
+    assert_eq!(
+        paths,
+        vec!["sub/src/a.rs".to_owned()],
+        "a `.git` at any depth, of any kind, is rule 1: {paths:?}"
+    );
+    // And `htui-core` agrees, so the ranker and the reader cannot disagree about it (H-22).
+    assert_eq!(
+        htui_core::prompt::excerpt::skip_by_path("sub/.git"),
+        Some("git")
+    );
+}
+
+#[test]
 fn the_scan_cap_counts_directories_too() {
     // L2: the cap exists to bound the walk's *cost*, and a `read_dir` plus a `.gitignore` open per
     // level is what a tree of nested directories costs without ever presenting a regular file. A

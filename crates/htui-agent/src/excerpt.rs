@@ -237,6 +237,15 @@ impl FsRepoReader {
                 // it is skipped rather than lossily renamed.
                 continue;
             };
+            // Rule 1, above the `is_dir` branch and above the stat: `.git` is never source,
+            // whatever kind of entry it is. A **submodule's** `sub/.git` is a file holding
+            // `gitdir: /abs/path`, and a prune that ran only on the directory branch listed it and
+            // read it — an absolute path in a rendered byte, which is hazard H-1.
+            // `skip_by_path` refuses the same name at the same breadth, so neither crate is the
+            // only one holding rule 1 (H-22).
+            if name == ".git" {
+                continue;
+            }
             let child = if relative.is_empty() {
                 name.to_owned()
             } else {
@@ -263,8 +272,7 @@ impl FsRepoReader {
                 continue;
             }
             if meta.is_dir() {
-                // Rule 1, at the directory: nothing under `.git/` is even stat-ed.
-                if name == ".git" || self.skip(&child, ignores, None).is_some() {
+                if self.skip(&child, ignores, None).is_some() {
                     continue;
                 }
                 // A subdirectory this box cannot open contributes nothing and does **not** fail the
