@@ -20,10 +20,13 @@
 //! different facts, and a surprising number is then traceable in one field rather than by
 //! re-deriving the chain.
 
+use core::time::Duration;
 use std::collections::BTreeMap;
 
 use serde::Serialize;
 use serde_json::Value;
+
+use crate::prompt::excerpt::ExcerptCaps;
 
 /// ANA-5 §5.3's ten reserved `app_setting` keys, with the defaults migration `0002` seeds
 /// (`0002_agent_probe.sql:68-79`).
@@ -273,6 +276,46 @@ pub fn resolve_max_skill_tokens(app: &BTreeMap<String, Value>) -> i64 {
     positive_i64(app.get("max_skill_tokens")).unwrap_or(DEFAULTS.max_skill_tokens)
 }
 
+/// §5.3's six `excerpt_*` keys: the four caps the audit records, the walk's scan cap, and the
+/// provider deadline (blueprint B.8; T65 deferred this to T66 by name).
+///
+/// Three returns rather than one struct because the three go to three different places: the caps
+/// are recorded verbatim in `trim_record.excerpts.caps`, the scan cap is the walk's and never
+/// appears in the record, and the deadline belongs to the provider runner in `htui-agent`. Folding
+/// them together would put two fields into the audit that ANA-5 `:1127` does not have.
+///
+/// Every key resolves independently under the one rung rule (`connect.rs:299-302`): absent, `null`,
+/// non-numeric or non-positive falls through to [`DEFAULTS`]. `excerpt_head_lines` is then clamped
+/// to `excerpt_file_line_cap` — a head above the cap that made a file window at all is a stored
+/// typo, and honouring it would render more lines than the cap permits.
+#[must_use]
+pub fn resolve_excerpt_caps(app: &BTreeMap<String, Value>) -> (ExcerptCaps, u32, Duration) {
+    let file_line_cap =
+        positive_u32(app.get("excerpt_file_line_cap")).unwrap_or(DEFAULTS.excerpt_file_line_cap);
+    let caps = ExcerptCaps {
+        max_files: positive_u32(app.get("excerpt_max_files")).unwrap_or(DEFAULTS.excerpt_max_files),
+        file_line_cap,
+        head_lines: positive_u32(app.get("excerpt_head_lines"))
+            .unwrap_or(DEFAULTS.excerpt_head_lines)
+            .min(file_line_cap),
+        max_file_bytes: positive_i64(app.get("excerpt_max_file_bytes"))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(DEFAULTS.excerpt_max_file_bytes),
+    };
+    let scan =
+        positive_u32(app.get("excerpt_max_scan_files")).unwrap_or(DEFAULTS.excerpt_max_scan_files);
+    let deadline = positive_i64(app.get("excerpt_provider_deadline_ms"))
+        .and_then(|ms| u64::try_from(ms).ok())
+        .unwrap_or(DEFAULTS.excerpt_provider_deadline_ms);
+    (caps, scan, Duration::from_millis(deadline))
+}
+
+/// [`positive_i64`] narrowed, for the four `u32` caps. A row too large for a `u32` is a typo and
+/// falls through rather than saturating into a cap nobody wrote.
+fn positive_u32(value: Option<&Value>) -> Option<u32> {
+    positive_i64(value).and_then(|n| u32::try_from(n).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +545,57 @@ mod tests {
             resolve_max_skill_tokens(&app(&[("max_skill_tokens", json!(-1))])),
             DEFAULTS.max_skill_tokens
         );
+    }
+
+    #[test]
+    fn excerpt_caps_fall_through_key_by_key() {
+        // §5.3's six `excerpt_*` keys, each independent: a project that configured two of them
+        // must not lose the other four to the fall-through.
+        let (caps, scan, deadline) = resolve_excerpt_caps(&BTreeMap::new());
+        assert_eq!(
+            caps,
+            ExcerptCaps {
+                max_files: DEFAULTS.excerpt_max_files,
+                file_line_cap: DEFAULTS.excerpt_file_line_cap,
+                head_lines: DEFAULTS.excerpt_head_lines,
+                max_file_bytes: DEFAULTS.excerpt_max_file_bytes,
+            }
+        );
+        assert_eq!(scan, DEFAULTS.excerpt_max_scan_files);
+        assert_eq!(
+            deadline,
+            Duration::from_millis(DEFAULTS.excerpt_provider_deadline_ms)
+        );
+
+        let rows = app(&[
+            ("excerpt_max_files", json!(3)),
+            ("excerpt_head_lines", json!(40)),
+            ("excerpt_max_scan_files", json!(500)),
+            ("excerpt_provider_deadline_ms", json!(250)),
+            // The `connect.rs:299-302` rule: neither of these is a value.
+            ("excerpt_file_line_cap", json!(0)),
+            ("excerpt_max_file_bytes", json!("524288")),
+        ]);
+        let (caps, scan, deadline) = resolve_excerpt_caps(&rows);
+        assert_eq!(caps.max_files, 3);
+        assert_eq!(caps.head_lines, 40);
+        assert_eq!(caps.file_line_cap, DEFAULTS.excerpt_file_line_cap);
+        assert_eq!(caps.max_file_bytes, DEFAULTS.excerpt_max_file_bytes);
+        assert_eq!(scan, 500);
+        assert_eq!(deadline, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn the_head_never_exceeds_the_line_cap() {
+        // A head above the line cap is a stored typo, not a policy: `select` would then window a
+        // file to more lines than the cap that made it window at all.
+        let rows = app(&[
+            ("excerpt_file_line_cap", json!(50)),
+            ("excerpt_head_lines", json!(400)),
+        ]);
+        let (caps, _, _) = resolve_excerpt_caps(&rows);
+        assert_eq!(caps.file_line_cap, 50);
+        assert_eq!(caps.head_lines, 50, "clamped to the cap it sits under");
     }
 
     fn budget(tokens: i64, reserve_bp: u32) -> Budget {
