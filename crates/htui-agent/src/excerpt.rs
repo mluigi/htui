@@ -369,13 +369,18 @@ fn descend(root: &Path, path: &str) -> Result<std::path::PathBuf, ProviderError>
     if path.is_empty() || rooted || drive {
         return Err(not_repo_relative(path));
     }
+    // Every segment is judged **before** the first `stat`, so the refusal names the path's own
+    // shape rather than whichever component happened not to exist. An empty, `.` or `..` segment
+    // is refused rather than normalised: the caller named a path it cannot have listed, and
+    // normalising one is how a `..` survives a textual check.
+    if path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(not_repo_relative(path));
+    }
     let mut at = root.to_path_buf();
     for segment in path.split('/') {
-        // An empty, `.` or `..` segment is refused rather than normalised: the caller named a path
-        // it cannot have listed, and normalising one is how a `..` survives a textual check.
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return Err(not_repo_relative(path));
-        }
         at.push(segment);
         let Ok(meta) = std::fs::symlink_metadata(&at) else {
             return Err(ProviderError::new(
