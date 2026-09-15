@@ -29,6 +29,12 @@
 //! It names no agent, no method id and no host (`R-AGT-5`) — the method list is whatever the agent
 //! answered `initialize` with, and the verdict afterwards is [`probe`]'s.
 //!
+//! [`mod@excerpt`] is MOD-2 milestone 9's filesystem half of ANA-5 §4.5: the repository walk
+//! [`RepoReader`](htui_core::prompt::excerpt::RepoReader) is the seam for, and the deadline runner
+//! that gives each [`ExcerptProvider`](htui_core::prompt::excerpt::ExcerptProvider) a thread. The
+//! ranker, the tiers and every value type stay in `htui-core`, which names no `std::fs` — this
+//! crate is where the disk is.
+//!
 //! Deliberately absent in milestones 1–2 (plan D16): any wire protocol (`acp/`, `cli/`), the chat
 //! tab, and quota. Each is a named seam, not a plan.
 #![warn(missing_docs)]
@@ -91,6 +97,7 @@ pub mod conformance;
 pub mod driver;
 pub mod error;
 pub mod event;
+pub mod excerpt;
 #[cfg(feature = "test-support")]
 pub mod fake;
 pub mod install;
@@ -130,6 +137,9 @@ pub use event::{
     TextChunk, ToolCallEvent, ToolKind, ToolLocation, ToolResultEvent, ToolResultStatus,
     UsageEvent,
 };
+// `run_providers`, not `run`: at the crate root the bare name says nothing about what is being
+// run, and `plan_install`/`resolve_tools` set the precedent.
+pub use excerpt::{FsRepoReader, GitignoreSubset, SkipRule, run_providers};
 // `plan_install`, not `plan`: at the crate root the bare name says nothing about what is being
 // planned, and `resolve_tools` set the precedent.
 pub use install::{
