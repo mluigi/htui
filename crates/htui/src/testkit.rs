@@ -12,20 +12,23 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use htui_core::model::StepId;
+use htui_core::model::{ProjectRef, Scope, StepId};
 use htui_core::store::MemStore;
 use htui_store::Backend;
-use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use crate::agent_worker::{AgentRuntime, ChatTask, Served};
-use crate::app::{Action, App};
+use crate::app::{Action, App, Ctx, Emit, Handled, TopBarState};
 use crate::keymap::{KeyChord, Keymap};
-use crate::store_worker::{self, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
+use crate::store_worker::{self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
+use crate::ui::Theme;
 use crate::ui::overlay::Overlay;
 use crate::ui::tabs::Tab;
+use crate::ui::tabs::settings::{SettingsSection, SettingsTab};
 
 /// Default snapshot size (plan risk row: snapshots are flaky across terminal sizes).
 const DEFAULT_SIZE: (u16, u16) = (100, 30);
@@ -439,10 +442,127 @@ fn buffer_text(buffer: &Buffer) -> String {
     out
 }
 
+/// Everything [`Ctx::new`] borrows, owned in one place, for testing a section without a shell
+/// around it.
+///
+/// A section is tested on its own — that is what makes a key and a reply independently
+/// assertable — and every one of those tests needs the same six values. Holding them together
+/// also holds the [`Emit`] queue, which is how a test sees what the section asked the store for
+/// without a store existing at all (`R-NF-3`).
+#[derive(Debug)]
+pub struct SectionBench {
+    /// The workspace every request is issued against.
+    scope: Scope,
+    /// The scope's projects. Empty: a section that needs them builds its own.
+    projects: Vec<ProjectRef>,
+    /// What the top bar would be showing.
+    top_bar: TopBarState,
+    /// The key table, for the hint lines a section renders.
+    keymap: Keymap,
+    /// The palette.
+    theme: Theme,
+    /// What the section emitted, drained by [`drained`](SectionBench::drained).
+    emit: Emit,
+}
+
+impl SectionBench {
+    /// A bench in the demo fixture's first workspace (`Graphics`; workspaces come back by name).
+    ///
+    /// # Panics
+    ///
+    /// If the demo fixture has no workspace.
+    pub async fn new() -> Self {
+        let workspaces = MemStore::demo()
+            .workspaces()
+            .await
+            .expect("the memory store never fails");
+        Self {
+            scope: Scope::from_workspace(workspaces.first().expect("the fixture has a workspace")),
+            projects: Vec::new(),
+            top_bar: TopBarState::default(),
+            keymap: Keymap::default_global(),
+            theme: Theme::default(),
+            emit: Emit::default(),
+        }
+    }
+
+    /// A context addressed to the Settings tab, as the shell builds one.
+    #[must_use]
+    pub fn ctx(&self) -> Ctx<'_> {
+        Ctx::new(
+            &self.scope,
+            &self.projects,
+            &self.top_bar,
+            &self.keymap,
+            &self.theme,
+            Origin::Tab(SettingsTab::ID),
+            &self.emit,
+        )
+    }
+
+    /// Feeds one key to a section, written the way [`KeyChord::parse`] reads it.
+    ///
+    /// # Panics
+    ///
+    /// If `chord` is not a chord.
+    pub fn key(&self, section: &mut dyn SettingsSection, chord: &str) -> Handled {
+        let parsed = KeyChord::parse(chord).unwrap_or_else(|| panic!("`{chord}` is not a chord"));
+        let mut ctx = self.ctx();
+        section.on_key(parsed.to_event(), &mut ctx)
+    }
+
+    /// Hands one reply to a section.
+    pub fn reply(&self, section: &mut dyn SettingsSection, reply: &StoreReply) {
+        let mut ctx = self.ctx();
+        section.on_reply(reply, &mut ctx);
+    }
+
+    /// Everything the section emitted since this was last called, leaving the queue empty.
+    #[must_use]
+    pub fn drained(&self) -> Vec<Action> {
+        self.emit.take()
+    }
+
+    /// The error texts the section put on the status line since this was last called.
+    #[must_use]
+    pub fn errors(&self) -> Vec<String> {
+        self.drained()
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Error(message) => Some(message),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Draws one section into a `width`x30 buffer and returns it as snapshot text.
+    ///
+    /// The section's own test file keeps its `Buffer`-returning twin: a cursor is a *style*, and
+    /// text alone cannot tell a moved cursor from a stuck one.
+    ///
+    /// # Panics
+    ///
+    /// If the `TestBackend` fails to draw, which it only does when the section panics.
+    pub fn render_section(&self, section: &dyn SettingsSection, width: u16) -> String {
+        let area = Rect::new(0, 0, width, 30);
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(width, 30),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .expect("a test terminal");
+        let ctx = self.ctx();
+        terminal
+            .draw(|frame| section.render(frame, frame.area(), &ctx))
+            .expect("the section draws");
+        buffer_text(terminal.backend().buffer())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Ctx, Handled};
     use crate::ui::layout::centered;
     use crate::ui::overlay::OverlayId;
     use crossterm::event::{KeyCode, KeyEvent};

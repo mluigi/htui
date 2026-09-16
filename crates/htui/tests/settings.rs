@@ -4,10 +4,9 @@
 //! snapshot suite is pinned to.
 #![cfg(feature = "testkit")]
 
-use htui::app::{Action, Ctx, Emit, Handled, TopBarState};
-use htui::keymap::{KeyChord, Keymap};
-use htui::store_worker::{AuthFrame, InstallFrame, Origin, StoreReply, StoreRequest};
-use htui::testkit::Harness;
+use htui::app::{Action, Ctx, Handled};
+use htui::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
+use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{AgentsSection, SectionId, SettingsSection, SettingsTab, message};
 use htui_agent::acp::Handshake;
@@ -15,9 +14,7 @@ use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::InstallRecord;
 use htui_agent::probe::{CredentialTier, ProbeSnapshot, ProbeSource, ProbeStatus};
 use htui_agent::{ArchiveFormat, InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
-use htui_core::model::{
-    Agent, AgentBox, AgentId, AgentSummary, Billing, BoxId, ProjectRef, Scope, Transport,
-};
+use htui_core::model::{Agent, AgentBox, AgentId, AgentSummary, Billing, BoxId, Scope, Transport};
 use htui_core::store::{MemStore, WriteStore};
 use ratatui::Frame;
 use ratatui::backend::TestBackend;
@@ -117,77 +114,6 @@ fn accented_lines(section: &dyn SettingsSection, ctx: &Ctx<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Everything [`Ctx::new`] borrows, owned in one place.
-///
-/// A section is tested without a shell around it — that is what makes a key and a reply
-/// independently assertable — and every one of those tests needs the same seven values. Holding
-/// them together also holds the [`Emit`] queue, which is how a test sees what the section asked
-/// the store for without a store existing at all (`R-NF-3`).
-struct Bench {
-    scope: Scope,
-    projects: Vec<ProjectRef>,
-    top_bar: TopBarState,
-    keymap: Keymap,
-    theme: Theme,
-    emit: Emit,
-}
-
-impl Bench {
-    /// A bench in the demo fixture's first workspace.
-    async fn new() -> Self {
-        Self {
-            scope: demo_scope().await,
-            projects: Vec::new(),
-            top_bar: TopBarState::default(),
-            keymap: Keymap::default_global(),
-            theme: Theme::default(),
-            emit: Emit::default(),
-        }
-    }
-
-    /// A context addressed to the Settings tab, as the shell builds one.
-    fn ctx(&self) -> Ctx<'_> {
-        Ctx::new(
-            &self.scope,
-            &self.projects,
-            &self.top_bar,
-            &self.keymap,
-            &self.theme,
-            Origin::Tab(SettingsTab::ID),
-            &self.emit,
-        )
-    }
-
-    /// Feeds one key to a section, written the way `KeyChord::parse` reads it.
-    fn key(&self, section: &mut dyn SettingsSection, chord: &str) -> Handled {
-        let parsed = KeyChord::parse(chord).unwrap_or_else(|| panic!("`{chord}` is not a chord"));
-        let mut ctx = self.ctx();
-        section.on_key(parsed.to_event(), &mut ctx)
-    }
-
-    /// Hands one reply to a section.
-    fn reply(&self, section: &mut dyn SettingsSection, reply: &StoreReply) {
-        let mut ctx = self.ctx();
-        section.on_reply(reply, &mut ctx);
-    }
-
-    /// Everything the section emitted since this was last called, leaving the queue empty.
-    fn drained(&self) -> Vec<Action> {
-        self.emit.take()
-    }
-
-    /// The error texts the section put on the status line since this was last called.
-    fn errors(&self) -> Vec<String> {
-        self.drained()
-            .into_iter()
-            .filter_map(|action| match action {
-                Action::Error(message) => Some(message),
-                _ => None,
-            })
-            .collect()
-    }
-}
-
 /// A settled Settings tab over `store`, with the agent section registered.
 async fn settings_over(store: MemStore) -> Harness {
     let mut harness =
@@ -259,7 +185,7 @@ async fn a_failed_read_says_the_registry_needs_postgres() {
     // `agent` and `agent_box` are not mirrored (`docs/ANA-9.md` §4.4), so an offline backend
     // answers `Unreachable` and the section has nothing to fall back to. The reply is injected
     // rather than provoked because a `Backend::Memory` cannot be offline.
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = AgentsSection::new();
     bench.reply(
         &mut section,
@@ -342,7 +268,7 @@ fn probed_row(
 /// The `on this box` column, one row per outcome of plan D50.
 #[tokio::test]
 async fn the_status_column_renders_each_probe_outcome() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let rows = vec![
         probed_row(
             "ready-on",
@@ -579,7 +505,7 @@ fn row_line<'a>(rendered: &'a str, name: &str) -> &'a str {
 /// the other seven, and the floor D76 set on that trade is that every header still reads.
 #[tokio::test]
 async fn the_default_column_holds_the_whole_model_id() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut row = quota_row("seeded", None);
     row.agent.default_model = Some(SEEDED_MODEL.to_owned());
 
@@ -627,7 +553,7 @@ async fn the_default_column_holds_the_whole_model_id() {
 /// is where that shows up as a test rather than as a screen.
 #[tokio::test]
 async fn the_name_column_holds_the_whole_row_name_and_on_this_box_pays() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut row = probed_row(
         "claude-cli",
         true,
@@ -685,7 +611,7 @@ async fn the_name_column_holds_the_whole_row_name_and_on_this_box_pays() {
 /// neighbours. `Max(256)` and `Fill(1)` are identical at every width, so the code says `Fill(1)`.
 #[tokio::test]
 async fn the_name_column_absorbs_every_character_a_wider_terminal_adds() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = probed_row("claude-cli", true, Some("1.1.26"), None);
     let mut section = AgentsSection::new();
     bench.reply(&mut section, &StoreReply::Agents(vec![row]));
@@ -724,7 +650,7 @@ async fn the_name_column_absorbs_every_character_a_wider_terminal_adds() {
 /// guess.
 #[tokio::test]
 async fn the_quota_column_renders_windows_spend_and_nothing() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let rows = vec![
         quota_row(
             "windows",
@@ -809,7 +735,7 @@ async fn a_window_short_of_full_is_not_rounded_up_to_a_full_one() {
         })
     };
 
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let rows = vec![
         quota_row("nearly", Some(window(0.996))),
         quota_row("mid", Some(window(0.57))),
@@ -848,7 +774,7 @@ async fn a_window_short_of_full_is_not_rounded_up_to_a_full_one() {
 /// binds is written (MOD-20 D19).
 #[tokio::test]
 async fn the_idle_hint_says_r_cannot_refresh_quota() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let section = section_over(&bench, vec![registry_row("declared", true)]);
 
     let rendered = render_section(&section, &bench.ctx());
@@ -1004,6 +930,25 @@ async fn a_capturing_section_receives_l_and_a_plain_one_cycles() {
     );
 }
 
+/// The strip has to fit the frame it is drawn in (D4; PRD risk "strip overflow at 100 columns").
+///
+/// `render_strip` draws `format!(" {title} ")` per registered section, so the joined width is
+/// `Σ (title chars + 2)`. The pin is over the sections the product registers, not over a test
+/// fixture: the moment a fifth section makes the strip 101 columns wide this fails, and that is
+/// the one warning a snapshot of a clipped strip could not give.
+#[test]
+fn the_section_strip_fits_the_frame() {
+    let sections: Vec<Box<dyn SettingsSection>> = vec![Box::new(AgentsSection::new())];
+    let width: usize = sections
+        .iter()
+        .map(|section| section.title().chars().count() + 2)
+        .sum();
+    assert!(
+        width <= usize::from(SECTION_WIDE),
+        "the section strip is {width} columns and the frame is {SECTION_WIDE}"
+    );
+}
+
 // -------------------------------------------------------------------------------------------
 // MOD-20 T8: the row cursor, `i`, and the install pane (blueprint B.12)
 // -------------------------------------------------------------------------------------------
@@ -1081,7 +1026,7 @@ fn demo_plan(agent_id: AgentId, agent_name: &str, sha256: Option<&str>) -> Insta
 /// `Failed { "install_cancel" }`, which lands on `Idle` either way.
 #[tokio::test]
 async fn x_cancels_a_pre_flight_that_has_not_answered() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(&bench, vec![registry_row("declared", true)]);
 
     assert_eq!(bench.key(&mut section, "i"), Handled::Consumed);
@@ -1111,7 +1056,7 @@ async fn x_cancels_a_pre_flight_that_has_not_answered() {
     );
 }
 
-fn section_over(bench: &Bench, rows: Vec<AgentSummary>) -> AgentsSection {
+fn section_over(bench: &SectionBench, rows: Vec<AgentSummary>) -> AgentsSection {
     let mut section = AgentsSection::new();
     bench.reply(&mut section, &StoreReply::Agents(rows));
     section
@@ -1160,7 +1105,7 @@ fn as_drawn(expected: &str) -> String {
 /// installs the wrong row.
 #[tokio::test]
 async fn j_and_k_move_the_row_cursor_and_stop_at_both_ends() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(
         &bench,
         vec![
@@ -1208,7 +1153,7 @@ async fn j_and_k_move_the_row_cursor_and_stop_at_both_ends() {
 /// the section is already holding, so no request leaves and no byte is fetched.
 #[tokio::test]
 async fn i_on_a_row_without_an_install_block_is_refused_by_name_and_sends_nothing() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(&bench, vec![registry_row("undeclared", false)]);
     let _ = bench.drained();
 
@@ -1240,7 +1185,7 @@ async fn i_on_a_row_without_an_install_block_is_refused_by_name_and_sends_nothin
 /// rule is that the user is told what will be fetched before anything is.
 #[tokio::test]
 async fn i_asks_for_a_plan_and_never_for_a_confirm() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = registry_row("declared", true);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row]);
@@ -1267,7 +1212,7 @@ async fn i_asks_for_a_plan_and_never_for_a_confirm() {
 /// the user just asked, so an install planned against them would be planned against stale facts.
 #[tokio::test]
 async fn i_while_a_probe_runs_is_refused() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(&bench, vec![registry_row("declared", true)]);
     bench.key(&mut section, "r");
     let _ = bench.drained();
@@ -1296,7 +1241,7 @@ async fn i_while_a_probe_runs_is_refused() {
 /// so is `r` — a probe spawns a process per agent and the install is about to spawn one itself.
 #[tokio::test]
 async fn i_and_r_are_both_refused_while_an_install_is_in_flight() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(&bench, vec![registry_row("declared", true)]);
     bench.key(&mut section, "i");
     let _ = bench.drained();
@@ -1320,7 +1265,7 @@ async fn i_and_r_are_both_refused_while_an_install_is_in_flight() {
 /// which is what keeps a pending plan from trapping the user in the section.
 #[tokio::test]
 async fn a_pending_plan_swallows_every_key_but_y_n_and_esc() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = registry_row("declared", true);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row, registry_row("second", true)]);
@@ -1379,7 +1324,7 @@ async fn a_pending_plan_swallows_every_key_but_y_n_and_esc() {
 /// rule that what the user said yes to is what is installed.
 #[tokio::test]
 async fn y_confirms_exactly_the_plan_that_was_shown() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = registry_row("declared", true);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row]);
@@ -1409,7 +1354,7 @@ async fn y_confirms_exactly_the_plan_that_was_shown() {
 /// what the user is agreeing to.
 #[tokio::test]
 async fn the_consent_pane_renders_every_line_and_both_digest_wordings() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = registry_row("declared", true);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row]);
@@ -1457,7 +1402,7 @@ async fn the_consent_pane_renders_every_line_and_both_digest_wordings() {
 /// renders the phase word alone.
 #[tokio::test]
 async fn the_progress_cell_renders_each_phase_and_never_a_misleading_zero() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = registry_row("declared", true);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row]);
@@ -1514,7 +1459,7 @@ async fn the_progress_cell_renders_each_phase_and_never_a_misleading_zero() {
 /// notices: a cancel the user cannot see is a cancel they press twice.
 #[tokio::test]
 async fn x_while_an_install_runs_asks_for_a_cancel_and_the_cell_says_so() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = registry_row("declared", true);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row]);
@@ -1552,7 +1497,7 @@ async fn x_while_an_install_runs_asks_for_a_cancel_and_the_cell_says_so() {
 /// entirely from the plan and the helper, and `Esc` puts them away.
 #[tokio::test]
 async fn a_failed_install_with_manual_steps_renders_them_under_the_table() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = registry_row("declared", true);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row]);
@@ -1602,7 +1547,7 @@ async fn a_failed_install_with_manual_steps_renders_them_under_the_table() {
 /// to be clipped at the frame's edge would be asserting the width rather than the routing.
 #[tokio::test]
 async fn a_failure_without_manual_steps_is_a_notice() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = registry_row("declared", true);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row]);
@@ -1637,7 +1582,7 @@ async fn a_failure_without_manual_steps_is_a_notice() {
 /// There is no "installed" state anywhere in this file — the probe's row is what the cell shows.
 #[tokio::test]
 async fn a_done_frame_reads_the_registry_again_rather_than_claiming_success() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = registry_row("declared", true);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row.clone()]);
@@ -1692,7 +1637,7 @@ async fn a_done_frame_reads_the_registry_again_rather_than_claiming_success() {
 /// install that loses its state leaves a running download with no way to cancel it.
 #[tokio::test]
 async fn an_agents_reply_does_not_clear_an_install_in_flight() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = registry_row("declared", true);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row.clone()]);
@@ -1731,7 +1676,7 @@ async fn an_agents_reply_does_not_clear_an_install_in_flight() {
 /// to stop saying an install is running.
 #[tokio::test]
 async fn a_refused_install_request_leaves_the_section_idle() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(&bench, vec![registry_row("declared", true)]);
     bench.key(&mut section, "i");
     let _ = bench.drained();
@@ -1869,7 +1814,7 @@ fn methods_frame(logout: bool, hidden: usize) -> StoreReply {
 }
 
 /// A section with one row a login is offered on, already past `a` and past the method list.
-fn chooser_over(bench: &Bench, logout: bool, hidden: usize) -> AgentsSection {
+fn chooser_over(bench: &SectionBench, logout: bool, hidden: usize) -> AgentsSection {
     let mut section = section_over(
         bench,
         vec![login_row(
@@ -1888,7 +1833,7 @@ fn chooser_over(bench: &Bench, logout: bool, hidden: usize) -> AgentsSection {
 /// call at all, and the refusal names the row and its transport.
 #[tokio::test]
 async fn a_on_a_cli_row_is_refused_by_name_and_sends_nothing() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut row = login_row("cli-row", ProbeStatus::Unauthenticated, &[METHOD]);
     row.agent.transport = Transport::Cli;
     let mut section = section_over(&bench, vec![row]);
@@ -1915,7 +1860,7 @@ async fn a_on_a_cli_row_is_refused_by_name_and_sends_nothing() {
 /// nothing to offer it from.
 #[tokio::test]
 async fn a_on_an_unprobed_row_says_probe_first() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let unprobed = probed_row("never-probed", true, None, None);
     let mut section = section_over(&bench, vec![unprobed]);
     let _ = bench.drained();
@@ -1933,7 +1878,7 @@ async fn a_on_an_unprobed_row_says_probe_first() {
 /// `failed` are boxes that could not run the adapter at all, and a spawn would only say so again.
 #[tokio::test]
 async fn a_on_a_row_the_probe_could_not_run_says_probe_first() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(
         &bench,
         vec![login_row("broke", ProbeStatus::Failed, &[METHOD])],
@@ -1950,7 +1895,7 @@ async fn a_on_a_row_the_probe_could_not_run_says_probe_first() {
 /// refusal says so in the row's own name rather than spawning to find out.
 #[tokio::test]
 async fn a_on_a_row_with_no_auth_methods_is_refused_by_name() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(
         &bench,
         vec![login_row("open-door", ProbeStatus::Ready, &[])],
@@ -1970,7 +1915,7 @@ async fn a_on_a_row_with_no_auth_methods_is_refused_by_name() {
 /// request is spent.
 #[tokio::test]
 async fn a_while_something_else_is_in_flight_is_refused_and_sends_nothing() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut empty = AgentsSection::new();
     assert_eq!(bench.key(&mut empty, "a"), Handled::Consumed);
     let emitted = bench.drained();
@@ -2032,7 +1977,7 @@ async fn a_while_something_else_is_in_flight_is_refused_and_sends_nothing() {
 /// `a` on a row the probe left `unauthenticated` asks for the flow and says so in the cell.
 #[tokio::test]
 async fn a_on_an_unauthenticated_row_sends_auth_start_and_the_cell_reads_starting() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = login_row("loginable", ProbeStatus::Unauthenticated, &[METHOD]);
     let agent_id = row.agent.id;
     let mut section = section_over(&bench, vec![row]);
@@ -2060,7 +2005,7 @@ async fn a_on_an_unauthenticated_row_sends_auth_start_and_the_cell_reads_startin
 /// log *out*, and the chooser is where a logout lives (D20).
 #[tokio::test]
 async fn a_on_a_ready_row_that_advertises_methods_is_offered() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(
         &bench,
         vec![login_row("logged-in", ProbeStatus::Ready, &[METHOD])],
@@ -2082,7 +2027,7 @@ async fn a_on_a_ready_row_that_advertises_methods_is_offered() {
 /// advertised one, and one dim line for what `htui` cannot offer (D4, D7).
 #[tokio::test]
 async fn a_methods_frame_renders_the_chooser_with_names_descriptions_logout_and_the_hidden_count() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, true, 2);
 
     let rendered = render_section(&section, &bench.ctx());
@@ -2130,7 +2075,7 @@ async fn a_methods_frame_renders_the_chooser_with_names_descriptions_logout_and_
 /// and a pane that bound them would take the user's way out of the section with it.
 #[tokio::test]
 async fn j_k_and_enter_choose_and_send_the_choice() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, true, 0);
 
     assert!(
@@ -2204,7 +2149,7 @@ async fn j_k_and_enter_choose_and_send_the_choice() {
 /// adapter is already spawned and only the runtime can kill it.
 #[tokio::test]
 async fn esc_in_the_chooser_cancels() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     for chord in ["Esc", "n"] {
         let mut section = chooser_over(&bench, true, 0);
         assert_eq!(bench.key(&mut section, chord), Handled::Consumed);
@@ -2231,7 +2176,7 @@ async fn esc_in_the_chooser_cancels() {
 /// of the application with it.
 #[tokio::test]
 async fn digits_and_q_pass_through_the_chooser() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, true, 1);
 
     for chord in ["1", "2", "9", "q", "?", "g"] {
@@ -2254,7 +2199,7 @@ async fn digits_and_q_pass_through_the_chooser() {
 /// The stream pane: the last six stderr lines as the adapter wrote them, and the link it printed.
 #[tokio::test]
 async fn line_and_url_frames_render_the_last_six_lines_and_the_link() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, false, 0);
     bench.key(&mut section, "Enter");
     let _ = bench.drained();
@@ -2293,7 +2238,7 @@ async fn line_and_url_frames_render_the_last_six_lines_and_the_link() {
 /// URL, it forwards the one the adapter wrote.
 #[tokio::test]
 async fn o_sends_auth_open_with_the_last_url_and_is_refused_without_one() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, false, 0);
     bench.key(&mut section, "Enter");
     let _ = bench.drained();
@@ -2338,7 +2283,7 @@ async fn o_sends_auth_open_with_the_last_url_and_is_refused_without_one() {
 /// `Failed`s in this codebase mean different things and the section renders them differently.
 #[tokio::test]
 async fn x_sends_auth_cancel_and_the_cell_reads_cancelling() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, false, 0);
     bench.key(&mut section, "Enter");
     let _ = bench.drained();
@@ -2367,7 +2312,7 @@ async fn x_sends_auth_cancel_and_the_cell_reads_cancelling() {
 /// A refused `auth_open` leaves the running flow exactly where it was (hazard H-22).
 #[tokio::test]
 async fn a_refused_open_keeps_the_pane_and_a_refused_start_clears_it() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, false, 0);
     bench.key(&mut section, "Enter");
     let _ = bench.drained();
@@ -2408,7 +2353,7 @@ async fn a_refused_open_keeps_the_pane_and_a_refused_start_clears_it() {
 /// whose `Enter` would go into a flow that was being killed.
 #[tokio::test]
 async fn a_methods_frame_does_not_undo_a_cancel_pressed_while_starting() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(
         &bench,
         vec![login_row(
@@ -2456,7 +2401,7 @@ async fn a_methods_frame_does_not_undo_a_cancel_pressed_while_starting() {
 /// child, an open loopback listener and no `x` on screen to stop either.
 #[tokio::test]
 async fn a_second_choice_refused_by_a_live_flow_keeps_the_pane_and_the_others_clear_it() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, false, 0);
     bench.key(&mut section, "Enter");
     let _ = bench.drained();
@@ -2502,7 +2447,7 @@ async fn a_second_choice_refused_by_a_live_flow_keeps_the_pane_and_the_others_cl
 /// `R-AGT-6` at the section: `Done` is not a status, it is the cue to read the registry again.
 #[tokio::test]
 async fn done_clears_the_state_notes_the_status_and_re_reads_the_registry() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, true, 0);
     bench.key(&mut section, "Enter");
     let _ = bench.drained();
@@ -2549,7 +2494,7 @@ async fn done_clears_the_state_notes_the_status_and_re_reads_the_registry() {
 /// D5: the agent's own sentence, verbatim. It is the one line that says what the user has to do.
 #[tokio::test]
 async fn refused_shows_the_agents_sentence() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, false, 0);
     bench.key(&mut section, "Enter");
     let _ = bench.drained();
@@ -2585,7 +2530,7 @@ async fn refused_shows_the_agents_sentence() {
 /// screen to cancel it with.
 #[tokio::test]
 async fn an_agents_reply_during_a_login_does_not_clear_the_state() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let row = login_row("loginable", ProbeStatus::Unauthenticated, &[METHOD]);
     let mut section = section_over(&bench, vec![row.clone()]);
     bench.key(&mut section, "a");
@@ -2618,7 +2563,7 @@ async fn an_agents_reply_during_a_login_does_not_clear_the_state() {
 /// row, and either of the other two would be racing it for that row (D19).
 #[tokio::test]
 async fn r_and_i_are_refused_while_a_login_runs() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = section_over(
         &bench,
         vec![login_row(
@@ -2655,7 +2600,7 @@ async fn r_and_i_are_refused_while_a_login_runs() {
 /// The two frames a flow can die with, each on the hint line and each leaving the section idle.
 #[tokio::test]
 async fn a_failed_or_idle_flow_leaves_a_notice_and_an_idle_section() {
-    let bench = Bench::new().await;
+    let bench = SectionBench::new().await;
     let mut section = chooser_over(&bench, false, 0);
     bench.key(&mut section, "Enter");
     let _ = bench.drained();
