@@ -4,7 +4,9 @@
 pub mod layout;
 pub mod overlay;
 pub mod tabs;
+pub mod text_field;
 pub mod theme;
 pub mod top_bar;
 
 pub use theme::Theme;
+pub use text_field::{FieldOutcome, TextField};
