@@ -3003,8 +3003,12 @@ impl WriteStore for MemStore {
 mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
-    use crate::model::{AgentBox, AgentId, ChatRunSpec, ItemId, RunStatus, StepId, StepStatus};
+    use crate::model::{
+        AgentBox, AgentId, ChatRunSpec, ItemId, ItemKindPatch, NewItem, NewProject, ProjectId,
+        RunStatus, StepId, StepStatus,
+    };
     use crate::prompt::settings::SettingKey;
+    use crate::prompt::{DEFAULT_TEMPLATES, body_of};
     use crate::store::error::StoreError;
     use crate::store::{CasOutcome, ReadStore as _, SettingRung, WriteStore as _};
     use chrono::Utc;
@@ -3542,7 +3546,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .project_settings(crate::model::ProjectId::new())
+                .project_settings(ProjectId::new())
                 .await
                 .expect("the read must not fail"),
             None,
@@ -3946,5 +3950,179 @@ mod tests {
                 "skill, skill_version, app_user, box, box_tool and agent are not below a project"
             );
         });
+    }
+
+    /// A fresh project, authored by the fixture user, with the slug the test names.
+    fn fresh_project(slug: &str) -> NewProject {
+        NewProject {
+            id: ProjectId::new(),
+            slug: slug.to_owned(),
+            name: slug.to_uppercase(),
+            description: String::new(),
+            created_by: ids::USER,
+        }
+    }
+
+    /// The template *content* the seed writes, which no `WriteStore` reader can return
+    /// (M1 D9: MOD-9 owns the editor). `project_create_seeds_the_catalogue` counts ten
+    /// through `delete_reach`; this reads them through the inherent `prompt_templates`.
+    #[tokio::test]
+    async fn seeded_templates_carry_the_shipped_bodies() {
+        let store = MemStore::demo();
+        let project = store
+            .create_project(fresh_project("seeded"))
+            .await
+            .expect("the create lands");
+
+        let rows = store
+            .prompt_templates(project.id)
+            .await
+            .expect("the inherent reader answers");
+        let mut expected: Vec<&str> = DEFAULT_TEMPLATES.iter().map(|(name, ..)| *name).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            expected,
+            "ten rows, one per default template, in the reader's name-byte order"
+        );
+        for row in &rows {
+            assert_eq!(
+                Some(row.body.as_str()),
+                body_of(&row.name),
+                "`{}` body",
+                row.name
+            );
+            assert_eq!(row.version, 1, "`{}` is version 1", row.name);
+            assert_eq!(row.created_by, ids::USER, "`{}` is the creator's", row.name);
+            assert_eq!(row.project_id, project.id);
+        }
+    }
+
+    /// D5: the seed writes no `item_key_counter` row; `mint` creates it on first use.
+    #[tokio::test]
+    async fn seed_never_writes_a_counter_row() {
+        let store = MemStore::demo();
+        let project = store
+            .create_project(fresh_project("lazy"))
+            .await
+            .expect("the create lands");
+        let counter = |prefix: &str| {
+            store.read(|state| {
+                state
+                    .item_key_counter
+                    .get(&(project.id, prefix.to_owned()))
+                    .copied()
+            })
+        };
+        assert!(
+            store.read(|state| state
+                .item_key_counter
+                .keys()
+                .all(|(id, _)| *id != project.id)),
+            "no counter row of any prefix after the create"
+        );
+
+        let feat = store
+            .item_kinds(project.id)
+            .await
+            .expect("kinds read")
+            .into_iter()
+            .find(|kind| kind.prefix == "FEAT")
+            .expect("the seeded FEAT kind");
+        let minted = store
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: project.id,
+                kind_id: feat.id,
+                title: "first".to_owned(),
+                body: String::new(),
+                required_tags: Vec::new(),
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the first mint lands");
+        assert_eq!(minted.key, "FEAT-1");
+        assert_eq!(
+            counter("FEAT"),
+            Some(1),
+            "the row exists only after the mint"
+        );
+        assert_eq!(counter("ANA"), None, "and only for the prefix that minted");
+    }
+
+    /// PRD D12's third fact: the counter row of the **old** prefix survives a rename.
+    /// `item_kind_round_trip_and_prefix_rules` pins the other two (old key text kept, `ANL-1`
+    /// next) on both stores; no trait reader sees `item_key_counter`, so this one is per backend.
+    #[tokio::test]
+    async fn renamed_prefix_leaves_the_old_counter_row() {
+        let store = MemStore::demo();
+        let project = ids::PROJECT_HTUI;
+        let counter = |prefix: &str| {
+            store.read(|state| {
+                state
+                    .item_key_counter
+                    .get(&(project, prefix.to_owned()))
+                    .copied()
+            })
+        };
+        assert_eq!(
+            counter("ANA"),
+            Some(2),
+            "the fixture minted ANA-1 and ANA-2"
+        );
+
+        let ana = store
+            .item_kinds(project)
+            .await
+            .expect("kinds read")
+            .into_iter()
+            .find(|kind| kind.id == ids::KIND_HTUI_ANA)
+            .expect("the fixture kind");
+        let renamed = store
+            .update_item_kind(
+                ana.id,
+                ana.updated_at,
+                ItemKindPatch {
+                    prefix: Some("ANL".to_owned()),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect("the rename lands");
+        assert!(matches!(renamed, CasOutcome::Applied(_)));
+        assert_eq!(
+            counter("ANA"),
+            Some(2),
+            "the old row is history, not garbage"
+        );
+        assert_eq!(
+            counter("ANL"),
+            None,
+            "nothing minted under the new prefix yet"
+        );
+
+        let minted = store
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: project,
+                kind_id: ids::KIND_HTUI_ANA,
+                title: "after the rename".to_owned(),
+                body: String::new(),
+                required_tags: Vec::new(),
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the mint lands");
+        assert_eq!(minted.key, "ANL-1");
+        assert_eq!(counter("ANL"), Some(1));
+        assert_eq!(counter("ANA"), Some(2), "still");
     }
 }

@@ -20,6 +20,7 @@ use crate::model::{
     SessionEvent, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, Transport,
     UpstreamEntry, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
+use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
@@ -63,6 +64,7 @@ pub const CASES: &[&str] = &[
     "settings_app_rung_validates_and_cas",
     "settings_project_rung_merges_keys",
     "settings_phase_rung_writes_token_budget_only",
+    "project_create_seeds_the_catalogue",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -127,6 +129,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "settings_phase_rung_writes_token_budget_only" => {
             settings_phase_rung_writes_token_budget_only(store).await;
         }
+        "project_create_seeds_the_catalogue" => project_create_seeds_the_catalogue(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -2141,7 +2144,8 @@ async fn workspace_delete_reports_its_reach<S: WriteStore>(store: &S) {
     );
 }
 
-/// D9's create, unseeded, plus D3's compare-and-set. `settings` is `{}` on create and is not
+/// D9's create (its seed is `project_create_seeds_the_catalogue`'s to check) plus D3's
+/// compare-and-set. `settings` is `{}` on create and is not
 /// [`WriteStore::update_project`]'s to touch — that column belongs to
 /// [`WriteStore::set_setting`] alone.
 async fn project_create_update_cas<S: WriteStore>(store: &S) {
@@ -2324,6 +2328,280 @@ async fn project_delete_takes_everything_and_says_so<S: WriteStore>(store: &S) {
     );
 }
 
+/// D4's seed on a fresh project, read back through the trait: five graphs, fifteen phases, five
+/// kinds and — by count alone, through `delete_reach` — ten templates. D3's table is repeated
+/// here as a literal so the case checks the seed against the PRD and ANA-2 §4.1, not against
+/// `seed::KINDS`, which is what it is meant to check; the `seed` module's own unit tests pin the
+/// table's self-consistency (reserved names, bodies, density) with no store at all.
+///
+/// Template *content* and the counter's absence are per-backend facts no trait reader returns:
+/// `mem.rs::seeded_templates_carry_the_shipped_bodies` and
+/// `mem.rs::seed_never_writes_a_counter_row`.
+async fn project_create_seeds_the_catalogue<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_create_seeds_the_catalogue";
+    /// One phase of the table below: `(name, input_kinds, gate_hard)`, the three columns D3
+    /// varies. Named rather than written inline because `clippy::type_complexity` refuses the
+    /// nested tuple otherwise.
+    type PhaseRow = (&'static str, &'static [&'static str], bool);
+    /// `(graph and kind name, prefix, description, phases)`.
+    type KindRow = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [PhaseRow],
+    );
+    /// D3's table, in `item_kind.position` order — PRD D3/D5 and ANA-2 `:307-319`, not the
+    /// `seed` module.
+    const TABLE: [KindRow; 5] = [
+        (
+            "analysis",
+            "ANA",
+            "A question answered in writing",
+            &[("research", &[], false), ("verdict", &["research"], true)],
+        ),
+        (
+            "feature",
+            "FEAT",
+            "New behaviour",
+            &[
+                ("prd", &[], true),
+                ("plan", &["prd"], true),
+                ("implement", &["plan", "review"], false),
+                ("review", &["implement"], false),
+            ],
+        ),
+        (
+            "bug",
+            "FIX",
+            "Behaviour that is wrong",
+            &[
+                ("reproduce", &[], false),
+                ("fix", &["reproduce", "review"], false),
+                ("review", &["fix"], false),
+            ],
+        ),
+        (
+            "refactor",
+            "CLEAN",
+            "Behaviour kept, shape improved",
+            &[
+                ("plan", &[], false),
+                ("implement", &["plan", "review"], false),
+                ("review", &["implement"], false),
+            ],
+        ),
+        (
+            "tooling",
+            "TOOL",
+            "The workshop rather than the product",
+            &[
+                ("plan", &[], false),
+                ("implement", &["plan", "review"], false),
+                ("review", &["implement"], false),
+            ],
+        ),
+    ];
+
+    let project = store
+        .create_project(new_project("seeded"))
+        .await
+        .expect(CASE);
+    let p = project.id;
+
+    // (a) graphs, by name bytes
+    let graphs = store.step_graphs(p).await.expect(CASE);
+    assert_eq!(
+        graphs
+            .iter()
+            .map(|graph| graph.name.as_str())
+            .collect::<Vec<_>>(),
+        ["analysis", "bug", "feature", "refactor", "tooling"],
+        "{CASE}: five default graphs, ordered by name bytes (a)"
+    );
+    for graph in &graphs {
+        assert_eq!(
+            graph.project_id, p,
+            "{CASE}: `{}` is the new project's (a)",
+            graph.name
+        );
+        assert_eq!(
+            graph.description,
+            format!("Default graph for {} items", graph.name),
+            "{CASE}: `{}` description (a)",
+            graph.name
+        );
+    }
+
+    // (b) kinds, by position; each default graph is the graph of the same name
+    let kinds = store.item_kinds(p).await.expect(CASE);
+    assert_eq!(
+        kinds
+            .iter()
+            .map(|kind| (kind.prefix.as_str(), kind.name.as_str(), kind.position))
+            .collect::<Vec<_>>(),
+        TABLE
+            .iter()
+            .enumerate()
+            .map(|(position, (name, prefix, ..))| (*prefix, *name, position as i32))
+            .collect::<Vec<_>>(),
+        "{CASE}: five kinds, positions dense from 0 (b)"
+    );
+    for (kind, (_, _, description, _)) in kinds.iter().zip(TABLE.iter()) {
+        let graph = graphs
+            .iter()
+            .find(|graph| graph.id == kind.default_graph_id)
+            .unwrap_or_else(|| panic!("{CASE}: `{}` has a default graph (b)", kind.prefix));
+        assert_eq!(
+            graph.name, kind.name,
+            "{CASE}: `{}`'s graph is its namesake (b)",
+            kind.prefix
+        );
+        assert_eq!(
+            kind.description, *description,
+            "{CASE}: `{}` description (b)",
+            kind.prefix
+        );
+    }
+
+    // (c) every graph's phases are D3's rows; (d) none is a reserved template name
+    for (name, _, _, expected) in TABLE {
+        let graph = graphs
+            .iter()
+            .find(|graph| graph.name == name)
+            .unwrap_or_else(|| panic!("{CASE}: graph `{name}` (c)"));
+        let phases = store.phases(graph.id).await.expect(CASE);
+        let got: Vec<(&str, Vec<&str>, bool)> = phases
+            .iter()
+            .map(|phase| {
+                (
+                    phase.name.as_str(),
+                    phase.input_kinds.iter().map(String::as_str).collect(),
+                    phase.gate_hard,
+                )
+            })
+            .collect();
+        let want: Vec<(&str, Vec<&str>, bool)> = expected
+            .iter()
+            .map(|(phase, inputs, hard)| (*phase, inputs.to_vec(), *hard))
+            .collect();
+        assert_eq!(got, want, "{CASE}: `{name}` phases are D3's rows (c)");
+
+        for (position, phase) in phases.iter().enumerate() {
+            assert_eq!(
+                phase.graph_id, graph.id,
+                "{CASE}: `{name}`/`{}` (c)",
+                phase.name
+            );
+            assert_eq!(
+                phase.position, position as i32,
+                "{CASE}: `{name}` positions are dense from 0 (c)"
+            );
+            if position == 0 {
+                assert!(
+                    phase.input_kinds.is_empty(),
+                    "{CASE}: `{name}` position 0 reads nothing (c)"
+                );
+            }
+            assert_eq!(
+                (
+                    phase.fan_out,
+                    phase.gate,
+                    phase.retry_limit,
+                    phase.isolation,
+                    phase.command_queue,
+                    phase.verify_command.as_deref(),
+                    phase.template_version,
+                    phase.token_budget,
+                ),
+                (
+                    1,
+                    Gate::Always,
+                    1,
+                    None,
+                    CommandQueue::FanOutOnly,
+                    None,
+                    None,
+                    None
+                ),
+                "{CASE}: `{name}`/`{}` carries ANA-2's frozen defaults (c)",
+                phase.name
+            );
+            assert_eq!(
+                phase.output_kind, phase.name,
+                "{CASE}: output_kind = name (c)"
+            );
+            assert_eq!(
+                phase.template_name, phase.name,
+                "{CASE}: template_name = name (c)"
+            );
+            assert_eq!(
+                TemplateRole::of_name(&phase.name),
+                TemplateRole::Phase,
+                "{CASE}: `{}` is a phase name, not `judge`/`handoff` (d)",
+                phase.name
+            );
+        }
+    }
+
+    // (e) the count of what was seeded, templates included
+    let reach = store
+        .delete_reach(DeleteTarget::Project(p))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the project exists (e)"));
+    assert_eq!(
+        (
+            reach.step_graphs,
+            reach.phases,
+            reach.item_kinds,
+            reach.prompt_templates
+        ),
+        (5, 15, 5, 10),
+        "{CASE}: 5 graphs, 15 phases, 5 kinds, 10 templates (e)"
+    );
+    assert_eq!(
+        (reach.items, reach.item_key_counters),
+        (0, 0),
+        "{CASE}: the seed mints no item and writes no counter row (e)"
+    );
+
+    // (f) the counter is lazy: the first mint under FEAT is FEAT-1
+    let feat = kinds
+        .iter()
+        .find(|kind| kind.prefix == "FEAT")
+        .unwrap_or_else(|| panic!("{CASE}: FEAT (f)"));
+    let minted = store
+        .mint_item(new_item(p, feat.id, "first"))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        minted.key, "FEAT-1",
+        "{CASE}: no counter row was seeded (f)"
+    );
+
+    // (g) an unknown creator is refused before anything is written
+    let mut orphan = new_project("orphan");
+    orphan.created_by = UserId::new();
+    let orphan_id = orphan.id;
+    let refused = store.create_project(orphan).await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown created_by is Constraint, got {refused:?} (g)"
+    );
+    assert!(
+        store.project(orphan_id).await.expect(CASE).is_none(),
+        "{CASE}: no project row survives the refusal (g)"
+    );
+    assert!(
+        store.step_graphs(orphan_id).await.expect(CASE).is_empty(),
+        "{CASE}: no graph survives the refusal (g)"
+    );
+    assert!(
+        store.item_kinds(orphan_id).await.expect(CASE).is_empty(),
+        "{CASE}: no kind survives the refusal (g)"
+    );
+}
+
 /// D10's `uq_repo_primary` rule: promoting the second repo demotes the first inside the same
 /// transaction, and the demoted row's own token advances because its column changed.
 async fn repo_round_trip_and_primary_flag<S: WriteStore>(store: &S) {
@@ -2449,6 +2727,9 @@ async fn repo_round_trip_and_primary_flag<S: WriteStore>(store: &S) {
 
 /// D11's three seam-side rules and PRD D12's rename semantics: old keys keep their text, the old
 /// counter survives, and the next mint under the kind starts the new prefix at 1.
+///
+/// The middle fact is the one no trait reader can see, so it is asserted per backend, which
+/// `mem.rs::renamed_prefix_leaves_the_old_counter_row` does by reading `item_key_counter` directly.
 async fn item_kind_round_trip_and_prefix_rules<S: WriteStore>(store: &S) {
     const CASE: &str = "item_kind_round_trip_and_prefix_rules";
     for (label, prefix) in [
