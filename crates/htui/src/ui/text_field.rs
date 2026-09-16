@@ -22,7 +22,7 @@ pub enum FieldOutcome {
     Submit,
     /// `Esc`: the caller decides what cancelling means.
     Cancel,
-    /// Not a field key (`Tab`, `BackTab`, `Up`, `Down`, `F(n)`, any `CONTROL`/`ALT` chord): the
+    /// Not a field key (`Tab`, `BackTab`, `Up`, `Down`, `F(n)`, any chord but `SHIFT`): the
     /// caller keeps its own bindings.
     Pass,
 }
@@ -59,6 +59,13 @@ impl TextField {
     }
 
     /// An empty masked field: it draws `•` per char and [`text`](TextField::text) is `None`.
+    ///
+    /// The mask is a **rendering** guarantee, not a storage one: the buffer is a plain `String`,
+    /// it is not zeroized on drop, and `TextField: Clone` duplicates it. Milestone 6 is the first
+    /// caller with an actual secret and owns both halves — the zeroizing buffer here, and the
+    /// other end of the same rule: **a DSN must not reach the worker as a plain `String` field on
+    /// [`StoreRequest`](crate::store_worker::StoreRequest)**, which derives `Debug` and is printed
+    /// by every test that reports an unexpected reply. It owes a redacting newtype instead.
     #[must_use]
     pub fn masked() -> Self {
         Self {
@@ -79,15 +86,22 @@ impl TextField {
 
     /// Feeds one key.
     ///
-    /// `Char` inserts unless it carries `CONTROL`/`ALT` or is itself a control char (which is
+    /// `Char` inserts unless it carries a chord modifier or is itself a control char (which is
     /// swallowed, not inserted); `Backspace`/`Delete`/`Left`/`Right`/`Home`/`End` edit and move;
     /// `Enter` submits, `Esc` cancels, everything else passes so a form keeps `Tab` and a section
     /// keeps its own letters.
+    ///
+    /// Every modifier but `SHIFT` passes: `SHIFT` is how a terminal reports a capital, and the
+    /// other five — including the `SUPER`/`META`/`HYPER` a kitty-protocol terminal reports and a
+    /// plain one never does — mean the key was a chord aimed at something other than this buffer.
     pub fn on_key(&mut self, key: KeyEvent) -> FieldOutcome {
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
+        if key.modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::META
+                | KeyModifiers::HYPER,
+        ) {
             return FieldOutcome::Pass;
         }
         match key.code {
@@ -374,6 +388,15 @@ mod tests {
             field.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
             FieldOutcome::Pass
         );
+        // The three the kitty protocol reports and a plain terminal never does: a chord is a
+        // chord, and `super-w` must not type a `w` into a slug.
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::META, KeyModifiers::HYPER] {
+            assert_eq!(
+                field.on_key(KeyEvent::new(KeyCode::Char('w'), modifier)),
+                FieldOutcome::Pass,
+                "`{modifier:?}` is a chord, not a character"
+            );
+        }
         assert!(field.is_empty(), "none of those typed anything");
 
         // `SHIFT` is how a terminal reports a capital, so it must not pass.

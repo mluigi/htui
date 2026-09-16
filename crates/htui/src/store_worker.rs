@@ -56,6 +56,14 @@ pub enum Origin {
 /// MOD-2 milestone 4 is the worked example of how this list grows: [`StoreRequest::StepEvents`]
 /// is one variant, one arm inside [`serve`] and one [`StoreRequest::name`] arm, and the event
 /// loop still does not change.
+///
+/// **No variant may carry a secret as a plain `String`.** This enum derives `Debug`, so does
+/// [`RequestEnvelope`], and the tests print what came back with `{reply:?}`: a value here is one
+/// `tracing::debug!` or one failed assertion away from a log. Nothing in MOD-15 milestone 3
+/// carries one — every field below is a slug, a name, a branch or a path the user typed in the
+/// open — but milestone 6's DSN entry does, and it owes a redacting newtype (a hand-written
+/// `Debug` that prints `<redacted>`, no `Display`) rather than a `String` field. The masking end
+/// of the same rule is [`TextField::masked`](crate::ui::TextField::masked).
 #[derive(Debug, Clone)]
 pub enum StoreRequest {
     /// Every workspace with its projects (switcher, startup scope).
