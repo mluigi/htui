@@ -1041,7 +1041,7 @@ impl WriteStore for PgStore {
 
     // project
 
-    /// The project row and, in the same transaction, the thirty-five rows [`seed_project`] gives
+    /// The project row and, in the same transaction, the thirty-five rows `seed_project` gives
     /// every project: five default graphs, their fifteen phases, five kinds and the ten
     /// `DEFAULT_TEMPLATES` at version 1 (M1 D9, M2 D4). `settings` takes the column default `{}`
     /// and the two secret columns are MOD-10's.
