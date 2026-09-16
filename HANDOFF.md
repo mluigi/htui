@@ -282,7 +282,16 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `is_override = false`); whichever of MOD-15 and MOD-4 lands second owns the seed amendment. Per
   ANA-5 (`docs/ANA-5.md` §5.3, §5.4, §9): seed ten `prompt_template` rows per project (eight phase
   names plus reserved `judge` and `handoff`, amending `docs/ANA-9.md` §5.10), the phase editor
-  refuses the two reserved names, and the Settings tab exposes the ten `app_setting` keys. Creating
+  refuses the two reserved names, and the Settings tab exposes the ten `app_setting` keys.
+  **MOD-2 shipped the read half of those ten and none of the write half** (closed 2026-09-15,
+  `docs/decisions/mod/mod-2.md`): `prompt::settings::{DEFAULTS, resolve_budget, resolve_reserve_bp,
+  resolve_hops, resolve_max_skill_tokens, resolve_excerpt_caps}` resolve each key through
+  phase → `project.settings` → `app_setting` → the compiled table, and `trim_record.budget_source`
+  records which rung answered. There is **no `app_setting` writer on the store seam**, so today the
+  only way to change `token_budget` (default **120 000**, with a 10% response reserve) or any other
+  of the ten is SQL against the database — this item is what makes them editable from the app. The
+  phase rung is the finest-grained one and has no editor either; `ResolvedPhase.token_budget` is
+  read but never written. Creating
   a workspace on a box with no server is **MOD-17's** (ANA-10 concluded; `docs/ANA-10.md` §9.3,
   §9.4): "Not blocked" above holds for the server-backed paths only — the create paths for a
   server-less box depend on MOD-17. This item builds and registers the Settings connection
