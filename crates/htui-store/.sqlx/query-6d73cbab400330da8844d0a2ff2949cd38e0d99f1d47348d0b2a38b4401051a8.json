@@ -1,0 +1,156 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH i  AS (SELECT id FROM item             WHERE project_id = $1),\n             r  AS (SELECT id FROM run              WHERE project_id = $1\n                                                       OR item_id IN (SELECT id FROM i)),\n             s  AS (SELECT id FROM run_step         WHERE run_id   IN (SELECT id FROM r)),\n             g  AS (SELECT id FROM step_graph       WHERE project_id = $1),\n             ph AS (SELECT id FROM step_graph_phase WHERE graph_id IN (SELECT id FROM g)),\n             rp AS (SELECT id FROM repo             WHERE project_id = $1)\n        SELECT (SELECT count(*) FROM workspace_project WHERE project_id = $1) AS \"workspace_links!\",\n               (SELECT count(*) FROM i)                                       AS \"items!\",\n               (SELECT count(*) FROM item_key_counter WHERE project_id = $1)  AS \"item_key_counters!\",\n               (SELECT count(*) FROM item_kind        WHERE project_id = $1)  AS \"item_kinds!\",\n               (SELECT count(*) FROM g)                                       AS \"step_graphs!\",\n               (SELECT count(*) FROM ph)                                      AS \"phases!\",\n               (SELECT count(*) FROM phase_agent\n                 WHERE phase_id IN (SELECT id FROM ph))                       AS \"phase_agents!\",\n               (SELECT count(*) FROM prompt_template  WHERE project_id = $1)  AS \"prompt_templates!\",\n               (SELECT count(*) FROM rp)                                      AS \"repos!\",\n               (SELECT count(*) FROM repo_box_path\n                 WHERE repo_id IN (SELECT id FROM rp))                        AS \"repo_box_paths!\",\n               (SELECT count(*) FROM skill_binding    WHERE project_id = $1)  AS \"skill_bindings!\",\n               (SELECT count(*) FROM r)                                       AS \"runs!\",\n               (SELECT count(*) FROM s)                                       AS \"run_steps!\",\n               (SELECT count(*) FROM session_event\n                 WHERE run_step_id IN (SELECT id FROM s))                     AS \"session_events!\",\n               (SELECT count(*) FROM run_step_commit\n                 WHERE run_step_id IN (SELECT id FROM s))                     AS \"run_step_commits!\",\n               (SELECT count(*) FROM command_run\n                 WHERE run_step_id IN (SELECT id FROM s))                     AS \"command_runs!\",\n               (SELECT count(*) FROM item_note\n                 WHERE item_id IN (SELECT id FROM i))                         AS \"notes!\",\n               (SELECT count(*) FROM item_revision\n                 WHERE item_id IN (SELECT id FROM i))                         AS \"revisions!\",\n               (SELECT count(*) FROM item_link\n                 WHERE from_item_id IN (SELECT id FROM i)\n                    OR to_item_id   IN (SELECT id FROM i))                    AS \"links!\",\n               (SELECT count(*) FROM document\n                 WHERE item_id IN (SELECT id FROM i))                         AS \"documents!\"\n          FROM project WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_links!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "items!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "item_key_counters!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "item_kinds!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "step_graphs!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "phases!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "phase_agents!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "prompt_templates!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "repos!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "repo_box_paths!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 10,
+        "name": "skill_bindings!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 11,
+        "name": "runs!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 12,
+        "name": "run_steps!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 13,
+        "name": "session_events!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 14,
+        "name": "run_step_commits!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 15,
+        "name": "command_runs!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 16,
+        "name": "notes!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 17,
+        "name": "revisions!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 18,
+        "name": "links!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 19,
+        "name": "documents!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "6d73cbab400330da8844d0a2ff2949cd38e0d99f1d47348d0b2a38b4401051a8"
+}

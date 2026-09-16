@@ -166,6 +166,9 @@ async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Opt
 /// (`0001_init.sql:450` cascades from the item), and `item_link` by **either** end, tombstones
 /// included — which is what takes the fixture's cross-project edge.
 ///
+/// `command_run` hangs off `s` like `session_event` and `run_step_commit` do (`0001_init.sql:539`);
+/// plan V11's list of the cascade left it out and this is where that is corrected (review L1).
+///
 /// `workspace_box_paths` is `0`: a project is not a workspace.
 async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<DeleteReach>> {
     let counted = sqlx::query!(
@@ -196,6 +199,8 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
                  WHERE run_step_id IN (SELECT id FROM s))                     AS "session_events!",
                (SELECT count(*) FROM run_step_commit
                  WHERE run_step_id IN (SELECT id FROM s))                     AS "run_step_commits!",
+               (SELECT count(*) FROM command_run
+                 WHERE run_step_id IN (SELECT id FROM s))                     AS "command_runs!",
                (SELECT count(*) FROM item_note
                  WHERE item_id IN (SELECT id FROM i))                         AS "notes!",
                (SELECT count(*) FROM item_revision
@@ -230,6 +235,7 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
         run_steps: rows(row.run_steps),
         session_events: rows(row.session_events),
         run_step_commits: rows(row.run_step_commits),
+        command_runs: rows(row.command_runs),
         notes: rows(row.notes),
         revisions: rows(row.revisions),
         links: rows(row.links),

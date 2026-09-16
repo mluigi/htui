@@ -2415,8 +2415,9 @@ impl State {
     ///
     /// The counts and the id sets come out of the same predicates, which is what makes
     /// `delete_reach`'s report and `delete_project`'s act equal by construction rather than by two
-    /// lists kept in step by hand. `phase_agents` and `run_step_commits` are `0` because this store
-    /// holds neither table, and `workspace_box_paths` because a project is not a workspace.
+    /// lists kept in step by hand. `phase_agents`, `run_step_commits` and `command_runs` are `0`
+    /// because this store holds none of the three tables, and `workspace_box_paths` because a
+    /// project is not a workspace.
     fn project_reach(&self, id: ProjectId) -> Option<(DeleteReach, ProjectReach)> {
         if !self.projects.contains_key(&id) {
             return None;
@@ -2512,6 +2513,7 @@ impl State {
                     .count(),
             ),
             run_step_commits: 0,
+            command_runs: 0,
             notes: rows(
                 self.notes
                     .iter()

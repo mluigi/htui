@@ -716,8 +716,9 @@ pub enum DeleteTarget {
 ///
 /// One struct rather than a method per table, so a table `0003` adds is a field here and the two
 /// callers of the counting code cannot disagree about it. A workspace delete fills
-/// `workspace_links` and `workspace_box_paths` only. `phase_agents` and `run_step_commits` are `0`
-/// on `MemStore`, which holds neither table, and `0` on the demo database, which seeds neither.
+/// `workspace_links` and `workspace_box_paths` only. `phase_agents`, `run_step_commits` and
+/// `command_runs` are `0` on `MemStore`, which holds none of the three tables, and `0` on the demo
+/// database, which seeds none of them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeleteReach {
     /// `workspace_project` rows.
@@ -752,6 +753,12 @@ pub struct DeleteReach {
     pub session_events: u64,
     /// `run_step_commit` rows.
     pub run_step_commits: u64,
+    /// `command_run` rows, which cascade from `run_step` (`0001_init.sql:539`).
+    ///
+    /// Nothing in this tree writes the table yet — MOD-16's queue is its first writer — so every
+    /// count of it is `0` today. It is here anyway, because the alternative is a field added later
+    /// by whoever first notices the delete took rows it never named (review L1).
+    pub command_runs: u64,
     /// `item_note` rows.
     pub notes: u64,
     /// `item_revision` rows.

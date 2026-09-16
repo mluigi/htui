@@ -23,7 +23,9 @@ use htui_core::model::{
     WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
-use htui_core::store::{CasOutcome, ReadStore as _, SettingRung, UpdateOutcome, WriteStore as _};
+use htui_core::store::{
+    CasOutcome, DeleteTarget, ReadStore as _, SettingRung, UpdateOutcome, WriteStore as _,
+};
 use htui_store::PgStore;
 use sqlx::Row as _;
 use sqlx::postgres::PgPool;
@@ -2539,6 +2541,69 @@ async fn a_child_committed_mid_delete_is_never_missing_from_the_count() {
             );
         }
     }
+
+    db.drop_db().await;
+}
+
+/// Review L1: `command_run` cascades from `run_step` (`0001_init.sql:537-544`) and belongs in the
+/// count.
+///
+/// Plan V11 pinned the cascade list and this table is not on it; nothing in the tree writes it yet,
+/// so `store::conformance`'s case would report `0` and be right by accident for as long as that
+/// holds. The row is therefore inserted here by hand - the only way to tell "counted and zero" from
+/// "not counted at all" before MOD-16's queue exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_run_is_counted_and_taken_by_the_project_delete() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let project = ids::PROJECT_HTUI;
+
+    let step: uuid::Uuid = sqlx::query_scalar(
+        "SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
+          WHERE r.project_id = $1 OR r.item_id IN (SELECT id FROM item WHERE project_id = $1) \
+          ORDER BY s.id LIMIT 1",
+    )
+    .bind(project.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("the fixture gives the project a run_step");
+
+    sqlx::query(
+        "INSERT INTO command_run (run_step_id, box_id, class, command, cwd) \
+         VALUES ($1, $2, 'test', 'cargo test', '/srv/htui')",
+    )
+    .bind(step)
+    .bind(ids::BOX.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("queue one command_run under the project");
+
+    let reach = db
+        .store
+        .delete_reach(DeleteTarget::Project(project))
+        .await
+        .expect("the reach read")
+        .expect("the fixture project has a reach");
+    assert_eq!(
+        reach.command_runs, 1,
+        "the queued command is part of what the delete would take (review L1)"
+    );
+
+    let report = db
+        .store
+        .delete_project(project)
+        .await
+        .expect("the delete lands");
+    assert_eq!(
+        report.command_runs, 1,
+        "and part of what it says it took (PRD D13)"
+    );
+    assert_eq!(
+        common::count(&db.pool, "command_run").await,
+        0,
+        "the cascade from run_step took it, counted or not"
+    );
 
     db.drop_db().await;
 }
