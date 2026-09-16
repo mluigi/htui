@@ -251,12 +251,16 @@ closed:
 - [ ] **F-34 — `docs/ANA-5.md` §4.4 step 7 and §5.1's worked example disagree, and the example is
       arithmetically impossible.** Step 7 is what the code implements (blueprint D.2); which of the
       two the ANA meant is a maintainer decision.
-- [ ] **F-37 — the separator between the N blocks of `{{documents}}` / `{{candidates}}` is undecided
+- [x] **F-37 — the separator between the N blocks of `{{documents}}` / `{{candidates}}` is undecided
       in the ANA.** A blank line was chosen so the milestone could render something. It is a digest
-      input, so changing it invalidates every golden snapshot.
-- [ ] **L-5 — `render.rs` renders `hostname:` into digested bytes.** Sanctioned by §4.2's closed
+      input, so changing it invalidates every golden snapshot. **Closed 2026-09-16: the real
+      question is whether the framing should be calibrated per model, which is `ANA-17`.** The blank
+      line stands until that analysis concludes.
+- [x] **L-5 — `render.rs` renders `hostname:` into digested bytes.** Sanctioned by §4.2's closed
       field list, but it is a machine identifier, so identical inputs digest differently on another
-      box.
+      box. **Closed 2026-09-16: the hostname leaves the digest, stays in the prompt, and gains a
+      settings switch** — an agent building one project across several machines needs to know which
+      box it is on. Amends ANA-5 §4.2 and §4.7 rule 8; the work is `MOD-33`.
 
 ## Risks
 

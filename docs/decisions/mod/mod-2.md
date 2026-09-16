@@ -361,11 +361,20 @@ should be read as closed:
   ANA meant is a **maintainer decision and is still open**.
 - **F-37 — the separator between the N blocks of `{{documents}}` / `{{candidates}}` is undecided in
   the ANA.** A blank line was chosen so the milestone could render something; it is a digest input,
-  so changing it later invalidates every golden snapshot. **Open.**
+  so changing it later invalidates every golden snapshot. **Closed 2026-09-16 by the maintainer as
+  bigger than a separator:** whether the section framing should be calibrated *per model* is an
+  analysis in its own right, now **ANA-17**. The blank line stays until that concludes.
 - **L-5 — `render.rs` renders `hostname:` into digested bytes.** It is sanctioned: §4.2's closed
   field list includes it. But it is a machine identifier, so identical inputs digest differently on
   another box, which is a weaker form of the reproducibility invariant than §4.7 reads as
-  promising. Left as the ANA has it, **open** for the maintainer.
+  promising. **Closed 2026-09-16 by the maintainer, and it amends ANA-5:** the hostname leaves the
+  **digest** but stays in the prompt, because an agent building the same project across several
+  machines has to know which box it is on — the maintainer's own graphics-engine case. It
+  additionally gains a settings switch so a project that does not want it can omit the field
+  entirely. §4.2's closed field list gains a conditional field and §4.7 rule 8's "no machine
+  identifier" becomes a statement about the digest rather than about the prompt. The work is
+  **MOD-33**; per the milestone-5 precedent the amendment is recorded here and in `HANDOFF.md`
+  rather than in `docs/ANA-5.md`, which only the maintainer edits.
 
 ---
 

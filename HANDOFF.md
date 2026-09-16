@@ -70,8 +70,39 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 - [ ] **ANA-11 - Models for requirements and decisions.** Evaluate database schema models to track product requirements (R-IDs) and architectural decisions (MOD/ANA items) inside `htui` itself instead of standalone markdown files.
 - [ ] **ANA-14 - Research whether using Redis could be beneficial.**
 - [ ] **ANA-16 - Research agent execution environments (Docker, remote shell).** Research how to implement ways to run an agent in a Docker container (local and remote) and in a remote shell. Note this would require a central server with htui as just the interface.
+- [ ] **ANA-17 - Per-model calibration of the prompt's section framing** (from MOD-2, finding F-37).
+  `R-PRM-1`, `R-PRM-2`. ANA-5 fixes the `<section name="...">` wrapper but never fixes what separates
+  the N blocks a single placeholder expands to — `{{documents}}` renders one block per document,
+  `{{candidates}}` one per candidate. MOD-2 shipped a blank line between them
+  (`prompt/render.rs`, stable under §4.7 step 5's "collapse 3+ LFs to 2"), chosen for readability
+  rather than measured against any model. The question this analysis owns is whether the framing
+  should be **calibrated per model at all** — separator, and plausibly the wrapper itself — since
+  the registry already carries a row per agent and `TokenEstimator::for_agent` already varies by
+  model family (D108). Any verdict has to price the cost of varying it: the separator bytes are
+  digest input, so a per-model frame means `prompt_digest` is only comparable within one model, and
+  every golden snapshot in `crates/htui-core/tests/snapshots/` is re-recorded on each change. Leave
+  the current blank line in place until this concludes.
 
 ### Next features
+- [ ] **MOD-33 - The box hostname leaves the digest and gains a settings switch** (from MOD-2,
+  finding L-5; maintainer-decided 2026-09-16). `R-PRM-1`, `R-PRM-3`, `R-TUI-8`. Two changes to the
+  box section (`prompt/render.rs`, the §4.2 projection over `BoxProfile`):
+  **(1) the hostname stops being a digest input.** Today an identical `PromptSpec` assembled on two
+  boxes produces different bytes and therefore a different `prompt_digest`, so a digest can only be
+  compared within one machine — which defeats MOD-4's criterion 11 (comparing a real step's digest
+  against the preview's) the moment the two run on different boxes. The hostname stays *in the text
+  the model sees*; it is excluded from the bytes that are hashed. That split does not exist yet:
+  §4.7's pipeline hashes exactly what it renders, so this needs a "rendered but not digested" span
+  concept, and the `trim_record` must say the prompt carried one.
+  **(2) a setting decides whether it is rendered at all.** The maintainer's case for keeping it:
+  building a graphics engine across several machines, where the agent must know which box it is
+  building on. The case against: it is a machine identifier in text sent to a model. So it becomes a
+  per-project switch (`app_setting`/`project.settings`, defaulting to on to preserve today's
+  behaviour), surfaced in Settings, with the box section omitting the field entirely when off.
+  **This amends ANA-5 §4.2** (the closed box field list gains a conditional field) **and §4.7**
+  (rule 8's "no machine identifier" becomes true of the digest rather than of the prompt) — the
+  amendment is maintainer-approved and recorded here per the milestone-5 precedent that an ANA edit
+  is maintainer-only. Its write-up should carry the ANA-5 sections it touches.
 - [ ] **MOD-30 - The detail sub-tab strip overflows at the pinned width** (from MOD-2, finding
   F-71). `R-TUI-3`. The sixth sub-tab took the strip past the pane: ` Body ` + ` Runs ` + ` Graph ` +
   ` Documents ` + ` Notes ` + ` Prompt ` is **45 columns** against a **43-column** inner pane at the
@@ -484,7 +515,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-11 requirements/decisions models, ANA-14 Redis research, ANA-16 execution environments)                                 |
-| MOD-N   | 27 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-29 Bugsink integration, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 4 (ANA-11 requirements/decisions models, ANA-14 Redis research, ANA-16 execution environments, ANA-17 per-model prompt framing)                                 |
+| MOD-N   | 28 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-29 Bugsink integration, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                        |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

@@ -308,10 +308,18 @@ agents; `git log a601931..HEAD` carries the detail for each commit named below.
 subdirectory must not cost a repo its excerpts" (`f3b96d6`) — is **renumbered F-122**. Renumbering
 the tree-pinned one would mean editing source to fix bookkeeping, which is the wrong direction.
 
-**Two ANA-amendment questions stay open for the maintainer** and must not be read as resolved:
-**F-34** (below) and **L-5** — `render.rs` renders `hostname:`, a machine identifier, into digested
-bytes. L-5 is *sanctioned* by ANA-5 §4.2's closed field list, but it makes identical inputs digest
-differently on another box, which is a weaker guarantee than §4.7 reads as promising.
+**One ANA-amendment question stays open for the maintainer** and must not be read as resolved:
+**F-34** (below).
+
+**L-5 is closed (2026-09-16), and it amends ANA-5.** `render.rs` renders `hostname:`, a machine
+identifier, into digested bytes; §4.2's closed field list sanctions it, but it makes identical
+inputs digest differently on another box, which is a weaker guarantee than §4.7 reads as promising.
+The maintainer's decision: the hostname **leaves the digest and stays in the prompt** — an agent
+building one project across several machines has to know which box it is building on — and gains a
+**settings switch** so a project that does not want it can omit the field entirely. §4.2's field
+list gains a conditional field; §4.7 rule 8's "no machine identifier" becomes a statement about the
+digest rather than about the prompt. The work is **MOD-33**. Recorded here rather than in
+`docs/ANA-5.md` per the milestone-5 precedent.
 
 ### Trim, record and estimator
 
@@ -336,9 +344,12 @@ which reorders keys on the way in. The test now asserts **byte stability** and �
 rather than their order (`03e5008`).
 
 **F-37 — the separator between the N blocks of `{{documents}}` and `{{candidates}}` is undecided in
-the ANA. MAINTAINER DECISION STILL OPEN.** A **blank line** was chosen so the milestone could render
-something. It is a digest input, so changing it later invalidates every golden snapshot — which is
-the same argument D111 used to settle `COMMAND_QUEUE_TEXT` before T64 accepted one.
+the ANA. CLOSED 2026-09-16 as an analysis, not a choice.** A **blank line** was chosen so the
+milestone could render something. It is a digest input, so changing it later invalidates every
+golden snapshot — the same argument D111 used to settle `COMMAND_QUEUE_TEXT` before T64 accepted
+one. The maintainer's ruling is that the separator is the small end of a real question — whether the
+section framing should be **calibrated per model at all**, the way `TokenEstimator::for_agent`
+already is — and that question is **ANA-17**. The blank line stands until ANA-17 concludes.
 
 **F-38 — `{{item_title}}` uses `one_line_title`, not attribute escaping.** The placeholder collapses
 the title to one line rather than escaping it as an XML attribute value; the escape and the 120-byte
@@ -901,6 +912,9 @@ At close-out, on **Linux** with Postgres live (`USERNAME=htui-ci`, TOOL-2):
 `cargo doc --workspace --no-deps` and `cargo sqlx prepare --check` all clean;
 `validate-workflow-docs.sh` → 0 errors.
 
-Three items were minted from this milestone's findings — **MOD-30** (F-71, the strip overflow),
-**MOD-31** (F-121, a preview blocking an install) and **MOD-32** (F-80, the unscrubbed trim record).
-Three questions are left open for the maintainer: **F-34**, **F-37** and **L-5**.
+Five items were minted from this milestone's findings — **MOD-30** (F-71, the strip overflow),
+**MOD-31** (F-121, a preview blocking an install), **MOD-32** (F-80, the unscrubbed trim record),
+and, from the maintainer's 2026-09-16 rulings, **MOD-33** (L-5, the hostname out of the digest and
+behind a setting) and **ANA-17** (F-37, whether the section framing is calibrated per model).
+**F-34 is the one question still open**: ANA-5 §4.4 step 7 as implemented, versus §5.1's worked
+example, which its own arithmetic cannot produce.
