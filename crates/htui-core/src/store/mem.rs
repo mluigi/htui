@@ -24,14 +24,16 @@ use crate::model::{
     ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRevision, ItemSummary, LinkEdge,
     LinkGraph, LinkKind, LinkNode, NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph,
     NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
-    PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepSummary, RunSummary, Scope, SessionEvent, Skill,
-    SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
+    PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Run,
+    RunId, RunKind, RunMode, RunStatus, RunStep, RunStepSummary, RunSummary, Scope, SessionEvent,
+    Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
     StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath,
     WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, prompt_summary,
 };
+use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
 use crate::prompt::template::TemplateRole;
+use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
@@ -1565,7 +1567,17 @@ impl State {
         rows
     }
 
-    /// A project with `settings = {}` and no secret provider (D9).
+    /// A project with `settings = {}` and no secret provider (M1 D9), plus the thirty-five rows
+    /// `seed` gives every project — five graphs, fifteen phases, five kinds, ten templates (M2
+    /// D4).
+    ///
+    /// Validate, then mutate: `require_user`, the duplicate id and the duplicate slug all fire
+    /// before the first insert, and nothing after it can fail — the rows come from `seed::KINDS`
+    /// and `DEFAULT_TEMPLATES`, whose self-consistency is the `seed` module's unit tests' to
+    /// prove, not this fn's to re-check (D5). None of `create_step_graph`, `create_phase` or
+    /// `create_item_kind` is called: each validates against the maps and a refusal midway would
+    /// leave a half-seeded project. `item_key_counter` is untouched; `mint` creates the row
+    /// lazily. `settings` stays `{}`: `set_setting` is that column's only writer.
     fn create_project(&mut self, new: NewProject, now: DateTime<Utc>) -> Result<Project> {
         self.require_user(new.created_by, "project.created_by")?;
         if self.projects.contains_key(&new.id) {
@@ -1580,6 +1592,8 @@ impl State {
                 new.slug
             )));
         }
+
+        let created_by = new.created_by;
         let row = Project {
             id: new.id,
             slug: new.slug,
@@ -1588,11 +1602,47 @@ impl State {
             secret_provider: None,
             secret_scope: None,
             settings: Value::Object(serde_json::Map::new()),
-            created_by: new.created_by,
+            created_by,
             created_at: now,
             updated_at: now,
         };
-        self.projects.insert(row.id, row.clone());
+        let project_id = row.id;
+        self.projects.insert(project_id, row.clone());
+
+        for (position, kind) in seed::KINDS.iter().enumerate() {
+            let graph = seed::graph_row(StepGraphId::new(), project_id, kind, now);
+            let graph_id = graph.id;
+            self.graphs.insert(graph_id, graph);
+            for (phase_position, phase) in kind.phases.iter().enumerate() {
+                self.phases.push(seed::phase_row(
+                    PhaseId::new(),
+                    graph_id,
+                    phase_position as i32,
+                    phase,
+                    now,
+                ));
+            }
+            let kind_row = seed::kind_row(
+                ItemKindId::new(),
+                project_id,
+                graph_id,
+                position as i32,
+                kind,
+                now,
+            );
+            self.kinds.insert(kind_row.id, kind_row);
+        }
+        for (name, _, body) in &DEFAULT_TEMPLATES {
+            self.templates.push(seed::template_row(
+                PromptTemplateId::new(),
+                project_id,
+                name,
+                body,
+                created_by,
+                now,
+            ));
+        }
+
         Ok(row)
     }
 

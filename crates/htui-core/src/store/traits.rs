@@ -376,12 +376,14 @@ pub trait WriteStore: ReadStore {
 
     // project
 
-    /// Inserts a project with `settings = {}` and no secret provider (D9); milestone 2 seeds the
-    /// graphs, kinds and templates inside this same transaction.
+    /// Inserts a project with `settings = {}` and no secret provider (M1 D9) and seeds it, in
+    /// the same transaction, with `htui_core::seed`'s catalogue: five default graphs, their
+    /// fifteen phases (ANA-2 §4.1 as amended by PRD D3/D5), five kinds and the ten
+    /// `DEFAULT_TEMPLATES` at version 1 (M2 D4). `item_key_counter` is not seeded.
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `slug` is taken or
-    /// `created_by` names no user.
+    /// `created_by` names no user; either way nothing is written.
     async fn create_project(&self, new: NewProject) -> Result<Project>;
 
     /// Edits `slug` / `name` / `description` under CAS; never touches `settings` (that is
