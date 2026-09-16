@@ -11,7 +11,7 @@
 //! `(project, prefix)` key counter and the absent delete path of §4.1, and the compare-and-set on
 //! `version` with its `Diverged { head, ancestor }` answer of §4.2.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -21,16 +21,22 @@ use serde_json::Value;
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProfile,
     BoxRow, BoxTool, ChatRunSpec, Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId,
-    ItemKind, ItemKindId, ItemLink, ItemPatch, ItemRevision, ItemSummary, LinkEdge, LinkGraph,
-    LinkKind, LinkNode, NewItem, Note, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
-    PromptTemplate, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepSummary, RunSummary,
-    Scope, SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceId,
-    WorkspaceProject, WorkspaceSummary, prompt_summary,
+    ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRevision, ItemSummary, LinkEdge,
+    LinkGraph, LinkKind, LinkNode, NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph,
+    NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
+    PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepSummary, RunSummary, Scope, SessionEvent, Skill,
+    SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, prompt_summary,
 };
+use crate::prompt::settings::{SettingKey, rung_refusal, validate};
+use crate::prompt::template::TemplateRole;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
-    ReadStore, UpdateOutcome, WriteStore, chat_step_status, not_a_terminal_status,
+    CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
+    WriteStore, chat_step_status, graph_not_in_project, invalid_prefix, item_kind_is_held,
+    not_a_terminal_status, reserved_phase_name,
 };
 
 /// The store the TUI runs against in MOD-1: every row in process memory, cloned out under a lock
@@ -53,15 +59,19 @@ struct State {
     workspaces: HashMap<WorkspaceId, Workspace>,
     /// `workspace_project`.
     workspace_projects: Vec<WorkspaceProject>,
+    /// `workspace_box_path` (`R-BOX-4`). No fixture loads it: MOD-15 is its first writer.
+    workspace_box_paths: Vec<WorkspaceBoxPath>,
     /// `project`.
     projects: HashMap<ProjectId, Project>,
+    /// `repo`. No fixture loads it: MOD-15 is its first writer, and MOD-7 its second.
+    repos: HashMap<RepoId, Repo>,
+    /// `repo_box_path` (`R-BOX-4`). Empty for the reason [`State::repos`] is.
+    repo_box_paths: Vec<RepoBoxPath>,
     /// `item_kind`.
     kinds: HashMap<ItemKindId, ItemKind>,
-    /// `step_graph`. Held for the modules that read it: no §6.1 method exposes it yet (blueprint B.8).
-    #[expect(dead_code, reason = "loaded now, read by MOD-2 / MOD-4 / MOD-15")]
+    /// `step_graph`, read by [`WriteStore::step_graphs`] since MOD-15 (plan D1).
     graphs: HashMap<StepGraphId, StepGraph>,
-    /// `step_graph_phase`. Held for the modules that read it: no §6.1 method exposes it yet (blueprint B.8).
-    #[expect(dead_code, reason = "loaded now, read by MOD-2 / MOD-4 / MOD-15")]
+    /// `step_graph_phase`, read by [`WriteStore::phases`] since MOD-15 (plan D1).
     phases: Vec<StepGraphPhase>,
     /// `prompt_template`, read by the inherent [`MemStore::prompt_templates`] (MOD-2 plan D102).
     templates: Vec<PromptTemplate>,
@@ -73,11 +83,14 @@ struct State {
     skill_bindings: Vec<SkillBinding>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
     box_tools: Vec<BoxTool>,
-    /// `app_setting`, the last rung of the prompt's settings chain (`docs/ANA-5.md` §4.4).
+    /// `app_setting`, the last rung of the prompt's settings chain (`docs/ANA-5.md` §4.4), each
+    /// value paired with the `updated_at` the `App` rung's compare-and-set compares against.
     ///
-    /// Empty unless a test sets it: no fixture loads it, and
-    /// [`MemStore::set_app_setting`] is its only writer.
-    app_settings: BTreeMap<String, Value>,
+    /// The column is the CAS token because `app_setting` has no `version` column and this milestone
+    /// adds no migration (PRD D8); the map carries it so `MemStore` can answer
+    /// [`WriteStore::setting`] with a token at all. Empty unless something wrote it: no fixture
+    /// loads it.
+    app_settings: BTreeMap<String, (Value, DateTime<Utc>)>,
     /// `agent`, read by the inherent [`MemStore::agents`] (MOD-2 plan D3).
     agents: HashMap<AgentId, Agent>,
     /// `agent_box`, keyed as its composite primary key is. Empty until something probes a box:
@@ -153,7 +166,10 @@ impl MemStore {
                 .map(|row| (row.id, row))
                 .collect(),
             workspace_projects: data.workspace_projects,
+            workspace_box_paths: Vec::new(),
             projects: data.projects.into_iter().map(|row| (row.id, row)).collect(),
+            repos: HashMap::new(),
+            repo_box_paths: Vec::new(),
             kinds: data.kinds.into_iter().map(|row| (row.id, row)).collect(),
             graphs: data.graphs.into_iter().map(|row| (row.id, row)).collect(),
             phases: data.phases,
@@ -357,25 +373,36 @@ impl MemStore {
     /// answered, and a map iterated in hash order would make that record depend on the process's
     /// random state.
     ///
-    /// A `MemStore` loads none of these from the fixture, so this is empty unless a test called
-    /// [`MemStore::set_app_setting`]. That is not a gap: plan D101 compiles the defaults into
-    /// `prompt::settings::DEFAULTS` precisely because `app_setting` is the one prompt input with
-    /// no mirror **and** no generic reader, so an absent row is the normal case, not a failure.
+    /// A `MemStore` loads none of these from the fixture, so this is empty unless something wrote
+    /// one. That is not a gap: plan D101 compiles the defaults into `prompt::settings::DEFAULTS`
+    /// precisely because `app_setting` is the one prompt input with no mirror **and** no generic
+    /// reader, so an absent row is the normal case, not a failure.
+    ///
+    /// The stored `updated_at` is projected away here: the settings chain resolves values, and the
+    /// CAS token belongs to [`WriteStore::setting`], which is where an editor reads it.
     ///
     /// # Errors
     ///
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
     pub async fn app_settings(&self) -> Result<BTreeMap<String, Value>> {
-        Ok(self.read(|state| state.app_settings.clone()))
+        Ok(self.read(|state| {
+            state
+                .app_settings
+                .iter()
+                .map(|(key, (value, _))| (key.clone(), value.clone()))
+                .collect()
+        }))
     }
 
-    /// Writes one `app_setting` row. **Tests only**, and the only writer of that map.
+    /// Writes one `app_setting` row without validating it or comparing a token. **Tests only.**
     ///
-    /// `app_setting` is seeded by migration `0002` and edited nowhere in the product (MOD-15 owns
-    /// any editor), so this exists to let a test drive
-    /// [`app_settings`](MemStore::app_settings)'s rung of the settings chain without a Postgres.
+    /// [`WriteStore::set_setting`] is the product writer since MOD-15, and it refuses every value
+    /// the reader would clamp or ignore (plan D7). This one stays because the opposite is also
+    /// worth testing: the resolvers' fall-through rule only fires on a stored value the validator
+    /// would never have accepted, and there has to be a way to plant one.
     pub fn set_app_setting(&self, key: &str, value: Value) {
-        self.write(|state| state.app_settings.insert(key.to_owned(), value));
+        let now = Utc::now();
+        self.write(|state| state.app_settings.insert(key.to_owned(), (value, now)));
     }
 
     /// One `item_kind` row, or `None` when no row has that id.
@@ -1331,12 +1358,1302 @@ impl State {
         }
         Ok(())
     }
+
+    // ---- MOD-15 milestone 1: the hierarchy (plan D1-D12) -------------------------------------
+    //
+    // The rules live here rather than in the trait arms below, for the reason `mint` and `update`
+    // do: an arm is one line that takes the lock, so nothing that can refuse a write is spelled
+    // twice, and `delete_reach` and `delete_project` share the one function that counts
+    // (`project_reach`) rather than two that could drift apart.
+
+    /// One phase row by id; `step_graph_phase` is a `Vec` because nothing looks it up by anything
+    /// but `graph_id` and `position`.
+    fn phase(&self, id: PhaseId) -> Option<&StepGraphPhase> {
+        self.phases.iter().find(|row| row.id == id)
+    }
+
+    /// [`State::phase`] for a writer.
+    fn phase_mut(&mut self, id: PhaseId) -> Option<&mut StepGraphPhase> {
+        self.phases.iter_mut().find(|row| row.id == id)
+    }
+
+    /// The `app_user` a `created_by` column must reference; the FK's half of `require_author`.
+    fn require_user(&self, id: UserId, column: &str) -> Result<()> {
+        require_author(id, column)?;
+        if self.users.contains_key(&id) {
+            return Ok(());
+        }
+        Err(StoreError::Constraint(format!(
+            "{column} `{id}` references no app_user"
+        )))
+    }
+
+    fn create_workspace(&mut self, new: NewWorkspace, now: DateTime<Utc>) -> Result<Workspace> {
+        self.require_user(new.created_by, "workspace.created_by")?;
+        if self.workspaces.contains_key(&new.id) {
+            return Err(StoreError::Constraint(format!(
+                "workspace `{}` already exists",
+                new.id
+            )));
+        }
+        if self.workspaces.values().any(|row| row.slug == new.slug) {
+            return Err(StoreError::Constraint(format!(
+                "workspace.slug `{}` is taken",
+                new.slug
+            )));
+        }
+        let row = Workspace {
+            id: new.id,
+            slug: new.slug,
+            name: new.name,
+            description: new.description,
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        self.workspaces.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// Compare-and-set on `workspace.updated_at` (D3).
+    fn update_workspace(
+        &mut self,
+        id: WorkspaceId,
+        expected: DateTime<Utc>,
+        patch: WorkspacePatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Workspace>> {
+        let current = self
+            .workspaces
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "workspace",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(slug) = &patch.slug
+            && self
+                .workspaces
+                .values()
+                .any(|row| row.id != id && row.slug == *slug)
+        {
+            return Err(StoreError::Constraint(format!(
+                "workspace.slug `{slug}` is taken"
+            )));
+        }
+        let row = self
+            .workspaces
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(slug) = patch.slug {
+            row.slug = slug;
+        }
+        if let Some(name) = patch.name {
+            row.name = name;
+        }
+        if let Some(description) = patch.description {
+            row.description = description;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// Inserts or repositions a link; the PK is `(workspace_id, project_id)` and there is no
+    /// `updated_at` to compare (D3).
+    fn upsert_workspace_project(&mut self, link: &WorkspaceProject) -> Result<()> {
+        if !self.workspaces.contains_key(&link.workspace_id) {
+            return Err(StoreError::Constraint(format!(
+                "workspace_project.workspace_id `{}` references no workspace",
+                link.workspace_id
+            )));
+        }
+        if !self.projects.contains_key(&link.project_id) {
+            return Err(StoreError::Constraint(format!(
+                "workspace_project.project_id `{}` references no project",
+                link.project_id
+            )));
+        }
+        match self
+            .workspace_projects
+            .iter_mut()
+            .find(|row| row.workspace_id == link.workspace_id && row.project_id == link.project_id)
+        {
+            Some(row) => row.position = link.position,
+            None => self.workspace_projects.push(link.clone()),
+        }
+        Ok(())
+    }
+
+    /// Removes one link. The project survives it (D4).
+    fn remove_workspace_project(
+        &mut self,
+        workspace: WorkspaceId,
+        project: ProjectId,
+    ) -> Result<()> {
+        let before = self.workspace_projects.len();
+        self.workspace_projects
+            .retain(|row| !(row.workspace_id == workspace && row.project_id == project));
+        if self.workspace_projects.len() == before {
+            return Err(StoreError::NotFound {
+                entity: "workspace_project",
+                id: format!("{workspace}/{project}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// A workspace's links, ordered by `position` then `project_id` bytes.
+    fn workspace_project_rows(&self, workspace: WorkspaceId) -> Vec<WorkspaceProject> {
+        let mut rows: Vec<WorkspaceProject> = self
+            .workspace_projects
+            .iter()
+            .filter(|row| row.workspace_id == workspace)
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            left.position
+                .cmp(&right.position)
+                .then_with(|| left.project_id.cmp(&right.project_id))
+        });
+        rows
+    }
+
+    /// Inserts or replaces this box's root path; one writer per `(workspace_id, box_id)`, so the
+    /// replace needs no token either (`R-BOX-4`).
+    fn upsert_workspace_box_path(
+        &mut self,
+        path: &WorkspaceBoxPath,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        if !self.workspaces.contains_key(&path.workspace_id) {
+            return Err(StoreError::Constraint(format!(
+                "workspace_box_path.workspace_id `{}` references no workspace",
+                path.workspace_id
+            )));
+        }
+        if !self.boxes.contains_key(&path.box_id) {
+            return Err(StoreError::Constraint(format!(
+                "workspace_box_path.box_id `{}` references no box",
+                path.box_id
+            )));
+        }
+        let mut row = path.clone();
+        row.updated_at = now;
+        match self
+            .workspace_box_paths
+            .iter_mut()
+            .find(|held| held.workspace_id == path.workspace_id && held.box_id == path.box_id)
+        {
+            Some(held) => *held = row,
+            None => self.workspace_box_paths.push(row),
+        }
+        Ok(())
+    }
+
+    /// Every box's root path for a workspace, ordered by `box_id` bytes.
+    fn workspace_box_path_rows(&self, workspace: WorkspaceId) -> Vec<WorkspaceBoxPath> {
+        let mut rows: Vec<WorkspaceBoxPath> = self
+            .workspace_box_paths
+            .iter()
+            .filter(|row| row.workspace_id == workspace)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.box_id);
+        rows
+    }
+
+    /// A project with `settings = {}` and no secret provider (D9).
+    fn create_project(&mut self, new: NewProject, now: DateTime<Utc>) -> Result<Project> {
+        self.require_user(new.created_by, "project.created_by")?;
+        if self.projects.contains_key(&new.id) {
+            return Err(StoreError::Constraint(format!(
+                "project `{}` already exists",
+                new.id
+            )));
+        }
+        if self.projects.values().any(|row| row.slug == new.slug) {
+            return Err(StoreError::Constraint(format!(
+                "project.slug `{}` is taken",
+                new.slug
+            )));
+        }
+        let row = Project {
+            id: new.id,
+            slug: new.slug,
+            name: new.name,
+            description: new.description,
+            secret_provider: None,
+            secret_scope: None,
+            settings: Value::Object(serde_json::Map::new()),
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        self.projects.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// Compare-and-set on `project.updated_at`; `settings` is not this writer's (D8).
+    fn update_project(
+        &mut self,
+        id: ProjectId,
+        expected: DateTime<Utc>,
+        patch: ProjectPatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Project>> {
+        let current = self
+            .projects
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "project",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(slug) = &patch.slug
+            && self
+                .projects
+                .values()
+                .any(|row| row.id != id && row.slug == *slug)
+        {
+            return Err(StoreError::Constraint(format!(
+                "project.slug `{slug}` is taken"
+            )));
+        }
+        let row = self
+            .projects
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(slug) = patch.slug {
+            row.slug = slug;
+        }
+        if let Some(name) = patch.name {
+            row.name = name;
+        }
+        if let Some(description) = patch.description {
+            row.description = description;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// Clears the project's current primary repo, `except` the row being written (D10).
+    fn demote_primary_repos(&mut self, project: ProjectId, except: RepoId, now: DateTime<Utc>) {
+        for row in self
+            .repos
+            .values_mut()
+            .filter(|row| row.id != except && row.project_id == project && row.is_primary)
+        {
+            row.is_primary = false;
+            row.updated_at = now;
+        }
+    }
+
+    fn create_repo(&mut self, new: NewRepo, now: DateTime<Utc>) -> Result<Repo> {
+        if !self.projects.contains_key(&new.project_id) {
+            return Err(StoreError::Constraint(format!(
+                "repo.project_id `{}` references no project",
+                new.project_id
+            )));
+        }
+        if self.repos.contains_key(&new.id) {
+            return Err(StoreError::Constraint(format!(
+                "repo `{}` already exists",
+                new.id
+            )));
+        }
+        if self
+            .repos
+            .values()
+            .any(|row| row.project_id == new.project_id && row.name == new.name)
+        {
+            return Err(StoreError::Constraint(format!(
+                "repo.name `{}` is taken in project `{}`",
+                new.name, new.project_id
+            )));
+        }
+        if new.is_primary {
+            self.demote_primary_repos(new.project_id, new.id, now);
+        }
+        let row = Repo {
+            id: new.id,
+            project_id: new.project_id,
+            name: new.name,
+            remote_url: new.remote_url,
+            default_branch: new.default_branch,
+            is_primary: new.is_primary,
+            created_at: now,
+            updated_at: now,
+        };
+        self.repos.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// Compare-and-set on `repo.updated_at`; promoting this row demotes the other primary in the
+    /// same lock, so `uq_repo_primary` is never momentarily violated (D10).
+    fn update_repo(
+        &mut self,
+        id: RepoId,
+        expected: DateTime<Utc>,
+        patch: RepoPatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Repo>> {
+        let current = self
+            .repos
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "repo",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(name) = &patch.name
+            && self.repos.values().any(|row| {
+                row.id != id && row.project_id == current.project_id && row.name == *name
+            })
+        {
+            return Err(StoreError::Constraint(format!(
+                "repo.name `{name}` is taken in project `{}`",
+                current.project_id
+            )));
+        }
+        if patch.is_primary == Some(true) {
+            self.demote_primary_repos(current.project_id, id, now);
+        }
+        let row = self
+            .repos
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(name) = patch.name {
+            row.name = name;
+        }
+        if let Some(remote_url) = patch.remote_url {
+            row.remote_url = remote_url;
+        }
+        if let Some(default_branch) = patch.default_branch {
+            row.default_branch = default_branch;
+        }
+        if let Some(is_primary) = patch.is_primary {
+            row.is_primary = is_primary;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// A project's repos, ordered by `name` bytes.
+    fn repo_rows(&self, project: ProjectId) -> Vec<Repo> {
+        let mut rows: Vec<Repo> = self
+            .repos
+            .values()
+            .filter(|row| row.project_id == project)
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        rows
+    }
+
+    /// Inserts or replaces this box's checkout path (`R-BOX-4`).
+    fn upsert_repo_box_path(&mut self, path: &RepoBoxPath, now: DateTime<Utc>) -> Result<()> {
+        if !self.repos.contains_key(&path.repo_id) {
+            return Err(StoreError::Constraint(format!(
+                "repo_box_path.repo_id `{}` references no repo",
+                path.repo_id
+            )));
+        }
+        if !self.boxes.contains_key(&path.box_id) {
+            return Err(StoreError::Constraint(format!(
+                "repo_box_path.box_id `{}` references no box",
+                path.box_id
+            )));
+        }
+        let mut row = path.clone();
+        row.updated_at = now;
+        match self
+            .repo_box_paths
+            .iter_mut()
+            .find(|held| held.repo_id == path.repo_id && held.box_id == path.box_id)
+        {
+            Some(held) => *held = row,
+            None => self.repo_box_paths.push(row),
+        }
+        Ok(())
+    }
+
+    /// Every box's checkout path for a repo, ordered by `box_id` bytes.
+    fn repo_box_path_rows(&self, repo: RepoId) -> Vec<RepoBoxPath> {
+        let mut rows: Vec<RepoBoxPath> = self
+            .repo_box_paths
+            .iter()
+            .filter(|row| row.repo_id == repo)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.box_id);
+        rows
+    }
+
+    /// The three `item_kind` rules the schema cannot express on its own (D11): the prefix CHECK in
+    /// words, `(project, prefix)` and `(project, name)` uniqueness, and a `default_graph_id` that
+    /// belongs to the kind's own project.
+    fn check_item_kind(
+        &self,
+        project: ProjectId,
+        prefix: &str,
+        name: &str,
+        graph: StepGraphId,
+        except: Option<ItemKindId>,
+    ) -> Result<()> {
+        if !ItemKind::prefix_is_valid(prefix) {
+            return Err(StoreError::Constraint(invalid_prefix(prefix)));
+        }
+        if !self.projects.contains_key(&project) {
+            return Err(StoreError::Constraint(format!(
+                "item_kind.project_id `{project}` references no project"
+            )));
+        }
+        if self
+            .graphs
+            .get(&graph)
+            .is_none_or(|row| row.project_id != project)
+        {
+            return Err(StoreError::Constraint(graph_not_in_project(graph, project)));
+        }
+        let clashes = |taken: &dyn Fn(&ItemKind) -> bool| {
+            self.kinds
+                .values()
+                .any(|row| row.project_id == project && Some(row.id) != except && taken(row))
+        };
+        if clashes(&|row| row.prefix == prefix) {
+            return Err(StoreError::Constraint(format!(
+                "item_kind.prefix `{prefix}` is taken in project `{project}`"
+            )));
+        }
+        if clashes(&|row| row.name == name) {
+            return Err(StoreError::Constraint(format!(
+                "item_kind.name `{name}` is taken in project `{project}`"
+            )));
+        }
+        Ok(())
+    }
+
+    fn create_item_kind(&mut self, new: NewItemKind, now: DateTime<Utc>) -> Result<ItemKind> {
+        self.check_item_kind(
+            new.project_id,
+            &new.prefix,
+            &new.name,
+            new.default_graph_id,
+            None,
+        )?;
+        if self.kinds.contains_key(&new.id) {
+            return Err(StoreError::Constraint(format!(
+                "item_kind `{}` already exists",
+                new.id
+            )));
+        }
+        let row = ItemKind {
+            id: new.id,
+            project_id: new.project_id,
+            prefix: new.prefix,
+            name: new.name,
+            description: new.description,
+            default_graph_id: new.default_graph_id,
+            position: new.position,
+            updated_at: now,
+        };
+        self.kinds.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// Compare-and-set on `item_kind.updated_at`. A prefix rename touches no `item` and no
+    /// `item_key_counter`: the counter is keyed by `(project, prefix)`, so the next mint under the
+    /// kind starts the new prefix at 1 and the old keys keep their text (PRD D12).
+    fn update_item_kind(
+        &mut self,
+        id: ItemKindId,
+        expected: DateTime<Utc>,
+        patch: ItemKindPatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<ItemKind>> {
+        let current = self
+            .kinds
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "item_kind",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        self.check_item_kind(
+            current.project_id,
+            patch.prefix.as_deref().unwrap_or(&current.prefix),
+            patch.name.as_deref().unwrap_or(&current.name),
+            patch.default_graph_id.unwrap_or(current.default_graph_id),
+            Some(id),
+        )?;
+        let row = self
+            .kinds
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(prefix) = patch.prefix {
+            row.prefix = prefix;
+        }
+        if let Some(name) = patch.name {
+            row.name = name;
+        }
+        if let Some(description) = patch.description {
+            row.description = description;
+        }
+        if let Some(graph) = patch.default_graph_id {
+            row.default_graph_id = graph;
+        }
+        if let Some(position) = patch.position {
+            row.position = position;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// A project's kinds, ordered by `position` then `prefix` bytes; `position` is not unique.
+    fn item_kind_rows(&self, project: ProjectId) -> Vec<ItemKind> {
+        let mut rows: Vec<ItemKind> = self
+            .kinds
+            .values()
+            .filter(|row| row.project_id == project)
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            left.position
+                .cmp(&right.position)
+                .then_with(|| left.prefix.as_bytes().cmp(right.prefix.as_bytes()))
+        });
+        rows
+    }
+
+    /// Deletes a kind nothing references, and names the count when something does (D6).
+    fn delete_item_kind(&mut self, id: ItemKindId) -> Result<()> {
+        let kind = self.kinds.get(&id).ok_or_else(|| StoreError::NotFound {
+            entity: "item_kind",
+            id: id.to_string(),
+        })?;
+        let held = rows(self.items.values().filter(|row| row.kind_id == id).count());
+        if held > 0 {
+            return Err(StoreError::Constraint(item_kind_is_held(
+                &kind.prefix,
+                held,
+            )));
+        }
+        self.kinds.remove(&id);
+        Ok(())
+    }
+
+    fn create_step_graph(&mut self, new: NewStepGraph, now: DateTime<Utc>) -> Result<StepGraph> {
+        if !self.projects.contains_key(&new.project_id) {
+            return Err(StoreError::Constraint(format!(
+                "step_graph.project_id `{}` references no project",
+                new.project_id
+            )));
+        }
+        if self.graphs.contains_key(&new.id) {
+            return Err(StoreError::Constraint(format!(
+                "step_graph `{}` already exists",
+                new.id
+            )));
+        }
+        if self
+            .graphs
+            .values()
+            .any(|row| row.project_id == new.project_id && row.name == new.name)
+        {
+            return Err(StoreError::Constraint(format!(
+                "step_graph.name `{}` is taken in project `{}`",
+                new.name, new.project_id
+            )));
+        }
+        let row = StepGraph {
+            id: new.id,
+            project_id: new.project_id,
+            name: new.name,
+            description: new.description,
+            created_at: now,
+            updated_at: now,
+        };
+        self.graphs.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// Compare-and-set on `step_graph.updated_at`.
+    fn update_step_graph(
+        &mut self,
+        id: StepGraphId,
+        expected: DateTime<Utc>,
+        patch: StepGraphPatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<StepGraph>> {
+        let current = self
+            .graphs
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "step_graph",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(name) = &patch.name
+            && self.graphs.values().any(|row| {
+                row.id != id && row.project_id == current.project_id && row.name == *name
+            })
+        {
+            return Err(StoreError::Constraint(format!(
+                "step_graph.name `{name}` is taken in project `{}`",
+                current.project_id
+            )));
+        }
+        let row = self
+            .graphs
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(name) = patch.name {
+            row.name = name;
+        }
+        if let Some(description) = patch.description {
+            row.description = description;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// A project's graphs, ordered by `name` bytes.
+    fn step_graph_rows(&self, project: ProjectId) -> Vec<StepGraph> {
+        let mut rows: Vec<StepGraph> = self
+            .graphs
+            .values()
+            .filter(|row| row.project_id == project)
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        rows
+    }
+
+    /// The reserved-name rule and the two uniqueness rules of `step_graph_phase` (D11).
+    fn check_phase(
+        &self,
+        graph: StepGraphId,
+        position: i32,
+        name: &str,
+        except: Option<PhaseId>,
+    ) -> Result<()> {
+        if TemplateRole::of_name(name) != TemplateRole::Phase {
+            return Err(StoreError::Constraint(reserved_phase_name(name)));
+        }
+        if !self.graphs.contains_key(&graph) {
+            return Err(StoreError::Constraint(format!(
+                "step_graph_phase.graph_id `{graph}` references no step_graph"
+            )));
+        }
+        let clashes = |taken: &dyn Fn(&StepGraphPhase) -> bool| {
+            self.phases
+                .iter()
+                .any(|row| row.graph_id == graph && Some(row.id) != except && taken(row))
+        };
+        if clashes(&|row| row.position == position) {
+            return Err(StoreError::Constraint(format!(
+                "step_graph_phase.position {position} is taken in graph `{graph}`"
+            )));
+        }
+        if clashes(&|row| row.name == name) {
+            return Err(StoreError::Constraint(format!(
+                "step_graph_phase.name `{name}` is taken in graph `{graph}`"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Inserts a whole phase row; the caller's `updated_at` is discarded for the store's clock.
+    fn create_phase(
+        &mut self,
+        phase: &StepGraphPhase,
+        now: DateTime<Utc>,
+    ) -> Result<StepGraphPhase> {
+        self.check_phase(phase.graph_id, phase.position, &phase.name, None)?;
+        if self.phase(phase.id).is_some() {
+            return Err(StoreError::Constraint(format!(
+                "step_graph_phase `{}` already exists",
+                phase.id
+            )));
+        }
+        let mut row = phase.clone();
+        row.updated_at = now;
+        self.phases.push(row.clone());
+        Ok(row)
+    }
+
+    /// Compare-and-set on the phase's `updated_at` over [`PhasePatch`]'s five columns;
+    /// `token_budget` is the `Phase` rung's and is not here (D8).
+    fn update_phase(
+        &mut self,
+        id: PhaseId,
+        expected: DateTime<Utc>,
+        patch: PhasePatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<StepGraphPhase>> {
+        let current = self
+            .phase(id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "step_graph_phase",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        self.check_phase(
+            current.graph_id,
+            patch.position.unwrap_or(current.position),
+            patch.name.as_deref().unwrap_or(&current.name),
+            Some(id),
+        )?;
+        let row = self
+            .phase_mut(id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(name) = patch.name {
+            row.name = name;
+        }
+        if let Some(position) = patch.position {
+            row.position = position;
+        }
+        if let Some(template_name) = patch.template_name {
+            row.template_name = template_name;
+        }
+        if let Some(gate_hard) = patch.gate_hard {
+            row.gate_hard = gate_hard;
+        }
+        if let Some(input_kinds) = patch.input_kinds {
+            row.input_kinds = input_kinds;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// A graph's phases, ordered by `position`, which is unique per graph.
+    fn phase_rows(&self, graph: StepGraphId) -> Vec<StepGraphPhase> {
+        let mut rows: Vec<StepGraphPhase> = self
+            .phases
+            .iter()
+            .filter(|row| row.graph_id == graph)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.position);
+        rows
+    }
+
+    /// The value one rung currently holds for a key, for [`validate`]'s `not_above` peer.
+    fn setting_value(&self, rung: SettingRung, key: SettingKey) -> Option<Value> {
+        self.stored_setting(rung, key).and_then(|row| row.value)
+    }
+
+    /// One setting with the rung row's token, or `None` when the rung's row is absent (D8).
+    fn stored_setting(&self, rung: SettingRung, key: SettingKey) -> Option<StoredSetting> {
+        match rung {
+            SettingRung::App => {
+                self.app_settings
+                    .get(key.key())
+                    .map(|(value, updated_at)| StoredSetting {
+                        value: Some(value.clone()),
+                        updated_at: *updated_at,
+                    })
+            }
+            SettingRung::Project(id) => self.projects.get(&id).map(|project| StoredSetting {
+                value: key
+                    .spec()
+                    .project_key
+                    .and_then(|name| project.settings.get(name).cloned()),
+                updated_at: project.updated_at,
+            }),
+            SettingRung::Phase(id) => self.phase(id).map(|phase| StoredSetting {
+                value: phase.token_budget.map(Value::from),
+                updated_at: phase.updated_at,
+            }),
+        }
+    }
+
+    /// Writes one setting on one rung, after the whole of [`validate`] (D7, D8).
+    ///
+    /// Validation runs before the compare-and-set on purpose: a value the reader would clamp is
+    /// refused whether or not the caller's token was current, so "your edit was stale" never
+    /// stands in for "that number does not mean what you think".
+    fn set_setting(
+        &mut self,
+        rung: SettingRung,
+        key: SettingKey,
+        value: Value,
+        expected: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<StoredSetting>> {
+        if let Some(refusal) = rung_refusal(key, rung.flag()) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let peer = key
+            .spec()
+            .not_above
+            .and_then(|other| self.setting_value(rung, other));
+        validate(key, rung.flag(), &value, peer.as_ref()).map_err(StoreError::Constraint)?;
+
+        match rung {
+            SettingRung::App => {
+                let stored = self
+                    .app_settings
+                    .get(key.key())
+                    .map(|(value, token)| (value.clone(), *token));
+                // `expected: None` is "I expect no row" — the insert after a clear — so the two
+                // that match are no row and no expectation, or a row whose token is the one held.
+                let current = match (&stored, expected) {
+                    (None, None) => true,
+                    (Some((_, token)), Some(want)) => *token == want,
+                    (None, Some(_)) | (Some(_), None) => false,
+                };
+                if current {
+                    self.app_settings
+                        .insert(key.key().to_owned(), (value.clone(), now));
+                    return Ok(CasOutcome::Applied(StoredSetting {
+                        value: Some(value),
+                        updated_at: now,
+                    }));
+                }
+                match stored {
+                    Some((held, token)) => Ok(CasOutcome::Stale(StoredSetting {
+                        value: Some(held),
+                        updated_at: token,
+                    })),
+                    // A token for a row that is not there is a missing edit, not a stale one:
+                    // there is nothing to hand back for the caller to reload from.
+                    None => Err(StoreError::NotFound {
+                        entity: "app_setting",
+                        id: key.key().to_owned(),
+                    }),
+                }
+            }
+            SettingRung::Project(id) => {
+                let token = expected_on_row(expected, key, "project")?;
+                let stored =
+                    self.stored_setting(rung, key)
+                        .ok_or_else(|| StoreError::NotFound {
+                            entity: "project",
+                            id: id.to_string(),
+                        })?;
+                if stored.updated_at != token {
+                    return Ok(CasOutcome::Stale(stored));
+                }
+                let name = key
+                    .spec()
+                    .project_key
+                    .expect("the rung check passed, so the spec names a project key");
+                let project = self
+                    .projects
+                    .get_mut(&id)
+                    .expect("the row was read a statement ago under the same lock");
+                let Some(map) = project.settings.as_object_mut() else {
+                    return Err(StoreError::Constraint(format!(
+                        "project.settings of `{id}` is not a JSON object, so `{key}` cannot be \
+                         merged into it"
+                    )));
+                };
+                map.insert(name.to_owned(), value.clone());
+                project.updated_at = now;
+                Ok(CasOutcome::Applied(StoredSetting {
+                    value: Some(value),
+                    updated_at: now,
+                }))
+            }
+            SettingRung::Phase(id) => {
+                let token = expected_on_row(expected, key, "step_graph_phase")?;
+                let stored =
+                    self.stored_setting(rung, key)
+                        .ok_or_else(|| StoreError::NotFound {
+                            entity: "step_graph_phase",
+                            id: id.to_string(),
+                        })?;
+                if stored.updated_at != token {
+                    return Ok(CasOutcome::Stale(stored));
+                }
+                let budget = value
+                    .as_i64()
+                    .and_then(|number| i32::try_from(number).ok())
+                    .expect("validate narrows the phase rung to i32::MAX (flag C)");
+                let phase = self
+                    .phase_mut(id)
+                    .expect("the row was read a statement ago under the same lock");
+                phase.token_budget = Some(budget);
+                phase.updated_at = now;
+                Ok(CasOutcome::Applied(StoredSetting {
+                    value: Some(value),
+                    updated_at: now,
+                }))
+            }
+        }
+    }
+
+    /// Removes one setting from one rung under CAS; `Applied` always carries `value: None` (D8).
+    fn clear_setting(
+        &mut self,
+        rung: SettingRung,
+        key: SettingKey,
+        expected: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<StoredSetting>> {
+        if let Some(refusal) = rung_refusal(key, rung.flag()) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        match rung {
+            SettingRung::App => {
+                let Some((held, token)) = self
+                    .app_settings
+                    .get(key.key())
+                    .map(|(value, token)| (value.clone(), *token))
+                else {
+                    return Err(StoreError::NotFound {
+                        entity: "app_setting",
+                        id: key.key().to_owned(),
+                    });
+                };
+                if token != expected {
+                    return Ok(CasOutcome::Stale(StoredSetting {
+                        value: Some(held),
+                        updated_at: token,
+                    }));
+                }
+                self.app_settings.remove(key.key());
+                // Flag D: a cleared App setting has no row left to carry a token, so the deleted
+                // row's is what comes back and the next `set_setting` passes `expected: None`.
+                Ok(CasOutcome::Applied(StoredSetting {
+                    value: None,
+                    updated_at: token,
+                }))
+            }
+            SettingRung::Project(id) => {
+                let stored =
+                    self.stored_setting(rung, key)
+                        .ok_or_else(|| StoreError::NotFound {
+                            entity: "project",
+                            id: id.to_string(),
+                        })?;
+                if stored.updated_at != expected {
+                    return Ok(CasOutcome::Stale(stored));
+                }
+                let name = key
+                    .spec()
+                    .project_key
+                    .expect("the rung check passed, so the spec names a project key");
+                let project = self
+                    .projects
+                    .get_mut(&id)
+                    .expect("the row was read a statement ago under the same lock");
+                if let Some(map) = project.settings.as_object_mut() {
+                    map.remove(name);
+                }
+                project.updated_at = now;
+                Ok(CasOutcome::Applied(StoredSetting {
+                    value: None,
+                    updated_at: now,
+                }))
+            }
+            SettingRung::Phase(id) => {
+                let stored =
+                    self.stored_setting(rung, key)
+                        .ok_or_else(|| StoreError::NotFound {
+                            entity: "step_graph_phase",
+                            id: id.to_string(),
+                        })?;
+                if stored.updated_at != expected {
+                    return Ok(CasOutcome::Stale(stored));
+                }
+                let phase = self
+                    .phase_mut(id)
+                    .expect("the row was read a statement ago under the same lock");
+                phase.token_budget = None;
+                phase.updated_at = now;
+                Ok(CasOutcome::Applied(StoredSetting {
+                    value: None,
+                    updated_at: now,
+                }))
+            }
+        }
+    }
+
+    /// What a workspace delete reaches: its links and its box paths, and no project (D4).
+    fn workspace_reach(&self, id: WorkspaceId) -> Option<DeleteReach> {
+        if !self.workspaces.contains_key(&id) {
+            return None;
+        }
+        Some(DeleteReach {
+            workspace_links: rows(
+                self.workspace_projects
+                    .iter()
+                    .filter(|row| row.workspace_id == id)
+                    .count(),
+            ),
+            workspace_box_paths: rows(
+                self.workspace_box_paths
+                    .iter()
+                    .filter(|row| row.workspace_id == id)
+                    .count(),
+            ),
+            ..DeleteReach::default()
+        })
+    }
+
+    /// What a project delete reaches, counted and identified in one pass (PRD D13).
+    ///
+    /// The counts and the id sets come out of the same predicates, which is what makes
+    /// `delete_reach`'s report and `delete_project`'s act equal by construction rather than by two
+    /// lists kept in step by hand. `phase_agents` and `run_step_commits` are `0` because this store
+    /// holds neither table, and `workspace_box_paths` because a project is not a workspace.
+    fn project_reach(&self, id: ProjectId) -> Option<(DeleteReach, ProjectReach)> {
+        if !self.projects.contains_key(&id) {
+            return None;
+        }
+        let items: HashSet<ItemId> = self
+            .items
+            .values()
+            .filter(|row| row.project_id == id)
+            .map(|row| row.id)
+            .collect();
+        let runs: HashSet<RunId> = self
+            .runs
+            .values()
+            .filter(|row| {
+                row.project_id == id || row.item_id.is_some_and(|item| items.contains(&item))
+            })
+            .map(|row| row.id)
+            .collect();
+        let steps: HashSet<StepId> = self
+            .steps
+            .values()
+            .filter(|row| runs.contains(&row.run_id))
+            .map(|row| row.id)
+            .collect();
+        let graphs: HashSet<StepGraphId> = self
+            .graphs
+            .values()
+            .filter(|row| row.project_id == id)
+            .map(|row| row.id)
+            .collect();
+        let phases: HashSet<PhaseId> = self
+            .phases
+            .iter()
+            .filter(|row| graphs.contains(&row.graph_id))
+            .map(|row| row.id)
+            .collect();
+        let repos: HashSet<RepoId> = self
+            .repos
+            .values()
+            .filter(|row| row.project_id == id)
+            .map(|row| row.id)
+            .collect();
+
+        let reach = DeleteReach {
+            workspace_links: rows(
+                self.workspace_projects
+                    .iter()
+                    .filter(|row| row.project_id == id)
+                    .count(),
+            ),
+            workspace_box_paths: 0,
+            items: rows(items.len()),
+            item_key_counters: rows(
+                self.item_key_counter
+                    .keys()
+                    .filter(|(project, _)| *project == id)
+                    .count(),
+            ),
+            item_kinds: rows(
+                self.kinds
+                    .values()
+                    .filter(|row| row.project_id == id)
+                    .count(),
+            ),
+            step_graphs: rows(graphs.len()),
+            phases: rows(phases.len()),
+            phase_agents: 0,
+            prompt_templates: rows(
+                self.templates
+                    .iter()
+                    .filter(|row| row.project_id == id)
+                    .count(),
+            ),
+            repos: rows(repos.len()),
+            repo_box_paths: rows(
+                self.repo_box_paths
+                    .iter()
+                    .filter(|row| repos.contains(&row.repo_id))
+                    .count(),
+            ),
+            skill_bindings: rows(
+                self.skill_bindings
+                    .iter()
+                    .filter(|row| row.project_id == id)
+                    .count(),
+            ),
+            runs: rows(runs.len()),
+            run_steps: rows(steps.len()),
+            session_events: rows(
+                self.events
+                    .iter()
+                    .filter(|row| steps.contains(&row.run_step_id))
+                    .count(),
+            ),
+            run_step_commits: 0,
+            notes: rows(
+                self.notes
+                    .iter()
+                    .filter(|row| items.contains(&row.item_id))
+                    .count(),
+            ),
+            revisions: rows(
+                self.revisions
+                    .keys()
+                    .filter(|(item, _)| items.contains(item))
+                    .count(),
+            ),
+            links: rows(
+                self.links
+                    .iter()
+                    .filter(|row| {
+                        items.contains(&row.from_item_id) || items.contains(&row.to_item_id)
+                    })
+                    .count(),
+            ),
+            documents: rows(
+                self.documents
+                    .iter()
+                    .filter(|row| items.contains(&row.item_id))
+                    .count(),
+            ),
+        };
+        Some((
+            reach,
+            ProjectReach {
+                items,
+                runs,
+                steps,
+                graphs,
+                phases,
+                repos,
+            },
+        ))
+    }
+
+    /// Removes a workspace, its links and its box paths. Projects survive it
+    /// (`0001_init.sql:162,174`).
+    fn delete_workspace(&mut self, id: WorkspaceId) -> Result<DeleteReach> {
+        let reach = self
+            .workspace_reach(id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "workspace",
+                id: id.to_string(),
+            })?;
+        self.workspace_projects.retain(|row| row.workspace_id != id);
+        self.workspace_box_paths
+            .retain(|row| row.workspace_id != id);
+        self.workspaces.remove(&id);
+        Ok(reach)
+    }
+
+    /// Removes a project and everything PRD D13 lists, in `0001_init.sql`'s cascade order: leaves
+    /// first, so no row is taken before the row that counted it.
+    ///
+    /// `item_link` goes when **either** end is the project's, tombstones included: that is what
+    /// takes the fixture's cross-project edge from `agy:FEAT-1` to `htui:FEAT-2`, which no
+    /// per-project predicate would have reached.
+    fn delete_project(&mut self, id: ProjectId) -> Result<DeleteReach> {
+        let (reach, gone) = self.project_reach(id).ok_or_else(|| StoreError::NotFound {
+            entity: "project",
+            id: id.to_string(),
+        })?;
+        self.events
+            .retain(|row| !gone.steps.contains(&row.run_step_id));
+        self.steps.retain(|id, _| !gone.steps.contains(id));
+        self.runs.retain(|id, _| !gone.runs.contains(id));
+        self.documents
+            .retain(|row| !gone.items.contains(&row.item_id));
+        self.notes.retain(|row| !gone.items.contains(&row.item_id));
+        self.revisions
+            .retain(|(item, _), _| !gone.items.contains(item));
+        self.links.retain(|row| {
+            !gone.items.contains(&row.from_item_id) && !gone.items.contains(&row.to_item_id)
+        });
+        self.items.retain(|id, _| !gone.items.contains(id));
+        self.item_key_counter
+            .retain(|(project, _), _| *project != id);
+        self.skill_bindings.retain(|row| row.project_id != id);
+        self.kinds.retain(|_, row| row.project_id != id);
+        self.phases.retain(|row| !gone.phases.contains(&row.id));
+        self.graphs.retain(|id, _| !gone.graphs.contains(id));
+        self.templates.retain(|row| row.project_id != id);
+        self.repo_box_paths
+            .retain(|row| !gone.repos.contains(&row.repo_id));
+        self.repos.retain(|id, _| !gone.repos.contains(id));
+        self.workspace_projects.retain(|row| row.project_id != id);
+        self.projects.remove(&id);
+        Ok(reach)
+    }
 }
 
 /// A revision author must name a real `app_user` row (§5.5 `REFERENCES app_user(id)`); the nil
 /// UUID is what `UserId::default()` yields, so it is rejected here rather than written and later
 /// refused by MOD-6's `PgStore`. An author that is non-nil but unknown is out of scope: the
 /// default [`MemStore::new`] holds no users at all (plan D7).
+/// The rows a project delete takes, identified once by [`State::project_reach`] so the report and
+/// the act cannot disagree about which they were (D4).
+#[derive(Debug)]
+struct ProjectReach {
+    /// `item` ids of the project.
+    items: HashSet<ItemId>,
+    /// `run` ids of the project, plus any run of one of its items.
+    runs: HashSet<RunId>,
+    /// `run_step` ids below those runs.
+    steps: HashSet<StepId>,
+    /// `step_graph` ids of the project.
+    graphs: HashSet<StepGraphId>,
+    /// `step_graph_phase` ids below those graphs.
+    phases: HashSet<PhaseId>,
+    /// `repo` ids of the project.
+    repos: HashSet<RepoId>,
+}
+
+/// A row count as the `u64` [`DeleteReach`] holds, saturating rather than casting: `usize` is
+/// never wider than `u64` on a target this ships to, and the `try_from` says so without an `as`.
+fn rows(count: usize) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// The CAS token a rung whose row always exists must be given (D8).
+///
+/// `expected: None` means "I expect no row", which only the `App` rung can mean: a project and a
+/// phase exist before the setting does, so `None` there is misuse rather than an insert — and
+/// refusing it is what keeps a caller from treating a missing token as a force-write.
+fn expected_on_row(
+    expected: Option<DateTime<Utc>>,
+    key: SettingKey,
+    entity: &str,
+) -> Result<DateTime<Utc>> {
+    expected.ok_or_else(|| {
+        StoreError::Constraint(format!(
+            "`{key}` on the {entity} rung needs the row's `updated_at`; `expected: None` is the \
+             app_setting insert alone"
+        ))
+    })
+}
+
 fn require_author(id: UserId, column: &str) -> Result<()> {
     if id.as_uuid().is_nil() {
         return Err(StoreError::Constraint(format!(
@@ -1477,6 +2794,201 @@ impl WriteStore for MemStore {
     async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
         let now = Utc::now();
         self.write(|state| state.set_step_prompt(step, digest, trim, now))
+    }
+
+    // MOD-15 milestone 1. Each arm takes the lock and hands one `State` method the store's clock;
+    // every rule that can refuse is in `impl State`, so nothing here can disagree with `PgStore`
+    // about what is legal, only about how it is stored.
+
+    async fn create_workspace(&self, new: NewWorkspace) -> Result<Workspace> {
+        let now = Utc::now();
+        self.write(|state| state.create_workspace(new, now))
+    }
+
+    async fn update_workspace(
+        &self,
+        id: WorkspaceId,
+        expected: DateTime<Utc>,
+        patch: WorkspacePatch,
+    ) -> Result<CasOutcome<Workspace>> {
+        let now = Utc::now();
+        self.write(|state| state.update_workspace(id, expected, patch, now))
+    }
+
+    async fn workspace(&self, id: WorkspaceId) -> Result<Option<Workspace>> {
+        Ok(self.read(|state| state.workspaces.get(&id).cloned()))
+    }
+
+    async fn upsert_workspace_project(&self, link: &WorkspaceProject) -> Result<()> {
+        self.write(|state| state.upsert_workspace_project(link))
+    }
+
+    async fn remove_workspace_project(
+        &self,
+        workspace: WorkspaceId,
+        project: ProjectId,
+    ) -> Result<()> {
+        self.write(|state| state.remove_workspace_project(workspace, project))
+    }
+
+    async fn workspace_projects(&self, workspace: WorkspaceId) -> Result<Vec<WorkspaceProject>> {
+        Ok(self.read(|state| state.workspace_project_rows(workspace)))
+    }
+
+    async fn upsert_workspace_box_path(&self, path: &WorkspaceBoxPath) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.upsert_workspace_box_path(path, now))
+    }
+
+    async fn workspace_box_paths(&self, workspace: WorkspaceId) -> Result<Vec<WorkspaceBoxPath>> {
+        Ok(self.read(|state| state.workspace_box_path_rows(workspace)))
+    }
+
+    async fn create_project(&self, new: NewProject) -> Result<Project> {
+        let now = Utc::now();
+        self.write(|state| state.create_project(new, now))
+    }
+
+    async fn update_project(
+        &self,
+        id: ProjectId,
+        expected: DateTime<Utc>,
+        patch: ProjectPatch,
+    ) -> Result<CasOutcome<Project>> {
+        let now = Utc::now();
+        self.write(|state| state.update_project(id, expected, patch, now))
+    }
+
+    async fn create_repo(&self, new: NewRepo) -> Result<Repo> {
+        let now = Utc::now();
+        self.write(|state| state.create_repo(new, now))
+    }
+
+    async fn update_repo(
+        &self,
+        id: RepoId,
+        expected: DateTime<Utc>,
+        patch: RepoPatch,
+    ) -> Result<CasOutcome<Repo>> {
+        let now = Utc::now();
+        self.write(|state| state.update_repo(id, expected, patch, now))
+    }
+
+    async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
+        Ok(self.read(|state| state.repo_rows(project)))
+    }
+
+    async fn upsert_repo_box_path(&self, path: &RepoBoxPath) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.upsert_repo_box_path(path, now))
+    }
+
+    async fn repo_box_paths(&self, repo: RepoId) -> Result<Vec<RepoBoxPath>> {
+        Ok(self.read(|state| state.repo_box_path_rows(repo)))
+    }
+
+    async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind> {
+        let now = Utc::now();
+        self.write(|state| state.create_item_kind(new, now))
+    }
+
+    async fn update_item_kind(
+        &self,
+        id: ItemKindId,
+        expected: DateTime<Utc>,
+        patch: ItemKindPatch,
+    ) -> Result<CasOutcome<ItemKind>> {
+        let now = Utc::now();
+        self.write(|state| state.update_item_kind(id, expected, patch, now))
+    }
+
+    async fn item_kinds(&self, project: ProjectId) -> Result<Vec<ItemKind>> {
+        Ok(self.read(|state| state.item_kind_rows(project)))
+    }
+
+    async fn delete_item_kind(&self, id: ItemKindId) -> Result<()> {
+        self.write(|state| state.delete_item_kind(id))
+    }
+
+    async fn create_step_graph(&self, new: NewStepGraph) -> Result<StepGraph> {
+        let now = Utc::now();
+        self.write(|state| state.create_step_graph(new, now))
+    }
+
+    async fn update_step_graph(
+        &self,
+        id: StepGraphId,
+        expected: DateTime<Utc>,
+        patch: StepGraphPatch,
+    ) -> Result<CasOutcome<StepGraph>> {
+        let now = Utc::now();
+        self.write(|state| state.update_step_graph(id, expected, patch, now))
+    }
+
+    async fn step_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
+        Ok(self.read(|state| state.step_graph_rows(project)))
+    }
+
+    async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
+        let now = Utc::now();
+        self.write(|state| state.create_phase(phase, now))
+    }
+
+    async fn update_phase(
+        &self,
+        id: PhaseId,
+        expected: DateTime<Utc>,
+        patch: PhasePatch,
+    ) -> Result<CasOutcome<StepGraphPhase>> {
+        let now = Utc::now();
+        self.write(|state| state.update_phase(id, expected, patch, now))
+    }
+
+    async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
+        Ok(self.read(|state| state.phase_rows(graph)))
+    }
+
+    async fn set_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+        value: Value,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<StoredSetting>> {
+        let now = Utc::now();
+        self.write(|state| state.set_setting(rung, key, value, expected, now))
+    }
+
+    async fn clear_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<StoredSetting>> {
+        let now = Utc::now();
+        self.write(|state| state.clear_setting(rung, key, expected, now))
+    }
+
+    async fn setting(&self, rung: SettingRung, key: SettingKey) -> Result<Option<StoredSetting>> {
+        if let Some(refusal) = rung_refusal(key, rung.flag()) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        Ok(self.read(|state| state.stored_setting(rung, key)))
+    }
+
+    async fn delete_reach(&self, target: DeleteTarget) -> Result<Option<DeleteReach>> {
+        Ok(self.read(|state| match target {
+            DeleteTarget::Workspace(id) => state.workspace_reach(id),
+            DeleteTarget::Project(id) => state.project_reach(id).map(|(reach, _)| reach),
+        }))
+    }
+
+    async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach> {
+        self.write(|state| state.delete_workspace(id))
+    }
+
+    async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
+        self.write(|state| state.delete_project(id))
     }
 }
 

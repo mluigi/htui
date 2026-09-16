@@ -41,7 +41,7 @@ pub use estimate::TokenEstimator;
 pub use excerpt::ExcerptSet;
 pub use settings::{
     Budget, BudgetSource, DEFAULTS, Defaults, Rungs, SPECS, SettingKey, SettingKind, SettingSpec,
-    validate,
+    rung_refusal, validate,
 };
 pub use template::{ParsedTemplate, Placeholder, Span, TemplateError, TemplateRole, parse};
 pub use trim::{Section, SectionEntry, TrimRecord, TrimStrategy};

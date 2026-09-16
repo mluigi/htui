@@ -430,6 +430,18 @@ pub const SPECS: [SettingSpec; 10] = [
     },
 ];
 
+/// [`validate`]'s first check on its own: `Some` is the sentence to refuse with, `None` is "this
+/// rung accepts this key".
+///
+/// Separate because `clear_setting` and `setting` have the same rule and no value to validate
+/// (plan D8), and a store that spelled the refusal itself would be a second sentence for a fact
+/// this one already states — the drift the four text helpers in
+/// [`store::traits`](crate::store::traits) exist to prevent.
+#[must_use]
+pub fn rung_refusal(key: SettingKey, at: Rungs) -> Option<String> {
+    (!key.spec().rungs.contains(at)).then(|| format!("`{key}` is not accepted on the {at} rung"))
+}
+
 /// Refuses what the reader would clamp or ignore (plan D7, D8), in order: rung, kind, range,
 /// `not_above`.
 ///
@@ -457,8 +469,8 @@ pub fn validate(
     peer: Option<&Value>,
 ) -> Result<(), String> {
     let spec = key.spec();
-    if !spec.rungs.contains(at) {
-        return Err(format!("`{key}` is not accepted on the {at} rung"));
+    if let Some(refusal) = rung_refusal(key, at) {
+        return Err(refusal);
     }
 
     // The phase rung is one `INTEGER` column, so it narrows the spec's own ceiling rather than
