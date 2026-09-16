@@ -3059,7 +3059,9 @@ async fn settings_app_rung_validates_and_cas<S: WriteStore>(store: &S) {
 /// PRD's "`project.settings` loses nothing": one key is merged in, every other key comes back
 /// equal, and the clear takes only what it wrote. The `mem.rs` twin
 /// `set_setting_project_rung_leaves_unknown_keys_byte_identical` asserts the stronger byte
-/// identity, which JSONB's key normalisation makes unassertable across both stores.
+/// identity, which JSONB's key normalisation makes unassertable across both stores; the Postgres
+/// twin is `pg_criteria.rs::set_setting_project_rung_changes_only_settings_and_updated_at`, which
+/// diffs the whole row to prove the merge touches nothing but `settings` and `updated_at`.
 async fn settings_project_rung_merges_keys<S: WriteStore>(store: &S) {
     const CASE: &str = "settings_project_rung_merges_keys";
     let rung = SettingRung::Project(ids::PROJECT_HTUI);
