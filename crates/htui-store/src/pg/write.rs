@@ -19,13 +19,14 @@ use chrono::{DateTime, Utc};
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Isolation, Item, ItemId, ItemKind, ItemKindId,
     ItemKindPatch, ItemPatch, ItemRevision, NewItem, NewItemKind, NewProject, NewRepo,
-    NewStepGraph, NewWorkspace, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, Repo,
-    RepoBoxPath, RepoId, RepoPatch, RunId, RunStatus, SessionEvent, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject,
+    NewStepGraph, NewWorkspace, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, RunId, RunStatus, SessionEvent, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, UserId, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
-use htui_core::prompt::TemplateRole;
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
+use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
+use htui_core::seed;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung, StoreError,
     StoredSetting, UpdateOutcome, WriteStore, chat_step_status, expected_on_row,
@@ -1040,18 +1041,19 @@ impl WriteStore for PgStore {
 
     // project
 
-    /// The project row alone: `settings` takes the column default `{}` and the two secret columns
-    /// are MOD-10's (D9).
+    /// The project row and, in the same transaction, the thirty-five rows [`seed_project`] gives
+    /// every project: five default graphs, their fifteen phases, five kinds and the ten
+    /// `DEFAULT_TEMPLATES` at version 1 (M1 D9, M2 D4). `settings` takes the column default `{}`
+    /// and the two secret columns are MOD-10's.
     ///
-    /// One statement inside an explicit transaction, which is the whole point of the shape: MOD-15
-    /// milestone 2 adds its thirty-five seed inserts between the insert and the commit, so a
-    /// project that fails to seed never existed. Until then the transaction wraps one statement and
-    /// costs a round trip.
+    /// The explicit transaction is what makes "a project that fails to seed never existed" true
+    /// rather than aspirational; `item_key_counter` is not among the rows, because
+    /// [`mint_item`](WriteStore::mint_item) creates that one on first use (M2 D5).
     ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`] when `slug` is taken (`23505`) or `created_by` names no
-    /// `app_user` row (`23503`).
+    /// `app_user` row (`23503`) — both on the first statement, before any seed row.
     async fn create_project(&self, new: NewProject) -> Result<Project> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
@@ -1080,6 +1082,8 @@ impl WriteStore for PgStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(map_sqlx)?;
+
+        seed_project(&mut tx, created.id, created.created_by).await?;
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(created)
@@ -2107,6 +2111,125 @@ impl WriteStore for PgStore {
             "rows the cascade would take",
         )))
     }
+}
+
+/// The thirty-five rows a project is born with (MOD-15 D9/D10), on the caller's transaction.
+///
+/// Graphs first, then each graph's phases, then the kind (`item_kind.default_graph_id` is
+/// `NOT NULL REFERENCES step_graph`, `0001_init.sql:288`), then the templates, which reference
+/// only the project and its creator. Every non-timestamp column is bound — `gate_hard` and
+/// `input_kinds` included, where they happen to equal the column default — so [`seed::KINDS`] is
+/// the whole truth and a later migration's default cannot re-seed by omission.
+///
+/// The timestamp columns are the database's: `created_at` and `updated_at` on `step_graph` and
+/// `prompt_template`, `updated_at` alone on `step_graph_phase` and `item_kind`, all `DEFAULT now()`
+/// (`0001_init.sql:214-295`); the `now` the row constructors take is discarded here. No
+/// `RETURNING`: nothing reads a seed row before the commit.
+///
+/// None of [`create_step_graph`](WriteStore::create_step_graph),
+/// [`create_phase`](WriteStore::create_phase) or
+/// [`create_item_kind`](WriteStore::create_item_kind) is reused: each runs on the pool rather than
+/// on this transaction, so `create_item_kind`'s `EXISTS` guard would read through the pool, where
+/// the graph inserted two statements ago is still invisible.
+async fn seed_project(
+    tx: &mut PgConnection,
+    project_id: ProjectId,
+    created_by: UserId,
+) -> Result<()> {
+    // For the row constructors only; every timestamp column takes the server's clock.
+    let now = Utc::now();
+
+    for (position, kind) in seed::KINDS.iter().enumerate() {
+        let graph = seed::graph_row(StepGraphId::new(), project_id, kind, now);
+        sqlx::query!(
+            "INSERT INTO step_graph (id, project_id, name, description) VALUES ($1, $2, $3, $4)",
+            graph.id.as_uuid(),
+            graph.project_id.as_uuid(),
+            graph.name,
+            graph.description,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        for (phase_position, phase) in kind.phases.iter().enumerate() {
+            let row = seed::phase_row(PhaseId::new(), graph.id, phase_position as i32, phase, now);
+            sqlx::query!(
+                "INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, \
+                 gate_hard, retry_limit, input_kinds, output_kind, isolation, command_queue, \
+                 verify_command, template_name, template_version, token_budget) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                row.id.as_uuid(),
+                row.graph_id.as_uuid(),
+                row.position,
+                row.name,
+                row.fan_out,
+                row.gate.as_str(),
+                row.gate_hard,
+                row.retry_limit,
+                &row.input_kinds[..],
+                row.output_kind,
+                row.isolation.map(Isolation::as_str),
+                row.command_queue.as_str(),
+                row.verify_command.as_deref(),
+                row.template_name,
+                row.template_version,
+                row.token_budget,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        let kind_row = seed::kind_row(
+            ItemKindId::new(),
+            project_id,
+            graph.id,
+            position as i32,
+            kind,
+            now,
+        );
+        sqlx::query!(
+            "INSERT INTO item_kind (id, project_id, prefix, name, description, default_graph_id, \
+             position) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            kind_row.id.as_uuid(),
+            kind_row.project_id.as_uuid(),
+            kind_row.prefix,
+            kind_row.name,
+            kind_row.description,
+            kind_row.default_graph_id.as_uuid(),
+            kind_row.position,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    }
+
+    for (name, _, body) in &DEFAULT_TEMPLATES {
+        let row = seed::template_row(
+            PromptTemplateId::new(),
+            project_id,
+            name,
+            body,
+            created_by,
+            now,
+        );
+        sqlx::query!(
+            "INSERT INTO prompt_template (id, project_id, name, version, body, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            row.id.as_uuid(),
+            row.project_id.as_uuid(),
+            row.name,
+            row.version,
+            row.body,
+            row.created_by.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    }
+
+    Ok(())
 }
 
 /// The refusal a delete gets after [`DELETE_ATTEMPTS`] serialization failures (review M1).
