@@ -18,11 +18,12 @@ use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, ItemFilter, ItemId, ItemKindId, ItemPatch, NewItem,
-    NewWorkspace, ProjectId, Status, StepId, Transport, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch,
+    Agent, AgentBox, AgentId, Billing, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
+    NewItem, NewProject, NewWorkspace, ProjectId, Status, StepId, Transport, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
+use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, UpdateOutcome,
     WriteStore as _,
@@ -30,7 +31,7 @@ use htui_core::store::{
 use htui_store::PgStore;
 use sqlx::Row as _;
 use sqlx::postgres::PgPool;
-use sqlx::{Connection as _, PgConnection};
+use sqlx::{AssertSqlSafe, Connection as _, PgConnection};
 
 /// The prefix the concurrency cases mint under: its own `item_kind`, so the counter starts empty
 /// and the expected numbers are `1..=n` rather than "whatever the fixture left".
@@ -84,6 +85,34 @@ async fn counter(pool: &PgPool, project: ProjectId, prefix: &str) -> Option<i32>
     .fetch_optional(pool)
     .await
     .expect("read item_key_counter")
+}
+
+/// A fresh project authored by the fixture user, the one `app_user` the demo database keeps.
+///
+/// `demo_db` deletes the seeded user (`testkit.rs:170-193`), so `ids::USER` is the only value
+/// `project.created_by` can take here without a `23503`.
+fn fresh_project(slug: &str) -> NewProject {
+    NewProject {
+        id: ProjectId::new(),
+        slug: slug.to_owned(),
+        name: slug.to_uppercase(),
+        description: String::new(),
+        created_by: ids::USER,
+    }
+}
+
+/// How many rows of `table` carry `project_id = project`.
+///
+/// Runtime-checked rather than `query!`, like the other reads this file adds: a new `query!`
+/// string would need a `cargo sqlx prepare` pass, and `.sqlx/` belongs to the crate, not to a
+/// test. `table` is one of four literals from the bodies below and never comes from input.
+async fn rows_of(pool: &PgPool, table: &str, project: ProjectId) -> i64 {
+    let sql = format!("SELECT count(*) FROM \"{table}\" WHERE project_id = $1");
+    sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql))
+        .bind(project.as_uuid())
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("count {table}: {error}"))
 }
 
 /// How many `item_revision` rows one item has.
@@ -2874,6 +2903,183 @@ async fn a_mint_racing_a_kind_delete_still_names_what_holds_it() {
         still_there, 1,
         "the refused delete removed nothing, so the item that holds it still has its kind"
     );
+
+    db.drop_db().await;
+}
+
+/// MOD-15 D4's template rows, which no `WriteStore` reader returns: ten per project, named by
+/// `DEFAULT_TEMPLATES`, body `body_of(name)`, version 1, `created_by` the creator's.
+///
+/// The Postgres twin of `store::mem`'s test of the same name. `project_create_seeds_the_catalogue`
+/// counts the ten through `delete_reach`; what it cannot see is the *content*, and on this backend
+/// it also cannot see that `created_at` and `updated_at` are the server's - both default in one
+/// statement, so an equal pair is what says the seeder bound neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn seeded_templates_carry_the_shipped_bodies() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let project = db
+        .store
+        .create_project(fresh_project("seeded"))
+        .await
+        .expect("the create lands");
+
+    // `step_graph_phase` has no `project_id`; its fifteen are the conformance case's (e).
+    assert_eq!(
+        rows_of(&db.pool, "prompt_template", project.id).await,
+        10,
+        "ten template rows on the table itself"
+    );
+    assert_eq!(rows_of(&db.pool, "step_graph", project.id).await, 5);
+    assert_eq!(rows_of(&db.pool, "item_kind", project.id).await, 5);
+
+    let rows = db
+        .store
+        .prompt_templates(project.id)
+        .await
+        .expect("the inherent reader answers");
+    let mut expected: Vec<&str> = DEFAULT_TEMPLATES.iter().map(|(name, ..)| *name).collect();
+    expected.sort_unstable();
+    assert_eq!(
+        rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+        expected,
+        "ten rows, one per default template, in the reader's name-byte order"
+    );
+    for row in &rows {
+        assert_eq!(
+            Some(row.body.as_str()),
+            body_of(&row.name),
+            "`{}` body",
+            row.name
+        );
+        assert_eq!(row.version, 1, "`{}` is version 1", row.name);
+        assert_eq!(row.created_by, ids::USER, "`{}` is the creator's", row.name);
+        assert_eq!(row.project_id, project.id);
+        assert_eq!(
+            row.created_at, row.updated_at,
+            "`{}` untouched since the insert, both columns the server's",
+            row.name
+        );
+    }
+
+    db.drop_db().await;
+}
+
+/// MOD-15 D5 on the table itself: `item_key_counter` has no row for a project until its first
+/// mint, and then exactly one, for the prefix that minted.
+///
+/// The Postgres twin of `store::mem`'s test of the same name. `FEAT-1` rather than `FEAT-2` is the
+/// user-visible half and the conformance case pins it; the row count is what says the seeder never
+/// took §7.1's `ON CONFLICT` path on its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn seed_never_writes_a_counter_row() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let project = db
+        .store
+        .create_project(fresh_project("lazy"))
+        .await
+        .expect("the create lands");
+
+    assert_eq!(
+        rows_of(&db.pool, "item_key_counter", project.id).await,
+        0,
+        "no counter row of any prefix after the create"
+    );
+    assert_eq!(counter(&db.pool, project.id, "FEAT").await, None);
+
+    let feat = db
+        .store
+        .item_kinds(project.id)
+        .await
+        .expect("kinds read")
+        .into_iter()
+        .find(|kind| kind.prefix == "FEAT")
+        .expect("the seeded FEAT kind");
+    let minted = db
+        .store
+        .mint_item(NewItem {
+            project_id: project.id,
+            kind_id: feat.id,
+            ..race_item(feat.id, "first")
+        })
+        .await
+        .expect("the first mint lands");
+    assert_eq!(minted.key, "FEAT-1");
+    assert_eq!(
+        counter(&db.pool, project.id, "FEAT").await,
+        Some(1),
+        "the row exists only after the mint"
+    );
+    assert_eq!(
+        rows_of(&db.pool, "item_key_counter", project.id).await,
+        1,
+        "and only for the prefix that minted"
+    );
+
+    db.drop_db().await;
+}
+
+/// PRD D12's third fact: the counter row of the **old** prefix survives a rename.
+///
+/// The Postgres twin of `store::mem`'s test of the same name.
+/// `item_kind_round_trip_and_prefix_rules` pins the other two (old key text kept, `ANL-1` next) on
+/// both stores; no trait reader sees `item_key_counter`, so this one is per backend. It runs on
+/// the fixture's `htui` project, whose `ANA` counter stands at 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn renamed_prefix_leaves_the_old_counter_row() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let project = ids::PROJECT_HTUI;
+    assert_eq!(
+        counter(&db.pool, project, "ANA").await,
+        Some(2),
+        "the fixture minted ANA-1 and ANA-2"
+    );
+
+    let ana = db
+        .store
+        .item_kinds(project)
+        .await
+        .expect("kinds read")
+        .into_iter()
+        .find(|kind| kind.id == ids::KIND_HTUI_ANA)
+        .expect("the fixture kind");
+    let renamed = db
+        .store
+        .update_item_kind(
+            ana.id,
+            ana.updated_at,
+            ItemKindPatch {
+                prefix: Some("ANL".to_owned()),
+                ..ItemKindPatch::default()
+            },
+        )
+        .await
+        .expect("the rename lands");
+    assert!(matches!(renamed, CasOutcome::Applied(_)));
+    assert_eq!(
+        counter(&db.pool, project, "ANA").await,
+        Some(2),
+        "the old row is history, not garbage"
+    );
+    assert_eq!(
+        counter(&db.pool, project, "ANL").await,
+        None,
+        "nothing minted under the new prefix yet"
+    );
+
+    let minted = db
+        .store
+        .mint_item(race_item(ids::KIND_HTUI_ANA, "after the rename"))
+        .await
+        .expect("the mint lands");
+    assert_eq!(minted.key, "ANL-1");
+    assert_eq!(counter(&db.pool, project, "ANL").await, Some(1));
+    assert_eq!(counter(&db.pool, project, "ANA").await, Some(2), "still");
 
     db.drop_db().await;
 }

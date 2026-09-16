@@ -2336,7 +2336,9 @@ async fn project_delete_takes_everything_and_says_so<S: WriteStore>(store: &S) {
 ///
 /// Template *content* and the counter's absence are per-backend facts no trait reader returns:
 /// `mem.rs::seeded_templates_carry_the_shipped_bodies` and
-/// `mem.rs::seed_never_writes_a_counter_row`.
+/// `mem.rs::seed_never_writes_a_counter_row`; on Postgres,
+/// `pg_criteria.rs::seeded_templates_carry_the_shipped_bodies` and
+/// `pg_criteria.rs::seed_never_writes_a_counter_row`.
 async fn project_create_seeds_the_catalogue<S: WriteStore>(store: &S) {
     const CASE: &str = "project_create_seeds_the_catalogue";
     /// One phase of the table below: `(name, input_kinds, gate_hard)`, the three columns D3
@@ -2729,7 +2731,8 @@ async fn repo_round_trip_and_primary_flag<S: WriteStore>(store: &S) {
 /// counter survives, and the next mint under the kind starts the new prefix at 1.
 ///
 /// The middle fact is the one no trait reader can see, so it is asserted per backend, which
-/// `mem.rs::renamed_prefix_leaves_the_old_counter_row` does by reading `item_key_counter` directly.
+/// `mem.rs::renamed_prefix_leaves_the_old_counter_row` does by reading `item_key_counter` directly
+/// and `pg_criteria.rs::renamed_prefix_leaves_the_old_counter_row` off the table.
 async fn item_kind_round_trip_and_prefix_rules<S: WriteStore>(store: &S) {
     const CASE: &str = "item_kind_round_trip_and_prefix_rules";
     for (label, prefix) in [
