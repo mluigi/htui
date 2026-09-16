@@ -3888,12 +3888,18 @@ pub(crate) mod tests {
         );
     }
 
-    /// An offline backend is no longer refused for *being* offline (milestone 4, D34): it hands
-    /// out `Writer::Buffered` and a chat records to `<cache_dir>/pending/`. What still refuses it
-    /// is a mirror that has nothing in it — a box that has never synced cannot name
-    /// `run.target_box_id`, and the refusal says which row is missing rather than "offline".
+    /// Since MOD-25 an offline backend is refused for *being* offline, and the refusal is one
+    /// fixed sentence: `htui` is online-only, so a box whose Postgres is unreachable browses its
+    /// read-only cache and starts no run (`R-STO-4`). The old milestone-4 behaviour — hand out
+    /// `Writer::Buffered` and record into `<cache_dir>/pending/` — is withdrawn.
+    ///
+    /// Three facts, and the sentence is asserted by **equality**, not `contains`: it is the
+    /// contract the status line and the Chat body both render, so a reword is a deliberate change
+    /// and not a silent one. The refusal is answered under the `chat_start` request name, and
+    /// nothing was started — no step, so no driver was spawned to write into a buffer nobody
+    /// reads.
     #[tokio::test]
-    async fn an_offline_backend_with_an_empty_mirror_refuses_and_names_what_is_missing() {
+    async fn an_offline_backend_refuses_a_chat_with_the_unreachable_warning() {
         let root = tempfile::tempdir().expect("temp root");
         let cache = htui_store::CacheStore::open(root.path(), "chat-test", 1)
             .await
@@ -3903,8 +3909,8 @@ pub(crate) mod tests {
             since: None,
         };
         assert!(
-            backend.writer().is_some(),
-            "the offline write path is the buffer, not a refusal"
+            backend.writer().is_none(),
+            "since MOD-25 the offline write path is a refusal, not the buffer"
         );
 
         let mut runtime = AgentRuntime::new(DriverFactory::new());
@@ -3915,13 +3921,19 @@ pub(crate) mod tests {
         match served {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "chat_start");
-                assert!(
-                    message.contains("box") && message.contains("not registered"),
-                    "the refusal names the row this box has never synced: {message}"
+                assert_eq!(
+                    message,
+                    htui_store::DATABASE_UNREACHABLE,
+                    "the sentence is the contract, word for word"
                 );
             }
-            other => panic!("a chat with no box row must be refused: {other:?}"),
+            other => panic!("an offline chat must be refused: {other:?}"),
         }
+        assert!(
+            runtime.steps().is_empty(),
+            "a refused chat starts no step: {:?}",
+            runtime.steps()
+        );
         cache.close().await;
     }
 
