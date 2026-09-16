@@ -19,9 +19,11 @@ use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, ItemFilter, ItemId, ItemKindId, ItemPatch, NewItem,
-    ProjectId, Status, StepId, Transport,
+    NewWorkspace, ProjectId, Status, StepId, Transport, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch,
 };
-use htui_core::store::{ReadStore as _, UpdateOutcome, WriteStore as _};
+use htui_core::prompt::settings::SettingKey;
+use htui_core::store::{CasOutcome, ReadStore as _, SettingRung, UpdateOutcome, WriteStore as _};
 use htui_store::PgStore;
 use sqlx::Row as _;
 use sqlx::postgres::PgPool;
@@ -2160,6 +2162,264 @@ async fn inherent_prompt_reads_answer_the_fixture() {
             .await
             .expect("MemStore::item_kind"),
         "the two backends answer the same row"
+    );
+
+    db.drop_db().await;
+}
+
+/// D3's token is the migration's `BEFORE UPDATE` trigger's, and nothing a caller sends can become
+/// one.
+///
+/// `store::conformance`'s `workspace_round_trip_and_cas` can say the token *advanced*; only SQL can
+/// say **who advanced it**. Three claims Postgres alone can carry: the stamp a write leaves lies
+/// strictly between two server-side `clock_timestamp()` readings taken around it, so it is the
+/// server's clock rather than the client's; two writes in a row leave two distinct, strictly
+/// increasing stamps; and an `updated_at` the caller puts in the row it hands to
+/// `upsert_workspace_box_path` is discarded rather than stored - which is what "no write path may
+/// set `updated_at` by hand" (`0001_init.sql:567`) means from the outside.
+///
+/// The App settings rung is included because its `UPDATE app_setting SET value = $2` names one
+/// column and still moves the token: `app_setting` is in the trigger loop (`0001_init.sql:577`).
+#[tokio::test(flavor = "multi_thread")]
+async fn cas_tokens_advance_by_the_trigger_alone() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    /// The server's wall clock, read on a pooled connection of its own.
+    async fn server_now(pool: &PgPool) -> DateTime<Utc> {
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+            .fetch_one(pool)
+            .await
+            .expect("the server answers its own clock")
+    }
+
+    /// `CasOutcome::Applied`'s row, or a panic naming what came back instead.
+    fn applied<T: std::fmt::Debug>(outcome: CasOutcome<T>) -> T {
+        match outcome {
+            CasOutcome::Applied(row) => row,
+            CasOutcome::Stale(row) => panic!("expected Applied, got Stale({row:?})"),
+        }
+    }
+
+    let created = db
+        .store
+        .create_workspace(NewWorkspace {
+            id: WorkspaceId::new(),
+            slug: "trigger".to_owned(),
+            name: "Trigger".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the create lands");
+
+    let rename = |name: &str| WorkspacePatch {
+        name: Some(name.to_owned()),
+        ..WorkspacePatch::default()
+    };
+
+    let opened = server_now(&db.pool).await;
+    let first = applied(
+        db.store
+            .update_workspace(created.id, created.updated_at, rename("First"))
+            .await
+            .expect("the first edit lands"),
+    );
+    let closed = server_now(&db.pool).await;
+
+    assert!(
+        first.updated_at > opened && first.updated_at < closed,
+        "the token is the server's clock_timestamp(), taken while the statement ran: \
+         {opened} < {} < {closed}",
+        first.updated_at
+    );
+    assert_ne!(
+        first.updated_at, created.updated_at,
+        "the token the caller edited from is not the token it edits into"
+    );
+
+    let second = applied(
+        db.store
+            .update_workspace(first.id, first.updated_at, rename("Second"))
+            .await
+            .expect("the second edit lands"),
+    );
+    assert!(
+        second.updated_at > first.updated_at,
+        "two writes in a row leave two distinct tokens, so neither can be replayed"
+    );
+
+    // A caller that fills `updated_at` in the row it hands over is writing into a column the
+    // trigger and the column default own; the year 2000 is there to be conspicuous if it landed.
+    let caller_stamp =
+        DateTime::<Utc>::from_timestamp(946_684_800, 0).expect("2000-01-01 is a date");
+    let before_path = server_now(&db.pool).await;
+    db.store
+        .upsert_workspace_box_path(&WorkspaceBoxPath {
+            workspace_id: second.id,
+            box_id: ids::BOX,
+            root_path: "/srv/trigger".to_owned(),
+            updated_at: caller_stamp,
+        })
+        .await
+        .expect("the path insert lands");
+    let stored = db
+        .store
+        .workspace_box_paths(second.id)
+        .await
+        .expect("the read-back")
+        .pop()
+        .expect("the row that was just written");
+    assert!(
+        stored.updated_at > before_path,
+        "the caller's {caller_stamp} was discarded for the server's own stamp, got {}",
+        stored.updated_at
+    );
+
+    let token = db
+        .store
+        .setting(SettingRung::App, SettingKey::TokenBudget)
+        .await
+        .expect("the App rung read")
+        .expect("migration 0002 seeds token_budget");
+    let opened = server_now(&db.pool).await;
+    let written = applied(
+        db.store
+            .set_setting(
+                SettingRung::App,
+                SettingKey::TokenBudget,
+                serde_json::json!(90_000),
+                Some(token.updated_at),
+            )
+            .await
+            .expect("the App rung write lands"),
+    );
+    let closed = server_now(&db.pool).await;
+    assert!(
+        written.updated_at > opened && written.updated_at < closed,
+        "`UPDATE app_setting SET value = $2` names one column and the trigger still moves the \
+         token: {opened} < {} < {closed}",
+        written.updated_at
+    );
+
+    db.drop_db().await;
+}
+
+/// The `Project` rung merges **one key** and touches **one other column**: the whole `project` row
+/// is diffed as `jsonb` before and after, and only `settings` and `updated_at` may differ (D7, D8).
+///
+/// `store::conformance`'s `settings_project_rung_merges_keys` asserts per-key equality of the
+/// settings document, because JSONB's own normalisation makes byte identity unassertable across
+/// `MemStore` and `PgStore`; `store::mem`'s
+/// `set_setting_project_rung_leaves_unknown_keys_byte_identical` is the memory half. This is the
+/// Postgres half, and it can say two things neither of those can: that no **other column** of
+/// `project` moved - `slug`, `name`, `secret_provider`, `created_by` and the rest - and that a
+/// clear puts the document back to the same JSONB it found, which is byte identity on this side of
+/// the seam.
+///
+/// The whole row rather than a chosen column list, for the reason
+/// `set_step_prompt_writes_only_the_digest_and_the_record` gives: a column a later migration adds
+/// is covered without anyone remembering to extend this.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_setting_project_rung_changes_only_settings_and_updated_at() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let id = ids::PROJECT_HTUI;
+    let rung = SettingRung::Project(id);
+
+    /// The `project` row as a JSON object, so two of them can be diffed key by key.
+    async fn row(pool: &PgPool, id: ProjectId) -> serde_json::Map<String, serde_json::Value> {
+        let row = sqlx::query("SELECT to_jsonb(p) AS row FROM project p WHERE p.id = $1")
+            .bind(id.as_uuid())
+            .fetch_one(pool)
+            .await
+            .expect("the fixture project is there");
+        match row.get::<serde_json::Value, _>("row") {
+            serde_json::Value::Object(map) => map,
+            other => panic!("to_jsonb of a row is an object, got {other}"),
+        }
+    }
+
+    /// The `settings` column of such a row, which every fixture project seeds as an object.
+    fn settings(row: &serde_json::Map<String, serde_json::Value>) -> &serde_json::Value {
+        row.get("settings").expect("project.settings is a column")
+    }
+
+    let project = db
+        .store
+        .project(id)
+        .await
+        .expect("the project read")
+        .expect("the fixture project");
+    let before = row(&db.pool, id).await;
+    assert!(
+        settings(&before)
+            .as_object()
+            .is_some_and(|map| !map.is_empty()),
+        "the fixture seeds keys this write must not disturb"
+    );
+
+    let written = match db
+        .store
+        .set_setting(
+            rung,
+            SettingKey::UpstreamHops,
+            serde_json::json!(2),
+            Some(project.updated_at),
+        )
+        .await
+        .expect("the merge lands")
+    {
+        CasOutcome::Applied(row) => row,
+        CasOutcome::Stale(row) => panic!("expected Applied, got Stale({row:?})"),
+    };
+    let after = row(&db.pool, id).await;
+
+    let mut changed: Vec<&str> = before
+        .keys()
+        .chain(after.keys())
+        .map(String::as_str)
+        .filter(|key| before.get(*key) != after.get(*key))
+        .collect();
+    changed.sort_unstable();
+    changed.dedup();
+    assert_eq!(
+        changed,
+        vec!["settings", "updated_at"],
+        "the one column D7 writes, plus the migration's `BEFORE UPDATE` trigger's own"
+    );
+
+    let before_keys = settings(&before).as_object().expect("an object").clone();
+    let after_keys = settings(&after).as_object().expect("an object").clone();
+    assert_eq!(
+        after_keys.get("upstream_hops"),
+        Some(&serde_json::json!(2)),
+        "the project rung writes the key `resolve_hops` reads, not the App key (flag A)"
+    );
+    assert_eq!(
+        after_keys.len(),
+        before_keys.len() + 1,
+        "one key was added and none was replaced"
+    );
+    for (key, value) in &before_keys {
+        assert_eq!(
+            after_keys.get(key),
+            Some(value),
+            "`{key}` survived the merge unchanged"
+        );
+    }
+
+    db.store
+        .clear_setting(rung, SettingKey::UpstreamHops, written.updated_at)
+        .await
+        .expect("the clear lands");
+    let cleared = row(&db.pool, id).await;
+    assert_eq!(
+        settings(&cleared),
+        settings(&before),
+        "`settings - key` puts the document back to the JSONB it found, byte for byte"
     );
 
     db.drop_db().await;
