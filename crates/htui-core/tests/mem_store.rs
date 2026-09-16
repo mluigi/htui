@@ -34,9 +34,10 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        23,
+        35,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
-         cases (plans D67 and D74) and milestone 9's `set_step_prompt`"
+         cases (plans D67 and D74), milestone 9's `set_step_prompt` and MOD-15 milestone 1's \
+         twelve, one per entity group (plan D12)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

@@ -13,12 +13,18 @@ use serde_json::{Value, json};
 
 use crate::fixtures::ids;
 use crate::model::{
-    Agent, AgentBox, AgentId, Billing, ChatRunSpec, DocumentId, EventKind, EventRole, ItemFilter,
-    ItemId, ItemKindId, ItemPatch, ItemSummary, LinkKind, NewItem, ProjectId, PromptScope, RunId,
-    RunStatus, Scope, SessionEvent, Status, StepId, Transport, UpstreamEntry, UserId,
+    Agent, AgentBox, AgentId, Billing, ChatRunSpec, CommandQueue, DocumentId, EventKind, EventRole,
+    Gate, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewItem,
+    NewItemKind, NewProject, NewRepo, NewStepGraph, NewWorkspace, PhaseId, PhasePatch, ProjectId,
+    ProjectPatch, PromptScope, RepoBoxPath, RepoId, RepoPatch, RunId, RunStatus, Scope,
+    SessionEvent, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, Transport,
+    UpstreamEntry, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
+use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
-use crate::store::traits::{ReadStore, UpdateOutcome, WriteStore};
+use crate::store::traits::{
+    CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, UpdateOutcome, WriteStore,
+};
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
 pub const CASES: &[&str] = &[
@@ -45,6 +51,18 @@ pub const CASES: &[&str] = &[
     "set_agent_box_quota_updates_two_columns_or_not_found",
     "upsert_agent_box_cannot_write_quota",
     "set_step_prompt_writes_digest_and_trim",
+    "workspace_round_trip_and_cas",
+    "workspace_links_and_box_paths_upsert",
+    "workspace_delete_reports_its_reach",
+    "project_create_update_cas",
+    "project_delete_takes_everything_and_says_so",
+    "repo_round_trip_and_primary_flag",
+    "item_kind_round_trip_and_prefix_rules",
+    "item_kind_delete_refused_while_referenced",
+    "step_graph_and_phase_round_trip",
+    "settings_app_rung_validates_and_cas",
+    "settings_project_rung_merges_keys",
+    "settings_phase_rung_writes_token_budget_only",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -86,6 +104,28 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "upsert_agent_box_cannot_write_quota" => upsert_agent_box_cannot_write_quota(store).await,
         "set_step_prompt_writes_digest_and_trim" => {
             set_step_prompt_writes_digest_and_trim(store).await;
+        }
+        "workspace_round_trip_and_cas" => workspace_round_trip_and_cas(store).await,
+        "workspace_links_and_box_paths_upsert" => {
+            workspace_links_and_box_paths_upsert(store).await;
+        }
+        "workspace_delete_reports_its_reach" => workspace_delete_reports_its_reach(store).await,
+        "project_create_update_cas" => project_create_update_cas(store).await,
+        "project_delete_takes_everything_and_says_so" => {
+            project_delete_takes_everything_and_says_so(store).await;
+        }
+        "repo_round_trip_and_primary_flag" => repo_round_trip_and_primary_flag(store).await,
+        "item_kind_round_trip_and_prefix_rules" => {
+            item_kind_round_trip_and_prefix_rules(store).await;
+        }
+        "item_kind_delete_refused_while_referenced" => {
+            item_kind_delete_refused_while_referenced(store).await;
+        }
+        "step_graph_and_phase_round_trip" => step_graph_and_phase_round_trip(store).await,
+        "settings_app_rung_validates_and_cas" => settings_app_rung_validates_and_cas(store).await,
+        "settings_project_rung_merges_keys" => settings_project_rung_merges_keys(store).await,
+        "settings_phase_rung_writes_token_budget_only" => {
+            settings_phase_rung_writes_token_budget_only(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -1720,6 +1760,1526 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
             })
         ),
         "set_step_prompt_writes_digest_and_trim: an unknown step is NotFound, got {unknown:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-15 milestone 1: the hierarchy, one case per entity group (plan D12)
+// ------------------------------------------------------------------------------------------------
+
+/// The row a compare-and-set applied, or a panic naming the case.
+///
+/// `Stale` is a legitimate answer of every edit, so unwrapping it inline in twelve cases would
+/// spell the same four lines twelve times and lose the case name from the message.
+fn applied<T: core::fmt::Debug>(case: &str, outcome: CasOutcome<T>) -> T {
+    match outcome {
+        CasOutcome::Applied(row) => row,
+        CasOutcome::Stale(row) => panic!("{case}: expected Applied, got Stale({row:?})"),
+    }
+}
+
+/// The row a spent token found, or a panic naming the case. The mirror of [`applied`].
+fn stale<T: core::fmt::Debug>(case: &str, outcome: CasOutcome<T>) -> T {
+    match outcome {
+        CasOutcome::Stale(row) => row,
+        CasOutcome::Applied(row) => panic!("{case}: expected Stale, got Applied({row:?})"),
+    }
+}
+
+/// A workspace request with a fresh id, authored by the fixture user.
+fn new_workspace(slug: &str) -> NewWorkspace {
+    NewWorkspace {
+        id: WorkspaceId::new(),
+        slug: slug.to_owned(),
+        name: slug.to_uppercase(),
+        description: String::new(),
+        created_by: ids::USER,
+    }
+}
+
+/// A project request with a fresh id, authored by the fixture user.
+fn new_project(slug: &str) -> NewProject {
+    NewProject {
+        id: ProjectId::new(),
+        slug: slug.to_owned(),
+        name: slug.to_uppercase(),
+        description: String::new(),
+        created_by: ids::USER,
+    }
+}
+
+/// A repo request with a fresh id, in the project the caller names.
+fn new_repo(project: ProjectId, name: &str, is_primary: bool) -> NewRepo {
+    NewRepo {
+        id: RepoId::new(),
+        project_id: project,
+        name: name.to_owned(),
+        remote_url: Some(format!("git@example.invalid:{name}.git")),
+        default_branch: "main".to_owned(),
+        is_primary,
+    }
+}
+
+/// A kind request with a fresh id; `graph` is what the D11 cross-project rule is checked against.
+fn new_item_kind(project: ProjectId, prefix: &str, name: &str, graph: StepGraphId) -> NewItemKind {
+    NewItemKind {
+        id: ItemKindId::new(),
+        project_id: project,
+        prefix: prefix.to_owned(),
+        name: name.to_owned(),
+        description: String::new(),
+        default_graph_id: graph,
+        position: 9,
+    }
+}
+
+/// A whole phase row, the shape [`WriteStore::create_phase`] takes (D10). `updated_at` is the
+/// caller's only because the struct has the column; the store's clock overwrites it.
+fn new_phase(graph: StepGraphId, position: i32, name: &str) -> StepGraphPhase {
+    StepGraphPhase {
+        id: PhaseId::new(),
+        graph_id: graph,
+        position,
+        name: name.to_owned(),
+        fan_out: 1,
+        gate: Gate::Always,
+        gate_hard: false,
+        retry_limit: 1,
+        input_kinds: Vec::new(),
+        output_kind: name.to_owned(),
+        isolation: None,
+        command_queue: CommandQueue::FanOutOnly,
+        verify_command: None,
+        template_name: name.to_owned(),
+        template_version: None,
+        token_budget: None,
+        updated_at: Utc::now(),
+    }
+}
+
+/// `project.settings` as an object, or a panic: every fixture project seeds a JSON object and the
+/// key-level merge of D7 is only defined over one.
+fn settings_map(case: &str, settings: &Value) -> serde_json::Map<String, Value> {
+    settings
+        .as_object()
+        .unwrap_or_else(|| panic!("{case}: project.settings is a JSON object, got {settings}"))
+        .clone()
+}
+
+/// D3 on the smallest table: a create, a slug collision, a read-back, one `Applied` and one
+/// `Stale` carrying the current row. `updated_at` is advanced by the store, never by the case.
+async fn workspace_round_trip_and_cas<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_round_trip_and_cas";
+    let created = store
+        .create_workspace(new_workspace("ops"))
+        .await
+        .expect(CASE);
+    assert_eq!(created.slug, "ops", "{CASE}: the request's slug is stored");
+
+    let duplicate = store.create_workspace(new_workspace("ops")).await;
+    assert!(
+        matches!(duplicate, Err(StoreError::Constraint(_))),
+        "{CASE}: a duplicate slug is Constraint, got {duplicate:?}"
+    );
+
+    assert_eq!(
+        store.workspace(created.id).await.expect(CASE).as_ref(),
+        Some(&created),
+        "{CASE}: the read-back is the row the create returned"
+    );
+    assert!(
+        store
+            .workspace(WorkspaceId::new())
+            .await
+            .expect(CASE)
+            .is_none(),
+        "{CASE}: an id nothing has is None, not a default row"
+    );
+
+    let patch = WorkspacePatch {
+        name: Some("Operations".to_owned()),
+        ..WorkspacePatch::default()
+    };
+    let edited = applied(
+        CASE,
+        store
+            .update_workspace(created.id, created.updated_at, patch.clone())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(edited.name, "Operations", "{CASE}: the patch applied");
+    assert!(
+        edited.updated_at > created.updated_at,
+        "{CASE}: the store's clock advances the token, the caller never does"
+    );
+
+    let current = stale(
+        CASE,
+        store
+            .update_workspace(created.id, created.updated_at, patch)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        current, edited,
+        "{CASE}: Stale carries the row as it is now, so the editor can reload"
+    );
+
+    let unknown = store
+        .update_workspace(
+            WorkspaceId::new(),
+            edited.updated_at,
+            WorkspacePatch::default(),
+        )
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "workspace",
+                ..
+            })
+        ),
+        "{CASE}: an unknown id is NotFound, not Stale, got {unknown:?}"
+    );
+}
+
+/// The three tables with no `updated_at` token of their own (D3): a link that repositions, a link
+/// that is removed without taking its project, and a per-box path that is replaced in place.
+async fn workspace_links_and_box_paths_upsert<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_links_and_box_paths_upsert";
+    let workspace = store
+        .create_workspace(new_workspace("links"))
+        .await
+        .expect(CASE);
+
+    let link = |project: ProjectId, position: i32| WorkspaceProject {
+        workspace_id: workspace.id,
+        project_id: project,
+        position,
+    };
+    store
+        .upsert_workspace_project(&link(ids::PROJECT_HTUI, 5))
+        .await
+        .expect(CASE);
+    store
+        .upsert_workspace_project(&link(ids::PROJECT_AGY, 1))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store
+            .workspace_projects(workspace.id)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| (row.project_id, row.position))
+            .collect::<Vec<_>>(),
+        vec![(ids::PROJECT_AGY, 1), (ids::PROJECT_HTUI, 5)],
+        "{CASE}: links come back in position order"
+    );
+
+    store
+        .upsert_workspace_project(&link(ids::PROJECT_HTUI, 0))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store
+            .workspace_projects(workspace.id)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| (row.project_id, row.position))
+            .collect::<Vec<_>>(),
+        vec![(ids::PROJECT_HTUI, 0), (ids::PROJECT_AGY, 1)],
+        "{CASE}: the second upsert repositions rather than inserting a second row"
+    );
+
+    let unknown_project = store
+        .upsert_workspace_project(&link(ProjectId::new(), 2))
+        .await;
+    assert!(
+        matches!(unknown_project, Err(StoreError::Constraint(_))),
+        "{CASE}: a link to no project is Constraint, got {unknown_project:?}"
+    );
+
+    store
+        .remove_workspace_project(workspace.id, ids::PROJECT_HTUI)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store
+            .workspace_projects(workspace.id)
+            .await
+            .expect(CASE)
+            .len(),
+        1,
+        "{CASE}: only the named link goes"
+    );
+    assert!(
+        store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}: removing a link never removes the project (D4)"
+    );
+    let gone = store
+        .remove_workspace_project(workspace.id, ids::PROJECT_HTUI)
+        .await;
+    assert!(
+        matches!(
+            gone,
+            Err(StoreError::NotFound {
+                entity: "workspace_project",
+                ..
+            })
+        ),
+        "{CASE}: removing a link twice is NotFound, got {gone:?}"
+    );
+
+    let path = |root: &str| WorkspaceBoxPath {
+        workspace_id: workspace.id,
+        box_id: ids::BOX,
+        root_path: root.to_owned(),
+        updated_at: Utc::now(),
+    };
+    store
+        .upsert_workspace_box_path(&path("/srv/first"))
+        .await
+        .expect(CASE);
+    store
+        .upsert_workspace_box_path(&path("/srv/second"))
+        .await
+        .expect(CASE);
+    let paths = store.workspace_box_paths(workspace.id).await.expect(CASE);
+    assert_eq!(
+        paths
+            .iter()
+            .map(|row| (row.box_id, row.root_path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(ids::BOX, "/srv/second")],
+        "{CASE}: the per-box path is replaced in place, never doubled (R-BOX-4)"
+    );
+}
+
+/// D4's first half: a workspace delete reaches its links and its box paths and stops there. The
+/// reach is counted before the act and the act reports the same struct (PRD D13).
+async fn workspace_delete_reports_its_reach<S: WriteStore>(store: &S) {
+    const CASE: &str = "workspace_delete_reports_its_reach";
+    let workspace = store
+        .create_workspace(new_workspace("doomed"))
+        .await
+        .expect(CASE);
+    store
+        .upsert_workspace_project(&WorkspaceProject {
+            workspace_id: workspace.id,
+            project_id: ids::PROJECT_VULKAN,
+            position: 0,
+        })
+        .await
+        .expect(CASE);
+    store
+        .upsert_workspace_box_path(&WorkspaceBoxPath {
+            workspace_id: workspace.id,
+            box_id: ids::BOX,
+            root_path: "/srv/doomed".to_owned(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect(CASE);
+
+    let reach = store
+        .delete_reach(DeleteTarget::Workspace(workspace.id))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: a workspace that exists has a reach"));
+    assert_eq!(
+        reach,
+        DeleteReach {
+            workspace_links: 1,
+            workspace_box_paths: 1,
+            ..DeleteReach::default()
+        },
+        "{CASE}: a workspace reaches its two tables and nothing else"
+    );
+
+    let report = store.delete_workspace(workspace.id).await.expect(CASE);
+    assert_eq!(
+        report, reach,
+        "{CASE}: the counts shown before the act are the counts the act took (PRD D13)"
+    );
+    assert!(
+        store.workspace(workspace.id).await.expect(CASE).is_none(),
+        "{CASE}: the workspace is gone"
+    );
+    assert!(
+        store
+            .project(ids::PROJECT_VULKAN)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}: the project survives its workspace (0001_init.sql:162)"
+    );
+    assert!(
+        store
+            .delete_reach(DeleteTarget::Workspace(workspace.id))
+            .await
+            .expect(CASE)
+            .is_none(),
+        "{CASE}: a target that does not exist has no reach"
+    );
+    let again = store.delete_workspace(workspace.id).await;
+    assert!(
+        matches!(
+            again,
+            Err(StoreError::NotFound {
+                entity: "workspace",
+                ..
+            })
+        ),
+        "{CASE}: a second delete is NotFound, got {again:?}"
+    );
+}
+
+/// D9's create, unseeded, plus D3's compare-and-set. `settings` is `{}` on create and is not
+/// [`WriteStore::update_project`]'s to touch — that column belongs to
+/// [`WriteStore::set_setting`] alone.
+async fn project_create_update_cas<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_create_update_cas";
+    let created = store.create_project(new_project("ops")).await.expect(CASE);
+    assert_eq!(
+        created.settings,
+        json!({}),
+        "{CASE}: a created project carries an empty settings document (D9)"
+    );
+    assert_eq!(
+        (
+            created.secret_provider.as_deref(),
+            created.secret_scope.as_deref()
+        ),
+        (None, None),
+        "{CASE}: the secret columns are MOD-10's and are not written here"
+    );
+
+    let duplicate = store.create_project(new_project("ops")).await;
+    assert!(
+        matches!(duplicate, Err(StoreError::Constraint(_))),
+        "{CASE}: a duplicate slug is Constraint, got {duplicate:?}"
+    );
+    assert_eq!(
+        store.project(created.id).await.expect(CASE).as_ref(),
+        Some(&created),
+        "{CASE}: the read-back is the row the create returned"
+    );
+
+    let patch = ProjectPatch {
+        name: Some("Operations".to_owned()),
+        ..ProjectPatch::default()
+    };
+    let edited = applied(
+        CASE,
+        store
+            .update_project(created.id, created.updated_at, patch.clone())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(edited.name, "Operations", "{CASE}: the patch applied");
+    assert!(
+        edited.updated_at > created.updated_at,
+        "{CASE}: the store's clock advances the token"
+    );
+    assert_eq!(
+        edited.settings,
+        json!({}),
+        "{CASE}: update_project never touches settings"
+    );
+
+    let current = stale(
+        CASE,
+        store
+            .update_project(created.id, created.updated_at, patch)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        current, edited,
+        "{CASE}: Stale carries the row as it is now"
+    );
+
+    let unknown = store
+        .update_project(ProjectId::new(), edited.updated_at, ProjectPatch::default())
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "project",
+                ..
+            })
+        ),
+        "{CASE}: an unknown id is NotFound, got {unknown:?}"
+    );
+}
+
+/// PRD D13's cascade, counted before and reported after, over the fixture's fullest project.
+///
+/// The exact numbers are the fixture's per-project seed (5 kinds, 5 graphs, 15 phases, 10
+/// templates); the rest are asserted non-zero, because a project delete that reported zero runs
+/// while taking two would be the drift this case exists to catch. `phase_agents` and
+/// `run_step_commits` are `0` on both stores: `MemStore` holds neither table and the demo database
+/// seeds neither.
+async fn project_delete_takes_everything_and_says_so<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_delete_takes_everything_and_says_so";
+    let agy_scope = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_AGY],
+    };
+    let agy_before = store
+        .items(&agy_scope, &ItemFilter::default())
+        .await
+        .expect(CASE);
+
+    let reach = store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture project has a reach"));
+    let report = store.delete_project(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(
+        report, reach,
+        "{CASE}: the counts shown before the act are the counts the act took (PRD D13)"
+    );
+
+    assert_eq!(
+        (
+            report.item_kinds,
+            report.step_graphs,
+            report.phases,
+            report.prompt_templates
+        ),
+        (5, 5, 15, 10),
+        "{CASE}: the per-project seed of ANA-9 §5.10 goes whole"
+    );
+    assert_eq!(report.items, 8, "{CASE}: every item of the project");
+    assert_eq!(report.workspace_links, 1, "{CASE}: the Platform membership");
+    assert_eq!(report.skill_bindings, 3, "{CASE}: R-SKL-2's three bindings");
+    assert_eq!(
+        (
+            report.repos,
+            report.repo_box_paths,
+            report.phase_agents,
+            report.run_step_commits,
+            report.workspace_box_paths
+        ),
+        (0, 0, 0, 0, 0),
+        "{CASE}: tables neither store seeds for this project count zero, not one"
+    );
+    for (label, count) in [
+        ("item_key_counters", report.item_key_counters),
+        ("runs", report.runs),
+        ("run_steps", report.run_steps),
+        ("session_events", report.session_events),
+        ("notes", report.notes),
+        ("revisions", report.revisions),
+        ("links", report.links),
+        ("documents", report.documents),
+    ] {
+        assert!(
+            count > 0,
+            "{CASE}: the fixture gives the project {label}, so the report may not be zero"
+        );
+    }
+
+    assert!(
+        store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .is_none(),
+        "{CASE}: the project is gone"
+    );
+    assert_eq!(
+        row_ids(
+            &store
+                .items(&agy_scope, &ItemFilter::default())
+                .await
+                .expect(CASE)
+        ),
+        row_ids(&agy_before),
+        "{CASE}: a sibling project's items are untouched"
+    );
+    assert_eq!(
+        store
+            .links(ids::AGY_FEAT_1, 1)
+            .await
+            .expect(CASE)
+            .nodes
+            .into_iter()
+            .map(|node| node.item_id)
+            .collect::<Vec<_>>(),
+        vec![ids::AGY_FEAT_1],
+        "{CASE}: the cross-project edge to htui:FEAT-2 went with the project it pointed at"
+    );
+}
+
+/// D10's `uq_repo_primary` rule: promoting the second repo demotes the first inside the same
+/// transaction, and the demoted row's own token advances because its column changed.
+async fn repo_round_trip_and_primary_flag<S: WriteStore>(store: &S) {
+    const CASE: &str = "repo_round_trip_and_primary_flag";
+    let core = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE);
+    let docs = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "docs", false))
+        .await
+        .expect(CASE);
+    assert!(core.is_primary && !docs.is_primary, "{CASE}: as requested");
+
+    let duplicate = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", false))
+        .await;
+    assert!(
+        matches!(duplicate, Err(StoreError::Constraint(_))),
+        "{CASE}: a duplicate (project, name) is Constraint, got {duplicate:?}"
+    );
+    let orphan = store
+        .create_repo(new_repo(ProjectId::new(), "core", false))
+        .await;
+    assert!(
+        matches!(orphan, Err(StoreError::Constraint(_))),
+        "{CASE}: a repo of no project is Constraint, got {orphan:?}"
+    );
+
+    assert_eq!(
+        store
+            .repos(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<Vec<_>>(),
+        vec!["core".to_owned(), "docs".to_owned()],
+        "{CASE}: repos come back in name byte order"
+    );
+
+    let promoted = applied(
+        CASE,
+        store
+            .update_repo(
+                docs.id,
+                docs.updated_at,
+                RepoPatch {
+                    is_primary: Some(true),
+                    remote_url: Some(None),
+                    ..RepoPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert!(
+        promoted.is_primary,
+        "{CASE}: the second repo is now primary"
+    );
+    assert_eq!(
+        promoted.remote_url, None,
+        "{CASE}: `Some(None)` clears the URL, `None` would have left it"
+    );
+    let demoted = store
+        .repos(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.id == core.id)
+        .unwrap_or_else(|| panic!("{CASE}: the first repo survives the promotion"));
+    assert!(
+        !demoted.is_primary,
+        "{CASE}: promoting one demotes the other, so uq_repo_primary never trips (D10)"
+    );
+    assert!(
+        demoted.updated_at > core.updated_at,
+        "{CASE}: the demoted row's column changed, so its token changed too"
+    );
+
+    let spent = stale(
+        CASE,
+        store
+            .update_repo(core.id, core.updated_at, RepoPatch::default())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(spent, demoted, "{CASE}: Stale carries the row as it is now");
+    let unknown = store
+        .update_repo(RepoId::new(), core.updated_at, RepoPatch::default())
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "repo", .. })),
+        "{CASE}: an unknown id is NotFound, got {unknown:?}"
+    );
+
+    let path = |local: &str| RepoBoxPath {
+        repo_id: core.id,
+        box_id: ids::BOX,
+        local_path: local.to_owned(),
+        updated_at: Utc::now(),
+    };
+    store
+        .upsert_repo_box_path(&path("/src/one"))
+        .await
+        .expect(CASE);
+    store
+        .upsert_repo_box_path(&path("/src/two"))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store
+            .repo_box_paths(core.id)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| (row.box_id, row.local_path))
+            .collect::<Vec<_>>(),
+        vec![(ids::BOX, "/src/two".to_owned())],
+        "{CASE}: the per-box checkout path is replaced in place (R-BOX-4)"
+    );
+}
+
+/// D11's three seam-side rules and PRD D12's rename semantics: old keys keep their text, the old
+/// counter survives, and the next mint under the kind starts the new prefix at 1.
+async fn item_kind_round_trip_and_prefix_rules<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_kind_round_trip_and_prefix_rules";
+    for (label, prefix) in [
+        ("lowercase", "feat"),
+        ("leading digit", "1A"),
+        ("one byte", "A"),
+        ("seventeen bytes", "ABCDEFGHIJKLMNOPQ"),
+        ("a hyphen", "AN-A"),
+    ] {
+        let refused = store
+            .create_item_kind(new_item_kind(
+                ids::PROJECT_HTUI,
+                prefix,
+                &format!("kind {label}"),
+                ids::GRAPH_HTUI_ANA,
+            ))
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Constraint(_))),
+            "{CASE}: a prefix with {label} is Constraint, got {refused:?}"
+        );
+    }
+
+    let taken_prefix = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "ANA",
+            "second analysis",
+            ids::GRAPH_HTUI_ANA,
+        ))
+        .await;
+    assert!(
+        matches!(taken_prefix, Err(StoreError::Constraint(_))),
+        "{CASE}: (project, prefix) is unique, got {taken_prefix:?}"
+    );
+    let foreign_graph = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "SPEC",
+            "specification",
+            ids::GRAPH_AGY_FEAT,
+        ))
+        .await;
+    assert!(
+        matches!(foreign_graph, Err(StoreError::Constraint(_))),
+        "{CASE}: a default graph from another project is Constraint, got {foreign_graph:?}"
+    );
+
+    let created = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "SPEC",
+            "specification",
+            ids::GRAPH_HTUI_ANA,
+        ))
+        .await
+        .expect(CASE);
+    assert_eq!(created.prefix, "SPEC", "{CASE}: the request's prefix");
+
+    let kinds = store.item_kinds(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(
+        kinds
+            .iter()
+            .map(|row| row.prefix.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ANA", "FEAT", "FIX", "CLEAN", "TOOL", "SPEC"],
+        "{CASE}: kinds come back in position order, the fresh one last at position 9"
+    );
+
+    let ana = kinds
+        .iter()
+        .find(|row| row.id == ids::KIND_HTUI_ANA)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture kind"))
+        .clone();
+    let renamed = applied(
+        CASE,
+        store
+            .update_item_kind(
+                ana.id,
+                ana.updated_at,
+                ItemKindPatch {
+                    prefix: Some("ANL".to_owned()),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(renamed.prefix, "ANL", "{CASE}: the rename landed");
+    assert_eq!(
+        store
+            .item(ids::HTUI_ANA_2)
+            .await
+            .expect(CASE)
+            .unwrap_or_else(|| panic!("{CASE}: the fixture item"))
+            .key,
+        "ANA-2",
+        "{CASE}: key_prefix is copied at mint time and never rewritten (ANA-9 §4.1)"
+    );
+    let minted = store
+        .mint_item(new_item(
+            ids::PROJECT_HTUI,
+            ids::KIND_HTUI_ANA,
+            "after the rename",
+        ))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        minted.key, "ANL-1",
+        "{CASE}: the counter is keyed by prefix, so the new prefix mints from 1 (PRD D12)"
+    );
+
+    let spent = stale(
+        CASE,
+        store
+            .update_item_kind(ana.id, ana.updated_at, ItemKindPatch::default())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(spent, renamed, "{CASE}: Stale carries the row as it is now");
+    let bad_rename = store
+        .update_item_kind(
+            renamed.id,
+            renamed.updated_at,
+            ItemKindPatch {
+                prefix: Some("anl".to_owned()),
+                ..ItemKindPatch::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(bad_rename, Err(StoreError::Constraint(_))),
+        "{CASE}: the prefix rule applies to a rename too, got {bad_rename:?}"
+    );
+    let unknown = store
+        .update_item_kind(ItemKindId::new(), ana.updated_at, ItemKindPatch::default())
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "item_kind",
+                ..
+            })
+        ),
+        "{CASE}: an unknown id is NotFound, got {unknown:?}"
+    );
+}
+
+/// D6: a kind items point at cannot be deleted, and the refusal names the count rather than a
+/// constraint name. An unreferenced kind goes, and goes only once.
+async fn item_kind_delete_refused_while_referenced<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_kind_delete_refused_while_referenced";
+    let held = store.delete_item_kind(ids::KIND_HTUI_ANA).await;
+    match held {
+        Err(StoreError::Constraint(text)) => assert!(
+            text.contains("held by 2 items"),
+            "{CASE}: the refusal names what holds it (D6), got `{text}`"
+        ),
+        other => panic!("{CASE}: a referenced kind is Constraint, got {other:?}"),
+    }
+    assert!(
+        store
+            .item_kinds(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.id == ids::KIND_HTUI_ANA),
+        "{CASE}: the refused delete removed nothing"
+    );
+
+    let fresh = store
+        .create_item_kind(new_item_kind(
+            ids::PROJECT_HTUI,
+            "SPEC",
+            "specification",
+            ids::GRAPH_HTUI_ANA,
+        ))
+        .await
+        .expect(CASE);
+    store.delete_item_kind(fresh.id).await.expect(CASE);
+    assert!(
+        !store
+            .item_kinds(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.id == fresh.id),
+        "{CASE}: an unreferenced kind goes"
+    );
+    let again = store.delete_item_kind(fresh.id).await;
+    assert!(
+        matches!(
+            again,
+            Err(StoreError::NotFound {
+                entity: "item_kind",
+                ..
+            })
+        ),
+        "{CASE}: a second delete is NotFound, got {again:?}"
+    );
+}
+
+/// The graph and its phases: uniqueness the database owns, the reserved names D11 owns, and
+/// [`PhasePatch`]'s five columns — `token_budget` is not among them, because the `Phase` rung of
+/// [`WriteStore::set_setting`] is that column's one writer (D8).
+async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
+    const CASE: &str = "step_graph_and_phase_round_trip";
+    let graph = store
+        .create_step_graph(NewStepGraph {
+            id: StepGraphId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: "release".to_owned(),
+            description: "Cut a release".to_owned(),
+        })
+        .await
+        .expect(CASE);
+
+    let duplicate = store
+        .create_step_graph(NewStepGraph {
+            id: StepGraphId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: "analysis".to_owned(),
+            description: String::new(),
+        })
+        .await;
+    assert!(
+        matches!(duplicate, Err(StoreError::Constraint(_))),
+        "{CASE}: (project, name) is unique, got {duplicate:?}"
+    );
+
+    assert_eq!(
+        store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<Vec<_>>(),
+        vec![
+            "analysis".to_owned(),
+            "bug".to_owned(),
+            "feature".to_owned(),
+            "refactor".to_owned(),
+            "release".to_owned(),
+            "tooling".to_owned(),
+        ],
+        "{CASE}: graphs come back in name byte order"
+    );
+
+    let phase = store
+        .create_phase(&new_phase(graph.id, 0, "cut"))
+        .await
+        .expect(CASE);
+    assert_eq!(phase.name, "cut", "{CASE}: the row the caller built");
+
+    for reserved in ["judge", "handoff"] {
+        let refused = store.create_phase(&new_phase(graph.id, 7, reserved)).await;
+        assert!(
+            matches!(refused, Err(StoreError::Constraint(_))),
+            "{CASE}: `{reserved}` is a template role, not a phase name (D11), got {refused:?}"
+        );
+    }
+    let taken_position = store
+        .create_phase(&new_phase(ids::GRAPH_HTUI_FEAT, 0, "rehearse"))
+        .await;
+    assert!(
+        matches!(taken_position, Err(StoreError::Constraint(_))),
+        "{CASE}: (graph, position) is unique, got {taken_position:?}"
+    );
+    let taken_name = store
+        .create_phase(&new_phase(ids::GRAPH_HTUI_FEAT, 9, "prd"))
+        .await;
+    assert!(
+        matches!(taken_name, Err(StoreError::Constraint(_))),
+        "{CASE}: (graph, name) is unique, got {taken_name:?}"
+    );
+    let orphan = store
+        .create_phase(&new_phase(StepGraphId::new(), 0, "cut"))
+        .await;
+    assert!(
+        matches!(orphan, Err(StoreError::Constraint(_))),
+        "{CASE}: a phase of no graph is Constraint, got {orphan:?}"
+    );
+
+    assert_eq!(
+        store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| (row.position, row.name))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, "prd".to_owned()),
+            (1, "plan".to_owned()),
+            (2, "implement".to_owned()),
+            (3, "review".to_owned()),
+        ],
+        "{CASE}: phases come back in position order"
+    );
+
+    let edited = applied(
+        CASE,
+        store
+            .update_phase(
+                phase.id,
+                phase.updated_at,
+                PhasePatch {
+                    name: Some("tag".to_owned()),
+                    position: Some(3),
+                    template_name: Some("plan".to_owned()),
+                    gate_hard: Some(true),
+                    input_kinds: Some(vec!["plan".to_owned()]),
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            edited.name.as_str(),
+            edited.position,
+            edited.template_name.as_str(),
+            edited.gate_hard,
+            edited.input_kinds.as_slice()
+        ),
+        ("tag", 3, "plan", true, ["plan".to_owned()].as_slice()),
+        "{CASE}: all five columns of the patch"
+    );
+    assert_eq!(
+        edited.token_budget, None,
+        "{CASE}: the patch has no token_budget to write (D8)"
+    );
+
+    let reserved_rename = store
+        .update_phase(
+            edited.id,
+            edited.updated_at,
+            PhasePatch {
+                name: Some("judge".to_owned()),
+                ..PhasePatch::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(reserved_rename, Err(StoreError::Constraint(_))),
+        "{CASE}: a phase cannot be renamed into a reserved name either, got {reserved_rename:?}"
+    );
+    let spent = stale(
+        CASE,
+        store
+            .update_phase(phase.id, phase.updated_at, PhasePatch::default())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(spent, edited, "{CASE}: Stale carries the row as it is now");
+    let unknown = store
+        .update_phase(PhaseId::new(), phase.updated_at, PhasePatch::default())
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "step_graph_phase",
+                ..
+            })
+        ),
+        "{CASE}: an unknown id is NotFound, got {unknown:?}"
+    );
+}
+
+/// D7's promise on the rung every key accepts: every refusal is a `Constraint` carrying the rule,
+/// and nothing is clamped into a number the writer did not ask for.
+///
+/// The token is read first rather than assumed: migration `0002` seeds the ten rows on Postgres and
+/// `MemStore` loads none, so `expected` is `Some` on one store and `None` on the other and the case
+/// must pass on both.
+async fn settings_app_rung_validates_and_cas<S: WriteStore>(store: &S) {
+    const CASE: &str = "settings_app_rung_validates_and_cas";
+    let before = store
+        .setting(SettingRung::App, SettingKey::TokenBudget)
+        .await
+        .expect(CASE);
+    let token = before.as_ref().map(|row| row.updated_at);
+
+    let written = applied(
+        CASE,
+        store
+            .set_setting(
+                SettingRung::App,
+                SettingKey::TokenBudget,
+                json!(90_000),
+                token,
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        written.value,
+        Some(json!(90_000)),
+        "{CASE}: the value as stored comes back"
+    );
+    assert_eq!(
+        store
+            .setting(SettingRung::App, SettingKey::TokenBudget)
+            .await
+            .expect(CASE),
+        Some(written.clone()),
+        "{CASE}: the read-back is the row the write returned"
+    );
+
+    for (label, key, value) in [
+        ("zero", SettingKey::TokenBudget, json!(0)),
+        ("a string", SettingKey::TokenBudget, json!("120000")),
+        ("a float", SettingKey::TokenBudget, json!(1.5)),
+        ("three hops", SettingKey::UpstreamHops, json!(3)),
+        (
+            "half the budget and one basis point",
+            SettingKey::PromptReserveFraction,
+            json!(0.5001),
+        ),
+        (
+            "more files than a u32",
+            SettingKey::ExcerptMaxFiles,
+            json!(i64::from(u32::MAX) + 1),
+        ),
+        (
+            "a head above the current line cap",
+            SettingKey::ExcerptHeadLines,
+            json!(500),
+        ),
+    ] {
+        let refused = store
+            .set_setting(SettingRung::App, key, value.clone(), None)
+            .await;
+        match refused {
+            Err(StoreError::Constraint(text)) => assert!(
+                text.contains(key.key()),
+                "{CASE}: the refusal of {label} names its key, got `{text}`"
+            ),
+            other => panic!("{CASE}: {label} is refused, not clamped, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        store
+            .setting(SettingRung::App, SettingKey::TokenBudget)
+            .await
+            .expect(CASE)
+            .and_then(|row| row.value),
+        Some(json!(90_000)),
+        "{CASE}: a refused write stored nothing"
+    );
+
+    let spent = stale(
+        CASE,
+        store
+            .set_setting(
+                SettingRung::App,
+                SettingKey::TokenBudget,
+                json!(80_000),
+                token,
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent, written,
+        "{CASE}: a spent token is Stale carrying the setting as stored now"
+    );
+
+    let cleared = applied(
+        CASE,
+        store
+            .clear_setting(
+                SettingRung::App,
+                SettingKey::TokenBudget,
+                written.updated_at,
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        cleared.value, None,
+        "{CASE}: a clear always answers with no value"
+    );
+    assert!(
+        store
+            .setting(SettingRung::App, SettingKey::TokenBudget)
+            .await
+            .expect(CASE)
+            .is_none(),
+        "{CASE}: the App row is deleted, so the compiled-in default answers (D7)"
+    );
+    let gone = store
+        .clear_setting(
+            SettingRung::App,
+            SettingKey::TokenBudget,
+            written.updated_at,
+        )
+        .await;
+    assert!(
+        matches!(
+            gone,
+            Err(StoreError::NotFound {
+                entity: "app_setting",
+                ..
+            })
+        ),
+        "{CASE}: clearing what is not there is NotFound, got {gone:?}"
+    );
+
+    let reinserted = applied(
+        CASE,
+        store
+            .set_setting(
+                SettingRung::App,
+                SettingKey::TokenBudget,
+                json!(70_000),
+                None,
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        reinserted.value,
+        Some(json!(70_000)),
+        "{CASE}: `expected: None` is the insert after a clear (D8)"
+    );
+    let occupied = stale(
+        CASE,
+        store
+            .set_setting(
+                SettingRung::App,
+                SettingKey::TokenBudget,
+                json!(60_000),
+                None,
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        occupied, reinserted,
+        "{CASE}: `expected: None` against a row that exists is Stale, never an overwrite"
+    );
+}
+
+/// PRD's "`project.settings` loses nothing": one key is merged in, every other key comes back
+/// equal, and the clear takes only what it wrote. The `mem.rs` twin
+/// `set_setting_project_rung_leaves_unknown_keys_byte_identical` asserts the stronger byte
+/// identity, which JSONB's key normalisation makes unassertable across both stores.
+async fn settings_project_rung_merges_keys<S: WriteStore>(store: &S) {
+    const CASE: &str = "settings_project_rung_merges_keys";
+    let rung = SettingRung::Project(ids::PROJECT_HTUI);
+    let project = store
+        .project(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture project"));
+    let before = settings_map(CASE, &project.settings);
+    assert!(
+        !before.is_empty(),
+        "{CASE}: the fixture seeds keys this write must not disturb"
+    );
+
+    let wrong_rung = store
+        .set_setting(rung, SettingKey::ExcerptMaxFiles, json!(3), None)
+        .await;
+    assert!(
+        matches!(wrong_rung, Err(StoreError::Constraint(_))),
+        "{CASE}: a key the project rung does not accept is Constraint, got {wrong_rung:?}"
+    );
+    let no_token = store
+        .set_setting(rung, SettingKey::UpstreamHops, json!(2), None)
+        .await;
+    assert!(
+        matches!(no_token, Err(StoreError::Constraint(_))),
+        "{CASE}: `expected: None` on a rung whose row always exists is misuse, got {no_token:?}"
+    );
+
+    let written = applied(
+        CASE,
+        store
+            .set_setting(
+                rung,
+                SettingKey::UpstreamHops,
+                json!(2),
+                Some(project.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(written.value, Some(json!(2)), "{CASE}: the value as stored");
+
+    let merged = settings_map(
+        CASE,
+        &store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .unwrap_or_else(|| panic!("{CASE}: the project survives its own settings write"))
+            .settings,
+    );
+    assert_eq!(
+        merged.get("upstream_hops"),
+        Some(&json!(2)),
+        "{CASE}: the project rung writes the key `resolve_hops` reads, not the App key (flag A)"
+    );
+    for (key, value) in &before {
+        assert_eq!(
+            merged.get(key),
+            Some(value),
+            "{CASE}: `{key}` survived the merge unchanged"
+        );
+    }
+
+    let spent = stale(
+        CASE,
+        store
+            .set_setting(
+                rung,
+                SettingKey::UpstreamHops,
+                json!(1),
+                Some(project.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent, written,
+        "{CASE}: the CAS is on project.updated_at, which the merge advanced"
+    );
+
+    let cleared = applied(
+        CASE,
+        store
+            .clear_setting(rung, SettingKey::UpstreamHops, written.updated_at)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(cleared.value, None, "{CASE}: a clear answers with no value");
+    assert_eq!(
+        settings_map(
+            CASE,
+            &store
+                .project(ids::PROJECT_HTUI)
+                .await
+                .expect(CASE)
+                .unwrap_or_else(|| panic!("{CASE}: the project survives the clear"))
+                .settings,
+        ),
+        before,
+        "{CASE}: the clear took the one key it wrote and left the document as it found it"
+    );
+    assert_eq!(
+        store
+            .setting(rung, SettingKey::UpstreamHops)
+            .await
+            .expect(CASE)
+            .map(|row| row.value),
+        Some(None),
+        "{CASE}: a row that exists without the key answers Some(value: None)"
+    );
+
+    let unknown = store
+        .setting(
+            SettingRung::Project(ProjectId::new()),
+            SettingKey::UpstreamHops,
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        unknown.is_none(),
+        "{CASE}: a rung whose row is absent answers None, got {unknown:?}"
+    );
+    let unknown_write = store
+        .set_setting(
+            SettingRung::Project(ProjectId::new()),
+            SettingKey::UpstreamHops,
+            json!(1),
+            Some(project.updated_at),
+        )
+        .await;
+    assert!(
+        matches!(
+            unknown_write,
+            Err(StoreError::NotFound {
+                entity: "project",
+                ..
+            })
+        ),
+        "{CASE}: an unknown project is NotFound, got {unknown_write:?}"
+    );
+}
+
+/// The `Phase` rung is one `INTEGER` column, so it accepts one key and caps where the column does
+/// (flag C). The value is read back through [`WriteStore::phases`] as well as through
+/// [`WriteStore::setting`], because the editor and the resolver read it from different places.
+async fn settings_phase_rung_writes_token_budget_only<S: WriteStore>(store: &S) {
+    const CASE: &str = "settings_phase_rung_writes_token_budget_only";
+    let rung = SettingRung::Phase(ids::PHASE_HTUI_IMPLEMENT);
+    let budget_of = |phases: Vec<StepGraphPhase>| {
+        phases
+            .into_iter()
+            .find(|row| row.id == ids::PHASE_HTUI_IMPLEMENT)
+            .unwrap_or_else(|| panic!("{CASE}: the fixture phase"))
+    };
+    let phase = budget_of(store.phases(ids::GRAPH_HTUI_FEAT).await.expect(CASE));
+    assert_eq!(
+        phase.token_budget, None,
+        "{CASE}: the fixture leaves the column NULL"
+    );
+
+    let wrong_key = store
+        .set_setting(rung, SettingKey::UpstreamHops, json!(1), None)
+        .await;
+    assert!(
+        matches!(wrong_key, Err(StoreError::Constraint(_))),
+        "{CASE}: the phase rung accepts token_budget alone, got {wrong_key:?}"
+    );
+    let no_token = store
+        .set_setting(rung, SettingKey::TokenBudget, json!(90_000), None)
+        .await;
+    assert!(
+        matches!(no_token, Err(StoreError::Constraint(_))),
+        "{CASE}: `expected: None` on a rung whose row always exists is misuse, got {no_token:?}"
+    );
+    let too_wide = store
+        .set_setting(
+            rung,
+            SettingKey::TokenBudget,
+            json!(i64::from(i32::MAX) + 1),
+            Some(phase.updated_at),
+        )
+        .await;
+    assert!(
+        matches!(too_wide, Err(StoreError::Constraint(_))),
+        "{CASE}: the column is INTEGER, so this rung caps at i32::MAX, got {too_wide:?}"
+    );
+
+    let written = applied(
+        CASE,
+        store
+            .set_setting(
+                rung,
+                SettingKey::TokenBudget,
+                json!(90_000),
+                Some(phase.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(written.value, Some(json!(90_000)), "{CASE}: as stored");
+    assert_eq!(
+        budget_of(store.phases(ids::GRAPH_HTUI_FEAT).await.expect(CASE)).token_budget,
+        Some(90_000),
+        "{CASE}: the column the resolver reads carries the number"
+    );
+    assert_eq!(
+        store
+            .setting(rung, SettingKey::TokenBudget)
+            .await
+            .expect(CASE),
+        Some(written.clone()),
+        "{CASE}: the read-back is the row the write returned"
+    );
+
+    let spent = stale(
+        CASE,
+        store
+            .set_setting(
+                rung,
+                SettingKey::TokenBudget,
+                json!(80_000),
+                Some(phase.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent, written,
+        "{CASE}: the CAS is on the phase's own updated_at"
+    );
+
+    let cleared = applied(
+        CASE,
+        store
+            .clear_setting(rung, SettingKey::TokenBudget, written.updated_at)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(cleared.value, None, "{CASE}: a clear answers with no value");
+    assert_eq!(
+        budget_of(store.phases(ids::GRAPH_HTUI_FEAT).await.expect(CASE)).token_budget,
+        None,
+        "{CASE}: the column is NULL again, so the project rung answers"
+    );
+    assert_eq!(
+        store
+            .setting(rung, SettingKey::TokenBudget)
+            .await
+            .expect(CASE)
+            .map(|row| row.value),
+        Some(None),
+        "{CASE}: a phase that exists without a budget answers Some(value: None)"
+    );
+
+    let unknown = SettingRung::Phase(PhaseId::new());
+    assert!(
+        store
+            .setting(unknown, SettingKey::TokenBudget)
+            .await
+            .expect(CASE)
+            .is_none(),
+        "{CASE}: a phase that does not exist has no setting"
+    );
+    let unknown_write = store
+        .set_setting(
+            unknown,
+            SettingKey::TokenBudget,
+            json!(1),
+            Some(written.updated_at),
+        )
+        .await;
+    assert!(
+        matches!(
+            unknown_write,
+            Err(StoreError::NotFound {
+                entity: "step_graph_phase",
+                ..
+            })
+        ),
+        "{CASE}: an unknown phase is NotFound, got {unknown_write:?}"
     );
 }
 
