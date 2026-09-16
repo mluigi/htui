@@ -2059,9 +2059,10 @@ impl WriteStore for PgStore {
     /// Counts inside the transaction, then lets the cascade do the deleting
     /// (`0001_init.sql:162,174`). Projects survive it.
     ///
-    /// [`DELETE_ATTEMPTS`] tries, because the transaction is
-    /// [`REPEATABLE READ`](begin_repeatable_read) and a link or a box path committed under it
-    /// raises `40001` rather than slipping past the count (review M1).
+    /// Up to `DELETE_ATTEMPTS` tries, because the transaction runs at `REPEATABLE READ` and a link
+    /// or a box path committed under it raises `40001` rather than slipping past the count (review
+    /// M1). Both are named rather than linked because they are private and this doc comment is
+    /// public (`rustdoc::private_intra_doc_links`).
     ///
     /// # Errors
     ///
@@ -2076,7 +2077,7 @@ impl WriteStore for PgStore {
         Err(StoreError::Constraint(concurrent_write(
             "workspace",
             id,
-            "links",
+            "links or box paths",
         )))
     }
 
@@ -2084,7 +2085,7 @@ impl WriteStore for PgStore {
     /// with the counts taken in the same transaction **and the same snapshot** so the report is the
     /// act.
     ///
-    /// [`DELETE_ATTEMPTS`] tries, for the reason
+    /// Up to `DELETE_ATTEMPTS` tries, for the reason
     /// [`delete_workspace`](WriteStore::delete_workspace) has them.
     ///
     /// The mirror rebuild afterwards is the caller's, not the seam's (D5): `PgStore` holds no
