@@ -314,7 +314,9 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   2026-09-16). Nothing exists yet: `SectionId("connection")`, `MaskedField` and
   `TabAction::FocusSection` have zero occurrences in `crates/`. Also:
   no ad-hoc focus mechanism instead of M0's `TabAction::FocusSection` /
-  `SettingsSection::captures_input` / `MaskedField` names; no second persistence location for a
+  `SettingsSection::captures_input` names — **`MaskedField` is superseded**: milestone 3 shipped
+  one `TextField` with a mask flag rather than a masked type, so the connection section builds on
+  `TextField::masked()` (`crates/htui/src/ui/text_field.rs`); no second persistence location for a
   "shown once" marker (ANA-10 §5.4's `local_setting` is withdrawn with the mode); and
   `Settings > Rebuild cache` stays as written — it is safe because the local store is a different
   file that `MIRRORED_TABLES` never names, so it must not be "helpfully" extended to clear local
@@ -370,8 +372,48 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   doc comment linking the private `seed_project`, which `rustdoc::private_intra_doc_links = "deny"`
   turned into a broken `cargo doc` for the whole crate (`077cd0d`) — and two LOW, one fixed
   (`0e11c42`), one deferred with reason (`seed_project`'s length, whose shape the blueprint fixed
-  and which matches the crate's existing writers). Milestones 3–6 remain: the text-field widget and
-  hierarchy section, kinds and graphs, the ten settings, and the connection section.
+  and which matches the crate's existing writers).
+  **Milestone 3 landed (`171cf3c`..`524f069`, 2026-09-17): the app can take typed input.** Plan at
+  `.claude/plans/mod-15-hierarchy-section.plan.md`, blueprint beside it. Three things shipped.
+  (1) **`TextField`** (`crates/htui/src/ui/text_field.rs`): one single-line field with a char
+  cursor, insertion, a render-time window that leads with `…`, and an optional mask — the widget
+  PRD D1 owes MOD-22 and MOD-23. Its `Debug` is **hand-written and never prints the buffer**, and
+  `text()` answers `None` when masked (`take()` is the only read of a masked field); the mask has
+  **no consumer until milestone 6**. (2) **`SettingsSection::captures_input`**, the trait's first
+  default body, checked in `SettingsTab::on_key` before the `h`/`l`/`[`/`]` cycle
+  (`settings/mod.rs`) — ANA-10 §4.9's named fix, so a section taking text gets `l` as a letter.
+  (3) **`HierarchySection`** (`ui/tabs/settings/hierarchy.rs`), registered **after** `agents`:
+  workspaces, projects, repos with the primary flag (`p` moves it, nothing unsets it) and this
+  box's paths, all edited through milestone 1's CAS seam; a CAS miss reloads, keeps the typed text
+  and retries only on `Enter` (PRD D8, never auto-retry); delete is `d` → counts from
+  `delete_reach` → `y` → **typed slug** (PRD D13). **No seam change, no migration, no `query!`**:
+  `CASES` stays 36, `EXPECTED_CASES` 36, `.sqlx/` byte-identical. **Live coordinates.** (1) The
+  twelve hierarchy `StoreRequest` variants (`StoreRequest` 26 → 38, names in
+  `htui::hierarchy::REQUEST_NAMES`) are served by `hierarchy::serve` through **one `try_serve` arm
+  of twelve or-ed patterns** — `try_serve`'s `match` has no wildcard, so a *guarded* arm is `E0004`
+  (the plan's fact-check caught this by compile probe before any code was written). (2) Identity is
+  worker-side: `created_by` from `Backend::this_user`, `box_id` from `Backend::box_info`; **no view
+  holds a `UserId` or `BoxId`** and `HierarchySnapshot` deliberately carries neither. (3) The
+  per-box root guard is `htui_core::root_path::canonical_root` (new `crates/htui-core/src/root_path.rs`,
+  `tempfile` dev-dep added): relative / missing / dangling / not-a-directory refused in that order,
+  a link **to** a directory stored canonical, and no refusal ever names a link's target (PRD D11;
+  MOD-7 is the second caller and reuses it). (4) A **project** delete rebuilds the mirror from the
+  worker (`CacheStore::rebuild`, M1 D5), a **workspace** delete does not — so PRD D13's stale-mirror
+  hole is closed here rather than waiting for milestone 6's button. (5) `htui::testkit::SectionBench`
+  (was `Bench` in `tests/settings.rs`) is the shared section bench for milestones 4–6.
+  **1102 passed, 0 failed, 30 ignored**; 7 new `hierarchy__*.snap`, the two switcher snapshots moved
+  with their copy, the five `settings__agents_*.snap` byte-identical. The `--demo` smoke was **not**
+  run (no TTY in the agent environment) — interactive behaviour is pinned by tests only. Reviewed by
+  `rust-reviewer`: no CRITICAL, one HIGH, three MEDIUM, nine LOW, **all twelve fixed**
+  (`d566cd6`..`524f069`) — the HIGH being an editor `submit()` with no in-flight guard, where a
+  second `Enter` created the row, lost the first reply to the staleness index and then reported
+  "duplicate slug" for a write that had landed. Two residues recorded, neither a defect: a write
+  and its re-read are still two seam calls, so a connection lost between them reports `Failed` for
+  a write that applied (closing it needs a seam method this item does not add); and
+  `chat/composer.rs` was **not** rebuilt on `TextField` (plan D3) — a CLEAN candidate for this
+  item's close-out. Milestones 4–6 remain: kinds and graphs, the ten settings, and the connection
+  section, which is where `TextField::masked()` gets its first consumer and where a DSN must arrive
+  as a redacting newtype rather than a `String` on `StoreRequest` (review L-9, doc'd at both ends).
 
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. Every Windows-only path MOD-2 compile- and lint-checked from Linux but
