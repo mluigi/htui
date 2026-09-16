@@ -140,11 +140,7 @@ impl TextField {
     /// secret by accident and cannot read one twice.
     #[must_use]
     pub fn text(&self) -> Option<&str> {
-        if self.masked {
-            None
-        } else {
-            Some(&self.text)
-        }
+        if self.masked { None } else { Some(&self.text) }
     }
 
     /// Moves the buffer out, leaving the field empty. The only read of a masked field.
@@ -290,7 +286,10 @@ mod tests {
     fn inserts_at_the_cursor() {
         let mut field = TextField::with_text("ac");
         assert_eq!(field.on_key(key(KeyCode::Left)), FieldOutcome::Consumed);
-        assert_eq!(field.on_key(key(KeyCode::Char('b'))), FieldOutcome::Consumed);
+        assert_eq!(
+            field.on_key(key(KeyCode::Char('b'))),
+            FieldOutcome::Consumed
+        );
         assert_eq!(field.text(), Some("abc"), "`b` lands before `c`");
         assert_eq!(field.len(), 3);
 
@@ -309,7 +308,11 @@ mod tests {
 
         field.on_key(key(KeyCode::Home));
         field.on_key(key(KeyCode::Backspace));
-        assert_eq!(field.text(), Some("ab"), "backspace at the start does nothing");
+        assert_eq!(
+            field.text(),
+            Some("ab"),
+            "backspace at the start does nothing"
+        );
 
         field.on_key(key(KeyCode::Delete));
         assert_eq!(field.text(), Some("b"));
@@ -391,7 +394,11 @@ mod tests {
         );
 
         let short = TextField::with_text("abc");
-        assert_eq!(drawn_text(&short, 10, true), "abc", "nothing clipped, no `…`");
+        assert_eq!(
+            drawn_text(&short, 10, true),
+            "abc",
+            "nothing clipped, no `…`"
+        );
     }
 
     #[test]
@@ -443,7 +450,11 @@ mod tests {
         let mut field = TextField::masked();
         field.on_key(key(KeyCode::Char('s')));
         assert!(field.is_masked());
-        assert_eq!(field.text(), None, "a masked buffer leaves only through `take`");
+        assert_eq!(
+            field.text(),
+            None,
+            "a masked buffer leaves only through `take`"
+        );
         assert_eq!(field.len(), 1);
     }
 

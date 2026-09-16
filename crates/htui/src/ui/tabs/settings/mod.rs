@@ -49,6 +49,12 @@ pub trait SettingsSection {
     fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest>;
     /// The scope changed: drop cached rows whose ids belong to the previous workspace.
     fn on_scope_change(&mut self, scope: &Scope);
+    /// Whether this section is consuming every printable key right now, so the tab must not take
+    /// `h`/`l`/`[`/`]`/`Left`/`Right` for section cycling (ANA-10 §4.9; the chat tab's rule,
+    /// `chat/mod.rs:403-412`, one tab across). Derived from a mode, never a flag.
+    fn captures_input(&self) -> bool {
+        false
+    }
     /// A key the tab did not use for section navigation.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled;
     /// A reply addressed to the Settings tab. Sections that do not care ignore it.
@@ -166,6 +172,14 @@ impl SettingsTab {
         }
         Self { sections: registry }
     }
+
+    /// Hands one key to the active section, or passes it on while nothing is registered.
+    fn delegate(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        match self.sections.sections.get_mut(self.sections.active) {
+            Some(section) => section.on_key(key, ctx),
+            None => Handled::Pass,
+        }
+    }
 }
 
 impl Tab for SettingsTab {
@@ -195,6 +209,14 @@ impl Tab for SettingsTab {
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        // A section that is taking typed text answers first: `l` is a letter there, not a cycle.
+        if self
+            .sections
+            .active()
+            .is_some_and(SettingsSection::captures_input)
+        {
+            return self.delegate(key, ctx);
+        }
         match key.code {
             KeyCode::Char('l') | KeyCode::Char(']') | KeyCode::Right => {
                 self.sections.cycle_next();
@@ -206,10 +228,7 @@ impl Tab for SettingsTab {
             }
             _ => {}
         }
-        match self.sections.sections.get_mut(self.sections.active) {
-            Some(section) => section.on_key(key, ctx),
-            None => Handled::Pass,
-        }
+        self.delegate(key, ctx)
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {

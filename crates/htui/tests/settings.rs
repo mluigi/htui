@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 
 /// The scope of the demo fixture's first workspace: `Scope` has no `Default`, and a section that
 /// ignores the scope should still be handed a real one.
@@ -915,6 +915,92 @@ async fn h_and_l_move_between_sections() {
     assert!(
         harness.render().contains("claude"),
         "`h` comes back to Agents"
+    );
+}
+
+/// A section that is taking typed text: every key is its own, `l` included (D2).
+///
+/// The counter is what makes the difference visible in a frame — a section that merely swallowed
+/// `l` would render the same thing whether the tab cycled to it or not.
+#[derive(Debug, Default)]
+struct CapturingProbe {
+    seen: Vec<KeyCode>,
+}
+
+impl SettingsSection for CapturingProbe {
+    fn id(&self) -> SectionId {
+        SectionId("capturing")
+    }
+
+    fn title(&self) -> &str {
+        "Capturing"
+    }
+
+    fn captures_input(&self) -> bool {
+        true
+    }
+
+    fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+        Vec::new()
+    }
+
+    fn on_scope_change(&mut self, _scope: &Scope) {}
+
+    fn on_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+        self.seen.push(key.code);
+        Handled::Consumed
+    }
+
+    fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        message(frame, area, &format!("seen {}", self.seen.len()), ctx.theme);
+    }
+}
+
+#[tokio::test]
+async fn a_capturing_section_receives_l_and_a_plain_one_cycles() {
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(CapturingProbe::default()),
+    ])));
+    harness.settle().await;
+
+    // Agents keeps the default `captures_input() == false`, so the tab still takes `l`.
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("seen 0"),
+        "`l` cycled into Capturing: {frame}"
+    );
+
+    // From here `l` is a letter, not a cycle: the strip must not move.
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("seen 1"),
+        "the capturing section received `l`: {frame}"
+    );
+    assert!(
+        !frame.contains("claude"),
+        "and the strip did not cycle back to Agents: {frame}"
+    );
+
+    // `h`, `[`, `]` and the arrows are the tab's the same way `l` is.
+    harness.key("h");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("seen 2"), "`h` reached it too: {frame}");
+
+    // A `Consumed` from a capturing section swallows the globals, which is the point of the gate
+    // while a slug is half typed.
+    harness.key("q");
+    harness.settle().await;
+    assert!(
+        !harness.app().should_quit,
+        "`q` is a letter while a section is taking text"
     );
 }
 
