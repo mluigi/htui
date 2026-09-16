@@ -574,7 +574,12 @@ async fn every_hierarchy_method_is_unreachable_offline() {
     refused(
         "set_setting",
         writer
-            .set_setting(SettingRung::App, SettingKey::TokenBudget, json!(64_000), None)
+            .set_setting(
+                SettingRung::App,
+                SettingKey::TokenBudget,
+                json!(64_000),
+                None,
+            )
             .await
             .expect_err("no setting is written offline"),
     );

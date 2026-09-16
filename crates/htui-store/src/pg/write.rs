@@ -1935,8 +1935,9 @@ impl WriteStore for PgStore {
         }
     }
 
-    /// One setting on one rung with its CAS token; the statement is
-    /// [`PgStore::stored_setting`] in `pg/read.rs`.
+    /// One setting on one rung with its CAS token; the statement is `PgStore::stored_setting` in
+    /// `pg/read.rs`, named rather than linked because it is `pub(crate)` and this doc comment is
+    /// public (`rustdoc::private_intra_doc_links`).
     ///
     /// # Errors
     ///
