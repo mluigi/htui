@@ -26,6 +26,9 @@ sqlx       = { version = "0.9.0", default-features = false, features = [
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt"] }
 insta = { workspace = true }
+# `root_path`'s guard tests need a real directory, a real file and a real symlink: the four
+# refusals are facts about the filesystem, not about a mocked one (MOD-15 M3 D8).
+tempfile = "3"
 
 [lints]
 workspace = true
