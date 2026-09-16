@@ -14,7 +14,7 @@ use htui::ui::Theme;
 use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
 use htui_core::model::{ProjectId, ProjectPatch, RepoId, RepoPatch, WorkspaceId, WorkspacePatch};
-use htui_core::store::{DeleteTarget, MemStore, ReadStore};
+use htui_core::store::{DeleteReach, DeleteTarget, MemStore, ReadStore};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -746,12 +746,233 @@ async fn a_stale_reply_keeps_the_typed_text() {
     );
 }
 
-/// The nil startup scope, and the shell after its last workspace was deleted: a pane that names
-/// the key that fixes it rather than an empty box.
+/// The nil startup scope: a pane that names the key that fixes it rather than an empty box. The
+/// shell after its **last** workspace was deleted is the other half, and it is
+/// [`deleting_the_last_workspace_leaves_the_pane_empty`] — a scope that never had a tree and a
+/// scope whose tree was just taken reach this pane by two different routes.
 #[tokio::test]
 async fn no_workspace_says_so() {
     let mut harness = hierarchy_over(MemStore::new()).await;
     insta::assert_snapshot!("no_workspace", harness.render());
+}
+
+/// The last workspace, deleted: the tree it took goes with it, so the pane reads "no workspace"
+/// rather than offering `e`/`n`/`b`/`d` over rows whose ids are gone (blueprint §9.6).
+#[tokio::test]
+async fn deleting_the_last_workspace_leaves_the_pane_empty() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    let _ = bench.drained();
+
+    // `d` on the workspace row, through both confirmations.
+    bench.key(&mut section, "d");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::DeleteReach(Some(DeleteReach {
+            workspace_links: 1,
+            ..DeleteReach::default()
+        })),
+    );
+    bench.key(&mut section, "y");
+    type_at(&bench, &mut section, "graphics");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Deleted {
+            target: DeleteTarget::Workspace(ids::WORKSPACE_GRAPHICS),
+            reach: DeleteReach {
+                workspace_links: 1,
+                ..DeleteReach::default()
+            },
+            mirror: MirrorAfterDelete::NotNeeded,
+        },
+    );
+    let asked = bench.drained();
+    assert!(
+        matches!(asked.as_slice(), [Action::Store(StoreRequest::Workspaces)]),
+        "the workspace the shell was inside is gone, so the list is what decides where it lands: {asked:?}"
+    );
+
+    // Nothing left to enter.
+    bench.reply(&mut section, &StoreReply::Workspaces(Vec::new()));
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("no workspace \u{2014} `N` creates one"),
+        "an empty list leaves the pane naming the key that fixes it: {frame}"
+    );
+    assert!(
+        frame.contains("deleted `graphics`"),
+        "and the notice still reports what was taken: {frame}"
+    );
+    assert!(
+        !frame.contains("vulkan-tutorials"),
+        "the deleted tree is not still on screen: {frame}"
+    );
+
+    // And the keys that would write against the deleted ids are refused.
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "d");
+    assert!(
+        bench.drained().is_empty(),
+        "a deleted tree is not a tree to write to"
+    );
+}
+
+/// `Enter` while the first write is still in flight is refused, as the Browse keys are (D6): the
+/// staleness index keeps only the newest request of a kind, so a second send would have the first
+/// reply — the one about the write that landed — dropped.
+#[tokio::test]
+async fn a_second_enter_does_not_resend_the_write() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    let _ = bench.drained();
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "-2");
+    bench.key(&mut section, "enter");
+    bench.key(&mut section, "enter");
+
+    let emitted = bench.drained();
+    let [Action::Store(StoreRequest::UpdateWorkspace { .. })] = emitted.as_slice() else {
+        panic!("two `Enter`s are one write: {emitted:?}");
+    };
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("`update_workspace` is still in flight"),
+        "and the second one says why it did nothing: {frame}"
+    );
+}
+
+/// `r` then `d`: the read's tree lands while the delete is being counted, and it must not take the
+/// confirmation with it — a reply carries no correlation, so `on_tree` closes an editor and never a
+/// delete.
+#[tokio::test]
+async fn a_tree_that_lands_mid_delete_keeps_the_confirmation() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(opened.clone()))),
+    );
+    let _ = bench.drained();
+
+    bench.key(&mut section, "d");
+    let asked = bench.drained();
+    assert!(
+        matches!(
+            asked.as_slice(),
+            [Action::Store(StoreRequest::DeleteReach(_))]
+        ),
+        "`d` counts first: {asked:?}"
+    );
+
+    // The read `r` asked for, answered after `d` was pressed.
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("counting rows"),
+        "a read is not the answer to a delete: {frame}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::DeleteReach(Some(DeleteReach {
+            workspace_links: 1,
+            ..DeleteReach::default()
+        })),
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("This deletes workspace `graphics`"),
+        "and the counts still reach the warning they were asked for: {frame}"
+    );
+}
+
+/// A `delete_reach` that was refused leaves the pane counting forever unless the stage is left:
+/// `Counting` binds nothing but `Esc`, so a refusal puts the tree back by itself.
+#[tokio::test]
+async fn a_refused_count_leaves_the_confirmation() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    let _ = bench.drained();
+
+    bench.key(&mut section, "d");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "delete_reach",
+            message: "connection closed".to_owned(),
+        },
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        !frame.contains("counting rows"),
+        "a refused count does not go on counting: {frame}"
+    );
+    assert!(
+        frame.contains("vulkan-tutorials"),
+        "the tree is back, where `d` can be pressed again: {frame}"
+    );
+}
+
+/// An outage that ended: the read that answers clears "hierarchy needs Postgres", and while it is
+/// up the keys it refuses say *that* rather than offering `N` against a store that did not answer.
+#[tokio::test]
+async fn a_refused_read_is_echoed_and_then_cleared() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "hierarchy",
+            message: "connection refused".to_owned(),
+        },
+    );
+
+    bench.key(&mut section, "N");
+    assert!(
+        bench.drained().is_empty(),
+        "`N` is refused too while the store did not answer"
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("connection refused"),
+        "the refusal echoes what the store said, not `N` creates one: {frame}"
+    );
+    assert!(
+        !frame.contains("`N` creates one"),
+        "`N` is not on offer here: {frame}"
+    );
+
+    // The store answers again, and the workspace is simply not there. (`Esc` clears the notice the
+    // refusal left; what is under test is the pane, which is not a notice.)
+    bench.reply(&mut section, &StoreReply::Hierarchy(None));
+    bench.key(&mut section, "esc");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        !frame.contains("hierarchy needs Postgres"),
+        "a read that answered is not an outage: {frame}"
+    );
+    assert!(
+        frame.contains("no workspace \u{2014} `N` creates one"),
+        "{frame}"
+    );
 }
 
 /// Offline the tree is one refused read: `Backend::writer()` is `None`, so the section says what is

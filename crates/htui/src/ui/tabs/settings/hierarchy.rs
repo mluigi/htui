@@ -416,15 +416,33 @@ impl HierarchySection {
     /// reply), then a tree that is not there to edit. `r` is deliberately **not** on this path —
     /// re-reading is how a section that lost a reply recovers.
     fn refuse(&mut self, key: char) -> bool {
-        if let Some(busy) = self.busy {
-            self.notice = Some(format!("`{busy}` is still in flight"));
+        if self.in_flight() {
             return true;
         }
-        if self.unavailable.is_some() || (self.snapshot.is_none() && key != 'N') {
+        // The read was refused, so there is nothing to edit and nothing to create against either:
+        // `N` is refused here too, and a notice offering it would name a key that does not work.
+        if let Some(why) = &self.unavailable {
+            self.notice = Some(format!("{UNAVAILABLE}: {why}"));
+            return true;
+        }
+        if self.snapshot.is_none() && key != 'N' {
             self.notice = Some(NO_WORKSPACE.to_owned());
             return true;
         }
         false
+    }
+
+    /// Whether a write is already in flight, with the notice that says which one.
+    ///
+    /// The one refusal both ends of the section owe: a second write of a kind would have the
+    /// staleness index drop the first one's reply, and the first is the one about the write that
+    /// actually landed.
+    fn in_flight(&mut self) -> bool {
+        let Some(busy) = self.busy else {
+            return false;
+        };
+        self.notice = Some(format!("`{busy}` is still in flight"));
+        true
     }
 
     /// Opens an editor, clearing whatever the last one said.
@@ -794,8 +812,13 @@ impl HierarchySection {
     /// `Enter` in an editor: the required fields, then one request per [`EditorKind`].
     ///
     /// The editor **stays open** until the reply lands, so a refusal (a duplicate slug, a refused
-    /// path) leaves the text where it was and a second `Enter` retries it.
+    /// path) leaves the text where it was and a second `Enter` retries it. Which is why the first
+    /// statement is the same refusal the Browse keys get: the editor being open is not a reply, and
+    /// a second `Enter` before one arrives would re-send a write that already landed (D6).
     fn submit(&mut self, ctx: &mut Ctx<'_>) {
+        if self.in_flight() {
+            return;
+        }
         let Mode::Editing(editor) = &self.mode else {
             return;
         };
@@ -907,7 +930,13 @@ impl HierarchySection {
         self.unavailable = None;
         if let Some(name) = write {
             self.notice = self.written(name, snapshot);
-            self.mode = Mode::Browse;
+            // An **editor** only. A reply carries no correlation, so a read that lands while a
+            // delete is being counted would otherwise close a confirmation nobody answered, and the
+            // `Deleted` that followed would report a slug the section had already forgotten. The
+            // delete flow ends through `Deleted`, `DeleteReach(None)`, a refusal or `Esc`.
+            if matches!(self.mode, Mode::Editing(_)) {
+                self.mode = Mode::Browse;
+            }
         }
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
@@ -1100,8 +1129,11 @@ impl SettingsSection for HierarchySection {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Hierarchy(Some(snapshot)) => self.on_tree(snapshot, ctx),
+            // A read that answered, even with nothing in it, is the end of an outage: leaving
+            // `unavailable` set would say "hierarchy needs Postgres" over a store that just spoke.
             StoreReply::Hierarchy(None) => {
                 self.busy = None;
+                self.unavailable = None;
                 self.snapshot = None;
                 self.mode = Mode::Browse;
                 self.clamp_cursor();
@@ -1136,8 +1168,14 @@ impl SettingsSection for HierarchySection {
                         ctx.request(StoreRequest::Hierarchy(ctx.scope.workspace_id));
                     }
                     // The workspace the shell is inside is gone, so there is no tree to re-read:
-                    // the list of what is left is what decides where it lands next.
-                    DeleteTarget::Workspace(_) => ctx.request(StoreRequest::Workspaces),
+                    // the list of what is left is what decides where it lands next. The tree goes
+                    // with it — an empty list leaves this pane reading "no workspace", and a tree
+                    // left on screen would aim `e`/`n`/`b`/`d` at ids that no longer exist.
+                    DeleteTarget::Workspace(_) => {
+                        self.snapshot = None;
+                        self.clamp_cursor();
+                        ctx.request(StoreRequest::Workspaces);
+                    }
                 }
             }
             // Only ever after a workspace delete (the switcher asks for its own): the first
@@ -1163,14 +1201,16 @@ impl SettingsSection for HierarchySection {
             // can start from — with the editor left open over its text.
             StoreReply::Failed { request, .. } if REQUEST_NAMES.contains(request) => {
                 self.busy = None;
-                // A delete that was refused must not leave `deleting…` on screen: `InFlight`
-                // swallows every key, so the one state with no way out of it is the one state
-                // that has to be left. Back to the counts the user already saw, where `y` retries
-                // and `Esc` stops.
-                if let Mode::Deleting { stage, .. } = &mut self.mode
-                    && let DeleteStage::InFlight(reach) = stage
-                {
-                    *stage = DeleteStage::Warn(*reach);
+                // A delete that was refused must not leave `deleting…` or `counting rows…` on
+                // screen: neither stage has anything left to wait for. `InFlight` goes back to the
+                // counts the user already saw, where `y` retries and `Esc` stops; `Counting` has no
+                // counts to go back to, so it leaves the tree, where `d` starts again.
+                if let Mode::Deleting { stage, .. } = &mut self.mode {
+                    match stage {
+                        DeleteStage::InFlight(reach) => *stage = DeleteStage::Warn(*reach),
+                        DeleteStage::Counting => self.mode = Mode::Browse,
+                        DeleteStage::Warn(_) | DeleteStage::Typed { .. } => {}
+                    }
                 }
             }
             _ => {}
