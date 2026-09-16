@@ -35,8 +35,8 @@ use crate::prompt::template::TemplateRole;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
-    WriteStore, chat_step_status, graph_not_in_project, invalid_prefix, item_kind_is_held,
-    not_a_terminal_status, reserved_phase_name,
+    WriteStore, chat_step_status, expected_on_row, graph_not_in_project, invalid_prefix,
+    item_kind_is_held, not_a_terminal_status, reserved_phase_name,
 };
 
 /// The store the TUI runs against in MOD-1: every row in process memory, cloned out under a lock
@@ -2243,7 +2243,8 @@ impl State {
                 }
             }
             SettingRung::Project(id) => {
-                let token = expected_on_row(expected, key, "project")?;
+                let token = expected
+                    .ok_or_else(|| StoreError::Constraint(expected_on_row(key, "project")))?;
                 let stored =
                     self.stored_setting(rung, key)
                         .ok_or_else(|| StoreError::NotFound {
@@ -2272,7 +2273,9 @@ impl State {
                 }))
             }
             SettingRung::Phase(id) => {
-                let token = expected_on_row(expected, key, "step_graph_phase")?;
+                let token = expected.ok_or_else(|| {
+                    StoreError::Constraint(expected_on_row(key, "step_graph_phase"))
+                })?;
                 let stored =
                     self.stored_setting(rung, key)
                         .ok_or_else(|| StoreError::NotFound {
@@ -2639,24 +2642,6 @@ struct ProjectReach {
 /// never wider than `u64` on a target this ships to, and the `try_from` says so without an `as`.
 fn rows(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
-}
-
-/// The CAS token a rung whose row always exists must be given (D8).
-///
-/// `expected: None` means "I expect no row", which only the `App` rung can mean: a project and a
-/// phase exist before the setting does, so `None` there is misuse rather than an insert — and
-/// refusing it is what keeps a caller from treating a missing token as a force-write.
-fn expected_on_row(
-    expected: Option<DateTime<Utc>>,
-    key: SettingKey,
-    entity: &str,
-) -> Result<DateTime<Utc>> {
-    expected.ok_or_else(|| {
-        StoreError::Constraint(format!(
-            "`{key}` on the {entity} rung needs the row's `updated_at`; `expected: None` is the \
-             app_setting insert alone"
-        ))
-    })
 }
 
 /// The refusal both writers of `project.settings` give a blob that is not a JSON object (D7).

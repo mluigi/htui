@@ -630,7 +630,7 @@ pub fn not_a_terminal_status(status: RunStatus) -> String {
 
 /// D11: the `item_kind.prefix` CHECK, in words.
 ///
-/// The four helpers below exist for the reason [`chat_step_status`] does: a rule the schema cannot
+/// The five helpers below exist for the reason [`chat_step_status`] does: a rule the schema cannot
 /// express is checked in `htui-core` once, so `MemStore` and `PgStore` refuse the same input with
 /// the same sentence rather than with a Postgres constraint name on one side and prose on the
 /// other.
@@ -661,6 +661,26 @@ pub fn reserved_phase_name(name: &str) -> String {
 #[must_use]
 pub fn item_kind_is_held(prefix: &str, items: u64) -> String {
     format!("item_kind {prefix} is held by {items} items")
+}
+
+/// D8: the CAS token a rung whose row always exists must be given.
+///
+/// `expected: None` means "I expect no row", which only the [`SettingRung::App`] rung can mean: a
+/// project and a phase exist before the setting does, so `None` there is misuse rather than an
+/// insert — and refusing it is what keeps a caller from treating a missing token as a force-write.
+/// `entity` is the table the row is in, so the sentence names the row rather than the rung.
+///
+/// It was private to `store::mem` until the MOD-15 milestone 1 review, which found `PgStore`
+/// spelling the same sentence for itself in `pg/write.rs` — byte-identical, and one edit away from
+/// not being. The stores wrap it in
+/// [`StoreError::Constraint`](crate::store::StoreError::Constraint) themselves rather than sharing
+/// a signature: `MemStore` has the token to hand back and `PgStore` has a `?` to return through.
+#[must_use]
+pub fn expected_on_row(key: SettingKey, entity: &str) -> String {
+    format!(
+        "`{key}` on the {entity} rung needs the row's `updated_at`; `expected: None` is the \
+         app_setting insert alone"
+    )
 }
 
 /// Result of [`WriteStore::update_item`]: either the edit landed, or someone else committed first

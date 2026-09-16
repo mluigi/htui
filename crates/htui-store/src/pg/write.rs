@@ -28,8 +28,9 @@ use htui_core::prompt::TemplateRole;
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung, StoreError,
-    StoredSetting, UpdateOutcome, WriteStore, chat_step_status, graph_not_in_project,
-    invalid_prefix, item_kind_is_held, not_a_terminal_status, reserved_phase_name,
+    StoredSetting, UpdateOutcome, WriteStore, chat_step_status, expected_on_row,
+    graph_not_in_project, invalid_prefix, item_kind_is_held, not_a_terminal_status,
+    reserved_phase_name,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -67,21 +68,6 @@ fn cas_miss<T>(
             entity,
             id: id.to_string(),
         })
-}
-
-/// The refusal a rung whose row always exists gets for `expected: None` (D8).
-///
-/// `None` means "I expect no row", which only the `App` rung can mean: a project and a phase exist
-/// before the setting does, so `None` there is misuse rather than an insert. The sentence is
-/// `MemStore`'s `expected_on_row` word for word — that helper is private to `store::mem`, so this
-/// is the one place in the seam where two stores spell one rule twice rather than calling one
-/// function; a future move of it into `htui_core::store::traits` beside `reserved_phase_name`
-/// would close that.
-fn expected_on_row(key: SettingKey, entity: &str) -> StoreError {
-    StoreError::Constraint(format!(
-        "`{key}` on the {entity} rung needs the row's `updated_at`; `expected: None` is the \
-         app_setting insert alone"
-    ))
 }
 
 /// A `count(*)` as the `u64` [`DeleteReach`] holds. Postgres counts as `bigint` and never
@@ -1883,7 +1869,8 @@ impl WriteStore for PgStore {
                 }
             }
             SettingRung::Project(id) => {
-                let token = expected.ok_or_else(|| expected_on_row(key, "project"))?;
+                let token = expected
+                    .ok_or_else(|| StoreError::Constraint(expected_on_row(key, "project")))?;
                 let name = key
                     .spec()
                     .project_key
@@ -1912,7 +1899,9 @@ impl WriteStore for PgStore {
                 }
             }
             SettingRung::Phase(id) => {
-                let token = expected.ok_or_else(|| expected_on_row(key, "step_graph_phase"))?;
+                let token = expected.ok_or_else(|| {
+                    StoreError::Constraint(expected_on_row(key, "step_graph_phase"))
+                })?;
                 // `validate` has already narrowed this rung to `i32::MAX` (flag C), so the `None`
                 // arm is unreachable — and it is still an error rather than an `expect`, because
                 // "unreachable" here depends on a guard two modules away and a panic is a poor way
