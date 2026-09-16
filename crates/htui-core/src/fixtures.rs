@@ -16,12 +16,14 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AppUser, BoxRow, BoxTool, CommandQueue, Document, EventKind, EventRole, Gate,
-    GateOutcome, Item, ItemKind, ItemKindId, ItemLink, ItemRevision, LinkKind, Note, NoteId,
-    OsFamily, PhaseId, Project, ProjectId, PromptTemplate, PromptTemplateId, Run, RunKind, RunMode,
-    RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
+    Agent, AppUser, BoxRow, BoxTool, Document, EventKind, EventRole, GateOutcome, Item, ItemKind,
+    ItemKindId, ItemLink, ItemRevision, LinkKind, Note, NoteId, OsFamily, PhaseId, Project,
+    ProjectId, PromptTemplate, PromptTemplateId, Run, RunKind, RunMode, RunStatus, RunStep,
+    SessionEvent, Skill, SkillBinding, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
 };
+use crate::prompt::DEFAULT_TEMPLATES;
+use crate::seed;
 
 /// Milliseconds of `2026-09-03T00:00:00Z`, the timestamp field of every [`demo_uuid`].
 pub const DEMO_EPOCH_MS: u64 = 1_788_393_600_000;
@@ -652,88 +654,28 @@ fn projects() -> Vec<Project> {
         .collect()
 }
 
-/// One of the five `R-ENT-6` kinds, with the phase names of its default graph.
-struct KindSpec {
-    /// `item_kind.prefix`.
-    prefix: &'static str,
-    /// `item_kind.name`, also `step_graph.name`.
-    name: &'static str,
-    /// `item_kind.description`.
-    description: &'static str,
-    /// `step_graph_phase.name`, in position order.
-    phases: &'static [&'static str],
-}
-
-/// The `R-ENT-6` kinds every project is seeded with (§5.10).
-const KIND_SPECS: [KindSpec; 5] = [
-    KindSpec {
-        prefix: "ANA",
-        name: "analysis",
-        description: "A question answered in writing",
-        phases: &["research", "verdict"],
-    },
-    KindSpec {
-        prefix: "FEAT",
-        name: "feature",
-        description: "New behaviour",
-        phases: &["prd", "plan", "implement", "review"],
-    },
-    KindSpec {
-        prefix: "FIX",
-        name: "bug",
-        description: "Behaviour that is wrong",
-        phases: &["reproduce", "fix", "review"],
-    },
-    KindSpec {
-        prefix: "CLEAN",
-        name: "refactor",
-        description: "Behaviour kept, shape improved",
-        phases: &["plan", "implement", "review"],
-    },
-    KindSpec {
-        prefix: "TOOL",
-        name: "tooling",
-        description: "The workshop rather than the product",
-        phases: &["plan", "implement", "review"],
-    },
-];
-
-/// Distinct phase names across the five default graphs, plus the two reserved names: one
-/// `prompt_template` v1 each (§5.10 as amended by ANA-5 §5.4; plan D104).
+/// Kinds, their default graphs, the graphs' phases and one template version per default
+/// template name, all built through [`seed`]'s constructors with [`demo_uuid`] ids.
 ///
-/// The order is [`crate::prompt::DEFAULT_TEMPLATES`]'s, because the bodies come from there and the
-/// ids are minted from the position.
-const TEMPLATE_NAMES: [&str; 10] = [
-    "prd",
-    "plan",
-    "implement",
-    "review",
-    "research",
-    "verdict",
-    "reproduce",
-    "fix",
-    "judge",
-    "handoff",
-];
-
-/// Kinds, their default graphs, the graphs' phases and one template version per phase name.
+/// Ids follow blueprint §G: kind and graph `n` are `project_index * KINDS.len() + kind_index`,
+/// phases are numbered across the whole project ([`seed::PHASES_PER_PROJECT`] per project),
+/// templates are `project_index * DEFAULT_TEMPLATES.len() + template_index`.
 ///
-/// Ids follow blueprint §G: kind and graph `n` are `project_index * 5 + kind_index`, phases are
-/// numbered across the whole project (15 per project), templates are
-/// `project_index * TEMPLATE_NAMES.len() + template_index`.
-///
-/// The template stride is [`TEMPLATE_NAMES`]`.len()` and not a literal, because it is a primary
-/// key and not a formatting choice: [`demo_uuid`] is a pure function of `(class, n)`, so a stride
-/// below the number of templates per project hands project *i*'s first template the id project
-/// *i−1*'s late templates already hold, and `load_demo` fails on the second insert. The stride was
-/// `8` while there were eight names and had to move with them (blueprint E-5); the same holds for
-/// the other two strides if a kind or a phase is ever added.
+/// Every stride is the length of the table it indexes and not a literal, because it is a
+/// primary-key input and not a formatting choice: [`demo_uuid`] is a pure function of
+/// `(class, n)`, so a stride below the number of rows per project hands project *i*'s first row
+/// the id project *i−1*'s late rows already hold, and `load_demo` fails on the second insert
+/// (blueprint E-5, when the template stride was `8` for eight names).
 fn catalogue() -> (
     Vec<ItemKind>,
     Vec<StepGraph>,
     Vec<StepGraphPhase>,
     Vec<PromptTemplate>,
 ) {
+    let kinds_per_project = seed::KINDS.len() as u8;
+    let phases_per_project = seed::PHASES_PER_PROJECT as u8;
+    let templates_per_project = DEFAULT_TEMPLATES.len() as u8;
+
     let mut kinds = Vec::new();
     let mut graphs = Vec::new();
     let mut phases = Vec::new();
@@ -741,74 +683,51 @@ fn catalogue() -> (
 
     for (project_index, (project_id, _, _, _)) in PROJECT_SPECS.iter().enumerate() {
         let project_index = project_index as u8;
-        let mut phase_n = project_index * 15;
+        let mut phase_n = project_index * phases_per_project;
 
-        for (kind_index, spec) in KIND_SPECS.iter().enumerate() {
-            let n = project_index * 5 + kind_index as u8;
-            let graph_id = StepGraphId::from_uuid(demo_uuid(class::STEP_GRAPH, n));
+        for (kind_index, kind) in seed::KINDS.iter().enumerate() {
+            let n = project_index * kinds_per_project + kind_index as u8;
+            let graph = seed::graph_row(
+                StepGraphId::from_uuid(demo_uuid(class::STEP_GRAPH, n)),
+                *project_id,
+                kind,
+                epoch(),
+            );
+            let graph_id = graph.id;
+            graphs.push(graph);
+            kinds.push(seed::kind_row(
+                ItemKindId::from_uuid(demo_uuid(class::ITEM_KIND, n)),
+                *project_id,
+                graph_id,
+                kind_index as i32,
+                kind,
+                epoch(),
+            ));
 
-            graphs.push(StepGraph {
-                id: graph_id,
-                project_id: *project_id,
-                name: spec.name.to_owned(),
-                description: format!("Default graph for {} items", spec.name),
-                created_at: epoch(),
-                updated_at: epoch(),
-            });
-            kinds.push(ItemKind {
-                id: ItemKindId::from_uuid(demo_uuid(class::ITEM_KIND, n)),
-                project_id: *project_id,
-                prefix: spec.prefix.to_owned(),
-                name: spec.name.to_owned(),
-                description: spec.description.to_owned(),
-                default_graph_id: graph_id,
-                position: kind_index as i32,
-                updated_at: epoch(),
-            });
-
-            for (position, phase) in spec.phases.iter().enumerate() {
-                phases.push(StepGraphPhase {
-                    id: PhaseId::from_uuid(demo_uuid(class::PHASE, phase_n)),
+            for (position, phase) in kind.phases.iter().enumerate() {
+                phases.push(seed::phase_row(
+                    PhaseId::from_uuid(demo_uuid(class::PHASE, phase_n)),
                     graph_id,
-                    position: position as i32,
-                    name: (*phase).to_owned(),
-                    fan_out: 1,
-                    gate: Gate::Always,
-                    gate_hard: false,
-                    retry_limit: 1,
-                    input_kinds: position
-                        .checked_sub(1)
-                        .map(|previous| vec![spec.phases[previous].to_owned()])
-                        .unwrap_or_default(),
-                    output_kind: (*phase).to_owned(),
-                    isolation: None,
-                    command_queue: CommandQueue::FanOutOnly,
-                    verify_command: None,
-                    template_name: (*phase).to_owned(),
-                    template_version: None,
-                    token_budget: None,
-                    updated_at: epoch(),
-                });
+                    position as i32,
+                    phase,
+                    epoch(),
+                ));
                 phase_n += 1;
             }
         }
 
-        for (template_index, name) in TEMPLATE_NAMES.iter().enumerate() {
-            templates.push(PromptTemplate {
-                id: PromptTemplateId::from_uuid(demo_uuid(
+        for (template_index, (name, _, body)) in DEFAULT_TEMPLATES.iter().enumerate() {
+            templates.push(seed::template_row(
+                PromptTemplateId::from_uuid(demo_uuid(
                     class::PROMPT_TEMPLATE,
-                    project_index * TEMPLATE_NAMES.len() as u8 + template_index as u8,
+                    project_index * templates_per_project + template_index as u8,
                 )),
-                project_id: *project_id,
-                name: (*name).to_owned(),
-                version: 1,
-                body: crate::prompt::body_of(name)
-                    .expect("every TEMPLATE_NAMES entry is a DEFAULT_TEMPLATES name")
-                    .to_owned(),
-                created_by: ids::USER,
-                created_at: epoch(),
-                updated_at: epoch(),
-            });
+                *project_id,
+                name,
+                body,
+                ids::USER,
+                epoch(),
+            ));
         }
     }
 
@@ -1593,7 +1512,7 @@ fn strings(values: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{DemoData, demo_at, demo_data, demo_uuid, ids};
-    use crate::model::Status;
+    use crate::model::{Status, StepGraphId};
     use std::collections::HashSet;
 
     #[test]
@@ -1735,14 +1654,10 @@ mod tests {
     #[test]
     fn ten_templates_per_project_from_the_default_bodies() {
         let data = demo_data();
-        assert_eq!(
-            super::TEMPLATE_NAMES.to_vec(),
-            crate::prompt::DEFAULT_TEMPLATES
-                .iter()
-                .map(|(name, ..)| *name)
-                .collect::<Vec<_>>(),
-            "the fixture's names are §5.4's names, in §5.4's order"
-        );
+        let expected: Vec<&str> = crate::prompt::DEFAULT_TEMPLATES
+            .iter()
+            .map(|(name, ..)| *name)
+            .collect();
 
         for (project_id, ..) in super::PROJECT_SPECS {
             let names: Vec<&str> = data
@@ -1751,7 +1666,7 @@ mod tests {
                 .filter(|template| template.project_id == project_id)
                 .map(|template| template.name.as_str())
                 .collect();
-            assert_eq!(names, super::TEMPLATE_NAMES, "ten per project, in order");
+            assert_eq!(names, expected, "ten per project, in order");
         }
 
         for template in &data.templates {
@@ -1768,11 +1683,56 @@ mod tests {
         }
     }
 
+    /// The fixture's phases are `seed::KINDS`' rows and not a second table that happens to look
+    /// like them (plan D2): same names, same `input_kinds`, same `gate_hard`, graph by graph.
+    ///
+    /// The named id is pinned alongside because the phase strides are what place it: a stride
+    /// edit that shifted [`ids::PHASE_HTUI_IMPLEMENT`] onto `feature`'s `review` would leave
+    /// every count right and the `skill_binding` row pointing at the wrong step.
+    #[test]
+    fn the_fixture_phases_are_the_seed_rows() {
+        let data = demo_data();
+        for (kind_index, kind) in crate::seed::KINDS.iter().enumerate() {
+            let graph_id =
+                StepGraphId::from_uuid(demo_uuid(super::class::STEP_GRAPH, kind_index as u8));
+            let got: Vec<(&str, Vec<&str>, bool)> = data
+                .phases
+                .iter()
+                .filter(|phase| phase.graph_id == graph_id)
+                .map(|phase| {
+                    (
+                        phase.name.as_str(),
+                        phase.input_kinds.iter().map(String::as_str).collect(),
+                        phase.gate_hard,
+                    )
+                })
+                .collect();
+            let want: Vec<(&str, Vec<&str>, bool)> = kind
+                .phases
+                .iter()
+                .map(|phase| (phase.name, phase.input_kinds.to_vec(), phase.gate_hard))
+                .collect();
+            assert_eq!(got, want, "`{}`'s graph is the seed's", kind.name);
+        }
+
+        let implement = data
+            .phases
+            .iter()
+            .find(|phase| phase.id == ids::PHASE_HTUI_IMPLEMENT)
+            .expect("the named fixture phase");
+        assert_eq!(implement.name, "implement");
+        assert_eq!(
+            implement.input_kinds,
+            ["plan", "review"],
+            "ANA-2 §4.1's amendment, in the fixture the snapshots render"
+        );
+    }
+
     /// `demo_uuid` is a pure function of `(class, n)`, so the per-project stride **is** the id
     /// space: a stride below the number of templates per project makes project *i*'s first
     /// template share a primary key with project *i−1*'s last ones, and `load_demo` fails on the
     /// second insert. At eight names the two numbers agreed by accident; at ten they only agree
-    /// because the stride is `TEMPLATE_NAMES.len()` (blueprint E-5).
+    /// because the stride is `DEFAULT_TEMPLATES.len()` (blueprint E-5).
     #[test]
     fn template_ids_are_distinct_across_projects() {
         let data = demo_data();
