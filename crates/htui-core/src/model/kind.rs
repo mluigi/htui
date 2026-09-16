@@ -67,6 +67,66 @@ pub struct ItemKind {
     pub updated_at: DateTime<Utc>,
 }
 
+impl ItemKind {
+    /// The `item_kind.prefix` CHECK `^[A-Z][A-Z0-9]{1,15}$` (`0001_init.sql:282-290`) without a
+    /// regex crate: 2..=16 bytes, the first `A-Z`, the rest `A-Z0-9`.
+    ///
+    /// Here rather than in either store because both have to refuse the same strings with the same
+    /// sentence (plan D11): on Postgres the column would refuse anyway, but with a constraint name
+    /// rather than the rule, and `MemStore` has no column to refuse for it. Byte-wise and not
+    /// char-wise on purpose — a multi-byte character can never be `A-Z0-9`, so a leading `Ä` fails
+    /// on its first byte and the length test is the column's own, which counts bytes too.
+    #[must_use]
+    pub fn prefix_is_valid(prefix: &str) -> bool {
+        let bytes = prefix.as_bytes();
+        (2..=16).contains(&bytes.len())
+            && bytes[0].is_ascii_uppercase()
+            && bytes[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    }
+}
+
+/// Arguments of [`crate::store::WriteStore::create_item_kind`].
+///
+/// `default_graph_id` is `NOT NULL` (`0001_init.sql:288`) and must name a graph of `project_id`,
+/// which is the seed order ANA-9 §5.10 fixes: graphs, then phases, then kinds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewItemKind {
+    /// `item_kind.id`, minted client-side as a UUIDv7.
+    pub id: ItemKindId,
+    /// `item_kind.project_id`.
+    pub project_id: ProjectId,
+    /// `item_kind.prefix`; [`ItemKind::prefix_is_valid`] is checked before the statement.
+    pub prefix: String,
+    /// `item_kind.name`, unique within the project.
+    pub name: String,
+    /// `item_kind.description`.
+    pub description: String,
+    /// `item_kind.default_graph_id`, which must belong to `project_id`.
+    pub default_graph_id: StepGraphId,
+    /// `item_kind.position`.
+    pub position: i32,
+}
+
+/// Edit passed to [`crate::store::WriteStore::update_item_kind`]; `None` leaves the column.
+///
+/// Renaming `prefix` leaves the keys already minted under the old one alone (PRD D12): the store
+/// forbids rewriting `item.key_prefix`, so the rename is a change to what the *next* mint spells.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ItemKindPatch {
+    /// `item_kind.prefix`.
+    pub prefix: Option<String>,
+    /// `item_kind.name`.
+    pub name: Option<String>,
+    /// `item_kind.description`.
+    pub description: Option<String>,
+    /// `item_kind.default_graph_id`.
+    pub default_graph_id: Option<StepGraphId>,
+    /// `item_kind.position`.
+    pub position: Option<i32>,
+}
+
 /// A row of `step_graph` (§5.4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepGraph {
@@ -82,6 +142,32 @@ pub struct StepGraph {
     pub created_at: DateTime<Utc>,
     /// `step_graph.updated_at`.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Arguments of [`crate::store::WriteStore::create_step_graph`]. The graph lands with no phases;
+/// [`crate::store::WriteStore::create_phase`] adds them one row at a time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewStepGraph {
+    /// `step_graph.id`, minted client-side as a UUIDv7.
+    pub id: StepGraphId,
+    /// `step_graph.project_id`.
+    pub project_id: ProjectId,
+    /// `step_graph.name`, unique within the project.
+    pub name: String,
+    /// `step_graph.description`.
+    pub description: String,
+}
+
+/// Edit passed to [`crate::store::WriteStore::update_step_graph`]; `None` leaves the column.
+///
+/// `is_override` is not here: the column arrives with MOD-4's `0003` and seeded graphs take its
+/// default (PRD scope), so there is nothing for this milestone to write.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StepGraphPatch {
+    /// `step_graph.name`.
+    pub name: Option<String>,
+    /// `step_graph.description`.
+    pub description: Option<String>,
 }
 
 /// A row of `step_graph_phase` (§5.4): one phase of a graph (`R-ORCH-1`).
@@ -123,6 +209,26 @@ pub struct StepGraphPhase {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Edit passed to [`crate::store::WriteStore::update_phase`]; `None` leaves the column.
+///
+/// PRD D2's six editable columns minus `token_budget`, which the `Phase` rung of
+/// [`crate::store::WriteStore::set_setting`] owns alone (plan D8): a column two writers could set
+/// is the hole the rung design closes. `fan_out`, `isolation`, `command_queue`, `verify_command`
+/// and `retry_limit` are MOD-4's and are rendered rather than edited, so they are not here either.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PhasePatch {
+    /// `step_graph_phase.name`; `judge` and `handoff` are refused (ANA-5 §4.6).
+    pub name: Option<String>,
+    /// `step_graph_phase.position`, unique within the graph.
+    pub position: Option<i32>,
+    /// `step_graph_phase.template_name`.
+    pub template_name: Option<String>,
+    /// `step_graph_phase.gate_hard`.
+    pub gate_hard: Option<bool>,
+    /// `step_graph_phase.input_kinds`, replaced whole.
+    pub input_kinds: Option<Vec<String>>,
+}
+
 /// A row of `phase_agent` (§5.4): a candidate agent for a phase, in priority order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhaseAgent {
@@ -155,4 +261,36 @@ pub struct PromptTemplate {
     pub created_at: DateTime<Utc>,
     /// `prompt_template.updated_at`.
     pub updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ItemKind;
+
+    /// The CHECK, byte for byte: `^[A-Z][A-Z0-9]{1,15}$` (`0001_init.sql:282-290`).
+    ///
+    /// The store calls this before the statement so both backends refuse the same strings with the
+    /// same sentence (plan D11), which makes this test — not a database — the thing that says the
+    /// two agree with the column.
+    #[test]
+    fn prefix_is_valid_mirrors_the_check() {
+        let sixteen = format!("A{}", "9".repeat(15));
+        for good in ["ANA", "A1", "AB", sixteen.as_str()] {
+            assert!(ItemKind::prefix_is_valid(good), "`{good}` is a prefix");
+        }
+        let seventeen = format!("A{}", "9".repeat(16));
+        for bad in [
+            "feat",
+            "1A",
+            "A",
+            "",
+            seventeen.as_str(),
+            "AN-A",
+            "AN A",
+            "ÄNA",
+            "A_B",
+        ] {
+            assert!(!ItemKind::prefix_is_valid(bad), "`{bad}` is not a prefix");
+        }
+    }
 }

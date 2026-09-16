@@ -25,6 +25,32 @@ pub struct Workspace {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Arguments of [`crate::store::WriteStore::create_workspace`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewWorkspace {
+    /// `workspace.id`, minted client-side as a UUIDv7.
+    pub id: WorkspaceId,
+    /// `workspace.slug`, unique across the database.
+    pub slug: String,
+    /// `workspace.name`.
+    pub name: String,
+    /// `workspace.description`.
+    pub description: String,
+    /// `workspace.created_by`.
+    pub created_by: UserId,
+}
+
+/// Edit passed to [`crate::store::WriteStore::update_workspace`]; `None` leaves the column.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkspacePatch {
+    /// `workspace.slug`.
+    pub slug: Option<String>,
+    /// `workspace.name`.
+    pub name: Option<String>,
+    /// `workspace.description`.
+    pub description: Option<String>,
+}
+
 /// A row of `project` (§5.3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
@@ -48,6 +74,38 @@ pub struct Project {
     pub created_at: DateTime<Utc>,
     /// `project.updated_at`.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Arguments of [`crate::store::WriteStore::create_project`].
+///
+/// No `settings` and no secret columns (plan D9): the project lands with `settings = {}` and the
+/// key-level writer [`crate::store::WriteStore::set_setting`] fills it one key at a time, because a
+/// whole-document write would erase MOD-4's and MOD-12's keys without a word (PRD risk table).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewProject {
+    /// `project.id`, minted client-side as a UUIDv7.
+    pub id: ProjectId,
+    /// `project.slug`, unique across the database.
+    pub slug: String,
+    /// `project.name`.
+    pub name: String,
+    /// `project.description`.
+    pub description: String,
+    /// `project.created_by`.
+    pub created_by: UserId,
+}
+
+/// Edit passed to [`crate::store::WriteStore::update_project`]; `None` leaves the column.
+///
+/// `settings` is deliberately absent, for the reason [`NewProject`] gives.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectPatch {
+    /// `project.slug`.
+    pub slug: Option<String>,
+    /// `project.name`.
+    pub name: Option<String>,
+    /// `project.description`.
+    pub description: Option<String>,
 }
 
 /// A row of `workspace_project` (§5.3): a project's membership and order inside a workspace.
@@ -80,6 +138,45 @@ pub struct Repo {
     pub created_at: DateTime<Utc>,
     /// `repo.updated_at`.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Arguments of [`crate::store::WriteStore::create_repo`].
+///
+/// `is_primary: true` is honoured rather than refused: the store clears the project's current
+/// primary in the same transaction, so `uq_repo_primary` (`0001_init.sql:185-200`) is never tripped
+/// by a create (plan D10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewRepo {
+    /// `repo.id`, minted client-side as a UUIDv7.
+    pub id: RepoId,
+    /// `repo.project_id`.
+    pub project_id: ProjectId,
+    /// `repo.name`, unique within the project.
+    pub name: String,
+    /// `repo.remote_url`.
+    pub remote_url: Option<String>,
+    /// `repo.default_branch`.
+    pub default_branch: String,
+    /// `repo.is_primary`.
+    pub is_primary: bool,
+}
+
+/// Edit passed to [`crate::store::WriteStore::update_repo`]; `None` leaves the column.
+///
+/// `remote_url` is doubly wrapped as [`crate::model::ItemPatch::step_graph_id`] is: `None` leaves
+/// the stored URL, `Some(None)` clears it, `Some(Some(url))` replaces it. A single `Option` could
+/// not express "clear" at all.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RepoPatch {
+    /// `repo.name`.
+    pub name: Option<String>,
+    /// `repo.remote_url`; `Some(None)` clears it.
+    pub remote_url: Option<Option<String>>,
+    /// `repo.default_branch`.
+    pub default_branch: Option<String>,
+    /// `repo.is_primary`; `Some(true)` demotes the project's current primary in the same
+    /// transaction, `Some(false)` only unsets this row.
+    pub is_primary: Option<bool>,
 }
 
 /// A row of `repo_box_path` (§5.3): where a repository lives on one box (`R-BOX-4`).

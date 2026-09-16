@@ -99,8 +99,8 @@ pub use box_::{BoxInfo, BoxProfile, BoxRow, BoxTool, OsFamily};
 pub use document::{Document, DocumentHead};
 pub use event::{EventKind, EventRole, SessionEvent};
 pub use hierarchy::{
-    Project, ProjectRef, Repo, RepoBoxPath, Workspace, WorkspaceBoxPath, WorkspaceProject,
-    WorkspaceSummary,
+    NewProject, NewRepo, NewWorkspace, Project, ProjectPatch, ProjectRef, Repo, RepoBoxPath,
+    RepoPatch, Workspace, WorkspaceBoxPath, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
 };
 pub use ids::{
     AgentId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PhaseId, ProjectId,
@@ -109,7 +109,8 @@ pub use ids::{
 };
 pub use item::{Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Status};
 pub use kind::{
-    CommandQueue, Gate, Isolation, ItemKind, PhaseAgent, PromptTemplate, StepGraph, StepGraphPhase,
+    CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewStepGraph, PhaseAgent,
+    PhasePatch, PromptTemplate, StepGraph, StepGraphPatch, StepGraphPhase,
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
 pub use note::Note;
