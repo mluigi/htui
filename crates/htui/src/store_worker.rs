@@ -334,8 +334,9 @@ pub enum StoreReply {
         session_ref: Option<AgentSessionRef>,
         /// What this transport can do, for the tab's capability banner.
         caps: DriverCaps,
-        /// `Writer::label()` of the store this chat records into: `memory`, `online` or
-        /// `buffered` (MOD-2 D42).
+        /// `Writer::label()` of the store this chat records into: `memory` or `online` (MOD-2 D42;
+        /// `buffered` is the third label, which no accepted chat has carried since MOD-25 made an
+        /// offline one refuse).
         ///
         /// It travels on the acceptance because the tab must be able to say that a conversation is
         /// only on this disk, and it cannot ask: `R-NF-3` keeps every store handle on the worker's

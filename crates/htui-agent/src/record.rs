@@ -490,9 +490,10 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// Records `agent_box.quota` for one row as well as the step's log (plan D66-D68).
     ///
     /// A builder rather than a sixth parameter to [`Recorder::new`] because most recorders have no
-    /// latch: every conformance case that is not about quota, every offline chat (a buffered writer
-    /// refuses registry writes, so the worker answers `None` before the first row rather than
-    /// discovering it on one), and every test of the other twelve rules.
+    /// latch: every conformance case that is not about quota, every buffered chat a build before
+    /// MOD-25 started (a buffered writer refuses registry writes, so the worker answers `None`
+    /// before the first row rather than discovering it on one), and every test of the other twelve
+    /// rules.
     #[must_use]
     pub fn with_quota_latch(mut self, latch: QuotaLatch) -> Self {
         self.quota_latch = Some(latch);
@@ -1089,8 +1090,8 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// keeps the windows.
     ///
     /// **Best-effort** is plan D68: a failed allowance write is logged and dropped. `R-HIS-1`'s
-    /// durability is carried by the `usage` rows, which are buffered offline and re-derive the
-    /// figure after upload; failing a turn because an advisory number could not be stored would
+    /// durability is carried by the `usage` rows, which a pre-MOD-25 build buffered offline to
+    /// re-derive the figure after upload; failing a turn because an advisory number could not be stored would
     /// trade the requirement for the courtesy. Two of the four outcomes also switch the latch off
     /// for the session, because they will not change: an unreachable registry
     /// (`REGISTRY_ON_SERVER_ONLY` — the offline refusal, which the worker normally answers before

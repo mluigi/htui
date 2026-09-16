@@ -33,8 +33,10 @@ pub const PENDING_DIR: &str = "pending";
 /// The order is the one [`refresh::run_pass`] fills them in and the one [`CacheStore::rebuild`]
 /// empties them in; `cache_meta` and `cache_cursor` are local and deliberately absent.
 ///
-/// `agent` joined the list in MOD-2 milestone 4 (plan D31): an offline chat cannot resolve a driver
-/// without the registry row, and §4.4 was corrected in the same milestone to say so. `agent_box` is
+/// `agent` joined the list in MOD-2 milestone 4 (plan D31): a buffered chat could not resolve a
+/// driver without the registry row, and §4.4 was corrected in the same milestone to say so. MOD-25
+/// refuses that chat instead, but the row stays mirrored — the Backlog and the agents section read
+/// it off the mirror too. `agent_box` is
 /// still absent - it is a probe snapshot whose columns milestone 5 changes.
 pub const MIRRORED_TABLES: [&str; 16] = [
     "app_user",

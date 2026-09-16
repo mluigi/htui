@@ -1433,10 +1433,12 @@ fn project_caps_for(
 /// The decision is made **here**, at chat start, rather than discovered on the first `usage` row:
 /// a [`Writer::Buffered`] refuses every registry write with
 /// [`REGISTRY_ON_SERVER_ONLY`](htui_store::REGISTRY_ON_SERVER_ONLY) (`recording_writer`, plan D52),
-/// because the offline mirror has no `agent_box` table at all — deliberately. An offline chat
-/// therefore leaves the last server-side value standing and buffers the `usage` rows that
+/// because the offline mirror has no `agent_box` table at all — deliberately. A buffered chat
+/// therefore left the last server-side value standing and buffered the `usage` rows that
 /// re-derive it after upload, which is what `R-HIS-1` actually asks for; failing or retrying a
-/// turn over an advisory allowance figure would trade the requirement for the courtesy.
+/// turn over an advisory allowance figure would trade the requirement for the courtesy. Since
+/// MOD-25 an offline chat is refused before any of this, and the arm below is kept for the
+/// reversal.
 ///
 /// `source` is `agent.settings.quota.source` and `billing` is `agent.billing`, both read off the
 /// row. Nothing here looks at `agent.name` (`R-AGT-5`) — the name is logged, and a log line is not

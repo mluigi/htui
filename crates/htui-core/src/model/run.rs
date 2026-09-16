@@ -176,9 +176,10 @@ const TIMESTAMPTZ_DIGITS: u16 = 6;
 /// (MOD-2 plan D4).
 ///
 /// The ids are minted client-side, so both paths address the *same* two rows: written straight to
-/// Postgres by [`WriteStore::start_chat_run`](crate::store::WriteStore::start_chat_run), or
-/// buffered to `<cache_dir>/pending/<project_id>.<run_id>.jsonl` and uploaded later
-/// (`docs/ANA-9.md` §4.3). Both inserts are `ON CONFLICT (id) DO NOTHING`, so however the two
+/// Postgres by [`WriteStore::start_chat_run`](crate::store::WriteStore::start_chat_run), or — for
+/// a chat a build before MOD-25 started offline — buffered to
+/// `<cache_dir>/pending/<project_id>.<run_id>.jsonl` and uploaded later (`docs/ANA-9.md` §4.3);
+/// that upload path is still live, though nothing writes a new buffer. Both inserts are `ON CONFLICT (id) DO NOTHING`, so however the two
 /// interleave the database ends up with one `run` and one `run_step` for the chat, never a second
 /// pair and never a duplicate-key error.
 ///
