@@ -13,8 +13,10 @@ use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
-use htui_core::model::{ProjectId, ProjectPatch, RepoId, RepoPatch, WorkspaceId, WorkspacePatch};
-use htui_core::store::{DeleteReach, DeleteTarget, MemStore, ReadStore};
+use htui_core::model::{
+    NewProject, ProjectId, ProjectPatch, RepoId, RepoPatch, WorkspaceId, WorkspacePatch,
+};
+use htui_core::store::{DeleteReach, DeleteTarget, MemStore, ReadStore, WriteStore};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -56,11 +58,6 @@ async fn a_hierarchy_read_returns_the_demo_tree() {
     };
     assert_eq!(tree.workspace.slug, "graphics");
     assert_eq!(tree.workspace.id, ids::WORKSPACE_GRAPHICS);
-    assert_eq!(
-        tree.this_box,
-        Some(ids::BOX),
-        "identity is resolved worker-side, never carried by the request"
-    );
     assert!(
         tree.root_path.is_none(),
         "the fixture seeds no `workspace_box_path` row"
@@ -399,6 +396,185 @@ async fn a_root_is_stored_canonical_and_a_link_is_refused() {
             "a refusal never names the link's target: {message}"
         );
     }
+}
+
+/// A canonical path that is not UTF-8 is refused rather than stored mangled: `to_string_lossy`
+/// would put a string naming nothing on disk into `root_path`. The typed path is valid UTF-8 — it
+/// arrived as a `String` — so only what a link resolves to can get here, and the refusal names what
+/// was typed and never the target (`R-BOX-4`).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_canonical_path_that_is_not_utf8_is_refused() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = tempfile::tempdir().expect("a throwaway directory");
+    let target = dir.path().join(OsStr::from_bytes(b"not\xffutf8"));
+    std::fs::create_dir(&target).expect("a directory whose name is not UTF-8");
+    let link = dir.path().join("checkout");
+    std::os::unix::fs::symlink(&target, &link).expect("the link is created");
+
+    let (request, message) = refusal(
+        serve(
+            &demo(),
+            &StoreRequest::SetWorkspaceRoot {
+                id: ids::WORKSPACE_GRAPHICS,
+                path: link.display().to_string(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(request, "set_workspace_root");
+    assert!(
+        message.contains("is not valid UTF-8"),
+        "the refusal says what is wrong with it: {message}"
+    );
+    assert!(
+        message.contains("checkout"),
+        "and names the path as typed: {message}"
+    );
+    assert!(
+        !message.contains("utf8"),
+        "a refusal never names a link's target: {message}"
+    );
+}
+
+/// A box with no row is refused **before** the path is stat'ed: the box refusal is the one that
+/// tells the user what is actually wrong, and a `spawn_blocking` on a cold mount is not worth
+/// paying to reach a refusal that was already decided.
+#[tokio::test]
+async fn a_box_with_no_row_is_refused_before_the_path_is_read() {
+    let backend = Backend::memory(MemStore::new());
+    let (request, message) = refusal(
+        serve(
+            &backend,
+            &StoreRequest::SetWorkspaceRoot {
+                id: WorkspaceId::default(),
+                path: "/definitely/not/here".to_owned(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(request, "set_workspace_root");
+    assert!(
+        message.contains("box `(this box)` not found"),
+        "the box is refused, not the path: {message}"
+    );
+}
+
+/// The workspace a write's reply re-reads is resolved **before** the write: a project that is
+/// linked to nothing has no tree to answer with, and a read that failed after the fact would report
+/// `Failed` for a write that applied.
+#[tokio::test]
+async fn an_unlinked_project_is_refused_before_anything_is_written() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let orphan = store
+        .create_project(NewProject {
+            id: ProjectId::new(),
+            slug: "orphan".to_owned(),
+            name: "Orphan".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the store creates it");
+
+    let (request, message) = refusal(
+        serve(
+            &backend,
+            &StoreRequest::UpdateProject {
+                id: orphan.id,
+                expected: orphan.updated_at,
+                patch: ProjectPatch {
+                    name: Some("Renamed".to_owned()),
+                    ..ProjectPatch::default()
+                },
+            },
+        )
+        .await,
+    );
+    assert_eq!(request, "update_project");
+    assert!(message.contains("workspace_project"), "{message}");
+    assert_eq!(
+        store
+            .project(orphan.id)
+            .await
+            .expect("the store answers")
+            .expect("the project is there")
+            .name,
+        "Orphan",
+        "the rename did not apply behind a refusal that says it did not"
+    );
+
+    let (request, _) = refusal(
+        serve(
+            &backend,
+            &StoreRequest::CreateRepo {
+                project: orphan.id,
+                name: "alpha".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            },
+        )
+        .await,
+    );
+    assert_eq!(request, "create_repo");
+    assert!(
+        store
+            .repos(orphan.id)
+            .await
+            .expect("the store answers")
+            .is_empty(),
+        "and no repo was left behind either"
+    );
+}
+
+/// A link's position is one past the highest, not the count: after a middle project is deleted the
+/// count collides with a position that is still in use, and `workspace_project` has no unique on it.
+#[tokio::test]
+async fn a_link_takes_one_past_the_highest_position() {
+    let backend = demo();
+    let second = tree(
+        serve(
+            &backend,
+            &StoreRequest::CreateProject {
+                workspace: ids::WORKSPACE_GRAPHICS,
+                slug: "renderer".to_owned(),
+                name: "Renderer".to_owned(),
+                description: String::new(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(second.projects[1].link.position, 1);
+
+    // The first one goes, leaving a hole at `0` and `renderer` at `1`.
+    let _ = serve(&backend, &StoreRequest::DeleteProject(ids::PROJECT_VULKAN)).await;
+    let third = tree(
+        serve(
+            &backend,
+            &StoreRequest::CreateProject {
+                workspace: ids::WORKSPACE_GRAPHICS,
+                slug: "shaders".to_owned(),
+                name: "Shaders".to_owned(),
+                description: String::new(),
+            },
+        )
+        .await,
+    );
+
+    let positions: Vec<(&str, i32)> = third
+        .projects
+        .iter()
+        .map(|entry| (entry.project.slug.as_str(), entry.link.position))
+        .collect();
+    assert_eq!(
+        positions,
+        vec![("renderer", 1), ("shaders", 2)],
+        "the new link is one past the highest, so no two links share a position"
+    );
 }
 
 /// The report equals the act (PRD D13): what the warning pane showed is what the delete took. On a

@@ -25,12 +25,15 @@ use crate::store_worker::{StoreReply, StoreRequest};
 ///
 /// One read answers the whole tree (D5): the section re-renders from this and never patches its
 /// rows from a single returned row, so there is exactly one source of truth on the render side.
+///
+/// It carries **no `BoxId`**: the filtering D5 asks for is done by [`snapshot`] against the
+/// `this_box` it was handed, and the rows that survive it already name the box they belong to. A
+/// field here would be the one thing that made blueprint §15's "no view holds a `UserId` or a
+/// `BoxId`" false by ownership rather than by convention.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HierarchySnapshot {
     /// The workspace row itself; `updated_at` is the CAS token an editor opens on.
     pub workspace: Workspace,
-    /// This box, when one is registered — the id a path write is stored under.
-    pub this_box: Option<BoxId>,
     /// This box's root path for the workspace, when a row exists. Other boxes' rows are dropped.
     pub root_path: Option<WorkspaceBoxPath>,
     /// The workspace's projects, ordered by `workspace_project.position`.
@@ -144,7 +147,6 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 
     Ok(Some(HierarchySnapshot {
         workspace,
-        this_box,
         root_path,
         projects,
     }))
@@ -202,11 +204,15 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             cas(&writer, *id, this_box, &outcome).await
         }
         StoreRequest::SetWorkspaceRoot { id, path } => {
+            // The box first: it is an `Option` already in hand, and a box with no row is refused
+            // whatever the path says — paying `canonical`'s `spawn_blocking` stat to answer with
+            // the *path's* refusal would both cost a blocking call and name the wrong problem.
+            let box_id = box_id(this_box)?;
             let root_path = canonical(path).await?;
             writer
                 .upsert_workspace_box_path(&WorkspaceBoxPath {
                     workspace_id: *id,
-                    box_id: box_id(this_box)?,
+                    box_id,
                     root_path,
                     // The store's trigger stamps the column; nothing here sets `updated_at` by
                     // hand, and the value passed in is overwritten on both backends.
@@ -235,11 +241,19 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             // linker and this milestone adds no seam method, so a failure between them leaves an
             // unlinked project the editor's `Failed` reports and `r` does not show.
             let links = writer.workspace_projects(*workspace).await?;
+            // One past the highest, not the count: a middle project that was deleted leaves
+            // `[0, 2]`, where `links.len()` is `2` and `workspace_project` has no unique on
+            // `position` to catch the collision (`0001_init.sql:161-166`).
+            let position = links
+                .iter()
+                .map(|link| link.position)
+                .max()
+                .map_or(0, |highest| highest.saturating_add(1));
             writer
                 .upsert_workspace_project(&WorkspaceProject {
                     workspace_id: *workspace,
                     project_id: project.id,
-                    position: i32::try_from(links.len()).unwrap_or(i32::MAX),
+                    position,
                 })
                 .await?;
             reread(&writer, *workspace, this_box).await
@@ -249,8 +263,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             expected,
             patch,
         } => {
-            let outcome = writer.update_project(*id, *expected, patch.clone()).await?;
+            // Before the write: a project linked to no workspace has no tree for the reply to
+            // re-read, and resolving it afterwards would answer `Failed` for a write that applied.
+            // It doubles as the check that the project is linked at all.
             let ws = workspace_of(backend, *id).await?;
+            let outcome = writer.update_project(*id, *expected, patch.clone()).await?;
             cas(&writer, ws, this_box, &outcome).await
         }
         StoreRequest::CreateRepo {
@@ -260,6 +277,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             default_branch,
             is_primary,
         } => {
+            let ws = workspace_of(backend, *project).await?;
             writer
                 .create_repo(NewRepo {
                     id: RepoId::new(),
@@ -270,7 +288,6 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     is_primary: *is_primary,
                 })
                 .await?;
-            let ws = workspace_of(backend, *project).await?;
             reread(&writer, ws, this_box).await
         }
         StoreRequest::UpdateRepo {
@@ -279,8 +296,8 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             expected,
             patch,
         } => {
-            let outcome = writer.update_repo(*id, *expected, patch.clone()).await?;
             let ws = workspace_of(backend, *project).await?;
+            let outcome = writer.update_repo(*id, *expected, patch.clone()).await?;
             cas(&writer, ws, this_box, &outcome).await
         }
         StoreRequest::SetRepoPath {
@@ -288,16 +305,19 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             repo,
             path,
         } => {
+            // Everything that can refuse without touching the disk, first; then the stat; then the
+            // write. See `SetWorkspaceRoot` and `UpdateProject` above for the two halves of this.
+            let box_id = box_id(this_box)?;
+            let ws = workspace_of(backend, *project).await?;
             let local_path = canonical(path).await?;
             writer
                 .upsert_repo_box_path(&RepoBoxPath {
                     repo_id: *repo,
-                    box_id: box_id(this_box)?,
+                    box_id,
                     local_path,
                     updated_at: Utc::now(),
                 })
                 .await?;
-            let ws = workspace_of(backend, *project).await?;
             reread(&writer, ws, this_box).await
         }
         StoreRequest::DeleteReach(target) => {
@@ -387,13 +407,25 @@ fn box_id(this_box: Option<BoxId>) -> Result<BoxId> {
 ///
 /// A refusal becomes a [`StoreError::Constraint`], so it reaches the status line as
 /// ``set_repo_path: constraint violated: `/x` is a link to nothing``.
+///
+/// A canonical path that is not UTF-8 is a refusal of the same shape rather than a
+/// `to_string_lossy` that stores a string naming nothing on disk. What was typed is a `String` and
+/// so always UTF-8; only what a link resolves to can get here, and the sentence names the path as
+/// typed — never the target (`R-BOX-4`).
 async fn canonical(path: &str) -> Result<String> {
     let typed = path.to_owned();
-    tokio::task::spawn_blocking(move || canonical_root(Path::new(&typed)))
-        .await
-        .map_err(|err| StoreError::Backend(err.to_string()))?
-        .map(|canonical| canonical.to_string_lossy().into_owned())
-        .map_err(|refusal| StoreError::Constraint(refusal.to_string()))
+    let resolved = tokio::task::spawn_blocking({
+        let typed = typed.clone();
+        move || canonical_root(Path::new(&typed))
+    })
+    .await
+    .map_err(|err| StoreError::Backend(err.to_string()))?
+    .map_err(|refusal| StoreError::Constraint(refusal.to_string()))?;
+    resolved.into_os_string().into_string().map_err(|_| {
+        StoreError::Constraint(format!(
+            "`{typed}` resolves to a path that is not valid UTF-8"
+        ))
+    })
 }
 
 /// Which workspace a project belongs to.
