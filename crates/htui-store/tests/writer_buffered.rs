@@ -12,12 +12,16 @@ use std::path::{Path, PathBuf};
 
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
-    AgentBox, ChatRunSpec, EventKind, EventRole, ItemId, ItemPatch, NewItem, ProjectId, RunId,
-    RunStatus, SessionEvent, Status, StepId,
+    AgentBox, ChatRunSpec, EventKind, EventRole, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
+    NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph, NewWorkspace, PhaseId, PhasePatch,
+    ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch, RunId, RunStatus, SessionEvent,
+    Status, StepGraphId, StepGraphPatch, StepId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject,
 };
-use htui_core::store::{ReadStore as _, StoreError, WriteStore as _};
+use htui_core::prompt::settings::SettingKey;
+use htui_core::store::{DeleteTarget, ReadStore as _, SettingRung, StoreError, WriteStore as _};
 use htui_store::cache::pending::OPEN_SUFFIX;
-use htui_store::{Backend, BufferedWriter, CacheStore, PgStore};
+use htui_store::{Backend, BufferedWriter, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use serde_json::json;
 
 /// A mirror in a throwaway directory: no server, no `%APPDATA%`.
@@ -293,6 +297,329 @@ async fn item_and_registry_writes_are_unreachable() {
         pending_files(writer.dir()),
         0,
         "a refusal writes nothing to the buffer either"
+    );
+    cache.close().await;
+}
+
+/// MOD-15 milestone 1, plan D2: the hierarchy is written - and read - on the server only.
+///
+/// All **31** new [`htui_core::store::WriteStore`] methods are listed here, readers included, and
+/// every one answers [`DATABASE_UNREACHABLE`]. Two facts make that one sentence the right one
+/// rather than a new constant: `htui` has been online-only since MOD-25, so a hierarchy write off
+/// the server is the same event `R-STO-4` already words; and none of the six tables is mirrored
+/// (`cache/mod.rs`'s `MIRRORED_TABLES`), so offline a read of them is unreachable in the literal
+/// sense too. `REGISTRY_ON_SERVER_ONLY` and `PROMPT_ON_SERVER_ONLY` name other subsystems and
+/// would send a reader looking in the wrong place.
+///
+/// The assertion is on the sentence, not just the variant, because the refusal being *one*
+/// sentence is the thing that could silently regress: a second constant for the same fact is what
+/// this case exists to fail on.
+#[tokio::test]
+async fn every_hierarchy_method_is_unreachable_offline() {
+    let root = tempfile::tempdir().expect("temp root");
+    let cache = cache(root.path()).await;
+    let writer = BufferedWriter::new(cache.clone());
+
+    let refused = |what: &str, err: StoreError| match err {
+        StoreError::Unreachable(sentence) => assert_eq!(
+            sentence, DATABASE_UNREACHABLE,
+            "{what} answers MOD-25's one offline sentence, not a second one"
+        ),
+        other => panic!("{what} must refuse as Unreachable, got {other:?}"),
+    };
+
+    let demo = fixtures::demo_data();
+    let at = fixtures::demo_at(3, 0);
+    let workspace = WorkspaceId::new();
+    let project = ProjectId::new();
+    let repo = RepoId::new();
+    let kind = ItemKindId::new();
+    let graph = StepGraphId::new();
+    let phase = PhaseId::new();
+
+    // workspace
+    refused(
+        "create_workspace",
+        writer
+            .create_workspace(NewWorkspace {
+                id: workspace,
+                slug: "offline".to_owned(),
+                name: "Offline".to_owned(),
+                description: String::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect_err("no workspace is created offline"),
+    );
+    refused(
+        "update_workspace",
+        writer
+            .update_workspace(workspace, at, WorkspacePatch::default())
+            .await
+            .expect_err("no workspace is edited offline"),
+    );
+    refused(
+        "workspace",
+        writer
+            .workspace(workspace)
+            .await
+            .expect_err("the workspace table is not mirrored"),
+    );
+
+    // workspace links and box paths
+    refused(
+        "upsert_workspace_project",
+        writer
+            .upsert_workspace_project(&WorkspaceProject {
+                workspace_id: workspace,
+                project_id: project,
+                position: 0,
+            })
+            .await
+            .expect_err("no link is written offline"),
+    );
+    refused(
+        "remove_workspace_project",
+        writer
+            .remove_workspace_project(workspace, project)
+            .await
+            .expect_err("no link is removed offline"),
+    );
+    refused(
+        "workspace_projects",
+        writer
+            .workspace_projects(workspace)
+            .await
+            .expect_err("workspace_project is not mirrored"),
+    );
+    refused(
+        "upsert_workspace_box_path",
+        writer
+            .upsert_workspace_box_path(&WorkspaceBoxPath {
+                workspace_id: workspace,
+                box_id: ids::BOX,
+                root_path: "/tmp/offline".to_owned(),
+                updated_at: at,
+            })
+            .await
+            .expect_err("no root path is written offline"),
+    );
+    refused(
+        "workspace_box_paths",
+        writer
+            .workspace_box_paths(workspace)
+            .await
+            .expect_err("workspace_box_path is not mirrored"),
+    );
+
+    // project
+    refused(
+        "create_project",
+        writer
+            .create_project(NewProject {
+                id: project,
+                slug: "offline".to_owned(),
+                name: "Offline".to_owned(),
+                description: String::new(),
+                created_by: ids::USER,
+            })
+            .await
+            .expect_err("no project is created offline"),
+    );
+    refused(
+        "update_project",
+        writer
+            .update_project(project, at, ProjectPatch::default())
+            .await
+            .expect_err("no project is edited offline"),
+    );
+
+    // repo and repo box paths
+    refused(
+        "create_repo",
+        writer
+            .create_repo(NewRepo {
+                id: repo,
+                project_id: project,
+                name: "htui".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect_err("no repo is created offline"),
+    );
+    refused(
+        "update_repo",
+        writer
+            .update_repo(repo, at, RepoPatch::default())
+            .await
+            .expect_err("no repo is edited offline"),
+    );
+    refused(
+        "repos",
+        writer
+            .repos(project)
+            .await
+            .expect_err("repo has no mirror reader"),
+    );
+    refused(
+        "upsert_repo_box_path",
+        writer
+            .upsert_repo_box_path(&RepoBoxPath {
+                repo_id: repo,
+                box_id: ids::BOX,
+                local_path: "/tmp/offline/htui".to_owned(),
+                updated_at: at,
+            })
+            .await
+            .expect_err("no checkout path is written offline"),
+    );
+    refused(
+        "repo_box_paths",
+        writer
+            .repo_box_paths(repo)
+            .await
+            .expect_err("repo_box_path is not mirrored"),
+    );
+
+    // item_kind
+    refused(
+        "create_item_kind",
+        writer
+            .create_item_kind(NewItemKind {
+                id: kind,
+                project_id: project,
+                prefix: "OFF".to_owned(),
+                name: "Offline".to_owned(),
+                description: String::new(),
+                default_graph_id: graph,
+                position: 0,
+            })
+            .await
+            .expect_err("no kind is created offline"),
+    );
+    refused(
+        "update_item_kind",
+        writer
+            .update_item_kind(kind, at, ItemKindPatch::default())
+            .await
+            .expect_err("no kind is edited offline"),
+    );
+    refused(
+        "item_kinds",
+        writer
+            .item_kinds(project)
+            .await
+            .expect_err("item_kind has no mirror reader on this trait"),
+    );
+    refused(
+        "delete_item_kind",
+        writer
+            .delete_item_kind(kind)
+            .await
+            .expect_err("no kind is deleted offline"),
+    );
+
+    // step_graph and phase
+    refused(
+        "create_step_graph",
+        writer
+            .create_step_graph(NewStepGraph {
+                id: graph,
+                project_id: project,
+                name: "offline".to_owned(),
+                description: String::new(),
+            })
+            .await
+            .expect_err("no graph is created offline"),
+    );
+    refused(
+        "update_step_graph",
+        writer
+            .update_step_graph(graph, at, StepGraphPatch::default())
+            .await
+            .expect_err("no graph is edited offline"),
+    );
+    refused(
+        "step_graphs",
+        writer
+            .step_graphs(project)
+            .await
+            .expect_err("step_graph is not mirrored"),
+    );
+    refused(
+        "create_phase",
+        writer
+            .create_phase(&demo.phases[0])
+            .await
+            .expect_err("no phase is created offline"),
+    );
+    refused(
+        "update_phase",
+        writer
+            .update_phase(phase, at, PhasePatch::default())
+            .await
+            .expect_err("no phase is edited offline"),
+    );
+    refused(
+        "phases",
+        writer
+            .phases(graph)
+            .await
+            .expect_err("step_graph_phase is not mirrored"),
+    );
+
+    // settings (D7, D8)
+    refused(
+        "set_setting",
+        writer
+            .set_setting(SettingRung::App, SettingKey::TokenBudget, json!(64_000), None)
+            .await
+            .expect_err("no setting is written offline"),
+    );
+    refused(
+        "clear_setting",
+        writer
+            .clear_setting(SettingRung::App, SettingKey::TokenBudget, at)
+            .await
+            .expect_err("no setting is cleared offline"),
+    );
+    refused(
+        "setting",
+        writer
+            .setting(SettingRung::Project(project), SettingKey::UpstreamHops)
+            .await
+            .expect_err("app_setting is not mirrored"),
+    );
+
+    // deletes (D4)
+    refused(
+        "delete_reach",
+        writer
+            .delete_reach(DeleteTarget::Workspace(workspace))
+            .await
+            .expect_err("the reach is counted on the server"),
+    );
+    refused(
+        "delete_workspace",
+        writer
+            .delete_workspace(workspace)
+            .await
+            .expect_err("no workspace is deleted offline"),
+    );
+    refused(
+        "delete_project",
+        writer
+            .delete_project(project)
+            .await
+            .expect_err("no project is deleted offline"),
+    );
+
+    assert_eq!(
+        pending_files(writer.dir()),
+        0,
+        "31 refusals write nothing to the buffer either"
     );
     cache.close().await;
 }
