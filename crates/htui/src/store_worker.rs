@@ -11,21 +11,24 @@
 //! deferred until `PgStore` read latency has actually been measured against a populated database;
 //! until then the queue depth is bounded in practice by the keystrokes a user can produce.
 
+use chrono::{DateTime, Utc};
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, PermissionRequestId};
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
     AgentId, AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph,
-    Note, ProjectId, RunSummary, Scope, SessionEvent, StepId, WorkspaceSummary,
+    Note, ProjectId, ProjectPatch, RepoId, RepoPatch, RunSummary, Scope, SessionEvent, StepId,
+    WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
-use htui_core::store::{ReadStore, Result as StoreResult, StoreError};
+use htui_core::store::{DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, StoreError};
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
 use htui_store::{Backend, ConnEvent, PgStore, Started, connect};
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
 use crate::agent_worker::{AgentRuntime, Served};
+use crate::hierarchy::{self, HierarchySnapshot, MirrorAfterDelete};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
 
@@ -222,6 +225,100 @@ pub enum StoreRequest {
     StoreState,
     /// Apply the pending migrations (`R-STO-5`), after the user answered `y`.
     ApplyMigrations,
+
+    // The twelve hierarchy requests of `Settings > Hierarchy` (MOD-15 milestone 3, D5/D6). Each
+    // carries **only what the user typed**: `created_by` and the box a path belongs to are filled
+    // in by [`crate::hierarchy::serve`] from `Backend` identity, so no view holds a `UserId` or a
+    // `BoxId`. All twelve are served through one or-ed arm of [`try_serve`].
+    /// The whole tree of one workspace for `Settings > Hierarchy` (D5).
+    Hierarchy(WorkspaceId),
+    /// `created_by` is the worker's (`Backend::this_user`); the section never holds a `UserId`.
+    CreateWorkspace {
+        /// `workspace.slug`, unique across the database.
+        slug: String,
+        /// `workspace.name`.
+        name: String,
+        /// `workspace.description`.
+        description: String,
+    },
+    /// CAS on `updated_at` (M1 D3): `Stale` answers [`StoreReply::HierarchyStale`].
+    UpdateWorkspace {
+        /// The row to edit.
+        id: WorkspaceId,
+        /// The `updated_at` the editor opened on.
+        expected: DateTime<Utc>,
+        /// The columns to write.
+        patch: WorkspacePatch,
+    },
+    /// This box's root for a workspace, canonicalised or refused (D8).
+    SetWorkspaceRoot {
+        /// The workspace the root belongs to.
+        id: WorkspaceId,
+        /// The path **as the user typed it**; the guard canonicalises or refuses it.
+        path: String,
+    },
+    /// Creates a project and links it at `position = links.len()`.
+    CreateProject {
+        /// The workspace to link it into.
+        workspace: WorkspaceId,
+        /// `project.slug`, unique across the database.
+        slug: String,
+        /// `project.name`.
+        name: String,
+        /// `project.description`.
+        description: String,
+    },
+    /// CAS on `updated_at`, as [`StoreRequest::UpdateWorkspace`].
+    UpdateProject {
+        /// The row to edit.
+        id: ProjectId,
+        /// The `updated_at` the editor opened on.
+        expected: DateTime<Utc>,
+        /// The columns to write.
+        patch: ProjectPatch,
+    },
+    /// Creates a repo; `is_primary: true` demotes the project's current primary in the same
+    /// transaction (M1 D10).
+    CreateRepo {
+        /// The project the repo belongs to.
+        project: ProjectId,
+        /// `repo.name`, unique within the project.
+        name: String,
+        /// `repo.remote_url`.
+        remote_url: Option<String>,
+        /// `repo.default_branch`.
+        default_branch: String,
+        /// `repo.is_primary`.
+        is_primary: bool,
+    },
+    /// CAS on `updated_at`. `project` is the repo's owner, so the reply can re-read its workspace:
+    /// the seam has no `repo(id)` reader and a `Stale` outcome must answer the same tree an
+    /// `Applied` one does.
+    UpdateRepo {
+        /// The repo's project.
+        project: ProjectId,
+        /// The row to edit.
+        id: RepoId,
+        /// The `updated_at` the editor opened on.
+        expected: DateTime<Utc>,
+        /// The columns to write.
+        patch: RepoPatch,
+    },
+    /// This box's checkout path for a repo, canonicalised or refused (D8).
+    SetRepoPath {
+        /// The repo's project, for the same reason [`StoreRequest::UpdateRepo`] carries it.
+        project: ProjectId,
+        /// The repo the checkout belongs to.
+        repo: RepoId,
+        /// The path **as the user typed it**.
+        path: String,
+    },
+    /// Counts before the act (PRD D13); the reply is `None` when the target is already gone.
+    DeleteReach(DeleteTarget),
+    /// Removes a workspace, its links and its box paths; its projects survive (M1 D4).
+    DeleteWorkspace(WorkspaceId),
+    /// Removes a project and its whole history, then rebuilds the mirror from the worker (D10).
+    DeleteProject(ProjectId),
 }
 
 impl StoreRequest {
@@ -255,6 +352,20 @@ impl StoreRequest {
             Self::AuthCancel => "auth_cancel",
             Self::StoreState => "store_state",
             Self::ApplyMigrations => "apply_migrations",
+            // The twelve of `hierarchy::REQUEST_NAMES`, in that order. String literals, because
+            // this stays a `const fn`.
+            Self::Hierarchy(..) => "hierarchy",
+            Self::CreateWorkspace { .. } => "create_workspace",
+            Self::UpdateWorkspace { .. } => "update_workspace",
+            Self::SetWorkspaceRoot { .. } => "set_workspace_root",
+            Self::CreateProject { .. } => "create_project",
+            Self::UpdateProject { .. } => "update_project",
+            Self::CreateRepo { .. } => "create_repo",
+            Self::UpdateRepo { .. } => "update_repo",
+            Self::SetRepoPath { .. } => "set_repo_path",
+            Self::DeleteReach(..) => "delete_reach",
+            Self::DeleteWorkspace(..) => "delete_workspace",
+            Self::DeleteProject(..) => "delete_project",
         }
     }
 }
@@ -356,6 +467,29 @@ pub enum StoreReply {
     MigrationsApplied {
         /// How many were pending before the run; `0` when there was nothing to do.
         applied: usize,
+    },
+    /// Answer to [`StoreRequest::Hierarchy`] and to every hierarchy write that applied: the tree
+    /// as it is now (D6).
+    ///
+    /// A whole snapshot rather than the single row a write returned, so the section has one
+    /// source of truth and never patches its rows locally. `None` only for a
+    /// [`StoreRequest::Hierarchy`] of a workspace that does not exist — the nil startup scope, or
+    /// one deleted elsewhere.
+    Hierarchy(Option<Box<HierarchySnapshot>>),
+    /// A CAS write found the row changed (M1 D3): the tree as it is now, for the editor to
+    /// reload against (D7). Never a scope change — the editor is still open.
+    HierarchyStale(Box<HierarchySnapshot>),
+    /// Answer to [`StoreRequest::DeleteReach`]; `None` when the target is already gone.
+    DeleteReach(Option<DeleteReach>),
+    /// Answer to [`StoreRequest::DeleteWorkspace`] / [`StoreRequest::DeleteProject`]: what was
+    /// removed, and what the mirror did about it (D10).
+    Deleted {
+        /// What was deleted.
+        target: DeleteTarget,
+        /// The rows it took, per table — the same counts the warning pane showed.
+        reach: DeleteReach,
+        /// What the worker did to the mirror afterwards.
+        mirror: MirrorAfterDelete,
     },
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
@@ -591,6 +725,23 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             request: request.name(),
             message: "no agent runtime in this build".to_owned(),
         },
+        // The twelve hierarchy requests, or-ed rather than guarded: this `match` has no wildcard,
+        // and an arm with a guard does not count towards exhaustivity, so `_ if …` would be an
+        // E0004 here (MOD-15 M3 plan F-12). The `?` is what keeps `spawn`'s `go_offline` working:
+        // an `Unreachable` from `hierarchy::serve` still drops an `Online` backend onto the mirror
+        // exactly as any other read does.
+        StoreRequest::Hierarchy(..)
+        | StoreRequest::CreateWorkspace { .. }
+        | StoreRequest::UpdateWorkspace { .. }
+        | StoreRequest::SetWorkspaceRoot { .. }
+        | StoreRequest::CreateProject { .. }
+        | StoreRequest::UpdateProject { .. }
+        | StoreRequest::CreateRepo { .. }
+        | StoreRequest::UpdateRepo { .. }
+        | StoreRequest::SetRepoPath { .. }
+        | StoreRequest::DeleteReach(..)
+        | StoreRequest::DeleteWorkspace(..)
+        | StoreRequest::DeleteProject(..) => hierarchy::serve(backend, request).await?,
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,

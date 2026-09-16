@@ -13,6 +13,7 @@ pub mod agent_worker;
 pub mod app;
 pub mod cli;
 pub mod event_loop;
+pub mod hierarchy;
 pub mod keymap;
 pub mod preview;
 pub mod store_worker;
