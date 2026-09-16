@@ -108,7 +108,7 @@ macOS:
 ```
 %APPDATA%\htui\box.toml                                # this box's id (UUIDv7) and its hostname
 %APPDATA%\htui\cache\<fingerprint>\cache.sqlite        # the mirror, one per server
-%APPDATA%\htui\cache\<fingerprint>\pending\*.jsonl     # offline chat buffers, uploaded on connect
+%APPDATA%\htui\cache\<fingerprint>\pending\*.jsonl     # chat buffers from an earlier build, uploaded on connect
 ```
 
 `<fingerprint>` is `sha256(host:port/dbname)` and never contains credentials, so pointing `htui` at
@@ -241,9 +241,12 @@ it lists what the session **cannot** do — permission requests, edit proposals,
 the transport reports less than the full profile; it is computed from the driver's own
 capabilities, not from `agent.transport`.
 
-A chat can be started while the shell is offline. Its events go to a JSON-lines buffer under
-`cache/<fingerprint>/pending/`, the header says `buffered · uploads when the store returns`, and
-the next successful connection inserts the run, its step and every event in one transaction.
+A chat cannot be started while the shell is offline. With Postgres unreachable the shell opens
+read-only from the mirror, the top bar reads `offline · <age>`, and the first prompt is refused with
+one sentence — `the database is unreachable: this box browses its read-only cache and starts no run`
+— rather than being recorded locally. A `cache/<fingerprint>/pending/` buffer left by an earlier
+build is still uploaded on the next successful connection, which inserts that run, its step and
+every event in one transaction; nothing writes a new one.
 Ending the app cancels every live session and waits for its process tree to die before the process
 exits.
 
@@ -295,8 +298,8 @@ for an agent that reports nothing (which is every agent whose registry row decla
 The value is **latched passively** — every usage report a running chat sees updates it, which costs
 nothing — so `r` re-probes the row but **cannot** refresh quota: a probe handshake reports no
 allowance at all. The section says so on its hint line rather than leaving it to be discovered.
-An offline chat latches nothing (the mirror holds no `agent_box` row); its usage rows are buffered
-and the figure re-derives after upload.
+An offline box latches nothing, and has nothing to latch: a chat off the server is refused before
+it starts, and the mirror holds no `agent_box` row to hold the figure.
 
 ### Agents that speak no ACP
 
