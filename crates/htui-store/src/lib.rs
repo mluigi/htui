@@ -27,7 +27,9 @@ pub use connect::{ConnEvent, StartOptions, Started};
 pub use error::map_sqlx;
 pub use identity::Identity;
 pub use pg::{Connected, MigrationState, PgStore};
-pub use writer::{BufferedWriter, PROMPT_ON_SERVER_ONLY, REGISTRY_ON_SERVER_ONLY, Writer};
+pub use writer::{
+    BufferedWriter, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, REGISTRY_ON_SERVER_ONLY, Writer,
+};
 
 /// The hop ceiling of the amended §7.3 upstream walk, re-exported from where the trait it belongs
 /// to is defined.

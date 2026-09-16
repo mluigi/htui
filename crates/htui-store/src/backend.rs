@@ -32,7 +32,7 @@ use serde_json::Value;
 
 use crate::cache::CacheStore;
 use crate::pg::PgStore;
-use crate::writer::{BufferedWriter, PROMPT_ON_SERVER_ONLY, Writer};
+use crate::writer::{PROMPT_ON_SERVER_ONLY, Writer};
 
 /// Seconds in a minute and minutes in an hour: the two thresholds of [`Backend::label`].
 const MINUTE: i64 = 60;
@@ -144,9 +144,7 @@ impl Backend {
         match self {
             Self::Memory(store) => Some(Writer::Memory(store.clone())),
             Self::Online { pg, .. } => Some(Writer::Online(pg.clone())),
-            Self::Offline { cache, .. } => {
-                Some(Writer::Buffered(BufferedWriter::new(cache.clone())))
-            }
+            Self::Offline { .. } => None,
         }
     }
 

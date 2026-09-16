@@ -418,6 +418,17 @@ fn registry_writes_need_the_server() -> StoreError {
 pub const PROMPT_ON_SERVER_ONLY: &str = "the prompt path needs the server: templates, skills and box tools are not mirrored, and a \
      step's trim record has nowhere to go offline";
 
+/// The one sentence a chat is refused with off the server (MOD-25).
+///
+/// `htui` is online-only: since MOD-25 [`Backend::writer`](crate::Backend::writer) answers `None`
+/// on [`Backend::Offline`](crate::Backend::Offline), so a chat started on a box whose Postgres is
+/// unreachable is **refused** rather than recorded into `<cache_dir>/pending/`. This is the
+/// sentence it is refused with, and it echoes `R-STO-4`'s "the TUI opens in offline read-only mode
+/// from the cache ... No item creation, no runs": the shell still browses the mirror, with the top
+/// bar reading `offline · <age>`, and starts no run.
+pub const DATABASE_UNREACHABLE: &str =
+    "the database is unreachable: this box browses its read-only cache and starts no run";
+
 /// Plain delegation: a `Writer` decides *which* store, never *what* a read means.
 impl ReadStore for Writer {
     async fn items(&self, scope: &Scope, filter: &ItemFilter) -> Result<Vec<ItemSummary>> {
