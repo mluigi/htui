@@ -16,14 +16,22 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Item, ItemId, ItemPatch, ItemRevision, NewItem,
-    RunId, RunStatus, SessionEvent, Status, StepId,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Isolation, Item, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemRevision, NewItem, NewItemKind, NewProject, NewRepo,
+    NewStepGraph, NewWorkspace, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, Repo,
+    RepoBoxPath, RepoId, RepoPatch, RunId, RunStatus, SessionEvent, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject,
 };
+use htui_core::prompt::TemplateRole;
+use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::store::{
-    ReadStore as _, Result, StoreError, UpdateOutcome, WriteStore, chat_step_status,
-    not_a_terminal_status,
+    CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung, StoreError,
+    StoredSetting, UpdateOutcome, WriteStore, chat_step_status, graph_not_in_project,
+    invalid_prefix, item_kind_is_held, not_a_terminal_status, reserved_phase_name,
 };
 use serde_json::Value;
+use sqlx::PgConnection;
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
@@ -34,6 +42,158 @@ use crate::pg::PgStore;
 /// guard rather than a foreign key, on both write paths (blueprint H.13).
 fn kind_not_in_project(kind: impl core::fmt::Display, project: impl core::fmt::Display) -> String {
     format!("item_kind `{kind}` does not exist in project `{project}`")
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-15 milestone 1 helpers (plan D3, D4, D8).
+// ------------------------------------------------------------------------------------------------
+
+/// The other half of a compare-and-set that touched no row (D3).
+///
+/// `rows_affected() == 0` means **either** the token the caller edited from is spent **or** there
+/// is no such row, and those are different answers: the first hands the editor the row to reload
+/// from, the second says there is nothing to reload. One follow-up read decides, which is the same
+/// shape [`WriteStore::transition`]'s `SELECT 1 FROM item` has carried since MOD-1 — and the reason
+/// `Stale` and `NotFound` are never confused on this backend.
+fn cas_miss<T>(
+    current: Option<T>,
+    entity: &'static str,
+    id: impl core::fmt::Display,
+) -> Result<CasOutcome<T>> {
+    current
+        .map(CasOutcome::Stale)
+        .ok_or_else(|| StoreError::NotFound {
+            entity,
+            id: id.to_string(),
+        })
+}
+
+/// The refusal a rung whose row always exists gets for `expected: None` (D8).
+///
+/// `None` means "I expect no row", which only the `App` rung can mean: a project and a phase exist
+/// before the setting does, so `None` there is misuse rather than an insert. The sentence is
+/// `MemStore`'s `expected_on_row` word for word — that helper is private to `store::mem`, so this
+/// is the one place in the seam where two stores spell one rule twice rather than calling one
+/// function; a future move of it into `htui_core::store::traits` beside `reserved_phase_name`
+/// would close that.
+fn expected_on_row(key: SettingKey, entity: &str) -> StoreError {
+    StoreError::Constraint(format!(
+        "`{key}` on the {entity} rung needs the row's `updated_at`; `expected: None` is the \
+         app_setting insert alone"
+    ))
+}
+
+/// A `count(*)` as the `u64` [`DeleteReach`] holds. Postgres counts as `bigint` and never
+/// negative, so the `unwrap_or` is unreachable rather than a policy.
+fn rows(count: i64) -> u64 {
+    u64::try_from(count).unwrap_or(0)
+}
+
+/// What a workspace delete reaches: its links and its box paths, and no project
+/// (`0001_init.sql:162,174`). `None` when no row has that id.
+///
+/// Takes a connection rather than the pool so [`WriteStore::delete_reach`] can count on a borrowed
+/// one and [`WriteStore::delete_workspace`] can count **inside its own transaction** — which is
+/// what makes "the counts shown before the act are the counts the act took" (PRD D13) true of the
+/// same snapshot rather than of two.
+async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Option<DeleteReach>> {
+    let counted = sqlx::query!(
+        r#"
+        SELECT (SELECT count(*) FROM workspace_project  WHERE workspace_id = $1) AS "links!",
+               (SELECT count(*) FROM workspace_box_path WHERE workspace_id = $1) AS "paths!"
+          FROM workspace WHERE id = $1
+        "#,
+        id.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await
+    .map_err(map_sqlx)?;
+
+    Ok(counted.map(|row| DeleteReach {
+        workspace_links: rows(row.links),
+        workspace_box_paths: rows(row.paths),
+        ..DeleteReach::default()
+    }))
+}
+
+/// What a project delete reaches, in one statement of scalar subqueries over `0001_init.sql`'s
+/// `ON DELETE CASCADE` chain (PRD D13, plan V11). `None` when no row has that id.
+///
+/// The six CTEs are the id sets the cascade walks, named as
+/// [`MemStore`](htui_core::store::MemStore)'s `ProjectReach` names them, so the two backends count
+/// the same rows: `run` is reached by `project_id` **or** by an `item_id` of the project
+/// (`0001_init.sql:450` cascades from the item), and `item_link` by **either** end, tombstones
+/// included — which is what takes the fixture's cross-project edge.
+///
+/// `workspace_box_paths` is `0`: a project is not a workspace.
+async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<DeleteReach>> {
+    let counted = sqlx::query!(
+        r#"
+        WITH i  AS (SELECT id FROM item             WHERE project_id = $1),
+             r  AS (SELECT id FROM run              WHERE project_id = $1
+                                                       OR item_id IN (SELECT id FROM i)),
+             s  AS (SELECT id FROM run_step         WHERE run_id   IN (SELECT id FROM r)),
+             g  AS (SELECT id FROM step_graph       WHERE project_id = $1),
+             ph AS (SELECT id FROM step_graph_phase WHERE graph_id IN (SELECT id FROM g)),
+             rp AS (SELECT id FROM repo             WHERE project_id = $1)
+        SELECT (SELECT count(*) FROM workspace_project WHERE project_id = $1) AS "workspace_links!",
+               (SELECT count(*) FROM i)                                       AS "items!",
+               (SELECT count(*) FROM item_key_counter WHERE project_id = $1)  AS "item_key_counters!",
+               (SELECT count(*) FROM item_kind        WHERE project_id = $1)  AS "item_kinds!",
+               (SELECT count(*) FROM g)                                       AS "step_graphs!",
+               (SELECT count(*) FROM ph)                                      AS "phases!",
+               (SELECT count(*) FROM phase_agent
+                 WHERE phase_id IN (SELECT id FROM ph))                       AS "phase_agents!",
+               (SELECT count(*) FROM prompt_template  WHERE project_id = $1)  AS "prompt_templates!",
+               (SELECT count(*) FROM rp)                                      AS "repos!",
+               (SELECT count(*) FROM repo_box_path
+                 WHERE repo_id IN (SELECT id FROM rp))                        AS "repo_box_paths!",
+               (SELECT count(*) FROM skill_binding    WHERE project_id = $1)  AS "skill_bindings!",
+               (SELECT count(*) FROM r)                                       AS "runs!",
+               (SELECT count(*) FROM s)                                       AS "run_steps!",
+               (SELECT count(*) FROM session_event
+                 WHERE run_step_id IN (SELECT id FROM s))                     AS "session_events!",
+               (SELECT count(*) FROM run_step_commit
+                 WHERE run_step_id IN (SELECT id FROM s))                     AS "run_step_commits!",
+               (SELECT count(*) FROM item_note
+                 WHERE item_id IN (SELECT id FROM i))                         AS "notes!",
+               (SELECT count(*) FROM item_revision
+                 WHERE item_id IN (SELECT id FROM i))                         AS "revisions!",
+               (SELECT count(*) FROM item_link
+                 WHERE from_item_id IN (SELECT id FROM i)
+                    OR to_item_id   IN (SELECT id FROM i))                    AS "links!",
+               (SELECT count(*) FROM document
+                 WHERE item_id IN (SELECT id FROM i))                         AS "documents!"
+          FROM project WHERE id = $1
+        "#,
+        id.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await
+    .map_err(map_sqlx)?;
+
+    Ok(counted.map(|row| DeleteReach {
+        workspace_links: rows(row.workspace_links),
+        workspace_box_paths: 0,
+        items: rows(row.items),
+        item_key_counters: rows(row.item_key_counters),
+        item_kinds: rows(row.item_kinds),
+        step_graphs: rows(row.step_graphs),
+        phases: rows(row.phases),
+        phase_agents: rows(row.phase_agents),
+        prompt_templates: rows(row.prompt_templates),
+        repos: rows(row.repos),
+        repo_box_paths: rows(row.repo_box_paths),
+        skill_bindings: rows(row.skill_bindings),
+        runs: rows(row.runs),
+        run_steps: rows(row.run_steps),
+        session_events: rows(row.session_events),
+        run_step_commits: rows(row.run_step_commits),
+        notes: rows(row.notes),
+        revisions: rows(row.revisions),
+        links: rows(row.links),
+        documents: rows(row.documents),
+    }))
 }
 
 impl WriteStore for PgStore {
@@ -649,9 +809,1229 @@ impl WriteStore for PgStore {
         }
         Ok(())
     }
+
+    // ---- MOD-15 milestone 1: the hierarchy (plan D1-D12) ---------------------------------------
+    //
+    // Twenty-one writers, `delete_reach`, and the nine readers of D1 - whose statements live in
+    // `pg/read.rs` beside the other reads, because one trait has one `impl` block but a reader
+    // belongs with readers. Every edit is `WHERE id = $1 AND updated_at = $2`; **no statement below
+    // sets `updated_at`**, because `0001_init.sql`'s `BEFORE UPDATE` trigger owns it and the cache
+    // cursor of §4.4 rides on what that trigger writes. `RETURNING` therefore sees the token the
+    // caller must present next, without a second read.
+
+    // workspace
+
+    /// One `INSERT ... RETURNING`; the row comes back with the server's `now()`, not the caller's.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when `slug` is taken (`23505`) or `created_by` names no
+    /// `app_user` row (`23503`, which is what the nil UUID does).
+    async fn create_workspace(&self, new: NewWorkspace) -> Result<Workspace> {
+        sqlx::query_as!(
+            Workspace,
+            r#"
+            INSERT INTO workspace (id, slug, name, description, created_by)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id         AS "id: WorkspaceId",
+                      slug,
+                      name,
+                      description,
+                      created_by AS "created_by: htui_core::model::UserId",
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.slug,
+            new.name,
+            new.description,
+            new.created_by.as_uuid(),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// The compare-and-set of D3 with `COALESCE` patch semantics, exactly as
+    /// [`update_item`](PgStore::update_item) has them.
+    ///
+    /// A slug collision is the database's (`23505`) and arrives as [`StoreError::Constraint`]; a
+    /// spent token matches no row and never reaches the unique index, so a stale edit into a taken
+    /// slug answers `Stale` rather than `Constraint` — the same order of judgements `MemStore`
+    /// makes.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] on a `slug`
+    /// collision.
+    async fn update_workspace(
+        &self,
+        id: WorkspaceId,
+        expected: DateTime<Utc>,
+        patch: WorkspacePatch,
+    ) -> Result<CasOutcome<Workspace>> {
+        let updated = sqlx::query_as!(
+            Workspace,
+            r#"
+            UPDATE workspace SET
+                slug        = COALESCE($3, slug),
+                name        = COALESCE($4, name),
+                description = COALESCE($5, description)
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id         AS "id: WorkspaceId",
+                      slug,
+                      name,
+                      description,
+                      created_by AS "created_by: htui_core::model::UserId",
+                      created_at,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+            patch.slug,
+            patch.name,
+            patch.description,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        match updated {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => cas_miss(self.workspace_row(id).await?, "workspace", id),
+        }
+    }
+
+    /// One workspace by id, `None` when there is no such row.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn workspace(&self, id: WorkspaceId) -> Result<Option<Workspace>> {
+        self.workspace_row(id).await
+    }
+
+    // workspace links and box paths
+
+    /// `ON CONFLICT (workspace_id, project_id) DO UPDATE SET position`: the table's primary key is
+    /// the identity, so a second call repositions rather than inserting a second row. No CAS —
+    /// `workspace_project` is not in the trigger loop and has no `updated_at` to compare (D3).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when either id names no row (`23503`).
+    async fn upsert_workspace_project(&self, link: &WorkspaceProject) -> Result<()> {
+        sqlx::query!(
+            "INSERT INTO workspace_project (workspace_id, project_id, position) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (workspace_id, project_id) DO UPDATE SET position = EXCLUDED.position",
+            link.workspace_id.as_uuid(),
+            link.project_id.as_uuid(),
+            link.position,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Removes one link. The project survives it: the cascade runs from `project` to
+    /// `workspace_project`, never the other way (`0001_init.sql:162`).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no such link exists.
+    async fn remove_workspace_project(
+        &self,
+        workspace: WorkspaceId,
+        project: ProjectId,
+    ) -> Result<()> {
+        let removed = sqlx::query!(
+            "DELETE FROM workspace_project WHERE workspace_id = $1 AND project_id = $2",
+            workspace.as_uuid(),
+            project.as_uuid(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if removed == 0 {
+            return Err(StoreError::NotFound {
+                entity: "workspace_project",
+                id: format!("{workspace}/{project}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// A workspace's links ordered by `position`, then `project_id` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn workspace_projects(&self, workspace: WorkspaceId) -> Result<Vec<WorkspaceProject>> {
+        self.workspace_project_rows(workspace).await
+    }
+
+    /// One row per `(workspace_id, box_id)`, replaced in place (`R-BOX-4`). `updated_at` is in
+    /// neither list: the insert takes the column default and the `DO UPDATE` leaves it to the
+    /// trigger.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when either id names no row (`23503`).
+    async fn upsert_workspace_box_path(&self, path: &WorkspaceBoxPath) -> Result<()> {
+        sqlx::query!(
+            "INSERT INTO workspace_box_path (workspace_id, box_id, root_path) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (workspace_id, box_id) DO UPDATE SET root_path = EXCLUDED.root_path",
+            path.workspace_id.as_uuid(),
+            path.box_id.as_uuid(),
+            path.root_path,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Every box's root path for a workspace, ordered by `box_id` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn workspace_box_paths(&self, workspace: WorkspaceId) -> Result<Vec<WorkspaceBoxPath>> {
+        self.workspace_box_path_rows(workspace).await
+    }
+
+    // project
+
+    /// The project row alone: `settings` takes the column default `{}` and the two secret columns
+    /// are MOD-10's (D9).
+    ///
+    /// One statement inside an explicit transaction, which is the whole point of the shape: MOD-15
+    /// milestone 2 adds its thirty-five seed inserts between the insert and the commit, so a
+    /// project that fails to seed never existed. Until then the transaction wraps one statement and
+    /// costs a round trip.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when `slug` is taken (`23505`) or `created_by` names no
+    /// `app_user` row (`23503`).
+    async fn create_project(&self, new: NewProject) -> Result<Project> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let created = sqlx::query_as!(
+            Project,
+            r#"
+            INSERT INTO project (id, slug, name, description, created_by)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id              AS "id: ProjectId",
+                      slug,
+                      name,
+                      description,
+                      secret_provider,
+                      secret_scope,
+                      settings,
+                      created_by      AS "created_by: htui_core::model::UserId",
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.slug,
+            new.name,
+            new.description,
+            new.created_by.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(created)
+    }
+
+    /// The compare-and-set of D3 over the three text columns. `settings` is **not** in the `SET`
+    /// list: the key-level merge of [`set_setting`](WriteStore::set_setting) is that column's one
+    /// writer, so an edit of the name cannot silently drop MOD-4's or MOD-12's keys (D8).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] on a `slug`
+    /// collision.
+    async fn update_project(
+        &self,
+        id: ProjectId,
+        expected: DateTime<Utc>,
+        patch: ProjectPatch,
+    ) -> Result<CasOutcome<Project>> {
+        let updated = sqlx::query_as!(
+            Project,
+            r#"
+            UPDATE project SET
+                slug        = COALESCE($3, slug),
+                name        = COALESCE($4, name),
+                description = COALESCE($5, description)
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id              AS "id: ProjectId",
+                      slug,
+                      name,
+                      description,
+                      secret_provider,
+                      secret_scope,
+                      settings,
+                      created_by      AS "created_by: htui_core::model::UserId",
+                      created_at,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+            patch.slug,
+            patch.name,
+            patch.description,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        match updated {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => cas_miss(self.project(id).await?, "project", id),
+        }
+    }
+
+    // repo and repo box paths
+
+    /// `is_primary: true` is honoured rather than refused: the project's current primary is cleared
+    /// in the **same transaction**, so `uq_repo_primary` (`0001_init.sql:196`) is never violated,
+    /// not even momentarily — the partial unique index is checked per statement and would refuse a
+    /// second primary outright (D10).
+    ///
+    /// A failed insert drops `tx` unsent, so the demotion is rolled back with it: a create that
+    /// collides on `(project_id, name)` leaves the old primary primary.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when `(project_id, name)` is taken (`23505`) or `project_id`
+    /// names no row (`23503`).
+    async fn create_repo(&self, new: NewRepo) -> Result<Repo> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        if new.is_primary {
+            sqlx::query!(
+                "UPDATE repo SET is_primary = false WHERE project_id = $1 AND is_primary",
+                new.project_id.as_uuid(),
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        let created = sqlx::query_as!(
+            Repo,
+            r#"
+            INSERT INTO repo (id, project_id, name, remote_url, default_branch, is_primary)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id         AS "id: RepoId",
+                      project_id AS "project_id: ProjectId",
+                      name,
+                      remote_url,
+                      default_branch,
+                      is_primary,
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.project_id.as_uuid(),
+            new.name,
+            new.remote_url,
+            new.default_branch,
+            new.is_primary,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(created)
+    }
+
+    /// The compare-and-set of D3, with [`create_repo`](WriteStore::create_repo)'s demotion in front
+    /// of it when the patch promotes this row.
+    ///
+    /// The demotion runs **before** the row update because the unique index would refuse two
+    /// primaries within one statement; it is rolled back with the transaction when the token turns
+    /// out to be spent, so a stale promotion demotes nobody. `remote_url` needs two parameters for
+    /// the reason [`update_item`](PgStore::update_item)'s `step_graph_id` does: it is a
+    /// double-[`Option`] and `None` ("leave it") and `Some(None)` ("clear it") would both arrive as
+    /// SQL `NULL`.
+    ///
+    /// The demoted row's own `updated_at` advances, because its column changed and the trigger
+    /// fires per row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] on a `name`
+    /// collision.
+    async fn update_repo(
+        &self,
+        id: RepoId,
+        expected: DateTime<Utc>,
+        patch: RepoPatch,
+    ) -> Result<CasOutcome<Repo>> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        if patch.is_primary == Some(true) {
+            sqlx::query!(
+                "UPDATE repo SET is_primary = false \
+                  WHERE project_id = (SELECT project_id FROM repo WHERE id = $1) \
+                    AND id <> $1 \
+                    AND is_primary",
+                id.as_uuid(),
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        let updated = sqlx::query_as!(
+            Repo,
+            r#"
+            UPDATE repo SET
+                name           = COALESCE($3, name),
+                remote_url     = CASE WHEN $4 THEN $5 ELSE remote_url END,
+                default_branch = COALESCE($6, default_branch),
+                is_primary     = COALESCE($7, is_primary)
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id         AS "id: RepoId",
+                      project_id AS "project_id: ProjectId",
+                      name,
+                      remote_url,
+                      default_branch,
+                      is_primary,
+                      created_at,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+            patch.name,
+            patch.remote_url.is_some(),
+            patch.remote_url.flatten(),
+            patch.default_branch,
+            patch.is_primary,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        match updated {
+            Some(row) => {
+                tx.commit().await.map_err(map_sqlx)?;
+                Ok(CasOutcome::Applied(row))
+            }
+            None => {
+                // The demotion, if there was one, goes back with the transaction: a spent token
+                // must leave the project's primary exactly as it found it.
+                tx.rollback().await.map_err(map_sqlx)?;
+                cas_miss(self.repo_row(id).await?, "repo", id)
+            }
+        }
+    }
+
+    /// A project's repos ordered by `name` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
+        self.repo_rows(project).await
+    }
+
+    /// One row per `(repo_id, box_id)`, replaced in place (`R-BOX-4`), as
+    /// [`upsert_workspace_box_path`](WriteStore::upsert_workspace_box_path).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when either id names no row (`23503`).
+    async fn upsert_repo_box_path(&self, path: &RepoBoxPath) -> Result<()> {
+        sqlx::query!(
+            "INSERT INTO repo_box_path (repo_id, box_id, local_path) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (repo_id, box_id) DO UPDATE SET local_path = EXCLUDED.local_path",
+            path.repo_id.as_uuid(),
+            path.box_id.as_uuid(),
+            path.local_path,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Every box's checkout path for a repo, ordered by `box_id` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn repo_box_paths(&self, repo: RepoId) -> Result<Vec<RepoBoxPath>> {
+        self.repo_box_path_rows(repo).await
+    }
+
+    // item_kind
+
+    /// The prefix rule in Rust, the graph rule folded into the statement, and the two uniqueness
+    /// rules left to the database (D11).
+    ///
+    /// [`ItemKind::prefix_is_valid`] runs first so the refusal is the sentence `MemStore` uses
+    /// rather than `23514` and a constraint name; the `WHERE EXISTS` is the shape
+    /// [`mint_item`](PgStore::mint_item)'s kind guard has, because `item_kind.default_graph_id`
+    /// references `step_graph(id)` alone (`0001_init.sql:288`) and nothing below the seam checks
+    /// that the graph is the kind's own project's. Zero rows out is therefore exactly "the guard
+    /// fired", and one follow-up read names which of its two halves.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] for a bad prefix, an unknown project, a graph from another
+    /// project, or a taken `(project_id, prefix)` / `(project_id, name)` (`23505`).
+    async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind> {
+        if !ItemKind::prefix_is_valid(&new.prefix) {
+            return Err(StoreError::Constraint(invalid_prefix(&new.prefix)));
+        }
+
+        let created = sqlx::query_as!(
+            ItemKind,
+            r#"
+            INSERT INTO item_kind (id, project_id, prefix, name, description, default_graph_id,
+                                   position)
+            SELECT $1, $2, $3, $4, $5, $6, $7
+             WHERE EXISTS (SELECT 1 FROM step_graph g WHERE g.id = $6 AND g.project_id = $2)
+            RETURNING id               AS "id: ItemKindId",
+                      project_id       AS "project_id: ProjectId",
+                      prefix,
+                      name,
+                      description,
+                      default_graph_id AS "default_graph_id: StepGraphId",
+                      position,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.project_id.as_uuid(),
+            new.prefix,
+            new.name,
+            new.description,
+            new.default_graph_id.as_uuid(),
+            new.position,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        match created {
+            Some(row) => Ok(row),
+            None => Err(self
+                .kind_guard_refusal(new.project_id, new.default_graph_id)
+                .await),
+        }
+    }
+
+    /// The compare-and-set of D3 with [`create_item_kind`](WriteStore::create_item_kind)'s three
+    /// rules re-applied to the patched values.
+    ///
+    /// Renaming the prefix touches no `item` and no `item_key_counter`: `item.key` is generated
+    /// from the columns copied at mint time (`0001_init.sql:317`) and the counter is keyed by
+    /// `(project, prefix)`, so old keys keep their text and the next mint under the kind starts the
+    /// new prefix at 1 (PRD D12).
+    ///
+    /// Zero rows means one of three things, split by one follow-up read the way
+    /// [`update_item`](PgStore::update_item) splits its own: no such row, a spent token, or the
+    /// graph guard — which can only have fired if the token still matches.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] as for create.
+    async fn update_item_kind(
+        &self,
+        id: ItemKindId,
+        expected: DateTime<Utc>,
+        patch: ItemKindPatch,
+    ) -> Result<CasOutcome<ItemKind>> {
+        if let Some(prefix) = &patch.prefix
+            && !ItemKind::prefix_is_valid(prefix)
+        {
+            return Err(StoreError::Constraint(invalid_prefix(prefix)));
+        }
+
+        let updated = sqlx::query_as!(
+            ItemKind,
+            r#"
+            UPDATE item_kind SET
+                prefix           = COALESCE($3, prefix),
+                name             = COALESCE($4, name),
+                description      = COALESCE($5, description),
+                default_graph_id = COALESCE($6, default_graph_id),
+                position         = COALESCE($7, position)
+             WHERE id = $1
+               AND updated_at = $2
+               AND EXISTS (SELECT 1 FROM step_graph g
+                            WHERE g.id = COALESCE($6, item_kind.default_graph_id)
+                              AND g.project_id = item_kind.project_id)
+            RETURNING id               AS "id: ItemKindId",
+                      project_id       AS "project_id: ProjectId",
+                      prefix,
+                      name,
+                      description,
+                      default_graph_id AS "default_graph_id: StepGraphId",
+                      position,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+            patch.prefix,
+            patch.name,
+            patch.description,
+            patch.default_graph_id.map(StepGraphId::as_uuid),
+            patch.position,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        if let Some(row) = updated {
+            return Ok(CasOutcome::Applied(row));
+        }
+
+        let Some(current) = self.item_kind(id).await? else {
+            return Err(StoreError::NotFound {
+                entity: "item_kind",
+                id: id.to_string(),
+            });
+        };
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        // The compare-and-set matched, so the only other conjunct of the `WHERE` - the graph guard
+        // - is what refused the row, and the project exists because the row does.
+        let graph = patch.default_graph_id.unwrap_or(current.default_graph_id);
+        Err(StoreError::Constraint(graph_not_in_project(
+            graph,
+            current.project_id,
+        )))
+    }
+
+    /// A project's kinds ordered by `position`, then `prefix` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn item_kinds(&self, project: ProjectId) -> Result<Vec<ItemKind>> {
+        self.item_kind_rows(project).await
+    }
+
+    /// Counts the holders, then deletes (D6).
+    ///
+    /// The `item.kind_id` foreign key has no cascade (`0001_init.sql:313`) and would refuse the
+    /// delete on its own — with a constraint name where PRD D6 asks for "names what holds it". The
+    /// count is read first so the refusal carries the number, and
+    /// [`item_kind_is_held`] is the sentence both stores use.
+    ///
+    /// `item_key_counter` is keyed by prefix, not by kind, and is never touched: a kind that comes
+    /// back under the same prefix must not re-mint keys the project has already issued (§4.1).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] while items reference it; [`StoreError::NotFound`] for an
+    /// unknown id.
+    async fn delete_item_kind(&self, id: ItemKindId) -> Result<()> {
+        let held = sqlx::query!(
+            r#"
+            SELECT k.prefix,
+                   (SELECT count(*) FROM item i WHERE i.kind_id = k.id) AS "items!"
+              FROM item_kind k WHERE k.id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let Some(kind) = held else {
+            return Err(StoreError::NotFound {
+                entity: "item_kind",
+                id: id.to_string(),
+            });
+        };
+        let items = rows(kind.items);
+        if items > 0 {
+            return Err(StoreError::Constraint(item_kind_is_held(
+                &kind.prefix,
+                items,
+            )));
+        }
+
+        let removed = sqlx::query!("DELETE FROM item_kind WHERE id = $1", id.as_uuid())
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .rows_affected();
+        if removed == 0 {
+            return Err(StoreError::NotFound {
+                entity: "item_kind",
+                id: id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    // step_graph and phase
+
+    /// One `INSERT ... RETURNING`; the phases are [`create_phase`](WriteStore::create_phase)'s.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when `(project_id, name)` is taken (`23505`) or `project_id`
+    /// names no row (`23503`).
+    async fn create_step_graph(&self, new: NewStepGraph) -> Result<StepGraph> {
+        sqlx::query_as!(
+            StepGraph,
+            r#"
+            INSERT INTO step_graph (id, project_id, name, description)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id         AS "id: StepGraphId",
+                      project_id AS "project_id: ProjectId",
+                      name,
+                      description,
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.project_id.as_uuid(),
+            new.name,
+            new.description,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// The compare-and-set of D3 over `name` and `description`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] on a `name`
+    /// collision.
+    async fn update_step_graph(
+        &self,
+        id: StepGraphId,
+        expected: DateTime<Utc>,
+        patch: StepGraphPatch,
+    ) -> Result<CasOutcome<StepGraph>> {
+        let updated = sqlx::query_as!(
+            StepGraph,
+            r#"
+            UPDATE step_graph SET
+                name        = COALESCE($3, name),
+                description = COALESCE($4, description)
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id         AS "id: StepGraphId",
+                      project_id AS "project_id: ProjectId",
+                      name,
+                      description,
+                      created_at,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+            patch.name,
+            patch.description,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        match updated {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => cas_miss(self.step_graph_row(id).await?, "step_graph", id),
+        }
+    }
+
+    /// A project's graphs ordered by `name` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn step_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
+        self.step_graph_rows(project).await
+    }
+
+    /// The whole row (D10), minus `updated_at`: the column is left out of the insert so it takes
+    /// the server's `now()` and the caller's stamp is discarded.
+    ///
+    /// `judge` and `handoff` are refused before the statement because they are **template** roles
+    /// (ANA-5 §4.6) and nothing in the schema says so: a project cannot hold both a `judge` phase
+    /// template and a `judge` judge template, since `prompt_template` is
+    /// `UNIQUE (project_id, name, version)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] for a reserved name, a taken `(graph_id, position)` or
+    /// `(graph_id, name)` (`23505`), or a `graph_id` that names no row (`23503`).
+    async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
+        if TemplateRole::of_name(&phase.name) != TemplateRole::Phase {
+            return Err(StoreError::Constraint(reserved_phase_name(&phase.name)));
+        }
+
+        sqlx::query_as!(
+            StepGraphPhase,
+            r#"
+            INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard,
+                                          retry_limit, input_kinds, output_kind, isolation,
+                                          command_queue, verify_command, template_name,
+                                          template_version, token_budget)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            RETURNING id               AS "id: PhaseId",
+                      graph_id         AS "graph_id: StepGraphId",
+                      position,
+                      name,
+                      fan_out,
+                      gate             AS "gate: htui_core::model::Gate",
+                      gate_hard,
+                      retry_limit,
+                      input_kinds,
+                      output_kind,
+                      isolation        AS "isolation: Isolation",
+                      command_queue    AS "command_queue: htui_core::model::CommandQueue",
+                      verify_command,
+                      template_name,
+                      template_version,
+                      token_budget,
+                      updated_at
+            "#,
+            phase.id.as_uuid(),
+            phase.graph_id.as_uuid(),
+            phase.position,
+            phase.name,
+            phase.fan_out,
+            phase.gate.as_str(),
+            phase.gate_hard,
+            phase.retry_limit,
+            &phase.input_kinds[..],
+            phase.output_kind,
+            phase.isolation.map(Isolation::as_str),
+            phase.command_queue.as_str(),
+            phase.verify_command.as_deref(),
+            phase.template_name,
+            phase.template_version,
+            phase.token_budget,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// The compare-and-set of D3 over [`PhasePatch`]'s five columns.
+    ///
+    /// `token_budget` is not among them and cannot be: the `Phase` rung of
+    /// [`set_setting`](WriteStore::set_setting) is that column's one writer, so the value the
+    /// resolver reads has one editor rather than two (D8).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] for a reserved name
+    /// or a `(graph_id, position)` / `(graph_id, name)` collision (`23505`).
+    async fn update_phase(
+        &self,
+        id: PhaseId,
+        expected: DateTime<Utc>,
+        patch: PhasePatch,
+    ) -> Result<CasOutcome<StepGraphPhase>> {
+        if let Some(name) = &patch.name
+            && TemplateRole::of_name(name) != TemplateRole::Phase
+        {
+            return Err(StoreError::Constraint(reserved_phase_name(name)));
+        }
+
+        let updated = sqlx::query_as!(
+            StepGraphPhase,
+            r#"
+            UPDATE step_graph_phase SET
+                name          = COALESCE($3, name),
+                position      = COALESCE($4, position),
+                template_name = COALESCE($5, template_name),
+                gate_hard     = COALESCE($6, gate_hard),
+                input_kinds   = COALESCE($7, input_kinds)
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id               AS "id: PhaseId",
+                      graph_id         AS "graph_id: StepGraphId",
+                      position,
+                      name,
+                      fan_out,
+                      gate             AS "gate: htui_core::model::Gate",
+                      gate_hard,
+                      retry_limit,
+                      input_kinds,
+                      output_kind,
+                      isolation        AS "isolation: Isolation",
+                      command_queue    AS "command_queue: htui_core::model::CommandQueue",
+                      verify_command,
+                      template_name,
+                      template_version,
+                      token_budget,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+            patch.name,
+            patch.position,
+            patch.template_name,
+            patch.gate_hard,
+            patch.input_kinds.as_deref(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        match updated {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => cas_miss(self.phase_row(id).await?, "step_graph_phase", id),
+        }
+    }
+
+    /// A graph's phases ordered by `position`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
+        self.phase_rows(graph).await
+    }
+
+    // settings (D7, D8)
+
+    /// [`validate`] first, then the rung's own statement (D7, D8).
+    ///
+    /// Validation runs **before** the compare-and-set on purpose, which is also `MemStore`'s order:
+    /// a value the reader would clamp is refused whether or not the caller's token was current, so
+    /// "your edit was stale" never stands in for "that number does not mean what you think". The
+    /// peer for a `not_above` rule is read from the same rung, so the number the rule compares
+    /// against is the one the resolver would itself have resolved.
+    ///
+    /// Three rungs, three statements: `app_setting` takes an `INSERT ... ON CONFLICT DO NOTHING`
+    /// when `expected` is `None` — a conflict is `Stale`, never an overwrite — and a plain
+    /// compare-and-set `UPDATE` otherwise; `project.settings` takes
+    /// `settings || jsonb_build_object(key, value)`, which is the key-level merge that leaves every
+    /// other key alone; `step_graph_phase.token_budget` takes the `INTEGER` [`validate`] has
+    /// already narrowed to `i32::MAX` for this rung (flag C).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] for every validation refusal and for `expected: None` on
+    /// `Project` / `Phase`; [`StoreError::NotFound`] for an unknown project, phase or — under a
+    /// token — `app_setting` row.
+    async fn set_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+        value: Value,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<StoredSetting>> {
+        if let Some(refusal) = rung_refusal(key, rung.flag()) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let peer = match key.spec().not_above {
+            Some(other) => self
+                .stored_setting(rung, other)
+                .await?
+                .and_then(|row| row.value),
+            None => None,
+        };
+        validate(key, rung.flag(), &value, peer.as_ref()).map_err(StoreError::Constraint)?;
+
+        match rung {
+            SettingRung::App => {
+                let name = key.key();
+                let landed = match expected {
+                    // "I expect no row": the insert after a clear. A conflict means somebody is
+                    // there, and that is `Stale` rather than a silent overwrite.
+                    None => sqlx::query_scalar!(
+                        r#"
+                        INSERT INTO app_setting (key, value) VALUES ($1, $2)
+                        ON CONFLICT (key) DO NOTHING
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                        name,
+                        &value,
+                    )
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_sqlx)?,
+                    Some(token) => sqlx::query_scalar!(
+                        r#"
+                        UPDATE app_setting SET value = $2
+                         WHERE key = $1 AND updated_at = $3
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                        name,
+                        &value,
+                        token,
+                    )
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_sqlx)?,
+                };
+
+                match landed {
+                    Some(updated_at) => Ok(CasOutcome::Applied(StoredSetting {
+                        value: Some(value),
+                        updated_at,
+                    })),
+                    None => cas_miss(self.stored_setting(rung, key).await?, "app_setting", name),
+                }
+            }
+            SettingRung::Project(id) => {
+                let token = expected.ok_or_else(|| expected_on_row(key, "project"))?;
+                let name = key
+                    .spec()
+                    .project_key
+                    .expect("the rung check passed, so the spec names a project key");
+                let landed = sqlx::query_scalar!(
+                    r#"
+                    UPDATE project SET settings = settings || jsonb_build_object($2::text, $3::jsonb)
+                     WHERE id = $1 AND updated_at = $4
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+                    id.as_uuid(),
+                    name,
+                    &value,
+                    token,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+
+                match landed {
+                    Some(updated_at) => Ok(CasOutcome::Applied(StoredSetting {
+                        value: Some(value),
+                        updated_at,
+                    })),
+                    None => cas_miss(self.stored_setting(rung, key).await?, "project", id),
+                }
+            }
+            SettingRung::Phase(id) => {
+                let token = expected.ok_or_else(|| expected_on_row(key, "step_graph_phase"))?;
+                let budget = value
+                    .as_i64()
+                    .and_then(|number| i32::try_from(number).ok())
+                    .expect("validate narrows the phase rung to i32::MAX (flag C)");
+                let landed = sqlx::query_scalar!(
+                    r#"
+                    UPDATE step_graph_phase SET token_budget = $2
+                     WHERE id = $1 AND updated_at = $3
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+                    id.as_uuid(),
+                    budget,
+                    token,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+
+                match landed {
+                    Some(updated_at) => Ok(CasOutcome::Applied(StoredSetting {
+                        value: Some(value),
+                        updated_at,
+                    })),
+                    None => cas_miss(
+                        self.stored_setting(rung, key).await?,
+                        "step_graph_phase",
+                        id,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The `DELETE` / `settings - key` / `NULL` half of D8, under the same compare-and-set.
+    ///
+    /// On the `App` rung there is no row left afterwards to carry a token, so the **deleted** row's
+    /// comes back and the next [`set_setting`](WriteStore::set_setting) passes `expected: None`
+    /// (flag D). `DELETE ... RETURNING` reads the stored stamp rather than a trigger's: the
+    /// `BEFORE UPDATE` trigger does not fire on a delete.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when the key is not accepted on the rung;
+    /// [`StoreError::NotFound`] when the row — or, on `App`, the setting — does not exist.
+    async fn clear_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<StoredSetting>> {
+        if let Some(refusal) = rung_refusal(key, rung.flag()) {
+            return Err(StoreError::Constraint(refusal));
+        }
+
+        let (landed, entity, id) = match rung {
+            SettingRung::App => {
+                let name = key.key();
+                let landed = sqlx::query_scalar!(
+                    r#"
+                    DELETE FROM app_setting WHERE key = $1 AND updated_at = $2
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+                    name,
+                    expected,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                (landed, "app_setting", name.to_owned())
+            }
+            SettingRung::Project(id) => {
+                let name = key
+                    .spec()
+                    .project_key
+                    .expect("the rung check passed, so the spec names a project key");
+                let landed = sqlx::query_scalar!(
+                    r#"
+                    UPDATE project SET settings = settings - $2::text
+                     WHERE id = $1 AND updated_at = $3
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+                    id.as_uuid(),
+                    name,
+                    expected,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                (landed, "project", id.to_string())
+            }
+            SettingRung::Phase(id) => {
+                let landed = sqlx::query_scalar!(
+                    r#"
+                    UPDATE step_graph_phase SET token_budget = NULL
+                     WHERE id = $1 AND updated_at = $2
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+                    id.as_uuid(),
+                    expected,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                (landed, "step_graph_phase", id.to_string())
+            }
+        };
+
+        match landed {
+            Some(updated_at) => Ok(CasOutcome::Applied(StoredSetting {
+                value: None,
+                updated_at,
+            })),
+            None => cas_miss(self.stored_setting(rung, key).await?, entity, id),
+        }
+    }
+
+    /// One setting on one rung with its CAS token; the statement is
+    /// [`PgStore::stored_setting`] in `pg/read.rs`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when the key is not accepted on the rung.
+    async fn setting(&self, rung: SettingRung, key: SettingKey) -> Result<Option<StoredSetting>> {
+        if let Some(refusal) = rung_refusal(key, rung.flag()) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.stored_setting(rung, key).await
+    }
+
+    // deletes (D4)
+
+    /// What a delete would remove, counted without removing (PRD D13).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn delete_reach(&self, target: DeleteTarget) -> Result<Option<DeleteReach>> {
+        let mut conn = self.pool.acquire().await.map_err(map_sqlx)?;
+        match target {
+            DeleteTarget::Workspace(id) => workspace_reach(&mut conn, id).await,
+            DeleteTarget::Project(id) => project_reach(&mut conn, id).await,
+        }
+    }
+
+    /// Counts inside the transaction, then lets the cascade do the deleting
+    /// (`0001_init.sql:162,174`). Projects survive it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id.
+    async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let Some(reach) = workspace_reach(&mut tx, id).await? else {
+            return Err(StoreError::NotFound {
+                entity: "workspace",
+                id: id.to_string(),
+            });
+        };
+        sqlx::query!("DELETE FROM workspace WHERE id = $1", id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(reach)
+    }
+
+    /// One `DELETE FROM project` and nineteen tables of `ON DELETE CASCADE` behind it (PRD D13),
+    /// with the counts taken in the same transaction so the report is the act.
+    ///
+    /// The mirror rebuild afterwards is the caller's, not the seam's (D5): `PgStore` holds no
+    /// `CacheStore`, and milestone 3's store worker is the one handle that holds both.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id.
+    async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let Some(reach) = project_reach(&mut tx, id).await? else {
+            return Err(StoreError::NotFound {
+                entity: "project",
+                id: id.to_string(),
+            });
+        };
+        sqlx::query!("DELETE FROM project WHERE id = $1", id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(reach)
+    }
 }
 
 impl PgStore {
+    /// Which half of the `item_kind` writers' folded `EXISTS` guard refused, in the sentence
+    /// `MemStore` uses for it (D11).
+    ///
+    /// The guard is one conjunct and covers two rules — an unknown project and a graph that is not
+    /// the project's — so the split is made here, on the failure path only, rather than by two
+    /// statements on every create.
+    async fn kind_guard_refusal(&self, project: ProjectId, graph: StepGraphId) -> StoreError {
+        match self.project(project).await {
+            Ok(Some(_)) => StoreError::Constraint(graph_not_in_project(graph, project)),
+            Ok(None) => StoreError::Constraint(format!(
+                "item_kind.project_id `{project}` references no project"
+            )),
+            Err(err) => err,
+        }
+    }
+
     /// One `item_revision` row: the ancestor a [`UpdateOutcome::Diverged`] answer is rendered
     /// against (ANA-9 §4.2).
     ///
