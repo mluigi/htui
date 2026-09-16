@@ -2997,10 +2997,11 @@ mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
     use crate::model::{AgentBox, AgentId, ChatRunSpec, ItemId, RunStatus, StepId, StepStatus};
+    use crate::prompt::settings::SettingKey;
     use crate::store::error::StoreError;
-    use crate::store::{ReadStore as _, WriteStore as _};
+    use crate::store::{CasOutcome, ReadStore as _, SettingRung, WriteStore as _};
     use chrono::Utc;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     /// The columns `store::conformance` cannot see, because §6.1 returns neither `run_step.usage`
     /// nor `run_step.prompt_digest` (plan D15(a)). Read straight out of `State`, which is what a
@@ -3654,5 +3655,230 @@ mod tests {
              MOD-7's unregistration is the caller that turns both into `Option`s)"
         );
         assert_eq!(cleared.quota_at, Some(quota_at));
+    }
+
+    /// PRD's "`project.settings` loses nothing", asserted on the bytes rather than on `Value`
+    /// equality, which is what `MemStore` can promise and JSONB cannot: Postgres normalises key
+    /// order and number text, so `settings_project_rung_merges_keys` asserts per-key `Value`
+    /// equality on both stores and this one asserts the stronger thing on the one store that can.
+    ///
+    /// The seeded blob carries keys MOD-4 and MOD-12 own and this writer has never heard of. A
+    /// typed `ProjectSettings` round-trip — the shape D7 exists to refuse — would drop every one
+    /// of them, and `1.5` is there because it would also be the first to come back as `1.5000001`.
+    #[tokio::test]
+    async fn set_setting_project_rung_leaves_unknown_keys_byte_identical() {
+        let store = MemStore::demo();
+        let seeded = json!({
+            "token_budget": 90_000,
+            "retention_days": 30,
+            "keep_raw_events": true,
+            "orchestration": { "max_parallel_steps": 3, "window": ["22:00", "06:00"] },
+            "per_token_cap_run": 1.5,
+        });
+        let token = store.write(|state| {
+            let project = state
+                .projects
+                .get_mut(&ids::PROJECT_HTUI)
+                .expect("the fixture project");
+            project.settings = seeded.clone();
+            project.updated_at
+        });
+        let before = seeded.to_string();
+
+        let written = store
+            .set_setting(
+                SettingRung::Project(ids::PROJECT_HTUI),
+                SettingKey::UpstreamHops,
+                json!(1),
+                Some(token),
+            )
+            .await
+            .expect("the merge lands");
+        let CasOutcome::Applied(written) = written else {
+            panic!("the token was read a statement ago: {written:?}");
+        };
+
+        /// `project.settings` as stored, read back through the trait rather than out of `State`:
+        /// the merge has to be visible where the resolvers look.
+        async fn settings(store: &MemStore, label: &str) -> Value {
+            store
+                .project(ids::PROJECT_HTUI)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: the read must not fail: {error}"))
+                .unwrap_or_else(|| panic!("{label}: the project survives its settings write"))
+                .settings
+        }
+
+        let merged = settings(&store, "after the merge").await;
+        for (key, value) in seeded.as_object().expect("a JSON object") {
+            assert_eq!(
+                merged.get(key).map(ToString::to_string),
+                Some(value.to_string()),
+                "`{key}` is byte-identical to what was there before the merge"
+            );
+        }
+        let mut expected = seeded.clone();
+        expected
+            .as_object_mut()
+            .expect("a JSON object")
+            .insert("upstream_hops".to_owned(), json!(1));
+        assert_eq!(
+            merged.to_string(),
+            expected.to_string(),
+            "the document is the one that was there plus exactly one key"
+        );
+
+        store
+            .clear_setting(
+                SettingRung::Project(ids::PROJECT_HTUI),
+                SettingKey::UpstreamHops,
+                written.updated_at,
+            )
+            .await
+            .expect("the clear lands");
+        assert_eq!(
+            settings(&store, "after the clear").await.to_string(),
+            before,
+            "the clear leaves the document exactly as the merge found it"
+        );
+    }
+
+    /// PRD D13's cascade with no ghost left behind, read straight out of `State`.
+    ///
+    /// `project_delete_takes_everything_and_says_so` asserts the counts, which is all §6.1 can
+    /// see: no trait reader returns a `prompt_template`, an `item_key_counter` or a
+    /// `skill_binding`, and none returns a row that *should* have gone. This walks every map
+    /// instead, and asserts the second thing a count cannot — that nothing surviving points at
+    /// something that did not.
+    #[tokio::test]
+    async fn delete_project_leaves_no_row_in_any_map() {
+        let store = MemStore::demo();
+        let gone = ids::PROJECT_HTUI;
+        store.delete_project(gone).await.expect("the delete lands");
+
+        store.read(|state| {
+            assert!(!state.projects.contains_key(&gone), "the project itself");
+            assert!(
+                state.kinds.values().all(|row| row.project_id != gone),
+                "item_kind"
+            );
+            assert!(
+                state.graphs.values().all(|row| row.project_id != gone),
+                "step_graph"
+            );
+            assert!(
+                state.templates.iter().all(|row| row.project_id != gone),
+                "prompt_template"
+            );
+            assert!(
+                state
+                    .skill_bindings
+                    .iter()
+                    .all(|row| row.project_id != gone),
+                "skill_binding"
+            );
+            assert!(
+                state.repos.values().all(|row| row.project_id != gone),
+                "repo"
+            );
+            assert!(
+                state.item_key_counter.keys().all(|(id, _)| *id != gone),
+                "item_key_counter is keyed by (project, prefix) and goes with the project"
+            );
+            assert!(
+                state.items.values().all(|row| row.project_id != gone),
+                "item"
+            );
+            assert!(state.runs.values().all(|row| row.project_id != gone), "run");
+            assert!(
+                state
+                    .workspace_projects
+                    .iter()
+                    .all(|row| row.project_id != gone),
+                "workspace_project"
+            );
+
+            // Nothing that survived points at something that did not: the count could be right and
+            // the cascade still leave a note on an item that is gone.
+            assert!(
+                state
+                    .phases
+                    .iter()
+                    .all(|row| state.graphs.contains_key(&row.graph_id)),
+                "every surviving phase has a surviving graph"
+            );
+            assert!(
+                state
+                    .revisions
+                    .keys()
+                    .all(|(item, _)| state.items.contains_key(item)),
+                "every surviving revision has a surviving item"
+            );
+            assert!(
+                state
+                    .notes
+                    .iter()
+                    .all(|row| state.items.contains_key(&row.item_id)),
+                "every surviving note has a surviving item"
+            );
+            assert!(
+                state
+                    .documents
+                    .iter()
+                    .all(|row| state.items.contains_key(&row.item_id)),
+                "every surviving document has a surviving item"
+            );
+            assert!(
+                state
+                    .links
+                    .iter()
+                    .all(|row| state.items.contains_key(&row.from_item_id)
+                        && state.items.contains_key(&row.to_item_id)),
+                "every surviving link has both ends, tombstones included: this is what takes the \
+                 fixture's cross-project edge from agy:FEAT-1 to htui:FEAT-2"
+            );
+            assert!(
+                state
+                    .steps
+                    .values()
+                    .all(|row| state.runs.contains_key(&row.run_id)),
+                "every surviving step has a surviving run"
+            );
+            assert!(
+                state
+                    .events
+                    .iter()
+                    .all(|row| state.steps.contains_key(&row.run_step_id)),
+                "every surviving event has a surviving step"
+            );
+            assert!(
+                state
+                    .repo_box_paths
+                    .iter()
+                    .all(|row| state.repos.contains_key(&row.repo_id)),
+                "every surviving repo path has a surviving repo"
+            );
+
+            // …and what a project delete is not: the workspace, its sibling projects, and every
+            // table `0001_init.sql` does not cascade from `project`.
+            assert!(
+                state.workspaces.contains_key(&ids::WORKSPACE_PLATFORM),
+                "the workspace survives losing a project (D4)"
+            );
+            assert!(
+                state.projects.contains_key(&ids::PROJECT_AGY)
+                    && state.projects.contains_key(&ids::PROJECT_VULKAN),
+                "sibling projects are untouched"
+            );
+            assert!(
+                !state.skills.is_empty()
+                    && !state.skill_versions.is_empty()
+                    && !state.users.is_empty()
+                    && !state.boxes.is_empty()
+                    && !state.box_tools.is_empty()
+                    && !state.agents.is_empty(),
+                "skill, skill_version, app_user, box, box_tool and agent are not below a project"
+            );
+        });
     }
 }

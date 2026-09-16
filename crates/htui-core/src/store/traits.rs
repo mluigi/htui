@@ -765,8 +765,8 @@ pub struct DeleteReach {
 /// Where a setting lives (D8): an `app_setting` row, one key of `project.settings`, or
 /// `step_graph_phase.token_budget`.
 ///
-/// The PRD writes the phase id as `StepGraphPhaseId`; the newtype in this tree is
-/// [`PhaseId`](crate::model::PhaseId) and the seam uses the tree's name.
+/// The PRD writes the phase id as `StepGraphPhaseId`; the newtype in this tree is [`PhaseId`] and
+/// the seam uses the tree's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingRung {
     /// One `app_setting` row, keyed by [`SettingKey::key`].

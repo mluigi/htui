@@ -2697,6 +2697,68 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
         "{CASE}: graphs come back in name byte order"
     );
 
+    let collision = store
+        .update_step_graph(
+            graph.id,
+            graph.updated_at,
+            StepGraphPatch {
+                name: Some("analysis".to_owned()),
+                ..StepGraphPatch::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(collision, Err(StoreError::Constraint(_))),
+        "{CASE}: a rename into a taken name is Constraint, got {collision:?}"
+    );
+    let described = applied(
+        CASE,
+        store
+            .update_step_graph(
+                graph.id,
+                graph.updated_at,
+                StepGraphPatch {
+                    description: Some("Tag and publish".to_owned()),
+                    ..StepGraphPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (described.description.as_str(), described.name.as_str()),
+        ("Tag and publish", "release"),
+        "{CASE}: `None` leaves the column the patch does not name"
+    );
+    let spent_graph = stale(
+        CASE,
+        store
+            .update_step_graph(graph.id, graph.updated_at, StepGraphPatch::default())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent_graph, described,
+        "{CASE}: Stale carries the graph as it is now"
+    );
+    let unknown_graph = store
+        .update_step_graph(
+            StepGraphId::new(),
+            graph.updated_at,
+            StepGraphPatch::default(),
+        )
+        .await;
+    assert!(
+        matches!(
+            unknown_graph,
+            Err(StoreError::NotFound {
+                entity: "step_graph",
+                ..
+            })
+        ),
+        "{CASE}: an unknown graph is NotFound, got {unknown_graph:?}"
+    );
+
     let phase = store
         .create_phase(&new_phase(graph.id, 0, "cut"))
         .await
