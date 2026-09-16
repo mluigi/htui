@@ -22,8 +22,13 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use htui_core::store::{DeleteReach, DeleteTarget};
+
 use crate::app::{Action, Ctx, Handled};
-use crate::hierarchy::{HierarchySnapshot, ProjectEntry, REQUEST_NAMES, RepoEntry};
+use crate::hierarchy::{
+    HierarchySnapshot, MirrorAfterDelete, ProjectEntry, REQUEST_NAMES, RepoEntry, reach_parts,
+    reach_totals,
+};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{SectionId, SettingsSection, message};
 use crate::ui::{FieldOutcome, TextField, Theme};
@@ -60,6 +65,25 @@ const DELETED_ELSEWHERE: &str = "deleted elsewhere while you were editing";
 
 /// What a CAS miss says with no editor open — `p` is the one write that has none (D12).
 const RELOADED: &str = "reloaded; press p again";
+
+/// The hint line while `delete_reach` is being counted.
+const HINT_COUNTING: &str = "counting rows\u{2026} \u{b7} Esc stop";
+
+/// The hint line of the first confirmation.
+const HINT_WARN: &str = "y continue \u{b7} n/Esc stop";
+
+/// The hint line of the second, typed confirmation.
+const HINT_TYPED: &str = "Enter confirm \u{b7} Esc stop";
+
+/// The hint line while the delete is in flight.
+const HINT_DELETING: &str = "deleting\u{2026}";
+
+/// The second line of every warning: the one sentence PRD D13 asks to be in front of a user before
+/// anything is removed.
+const NOT_UNDONE: &str = "Nothing here can be undone. `y` to continue, `n` or `Esc` to stop.";
+
+/// What a second confirmation that did not match says. The stage stays where it was.
+const WRONG_SLUG: &str = "that is not the slug; nothing was deleted";
 
 /// One row of the flat list the section draws and the cursor indexes.
 ///
@@ -150,6 +174,36 @@ enum Mode {
     Browse,
     /// One row being typed into.
     Editing(Editor),
+    /// One row being deleted, behind PRD D13's two confirmations.
+    Deleting {
+        /// What the two `Delete*` requests would name.
+        target: DeleteTarget,
+        /// The slug the second confirmation asks to be typed.
+        slug: String,
+        /// How far the confirmation has got.
+        stage: DeleteStage,
+    },
+}
+
+/// The stages of a delete, each carrying the counts the pane shows (flag J).
+///
+/// The reach travels with the stage rather than beside it because both panes print it: a warning
+/// that said "5 kinds" and a prompt that had lost them would be two different claims about one act.
+#[derive(Debug)]
+enum DeleteStage {
+    /// `delete_reach` is in flight.
+    Counting,
+    /// The counts are on screen and `y` is the first confirmation.
+    Warn(DeleteReach),
+    /// The slug is being typed — the second confirmation, and the one that deletes.
+    Typed {
+        /// What the warning listed.
+        reach: DeleteReach,
+        /// What has been typed so far.
+        field: TextField,
+    },
+    /// The delete is in flight.
+    InFlight(DeleteReach),
 }
 
 /// The workspace tree of the scope, with the keys that edit it.
@@ -289,6 +343,11 @@ impl HierarchySection {
         match &self.mode {
             Mode::Browse => Vec::new(),
             Mode::Editing(editor) => editor.lines(width, theme),
+            Mode::Deleting {
+                target,
+                slug,
+                stage,
+            } => delete_pane(*target, slug, stage, width, theme),
         }
     }
 
@@ -297,7 +356,7 @@ impl HierarchySection {
     /// Two spans rather than one string: a CAS miss is reported here and D7 asks for it in
     /// `theme.error`, because "someone else wrote to this row" is the one notice a user has to act
     /// on rather than read.
-    fn hint(&self, theme: &Theme) -> Line<'static> {
+    fn hint(&self, width: u16, theme: &Theme) -> Line<'static> {
         let keys = self.hint_text();
         let Some(notice) = &self.notice else {
             return Line::styled(keys, theme.dim);
@@ -307,6 +366,14 @@ impl HierarchySection {
         } else {
             theme.dim
         };
+        // The outcome wins the line when both do not fit. `{keys} · {notice}` is what D9's
+        // longest notice — a delete's row and table counts — makes 150 columns wide on a pane
+        // that is 98, and a notice clipped at `deleted \`` is a line that reports nothing. The
+        // keys are on screen every other frame; this one is the only place the outcome appears.
+        let room = usize::from(width);
+        if keys.chars().count() + notice.chars().count() + 3 > room {
+            return Line::styled(notice.clone(), style);
+        }
         Line::from(vec![
             Span::styled(format!("{keys} \u{b7} "), theme.dim),
             Span::styled(notice.clone(), style),
@@ -326,6 +393,12 @@ impl HierarchySection {
                 }
             }
             Mode::Editing(_) => HINT_EDITING,
+            Mode::Deleting { stage, .. } => match stage {
+                DeleteStage::Counting => HINT_COUNTING,
+                DeleteStage::Warn(_) => HINT_WARN,
+                DeleteStage::Typed { .. } => HINT_TYPED,
+                DeleteStage::InFlight(_) => HINT_DELETING,
+            },
         };
         match self.busy {
             // Only in Browse: an editor's own hint says what `Enter` is for, and a write in flight
@@ -541,6 +614,132 @@ impl HierarchySection {
         }
     }
 
+    /// `d`: the first confirmation of PRD D13, which is a count rather than a question.
+    ///
+    /// The counting is a request of its own so the numbers on screen are the store's and not this
+    /// section's arithmetic; `delete_reach` and `delete_*` share one implementation, so what is
+    /// shown is what will go (M1 D4).
+    fn begin_delete(&mut self, row: Row, ctx: &Ctx<'_>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let (target, slug) = match row {
+            Row::Workspace => (
+                DeleteTarget::Workspace(snapshot.workspace.id),
+                snapshot.workspace.slug.clone(),
+            ),
+            Row::Project { index } => {
+                let Some(entry) = snapshot.projects.get(index) else {
+                    return;
+                };
+                (
+                    DeleteTarget::Project(entry.project.id),
+                    entry.project.slug.clone(),
+                )
+            }
+            // A repo is removed by deleting its project or not at all: `delete_repo` is not on the
+            // seam and this milestone adds no method to it.
+            Row::Repo { .. } => {
+                self.notice = Some("repos are not deleted here".to_owned());
+                return;
+            }
+        };
+        self.notice = None;
+        self.mode = Mode::Deleting {
+            target,
+            slug,
+            stage: DeleteStage::Counting,
+        };
+        self.send(StoreRequest::DeleteReach(target), ctx);
+    }
+
+    /// One key while a delete is being confirmed (D9, flag B).
+    ///
+    /// Modal over the shell as well as over the tree: a key that is not listed is **swallowed**,
+    /// because the second confirmation is a typed slug and a `q` in the middle of one must not quit
+    /// the application. A `CONTROL` chord is the carve-out, so `ctrl-c` still does.
+    fn on_deleting_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Handled::Pass;
+        }
+        let Mode::Deleting {
+            target,
+            slug,
+            stage,
+        } = &mut self.mode
+        else {
+            return Handled::Pass;
+        };
+        let target = *target;
+        let stop = matches!(key.code, KeyCode::Esc | KeyCode::Char('n'));
+        match stage {
+            DeleteStage::Counting => {
+                if stop {
+                    self.mode = Mode::Browse;
+                }
+            }
+            DeleteStage::Warn(reach) => match key.code {
+                KeyCode::Char('y') => {
+                    *stage = DeleteStage::Typed {
+                        reach: *reach,
+                        field: TextField::new(),
+                    };
+                }
+                _ if stop => self.mode = Mode::Browse,
+                _ => {}
+            },
+            DeleteStage::Typed { reach, field } => match field.on_key(key) {
+                FieldOutcome::Submit => {
+                    if field.text() == Some(slug.as_str()) {
+                        let request = match target {
+                            DeleteTarget::Workspace(id) => StoreRequest::DeleteWorkspace(id),
+                            DeleteTarget::Project(id) => StoreRequest::DeleteProject(id),
+                        };
+                        *stage = DeleteStage::InFlight(*reach);
+                        self.notice = None;
+                        self.send(request, ctx);
+                    } else {
+                        field.clear();
+                        self.notice = Some(WRONG_SLUG.to_owned());
+                    }
+                }
+                FieldOutcome::Cancel => {
+                    self.mode = Mode::Browse;
+                    self.notice = None;
+                }
+                // Typed, or swallowed: `n` is a letter of a slug here, not an answer.
+                FieldOutcome::Consumed | FieldOutcome::Pass => {}
+            },
+            // Nothing to answer: the rows are already going.
+            DeleteStage::InFlight(_) => {}
+        }
+        Handled::Consumed
+    }
+
+    /// What the delete just took, and what the mirror did about it (D9, D10, flag I).
+    fn deleted(&mut self, slug: &str, reach: &DeleteReach, mirror: &MirrorAfterDelete) {
+        let (rows, tables) = reach_totals(reach);
+        let mirror = match mirror {
+            MirrorAfterDelete::Rebuilt => "mirror rebuilt".to_owned(),
+            MirrorAfterDelete::NoMirror => "no mirror".to_owned(),
+            MirrorAfterDelete::NotNeeded => "no rebuild needed".to_owned(),
+            MirrorAfterDelete::Failed(err) => format!("mirror not rebuilt: {err}"),
+        };
+        self.notice = Some(format!(
+            "deleted `{slug}`: {rows} rows across {tables} tables; {mirror}"
+        ));
+        self.mode = Mode::Browse;
+        self.busy = None;
+    }
+
+    /// The slug of the delete being confirmed, for the notice that reports it afterwards.
+    fn deleting_slug(&self) -> Option<String> {
+        match &self.mode {
+            Mode::Deleting { slug, .. } => Some(slug.clone()),
+            Mode::Browse | Mode::Editing(_) => None,
+        }
+    }
+
     /// Sends one write and remembers its name until the reply.
     fn send(&mut self, request: StoreRequest, ctx: &Ctx<'_>) {
         self.busy = Some(request.name());
@@ -558,7 +757,7 @@ impl HierarchySection {
                 Some(field) => field.input.on_key(key),
                 None => FieldOutcome::Pass,
             },
-            Mode::Browse => return Handled::Pass,
+            Mode::Browse | Mode::Deleting { .. } => return Handled::Pass,
         };
         match outcome {
             FieldOutcome::Consumed => Handled::Consumed,
@@ -759,7 +958,8 @@ impl HierarchySection {
         self.busy = None;
         let reloaded = match &self.mode {
             Mode::Editing(editor) => Some(reload(snapshot, editor.kind)),
-            Mode::Browse => None,
+            // `p` is the one write with no editor behind it, and a delete has no CAS token at all.
+            Mode::Browse | Mode::Deleting { .. } => None,
         };
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
@@ -811,6 +1011,9 @@ impl SettingsSection for HierarchySection {
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if matches!(self.mode, Mode::Editing(_)) {
             return self.on_editor_key(key, ctx);
+        }
+        if matches!(self.mode, Mode::Deleting { .. }) {
+            return self.on_deleting_key(key, ctx);
         }
         // Browse. `j`, `k`, `N`, `n`, `e`, `p`, `b`, `d` and `r` are free: the global table binds
         // `q`, `?`, the digits, `ctrl-c` and `-`, and the tab consumes `h`/`l`/`[`/`]`/arrows
@@ -870,6 +1073,14 @@ impl SettingsSection for HierarchySection {
                 }
                 Handled::Consumed
             }
+            KeyCode::Char('d') => {
+                if !self.refuse('d')
+                    && let Some(row) = self.selected()
+                {
+                    self.begin_delete(row, ctx);
+                }
+                Handled::Consumed
+            }
             // Allowed while `busy`: re-reading is how a section that lost a reply recovers, and a
             // read cannot lose a write's reply — the staleness index is keyed by request kind.
             KeyCode::Char('r') => {
@@ -896,6 +1107,51 @@ impl SettingsSection for HierarchySection {
                 self.clamp_cursor();
             }
             StoreReply::HierarchyStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::DeleteReach(Some(reach)) => {
+                self.busy = None;
+                if let Mode::Deleting { stage, .. } = &mut self.mode
+                    && matches!(stage, DeleteStage::Counting)
+                {
+                    *stage = DeleteStage::Warn(*reach);
+                }
+            }
+            // Nothing to count and nothing to delete: someone else got there first.
+            StoreReply::DeleteReach(None) => {
+                self.busy = None;
+                self.mode = Mode::Browse;
+                self.notice = Some("already gone".to_owned());
+                ctx.request(StoreRequest::Hierarchy(ctx.scope.workspace_id));
+            }
+            StoreReply::Deleted {
+                target,
+                reach,
+                mirror,
+            } => {
+                let slug = self.deleting_slug().unwrap_or_default();
+                self.deleted(&slug, reach, mirror);
+                match target {
+                    // The fresh tree is what moves the scope: D11's arm emits `SetScope` because
+                    // the project list changed, and that is how the Backlog stops listing it.
+                    DeleteTarget::Project(_) => {
+                        ctx.request(StoreRequest::Hierarchy(ctx.scope.workspace_id));
+                    }
+                    // The workspace the shell is inside is gone, so there is no tree to re-read:
+                    // the list of what is left is what decides where it lands next.
+                    DeleteTarget::Workspace(_) => ctx.request(StoreRequest::Workspaces),
+                }
+            }
+            // Only ever after a workspace delete (the switcher asks for its own): the first
+            // workspace left is entered, and an empty list leaves the pane saying so.
+            StoreReply::Workspaces(list) => {
+                let stranded = self.snapshot.as_ref().is_none_or(|tree| {
+                    !list.iter().any(|row| row.workspace_id == tree.workspace.id)
+                });
+                if stranded && let Some(first) = list.first() {
+                    ctx.emit(Action::SetScope {
+                        workspace: first.clone(),
+                    });
+                }
+            }
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
             StoreReply::Failed { request, message } if *request == "hierarchy" => {
@@ -907,6 +1163,15 @@ impl SettingsSection for HierarchySection {
             // can start from — with the editor left open over its text.
             StoreReply::Failed { request, .. } if REQUEST_NAMES.contains(request) => {
                 self.busy = None;
+                // A delete that was refused must not leave `deleting…` on screen: `InFlight`
+                // swallows every key, so the one state with no way out of it is the one state
+                // that has to be left. Back to the counts the user already saw, where `y` retries
+                // and `Esc` stops.
+                if let Mode::Deleting { stage, .. } = &mut self.mode
+                    && let DeleteStage::InFlight(reach) = stage
+                {
+                    *stage = DeleteStage::Warn(*reach);
+                }
             }
             _ => {}
         }
@@ -931,7 +1196,7 @@ impl SettingsSection for HierarchySection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(Paragraph::new(self.hint(ctx.theme)), hint);
+        frame.render_widget(Paragraph::new(self.hint(area.width, ctx.theme)), hint);
     }
 }
 
@@ -1044,6 +1309,98 @@ fn reload(snapshot: &HierarchySnapshot, kind: EditorKind) -> Reload {
 /// The repo at `index` of a project entry, with the project it belongs to.
 fn repo_at(owner: &ProjectEntry, index: usize) -> Option<(ProjectId, &RepoEntry)> {
     owner.repos.get(index).map(|repo| (owner.project.id, repo))
+}
+
+/// The pane of a delete, every warning line in `theme.error` (D9).
+///
+/// The counts are the store's own, in [`DeleteReach`]'s field order and with the zeros left out:
+/// the pane lists what a delete takes, and "0 runs" is not something being taken.
+fn delete_pane(
+    target: DeleteTarget,
+    slug: &str,
+    stage: &DeleteStage,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let reach = match stage {
+        DeleteStage::Counting => {
+            return vec![Line::styled("counting rows\u{2026}".to_owned(), theme.dim)];
+        }
+        DeleteStage::InFlight(_) => {
+            return vec![Line::styled(
+                format!("deleting `{slug}`\u{2026}"),
+                theme.dim,
+            )];
+        }
+        DeleteStage::Warn(reach) | DeleteStage::Typed { reach, .. } => reach,
+    };
+
+    let headline = match target {
+        DeleteTarget::Project(_) => {
+            let parts = reach_parts(reach);
+            let taken = if parts.is_empty() {
+                "no other rows".to_owned()
+            } else {
+                parts.join(", ")
+            };
+            format!("This deletes project `{slug}` and its entire history. Gone for good: {taken}.")
+        }
+        DeleteTarget::Workspace(_) => format!(
+            "This deletes workspace `{slug}`: {} project links and {} box root paths. Its projects survive and stay reachable from other workspaces.",
+            reach.workspace_links, reach.workspace_box_paths
+        ),
+    };
+
+    let room = usize::from(width).max(1);
+    let mut lines: Vec<Line<'static>> = wrapped(&headline, room)
+        .into_iter()
+        .chain(wrapped(NOT_UNDONE, room))
+        .map(|line| Line::styled(line, theme.error))
+        .collect();
+    if let DeleteStage::Typed { field, .. } = stage {
+        let prompt = format!("Type `{slug}` to confirm: ");
+        let used = prompt.chars().count();
+        let mut spans = vec![Span::styled(prompt, theme.error)];
+        spans.extend(
+            field
+                .line(
+                    u16::try_from(room.saturating_sub(used)).unwrap_or(u16::MAX),
+                    true,
+                    theme,
+                )
+                .spans,
+        );
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// One sentence broken into lines of at most `width` chars, on spaces.
+///
+/// Wrapped here rather than by `Paragraph`'s own `Wrap`, because the layout needs the height
+/// *before* the pane is drawn and a count that disagreed with the widget's wrapping would clip the
+/// last line of a warning — the one line that says nothing can be undone.
+fn wrapped(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let extra = if line.is_empty() {
+            word.chars().count()
+        } else {
+            word.chars().count() + 1
+        };
+        if !line.is_empty() && line.chars().count() + extra > width {
+            lines.push(core::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Whether a notice is one the user has to act on rather than read (D7): both come from a row that

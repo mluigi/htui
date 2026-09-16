@@ -896,3 +896,83 @@ async fn a_reply_from_another_workspace_moves_the_scope() {
         "the summary carries the tree's own projects, in position order"
     );
 }
+
+/// PRD D13's two confirmations: the counts before the act, then the slug typed by hand. What the
+/// warning listed is what the delete then reports having taken (D9).
+#[tokio::test]
+async fn d_on_a_project_warns_with_counts_then_asks_for_the_slug() {
+    let mut harness = hierarchy_over(MemStore::demo()).await;
+    harness.key("j");
+    harness.key("d");
+    harness.settle().await;
+    insta::assert_snapshot!("delete_warn", harness.render());
+
+    harness.key("y");
+    harness.settle().await;
+    insta::assert_snapshot!("delete_typed", harness.render());
+
+    type_into(&mut harness, "vulkan-tutorials");
+    harness.key("enter");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("deleted `vulkan-tutorials`"),
+        "the notice reports what was taken: {frame}"
+    );
+    assert!(
+        frame.contains("no mirror"),
+        "a memory backend has no mirror to rebuild (D10): {frame}"
+    );
+    assert!(
+        harness.app().projects.is_empty(),
+        "the tree that came back moved the scope, so the Backlog loses the project too"
+    );
+    assert_eq!(
+        harness.app().top_bar.workspace,
+        "Graphics",
+        "the workspace outlived its project"
+    );
+}
+
+/// The second confirmation is the one that counts: anything but the slug deletes nothing, and the
+/// stage stays where it was. While it is up, `q` is a letter (flag B, E-9).
+#[tokio::test]
+async fn a_wrong_slug_deletes_nothing() {
+    let mut harness = hierarchy_over(MemStore::demo()).await;
+    harness.key("j");
+    harness.key("d");
+    harness.settle().await;
+    harness.key("y");
+
+    harness.key("q");
+    assert!(
+        !harness.app().should_quit,
+        "a typed confirmation swallows what it does not bind"
+    );
+    harness.key("enter");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("that is not the slug; nothing was deleted"),
+        "{frame}"
+    );
+    assert_eq!(
+        harness.app().projects.len(),
+        1,
+        "nothing was deleted and the scope did not move"
+    );
+
+    harness.key("esc");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("to confirm"),
+        "`Esc` leaves the confirmation: {frame}"
+    );
+    assert!(
+        frame.contains("vulkan-tutorials  Vulkan Tutorials"),
+        "and the tree is still there: {frame}"
+    );
+}
