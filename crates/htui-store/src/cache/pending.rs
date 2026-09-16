@@ -7,6 +7,14 @@
 //! next successful connection [`upload_pending`] inserts the
 //! `run`, its `run_step`s and every event in one transaction and then deletes the file.
 //!
+//! **Since MOD-25 no writer appends here**: `htui` is online-only,
+//! [`Backend::writer`](crate::Backend::writer) answers `None` off the server and a chat there is
+//! refused rather than buffered, so [`append_pending`] and [`seal_pending`] have no production
+//! caller. The **upload** side stays live on purpose — `upload_pending` still runs on every
+//! refresh pass and [`seal_orphaned`] still adopts what a crash left open — so a chat an earlier
+//! build buffered still lands on this box's next connection. The whole module is kept compiling
+//! for one release so the reversal costs nothing; a later CLEAN item deletes the append side.
+//!
 //! [`append_pending`] is the only writer of that name and [`upload_pending`] the only reader, so
 //! the naming contract has exactly one owner on each side (MOD-2 plan D8). The appender **trusts
 //! its input**: every event is expected to have been scrubbed by the recorder before it reaches

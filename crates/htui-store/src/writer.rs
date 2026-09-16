@@ -9,15 +9,23 @@
 //! `MemStore` is an `Arc`, [`BufferedWriter`] is a `CacheStore` handle and a path — so a `Writer`
 //! is a clone of a handle, never a copy of a store.
 //!
-//! Since MOD-2 milestone 4 there are **three** arms, because
-//! [`Backend::writer`](crate::Backend::writer) answers `Some` on
-//! [`Backend::Offline`](crate::Backend::Offline) too (plan D34): an offline chat records the same
-//! rows to `<cache_dir>/pending/` as JSON lines, and the refresher uploads them on the next
-//! connection. That is a different sink, not a different recorder — the recorder stays generic
-//! over `S: WriteStore` and learns nothing about being offline, so every conformance case that
-//! passes online passes offline with the same rows. What has **not** changed is the invariant
-//! that matters: nothing writes to Postgres unless the backend is `Online`, and
-//! [`Backend::writable`](crate::Backend::writable) still answers `None` off the server.
+//! There are **three** arms, but since MOD-25 only two of them are ever constructed. Between
+//! MOD-2 milestone 4 and MOD-25 [`Backend::writer`](crate::Backend::writer) answered `Some` on
+//! [`Backend::Offline`](crate::Backend::Offline) too (plan D34): an offline chat recorded the same
+//! rows to `<cache_dir>/pending/` as JSON lines, and the refresher uploaded them on the next
+//! connection. That was a different sink, not a different recorder — the recorder is generic over
+//! `S: WriteStore` and learns nothing about being offline, so every conformance case that passes
+//! online passed offline with the same rows.
+//!
+//! **MOD-25 made `htui` online-only**: `Backend::writer()` answers `None` off the server and a
+//! chat there is refused with [`DATABASE_UNREACHABLE`], so no backend hands out
+//! [`Writer::Buffered`] any more. The arm and [`BufferedWriter`] are kept, compiling and `pub`,
+//! for one release, so reversing MOD-25 is restoring one arm in `backend.rs`; the suites that
+//! prove them construct [`BufferedWriter`] directly, and `upload_pending` still runs on every
+//! refresh pass so buffers from earlier builds land. A later CLEAN item deletes all of it. What
+//! has **not** changed at any point is the invariant that matters: nothing writes to Postgres
+//! unless the backend is `Online`, and [`Backend::writable`](crate::Backend::writable) still
+//! answers `None` off the server.
 //!
 //! `MemStore` is reachable here and is not through `writable`, deliberately: `--demo` and every
 //! chat-tab snapshot run against it, and a seam only the production backend can exercise is a seam
@@ -48,6 +56,10 @@ pub enum Writer {
     /// Postgres.
     Online(PgStore),
     /// The offline sink (MOD-2 plan D34): reads from the mirror, writes to `<cache_dir>/pending/`.
+    ///
+    /// **Kept, but not constructed by any backend since MOD-25** — `htui` is online-only and a
+    /// chat off the server is refused with [`DATABASE_UNREACHABLE`]. The arm stays for one
+    /// release so the reversal is a one-arm change in `backend.rs`; the CLEAN item removes it.
     Buffered(BufferedWriter),
 }
 

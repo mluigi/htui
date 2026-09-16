@@ -8,15 +8,18 @@
 //! one call and answers `None` unless the server is reachable, and [`Backend::writer`] (MOD-2
 //! milestone 3), which hands out an owned [`Writer`] a spawned task can hold for a whole session.
 //!
-//! Since MOD-2 milestone 4 those two differ on [`Backend::Offline`] (plan D34): `writer()` answers
-//! `Some(Writer::Buffered(..))` there, so there **is** an offline write path — and it reaches a
-//! file under `<cache_dir>/pending/`, never the server. The invariant that survives is narrower
-//! and still true: nothing writes to Postgres unless the backend is [`Backend::Online`], which is
-//! what `writable()` still answers for. What has not changed at all is
-//! [`Backend::is_writable`]: it is still `false` offline, because the store worker's re-dial
-//! ticker keys on it and a `true` there would stop the process ever dialling Postgres again.
-//! Both claims are documented here and deliberately not covered by a compile-fail test: they are
-//! not worth a `trybuild` dependency.
+//! Those two differed on [`Backend::Offline`] between MOD-2 milestone 4 and MOD-25 (plan D34):
+//! `writer()` answered `Some(Writer::Buffered(..))` there, so there **was** an offline write path,
+//! reaching a file under `<cache_dir>/pending/` rather than the server. **Since MOD-25 `htui` is
+//! online-only** and they agree again: `writer()` answers `None` off the server, so a chat on a
+//! box whose Postgres is unreachable is refused with
+//! [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE) instead of buffered. The invariant is
+//! back to its widest form: nothing is written anywhere unless the backend is
+//! [`Backend::Online`] (or [`Backend::Memory`]), which is what `writable()` already answered for.
+//! What has not changed at any point is [`Backend::is_writable`]: it is still `false` offline,
+//! because the store worker's re-dial ticker keys on it and a `true` there would stop the process
+//! ever dialling Postgres again. Both claims are documented here and deliberately not covered by a
+//! compile-fail test: they are not worth a `trybuild` dependency.
 
 use std::collections::BTreeMap;
 
@@ -51,8 +54,10 @@ pub enum Backend {
         /// The mirror, kept warm by the refresher.
         cache: CacheStore,
     },
-    /// Postgres unreachable: reads come from the mirror, and the only write path is the offline
-    /// chat buffer under `<cache_dir>/pending/` (MOD-2 milestone 4, [`Backend::writer`]).
+    /// Postgres unreachable: reads come from the mirror and there is **no** write path at all
+    /// (MOD-25, [`Backend::writer`]). Between MOD-2 milestone 4 and MOD-25 there was one — the
+    /// offline chat buffer under `<cache_dir>/pending/` — and a buffer an earlier build left there
+    /// is still uploaded on the next connection; nothing new is ever appended to it.
     Offline {
         /// The mirror.
         cache: CacheStore,
@@ -122,23 +127,25 @@ impl Backend {
         }
     }
 
-    /// An **owned** writable handle, or `None` (MOD-2 D26, D34).
+    /// An **owned** writable handle, or `None` (MOD-2 D26, D34; MOD-25).
     ///
     /// The counterpart of [`Backend::writable`] for a caller that outlives one call — the chat
     /// recorder, which is generic over `S: WriteStore` and lives inside a spawned session task.
     /// [`Backend::Memory`] answers `Some` here and `None` there, because a `MemStore` **is** a
-    /// `WriteStore` even though it is not a [`PgStore`]. [`Backend::Offline`] answers `Some` here
-    /// since milestone 4: a chat that cannot reach Postgres records into
-    /// `<cache_dir>/pending/` through [`Writer::Buffered`] and the refresher uploads it on the
-    /// next connection, which is the difference between a chat that is recorded and no chat at
-    /// all. It still answers `None` to `writable()`, because that one is the server.
+    /// `WriteStore` even though it is not a [`PgStore`].
     ///
-    /// Every call builds a **fresh** [`crate::BufferedWriter`]: its registration map belongs to
-    /// one chat, and the runtime takes exactly one writer per chat.
+    /// **[`Backend::Offline`] answers `None` since MOD-25.** Between MOD-2 milestone 4 and MOD-25
+    /// it answered `Some(Writer::Buffered(..))`: a chat that could not reach Postgres recorded
+    /// into `<cache_dir>/pending/` and the refresher uploaded it on the next connection. MOD-25
+    /// made `htui` online-only, so that chat is now refused with
+    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE) instead. This one arm is the whole
+    /// disable: [`Writer::Buffered`] and [`crate::BufferedWriter`] stay in the tree and keep
+    /// compiling for one release so the reversal is restoring this arm and nothing else, and the
+    /// upload side stays live — `upload_pending` still runs on every refresh pass, so a buffer an
+    /// earlier build left on disk still lands. A later CLEAN item deletes the machinery.
     ///
-    /// The return type stays `Option` even though no variant answers `None` today: `writable()`
-    /// is the paired API and stays `Option`, and a fourth variant that cannot write should be a
-    /// one-arm change here rather than a signature change at every call site.
+    /// The `Option` the return type always was is what made that a one-arm change rather than a
+    /// signature change at every call site — which is exactly what this doc reserved it for.
     #[must_use]
     pub fn writer(&self) -> Option<Writer> {
         match self {
