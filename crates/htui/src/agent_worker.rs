@@ -733,8 +733,10 @@ impl AgentRuntime {
                 live.agent_id
             )));
         }
+        // Since MOD-25 an offline backend answers `None` here, so this closure fires where the
+        // guard below used to; the guard is kept, unreachable, for the reversal.
         let writer = backend.writer().ok_or_else(|| {
-            StoreError::Unreachable("this backend hands out no writer".to_owned())
+            StoreError::Unreachable(htui_store::REGISTRY_ON_SERVER_ONLY.to_owned())
         })?;
         // `Writer::Buffered` refuses `upsert_agent_box` with this same sentence (plan D52). It is
         // checked here rather than discovered on the write, because by then the spawns have
@@ -1155,14 +1157,15 @@ impl AgentRuntime {
         model: Option<String>,
         prompt: String,
     ) -> Result<Served, StoreError> {
-        // Every backend hands out a writer since milestone 4 — the offline one is
-        // `Writer::Buffered`, which records to `<cache_dir>/pending/` and is uploaded on the next
-        // connection (plan D34). The `ok_or_else` stays because the signature is still `Option`: a
-        // later backend that genuinely cannot record must refuse a chat rather than run one into
-        // memory nobody will ever read.
-        let writer = backend.writer().ok_or_else(|| {
-            StoreError::Unreachable("this backend hands out no writer".to_owned())
-        })?;
+        // `htui` is online-only since MOD-25: an offline backend hands out no writer, and a chat
+        // it cannot record is refused here rather than run into a buffer nobody reads. This is the
+        // one place the unreachable-database sentence is answered — `R-STO-4`'s "No item creation,
+        // no runs", rendered by the status line as `chat_start: <sentence>` and by the Chat body.
+        // The milestone-4 behaviour it replaces (`Writer::Buffered` into `<cache_dir>/pending/`,
+        // plan D34) is withdrawn; the machinery is kept one release for the reversal.
+        let writer = backend
+            .writer()
+            .ok_or_else(|| StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned()))?;
         let writer_label = writer.label();
         let box_id = backend
             .box_info()
@@ -1738,9 +1741,11 @@ async fn run_reprobe(args: ReprobeArgs) {
 /// `Writer::Buffered` refuses `upsert_agent_box` with `REGISTRY_ON_SERVER_ONLY` (plan D52), and
 /// the whole point of asking here is to hear that sentence before the work rather than after it.
 fn recording_writer(backend: &Backend) -> Result<Writer, StoreError> {
+    // Since MOD-25 an offline backend answers `None` here, so this closure fires where the guard
+    // below used to; the guard is kept, unreachable, for the reversal.
     let writer = backend
         .writer()
-        .ok_or_else(|| StoreError::Unreachable("this backend hands out no writer".to_owned()))?;
+        .ok_or_else(|| StoreError::Unreachable(htui_store::REGISTRY_ON_SERVER_ONLY.to_owned()))?;
     if matches!(writer, Writer::Buffered(_)) {
         return Err(StoreError::Unreachable(
             htui_store::REGISTRY_ON_SERVER_ONLY.to_owned(),
@@ -3921,9 +3926,14 @@ pub(crate) mod tests {
         match served {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "chat_start");
+                // Equality, not `contains`: the sentence is the contract. `message` is the
+                // error's `Display`, so it carries `StoreError::Unreachable`'s own
+                // `store unreachable: ` prefix (`htui-core/src/store/error.rs:33`) — the
+                // assertion pins the whole rendered line, and the constant word for word
+                // inside it.
                 assert_eq!(
                     message,
-                    htui_store::DATABASE_UNREACHABLE,
+                    format!("store unreachable: {}", htui_store::DATABASE_UNREACHABLE),
                     "the sentence is the contract, word for word"
                 );
             }
@@ -4314,6 +4324,7 @@ pub(crate) mod tests {
     /// Plan D52 for the chat path: a `Writer::Buffered` refuses `upsert_agent_box`, so a re-probe
     /// against one would spawn an adapter to throw its answer away.
     #[tokio::test]
+    #[ignore = "MOD-25: no backend hands out Writer::Buffered; kept for the reversal, removed by the CLEAN item"]
     async fn a_buffered_writer_never_re_probes() {
         let root = tempfile::tempdir().expect("a throwaway config root");
         let cache = htui_store::CacheStore::open(root.path(), "reprobe-test", 1)
