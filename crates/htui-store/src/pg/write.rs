@@ -1491,12 +1491,23 @@ impl WriteStore for PgStore {
         self.item_kind_rows(project).await
     }
 
-    /// Counts the holders, then deletes (D6).
+    /// Locks the kind, then deletes it under a guard the lock makes authoritative (D6).
     ///
     /// The `item.kind_id` foreign key has no cascade (`0001_init.sql:313`) and would refuse the
-    /// delete on its own — with a constraint name where PRD D6 asks for "names what holds it". The
-    /// count is read first so the refusal carries the number, and
-    /// [`item_kind_is_held`] is the sentence both stores use.
+    /// delete on its own — with a constraint name where PRD D6 asks for "names what holds it", so
+    /// the guard has to be the seam's and [`item_kind_is_held`] is the sentence both stores use.
+    ///
+    /// It used to be a `count(*)` and then a `DELETE`, two autocommit round trips: an item minted
+    /// between them was invisible to the count and present by the time the foreign key was checked,
+    /// so the caller got a raw `23503` where the sentence was promised (review L2). Folding the
+    /// guard into the `DELETE`'s own `WHERE` is most of the answer but not all of it — at
+    /// `READ COMMITTED` a statement has **one** snapshot, taken before it blocks, and waiting on a
+    /// row lock does not re-evaluate a `NOT EXISTS` the way it re-evaluates a compare-and-set's
+    /// `updated_at = $2`, because the racing mint only *locks* the kind row and never updates it.
+    /// So the `SELECT ... FOR UPDATE` comes first: `INSERT INTO item` takes `FOR KEY SHARE` on the
+    /// kind it names, which that lock conflicts with, so from there no mint under this kind can
+    /// commit and one already in flight is waited for and then **seen** by the next statement's
+    /// snapshot. Only then is the guarded delete authoritative.
     ///
     /// `item_key_counter` is keyed by prefix, not by kind, and is never touched: a kind that comes
     /// back under the same prefix must not re-mint keys the project has already issued (§4.1).
@@ -1506,43 +1517,51 @@ impl WriteStore for PgStore {
     /// [`StoreError::Constraint`] while items reference it; [`StoreError::NotFound`] for an
     /// unknown id.
     async fn delete_item_kind(&self, id: ItemKindId) -> Result<()> {
-        let held = sqlx::query!(
-            r#"
-            SELECT k.prefix,
-                   (SELECT count(*) FROM item i WHERE i.kind_id = k.id) AS "items!"
-              FROM item_kind k WHERE k.id = $1
-            "#,
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let Some(prefix) = sqlx::query_scalar!(
+            "SELECT prefix FROM item_kind WHERE id = $1 FOR UPDATE",
             id.as_uuid(),
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(map_sqlx)?;
-
-        let Some(kind) = held else {
+        .map_err(map_sqlx)?
+        else {
             return Err(StoreError::NotFound {
                 entity: "item_kind",
                 id: id.to_string(),
             });
         };
-        let items = rows(kind.items);
-        if items > 0 {
+
+        let removed = sqlx::query_scalar!(
+            r#"
+            DELETE FROM item_kind
+             WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM item WHERE kind_id = $1)
+            RETURNING prefix
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        if removed.is_none() {
+            // The row is there — it was just locked — so zero rows means the guard fired, and the
+            // count is read only to put the number in the sentence.
+            let items = sqlx::query_scalar!(
+                r#"SELECT count(*) AS "items!" FROM item WHERE kind_id = $1"#,
+                id.as_uuid(),
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
             return Err(StoreError::Constraint(item_kind_is_held(
-                &kind.prefix,
-                items,
+                &prefix,
+                rows(items),
             )));
         }
 
-        let removed = sqlx::query!("DELETE FROM item_kind WHERE id = $1", id.as_uuid())
-            .execute(&self.pool)
-            .await
-            .map_err(map_sqlx)?
-            .rows_affected();
-        if removed == 0 {
-            return Err(StoreError::NotFound {
-                entity: "item_kind",
-                id: id.to_string(),
-            });
-        }
+        tx.commit().await.map_err(map_sqlx)?;
         Ok(())
     }
 

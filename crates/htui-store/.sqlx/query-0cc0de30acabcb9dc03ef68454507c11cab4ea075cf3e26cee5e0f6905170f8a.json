@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM item_kind\n             WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM item WHERE kind_id = $1)\n            RETURNING prefix\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "prefix",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_kind",
+            "name": "prefix"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0cc0de30acabcb9dc03ef68454507c11cab4ea075cf3e26cee5e0f6905170f8a"
+}

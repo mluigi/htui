@@ -2812,3 +2812,68 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
 
     db.drop_db().await;
 }
+
+/// Review L2: a mint that lands while `delete_item_kind` is deciding must still get D6's sentence.
+///
+/// The two statements the delete used to be - `count(*)` the holders, then `DELETE` - are two
+/// autocommit round trips, so an item minted between them is invisible to the count and present by
+/// the time the `item.kind_id` foreign key is checked. PRD D6 asks the refusal to "name what holds
+/// it" and what came back instead was the constraint name and Postgres's own wording.
+///
+/// Deterministic by the same device `a_child_committed_mid_delete_is_never_missing_from_the_count`
+/// uses: the racing insert takes a `FOR KEY SHARE` lock on the `item_kind` row, so the delete
+/// parks on it until the commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mint_racing_a_kind_delete_still_names_what_holds_it() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let kind = race_kind(&db.pool).await;
+
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN on the racing connection");
+    sqlx::query(
+        "INSERT INTO item (project_id, kind_id, key_prefix, key_number, title, created_by) \
+         VALUES ($1, $2, $3, 1, 'raced in', $4)",
+    )
+    .bind(ids::PROJECT_HTUI.as_uuid())
+    .bind(kind.as_uuid())
+    .bind(RACE_PREFIX)
+    .bind(ids::USER.as_uuid())
+    .execute(&mut racer)
+    .await
+    .expect("the racing mint");
+
+    let store = db.store.clone();
+    let deleting = tokio::spawn(async move { store.delete_item_kind(kind).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+
+    match deleting.await.expect("the delete task") {
+        Err(htui_core::store::StoreError::Constraint(text)) => assert!(
+            text.contains("is held by 1 items"),
+            "the refusal names what holds it (PRD D6), got `{text}`"
+        ),
+        other => panic!("a kind an item holds is Constraint, got {other:?}"),
+    }
+    let still_there: i64 = sqlx::query_scalar("SELECT count(*) FROM item_kind WHERE id = $1")
+        .bind(kind.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the kind");
+    assert_eq!(
+        still_there, 1,
+        "the refused delete removed nothing, so the item that holds it still has its kind"
+    );
+
+    db.drop_db().await;
+}
