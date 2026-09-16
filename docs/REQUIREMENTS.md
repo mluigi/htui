@@ -134,10 +134,9 @@ conflict. Their verdicts survive only where restated here.
   `htui` on connect after confirmation. The per-box SQLite schemas for the read-only cache (R-STO-3)
   are versioned and forward-only, but answer a version mismatch by rebuilding.
 - **R-STO-6 (must).** Startup with a warm cache and reachable Postgres is under one second on the
-  reference workstation. Cache refresh runs in the background and never blocks input. Unchanged by
-  ANA-10, and a decision is owed: as written the budget is conditioned on a reachable server and
-  binds no local-only start (R-STO-7). `docs/ANA-10.md` §10.4 asks whether to extend it; §12
-  criterion 13 takes the measurement either way.
+  reference workstation. Cache refresh runs in the background and never blocks input. The budget is
+  conditioned on a reachable server and binds no offline start (R-STO-4); that scope was decided,
+  not overlooked (maintainer, 2026-09-08).
 - **R-STO-7 (withdrawn).** Local-only mode. Withdrawn by maintainer decision MOD-25, 2026-09-11.
 
 ## 5. Agent driver (R-AGT)
