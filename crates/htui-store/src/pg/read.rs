@@ -15,12 +15,15 @@ use std::collections::BTreeMap;
 
 use htui_core::model::{
     Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
-    BoxTool, Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
-    LinkEdge, LinkGraph, LinkKind, Note, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
-    PromptTemplate, RunId, RunStepSummary, RunSummary, Scope, SessionEvent, SkillId, SkillVersion,
-    StepId, UpstreamEntry, WorkspaceSummary,
+    BoxTool, CommandQueue, Document, DocumentHead, DocumentId, Gate, Isolation, Item, ItemFilter,
+    ItemId, ItemKind, ItemKindId, LinkEdge, LinkGraph, LinkKind, Note, PhaseId, Project, ProjectId,
+    ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RunId, RunStepSummary,
+    RunSummary, Scope, SessionEvent, SkillId, SkillVersion, StepGraph, StepGraphId, StepGraphPhase,
+    StepId, UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject,
+    WorkspaceSummary,
 };
-use htui_core::store::{ReadStore, Result, StoreError};
+use htui_core::prompt::settings::SettingKey;
+use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -577,7 +580,7 @@ impl ReadStore for PgStore {
             "#,
             id.as_uuid(),
             i32::from(hops),
-            scope.workspace.map(htui_core::model::WorkspaceId::as_uuid),
+            scope.workspace.map(WorkspaceId::as_uuid),
             scope.project.as_uuid(),
         )
         .fetch_all(&self.pool)
@@ -1104,6 +1107,400 @@ impl PgStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // MOD-15 milestone 1: the nine hierarchy reads of plan D1.
+    //
+    // They are [`WriteStore`](htui_core::store::WriteStore) methods, not inherent ones, so the
+    // conformance suite can read back what it wrote on both backends — but the trait arm lives in
+    // `pg/write.rs` with the other thirty, because one trait has one `impl` block. What is here is
+    // the statement each arm delegates to, named as `MemStore`'s `State` readers are
+    // (`workspace_project_rows`, `repo_rows`, ...) so the two sides read alike.
+    //
+    // `COLLATE "C"` wherever the documented order is bytes, for the reason
+    // [`prompt_templates`](PgStore::prompt_templates) gives: `MemStore` sorts `name.as_bytes()` and
+    // a bare `ORDER BY name` would follow the database's collation instead. `ORDER BY box_id` and
+    // `project_id` need no collation — Postgres compares `uuid` as its sixteen bytes, which is
+    // `Uuid`'s own `Ord`.
+    // -------------------------------------------------------------------------------------------
+
+    /// One `workspace` row, or `None` when no row has that id.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn workspace_row(&self, id: WorkspaceId) -> Result<Option<Workspace>> {
+        sqlx::query_as!(
+            Workspace,
+            r#"
+            SELECT id         AS "id: WorkspaceId",
+                   slug,
+                   name,
+                   description,
+                   created_by AS "created_by: htui_core::model::UserId",
+                   created_at,
+                   updated_at
+              FROM workspace WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// A workspace's `workspace_project` links, ordered by `position` then `project_id` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn workspace_project_rows(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<WorkspaceProject>> {
+        sqlx::query_as!(
+            WorkspaceProject,
+            r#"
+            SELECT workspace_id AS "workspace_id: WorkspaceId",
+                   project_id   AS "project_id: ProjectId",
+                   position
+              FROM workspace_project
+             WHERE workspace_id = $1
+             ORDER BY position, project_id
+            "#,
+            workspace.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// Every box's root path for a workspace, ordered by `box_id` bytes (`R-BOX-4`).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn workspace_box_path_rows(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<WorkspaceBoxPath>> {
+        sqlx::query_as!(
+            WorkspaceBoxPath,
+            r#"
+            SELECT workspace_id AS "workspace_id: WorkspaceId",
+                   box_id       AS "box_id: BoxId",
+                   root_path,
+                   updated_at
+              FROM workspace_box_path
+             WHERE workspace_id = $1
+             ORDER BY box_id
+            "#,
+            workspace.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// One `repo` row by id: the follow-up read that tells a spent token from an absent row after
+    /// a compare-and-set touched nothing (plan D3).
+    ///
+    /// Not on the trait — nothing reads a repo by id but the writer that just failed to write it,
+    /// and [`repo_rows`](PgStore::repo_rows) is what the editor lists.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn repo_row(&self, id: RepoId) -> Result<Option<Repo>> {
+        sqlx::query_as!(
+            Repo,
+            r#"
+            SELECT id         AS "id: RepoId",
+                   project_id AS "project_id: ProjectId",
+                   name,
+                   remote_url,
+                   default_branch,
+                   is_primary,
+                   created_at,
+                   updated_at
+              FROM repo WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// One `step_graph` row by id, for [`repo_row`](PgStore::repo_row)'s reason.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn step_graph_row(&self, id: StepGraphId) -> Result<Option<StepGraph>> {
+        sqlx::query_as!(
+            StepGraph,
+            r#"
+            SELECT id         AS "id: StepGraphId",
+                   project_id AS "project_id: ProjectId",
+                   name,
+                   description,
+                   created_at,
+                   updated_at
+              FROM step_graph WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// One `step_graph_phase` row by id, for [`repo_row`](PgStore::repo_row)'s reason.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn phase_row(&self, id: PhaseId) -> Result<Option<StepGraphPhase>> {
+        sqlx::query_as!(
+            StepGraphPhase,
+            r#"
+            SELECT id               AS "id: PhaseId",
+                   graph_id         AS "graph_id: StepGraphId",
+                   position,
+                   name,
+                   fan_out,
+                   gate             AS "gate: Gate",
+                   gate_hard,
+                   retry_limit,
+                   input_kinds,
+                   output_kind,
+                   isolation        AS "isolation: Isolation",
+                   command_queue    AS "command_queue: CommandQueue",
+                   verify_command,
+                   template_name,
+                   template_version,
+                   token_budget,
+                   updated_at
+              FROM step_graph_phase WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// A project's repos, ordered by `name` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn repo_rows(&self, project: ProjectId) -> Result<Vec<Repo>> {
+        sqlx::query_as!(
+            Repo,
+            r#"
+            SELECT id         AS "id: RepoId",
+                   project_id AS "project_id: ProjectId",
+                   name,
+                   remote_url,
+                   default_branch,
+                   is_primary,
+                   created_at,
+                   updated_at
+              FROM repo
+             WHERE project_id = $1
+             ORDER BY name COLLATE "C"
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// Every box's checkout path for a repo, ordered by `box_id` bytes (`R-BOX-4`).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn repo_box_path_rows(&self, repo: RepoId) -> Result<Vec<RepoBoxPath>> {
+        sqlx::query_as!(
+            RepoBoxPath,
+            r#"
+            SELECT repo_id AS "repo_id: RepoId",
+                   box_id  AS "box_id: BoxId",
+                   local_path,
+                   updated_at
+              FROM repo_box_path
+             WHERE repo_id = $1
+             ORDER BY box_id
+            "#,
+            repo.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// A project's kinds, ordered by `position` then `prefix` bytes; `position` is not unique.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn item_kind_rows(&self, project: ProjectId) -> Result<Vec<ItemKind>> {
+        sqlx::query_as!(
+            ItemKind,
+            r#"
+            SELECT id               AS "id: ItemKindId",
+                   project_id       AS "project_id: ProjectId",
+                   prefix,
+                   name,
+                   description,
+                   default_graph_id AS "default_graph_id: StepGraphId",
+                   position,
+                   updated_at
+              FROM item_kind
+             WHERE project_id = $1
+             ORDER BY position, prefix COLLATE "C"
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// A project's graphs, ordered by `name` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn step_graph_rows(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
+        sqlx::query_as!(
+            StepGraph,
+            r#"
+            SELECT id         AS "id: StepGraphId",
+                   project_id AS "project_id: ProjectId",
+                   name,
+                   description,
+                   created_at,
+                   updated_at
+              FROM step_graph
+             WHERE project_id = $1
+             ORDER BY name COLLATE "C"
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// A graph's phases, ordered by `position`, which is unique per graph.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn phase_rows(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
+        sqlx::query_as!(
+            StepGraphPhase,
+            r#"
+            SELECT id               AS "id: PhaseId",
+                   graph_id         AS "graph_id: StepGraphId",
+                   position,
+                   name,
+                   fan_out,
+                   gate             AS "gate: Gate",
+                   gate_hard,
+                   retry_limit,
+                   input_kinds,
+                   output_kind,
+                   isolation        AS "isolation: Isolation",
+                   command_queue    AS "command_queue: CommandQueue",
+                   verify_command,
+                   template_name,
+                   template_version,
+                   token_budget,
+                   updated_at
+              FROM step_graph_phase
+             WHERE graph_id = $1
+             ORDER BY position
+            "#,
+            graph.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// One setting on one rung with the rung row's CAS token, or `None` when that row is absent
+    /// (plan D8).
+    ///
+    /// The three rungs are three tables: an `app_setting` row keyed by
+    /// [`SettingKey::key`](htui_core::prompt::settings::SettingKey::key), one key of
+    /// `project.settings` named by
+    /// [`SettingSpec::project_key`](htui_core::prompt::settings::SettingSpec::project_key) (flag
+    /// A), and `step_graph_phase.token_budget`. A project or phase row that exists without a value
+    /// answers `Some` with `value: None`, which is a different fact from the row not existing:
+    /// the first means the rung below answers, the second that there is no rung here at all.
+    ///
+    /// The rung check is **not** here — [`WriteStore::setting`](htui_core::store::WriteStore::setting)
+    /// makes it, so a writer that has already made it does not pay for it twice.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn stored_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+    ) -> Result<Option<StoredSetting>> {
+        match rung {
+            SettingRung::App => {
+                let row = sqlx::query!(
+                    "SELECT value, updated_at FROM app_setting WHERE key = $1",
+                    key.key(),
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                Ok(row.map(|row| StoredSetting {
+                    value: Some(row.value),
+                    updated_at: row.updated_at,
+                }))
+            }
+            SettingRung::Project(id) => {
+                let row = sqlx::query!(
+                    "SELECT settings, updated_at FROM project WHERE id = $1",
+                    id.as_uuid(),
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                Ok(row.map(|row| StoredSetting {
+                    value: key
+                        .spec()
+                        .project_key
+                        .and_then(|name| row.settings.get(name).cloned()),
+                    updated_at: row.updated_at,
+                }))
+            }
+            SettingRung::Phase(id) => {
+                let row = sqlx::query!(
+                    "SELECT token_budget, updated_at FROM step_graph_phase WHERE id = $1",
+                    id.as_uuid(),
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                Ok(row.map(|row| StoredSetting {
+                    value: row.token_budget.map(Value::from),
+                    updated_at: row.updated_at,
+                }))
+            }
+        }
     }
 }
 
