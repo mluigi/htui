@@ -2262,10 +2262,7 @@ impl State {
                     .get_mut(&id)
                     .expect("the row was read a statement ago under the same lock");
                 let Some(map) = project.settings.as_object_mut() else {
-                    return Err(StoreError::Constraint(format!(
-                        "project.settings of `{id}` is not a JSON object, so `{key}` cannot be \
-                         merged into it"
-                    )));
+                    return Err(StoreError::Constraint(settings_not_an_object(id, key)));
                 };
                 map.insert(name.to_owned(), value.clone());
                 project.updated_at = now;
@@ -2357,9 +2354,10 @@ impl State {
                     .projects
                     .get_mut(&id)
                     .expect("the row was read a statement ago under the same lock");
-                if let Some(map) = project.settings.as_object_mut() {
-                    map.remove(name);
-                }
+                let Some(map) = project.settings.as_object_mut() else {
+                    return Err(StoreError::Constraint(settings_not_an_object(id, key)));
+                };
+                map.remove(name);
                 project.updated_at = now;
                 Ok(CasOutcome::Applied(StoredSetting {
                     value: None,
@@ -2650,6 +2648,19 @@ fn expected_on_row(
              app_setting insert alone"
         ))
     })
+}
+
+/// The refusal both writers of `project.settings` give a blob that is not a JSON object (D7).
+///
+/// One sentence rather than two: `set_setting` cannot merge a key into a scalar and `clear_setting`
+/// cannot remove one from it, and what stops both is the same fact — the document is not a
+/// document. A wording per verb would be two sentences about one blob, which is the drift the text
+/// helpers in [`store::traits`](crate::store::traits) exist to prevent (review L4).
+///
+/// Private, because `PgStore` cannot reach it: `project.settings` is `JSONB NOT NULL DEFAULT '{}'`
+/// there and the merge is Postgres's own `||`.
+fn settings_not_an_object(id: ProjectId, key: SettingKey) -> String {
+    format!("project.settings of `{id}` is not a JSON object, so `{key}` cannot be merged into it")
 }
 
 /// A revision author must name a real `app_user` row (§5.5 `REFERENCES app_user(id)`); the nil
@@ -3743,6 +3754,65 @@ mod tests {
             before,
             "the clear leaves the document exactly as the merge found it"
         );
+    }
+
+    /// Review L4: the two writers of `project.settings` agree about a blob that is not an object.
+    ///
+    /// `set_setting` refuses it - a key cannot be merged into a scalar - while `clear_setting` used
+    /// to reach for `as_object_mut`, find `None`, drop the `remove` on the floor and answer
+    /// `Applied` with a freshly advanced token. "The key is gone" and "the key was never reachable"
+    /// are different facts and only one of them was true.
+    ///
+    /// Nothing in the tree writes a non-object today - `project.settings` is `JSONB NOT NULL
+    /// DEFAULT '{}'` on Postgres and `create_project` seeds `{}` here - which is exactly why it is
+    /// worth pinning: the refusal is the only thing standing between a hand-edited row and a clear
+    /// that reports success.
+    #[tokio::test]
+    async fn clear_setting_refuses_a_project_settings_that_is_not_an_object() {
+        let store = MemStore::demo();
+        let rung = SettingRung::Project(ids::PROJECT_HTUI);
+        let token = store.write(|state| {
+            let project = state
+                .projects
+                .get_mut(&ids::PROJECT_HTUI)
+                .expect("the fixture project");
+            project.settings = json!("a hand-edited scalar");
+            project.updated_at
+        });
+
+        let merged = store
+            .set_setting(rung, SettingKey::UpstreamHops, json!(1), Some(token))
+            .await;
+        let cleared = store
+            .clear_setting(rung, SettingKey::UpstreamHops, token)
+            .await;
+        match (merged, cleared) {
+            (Err(StoreError::Constraint(on_set)), Err(StoreError::Constraint(on_clear))) => {
+                assert_eq!(
+                    on_clear, on_set,
+                    "one blob, one sentence: the two writers say the same thing about it"
+                );
+                assert!(
+                    on_clear.contains("is not a JSON object"),
+                    "and it names what is wrong with the blob, got `{on_clear}`"
+                );
+            }
+            other => panic!("both writers refuse a non-object, got {other:?}"),
+        }
+
+        let (settings, after) = store.read(|state| {
+            let project = state
+                .projects
+                .get(&ids::PROJECT_HTUI)
+                .expect("the fixture project");
+            (project.settings.clone(), project.updated_at)
+        });
+        assert_eq!(
+            settings,
+            json!("a hand-edited scalar"),
+            "a refused clear removed nothing"
+        );
+        assert_eq!(after, token, "and did not advance the token either");
     }
 
     /// PRD D13's cascade with no ghost left behind, read straight out of `State`.
