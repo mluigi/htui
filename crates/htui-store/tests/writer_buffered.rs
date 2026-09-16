@@ -489,10 +489,11 @@ async fn reads_delegate_to_the_mirror() {
     cache.close().await;
 }
 
-/// The seam T21 walks through: an offline backend now hands out a writer, and still says the
-/// server is unreachable - the re-dial ticker keys on the second answer, not the first.
+/// The seam T21 walked through is **closed** by MOD-25: an offline backend hands out no writer at
+/// all, so a chat off the server is refused rather than buffered. What has not changed is the
+/// second answer - the server is still unreachable, which is what the re-dial ticker keys on.
 #[tokio::test]
-async fn an_offline_backend_hands_out_a_buffered_writer() {
+async fn an_offline_backend_hands_out_no_writer() {
     let root = tempfile::tempdir().expect("temp root");
     let cache = cache(root.path()).await;
     let backend = Backend::Offline {
@@ -500,13 +501,9 @@ async fn an_offline_backend_hands_out_a_buffered_writer() {
         since: None,
     };
 
-    let writer = backend
-        .writer()
-        .expect("an offline backend records to its buffer (D34)");
-    assert_eq!(
-        writer.label(),
-        "buffered",
-        "what the chat header states (D42)"
+    assert!(
+        backend.writer().is_none(),
+        "no backend hands out Writer::Buffered since MOD-25 (`htui` is online-only)"
     );
     assert!(
         !backend.is_writable(),

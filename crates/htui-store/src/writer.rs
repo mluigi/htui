@@ -687,7 +687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_offline_backend_hands_out_a_buffered_writer_and_no_user() {
+    async fn an_offline_backend_hands_out_no_writer_and_no_user() {
         let root = tempfile::tempdir().expect("temp root");
         let cache = CacheStore::open(root.path(), "writer-test", 1)
             .await
@@ -696,12 +696,10 @@ mod tests {
             cache: cache.clone(),
             since: None,
         };
-        assert_eq!(
-            backend
-                .writer()
-                .expect("the offline write path is the buffer (MOD-2 D34)")
-                .label(),
-            "buffered",
+        assert!(
+            backend.writer().is_none(),
+            "since MOD-25 there is no offline write path at all: a chat off the server is \
+             refused, not buffered"
         );
         assert!(
             !backend.is_writable(),
