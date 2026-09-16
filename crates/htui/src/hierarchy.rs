@@ -60,7 +60,7 @@ pub struct RepoEntry {
 /// What the worker did to the mirror after a delete (D10).
 ///
 /// Never a reason to turn the reply into a
-/// [`StoreReply::Failed`](crate::store_worker::StoreReply::Failed): the rows are already gone, and
+/// [`StoreReply::Failed`]: the rows are already gone, and
 /// a delete that happened must be reported as done whatever the mirror did afterwards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MirrorAfterDelete {
@@ -416,9 +416,9 @@ async fn workspace_of(backend: &Backend, project: ProjectId) -> Result<Workspace
         })
 }
 
-/// The twelve request names, in [`StoreRequest`](crate::store_worker::StoreRequest) order.
+/// The twelve request names, in [`StoreRequest`] order.
 ///
-/// [`StoreRequest::name`](crate::store_worker::StoreRequest::name)'s arms and the section's
+/// [`StoreRequest::name`]'s arms and the section's
 /// `Failed` match both read from here, so a
 /// thirteenth request cannot be named in one place and matched in the other.
 pub const REQUEST_NAMES: [&str; 12] = [
@@ -516,8 +516,29 @@ pub fn reach_totals(reach: &DeleteReach) -> (u64, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{reach_parts, reach_totals};
-    use htui_core::store::DeleteReach;
+    use super::{box_id, reach_parts, reach_totals};
+    use htui_core::model::BoxId;
+    use htui_core::store::{DeleteReach, StoreError};
+
+    /// A path write on a box with no row is refused by name rather than stored under a nil id.
+    /// There is no backend this is reachable from in a test — a `MemStore` either has a
+    /// `this_box` or has no `box` row for a path to reference either way — so the refusal is
+    /// pinned here, where the worker builds it.
+    #[test]
+    fn a_box_without_a_row_cannot_set_a_path() {
+        assert_eq!(box_id(Some(BoxId::default())), Ok(BoxId::default()));
+        assert_eq!(
+            box_id(None),
+            Err(StoreError::NotFound {
+                entity: "box",
+                id: "(this box)".to_owned(),
+            })
+        );
+        assert_eq!(
+            box_id(None).unwrap_err().to_string(),
+            "box `(this box)` not found"
+        );
+    }
 
     /// Zeros are dropped and what is left reads in the struct's field order, not in the order the
     /// warning happens to mention them.
