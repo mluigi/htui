@@ -80,39 +80,437 @@ pub struct Defaults {
 impl Defaults {
     /// The ten rows as `(key, value)` in **key byte order**, which is the order migration `0002`'s
     /// `INSERT` is compared against and the order a seeder must write them in.
+    ///
+    /// Iterated out of [`SettingKey::ALL`] rather than spelled a second time (MOD-15 plan D7): the
+    /// key list has one home, so a key added to the registry cannot be forgotten here and drift
+    /// past `the_defaults_are_migration_0002s_ten_rows_verbatim`.
     #[must_use]
     pub fn as_rows(&self) -> Vec<(&'static str, Value)> {
-        vec![
-            (
-                "excerpt_file_line_cap",
-                Value::from(self.excerpt_file_line_cap),
-            ),
-            ("excerpt_head_lines", Value::from(self.excerpt_head_lines)),
-            (
-                "excerpt_max_file_bytes",
-                Value::from(self.excerpt_max_file_bytes),
-            ),
-            ("excerpt_max_files", Value::from(self.excerpt_max_files)),
-            (
-                "excerpt_max_scan_files",
-                Value::from(self.excerpt_max_scan_files),
-            ),
-            (
-                "excerpt_provider_deadline_ms",
-                Value::from(self.excerpt_provider_deadline_ms),
-            ),
-            ("max_skill_tokens", Value::from(self.max_skill_tokens)),
-            (
-                "prompt_reserve_fraction",
-                Value::from(f64::from(self.prompt_reserve_fraction_bp) / 10_000.0),
-            ),
-            (
-                "prompt_upstream_hops",
-                Value::from(self.prompt_upstream_hops),
-            ),
-            ("token_budget", Value::from(self.token_budget)),
-        ]
+        SettingKey::ALL
+            .into_iter()
+            .map(|key| (key.key(), self.value_of(key)))
+            .collect()
     }
+
+    /// One key's compiled-in value, as the JSON migration `0002` seeds.
+    ///
+    /// [`SettingKey::PromptReserveFraction`] is emitted through the same `f64` expression
+    /// [`as_rows`](Self::as_rows) has always used, so the byte-for-byte `0002` pin is unaffected by
+    /// the registry landing beside it.
+    #[must_use]
+    pub fn value_of(&self, key: SettingKey) -> Value {
+        match key {
+            SettingKey::ExcerptFileLineCap => Value::from(self.excerpt_file_line_cap),
+            SettingKey::ExcerptHeadLines => Value::from(self.excerpt_head_lines),
+            SettingKey::ExcerptMaxFileBytes => Value::from(self.excerpt_max_file_bytes),
+            SettingKey::ExcerptMaxFiles => Value::from(self.excerpt_max_files),
+            SettingKey::ExcerptMaxScanFiles => Value::from(self.excerpt_max_scan_files),
+            SettingKey::ExcerptProviderDeadlineMs => Value::from(self.excerpt_provider_deadline_ms),
+            SettingKey::MaxSkillTokens => Value::from(self.max_skill_tokens),
+            SettingKey::PromptReserveFraction => {
+                Value::from(f64::from(self.prompt_reserve_fraction_bp) / 10_000.0)
+            }
+            SettingKey::UpstreamHops => Value::from(self.prompt_upstream_hops),
+            SettingKey::TokenBudget => Value::from(self.token_budget),
+        }
+    }
+
+    /// One key's compiled-in value in the unit [`SettingSpec::min`] and `max` are written in, which
+    /// for [`SettingKind::Fraction`] is basis points.
+    ///
+    /// [`validate`]'s `not_above` rule needs a number for the peer key even when no rung stores
+    /// one, and "no row" means the table below answers — so the rule compares against the same
+    /// value the reader would have resolved rather than against nothing.
+    fn integer(&self, key: SettingKey) -> i64 {
+        match key {
+            SettingKey::ExcerptFileLineCap => i64::from(self.excerpt_file_line_cap),
+            SettingKey::ExcerptHeadLines => i64::from(self.excerpt_head_lines),
+            SettingKey::ExcerptMaxFileBytes => {
+                i64::try_from(self.excerpt_max_file_bytes).unwrap_or(i64::MAX)
+            }
+            SettingKey::ExcerptMaxFiles => i64::from(self.excerpt_max_files),
+            SettingKey::ExcerptMaxScanFiles => i64::from(self.excerpt_max_scan_files),
+            SettingKey::ExcerptProviderDeadlineMs => {
+                i64::try_from(self.excerpt_provider_deadline_ms).unwrap_or(i64::MAX)
+            }
+            SettingKey::MaxSkillTokens => self.max_skill_tokens,
+            SettingKey::PromptReserveFraction => i64::from(self.prompt_reserve_fraction_bp),
+            SettingKey::UpstreamHops => i64::from(self.prompt_upstream_hops),
+            SettingKey::TokenBudget => self.token_budget,
+        }
+    }
+}
+
+/// The ten `app_setting` keys of ANA-5 §5.3, declared in **key byte order**: the discriminant
+/// indexes [`SPECS`] and [`Self::ALL`] reproduces [`Defaults::as_rows`]'s order (MOD-15 plan D7).
+///
+/// A typed key rather than a `&str`, because the writer this exists for is the one place a typo
+/// used to be invisible: `positive_i64` treats an unknown key exactly as it treats a malformed
+/// one, so a misspelled write would show one number in the editor and use another in the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingKey {
+    /// `excerpt_file_line_cap`.
+    ExcerptFileLineCap = 0,
+    /// `excerpt_head_lines`.
+    ExcerptHeadLines = 1,
+    /// `excerpt_max_file_bytes`.
+    ExcerptMaxFileBytes = 2,
+    /// `excerpt_max_files`.
+    ExcerptMaxFiles = 3,
+    /// `excerpt_max_scan_files`.
+    ExcerptMaxScanFiles = 4,
+    /// `excerpt_provider_deadline_ms`.
+    ExcerptProviderDeadlineMs = 5,
+    /// `max_skill_tokens`.
+    MaxSkillTokens = 6,
+    /// `prompt_reserve_fraction`, the one [`SettingKind::Fraction`] of the ten.
+    PromptReserveFraction = 7,
+    /// `prompt_upstream_hops` on the App rung, `upstream_hops` on a project (flag A).
+    UpstreamHops = 8,
+    /// `token_budget`, the only key all three rungs accept.
+    TokenBudget = 9,
+}
+
+impl SettingKey {
+    /// Every key, in the order [`Defaults::as_rows`] emits and migration `0002` inserts.
+    pub const ALL: [Self; 10] = [
+        Self::ExcerptFileLineCap,
+        Self::ExcerptHeadLines,
+        Self::ExcerptMaxFileBytes,
+        Self::ExcerptMaxFiles,
+        Self::ExcerptMaxScanFiles,
+        Self::ExcerptProviderDeadlineMs,
+        Self::MaxSkillTokens,
+        Self::PromptReserveFraction,
+        Self::UpstreamHops,
+        Self::TokenBudget,
+    ];
+
+    /// This key's row of the registry.
+    #[must_use]
+    pub const fn spec(self) -> &'static SettingSpec {
+        &SPECS[self as usize]
+    }
+
+    /// The `app_setting.key` column value.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        self.spec().key
+    }
+
+    /// The reverse of [`Self::key`], `None` for a string outside the ten.
+    ///
+    /// The two MOD-6 cache keys (`cache_refresh_seconds`, `cache_overlap_seconds`) are deliberately
+    /// outside: their reader is `connect.rs`'s own `> 0` rule and the `0002` pin asserts exactly
+    /// ten rows. Adding one is a variant, when MOD-12 or the connection section asks (plan D7).
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.key() == key)
+    }
+}
+
+impl core::fmt::Display for SettingKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.key())
+    }
+}
+
+/// Which rungs accept a key (plan D7): a three-flag bitset, and no `bitflags` dependency for three
+/// bits that never grow — `docs/ANA-2.md:284`'s chain has exactly these three writable rungs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rungs(u8);
+
+impl Rungs {
+    /// An `app_setting` row.
+    pub const APP: Self = Self(1);
+    /// One key of `project.settings`.
+    pub const PROJECT: Self = Self(2);
+    /// `step_graph_phase.token_budget`.
+    pub const PHASE: Self = Self(4);
+
+    /// Whether every flag of `other` is set here.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The union, spelled as a `const fn` so [`SPECS`] can build one.
+    #[must_use]
+    pub const fn or(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl core::ops::BitOr for Rungs {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        self.or(rhs)
+    }
+}
+
+impl core::fmt::Display for Rungs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut written = false;
+        for (flag, name) in [
+            (Self::APP, "app"),
+            (Self::PROJECT, "project"),
+            (Self::PHASE, "phase"),
+        ] {
+            if self.contains(flag) {
+                if written {
+                    f.write_str("|")?;
+                }
+                f.write_str(name)?;
+                written = true;
+            }
+        }
+        if written { Ok(()) } else { f.write_str("no") }
+    }
+}
+
+/// How a key's JSON is read (PRD D7's `kind`): every key but one is an integer, and
+/// `prompt_reserve_fraction` is a float the reader rounds to basis points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingKind {
+    /// Read through `positive_i64` or a narrowing of it.
+    Integer,
+    /// Read through `as_f64` and rounded once, to basis points.
+    Fraction,
+}
+
+/// One row of the registry (plan D7): the single source `DEFAULTS`, the migration pin, the
+/// validator and milestone 5's editor all read.
+///
+/// `min` and `max` are **the reader's own clamps** in `unit`; for [`SettingKind::Fraction`] they
+/// are basis points of the stored float. That is what makes "no value can be written that the read
+/// half would clamp" checkable rather than aspirational — `ranges_are_the_readers_clamps` asserts
+/// them against the resolver's constants, so a clamp that moves fails a unit test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingSpec {
+    /// The `app_setting.key` column value.
+    pub key: &'static str,
+    /// The name under which `project.settings` holds it; `Some` exactly when `rungs` has
+    /// [`Rungs::PROJECT`]. Two of the ten spell it differently there (flag A), and writing the App
+    /// spelling into a project would store a key `resolve_hops` never looks at.
+    pub project_key: Option<&'static str>,
+    /// How the JSON is read.
+    pub kind: SettingKind,
+    /// The smallest value the reader honours, in `unit`.
+    pub min: i64,
+    /// The largest value the reader honours, in `unit`. Narrowed to `i32::MAX` on
+    /// [`Rungs::PHASE`], whose column is `INTEGER` (flag C).
+    pub max: i64,
+    /// Which rungs accept the key.
+    pub rungs: Rungs,
+    /// The peer key this one may not exceed, the one cross-key rule the reader applies.
+    pub not_above: Option<SettingKey>,
+    /// What `min` and `max` count.
+    pub unit: &'static str,
+    /// One line for the editor milestone 5 builds.
+    pub doc: &'static str,
+}
+
+/// `u32::MAX` as the `i64` the four `positive_u32` keys cap at.
+const U32_MAX: i64 = u32::MAX as i64;
+
+/// The registry, indexed by [`SettingKey`]'s discriminant.
+pub const SPECS: [SettingSpec; 10] = [
+    SettingSpec {
+        key: "excerpt_file_line_cap",
+        project_key: None,
+        kind: SettingKind::Integer,
+        min: 1,
+        max: U32_MAX,
+        rungs: Rungs::APP,
+        not_above: None,
+        unit: "lines",
+        doc: "Lines of one file the excerpt scanner reads.",
+    },
+    SettingSpec {
+        key: "excerpt_head_lines",
+        project_key: None,
+        kind: SettingKind::Integer,
+        min: 1,
+        max: U32_MAX,
+        rungs: Rungs::APP,
+        not_above: Some(SettingKey::ExcerptFileLineCap),
+        unit: "lines",
+        doc: "Lines quoted from the top of a file; the reader clamps it to excerpt_file_line_cap.",
+    },
+    SettingSpec {
+        key: "excerpt_max_file_bytes",
+        project_key: None,
+        kind: SettingKind::Integer,
+        min: 1,
+        max: i64::MAX,
+        rungs: Rungs::APP,
+        not_above: None,
+        unit: "bytes",
+        doc: "Largest file the scanner opens; read as an i64, so i64::MAX is the ceiling (F2).",
+    },
+    SettingSpec {
+        key: "excerpt_max_files",
+        project_key: None,
+        kind: SettingKind::Integer,
+        min: 1,
+        max: U32_MAX,
+        rungs: Rungs::APP,
+        not_above: None,
+        unit: "files",
+        doc: "Files quoted per prompt.",
+    },
+    SettingSpec {
+        key: "excerpt_max_scan_files",
+        project_key: None,
+        kind: SettingKind::Integer,
+        min: 1,
+        max: U32_MAX,
+        rungs: Rungs::APP,
+        not_above: None,
+        unit: "files",
+        doc: "Files the scanner visits before it stops.",
+    },
+    SettingSpec {
+        key: "excerpt_provider_deadline_ms",
+        project_key: None,
+        kind: SettingKind::Integer,
+        min: 1,
+        max: i64::MAX,
+        rungs: Rungs::APP,
+        not_above: None,
+        unit: "ms",
+        doc: "Wall clock the excerpt provider gets; read as an i64 (F2).",
+    },
+    SettingSpec {
+        key: "max_skill_tokens",
+        project_key: None,
+        kind: SettingKind::Integer,
+        min: 1,
+        max: i64::MAX,
+        rungs: Rungs::APP,
+        not_above: None,
+        unit: "tokens",
+        doc: "Tokens the skill section may take before the step is refused.",
+    },
+    SettingSpec {
+        key: "prompt_reserve_fraction",
+        project_key: None,
+        kind: SettingKind::Fraction,
+        min: 0,
+        max: 5_000,
+        rungs: Rungs::APP,
+        not_above: None,
+        unit: "bp",
+        doc: "Share of the budget held back for the answer, 0.0 to 0.5.",
+    },
+    SettingSpec {
+        key: "prompt_upstream_hops",
+        project_key: Some("upstream_hops"),
+        kind: SettingKind::Integer,
+        min: 1,
+        max: 2,
+        rungs: Rungs::APP.or(Rungs::PROJECT),
+        not_above: None,
+        unit: "hops",
+        doc: "Upstream items followed when quoting context.",
+    },
+    SettingSpec {
+        key: "token_budget",
+        project_key: Some("token_budget"),
+        kind: SettingKind::Integer,
+        min: 1,
+        max: i64::MAX,
+        rungs: Rungs::APP.or(Rungs::PROJECT).or(Rungs::PHASE),
+        not_above: None,
+        unit: "tokens",
+        doc: "Prompt budget; the phase column is INTEGER, so that rung caps at i32::MAX.",
+    },
+];
+
+/// Refuses what the reader would clamp or ignore (plan D7, D8), in order: rung, kind, range,
+/// `not_above`.
+///
+/// `at` is the single rung being written; `peer` is that same rung's current value of
+/// `not_above`'s key, or `None` for "this rung stores none", in which case the compiled-in default
+/// stands in — the number [`resolve_excerpt_caps`] would itself have resolved.
+///
+/// The `String` is the whole sentence to show; the store wraps it in
+/// [`StoreError::Constraint`](crate::store::StoreError::Constraint) unchanged, so the same words
+/// reach the editor from `MemStore` and from `PgStore`.
+///
+/// # Errors
+///
+/// One of, in the order they are checked:
+/// - `` `{key}` is not accepted on the {rung} rung ``
+/// - `` `{key}` must be a JSON integer, got {value} `` / `` `{key}` must be a finite JSON number,
+///   got {value} ``
+/// - `` `{key}` = {n} is outside {min}..={max} {unit} `` — for a fraction, `` `{key}` = {value}
+///   rounds to {n} bp, outside {min}..={max} bp ``
+/// - `` `{key}` = {n} is above `{other}` = {m}; the reader would clamp it ``
+pub fn validate(
+    key: SettingKey,
+    at: Rungs,
+    value: &Value,
+    peer: Option<&Value>,
+) -> Result<(), String> {
+    let spec = key.spec();
+    if !spec.rungs.contains(at) {
+        return Err(format!("`{key}` is not accepted on the {at} rung"));
+    }
+
+    // The phase rung is one `INTEGER` column, so it narrows the spec's own ceiling rather than
+    // letting Postgres answer `22003` to a value validation had already accepted (flag C).
+    let ceiling = if at == Rungs::PHASE {
+        spec.max.min(i64::from(i32::MAX))
+    } else {
+        spec.max
+    };
+
+    let number = match spec.kind {
+        SettingKind::Integer => {
+            let Some(number) = value.as_i64() else {
+                return Err(format!("`{key}` must be a JSON integer, got {value}"));
+            };
+            if number < spec.min || number > ceiling {
+                return Err(format!(
+                    "`{key}` = {number} is outside {}..={ceiling} {}",
+                    spec.min, spec.unit
+                ));
+            }
+            number
+        }
+        SettingKind::Fraction => {
+            let Some(fraction) = value.as_f64().filter(|f| f.is_finite()) else {
+                return Err(format!("`{key}` must be a finite JSON number, got {value}"));
+            };
+            // Saturating, as every float-to-integer cast has been since Rust 1.45: a fraction too
+            // large to name lands on `i64::MAX` and is refused by the range rather than wrapping
+            // into it.
+            let number = (fraction * 10_000.0).round() as i64;
+            if number < spec.min || number > ceiling {
+                return Err(format!(
+                    "`{key}` = {value} rounds to {number} bp, outside {}..={ceiling} bp",
+                    spec.min
+                ));
+            }
+            number
+        }
+    };
+
+    if let Some(other) = spec.not_above {
+        let limit = peer
+            .and_then(Value::as_i64)
+            .unwrap_or_else(|| DEFAULTS.integer(other));
+        if number > limit {
+            return Err(format!(
+                "`{key}` = {number} is above `{other}` = {limit}; the reader would clamp it"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Which rung of `docs/ANA-2.md:284`'s chain produced the budget, so a surprising number is
@@ -404,6 +802,290 @@ mod tests {
         let mut sorted = keys.clone();
         sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         assert_eq!(keys, sorted, "byte order, never a map's iteration order");
+    }
+
+    /// Every compiled-in default is a value its own spec accepts.
+    ///
+    /// The registry exists to refuse what the reader would ignore; a table whose own seeded value
+    /// the validator rejects would make migration `0002` unwritable through the editor it feeds.
+    #[test]
+    fn every_default_validates_under_its_own_spec() {
+        for key in SettingKey::ALL {
+            let value = DEFAULTS.value_of(key);
+            assert_eq!(
+                validate(key, Rungs::APP, &value, None),
+                Ok(()),
+                "the seeded default of {key} is a value its own spec accepts"
+            );
+        }
+    }
+
+    /// `min`/`max` are the reader's clamps, asserted against the reader's own constants rather
+    /// than against copies of them, so a later edit to one fails here instead of drifting.
+    #[test]
+    fn ranges_are_the_readers_clamps() {
+        let (low, high) = HOPS_RANGE;
+        let hops = SettingKey::UpstreamHops.spec();
+        assert_eq!(
+            (hops.min, hops.max),
+            (i64::from(low), i64::from(high)),
+            "`resolve_hops` clamps to HOPS_RANGE, so the writer refuses outside it"
+        );
+        assert_eq!(
+            SettingKey::PromptReserveFraction.spec().max,
+            i64::from(MAX_RESERVE_BP),
+            "`resolve_reserve_bp` clamps at MAX_RESERVE_BP basis points"
+        );
+
+        for key in [
+            SettingKey::ExcerptFileLineCap,
+            SettingKey::ExcerptHeadLines,
+            SettingKey::ExcerptMaxFiles,
+            SettingKey::ExcerptMaxScanFiles,
+        ] {
+            assert_eq!(
+                key.spec().max,
+                U32_MAX,
+                "{key} is read through `positive_u32`, which drops anything wider"
+            );
+        }
+        for key in [
+            // F2: read as `positive_i64(..).and_then(|v| u64::try_from(v).ok())`, so the ceiling
+            // is `i64::MAX` and not `u64::MAX` — above it the reader silently drops the row.
+            SettingKey::ExcerptMaxFileBytes,
+            SettingKey::ExcerptProviderDeadlineMs,
+            SettingKey::MaxSkillTokens,
+            SettingKey::TokenBudget,
+        ] {
+            assert_eq!(key.spec().max, i64::MAX, "{key} is read as an i64");
+        }
+        for key in SettingKey::ALL {
+            assert!(
+                key.spec().min >= 0,
+                "{key} is read through a `positive_*` helper, so zero is not a value"
+            );
+        }
+        assert_eq!(
+            SettingKey::ExcerptHeadLines.spec().not_above,
+            Some(SettingKey::ExcerptFileLineCap),
+            "`resolve_excerpt_caps` clamps the head to the line cap, so the writer refuses above it"
+        );
+    }
+
+    /// Flag A: the App key and the `project.settings` key are different strings for two of the
+    /// ten, so a spec that accepted the project rung without naming its key would write something
+    /// `resolve_hops` never reads.
+    #[test]
+    fn project_key_is_some_exactly_where_project_is_accepted() {
+        for key in SettingKey::ALL {
+            let spec = key.spec();
+            assert_eq!(
+                spec.project_key.is_some(),
+                spec.rungs.contains(Rungs::PROJECT),
+                "{key} declares a project key exactly when it accepts the project rung"
+            );
+        }
+        assert_eq!(
+            SettingKey::UpstreamHops.spec().project_key,
+            Some("upstream_hops"),
+            "`resolve_hops` reads `upstream_hops` out of the project, not the App spelling"
+        );
+        assert_eq!(
+            SettingKey::UpstreamHops.key(),
+            "prompt_upstream_hops",
+            "…while the App row is the one migration 0002 seeds"
+        );
+    }
+
+    /// The discriminant is the index and the keys ascend as bytes, which is what makes
+    /// `SettingKey::ALL` reproduce `as_rows`'s order without a second list.
+    #[test]
+    fn specs_are_indexed_by_discriminant() {
+        for key in SettingKey::ALL {
+            assert_eq!(
+                SPECS[key as usize].key,
+                key.key(),
+                "{key} indexes its own spec"
+            );
+            assert_eq!(
+                SettingKey::from_key(key.key()),
+                Some(key),
+                "{key} round-trips through its column value"
+            );
+        }
+        let keys: Vec<&str> = SettingKey::ALL.into_iter().map(SettingKey::key).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        sorted.dedup();
+        assert_eq!(
+            keys, sorted,
+            "ten distinct keys, strictly ascending as bytes"
+        );
+        assert!(
+            SettingKey::from_key("cache_refresh_seconds").is_none(),
+            "D7"
+        );
+    }
+
+    /// The PRD's "stored equals effective": a value the writer accepts comes back out of the
+    /// reader unchanged, rather than clamped into a number nobody wrote.
+    #[test]
+    fn an_accepted_value_survives_its_resolver() {
+        for hops in 1_u8..=2 {
+            let value = json!(hops);
+            assert_eq!(
+                validate(SettingKey::UpstreamHops, Rungs::APP, &value, None),
+                Ok(())
+            );
+            let mut notes = Vec::new();
+            assert_eq!(
+                resolve_hops(None, &app(&[("prompt_upstream_hops", value)]), &mut notes),
+                hops,
+                "an accepted hop count is the hop count the walk uses"
+            );
+            assert!(notes.is_empty(), "…and nothing was clamped on the way");
+        }
+
+        let fraction = json!(0.25);
+        assert_eq!(
+            validate(
+                SettingKey::PromptReserveFraction,
+                Rungs::APP,
+                &fraction,
+                None
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            resolve_reserve_bp(&app(&[("prompt_reserve_fraction", fraction)])),
+            2_500,
+            "0.25 is 2500 basis points, held exactly"
+        );
+
+        let head = json!(DEFAULTS.excerpt_file_line_cap);
+        let cap = DEFAULTS.value_of(SettingKey::ExcerptFileLineCap);
+        assert_eq!(
+            validate(SettingKey::ExcerptHeadLines, Rungs::APP, &head, Some(&cap)),
+            Ok(()),
+            "a head equal to the cap is accepted; `not_above` is not `not_equal`"
+        );
+        let (caps, _, _) = resolve_excerpt_caps(&app(&[
+            ("excerpt_head_lines", head),
+            ("excerpt_file_line_cap", cap),
+        ]));
+        assert_eq!(
+            caps.head_lines, DEFAULTS.excerpt_file_line_cap,
+            "…and it survives the clamp that refuses one line more"
+        );
+    }
+
+    /// Flag C: `step_graph_phase.token_budget` is `INTEGER`, so the phase rung narrows the spec's
+    /// own ceiling. Without this a write Postgres answers `22003` to would pass validation.
+    #[test]
+    fn phase_rung_caps_token_budget_at_i32() {
+        let too_wide = json!(i64::from(i32::MAX) + 1);
+        assert!(
+            validate(SettingKey::TokenBudget, Rungs::PHASE, &too_wide, None).is_err(),
+            "the phase column cannot hold it"
+        );
+        assert_eq!(
+            validate(SettingKey::TokenBudget, Rungs::APP, &too_wide, None),
+            Ok(()),
+            "…while `app_setting.value` is JSONB and the reader is an i64"
+        );
+        assert_eq!(
+            validate(
+                SettingKey::TokenBudget,
+                Rungs::PHASE,
+                &json!(i32::MAX),
+                None
+            ),
+            Ok(()),
+            "the ceiling itself is accepted"
+        );
+    }
+
+    /// The rung flag is checked before anything else, so a key on the wrong rung is refused by
+    /// name rather than by range.
+    #[test]
+    fn a_key_is_refused_on_a_rung_that_does_not_accept_it() {
+        let refused = validate(SettingKey::ExcerptMaxFiles, Rungs::PROJECT, &json!(3), None)
+            .expect_err("`excerpt_max_files` has no project rung");
+        assert!(
+            refused.contains("excerpt_max_files") && refused.contains("project"),
+            "the refusal names the key and the rung, got `{refused}`"
+        );
+        assert!(
+            validate(SettingKey::UpstreamHops, Rungs::PHASE, &json!(1), None).is_err(),
+            "`token_budget` is the phase rung's only key"
+        );
+    }
+
+    /// Every refusal carries the key, the value and the rule, because `positive_i64` fails
+    /// silently and a bare "invalid" would be indistinguishable from the silence it replaces.
+    #[test]
+    fn a_refusal_names_the_key_the_value_and_the_rule() {
+        for (label, key, value) in [
+            ("a string", SettingKey::TokenBudget, json!("120000")),
+            ("a float", SettingKey::TokenBudget, json!(1.5)),
+            ("null", SettingKey::TokenBudget, Value::Null),
+            ("zero", SettingKey::TokenBudget, json!(0)),
+            ("three hops", SettingKey::UpstreamHops, json!(3)),
+            (
+                "a string fraction",
+                SettingKey::PromptReserveFraction,
+                json!("0.1"),
+            ),
+            (
+                "more than half",
+                SettingKey::PromptReserveFraction,
+                json!(0.5001),
+            ),
+            (
+                "a negative fraction",
+                SettingKey::PromptReserveFraction,
+                json!(-0.1),
+            ),
+        ] {
+            let refused = validate(key, Rungs::APP, &value, None)
+                .expect_err("{label} is refused, never clamped");
+            assert!(
+                refused.contains(key.key()),
+                "the refusal of {label} names `{key}`, got `{refused}`"
+            );
+        }
+
+        let clamped = validate(
+            SettingKey::ExcerptHeadLines,
+            Rungs::APP,
+            &json!(500),
+            Some(&json!(400)),
+        )
+        .expect_err("a head above the cap would be clamped by the reader");
+        assert!(
+            clamped.contains("excerpt_file_line_cap"),
+            "the `not_above` refusal names the peer it lost to, got `{clamped}`"
+        );
+        assert_eq!(
+            validate(
+                SettingKey::ExcerptHeadLines,
+                Rungs::APP,
+                &json!(500),
+                Some(&json!(600))
+            ),
+            Ok(()),
+            "…and accepts the same value once the peer allows it"
+        );
+        assert!(
+            validate(
+                SettingKey::ExcerptHeadLines,
+                Rungs::APP,
+                &json!(DEFAULTS.excerpt_file_line_cap + 1),
+                None
+            )
+            .is_err(),
+            "an absent peer is its compiled-in default, not `no rule`"
+        );
     }
 
     fn app(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
