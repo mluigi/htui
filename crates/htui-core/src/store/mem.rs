@@ -2282,10 +2282,19 @@ impl State {
                 if stored.updated_at != token {
                     return Ok(CasOutcome::Stale(stored));
                 }
+                // `validate` has already narrowed this rung to `i32::MAX` (flag C), so the `None`
+                // arm is unreachable — and it is still an error rather than an `expect`, because
+                // "unreachable" here depends on a guard two modules away and a panic is a poor way
+                // to find out it moved (review L6).
                 let budget = value
                     .as_i64()
                     .and_then(|number| i32::try_from(number).ok())
-                    .expect("validate narrows the phase rung to i32::MAX (flag C)");
+                    .ok_or_else(|| {
+                        StoreError::Constraint(format!(
+                            "`{key}` = {value} does not fit `step_graph_phase.token_budget`, \
+                             which is INTEGER"
+                        ))
+                    })?;
                 let phase = self
                     .phase_mut(id)
                     .expect("the row was read a statement ago under the same lock");
