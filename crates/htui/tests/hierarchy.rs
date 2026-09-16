@@ -6,12 +6,21 @@
 #![cfg(feature = "testkit")]
 
 use chrono::Utc;
+use htui::app::Action;
 use htui::hierarchy::{HierarchySnapshot, MirrorAfterDelete, REQUEST_NAMES};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
+use htui::testkit::{Harness, SectionBench};
+use htui::ui::Theme;
+use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
 use htui_core::model::{ProjectId, ProjectPatch, RepoId, RepoPatch, WorkspaceId, WorkspacePatch};
 use htui_core::store::{DeleteTarget, MemStore, ReadStore};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
 /// The demo world behind a memory backend: a `Writer::Memory`, a `this_user` and a `this_box`.
 fn demo() -> Backend {
@@ -551,4 +560,339 @@ fn hierarchy_requests() -> Vec<StoreRequest> {
         StoreRequest::DeleteWorkspace(WorkspaceId::default()),
         StoreRequest::DeleteProject(ProjectId::default()),
     ]
+}
+
+// -------------------------------------------------------------------------------------------
+// ---- section (T3) ----
+//
+// The same tree from the other end: a `Harness` for the frames a user sees and a `SectionBench`
+// for the keys and replies a frame cannot show (a request that was emitted, a scope that moved).
+// -------------------------------------------------------------------------------------------
+
+/// A settled Settings tab over `store`, both sections registered and the strip already cycled onto
+/// `Hierarchy` — the product's own registration order (D4), so `l` is what reaches this section.
+async fn hierarchy_over(store: MemStore) -> Harness {
+    let mut harness = Harness::over(store).with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(HierarchySection::new()),
+    ])));
+    harness.settle().await;
+    harness.key("l");
+    harness.settle().await;
+    harness
+}
+
+/// The demo tree as the section draws it: the workspace line with its root unset, its one project
+/// and no repos.
+#[tokio::test]
+async fn the_demo_tree_renders() {
+    let mut harness = hierarchy_over(MemStore::demo()).await;
+    insta::assert_snapshot!("demo", harness.render());
+}
+
+/// Browse is not a mode: `captures_input` is false there, so the global table still owns `q`
+/// (the risk row "a capturing section swallows `q` forever").
+#[tokio::test]
+async fn q_quits_from_browse() {
+    let mut harness = hierarchy_over(MemStore::demo()).await;
+    harness.key("q");
+    harness.settle().await;
+    assert!(
+        harness.app().should_quit,
+        "Browse binds no `q`, so the global binding takes it"
+    );
+}
+
+/// Types one key per char, as a user would: the field is the only thing that sees them.
+fn type_into(harness: &mut Harness, text: &str) {
+    for c in text.chars() {
+        harness.key(&c.to_string());
+    }
+}
+
+/// The same, one section wide.
+fn type_at(bench: &SectionBench, section: &mut dyn SettingsSection, text: &str) {
+    for c in text.chars() {
+        bench.key(section, &c.to_string());
+    }
+}
+
+/// One section drawn into a `width`x30 buffer.
+///
+/// [`SectionBench::render_section`] answers text, and the two things below are *styles*: a warning
+/// that is not in `theme.error` reads as a row of the tree, and a snapshot records symbols only.
+fn drawn(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -> Buffer {
+    let area = Rect::new(0, 0, width, 30);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, 30),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// What the section drew in the theme's error colour, one entry per row that has any.
+fn error_text(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -> Vec<String> {
+    let error = Theme::default().error.fg.unwrap_or(Color::Reset);
+    let buffer = drawn(bench, section, width);
+    (0..buffer.area.height)
+        .filter_map(|y| {
+            let text: String = (0..width)
+                .filter(|x| buffer[(*x, y)].fg == error)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let text = text.trim().to_owned();
+            (!text.is_empty()).then_some(text)
+        })
+        .collect()
+}
+
+/// The demo tree behind a `SectionBench`, as the worker assembles it.
+async fn demo_tree(backend: &Backend, workspace: WorkspaceId) -> HierarchySnapshot {
+    tree(serve(backend, &StoreRequest::Hierarchy(workspace)).await)
+}
+
+/// `n` on a project row opens the repo editor, and from there `l` is a letter: the tab's own
+/// section cycle is off for as long as something is being typed (D2).
+#[tokio::test]
+async fn n_on_a_project_opens_the_repo_editor() {
+    let mut harness = hierarchy_over(MemStore::demo()).await;
+    harness.key("j");
+    harness.key("n");
+    harness.settle().await;
+    type_into(&mut harness, "l");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        !frame.contains("transport"),
+        "`l` typed into the name field instead of cycling to Agents: {frame}"
+    );
+    insta::assert_snapshot!("editor_repo", frame);
+}
+
+/// A CAS miss keeps the editor and its text, moves the token to the row as it is now, and waits for
+/// a second `Enter` (D7, PRD D8): retyping is the cost the PRD said not to pay.
+#[tokio::test]
+async fn a_stale_reply_keeps_the_typed_text() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(opened.clone()))),
+    );
+    let _ = bench.drained();
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "-2");
+
+    // Someone else wrote to the row this editor opened on.
+    let current = tree(
+        serve(
+            &backend,
+            &StoreRequest::UpdateWorkspace {
+                id: ids::WORKSPACE_GRAPHICS,
+                expected: opened.workspace.updated_at,
+                patch: WorkspacePatch {
+                    name: Some("Graphics, renamed".to_owned()),
+                    ..WorkspacePatch::default()
+                },
+            },
+        )
+        .await,
+    );
+    bench.reply(
+        &mut section,
+        &StoreReply::HierarchyStale(Box::new(current.clone())),
+    );
+    insta::assert_snapshot!("stale", bench.render_section(&section, 100));
+    let flagged = error_text(&bench, &section, 100);
+    assert_eq!(
+        flagged.len(),
+        1,
+        "the CAS miss is the one line in `theme.error`: {flagged:?}"
+    );
+    assert!(
+        flagged[0].starts_with("changed elsewhere since you opened it"),
+        "{flagged:?}"
+    );
+
+    bench.key(&mut section, "enter");
+    let emitted = bench.drained();
+    let [
+        Action::Store(StoreRequest::UpdateWorkspace {
+            expected, patch, ..
+        }),
+    ] = emitted.as_slice()
+    else {
+        panic!("`Enter` retries by hand, once: {emitted:?}");
+    };
+    assert_eq!(
+        *expected, current.workspace.updated_at,
+        "the retry carries the reloaded row's token, not the one the editor opened on"
+    );
+    assert_eq!(
+        patch.slug.as_deref(),
+        Some("graphics-2"),
+        "and the text that was typed survived the reload"
+    );
+}
+
+/// The nil startup scope, and the shell after its last workspace was deleted: a pane that names
+/// the key that fixes it rather than an empty box.
+#[tokio::test]
+async fn no_workspace_says_so() {
+    let mut harness = hierarchy_over(MemStore::new()).await;
+    insta::assert_snapshot!("no_workspace", harness.render());
+}
+
+/// Offline the tree is one refused read: `Backend::writer()` is `None`, so the section says what is
+/// missing instead of rendering a workspace that is not there (E-16).
+#[tokio::test]
+async fn offline_says_it_needs_postgres() {
+    // The mirror outlives the harness: dropping the directory deletes it mid-test.
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(root.path(), "hierarchy-section", PgStore::schema_version())
+        .await
+        .expect("a fresh mirror");
+    let mut harness = Harness::over_backend(Backend::Offline {
+        cache,
+        since: Some(Utc::now()),
+    })
+    .with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(HierarchySection::new()),
+    ])))
+    // `offline · 3s` would age between the render and the next tick.
+    .with_store_state("offline \u{b7} 0s", None);
+    harness.settle().await;
+    harness.key("l");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("hierarchy needs Postgres"),
+        "a refused read says what is missing: {frame}"
+    );
+    insta::assert_snapshot!("offline", frame);
+}
+
+/// `p` is the only writer of `is_primary` and it only ever sets it (D12): the store demotes the old
+/// primary in the same transaction, so no key in this section can leave a project without one.
+#[tokio::test]
+async fn p_moves_the_primary() {
+    let backend = demo();
+    for (name, is_primary) in [("alpha", true), ("beta", false)] {
+        let reply = serve(
+            &backend,
+            &StoreRequest::CreateRepo {
+                project: ids::PROJECT_VULKAN,
+                name: name.to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary,
+            },
+        )
+        .await;
+        let _ = tree(reply);
+    }
+    let with_repos = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let beta = with_repos.projects[0].repos[1].repo.clone();
+
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(with_repos))),
+    );
+    let _ = bench.drained();
+
+    // Workspace, project, `alpha`, `beta`.
+    for _ in 0..3 {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "p");
+
+    let emitted = bench.drained();
+    let [
+        Action::Store(StoreRequest::UpdateRepo {
+            project,
+            id,
+            expected,
+            patch,
+        }),
+    ] = emitted.as_slice()
+    else {
+        panic!("`p` is one request: {emitted:?}");
+    };
+    assert_eq!(*project, ids::PROJECT_VULKAN);
+    assert_eq!(*id, beta.id);
+    assert_eq!(*expected, beta.updated_at, "the row's own CAS token");
+    assert_eq!(patch.is_primary, Some(true));
+    assert_eq!(
+        (&patch.name, &patch.remote_url, &patch.default_branch),
+        (&None, &None, &None),
+        "`p` writes one column and the editor never writes this one"
+    );
+}
+
+/// `b` on the workspace row sends what was typed, untouched: the guard runs on the worker, so the
+/// section never stats a path and no test path ever reaches a frame (D8, D14).
+#[tokio::test]
+async fn b_on_the_workspace_row_sets_the_root() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    let _ = bench.drained();
+
+    bench.key(&mut section, "b");
+    type_at(&bench, &mut section, "/srv/htui");
+    bench.key(&mut section, "enter");
+
+    let emitted = bench.drained();
+    let [Action::Store(StoreRequest::SetWorkspaceRoot { id, path })] = emitted.as_slice() else {
+        panic!("`b` then `Enter` is one request: {emitted:?}");
+    };
+    assert_eq!(*id, ids::WORKSPACE_GRAPHICS);
+    assert_eq!(path, "/srv/htui", "the path is the user's, verbatim");
+}
+
+/// A tree from a workspace the shell is not inside moves the scope (D11): `N` creates a workspace
+/// *and enters it*, and the same arm is what makes a deleted project leave the Backlog.
+#[tokio::test]
+async fn a_reply_from_another_workspace_moves_the_scope() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let elsewhere = demo_tree(&backend, ids::WORKSPACE_PLATFORM).await;
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(elsewhere))),
+    );
+
+    let emitted = bench.drained();
+    let [Action::SetScope { workspace }] = emitted.as_slice() else {
+        panic!("a tree from elsewhere is one `SetScope`: {emitted:?}");
+    };
+    assert_eq!(workspace.workspace_id, ids::WORKSPACE_PLATFORM);
+    assert_eq!(
+        workspace
+            .projects
+            .iter()
+            .map(|project| project.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec!["htui", "agy"],
+        "the summary carries the tree's own projects, in position order"
+    );
 }

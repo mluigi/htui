@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/hierarchy.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Settings
+┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
+│ Agents  Hierarchy                                                                                │
+│Graphics (graphics) — root on this box: unset                                                     │
+│  vulkan-tutorials  Vulkan Tutorials                                                              │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│name          : l                                                                                 │
+│remote_url    :                                                                                   │
+│default_branch: main                                                                              │
+│primary (y/n) : y                                                                                 │
+│Tab/Shift+Tab field · Enter save · Esc cancel                                                     │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

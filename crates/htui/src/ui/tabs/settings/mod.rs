@@ -9,6 +9,7 @@
 //! `on_item_change`: a section is scoped to a workspace, not to an item.
 
 pub mod agents;
+pub mod hierarchy;
 
 use htui_core::model::Scope;
 use ratatui::Frame;
@@ -24,6 +25,7 @@ use crate::ui::tabs::registry::{Tab, TabId};
 use crossterm::event::{KeyCode, KeyEvent};
 
 pub use agents::AgentsSection;
+pub use hierarchy::HierarchySection;
 
 /// Stable identity of a Settings section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

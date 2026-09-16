@@ -8,7 +8,9 @@ use htui::app::{Action, Ctx, Handled};
 use htui::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
-use htui::ui::tabs::settings::{AgentsSection, SectionId, SettingsSection, SettingsTab, message};
+use htui::ui::tabs::settings::{
+    AgentsSection, HierarchySection, SectionId, SettingsSection, SettingsTab, message,
+};
 use htui_agent::acp::Handshake;
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::InstallRecord;
@@ -938,7 +940,10 @@ async fn a_capturing_section_receives_l_and_a_plain_one_cycles() {
 /// the one warning a snapshot of a clipped strip could not give.
 #[test]
 fn the_section_strip_fits_the_frame() {
-    let sections: Vec<Box<dyn SettingsSection>> = vec![Box::new(AgentsSection::new())];
+    let sections: Vec<Box<dyn SettingsSection>> = vec![
+        Box::new(AgentsSection::new()),
+        Box::new(HierarchySection::new()),
+    ];
     let width: usize = sections
         .iter()
         .map(|section| section.title().chars().count() + 2)
