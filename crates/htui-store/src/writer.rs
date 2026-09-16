@@ -38,10 +38,18 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, Item,
-    ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem, Note, Project, ProjectId,
-    PromptScope, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepId, UpstreamEntry,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkGraph,
+    NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph, NewWorkspace, Note, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId,
+    RepoPatch, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, UpstreamEntry, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
-use htui_core::store::{MemStore, ReadStore, Result, StoreError, UpdateOutcome, WriteStore};
+use htui_core::prompt::settings::SettingKey;
+use htui_core::store::{
+    CasOutcome, DeleteReach, DeleteTarget, MemStore, ReadStore, Result, SettingRung, StoreError,
+    StoredSetting, UpdateOutcome, WriteStore,
+};
 use serde_json::Value;
 
 use crate::cache::CacheStore;
@@ -396,6 +404,187 @@ impl WriteStore for BufferedWriter {
         tracing::debug!(%step, sealed, "buffered: the chat buffer is closed");
         Ok(())
     }
+
+    // ---- MOD-15 milestone 1: the hierarchy (plan D2) ---------------------------------------
+    //
+    // Thirty-one refusals through one helper, readers included. `htui` is online-only since
+    // MOD-25, so a hierarchy write off the server is refused rather than buffered; and none of
+    // these six tables is mirrored (`cache::MIRRORED_TABLES`), so offline a *read* of them is
+    // unreachable in the literal sense too. One sentence covers both directions, which is why
+    // this needs no constant of its own — see [`hierarchy_needs_the_server`].
+    //
+    // They are one-liners on purpose. A real buffered implementation would be a second
+    // hierarchy with a second set of rules to keep in step, written to be deleted: CLEAN-2
+    // removes `BufferedWriter` whole once MOD-25's decision has settled.
+
+    async fn create_workspace(&self, _new: NewWorkspace) -> Result<Workspace> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn update_workspace(
+        &self,
+        _id: WorkspaceId,
+        _expected: DateTime<Utc>,
+        _patch: WorkspacePatch,
+    ) -> Result<CasOutcome<Workspace>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn workspace(&self, _id: WorkspaceId) -> Result<Option<Workspace>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn upsert_workspace_project(&self, _link: &WorkspaceProject) -> Result<()> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn remove_workspace_project(
+        &self,
+        _workspace: WorkspaceId,
+        _project: ProjectId,
+    ) -> Result<()> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn workspace_projects(&self, _workspace: WorkspaceId) -> Result<Vec<WorkspaceProject>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn upsert_workspace_box_path(&self, _path: &WorkspaceBoxPath) -> Result<()> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn workspace_box_paths(&self, _workspace: WorkspaceId) -> Result<Vec<WorkspaceBoxPath>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn create_project(&self, _new: NewProject) -> Result<Project> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn update_project(
+        &self,
+        _id: ProjectId,
+        _expected: DateTime<Utc>,
+        _patch: ProjectPatch,
+    ) -> Result<CasOutcome<Project>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn create_repo(&self, _new: NewRepo) -> Result<Repo> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn update_repo(
+        &self,
+        _id: RepoId,
+        _expected: DateTime<Utc>,
+        _patch: RepoPatch,
+    ) -> Result<CasOutcome<Repo>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn repos(&self, _project: ProjectId) -> Result<Vec<Repo>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn upsert_repo_box_path(&self, _path: &RepoBoxPath) -> Result<()> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn repo_box_paths(&self, _repo: RepoId) -> Result<Vec<RepoBoxPath>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn create_item_kind(&self, _new: NewItemKind) -> Result<ItemKind> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn update_item_kind(
+        &self,
+        _id: ItemKindId,
+        _expected: DateTime<Utc>,
+        _patch: ItemKindPatch,
+    ) -> Result<CasOutcome<ItemKind>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn item_kinds(&self, _project: ProjectId) -> Result<Vec<ItemKind>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn delete_item_kind(&self, _id: ItemKindId) -> Result<()> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn create_step_graph(&self, _new: NewStepGraph) -> Result<StepGraph> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn update_step_graph(
+        &self,
+        _id: StepGraphId,
+        _expected: DateTime<Utc>,
+        _patch: StepGraphPatch,
+    ) -> Result<CasOutcome<StepGraph>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn step_graphs(&self, _project: ProjectId) -> Result<Vec<StepGraph>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn create_phase(&self, _phase: &StepGraphPhase) -> Result<StepGraphPhase> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn update_phase(
+        &self,
+        _id: PhaseId,
+        _expected: DateTime<Utc>,
+        _patch: PhasePatch,
+    ) -> Result<CasOutcome<StepGraphPhase>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn phases(&self, _graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn set_setting(
+        &self,
+        _rung: SettingRung,
+        _key: SettingKey,
+        _value: Value,
+        _expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<StoredSetting>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn clear_setting(
+        &self,
+        _rung: SettingRung,
+        _key: SettingKey,
+        _expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<StoredSetting>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn setting(&self, _rung: SettingRung, _key: SettingKey) -> Result<Option<StoredSetting>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn delete_reach(&self, _target: DeleteTarget) -> Result<Option<DeleteReach>> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn delete_workspace(&self, _id: WorkspaceId) -> Result<DeleteReach> {
+        Err(hierarchy_needs_the_server())
+    }
+
+    async fn delete_project(&self, _id: ProjectId) -> Result<DeleteReach> {
+        Err(hierarchy_needs_the_server())
+    }
 }
 
 /// D35's refusal for the three item writes: offline item editing is MOD-13's question.
@@ -447,6 +636,22 @@ pub const PROMPT_ON_SERVER_ONLY: &str = "the prompt path needs the server: templ
 /// prefixes `store unreachable: `. Reading the two together is the whole sentence; repeating the
 /// word here made the rendered line say "unreachable" twice.
 pub const DATABASE_UNREACHABLE: &str = "this box browses its read-only cache and starts no run";
+
+/// [`DATABASE_UNREACHABLE`] for all 31 hierarchy methods (MOD-15 plan D2), reads included.
+///
+/// Reusing MOD-25's sentence rather than coining a thirty-second one is the decision, not an
+/// economy. Writing: `htui` is online-only, so a workspace rename off the server is the same
+/// event `R-STO-4` already words — "offline read-only mode … no item creation". Reading:
+/// `workspace`, `repo`, `repo_box_path`, `workspace_box_path`, `step_graph` and
+/// `step_graph_phase` have no mirror at all (`cache::MIRRORED_TABLES`), so offline they are
+/// unreachable in the plainest sense of the word.
+///
+/// [`REGISTRY_ON_SERVER_ONLY`] and [`PROMPT_ON_SERVER_ONLY`] were the other candidates and both
+/// name a different subsystem; a maintainer who met "the agent registry is written on the server
+/// only" after renaming a project would go looking in the wrong place.
+fn hierarchy_needs_the_server() -> StoreError {
+    StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned())
+}
 
 /// Plain delegation: a `Writer` decides *which* store, never *what* a read means.
 impl ReadStore for Writer {
