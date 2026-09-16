@@ -11,6 +11,7 @@
 pub mod model;
 pub mod prompt;
 pub mod scrub;
+pub mod seed;
 pub mod store;
 
 #[cfg(feature = "demo")]
