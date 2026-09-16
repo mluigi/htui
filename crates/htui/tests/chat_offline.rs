@@ -1,15 +1,30 @@
-//! The offline chat, end to end (`docs/ANA-4.md` §11 criterion 12, MOD-2 milestone 4 T21).
+//! The offline chat, from the shell (MOD-25; previously `docs/ANA-4.md` §11 criterion 12, MOD-2
+//! milestone 4 T21).
 //!
-//! Criterion 12 is one sentence with two halves: a chat started with the store unreachable records
-//! its rows to `<cache_dir>/pending/`, and the next connection uploads them. Both halves run here,
-//! against the production pieces and nothing else — a `Backend::Offline` over a real mirror, the
-//! production `AgentRuntime` driving a scripted transport through the same registry the ACP one
-//! uses, the real recorder, the real `Writer::Buffered`, and `upload_pending` against a throwaway
-//! database. The only thing the test supplies is the mirror's contents (`testkit::seed_mirror`),
-//! because an offline box is by definition one that has already synced.
+//! **What this file proves now.** `htui` is online-only. A chat started on a box whose Postgres is
+//! unreachable is **refused** with the one sentence `htui_store::DATABASE_UNREACHABLE` carries, no
+//! step is minted, and nothing is written to `<cache_dir>/pending/`. That is
+//! `an_offline_chat_is_refused_with_the_unreachable_warning`, driven against the production pieces
+//! and nothing else — a `Backend::Offline` over a real mirror, the production `AgentRuntime`
+//! driving a scripted transport through the same registry the ACP one uses. Its online negative,
+//! `an_online_chat_header_says_nothing_about_a_buffer`, still runs: a chat over a store the
+//! maintainer can read back says nothing about a buffer. The only thing the tests supply is the
+//! mirror's contents (`testkit::seed_mirror`), because an offline box is by definition one that
+//! has already synced.
 //!
-//! The Postgres half is gated on `HTUI_TEST_DATABASE_URL` and prints `testkit::SKIP` without it,
-//! like every other Postgres-backed suite (plan D13). The offline half needs no server at all.
+//! **What this file keeps, ignored.** Criterion 12 read: a chat started with the store unreachable
+//! records its rows to `<cache_dir>/pending/`, and the next connection uploads them. It is
+//! withdrawn with the mode it proved — see `docs/decisions/mod/mod-2.md`, "Known, accepted, and
+//! handed on". The four cases that proved that mode are `#[ignore]`d rather than deleted, bodies
+//! byte-for-byte: the two buffer-writing cases, the `HTUI_TEST_DATABASE_URL`-gated end-to-end
+//! criterion-12 proof (`a_buffered_chat_lands_in_postgres_on_the_next_connection`, which prints
+//! `testkit::SKIP` without a server, plan D13), and D33's `app_user` refusal, now unreachable from
+//! the shell because `start()` refuses at the writer before it asks the mirror who this user is.
+//! They still compile and are expected to fail if run with `--ignored`; that is what "disabled"
+//! means. They are the evidence the reversal would need, and a later CLEAN item removes them.
+//!
+//! Only the **write** side is disabled. `upload_pending` still runs on every refresh pass, so a
+//! buffer left by an earlier build still lands on the next connection.
 #![cfg(feature = "testkit")]
 
 use std::sync::Arc;
@@ -267,6 +282,7 @@ async fn an_offline_chat_is_refused_with_the_unreachable_warning() {
 /// buffered chat can be photographed in without a race (`Harness::drive_to_end`); the header line
 /// the case is about is the same either way, and the transcript above it is the live renderer's.
 #[tokio::test]
+#[ignore = "MOD-25: the offline buffer is disabled (Backend::writer answers None offline); kept for the reversal, removed by the CLEAN item"]
 async fn an_offline_chat_is_accepted_and_its_header_says_it_is_buffered() {
     let agent_id = AgentId::new();
     let (_root, cache) = offline_mirror(agent_id).await;
@@ -294,6 +310,7 @@ async fn an_offline_chat_is_accepted_and_its_header_says_it_is_buffered() {
 /// would have sent to Postgres are on disk instead, in `seq` order, under the step the runtime
 /// minted — and the buffer is sealed once the chat ends, so the uploader may take it (`[H-1]`).
 #[tokio::test]
+#[ignore = "MOD-25: the offline buffer is disabled (Backend::writer answers None offline); kept for the reversal, removed by the CLEAN item"]
 async fn an_offline_chat_writes_its_rows_to_the_pending_buffer_in_seq_order() {
     let agent_id = AgentId::new();
     let (_root, cache) = offline_mirror(agent_id).await;
@@ -343,6 +360,7 @@ async fn an_offline_chat_writes_its_rows_to_the_pending_buffer_in_seq_order() {
 /// by hand, so they cannot notice the recorder and the uploader drifting apart; here the rows come
 /// out of the production recorder and go into the production uploader.
 #[tokio::test]
+#[ignore = "MOD-25: the offline buffer is disabled (Backend::writer answers None offline); kept for the reversal, removed by the CLEAN item"]
 async fn a_buffered_chat_lands_in_postgres_on_the_next_connection() {
     let agent_id = AgentId::new();
     let (_root, cache) = offline_mirror(agent_id).await;
@@ -423,6 +441,7 @@ async fn a_buffered_chat_lands_in_postgres_on_the_next_connection() {
 /// OS user cannot name `run.started_by`, and inventing one would make the uploader insert a
 /// stranger as the chat's author. The refusal says which row is missing.
 #[tokio::test]
+#[ignore = "MOD-25: the offline buffer is disabled (Backend::writer answers None offline); kept for the reversal, removed by the CLEAN item"]
 async fn an_offline_box_that_never_synced_this_user_refuses_and_says_so() {
     let agent_id = AgentId::new();
     let root = tempfile::tempdir().expect("a throwaway config root");

@@ -16,7 +16,10 @@
 //! Milestone 4 also lets a chat start with the store unreachable, in which case its rows go to the
 //! offline buffer instead of to Postgres. The header says so (D42), from the `writer_label` the
 //! acceptance carried — never from a guess about which backend the worker is holding, which is a
-//! thing this tab is not allowed to know (`R-NF-3`).
+//! thing this tab is not allowed to know (`R-NF-3`). Since MOD-25 no backend hands out the
+//! buffered writer at all — an offline chat is refused rather than buffered — so that D42 branch
+//! (`BUFFERED_LABEL` / `BUFFERED_NOTE`, and the comparison that uses them) is kept compiling
+//! for the reversal and is never taken; a later CLEAN item removes it.
 
 pub mod composer;
 pub mod permission;
