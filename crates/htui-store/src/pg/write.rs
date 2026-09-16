@@ -1388,6 +1388,13 @@ impl WriteStore for PgStore {
     /// [`update_item`](PgStore::update_item) splits its own: no such row, a spent token, or the
     /// graph guard — which can only have fired if the token still matches.
     ///
+    /// The prefix rule is checked **behind** the compare-and-set, which is `MemStore`'s order and
+    /// the order a `(project, prefix)` collision already has here: a spent token answers `Stale`
+    /// whether or not the input was also bad, so the two stores cannot disagree about which refusal
+    /// a caller sees (review M2). The bad-input path is the only one that pays for the extra read,
+    /// because the statement below cannot be sent with a prefix the column's `CHECK` would refuse
+    /// with its own wording.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] as for create.
@@ -1400,6 +1407,15 @@ impl WriteStore for PgStore {
         if let Some(prefix) = &patch.prefix
             && !ItemKind::prefix_is_valid(prefix)
         {
+            let Some(current) = self.item_kind(id).await? else {
+                return Err(StoreError::NotFound {
+                    entity: "item_kind",
+                    id: id.to_string(),
+                });
+            };
+            if current.updated_at != expected {
+                return Ok(CasOutcome::Stale(current));
+            }
             return Err(StoreError::Constraint(invalid_prefix(prefix)));
         }
 
@@ -1676,6 +1692,9 @@ impl WriteStore for PgStore {
     /// [`set_setting`](WriteStore::set_setting) is that column's one writer, so the value the
     /// resolver reads has one editor rather than two (D8).
     ///
+    /// The reserved-name rule is checked **behind** the compare-and-set, for the reason and in the
+    /// shape [`update_item_kind`](WriteStore::update_item_kind) gives (review M2).
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] for a reserved name
@@ -1689,6 +1708,15 @@ impl WriteStore for PgStore {
         if let Some(name) = &patch.name
             && TemplateRole::of_name(name) != TemplateRole::Phase
         {
+            let Some(current) = self.phase_row(id).await? else {
+                return Err(StoreError::NotFound {
+                    entity: "step_graph_phase",
+                    id: id.to_string(),
+                });
+            };
+            if current.updated_at != expected {
+                return Ok(CasOutcome::Stale(current));
+            }
             return Err(StoreError::Constraint(reserved_phase_name(name)));
         }
 

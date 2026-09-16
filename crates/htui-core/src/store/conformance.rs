@@ -2581,6 +2581,25 @@ async fn item_kind_round_trip_and_prefix_rules<S: WriteStore>(store: &S) {
         matches!(bad_rename, Err(StoreError::Constraint(_))),
         "{CASE}: the prefix rule applies to a rename too, got {bad_rename:?}"
     );
+    let stale_and_invalid = stale(
+        CASE,
+        store
+            .update_item_kind(
+                renamed.id,
+                ana.updated_at,
+                ItemKindPatch {
+                    prefix: Some("anl".to_owned()),
+                    ..ItemKindPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        stale_and_invalid, renamed,
+        "{CASE}: a spent token and an invalid prefix together answer Stale, not Constraint - the \
+         compare-and-set is checked first, the way a slug collision already is (review M2)"
+    );
     let unknown = store
         .update_item_kind(ItemKindId::new(), ana.updated_at, ItemKindPatch::default())
         .await;
@@ -2866,6 +2885,25 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
             .expect(CASE),
     );
     assert_eq!(spent, edited, "{CASE}: Stale carries the row as it is now");
+    let stale_and_reserved = stale(
+        CASE,
+        store
+            .update_phase(
+                phase.id,
+                phase.updated_at,
+                PhasePatch {
+                    name: Some("judge".to_owned()),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        stale_and_reserved, edited,
+        "{CASE}: a spent token and a reserved name together answer Stale, not Constraint - the \
+         compare-and-set is checked first, the way a (graph, name) collision already is (review M2)"
+    );
     let unknown = store
         .update_phase(PhaseId::new(), phase.updated_at, PhasePatch::default())
         .await;
