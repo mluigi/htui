@@ -2610,10 +2610,6 @@ impl State {
     }
 }
 
-/// A revision author must name a real `app_user` row (§5.5 `REFERENCES app_user(id)`); the nil
-/// UUID is what `UserId::default()` yields, so it is rejected here rather than written and later
-/// refused by MOD-6's `PgStore`. An author that is non-nil but unknown is out of scope: the
-/// default [`MemStore::new`] holds no users at all (plan D7).
 /// The rows a project delete takes, identified once by [`State::project_reach`] so the report and
 /// the act cannot disagree about which they were (D4).
 #[derive(Debug)]
@@ -2656,6 +2652,10 @@ fn expected_on_row(
     })
 }
 
+/// A revision author must name a real `app_user` row (§5.5 `REFERENCES app_user(id)`); the nil
+/// UUID is what `UserId::default()` yields, so it is rejected here rather than written and later
+/// refused by MOD-6's `PgStore`. An author that is non-nil but unknown is out of scope: the
+/// default [`MemStore::new`] holds no users at all (plan D7).
 fn require_author(id: UserId, column: &str) -> Result<()> {
     if id.as_uuid().is_nil() {
         return Err(StoreError::Constraint(format!(
