@@ -213,6 +213,53 @@ fn sealed_buffer(cache: &CacheStore) -> (ProjectId, Vec<SessionEvent>) {
     (project, rows)
 }
 
+/// MOD-25, from the shell: a box whose Postgres is unreachable **refuses** the chat instead of
+/// buffering it. The refusal is the one sentence `htui_store::DATABASE_UNREACHABLE` carries, and
+/// the proof that the buffer is disabled is negative on both sides — no step was minted, and
+/// `<cache_dir>/pending/` is still empty, with neither an `.open` file nor a sealed one.
+///
+/// `Backend::writer()` answers `None` offline, so `AgentRuntime::start` refuses at the writer,
+/// before it ever asks the mirror who this user is. That is why this case, not the D33 one below,
+/// is what an offline chat does now.
+///
+/// Plain asserts and no snapshot: the sentence and the empty directory are the whole contract, and
+/// a snapshot would only be one more file for the CLEAN item to delete.
+#[tokio::test]
+async fn an_offline_chat_is_refused_with_the_unreachable_warning() {
+    let agent_id = AgentId::new();
+    let (_root, cache) = offline_mirror(agent_id).await;
+    let mut harness = offline_harness(&cache, one_turn());
+    harness.drive().await;
+
+    compose(&mut harness, "what is in main.rs");
+    harness.drive().await;
+
+    let rendered = harness.render();
+    // `contains`, not equality: `StoreError::Unreachable` renders with a `store unreachable: `
+    // prefix, so the sentence reaches the screen inside a longer line.
+    assert!(
+        rendered.contains(htui_store::DATABASE_UNREACHABLE),
+        "the body states the refusal: {rendered}"
+    );
+    assert!(
+        harness.chat_steps().is_empty(),
+        "and no chat was started: {rendered}"
+    );
+
+    let pending = cache.dir().join("pending");
+    let buffers: Vec<std::path::PathBuf> = std::fs::read_dir(&pending)
+        .expect("the pending directory exists")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    assert!(
+        buffers.is_empty(),
+        "and nothing was buffered — no `.open` file and no sealed one: {buffers:?}"
+    );
+
+    cache.close().await;
+}
+
 /// D42: an offline chat says so, in the one place a chat is visible — its header. An offline chat
 /// is in no `run` table until it is uploaded, so nothing else on screen can say it happened.
 ///
