@@ -314,6 +314,35 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `Settings > Rebuild cache` stays as written — it is safe because the local store is a different
   file that `MIRRORED_TABLES` never names, so it must not be "helpfully" extended to clear local
   data, and its confirmation copy should say what it does and does not delete.
+  **Milestone 1 landed (`0d48a71`..`806f6b6`, 2026-09-16): the seam can write the hierarchy.**
+  Routed as PRD (`.claude/prds/mod-15-hierarchy-management.prd.md`, six milestones, maintainer
+  decisions D1–D13); plan at `.claude/plans/mod-15-hierarchy-seam.plan.md`, blueprint beside it.
+  `WriteStore` grew **31 methods** — 21 writers, `delete_reach`, 9 readers — for `workspace`,
+  `workspace_project`, `workspace_box_path`, `project`, `repo`, `repo_box_path`, `item_kind`,
+  `step_graph` and `step_graph_phase`, plus a typed `SettingKey`/`SPECS` registry in
+  `htui_core::prompt::settings` and the rung-aware `set_setting`/`clear_setting`/`setting` over
+  `App | Project | Phase`. **No migration**: every table was already in `0001_init.sql`, so
+  `0003_orchestration.sql` is still MOD-4's and still next. Conformance `CASES` **23 → 35**,
+  `READ_CASES` unchanged at 6; **1032 passed, 0 failed, 30 ignored** workspace-wide with Postgres
+  live. Every edit is a compare-and-set on `updated_at` (no `version` column exists and none was
+  added); `project.settings` is merged key by key, never round-tripped through a struct, so the
+  keys MOD-4 and MOD-12 will add cannot be erased; validation refuses what the reader would clamp
+  or ignore rather than clamping. **Three live coordinates open items need.** (1) `WriteStore` now
+  has **six** implementors, not four — `MemStore`, `PgStore`, `Writer`, `BufferedWriter`, plus
+  `UsageSpy` (`crates/htui-agent/src/conformance.rs:645`) and `SpyStore`
+  (`crates/htui-agent/tests/recorder.rs:323`), both invisible to `cargo check -p htui-store`; the
+  trait has no default bodies, so a new seam method costs six impls. (2) `project.settings` holds
+  `upstream_hops` under a **different name** than the `app_setting` key `prompt_upstream_hops` —
+  `SettingSpec::project_key` carries the mapping, and a writer that ignores it writes a key the
+  reader drops. (3) `run_step_commit.repo_id REFERENCES repo(id)` has **no cascade**
+  (`0001_init.sql:503`), so a project holding one cannot be deleted at all — latent because nothing
+  writes that table yet, and the fix is a migration, which makes it MOD-4's to carry in `0003`.
+  Reviewed by `rust-reviewer`: no CRITICAL or HIGH; 3 MEDIUM and 6 LOW all fixed
+  (`18459a5`..`806f6b6`), the MEDIUMs being a `delete_project` count/delete snapshot race
+  (now `REPEATABLE READ` with a bounded retry), a MemStore/PgStore divergence on
+  stale-token-plus-invalid-input, and a self-confirming cascade assertion (now measured against
+  `count(*)` per table). Milestones 2–6 remain: the 35-row project seed, the text-field widget and
+  hierarchy section, kinds and graphs, the ten settings, and the connection section.
 
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. Every Windows-only path MOD-2 compile- and lint-checked from Linux but
