@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT (SELECT count(*) FROM workspace_project  WHERE workspace_id = $1) AS \"links!\",\n               (SELECT count(*) FROM workspace_box_path WHERE workspace_id = $1) AS \"paths!\"\n          FROM workspace WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "links!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "paths!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "f6ba84312cfef5fe4c7039e144406d421614ea4b259d69c2c12addc2c373059a"
+}

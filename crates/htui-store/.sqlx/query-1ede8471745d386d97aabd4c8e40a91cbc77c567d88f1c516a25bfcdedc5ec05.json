@@ -1,0 +1,220 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id               AS \"id: PhaseId\",\n                   graph_id         AS \"graph_id: StepGraphId\",\n                   position,\n                   name,\n                   fan_out,\n                   gate             AS \"gate: Gate\",\n                   gate_hard,\n                   retry_limit,\n                   input_kinds,\n                   output_kind,\n                   isolation        AS \"isolation: Isolation\",\n                   command_queue    AS \"command_queue: CommandQueue\",\n                   verify_command,\n                   template_name,\n                   template_version,\n                   token_budget,\n                   updated_at\n              FROM step_graph_phase WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "graph_id: StepGraphId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "graph_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "fan_out",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "fan_out"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "gate: Gate",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "gate"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "gate_hard",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "gate_hard"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "retry_limit",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "retry_limit"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "input_kinds",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "input_kinds"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "output_kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "output_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "isolation: Isolation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "isolation"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "command_queue: CommandQueue",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "command_queue"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "verify_command",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "verify_command"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "template_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "template_name"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "template_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "template_version"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "token_budget",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "token_budget"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "1ede8471745d386d97aabd4c8e40a91cbc77c567d88f1c516a25bfcdedc5ec05"
+}

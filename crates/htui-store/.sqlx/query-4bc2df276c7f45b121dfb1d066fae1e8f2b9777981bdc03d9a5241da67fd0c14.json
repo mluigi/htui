@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE step_graph_phase SET token_budget = $2\n                     WHERE id = $1 AND updated_at = $3\n                    RETURNING updated_at AS \"updated_at!\"\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "updated_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4bc2df276c7f45b121dfb1d066fae1e8f2b9777981bdc03d9a5241da67fd0c14"
+}

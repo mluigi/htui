@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE project SET settings = settings - $2::text\n                     WHERE id = $1 AND updated_at = $3\n                    RETURNING updated_at AS \"updated_at!\"\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "updated_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "50b4eddc87b588b9d9ac3158f82d83dd1426b86dbedcc97ecbe85a5ccbcfb6bd"
+}

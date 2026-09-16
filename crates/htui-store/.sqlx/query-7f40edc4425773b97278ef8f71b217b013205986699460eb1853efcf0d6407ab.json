@@ -1,0 +1,118 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE item_kind SET\n                prefix           = COALESCE($3, prefix),\n                name             = COALESCE($4, name),\n                description      = COALESCE($5, description),\n                default_graph_id = COALESCE($6, default_graph_id),\n                position         = COALESCE($7, position)\n             WHERE id = $1\n               AND updated_at = $2\n               AND EXISTS (SELECT 1 FROM step_graph g\n                            WHERE g.id = COALESCE($6, item_kind.default_graph_id)\n                              AND g.project_id = item_kind.project_id)\n            RETURNING id               AS \"id: ItemKindId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      prefix,\n                      name,\n                      description,\n                      default_graph_id AS \"default_graph_id: StepGraphId\",\n                      position,\n                      updated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ItemKindId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_kind",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_kind",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "prefix",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_kind",
+            "name": "prefix"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_kind",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "description",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_kind",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "default_graph_id: StepGraphId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_kind",
+            "name": "default_graph_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item_kind",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_kind",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "7f40edc4425773b97278ef8f71b217b013205986699460eb1853efcf0d6407ab"
+}

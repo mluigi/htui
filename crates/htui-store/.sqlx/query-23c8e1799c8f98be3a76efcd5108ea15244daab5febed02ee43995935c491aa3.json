@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT token_budget, updated_at FROM step_graph_phase WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token_budget",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "token_budget"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "23c8e1799c8f98be3a76efcd5108ea15244daab5febed02ee43995935c491aa3"
+}

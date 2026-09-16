@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM workspace_project WHERE workspace_id = $1 AND project_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6f720a258fa5b59ee1da3e105e5c6f8ecda449c217d398f6f61e98c4ccb281be"
+}

@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE project SET settings = settings || jsonb_build_object($2::text, $3::jsonb)\n                     WHERE id = $1 AND updated_at = $4\n                    RETURNING updated_at AS \"updated_at!\"\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "updated_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7cffecf822285f98535f0805bc30f53babf10bbb9e84600a612c9f9061789239"
+}

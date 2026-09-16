@@ -1,0 +1,226 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE step_graph_phase SET\n                name          = COALESCE($3, name),\n                position      = COALESCE($4, position),\n                template_name = COALESCE($5, template_name),\n                gate_hard     = COALESCE($6, gate_hard),\n                input_kinds   = COALESCE($7, input_kinds)\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id               AS \"id: PhaseId\",\n                      graph_id         AS \"graph_id: StepGraphId\",\n                      position,\n                      name,\n                      fan_out,\n                      gate             AS \"gate: htui_core::model::Gate\",\n                      gate_hard,\n                      retry_limit,\n                      input_kinds,\n                      output_kind,\n                      isolation        AS \"isolation: Isolation\",\n                      command_queue    AS \"command_queue: htui_core::model::CommandQueue\",\n                      verify_command,\n                      template_name,\n                      template_version,\n                      token_budget,\n                      updated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "graph_id: StepGraphId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "graph_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "fan_out",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "fan_out"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "gate: htui_core::model::Gate",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "gate"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "gate_hard",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "gate_hard"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "retry_limit",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "retry_limit"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "input_kinds",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "input_kinds"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "output_kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "output_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "isolation: Isolation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "isolation"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "command_queue: htui_core::model::CommandQueue",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "command_queue"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "verify_command",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "verify_command"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "template_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "template_name"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "template_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "template_version"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "token_budget",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "token_budget"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Text",
+        "Int4",
+        "Text",
+        "Bool",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "6572649f3c5d24bb5ef0472e7fe050bc2de2b7faa6186a4419c7a9539ce6c7d0"
+}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO workspace_box_path (workspace_id, box_id, root_path) VALUES ($1, $2, $3) ON CONFLICT (workspace_id, box_id) DO UPDATE SET root_path = EXCLUDED.root_path",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2e53fba1e909ec32bd28a31ae9fde34b40ed70d1b5a1ecf7e87626feef4e12e6"
+}

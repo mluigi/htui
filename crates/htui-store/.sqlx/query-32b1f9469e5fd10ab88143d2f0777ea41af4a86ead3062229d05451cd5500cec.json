@@ -1,0 +1,91 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE step_graph SET\n                name        = COALESCE($3, name),\n                description = COALESCE($4, description)\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id         AS \"id: StepGraphId\",\n                      project_id AS \"project_id: ProjectId\",\n                      name,\n                      description,\n                      created_at,\n                      updated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: StepGraphId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "description",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "32b1f9469e5fd10ab88143d2f0777ea41af4a86ead3062229d05451cd5500cec"
+}
