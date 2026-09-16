@@ -247,7 +247,7 @@ Concretely in scope:
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | The seam can write the hierarchy | Every entity this item owns is readable and writable through `WriteStore` on both stores, including the three settings rungs with validation, key-level merge and compare-and-set. No UI. | complete | [plan](../plans/mod-15-hierarchy-seam.plan.md) |
-| 2 | A created project is a working project | Creating a project seeds 5 graphs, 15 phases, 5 kinds and 10 templates in an order the schema accepts, with ANA-2 §4.1's amendments applied and the reserved names refused. A prefix rename keeps history. | pending | — |
+| 2 | A created project is a working project | Creating a project seeds 5 graphs, 15 phases, 5 kinds and 10 templates in an order the schema accepts, with ANA-2 §4.1's amendments applied and the reserved names refused. A prefix rename keeps history. | complete | [plan](../plans/mod-15-project-seed.plan.md) |
 | 3 | The app can take typed input | A reusable text field with cursor, insertion and optional masking, and the hierarchy section built on it: workspaces, projects, repos with the primary flag, and this box's paths — a symlinked root canonicalised or refused. Delete is reachable but twice-guarded, and says what it takes. | pending | — |
 | 4 | Kinds and graphs are editable | The kinds section: kind create/edit with the prefix warning, delete refused when referenced, and the step-graph view with the six editable phase columns and the rest read-only. | pending | — |
 | 5 | The prompt is tunable from the app | The ten settings, driven off the registry, editable at whichever rung applies, showing which rung answered, and refusing any value the reader would ignore. | pending | — |

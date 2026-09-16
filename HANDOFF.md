@@ -287,8 +287,13 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   paths per box; item kind editor with the prefix-change warning (§10); Settings tab sections for
   kinds and step graphs per project. Not blocked (MOD-6 landed, `docs/decisions/mod/mod-6.md`;
   `Settings > Rebuild cache` calls `CacheStore::rebuild()`). Seed graphs per `docs/ANA-2.md` §4.1
-  (`review` in `implement`/`fix` `input_kinds`, `gate_hard` on `prd`, `plan` and `verdict`,
-  `is_override = false`); whichever of MOD-15 and MOD-4 lands second owns the seed amendment. Per
+  (`review` in `implement`/`fix` `input_kinds`, `gate_hard` on the **feature** graph's `prd` and
+  `plan` and the **analysis** graph's `verdict` and **none elsewhere** — this line previously read
+  "`prd`, `plan` and `verdict`", which would have hardened `plan` in the refactor and tooling
+  graphs too and taken MOD-12's first unattended targets away; PRD D3 and `docs/ANA-2.md` §10
+  item 5 rule the narrow reading, and milestone 2 shipped it. `is_override = false` needs no
+  write: the column arrives with MOD-4's `0003` defaulting to `false`);
+  whichever of MOD-15 and MOD-4 lands second owns the seed amendment. Per
   ANA-5 (`docs/ANA-5.md` §5.3, §5.4, §9): seed ten `prompt_template` rows per project (eight phase
   names plus reserved `judge` and `handoff`, amending `docs/ANA-9.md` §5.10), the phase editor
   refuses the two reserved names, and the Settings tab exposes the ten `app_setting` keys.
@@ -341,7 +346,31 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   (`18459a5`..`806f6b6`), the MEDIUMs being a `delete_project` count/delete snapshot race
   (now `REPEATABLE READ` with a bounded retry), a MemStore/PgStore divergence on
   stale-token-plus-invalid-input, and a self-confirming cascade assertion (now measured against
-  `count(*)` per table). Milestones 2–6 remain: the 35-row project seed, the text-field widget and
+  `count(*)` per table).
+  **Milestone 2 landed (`e0aa62a`..`0e11c42`, 2026-09-16): a created project is a working
+  project.** `create_project` now seeds, on both stores and inside the transaction milestone 1
+  shaped for it, the 35 rows every project is born with: 5 `step_graph`, 15 `step_graph_phase`,
+  5 `item_kind` and the 10 `prompt_template` rows of `DEFAULT_TEMPLATES` at version 1. Their one
+  source is the new **`htui_core::seed`** module (`crates/htui-core/src/seed.rs`, `KINDS` plus four
+  row constructors), which the demo fixture now builds from as well — `fixtures.rs` lost
+  `KindSpec`, `KIND_SPECS` and `TEMPLATE_NAMES`, so a seed change cannot land in the product and
+  miss the fixture, or the reverse. ANA-2 §4.1's two amendments are applied at seed time and in the
+  fixture: `implement.input_kinds = ['plan','review']` on feature, refactor and tooling (PRD D5
+  extends ANA-2's feature-only wording), `fix.input_kinds = ['reproduce','review']` on bug, and the
+  three `gate_hard` flags of the corrected sentence above. **The seed is not parameterised**: there
+  is no unseeded create, `NewProject` and the `WriteStore` signature are unchanged, and all six
+  implementors compile untouched. `item_key_counter` is still never seeded (the first mint on a
+  fresh project is `FEAT-1`), `project.settings` is still `set_setting`'s alone, and no seed
+  statement binds `created_at`/`updated_at` — note `step_graph_phase` and `item_kind` have **no
+  `created_at` column at all**. No migration: `0003_orchestration.sql` is still MOD-4's and still
+  next. Conformance `CASES` **35 → 36** (`project_create_seeds_the_catalogue`, which asserts the
+  amended table as a literal independent of `KINDS`), `READ_CASES` unchanged at 6, three
+  per-backend twins added on each store, and 4 new `.sqlx` files; **36/36 conformance cases ran
+  against Postgres, none skipped**. Reviewed by `rust-reviewer`: no CRITICAL, one HIGH — a public
+  doc comment linking the private `seed_project`, which `rustdoc::private_intra_doc_links = "deny"`
+  turned into a broken `cargo doc` for the whole crate (`077cd0d`) — and two LOW, one fixed
+  (`0e11c42`), one deferred with reason (`seed_project`'s length, whose shape the blueprint fixed
+  and which matches the crate's existing writers). Milestones 3–6 remain: the text-field widget and
   hierarchy section, kinds and graphs, the ten settings, and the connection section.
 
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
