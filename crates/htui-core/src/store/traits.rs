@@ -31,10 +31,14 @@ use serde_json::Value;
 
 use crate::model::{
     Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, Item,
-    ItemFilter, ItemId, ItemPatch, ItemRevision, ItemSummary, LinkGraph, NewItem, Note, Project,
-    ProjectId, PromptScope, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepId,
-    UpstreamEntry,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision, ItemSummary,
+    LinkGraph, NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph, NewWorkspace, Note,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId,
+    RepoPatch, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, UpstreamEntry, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
+use crate::prompt::settings::{Rungs, SettingKey};
 use crate::store::error::Result;
 
 /// The hop ceiling of [`ReadStore::upstream_summaries`], the amended §7.3 upstream walk
@@ -291,7 +295,315 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "run_step"` when
     /// the step does not exist.
     async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()>;
-    // links, notes, templates, box ...
+
+    // ---- MOD-15 milestone 1: the hierarchy (plan D1-D12) -----------------------------------
+    //
+    // Every edit is a compare-and-set on `updated_at` (D3): the caller passes the token it edited
+    // from, the trigger (`clock_timestamp()`) writes the next one, no statement here sets it.
+    // `workspace_project` has no `updated_at` and the two path tables are per-box rows with one
+    // writer each, so those three are plain upserts. Readers are here rather than on `ReadStore`
+    // (D1) so the conformance suite can read back what it wrote on both stores.
+
+    // workspace
+
+    /// Inserts a workspace; the returned row carries the store's clock, not the caller's.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `slug` is taken or
+    /// `created_by` names no user.
+    async fn create_workspace(&self, new: NewWorkspace) -> Result<Workspace>;
+
+    /// Edits `slug` / `name` / `description` when the row's `updated_at` still equals `expected`;
+    /// `Stale` carries the row as it is now so the editor can reload (D3).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the new `slug`
+    /// collides.
+    async fn update_workspace(
+        &self,
+        id: WorkspaceId,
+        expected: DateTime<Utc>,
+        patch: WorkspacePatch,
+    ) -> Result<CasOutcome<Workspace>>;
+
+    /// One workspace by id, `None` when there is no such row.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn workspace(&self, id: WorkspaceId) -> Result<Option<Workspace>>;
+
+    // workspace links and box paths
+
+    /// Inserts or repositions a workspace-to-project link (PK `(workspace_id, project_id)`, no
+    /// `updated_at`, so no CAS).
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when either id names no
+    /// row.
+    async fn upsert_workspace_project(&self, link: &WorkspaceProject) -> Result<()>;
+
+    /// Removes one link; the project survives (D4).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) (`entity: "workspace_project"`)
+    /// when no such link exists.
+    async fn remove_workspace_project(
+        &self,
+        workspace: WorkspaceId,
+        project: ProjectId,
+    ) -> Result<()>;
+
+    /// A workspace's links ordered by `position`, then `project_id` bytes.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn workspace_projects(&self, workspace: WorkspaceId) -> Result<Vec<WorkspaceProject>>;
+
+    /// Inserts or replaces this box's root path for a workspace (PK `(workspace_id, box_id)`); the
+    /// trigger advances `updated_at` on replace.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when either id names no
+    /// row.
+    async fn upsert_workspace_box_path(&self, path: &WorkspaceBoxPath) -> Result<()>;
+
+    /// Every box's root path for a workspace, ordered by `box_id` bytes.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn workspace_box_paths(&self, workspace: WorkspaceId) -> Result<Vec<WorkspaceBoxPath>>;
+
+    // project
+
+    /// Inserts a project with `settings = {}` and no secret provider (D9); milestone 2 seeds the
+    /// graphs, kinds and templates inside this same transaction.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `slug` is taken or
+    /// `created_by` names no user.
+    async fn create_project(&self, new: NewProject) -> Result<Project>;
+
+    /// Edits `slug` / `name` / `description` under CAS; never touches `settings` (that is
+    /// [`set_setting`](Self::set_setting)'s).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a `slug` collision.
+    async fn update_project(
+        &self,
+        id: ProjectId,
+        expected: DateTime<Utc>,
+        patch: ProjectPatch,
+    ) -> Result<CasOutcome<Project>>;
+
+    // repo and repo box paths
+
+    /// Inserts a repo. `is_primary: true` clears the project's current primary in the same
+    /// transaction so `uq_repo_primary` never trips (D10).
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `(project_id, name)`
+    /// is taken or `project_id` names no row.
+    async fn create_repo(&self, new: NewRepo) -> Result<Repo>;
+
+    /// Edits under CAS; `is_primary: Some(true)` demotes the other primary (its `updated_at`
+    /// advances too), `Some(false)` just unsets; `remote_url: Some(None)` clears the URL.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a `name` collision.
+    async fn update_repo(
+        &self,
+        id: RepoId,
+        expected: DateTime<Utc>,
+        patch: RepoPatch,
+    ) -> Result<CasOutcome<Repo>>;
+
+    /// A project's repos ordered by `name` bytes (`COLLATE "C"`, as `prompt_templates`).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>>;
+
+    /// Inserts or replaces this box's checkout path for a repo (PK `(repo_id, box_id)`).
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when either id names no
+    /// row.
+    async fn upsert_repo_box_path(&self, path: &RepoBoxPath) -> Result<()>;
+
+    /// Every box's checkout path for a repo, ordered by `box_id` bytes.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn repo_box_paths(&self, repo: RepoId) -> Result<Vec<RepoBoxPath>>;
+
+    // item_kind
+
+    /// Inserts a kind. The prefix is checked by [`ItemKind::prefix_is_valid`] before the statement
+    /// and `default_graph_id` must belong to the same project (D11).
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a bad prefix, a taken
+    /// `(project_id, prefix)` or `(project_id, name)`, or a graph from another project.
+    async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind>;
+
+    /// Edits under CAS with the same three rules as [`create_item_kind`](Self::create_item_kind).
+    /// Renaming the prefix leaves existing keys (`ANA-2`) and counters alone; the next mint under
+    /// the kind starts a counter for the new prefix (PRD D12).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) as for create.
+    async fn update_item_kind(
+        &self,
+        id: ItemKindId,
+        expected: DateTime<Utc>,
+        patch: ItemKindPatch,
+    ) -> Result<CasOutcome<ItemKind>>;
+
+    /// A project's kinds ordered by `position`, then `prefix` bytes (`position` is not unique).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn item_kinds(&self, project: ProjectId) -> Result<Vec<ItemKind>>;
+
+    /// Deletes a kind nothing references (D6). `item_key_counter` is keyed by prefix and is never
+    /// touched.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// `"item_kind FEAT is held by 4 items"` while items reference it;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id.
+    async fn delete_item_kind(&self, id: ItemKindId) -> Result<()>;
+
+    // step_graph and phase
+
+    /// Inserts a graph (no phases; [`create_phase`](Self::create_phase) adds them).
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `(project_id, name)`
+    /// is taken or `project_id` names no row.
+    async fn create_step_graph(&self, new: NewStepGraph) -> Result<StepGraph>;
+
+    /// Edits `name` / `description` under CAS.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a `name` collision.
+    async fn update_step_graph(
+        &self,
+        id: StepGraphId,
+        expected: DateTime<Utc>,
+        patch: StepGraphPatch,
+    ) -> Result<CasOutcome<StepGraph>>;
+
+    /// A project's graphs ordered by `name` bytes.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn step_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>>;
+
+    /// Inserts a whole phase row (D10); `phase.updated_at` is ignored and the store's clock is
+    /// returned. `judge` and `handoff` are template roles, not phase names
+    /// ([`TemplateRole::of_name`](crate::prompt::template::TemplateRole::of_name)).
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a reserved name, a
+    /// taken `(graph_id, position)` or `(graph_id, name)`, or a `graph_id` that names no row.
+    async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase>;
+
+    /// Edits the five columns of [`PhasePatch`] under CAS; `token_budget` is
+    /// [`set_setting`](Self::set_setting)'s on the `Phase` rung and is not here (D8).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a reserved name or a
+    /// `(graph_id, position)` / `(graph_id, name)` collision.
+    async fn update_phase(
+        &self,
+        id: PhaseId,
+        expected: DateTime<Utc>,
+        patch: PhasePatch,
+    ) -> Result<CasOutcome<StepGraphPhase>>;
+
+    /// A graph's phases ordered by `position` (unique per graph).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>>;
+
+    // settings (D7, D8)
+
+    /// Writes one setting on one rung after [`validate`](crate::prompt::settings::validate):
+    /// rung, kind, range, `not_above` against the same rung's current peer (or its default).
+    /// `App` is an `app_setting` row (`expected: None` = "I expect no row", the insert after a
+    /// clear; `Stale` if one exists); `Project` merges one key into `project.settings` under CAS
+    /// on `project.updated_at`; `Phase` writes `step_graph_phase.token_budget` under CAS on the
+    /// phase's `updated_at`. `Stale` carries the setting as stored now.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) with the key, value and
+    /// rule for every validation refusal, and for `expected: None` on `Project` / `Phase`;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown project or
+    /// phase.
+    async fn set_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+        value: Value,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<StoredSetting>>;
+
+    /// Removes one setting from one rung under CAS: `DELETE` on `app_setting` (the returned
+    /// `updated_at` is the deleted row's; the next `set_setting` passes `expected: None`),
+    /// `settings - key` on the project, `NULL` on the phase. `Applied` always carries
+    /// `value: None`.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the key is not
+    /// accepted on the rung; [`StoreError::NotFound`](crate::store::StoreError::NotFound) when
+    /// the row (or, on `App`, the setting) does not exist.
+    async fn clear_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<StoredSetting>>;
+
+    /// One setting on one rung with its CAS token. `None` only when the rung's row is absent
+    /// (`App`: no such `app_setting`; `Project` / `Phase`: no such id); a present project or
+    /// phase without the key answers `Some` with `value: None`.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the key is not
+    /// accepted on the rung.
+    async fn setting(&self, rung: SettingRung, key: SettingKey) -> Result<Option<StoredSetting>>;
+
+    // deletes (D4)
+
+    /// What a delete would remove, counted without removing; `None` when the target does not
+    /// exist. The same counting code feeds [`delete_workspace`](Self::delete_workspace) and
+    /// [`delete_project`](Self::delete_project), so the report equals the act (PRD D13).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn delete_reach(&self, target: DeleteTarget) -> Result<Option<DeleteReach>>;
+
+    /// Removes a workspace, its links and its box paths; projects survive
+    /// (`0001_init.sql:162,174`).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id.
+    async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach>;
+
+    /// Removes a project and everything PRD D13 lists, in one transaction, and returns the counts
+    /// it took. The mirror rebuild is the caller's (D5).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id.
+    async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the
@@ -316,6 +628,41 @@ pub fn not_a_terminal_status(status: RunStatus) -> String {
     format!("run.status `{status}` is not a terminal status a chat step can be closed with")
 }
 
+/// D11: the `item_kind.prefix` CHECK, in words.
+///
+/// The four helpers below exist for the reason [`chat_step_status`] does: a rule the schema cannot
+/// express is checked in `htui-core` once, so `MemStore` and `PgStore` refuse the same input with
+/// the same sentence rather than with a Postgres constraint name on one side and prose on the
+/// other.
+#[must_use]
+pub fn invalid_prefix(prefix: &str) -> String {
+    format!("item_kind.prefix `{prefix}` is not `^[A-Z][A-Z0-9]{{1,15}}$`")
+}
+
+/// D11: `default_graph_id` must be one of the kind's own project's graphs. The FK is to
+/// `step_graph(id)` alone (`0001_init.sql:288`), so nothing below the seam checks this.
+#[must_use]
+pub fn graph_not_in_project(graph: StepGraphId, project: ProjectId) -> String {
+    format!("step_graph {graph} is not in project {project}")
+}
+
+/// D11: `judge` and `handoff` are template roles (ANA-5 §4.6), not phase names — a project cannot
+/// hold both a `judge` phase template and a `judge` judge template, because `prompt_template` is
+/// `UNIQUE (project_id, name, version)`.
+#[must_use]
+pub fn reserved_phase_name(name: &str) -> String {
+    format!("`{name}` is a reserved template name, not a phase name")
+}
+
+/// D6: the holder count, in the sentence the refusal carries.
+///
+/// The `item.kind_id` FK would refuse the delete on Postgres anyway (`0001_init.sql:313`, no
+/// cascade), but with a constraint name where the PRD asks for "names what holds it".
+#[must_use]
+pub fn item_kind_is_held(prefix: &str, items: u64) -> String {
+    format!("item_kind {prefix} is held by {items} items")
+}
+
 /// Result of [`WriteStore::update_item`]: either the edit landed, or someone else committed first
 /// and the caller gets both sides plus the common ancestor to render (§4.2).
 #[derive(Debug, Clone, PartialEq)]
@@ -329,4 +676,131 @@ pub enum UpdateOutcome {
         /// The revision at the version the caller edited from.
         ancestor: ItemRevision,
     },
+}
+
+/// Result of a compare-and-set edit (D3). `Applied` carries the row the trigger stamped; `Stale`
+/// carries the row as it is now, because the token the caller edited from no longer matches, so
+/// the editor can reload and retry (PRD D8).
+///
+/// A type of its own rather than a reuse of [`UpdateOutcome`], which is typed to `Item` and
+/// `ItemRevision` and carries a common ancestor these tables keep no history of.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CasOutcome<T> {
+    /// The token matched; this is the row as the store's clock left it.
+    Applied(T),
+    /// The token did not match; this is the row as it is now.
+    Stale(T),
+}
+
+impl<T> CasOutcome<T> {
+    /// The row either way, for a caller that wants to render what is stored and does not branch
+    /// on which of the two happened.
+    pub fn into_inner(self) -> T {
+        match self {
+            Self::Applied(row) | Self::Stale(row) => row,
+        }
+    }
+}
+
+/// What [`WriteStore::delete_reach`] counts for (D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteTarget {
+    /// A workspace: its links and its box paths, and no project.
+    Workspace(WorkspaceId),
+    /// A project: the whole `ON DELETE CASCADE` chain of PRD D13.
+    Project(ProjectId),
+}
+
+/// Rows a delete removes, per table, in `0001_init.sql`'s cascade order (PRD D13; the fact-check
+/// added `phase_agents`, which cascades through `step_graph_phase`).
+///
+/// One struct rather than a method per table, so a table `0003` adds is a field here and the two
+/// callers of the counting code cannot disagree about it. A workspace delete fills
+/// `workspace_links` and `workspace_box_paths` only. `phase_agents` and `run_step_commits` are `0`
+/// on `MemStore`, which holds neither table, and `0` on the demo database, which seeds neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeleteReach {
+    /// `workspace_project` rows.
+    pub workspace_links: u64,
+    /// `workspace_box_path` rows.
+    pub workspace_box_paths: u64,
+    /// `item` rows.
+    pub items: u64,
+    /// `item_key_counter` rows.
+    pub item_key_counters: u64,
+    /// `item_kind` rows.
+    pub item_kinds: u64,
+    /// `step_graph` rows.
+    pub step_graphs: u64,
+    /// `step_graph_phase` rows.
+    pub phases: u64,
+    /// `phase_agent` rows.
+    pub phase_agents: u64,
+    /// `prompt_template` rows.
+    pub prompt_templates: u64,
+    /// `repo` rows.
+    pub repos: u64,
+    /// `repo_box_path` rows.
+    pub repo_box_paths: u64,
+    /// `skill_binding` rows.
+    pub skill_bindings: u64,
+    /// `run` rows.
+    pub runs: u64,
+    /// `run_step` rows.
+    pub run_steps: u64,
+    /// `session_event` rows.
+    pub session_events: u64,
+    /// `run_step_commit` rows.
+    pub run_step_commits: u64,
+    /// `item_note` rows.
+    pub notes: u64,
+    /// `item_revision` rows.
+    pub revisions: u64,
+    /// `item_link` rows, tombstones included.
+    pub links: u64,
+    /// `document` rows.
+    pub documents: u64,
+}
+
+/// Where a setting lives (D8): an `app_setting` row, one key of `project.settings`, or
+/// `step_graph_phase.token_budget`.
+///
+/// The PRD writes the phase id as `StepGraphPhaseId`; the newtype in this tree is
+/// [`PhaseId`](crate::model::PhaseId) and the seam uses the tree's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingRung {
+    /// One `app_setting` row, keyed by [`SettingKey::key`].
+    App,
+    /// One key of a project's `settings` document, keyed by
+    /// [`SettingSpec::project_key`](crate::prompt::settings::SettingSpec::project_key).
+    Project(ProjectId),
+    /// `step_graph_phase.token_budget` of one phase.
+    Phase(PhaseId),
+}
+
+impl SettingRung {
+    /// The flag [`validate`](crate::prompt::settings::validate) checks against
+    /// [`SettingSpec::rungs`](crate::prompt::settings::SettingSpec::rungs).
+    #[must_use]
+    pub const fn flag(self) -> Rungs {
+        match self {
+            Self::App => Rungs::APP,
+            Self::Project(_) => Rungs::PROJECT,
+            Self::Phase(_) => Rungs::PHASE,
+        }
+    }
+}
+
+/// One setting as stored, with the token a later [`WriteStore::set_setting`] or
+/// [`WriteStore::clear_setting`] must present.
+///
+/// `value: None` is "the rung's row exists but holds no value for this key", which is a different
+/// fact from the row not existing at all — the first means the rung below answers, the second
+/// means there is nothing on this rung to compare against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSetting {
+    /// The stored JSON, or `None` when this rung holds no value for the key.
+    pub value: Option<Value>,
+    /// The rung row's `updated_at`: the CAS token, never written by hand.
+    pub updated_at: DateTime<Utc>,
 }

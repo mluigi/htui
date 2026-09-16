@@ -13,6 +13,7 @@ pub mod conformance;
 pub use error::{Result, StoreError};
 pub use mem::MemStore;
 pub use traits::{
-    MAX_UPSTREAM_HOPS, ReadStore, UpdateOutcome, WriteStore, chat_step_status,
-    not_a_terminal_status,
+    CasOutcome, DeleteReach, DeleteTarget, MAX_UPSTREAM_HOPS, ReadStore, SettingRung,
+    StoredSetting, UpdateOutcome, WriteStore, chat_step_status, graph_not_in_project,
+    invalid_prefix, item_kind_is_held, not_a_terminal_status, reserved_phase_name,
 };
