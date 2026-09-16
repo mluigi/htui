@@ -449,6 +449,20 @@ pub fn rung_refusal(key: SettingKey, at: Rungs) -> Option<String> {
 /// `not_above`'s key, or `None` for "this rung stores none", in which case the compiled-in default
 /// stands in — the number [`resolve_excerpt_caps`] would itself have resolved.
 ///
+/// # The `not_above` rule is one-directional, by decision
+///
+/// It is checked when the **child** is written and never when the **peer** is, so "nothing this
+/// accepts is a value the reader would clamp" is true of the value in front of it and of no other.
+/// Concretely: `excerpt_head_lines` may not be set above `excerpt_file_line_cap`, but
+/// `excerpt_file_line_cap` may be *lowered below* a stored `excerpt_head_lines` and that write is
+/// accepted — after which [`resolve_excerpt_caps`]'s `.min(file_line_cap)` clamps the head the
+/// caller never touched, and the store's own `excerpt_head_lines` no longer describes what the
+/// reader uses.
+///
+/// Blueprint flag J, accepted by the maintainer rather than overlooked: the plan is authority and
+/// this is recorded so the settings editor can show the consequence instead of implying the pair is
+/// symmetric. A `not_below` twin would be one more field on [`SettingSpec`] if it is ever wanted.
+///
 /// The `String` is the whole sentence to show; the store wraps it in
 /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) unchanged, so the same words
 /// reach the editor from `MemStore` and from `PgStore`.
