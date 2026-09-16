@@ -870,6 +870,305 @@ impl WriteStore for Writer {
             Self::Buffered(buffer) => buffer.set_step_prompt(step, digest, trim).await,
         }
     }
+
+    // ---- MOD-15 milestone 1: the hierarchy (plan D2) ---------------------------------------
+    //
+    // Delegation, as every arm above: a `Writer` decides *which* store, never *what* a write
+    // means. The three stores disagree about all 31 of these — `MemStore` keeps maps, `PgStore`
+    // keeps rows, `BufferedWriter` refuses — and that disagreement stays in the stores.
+
+    async fn create_workspace(&self, new: NewWorkspace) -> Result<Workspace> {
+        match self {
+            Self::Memory(store) => store.create_workspace(new).await,
+            Self::Online(pg) => pg.create_workspace(new).await,
+            Self::Buffered(buffer) => buffer.create_workspace(new).await,
+        }
+    }
+
+    async fn update_workspace(
+        &self,
+        id: WorkspaceId,
+        expected: DateTime<Utc>,
+        patch: WorkspacePatch,
+    ) -> Result<CasOutcome<Workspace>> {
+        match self {
+            Self::Memory(store) => store.update_workspace(id, expected, patch).await,
+            Self::Online(pg) => pg.update_workspace(id, expected, patch).await,
+            Self::Buffered(buffer) => buffer.update_workspace(id, expected, patch).await,
+        }
+    }
+
+    async fn workspace(&self, id: WorkspaceId) -> Result<Option<Workspace>> {
+        match self {
+            Self::Memory(store) => store.workspace(id).await,
+            Self::Online(pg) => pg.workspace(id).await,
+            Self::Buffered(buffer) => buffer.workspace(id).await,
+        }
+    }
+
+    async fn upsert_workspace_project(&self, link: &WorkspaceProject) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.upsert_workspace_project(link).await,
+            Self::Online(pg) => pg.upsert_workspace_project(link).await,
+            Self::Buffered(buffer) => buffer.upsert_workspace_project(link).await,
+        }
+    }
+
+    async fn remove_workspace_project(
+        &self,
+        workspace: WorkspaceId,
+        project: ProjectId,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.remove_workspace_project(workspace, project).await,
+            Self::Online(pg) => pg.remove_workspace_project(workspace, project).await,
+            Self::Buffered(buffer) => buffer.remove_workspace_project(workspace, project).await,
+        }
+    }
+
+    async fn workspace_projects(&self, workspace: WorkspaceId) -> Result<Vec<WorkspaceProject>> {
+        match self {
+            Self::Memory(store) => store.workspace_projects(workspace).await,
+            Self::Online(pg) => pg.workspace_projects(workspace).await,
+            Self::Buffered(buffer) => buffer.workspace_projects(workspace).await,
+        }
+    }
+
+    async fn upsert_workspace_box_path(&self, path: &WorkspaceBoxPath) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.upsert_workspace_box_path(path).await,
+            Self::Online(pg) => pg.upsert_workspace_box_path(path).await,
+            Self::Buffered(buffer) => buffer.upsert_workspace_box_path(path).await,
+        }
+    }
+
+    async fn workspace_box_paths(&self, workspace: WorkspaceId) -> Result<Vec<WorkspaceBoxPath>> {
+        match self {
+            Self::Memory(store) => store.workspace_box_paths(workspace).await,
+            Self::Online(pg) => pg.workspace_box_paths(workspace).await,
+            Self::Buffered(buffer) => buffer.workspace_box_paths(workspace).await,
+        }
+    }
+
+    async fn create_project(&self, new: NewProject) -> Result<Project> {
+        match self {
+            Self::Memory(store) => store.create_project(new).await,
+            Self::Online(pg) => pg.create_project(new).await,
+            Self::Buffered(buffer) => buffer.create_project(new).await,
+        }
+    }
+
+    async fn update_project(
+        &self,
+        id: ProjectId,
+        expected: DateTime<Utc>,
+        patch: ProjectPatch,
+    ) -> Result<CasOutcome<Project>> {
+        match self {
+            Self::Memory(store) => store.update_project(id, expected, patch).await,
+            Self::Online(pg) => pg.update_project(id, expected, patch).await,
+            Self::Buffered(buffer) => buffer.update_project(id, expected, patch).await,
+        }
+    }
+
+    async fn create_repo(&self, new: NewRepo) -> Result<Repo> {
+        match self {
+            Self::Memory(store) => store.create_repo(new).await,
+            Self::Online(pg) => pg.create_repo(new).await,
+            Self::Buffered(buffer) => buffer.create_repo(new).await,
+        }
+    }
+
+    async fn update_repo(
+        &self,
+        id: RepoId,
+        expected: DateTime<Utc>,
+        patch: RepoPatch,
+    ) -> Result<CasOutcome<Repo>> {
+        match self {
+            Self::Memory(store) => store.update_repo(id, expected, patch).await,
+            Self::Online(pg) => pg.update_repo(id, expected, patch).await,
+            Self::Buffered(buffer) => buffer.update_repo(id, expected, patch).await,
+        }
+    }
+
+    async fn repos(&self, project: ProjectId) -> Result<Vec<Repo>> {
+        match self {
+            Self::Memory(store) => store.repos(project).await,
+            Self::Online(pg) => pg.repos(project).await,
+            Self::Buffered(buffer) => buffer.repos(project).await,
+        }
+    }
+
+    async fn upsert_repo_box_path(&self, path: &RepoBoxPath) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.upsert_repo_box_path(path).await,
+            Self::Online(pg) => pg.upsert_repo_box_path(path).await,
+            Self::Buffered(buffer) => buffer.upsert_repo_box_path(path).await,
+        }
+    }
+
+    async fn repo_box_paths(&self, repo: RepoId) -> Result<Vec<RepoBoxPath>> {
+        match self {
+            Self::Memory(store) => store.repo_box_paths(repo).await,
+            Self::Online(pg) => pg.repo_box_paths(repo).await,
+            Self::Buffered(buffer) => buffer.repo_box_paths(repo).await,
+        }
+    }
+
+    async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind> {
+        match self {
+            Self::Memory(store) => store.create_item_kind(new).await,
+            Self::Online(pg) => pg.create_item_kind(new).await,
+            Self::Buffered(buffer) => buffer.create_item_kind(new).await,
+        }
+    }
+
+    async fn update_item_kind(
+        &self,
+        id: ItemKindId,
+        expected: DateTime<Utc>,
+        patch: ItemKindPatch,
+    ) -> Result<CasOutcome<ItemKind>> {
+        match self {
+            Self::Memory(store) => store.update_item_kind(id, expected, patch).await,
+            Self::Online(pg) => pg.update_item_kind(id, expected, patch).await,
+            Self::Buffered(buffer) => buffer.update_item_kind(id, expected, patch).await,
+        }
+    }
+
+    async fn item_kinds(&self, project: ProjectId) -> Result<Vec<ItemKind>> {
+        match self {
+            Self::Memory(store) => store.item_kinds(project).await,
+            Self::Online(pg) => pg.item_kinds(project).await,
+            Self::Buffered(buffer) => buffer.item_kinds(project).await,
+        }
+    }
+
+    async fn delete_item_kind(&self, id: ItemKindId) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.delete_item_kind(id).await,
+            Self::Online(pg) => pg.delete_item_kind(id).await,
+            Self::Buffered(buffer) => buffer.delete_item_kind(id).await,
+        }
+    }
+
+    async fn create_step_graph(&self, new: NewStepGraph) -> Result<StepGraph> {
+        match self {
+            Self::Memory(store) => store.create_step_graph(new).await,
+            Self::Online(pg) => pg.create_step_graph(new).await,
+            Self::Buffered(buffer) => buffer.create_step_graph(new).await,
+        }
+    }
+
+    async fn update_step_graph(
+        &self,
+        id: StepGraphId,
+        expected: DateTime<Utc>,
+        patch: StepGraphPatch,
+    ) -> Result<CasOutcome<StepGraph>> {
+        match self {
+            Self::Memory(store) => store.update_step_graph(id, expected, patch).await,
+            Self::Online(pg) => pg.update_step_graph(id, expected, patch).await,
+            Self::Buffered(buffer) => buffer.update_step_graph(id, expected, patch).await,
+        }
+    }
+
+    async fn step_graphs(&self, project: ProjectId) -> Result<Vec<StepGraph>> {
+        match self {
+            Self::Memory(store) => store.step_graphs(project).await,
+            Self::Online(pg) => pg.step_graphs(project).await,
+            Self::Buffered(buffer) => buffer.step_graphs(project).await,
+        }
+    }
+
+    async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
+        match self {
+            Self::Memory(store) => store.create_phase(phase).await,
+            Self::Online(pg) => pg.create_phase(phase).await,
+            Self::Buffered(buffer) => buffer.create_phase(phase).await,
+        }
+    }
+
+    async fn update_phase(
+        &self,
+        id: PhaseId,
+        expected: DateTime<Utc>,
+        patch: PhasePatch,
+    ) -> Result<CasOutcome<StepGraphPhase>> {
+        match self {
+            Self::Memory(store) => store.update_phase(id, expected, patch).await,
+            Self::Online(pg) => pg.update_phase(id, expected, patch).await,
+            Self::Buffered(buffer) => buffer.update_phase(id, expected, patch).await,
+        }
+    }
+
+    async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
+        match self {
+            Self::Memory(store) => store.phases(graph).await,
+            Self::Online(pg) => pg.phases(graph).await,
+            Self::Buffered(buffer) => buffer.phases(graph).await,
+        }
+    }
+
+    async fn set_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+        value: Value,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<StoredSetting>> {
+        match self {
+            Self::Memory(store) => store.set_setting(rung, key, value, expected).await,
+            Self::Online(pg) => pg.set_setting(rung, key, value, expected).await,
+            Self::Buffered(buffer) => buffer.set_setting(rung, key, value, expected).await,
+        }
+    }
+
+    async fn clear_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<StoredSetting>> {
+        match self {
+            Self::Memory(store) => store.clear_setting(rung, key, expected).await,
+            Self::Online(pg) => pg.clear_setting(rung, key, expected).await,
+            Self::Buffered(buffer) => buffer.clear_setting(rung, key, expected).await,
+        }
+    }
+
+    async fn setting(&self, rung: SettingRung, key: SettingKey) -> Result<Option<StoredSetting>> {
+        match self {
+            Self::Memory(store) => store.setting(rung, key).await,
+            Self::Online(pg) => pg.setting(rung, key).await,
+            Self::Buffered(buffer) => buffer.setting(rung, key).await,
+        }
+    }
+
+    async fn delete_reach(&self, target: DeleteTarget) -> Result<Option<DeleteReach>> {
+        match self {
+            Self::Memory(store) => store.delete_reach(target).await,
+            Self::Online(pg) => pg.delete_reach(target).await,
+            Self::Buffered(buffer) => buffer.delete_reach(target).await,
+        }
+    }
+
+    async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach> {
+        match self {
+            Self::Memory(store) => store.delete_workspace(id).await,
+            Self::Online(pg) => pg.delete_workspace(id).await,
+            Self::Buffered(buffer) => buffer.delete_workspace(id).await,
+        }
+    }
+
+    async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
+        match self {
+            Self::Memory(store) => store.delete_project(id).await,
+            Self::Online(pg) => pg.delete_project(id).await,
+            Self::Buffered(buffer) => buffer.delete_project(id).await,
+        }
+    }
 }
 
 #[cfg(test)]
