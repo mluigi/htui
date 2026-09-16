@@ -24,7 +24,8 @@ use htui_core::model::{
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
-    CasOutcome, DeleteTarget, ReadStore as _, SettingRung, UpdateOutcome, WriteStore as _,
+    CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, UpdateOutcome,
+    WriteStore as _,
 };
 use htui_store::PgStore;
 use sqlx::Row as _;
@@ -2603,6 +2604,210 @@ async fn a_command_run_is_counted_and_taken_by_the_project_delete() {
         common::count(&db.pool, "command_run").await,
         0,
         "the cascade from run_step took it, counted or not"
+    );
+
+    db.drop_db().await;
+}
+
+/// Review M3: the cascade is **measured**, not re-derived.
+///
+/// `store::conformance`'s `project_delete_takes_everything_and_says_so` compares `delete_reach`
+/// with `delete_project` - two outputs of the same counting query - so a table missing from both
+/// the counter and [`DeleteReach`](htui_core::store::DeleteReach) passes it unnoticed. That is how
+/// `command_run` survived plan V11's own fact-check (review L1), and it is why this twin exists:
+/// it never asks the counter what the cascade removed. It `count(*)`s every table of the chain
+/// before and after and asserts the difference equals the report, field by field.
+///
+/// The fixture leaves five of those tables empty for this project - `repo`, `repo_box_path`,
+/// `phase_agent`, `run_step_commit`, `command_run` - and `0 == 0` would pass for any of them, so
+/// each is seeded with one row first. The rows go in through SQL rather than through the seam:
+/// a case that measured `WriteStore` with `WriteStore` would be self-confirming in exactly the way
+/// this one is written to stop being.
+///
+/// `workspace_box_path` is in the list and must **not** move: a project is not a workspace.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_cascade_table_loses_exactly_what_the_report_names() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let project = ids::PROJECT_HTUI;
+
+    let step: uuid::Uuid = sqlx::query_scalar(
+        "SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
+          WHERE r.project_id = $1 OR r.item_id IN (SELECT id FROM item WHERE project_id = $1) \
+          ORDER BY s.id LIMIT 1",
+    )
+    .bind(project.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("the fixture gives the project a run_step");
+    let phase: uuid::Uuid = sqlx::query_scalar(
+        "SELECT p.id FROM step_graph_phase p JOIN step_graph g ON g.id = p.graph_id \
+          WHERE g.project_id = $1 ORDER BY p.id LIMIT 1",
+    )
+    .bind(project.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("the fixture gives the project a phase");
+
+    let repo: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO repo (project_id, name) VALUES ($1, 'measured') RETURNING id",
+    )
+    .bind(project.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("seed a repo");
+    sqlx::query("INSERT INTO repo_box_path (repo_id, box_id, local_path) VALUES ($1, $2, '/src')")
+        .bind(repo)
+        .bind(ids::BOX.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("seed a repo_box_path");
+    sqlx::query(
+        "INSERT INTO phase_agent (phase_id, position, agent_id, model) VALUES ($1, 99, $2, 'm')",
+    )
+    .bind(phase)
+    .bind(ids::AGENT_CLAUDE.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("seed a phase_agent");
+    // The commit's repo is the **sibling** project's, and deliberately so: `run_step_commit.repo_id`
+    // has no cascade (`0001_init.sql:503`), and Postgres runs that check while the `repo` row is
+    // being cascaded away rather than at the end of the statement, so a project holding a commit
+    // against one of its *own* repos cannot be deleted at all - a raw `23503` where PRD D13
+    // promises a delete. Nothing in the tree writes `run_step_commit` yet, so the case is latent
+    // and is reported rather than papered over here; this case is about the counting, and it takes
+    // the one shape that isolates it.
+    let sibling_repo: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO repo (project_id, name) VALUES ($1, 'sibling') RETURNING id",
+    )
+    .bind(ids::PROJECT_AGY.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("seed the sibling project's repo");
+    sqlx::query(
+        "INSERT INTO run_step_commit (run_step_id, repo_id, before_hash) VALUES ($1, $2, 'abc')",
+    )
+    .bind(step)
+    .bind(sibling_repo)
+    .execute(&db.pool)
+    .await
+    .expect("seed a run_step_commit");
+    sqlx::query(
+        "INSERT INTO command_run (run_step_id, box_id, class, command, cwd) \
+         VALUES ($1, $2, 'test', 'cargo test', '/src')",
+    )
+    .bind(step)
+    .bind(ids::BOX.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("seed a command_run");
+
+    /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
+    ///
+    /// Twenty-one entries for twenty-one fields: a field added without an entry leaves the struct
+    /// literal below incomplete and the crate does not compile.
+    const TABLES: [&str; 21] = [
+        "workspace_project",
+        "workspace_box_path",
+        "item",
+        "item_key_counter",
+        "item_kind",
+        "step_graph",
+        "step_graph_phase",
+        "phase_agent",
+        "prompt_template",
+        "repo",
+        "repo_box_path",
+        "skill_binding",
+        "run",
+        "run_step",
+        "session_event",
+        "run_step_commit",
+        "command_run",
+        "item_note",
+        "item_revision",
+        "item_link",
+        "document",
+    ];
+
+    let mut before = Vec::with_capacity(TABLES.len());
+    for table in TABLES {
+        before.push(common::count(&db.pool, table).await);
+    }
+
+    let report = db
+        .store
+        .delete_project(project)
+        .await
+        .expect("the delete lands");
+
+    // Destructured rather than read through `report.field`, so a field added to `DeleteReach`
+    // without a line here is a compile error rather than a silent gap - which is the whole
+    // complaint this case answers.
+    let DeleteReach {
+        workspace_links,
+        workspace_box_paths,
+        items,
+        item_key_counters,
+        item_kinds,
+        step_graphs,
+        phases,
+        phase_agents,
+        prompt_templates,
+        repos,
+        repo_box_paths,
+        skill_bindings,
+        runs,
+        run_steps,
+        session_events,
+        run_step_commits,
+        command_runs,
+        notes,
+        revisions,
+        links,
+        documents,
+    } = report;
+    let claimed: [u64; 21] = [
+        workspace_links,
+        workspace_box_paths,
+        items,
+        item_key_counters,
+        item_kinds,
+        step_graphs,
+        phases,
+        phase_agents,
+        prompt_templates,
+        repos,
+        repo_box_paths,
+        skill_bindings,
+        runs,
+        run_steps,
+        session_events,
+        run_step_commits,
+        command_runs,
+        notes,
+        revisions,
+        links,
+        documents,
+    ];
+
+    for ((table, was), says) in TABLES.into_iter().zip(before).zip(claimed) {
+        let now = common::count(&db.pool, table).await;
+        let took = u64::try_from(was - now).expect("a cascade removes rows, it does not add them");
+        assert_eq!(
+            took, says,
+            "`{table}` lost {took} rows and the report claims {says}: the counts shown are the \
+             counts the act took, measured rather than re-counted (PRD D13, review M3)"
+        );
+    }
+    assert_eq!(
+        workspace_box_paths, 0,
+        "a project is not a workspace, so no box path of one moves"
+    );
+    assert!(
+        (phase_agents, run_step_commits, command_runs, repo_box_paths) == (1, 1, 1, 1),
+        "the five seeded tables are non-zero, so none of them passed on `0 == 0`"
     );
 
     db.drop_db().await;
