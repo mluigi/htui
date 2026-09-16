@@ -31,13 +31,18 @@ use htui_agent::record::{
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId,
-    EventKind, EventRole, Item, ItemFilter, ItemId, ItemPatch, ItemSummary, LinkGraph, NewItem,
-    Note, Project, ProjectId, PromptScope, Quota, QuotaSource, RunId, RunStatus, RunSummary, Scope,
-    SessionEvent, Status, StepId, UpstreamEntry, normalize,
+    EventKind, EventRole, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemSummary, LinkGraph, NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph, NewWorkspace,
+    Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Quota, QuotaSource,
+    Repo, RepoBoxPath, RepoId, RepoPatch, RunId, RunStatus, RunSummary, Scope, SessionEvent,
+    Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, UpstreamEntry,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
 };
+use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{
-    MemStore, ReadStore, Result as StoreResult, StoreError, UpdateOutcome, WriteStore,
+    CasOutcome, DeleteReach, DeleteTarget, MemStore, ReadStore, Result as StoreResult, SettingRung,
+    StoreError, StoredSetting, UpdateOutcome, WriteStore,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -415,6 +420,163 @@ impl WriteStore for SpyStore {
             .expect("the spy log is never poisoned")
             .push((step, digest.to_owned()));
         Ok(())
+    }
+
+    // ---- MOD-15 milestone 1: the hierarchy -------------------------------------------------
+    //
+    // Delegated, none of them logged or refusable: this spy watches the append, the usage row,
+    // the quota latch and the prompt row, and a recorder writes no hierarchy row. `WriteStore`
+    // has no default bodies, so a decorator owes every method whether a case reaches it or not.
+
+    async fn create_workspace(&self, new: NewWorkspace) -> StoreResult<Workspace> {
+        self.inner.create_workspace(new).await
+    }
+    async fn update_workspace(
+        &self,
+        id: WorkspaceId,
+        expected: DateTime<Utc>,
+        patch: WorkspacePatch,
+    ) -> StoreResult<CasOutcome<Workspace>> {
+        self.inner.update_workspace(id, expected, patch).await
+    }
+    async fn workspace(&self, id: WorkspaceId) -> StoreResult<Option<Workspace>> {
+        self.inner.workspace(id).await
+    }
+    async fn upsert_workspace_project(&self, link: &WorkspaceProject) -> StoreResult<()> {
+        self.inner.upsert_workspace_project(link).await
+    }
+    async fn remove_workspace_project(
+        &self,
+        workspace: WorkspaceId,
+        project: ProjectId,
+    ) -> StoreResult<()> {
+        self.inner
+            .remove_workspace_project(workspace, project)
+            .await
+    }
+    async fn workspace_projects(
+        &self,
+        workspace: WorkspaceId,
+    ) -> StoreResult<Vec<WorkspaceProject>> {
+        self.inner.workspace_projects(workspace).await
+    }
+    async fn upsert_workspace_box_path(&self, path: &WorkspaceBoxPath) -> StoreResult<()> {
+        self.inner.upsert_workspace_box_path(path).await
+    }
+    async fn workspace_box_paths(
+        &self,
+        workspace: WorkspaceId,
+    ) -> StoreResult<Vec<WorkspaceBoxPath>> {
+        self.inner.workspace_box_paths(workspace).await
+    }
+    async fn create_project(&self, new: NewProject) -> StoreResult<Project> {
+        self.inner.create_project(new).await
+    }
+    async fn update_project(
+        &self,
+        id: ProjectId,
+        expected: DateTime<Utc>,
+        patch: ProjectPatch,
+    ) -> StoreResult<CasOutcome<Project>> {
+        self.inner.update_project(id, expected, patch).await
+    }
+    async fn create_repo(&self, new: NewRepo) -> StoreResult<Repo> {
+        self.inner.create_repo(new).await
+    }
+    async fn update_repo(
+        &self,
+        id: RepoId,
+        expected: DateTime<Utc>,
+        patch: RepoPatch,
+    ) -> StoreResult<CasOutcome<Repo>> {
+        self.inner.update_repo(id, expected, patch).await
+    }
+    async fn repos(&self, project: ProjectId) -> StoreResult<Vec<Repo>> {
+        self.inner.repos(project).await
+    }
+    async fn upsert_repo_box_path(&self, path: &RepoBoxPath) -> StoreResult<()> {
+        self.inner.upsert_repo_box_path(path).await
+    }
+    async fn repo_box_paths(&self, repo: RepoId) -> StoreResult<Vec<RepoBoxPath>> {
+        self.inner.repo_box_paths(repo).await
+    }
+    async fn create_item_kind(&self, new: NewItemKind) -> StoreResult<ItemKind> {
+        self.inner.create_item_kind(new).await
+    }
+    async fn update_item_kind(
+        &self,
+        id: ItemKindId,
+        expected: DateTime<Utc>,
+        patch: ItemKindPatch,
+    ) -> StoreResult<CasOutcome<ItemKind>> {
+        self.inner.update_item_kind(id, expected, patch).await
+    }
+    async fn item_kinds(&self, project: ProjectId) -> StoreResult<Vec<ItemKind>> {
+        self.inner.item_kinds(project).await
+    }
+    async fn delete_item_kind(&self, id: ItemKindId) -> StoreResult<()> {
+        self.inner.delete_item_kind(id).await
+    }
+    async fn create_step_graph(&self, new: NewStepGraph) -> StoreResult<StepGraph> {
+        self.inner.create_step_graph(new).await
+    }
+    async fn update_step_graph(
+        &self,
+        id: StepGraphId,
+        expected: DateTime<Utc>,
+        patch: StepGraphPatch,
+    ) -> StoreResult<CasOutcome<StepGraph>> {
+        self.inner.update_step_graph(id, expected, patch).await
+    }
+    async fn step_graphs(&self, project: ProjectId) -> StoreResult<Vec<StepGraph>> {
+        self.inner.step_graphs(project).await
+    }
+    async fn create_phase(&self, phase: &StepGraphPhase) -> StoreResult<StepGraphPhase> {
+        self.inner.create_phase(phase).await
+    }
+    async fn update_phase(
+        &self,
+        id: PhaseId,
+        expected: DateTime<Utc>,
+        patch: PhasePatch,
+    ) -> StoreResult<CasOutcome<StepGraphPhase>> {
+        self.inner.update_phase(id, expected, patch).await
+    }
+    async fn phases(&self, graph: StepGraphId) -> StoreResult<Vec<StepGraphPhase>> {
+        self.inner.phases(graph).await
+    }
+    async fn set_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+        value: Value,
+        expected: Option<DateTime<Utc>>,
+    ) -> StoreResult<CasOutcome<StoredSetting>> {
+        self.inner.set_setting(rung, key, value, expected).await
+    }
+    async fn clear_setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+        expected: DateTime<Utc>,
+    ) -> StoreResult<CasOutcome<StoredSetting>> {
+        self.inner.clear_setting(rung, key, expected).await
+    }
+    async fn setting(
+        &self,
+        rung: SettingRung,
+        key: SettingKey,
+    ) -> StoreResult<Option<StoredSetting>> {
+        self.inner.setting(rung, key).await
+    }
+    async fn delete_reach(&self, target: DeleteTarget) -> StoreResult<Option<DeleteReach>> {
+        self.inner.delete_reach(target).await
+    }
+    async fn delete_workspace(&self, id: WorkspaceId) -> StoreResult<DeleteReach> {
+        self.inner.delete_workspace(id).await
+    }
+    async fn delete_project(&self, id: ProjectId) -> StoreResult<DeleteReach> {
+        self.inner.delete_project(id).await
     }
 }
 
