@@ -15,11 +15,11 @@ no workspace · no box · memory · 0 runs
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                       ┌ Workspaces ───────────────────────────────────────┐                      │
-│                       │  no workspaces — creating one arrives with MOD-15 │                      │
-│                       │                                                   │                      │
-│                       │  j/k move · Enter switch · Esc close              │                      │
-│                       └───────────────────────────────────────────────────┘                      │
+│                   ┌ Workspaces ──────────────────────────────────────────────┐                   │
+│                   │  no workspaces — `N` in Settings > Hierarchy creates one │                   │
+│                   │                                                          │                   │
+│                   │  j/k move · Enter switch · Esc close                     │                   │
+│                   └──────────────────────────────────────────────────────────┘                   │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

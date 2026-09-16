@@ -112,7 +112,7 @@ impl WorkspaceSwitcher {
     /// What an empty list says. Never a blank box (plan D11's rule, applied to an overlay).
     fn empty_text(&self) -> &'static str {
         if self.loaded {
-            "no workspaces — creating one arrives with MOD-15"
+            "no workspaces — `N` in Settings > Hierarchy creates one"
         } else {
             "reading the store"
         }
