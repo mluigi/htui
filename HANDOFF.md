@@ -14,7 +14,20 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-15):** **MOD-2 is done, all nine milestones**
+**Current status (2026-09-16):** **MOD-25 is done** (`docs/decisions/mod/mod-25.md`,
+`9dcf4b2`..`ba4b82c`): `htui` is **online-only**. A box that cannot reach its Postgres shows
+`offline · <age>`, browses its read-only cache, and **refuses** a chat with one sentence instead of
+buffering it — `Backend::writer()` answers `None` on `Offline`, one arm, at the seam whose own doc
+reserved the change. The buffered machinery stays in the tree, compiling, for one release so the
+reversal costs one arm; **`CLEAN-2`** deletes it once the decision has sat, and the **upload side is
+still live** so a buffer written by an earlier build still lands. **MOD-17, MOD-18 and MOD-19 are
+withdrawn, not done** — ANA-10's verdict is superseded, and `docs/ANA-10.md` stays as the analysis
+not taken. This **unblocks MOD-4 by removal** and **strikes MOD-4's M8** (no `LocalStore`, no
+`local_migrations/`). `R-STO-6` lost its dangling `R-STO-7` citation, the only `docs/REQUIREMENTS.md`
+edit. The masked DSN field is **owed to MOD-15**, which owns the section it lives in. **1013 passed,
+0 failed, 30 ignored** workspace-wide with Postgres live (5 of those ignores are MOD-25's parked
+reversal evidence).
+Before it, **MOD-2 was done, all nine milestones**
 (`docs/decisions/mod/mod-2.md`, `5c717d0`..`32e516d`): `htui` starts agent sessions, streams them
 into a chat tab, answers permissions inline, persists and replays every event, tracks quota and
 cancels on a cap — over **three transports** that pass **one** conformance list — and assembles the
@@ -28,9 +41,6 @@ write-up, not in the file** (D108, maintainer-only per the milestone-5 precedent
 `chars-v2`, Claude prose **2.5** / code **2.4** chars per token, *measured* — ANA-5's 3.5/3.0 was
 28.4% off in the overflow direction and would have shipped silently. **1017 passed, 0 failed, 25
 ignored** workspace-wide with Postgres live.
-Before it, **ANA-15 concluded** (`docs/decisions/ana/ana-15.md`): Bugsink integration is feasible
-via the standard Sentry SDK; spawned MOD-29. **ANA-3 concluded**
-(`docs/decisions/ana/ana-3.md`): external context tools designed, manual grepping constrained.
 **Live coordinates.** Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql`
 is no longer held (`docs/ANA-2.md` §9) and is **still the next migration** — MOD-2 milestone 9 and
 MOD-20 both deliberately added none. Adapters install under `HTUI_AGENTS_ROOT`, default
@@ -53,12 +63,12 @@ whatsoever**, which is why its seed keeps `quota.source: "none"` and why the GPT
 row cannot be measured on this box (MOD-2 F-17). `--uid=` is **mandatory** for it. Its credentials
 live in `$GEMINI_HOME/antigravity-acp/acp_token.json`, a sibling of and separate from the `agy`
 CLI's own directory (MOD-21).
-**Concluded analyses the open items lean on:** ANA-10 (`docs/decisions/ana/ana-10.md`) — a box with
-no DSN becomes a *complete* box over a separate `local.sqlite`, spawning MOD-17, MOD-18 and MOD-19,
-and `docs/REQUIREMENTS.md` was amended for it on 2026-09-08 (new `R-STO-7`, eleven amended in
-place); ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration;
+**Concluded analyses the open items lean on:** ANA-10 (`docs/decisions/ana/ana-10.md`) — **its
+verdict is withdrawn**, see MOD-25 (`docs/decisions/mod/mod-25.md`); the document stays in the tree
+as the analysis that was done and not taken, and anything leaning on its local-only half is stale;
+ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration;
 ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
-`htui-orch`. MOD-7, MOD-9, MOD-13, MOD-14, MOD-15 and MOD-17 can start now.
+`htui-orch`. MOD-4, MOD-7, MOD-9, MOD-13, MOD-14 and MOD-15 can start now.
 
 ---
 
@@ -164,19 +174,18 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   steps 1 to 4 need nothing from MOD-2. Per ANA-5 (`docs/ANA-5.md` §4.6, §8): calls `assemble()`
   for the judge and handoff prompts, supplies `verify_failure`/`previous_diff` for the review loop,
   `RunStepSummary` gains `prompt_tokens` and `trimmed`; the pre-flight digest write is MOD-2's
-  `set_step_prompt`, not `finish_step`. Per ANA-10 (`docs/ANA-10.md` §4.8, §9.1): **local-only mode
-  runs graphs at parity**, so this item also owns M8 — `LocalStore` implementations of the seam above
-  and the four SQL ports (`shared_serialized`'s advisory lock becomes an in-process lock sound only
-  under ANA-10 §7.1's file lock, `FOR UPDATE` becomes `BEGIN IMMEDIATE`, `&&` over `repo_scope` and
-  `<@` over tag arrays become Rust predicates shared with Postgres through `htui-core`). The
-  `PgStore`-inherent reads of ANA-2 §8 become `Backend`-inherent with a four-arm `match self`
-  (`agents()` precedent, `backend.rs:292-298`); §8's split rule itself is unchanged. Two
-  prohibitions: never `CHECK (fanout_index >= 0)` on any of the three schemas (ANA-2 risk 12), and
-  no local `shared_serialized` before ANA-10 §10.17 is answered. **No longer blocked on MOD-2**
-  (done, `docs/decisions/mod/mod-2.md`); still blocked on **MOD-17's M3** (ANA-10 §9.1's ordering
-  rule: `LocalStore` must exist before build step 1, or this item inherits eighteen unbudgeted
-  methods), which MOD-25 removes when it closes (MOD-6 landed,
-  `docs/decisions/mod/mod-6.md`). **Three things MOD-2 handed over by name.** (1) ANA-5 §12
+  `set_step_prompt`, not `finish_step`. **ANA-10's M8 is struck from this item** (MOD-25 closed
+  2026-09-16, `docs/decisions/mod/mod-25.md`): `htui` is online-only, so there is no `LocalStore`,
+  no local-only graph parity, no four SQL ports and **no
+  `local_migrations/0002_orchestration_local.sql`** — the migration set is `0003_orchestration.sql`
+  plus `cache_migrations/0003_orchestration.sql` and nothing else. Two stores oblige the seam,
+  `MemStore` and `PgStore`, not three. The `PgStore`-inherent reads of ANA-2 §8 become
+  `Backend`-inherent with a `match self` (`agents()` precedent, `backend.rs:292-298`); §8's split
+  rule itself is unchanged. One prohibition survives: never `CHECK (fanout_index >= 0)` on either
+  schema (ANA-2 risk 12); ANA-10 §10.17's local `shared_serialized` question is moot.
+  **Not blocked** — MOD-2 is done (`docs/decisions/mod/mod-2.md`), MOD-6 landed
+  (`docs/decisions/mod/mod-6.md`), and MOD-25 removed the MOD-17 M3 ordering rule by withdrawing
+  MOD-17 (not by satisfying it). **Three things MOD-2 handed over by name.** (1) ANA-5 §12
   **criterion 18's persistence half** is this item's (MOD-2 D107): a handoff prompt must be
   persisted as a `follow_up` event at the next `turn`, not as a second `prompt` row, leaving
   `run_step.prompt_digest` unchanged — it needs a promotion, which is `R-ORCH-5`. The assembler half
@@ -261,13 +270,13 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   the `DetailRegistry` and overlay registry; `PgStore` (MOD-6, `docs/decisions/mod/mod-6.md`)
   supplies the real mint and revisions. The `touched_paths` edit path accepts and validates the
   `repo_name:glob` qualification of `docs/ANA-2.md` §4.7 (bare glob = primary repo);
-  `touched_paths` is tier 1 of ANA-5's excerpt ranking (`docs/ANA-5.md` §4.5). Editing on a box
-  with no server is **MOD-17's** (ANA-10 concluded; `docs/ANA-10.md` §9.3): this item must not ship
-  a `new`/`edit` action reachable while the backend is `Local` or `Offline`, any local `mint_item`
-  or `item_key_counter` (that is MOD-17's M6, gated on the `R-ENT-7` amendment), a compare-and-set
-  view backed by anything but `PgStore`/`MemStore`, or a second copy of the local-only status word.
-  **The scope line "mint per §7.1" above means ANA-9 §7.1's Postgres statement**; on a box with no
-  server the mint is ANA-10 §7.3's three-statement local form, which MOD-17 owns.
+  `touched_paths` is tier 1 of ANA-5's excerpt ranking (`docs/ANA-5.md` §4.5). **Editing on a box
+  with no server does not exist** (MOD-25 closed 2026-09-16, `docs/decisions/mod/mod-25.md`): `htui`
+  is online-only, so this item must not ship a `new`/`edit` action reachable while the backend is
+  `Offline`, any local `mint_item` or `item_key_counter`, or a compare-and-set view backed by
+  anything but `PgStore`/`MemStore`. An offline box browses read-only and says so.
+  **The scope line "mint per §7.1" above means ANA-9 §7.1's Postgres statement**, which is now the
+  only mint.
 - [ ] **MOD-14 - Graph tab** (from MOD-1). `R-TUI-5`, `R-ENT-9`. Item neighbourhood one to N hops
   across projects through `ReadStore::links` (`docs/ANA-9.md` §6.1), status and link kind per
   edge, keyboard navigation that re-roots the Backlog selection; the `open graph` action of
@@ -291,15 +300,17 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   only way to change `token_budget` (default **120 000**, with a 10% response reserve) or any other
   of the ten is SQL against the database — this item is what makes them editable from the app. The
   phase rung is the finest-grained one and has no editor either; `ResolvedPhase.token_budget` is
-  read but never written. Creating
-  a workspace on a box with no server is **MOD-17's** (ANA-10 concluded; `docs/ANA-10.md` §9.3,
-  §9.4): "Not blocked" above holds for the server-backed paths only — the create paths for a
-  server-less box depend on MOD-17. This item builds and registers the Settings connection
-  **section** (`SectionId("connection")`, named by ANA-10 M0 so neither item has to guess);
-  **MOD-25 owns the masked DSN field inside it** and must not have a second one built here. Also:
+  read but never written. **Creating a workspace on a box with no server does not exist** (MOD-25
+  closed 2026-09-16, `docs/decisions/mod/mod-25.md`): `htui` is online-only, so every create path
+  here is a server-backed path and "Not blocked" holds without qualification. This item builds and
+  registers the Settings connection **section** (`SectionId("connection")`, named by ANA-10 M0 so
+  neither item has to guess) — **and now owns the masked DSN field inside it**, which MOD-25 handed
+  back rather than building scaffolding it does not own (MOD-25 close-out, maintainer decision
+  2026-09-16). Nothing exists yet: `SectionId("connection")`, `MaskedField` and
+  `TabAction::FocusSection` have zero occurrences in `crates/`. Also:
   no ad-hoc focus mechanism instead of M0's `TabAction::FocusSection` /
   `SettingsSection::captures_input` / `MaskedField` names; no second persistence location for a
-  "shown once" marker or for local settings (ANA-10 §5.4's `local_setting` exists for that); and
+  "shown once" marker (ANA-10 §5.4's `local_setting` is withdrawn with the mode); and
   `Settings > Rebuild cache` stays as written — it is safe because the local store is a different
   file that `MIRRORED_TABLES` never names, so it must not be "helpfully" extended to clear local
   data, and its confirmation copy should say what it does and does not delete.
@@ -348,57 +359,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   environment); and that the job object reaps the auth child **with its loopback listener** — MOD-2
   §11 criterion 11, now with a socket and a child that lives for minutes rather than seconds.
 
-- [ ] **MOD-17 - Local-only mode: a writable local store** (from ANA-10).
-  **Superseded by MOD-25 (maintainer decision, 2026-09-11): `htui` is online-only, so there is no
-  writable local store. This line is deleted at MOD-25's close-out; nothing below it should be
-  started.** `R-STO-1`, `R-STO-3..6`,
-  `R-ENT-7`, `R-TUI-1`, `R-TUI-8`, `R-NF-3`, `R-ID-3`, `R-ID-7`, `R-HIS-1`, `R-USR-2`, `R-BOX-1`.
-  A box that has never been given a DSN becomes a complete box rather than an empty read-only
-  shell. Design concluded in `docs/ANA-10.md` (ANA-10, `docs/decisions/ana/ana-10.md`): a fourth
-  `Backend::Local` arm over a **separate** file `<config_root>/local/local.sqlite` (never
-  `cache.sqlite`, which is delete-on-mismatch), a new `LocalStore: WriteStore` with its own
-  forward-only `local_migrations/` set, local id minting through a project-origin-scoped key
-  counter, `box.toml` carrying three `#[serde(default)]` facts (no `local_only` mode flag), a
-  once-only first-run overlay, and an in-app masked DSN field. **Local-only is a temporary, lite
-  mode** (`docs/ANA-10.md` §1.3): parity is over *features* — hierarchy, items, chat, graph runs —
-  not over server-shaped infrastructure, so there is no mirror, no refresh cursor, no
-  `db_fingerprint`, no `offline · <age>` and no warm-cache startup budget on this path. Its
-  first-run copy must not promise migration to a server before MOD-18 ships (§4.5's copy rule).
-  Milestones **M0-M6 plus M2b** of
-  `docs/ANA-10.md` §9.1; **M2b is the milestone that satisfies the item's stated objective** and
-  M0+M1+M2+M2b is a complete shippable answer on its own (§9.2). Blocked on nothing, but **M3 must
-  land before MOD-4's build step 1** (§9.1's ordering rule), and M6 is gated on the `R-ENT-7`
-  amendment (`docs/ANA-10.md` §6.1, §10.3). MOD-13's, MOD-15's and **MOD-23's** create/edit paths
-  for a server-less box depend on it; MOD-15 owns the Settings connection *section*, this item owns
-  the credential *field* inside it (§9.4). The requirement amendments of §6.1 are proposed, not
-  applied — `docs/REQUIREMENTS.md` is maintainer-only.
-- [ ] **MOD-18 - Adoption of local rows into a server** (from ANA-10).
-  **Superseded by MOD-25 (2026-09-11): with no local rows there is nothing to adopt. Deleted at
-  MOD-25's close-out.** `R-STO-1`, `R-STO-7`,
-  `R-ENT-7`, `R-USR-2`, `R-HIS-1`. `docs/ANA-10.md` §9.1's M7. **Funded, not deferred** (§10.5, on
-  §1.3's framing): local-only is a temporary lite mode and Postgres is the full product, so this is
-  the exit the mode promises rather than an optional extra. **MOD-17 must not ship first-run copy
-  promising migration before this item exists** — until then the overlay says configuring a server
-  does not move existing local work; when this lands, the copy gains the move. Explicit, confirmed,
-  resumable; one transaction per project
-  subtree; `MAX`/`GREATEST` counter fast-forward and the `sealed_at` write inside that transaction;
-  `created_by`/`author_id`/`box_id` and `agent_id` remaps (§10.33); pre-adoption file copy;
-  second-server refusal keyed on `system_identifier`; a UI-visible per-row status, never
-  `pending.rs`'s log-only quarantine. Its unit is a project subtree including `run`, `run_step`,
-  `session_event`, `document` and `command_run` rows, not only items. Blocked on MOD-17 (M6). Until
-  it lands, local rows stay local and a local project is not runnable while a DSN is configured
-  (`docs/ANA-10.md` §11 risk 22) — MOD-17's M3 export path is the floor. The `GREATEST` importer
-  statement now has two consumers, MOD-8 and this item (`item.rs:145-148` reserves it to MOD-8).
-- [ ] **MOD-19 - In-process transition out of local-only** (from ANA-10, deferred).
-  **Superseded by MOD-25 (2026-09-11): there is no local-only mode to transition out of. Deleted at
-  MOD-25's close-out.** `R-TUI-8`,
-  `R-NF-3`. `docs/ANA-10.md` §9.1's M9 and §10.13: `connect::reconnect_for` as a public factory
-  (the DSN stays inside `connect.rs`, which is `connect.rs:66-70`'s real property — the existing
-  `Reconnect` closure already captures a DSN by move), `let mut reconnect` at
-  `store_worker.rs:411`, and the expensive half, `go_online` learning to **open** a mirror rather
-  than move one (`store_worker.rs:572-575`) while a `Backend::Local` and its open `local.sqlite`
-  are still in hand. Buys one avoided restart and nothing else; MOD-17's M2b delivers the objective
-  without it. Blocked on MOD-17 (M3).
 - [ ] **MOD-22 - Complete a loopback OAuth login from a box the browser cannot reach** (from MOD-21).
   `R-AGT-9`, `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent's own login flow redirects to a
   listener **inside the adapter process**, on that box's loopback: `agy_acp_server`'s URL carries
@@ -443,9 +403,10 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   overwritten by a probe that finds nothing" (`docs/ANA-4.md` §4.6) — a guard that today protects
   rows no UI can create. Needs the same text-input widget MOD-22 needs and the Settings tab does not
   have yet (`R-TUI-8`), off the UI task like every other request (`R-NF-3`). Registry writes are
-  server-only (`REGISTRY_ON_SERVER_ONLY`, MOD-6 plan D52), so the same actions on a box with no DSN
-  are **blocked on MOD-17** (ANA-10's `R-AGT-4` amendment, `docs/ANA-10.md` §6.1); the Postgres path
-  is **not blocked** and can start now. File collisions to expect in that one section file: MOD-2
+  server-only (`REGISTRY_ON_SERVER_ONLY`, MOD-6 plan D52), and since MOD-25 that is the whole story
+  — a box with no DSN browses read-only and edits nothing, so there is no second path to build here
+  (`docs/decisions/mod/mod-25.md`; ANA-10's `R-AGT-4` amendment is withdrawn with the mode). **Not
+  blocked**, and can start now. File collisions to expect in that one section file: MOD-2
   milestone 7 adds a quota column to this table (plan D73), MOD-12 owns the Settings caps section,
   MOD-15 owns kinds and step graphs. **Budget warning inherited from MOD-2 milestone 7 (plan D76,
   T47/T48):** the table now runs eight columns with **no width slack left** — each sits at its own
@@ -456,38 +417,30 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   the cheaper shape than more columns. Out of scope: the caps editor (MOD-12), box-profile capability
   edits (MOD-7), and anything keyed on an agent's name (`R-AGT-5`). Raised by the maintainer on
   2026-09-10 while MOD-2 milestone 7 was in flight.
-- [ ] **MOD-25 - `htui` is online-only** (maintainer decision, 2026-09-11). `R-STO-1`, `R-STO-3..7`,
-  `R-ID-3`, `R-ENT-7`, `R-HIS-1`, `R-AGT-4`, `R-PRM-4`, `R-SKL-1`, `R-TUI-1`, `R-TUI-8`, `R-NF-2`.
-  **A box that cannot reach its configured Postgres shows a warning that the database is
-  unreachable and browses its read-only cache. It does not carry a second, writable life.** This
-  withdraws the verdict of ANA-10 (`docs/decisions/ana/ana-10.md`) — "a box with no DSN becomes a
-  *complete* box over a separate `local.sqlite`" — which is **concluded and therefore superseded
-  rather than edited**. Scope, in order: (1) `docs/REQUIREMENTS.md`, the only maintainer-owned file
-  here — withdraw **`R-STO-7`** outright and restate the eleven ANA-10 amended in place on
-  2026-09-08 (`R-ID-3`, `R-ENT-7`, `R-STO-1`, `R-STO-4`, `R-STO-5`, `R-HIS-1`, `R-AGT-4`, `R-PRM-4`,
-  `R-SKL-1`, `R-TUI-1`, `R-TUI-8`), of which `R-STO-4`'s offline-mode text changes meaning most;
-  (2) **disable, do not delete**, the offline buffered-write path MOD-2 milestone 4 shipped
-  (`Writer::Buffered`, `append_pending`, `upload_pending`, `crates/htui/tests/chat_offline.rs`) —
-  a chat on an unreachable box refuses with the warning instead of buffering, and the machinery
-  stays in the tree for one release so a reversal costs nothing; (3) a `CLEAN-N` minted at
-  **this** item's close-out to remove it once the decision has sat. **The read-only cache of
-  `R-STO-3` survives**: it is also the speed cache behind `R-STO-6`'s sub-second warm start, and
-  degraded read-only browsing is what the warning is shown *over*. **Supersedes MOD-17, MOD-18 and
-  MOD-19**, whose checklist lines this item's close-out deletes — they are not "done" and must not
-  archive as if they were; `docs/decisions/mod/mod-25.md` records them as withdrawn with their
-  reason. **Unblocks by removal**: MOD-4's build step 1 (ANA-10 §9.1 required MOD-17's M3 before
-  it), and MOD-13's, MOD-15's and MOD-23's create/edit paths for a server-less box, which no longer
-  exist. **MOD-2's close-out restated rather than silently dropped its claim on ANA-4 §11 criterion
-  12** (an offline chat buffers and `upload_pending` lands exactly those rows), as this item asked:
-  `docs/decisions/mod/mod-2.md`, "Known, accepted, and handed on" — it was proven end to end on
-  2026-09-08 by `crates/htui/tests/chat_offline.rs` and is being withdrawn **with the mode**, which
-  is a different sentence from "unproven". Disabling that path, and the CLEAN item that later
-  deletes it, are still this item's.
-  Not blocked. `docs/ANA-10.md` stays in the tree as the analysis that was done and not taken. **This item also owns the masked DSN field inside the Settings connection section, replacing MOD-17.**
 - [ ] **MOD-24 - Fault Tolerance of Agent Processes.** Implement agent memory checkpointing to Postgres. If the daemon or TUI crashes mid-run, `htui` should be able to read the last `SessionEvent` from Postgres, re-hydrate the agent's context window, and resume the exact step it was on so that multi-hour runs can survive process restarts.
 
 ### Deferred backlog
 
+- [ ] **CLEAN-2 - Delete the disabled offline buffered-write path** (from MOD-25). `R-STO-1`,
+  `R-STO-4`. MOD-25 disabled the offline buffer and **deliberately kept the machinery in the tree,
+  compiling, for one release** so a reversal would cost one arm in `backend.rs`
+  (`docs/decisions/mod/mod-25.md`). This item deletes it once the decision has sat. **Do not start
+  it before the maintainer says the decision has settled** — that wait is the item's whole point.
+  The list, from MOD-25's close-out: the `Writer::Buffered` arm and `BufferedWriter` in
+  `crates/htui-store/src/writer.rs` (with `Writer::label`'s `"buffered"`); `cache::pending`'s
+  **append and seal side only** — `append_pending`, `seal_pending`, `seal_orphaned`'s call in
+  `CacheStore::open`; the `matches!(Writer::Buffered(_))` guards and the `project_caps_for` /
+  `quota_latch_for` arms in `crates/htui/src/agent_worker.rs`; `BUFFERED_LABEL` / `BUFFERED_NOTE` /
+  `ChatSessionState::buffered` and the D42 header branch in `ui/tabs/chat/mod.rs`; the four ignored
+  cases in `crates/htui/tests/chat_offline.rs` plus
+  `tests/snapshots/chat_offline__chat_buffered.snap`; the ignored `a_buffered_writer_never_re_probes`;
+  `crates/htui-store/tests/writer_buffered.rs`; the pending cases in `tests/cache.rs` and
+  `tests/pg_criteria.rs`; and the doc comments MOD-25 rewrote to say "kept for the reversal".
+  **`upload_pending` is the decision, not a detail**: MOD-25 left the upload side live so a box that
+  buffered under an earlier build still lands its rows. Deleting it strands any such buffer, so this
+  item must either keep the upload path or state that enough releases have passed that no unuploaded
+  buffer can exist. `MIRRORED_TABLES` keeps `agent` either way — the Backlog and the agents section
+  read that row off the mirror too.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -525,6 +478,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-11 requirements/decisions models, ANA-14 Redis research, ANA-16 execution environments, ANA-17 per-model prompt framing)                                 |
-| MOD-N   | 28 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-25 online-only, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-29 Bugsink integration, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest; **superseded by MOD-25 and deleted at its close-out: MOD-17 local-only store, MOD-18 adoption, MOD-19 in-process transition**; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 0                                                                                        |
+| MOD-N   | 24 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-15 hierarchy, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-29 Bugsink integration, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| CLEAN-N | 1 (CLEAN-2 delete the disabled offline buffer)                                            |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

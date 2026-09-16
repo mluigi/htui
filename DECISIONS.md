@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[MOD-25](docs/decisions/mod/mod-25.md)** - `htui` is online-only: the offline buffered-write path is disabled behind an unchanged seam, and MOD-17, MOD-18 and MOD-19 are withdrawn with ANA-10's verdict (done, 2026-09-16)
 - **[MOD-2](docs/decisions/mod/mod-2.md)** - Agent driver + chat tab: three transports on one conformance list, durable history and replay, registry and autodiscovery, quota and caps, and the prompt assembler with its read-only preview (done, 2026-09-15)
 - **[ANA-15](docs/decisions/ana/ana-15.md)** - checking if it is possible to implement bugsink trough the crate sentry (concluded, 2026-09-14)
 - **[ANA-3](docs/decisions/ana/ana-3.md)** - External context tools (concluded, 2026-09-14)
