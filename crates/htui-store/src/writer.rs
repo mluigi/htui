@@ -96,11 +96,14 @@ impl Writer {
 ///   mid-flight and its `run_step.usage` frozen at a partial sum.
 /// - item and registry writes answer [`StoreError::Unreachable`]: they genuinely need the server.
 ///
-/// Two consequences worth stating. An offline chat is **not** in the mirror's `run` table until it
-/// is uploaded, so `active_runs` and the top bar do not count it — the D42 header is the one place
-/// it shows. And every [`Backend::writer`](crate::Backend::writer) call builds a fresh, empty
-/// writer, which is right because the runtime takes exactly one per chat and moves it into that
-/// chat's session task, so its `start_chat_run` and its `append_events` share one map.
+/// Two consequences worth stating, both of a buffered chat that a build before MOD-25 started.
+/// Such a chat is **not** in the mirror's `run` table until it is uploaded, so `active_runs` and
+/// the top bar do not count it — the D42 header is the one place it shows. And every construction
+/// of this writer yields a fresh, empty one, which was right because the runtime took exactly one
+/// per chat and moved it into that chat's session task, so its `start_chat_run` and its
+/// `append_events` shared one map. Since MOD-25 no [`Backend::writer`](crate::Backend::writer)
+/// call constructs it at all: the type is kept for one release for the reversal, and the upload
+/// side still lands whatever an earlier build buffered.
 #[derive(Debug, Clone)]
 pub struct BufferedWriter {
     /// Reads, and the directory the buffer lives under.
@@ -438,8 +441,12 @@ pub const PROMPT_ON_SERVER_ONLY: &str = "the prompt path needs the server: templ
 /// sentence it is refused with, and it echoes `R-STO-4`'s "the TUI opens in offline read-only mode
 /// from the cache ... No item creation, no runs": the shell still browses the mirror, with the top
 /// bar reading `offline · <age>`, and starts no run.
-pub const DATABASE_UNREACHABLE: &str =
-    "the database is unreachable: this box browses its read-only cache and starts no run";
+///
+/// It does **not** name the database itself, because it is carried by
+/// [`StoreError::Unreachable`], whose `Display` already
+/// prefixes `store unreachable: `. Reading the two together is the whole sentence; repeating the
+/// word here made the rendered line say "unreachable" twice.
+pub const DATABASE_UNREACHABLE: &str = "this box browses its read-only cache and starts no run";
 
 /// Plain delegation: a `Writer` decides *which* store, never *what* a read means.
 impl ReadStore for Writer {
