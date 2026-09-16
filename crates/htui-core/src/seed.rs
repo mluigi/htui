@@ -381,8 +381,7 @@ mod tests {
     /// so what is left to check is that no graph names a phase twice, which would make
     /// `input_kinds` ambiguous and `template_name` collide.
     #[test]
-    fn names_are_unique_and_positions_dense_per_graph() {
-        let graph = StepGraphId::new();
+    fn no_graph_names_a_phase_twice() {
         for kind in &KINDS {
             let names: HashSet<&str> = kind.phases.iter().map(|phase| phase.name).collect();
             assert_eq!(
@@ -391,10 +390,6 @@ mod tests {
                 "`{}` names a phase twice",
                 kind.name
             );
-            for (position, phase) in kind.phases.iter().enumerate() {
-                let row = phase_row(PhaseId::new(), graph, position as i32, phase, Utc::now());
-                assert_eq!(row.position, position as i32);
-            }
         }
     }
 
