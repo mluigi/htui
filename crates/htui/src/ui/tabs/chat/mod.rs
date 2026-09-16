@@ -13,8 +13,8 @@
 //! it is open the tab sends nothing at all (D40). A live session underneath keeps receiving its
 //! frames the whole time and is exactly where it was when `Esc` closes the replay.
 //!
-//! Milestone 4 also lets a chat start with the store unreachable, in which case its rows go to the
-//! offline buffer instead of to Postgres. The header says so (D42), from the `writer_label` the
+//! Milestone 4 also let a chat start with the store unreachable, in which case its rows went to the
+//! offline buffer instead of to Postgres. The header said so (D42), from the `writer_label` the
 //! acceptance carried — never from a guess about which backend the worker is holding, which is a
 //! thing this tab is not allowed to know (`R-NF-3`). Since MOD-25 no backend hands out the
 //! buffered writer at all — an offline chat is refused rather than buffered — so that D42 branch

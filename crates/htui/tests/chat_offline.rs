@@ -441,7 +441,7 @@ async fn a_buffered_chat_lands_in_postgres_on_the_next_connection() {
 /// OS user cannot name `run.started_by`, and inventing one would make the uploader insert a
 /// stranger as the chat's author. The refusal says which row is missing.
 #[tokio::test]
-#[ignore = "MOD-25: the offline buffer is disabled (Backend::writer answers None offline); kept for the reversal, removed by the CLEAN item"]
+#[ignore = "MOD-25: unreachable from the shell — start() refuses at the writer before it reaches this_user(); kept for the reversal, removed by the CLEAN item"]
 async fn an_offline_box_that_never_synced_this_user_refuses_and_says_so() {
     let agent_id = AgentId::new();
     let root = tempfile::tempdir().expect("a throwaway config root");
