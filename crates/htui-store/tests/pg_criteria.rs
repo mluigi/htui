@@ -27,6 +27,7 @@ use htui_core::store::{CasOutcome, ReadStore as _, SettingRung, UpdateOutcome, W
 use htui_store::PgStore;
 use sqlx::Row as _;
 use sqlx::postgres::PgPool;
+use sqlx::{Connection as _, PgConnection};
 
 /// The prefix the concurrency cases mint under: its own `item_kind`, so the counter starts empty
 /// and the expected numbers are `1..=n` rather than "whatever the fixture left".
@@ -2421,6 +2422,123 @@ async fn set_setting_project_rung_changes_only_settings_and_updated_at() {
         settings(&before),
         "`settings - key` puts the document back to the JSONB it found, byte for byte"
     );
+
+    db.drop_db().await;
+}
+
+/// Review M1: `delete_project` counts and deletes in one **snapshot**, not merely in one
+/// transaction.
+///
+/// At `READ COMMITTED` every statement of a transaction takes its own snapshot and the counting
+/// `SELECT` takes no row lock, so a child row committed between `project_reach`'s `count(*)` and
+/// the `DELETE FROM project` is cascaded away without ever having been counted. That is PRD D13's
+/// success metric - "the counts shown match what the cascade removes" - failing on the one
+/// operation that destroys history, which is why it is worth a deterministic case rather than a
+/// raced one.
+///
+/// Deterministic, and it does not need `delete_project` to pause anywhere: a second connection
+/// inserts a `session_event` under one of the project's steps and **holds the transaction open**.
+/// The count runs first and cannot see an uncommitted row, and the insert has taken a
+/// `FOR KEY SHARE` lock on its `run_step` row, so the cascade blocks there until the commit -
+/// which lands strictly between the count and the delete, every run.
+///
+/// Either answer is honest and the case accepts both: a report that names the extra row, or a
+/// refusal that leaves the project standing. What it refuses is a report that is one short of what
+/// the cascade took.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_committed_mid_delete_is_never_missing_from_the_count() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let project = ids::PROJECT_HTUI;
+
+    /// How many `session_event` rows a project delete reaches, by `project_reach`'s own predicate.
+    async fn events_of(pool: &PgPool, project: ProjectId) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM session_event e \
+               JOIN run_step s ON s.id = e.run_step_id \
+               JOIN run r ON r.id = s.run_id \
+              WHERE r.project_id = $1 \
+                 OR r.item_id IN (SELECT id FROM item WHERE project_id = $1)",
+        )
+        .bind(project.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("count session_event")
+    }
+
+    let step: uuid::Uuid = sqlx::query_scalar(
+        "SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
+          WHERE r.project_id = $1 OR r.item_id IN (SELECT id FROM item WHERE project_id = $1) \
+          ORDER BY s.id LIMIT 1",
+    )
+    .bind(project.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("the fixture gives the project a run_step");
+
+    let before = events_of(&db.pool, project).await;
+    assert!(
+        before > 0,
+        "the fixture seeds the project events, so a short count has something to be short of"
+    );
+
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN on the racing connection");
+    sqlx::query(
+        "INSERT INTO session_event (run_step_id, seq, kind, role, payload, at) \
+         VALUES ($1, 2147483647, 'other', 'htui', '{}'::jsonb, now())",
+    )
+    .bind(step)
+    .execute(&mut racer)
+    .await
+    .expect("the racing insert");
+
+    let store = db.store.clone();
+    let deleting = tokio::spawn(async move { store.delete_project(project).await });
+    // The counting statement is behind us and the cascade is parked on the `run_step` row lock.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+
+    match deleting.await.expect("the delete task") {
+        Ok(reach) => {
+            assert_eq!(
+                events_of(&db.pool, project).await,
+                0,
+                "the cascade ran, so the project keeps no event"
+            );
+            assert_eq!(
+                reach.session_events,
+                u64::try_from(before + 1).expect("a count is not negative"),
+                "the report names the row committed mid-delete: the counts shown are the counts \
+                 the act took (PRD D13)"
+            );
+        }
+        Err(err) => {
+            assert!(
+                db.store
+                    .project(project)
+                    .await
+                    .expect("the project read")
+                    .is_some(),
+                "a refused delete took nothing, so the project stands: {err}"
+            );
+            assert_eq!(
+                events_of(&db.pool, project).await,
+                before + 1,
+                "and so do its events, the racing one included"
+            );
+        }
+    }
 
     db.drop_db().await;
 }

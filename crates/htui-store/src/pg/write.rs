@@ -4,10 +4,11 @@
 //! Each one is a **single statement**, so atomicity comes from Postgres rather than from an
 //! explicit transaction: a `WITH ... RETURNING` CTE either lands whole or not at all, and under
 //! `READ COMMITTED` the loser of a compare-and-set race blocks on the row lock, re-evaluates
-//! `version = $2` against the committed value and matches nothing (ANA-9 §11.3). The two
-//! exceptions are MOD-2's chat-run pair, which writes one `run` and one `run_step` and therefore
-//! takes an explicit transaction, exactly as the pending-buffer upload does
-//! (`crate::cache::pending`).
+//! `version = $2` against the committed value and matches nothing (ANA-9 §11.3). The exceptions are
+//! MOD-2's chat-run pair, which writes one `run` and one `run_step` and therefore takes an explicit
+//! transaction, exactly as the pending-buffer upload does (`crate::cache::pending`), and MOD-15's
+//! two deletes, which count and delete in one transaction **at `REPEATABLE READ`** so that the two
+//! statements share a snapshot as well (review M1; see [`begin_repeatable_read`]).
 //!
 //! There is **no `DELETE FROM item`** in this file and none may be added: §4.1's "keys are never
 //! reused" is enforced by the absence of the path, and the conformance case `no_delete_path` is
@@ -89,13 +90,53 @@ fn rows(count: i64) -> u64 {
     u64::try_from(count).unwrap_or(0)
 }
 
+/// How many times the two delete paths re-run their whole transaction after a `40001` before they
+/// give up and refuse (review M1).
+///
+/// Three rather than one because a retry is cheap — the transaction holds no lock it has not just
+/// taken — and rather than unbounded because a project under a steady stream of writes would
+/// otherwise never return.
+const DELETE_ATTEMPTS: u32 = 3;
+
+/// Opens a transaction at `REPEATABLE READ`, which is where the two delete paths count (review M1).
+///
+/// `READ COMMITTED` gives every statement its own snapshot, so a `count(*)` and a `DELETE` in one
+/// transaction are still two views of the table: a child row committed between them is cascaded
+/// away uncounted. At `REPEATABLE READ` the whole transaction reads one snapshot **and** the
+/// cascade's own referential-integrity queries run with a crosscheck against it, so such a row
+/// raises `40001` instead of vanishing silently — which is what makes PRD D13's "the counts shown
+/// match what the cascade removes" a property of the code rather than of the timing.
+///
+/// `SET TRANSACTION` must be the transaction's first statement, which is why this is a helper
+/// rather than a line in each caller.
+async fn begin_repeatable_read(
+    pool: &sqlx::PgPool,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+    let mut tx = pool.begin().await.map_err(map_sqlx)?;
+    sqlx::raw_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    Ok(tx)
+}
+
+/// Whether a driver error is `40001`, *serialization failure*: the one outcome [`DELETE_ATTEMPTS`]
+/// retries.
+///
+/// Not folded into [`map_sqlx`], which would turn a retryable answer into the same
+/// [`StoreError::Backend`] every other class-`40` failure gets: only the two delete paths open a
+/// transaction that can raise it, and only they know the work is safe to repeat.
+fn is_serialization_failure(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db) if db.code().is_some_and(|code| code == "40001"))
+}
+
 /// What a workspace delete reaches: its links and its box paths, and no project
 /// (`0001_init.sql:162,174`). `None` when no row has that id.
 ///
 /// Takes a connection rather than the pool so [`WriteStore::delete_reach`] can count on a borrowed
-/// one and [`WriteStore::delete_workspace`] can count **inside its own transaction** — which is
-/// what makes "the counts shown before the act are the counts the act took" (PRD D13) true of the
-/// same snapshot rather than of two.
+/// one and [`WriteStore::delete_workspace`] can count **inside its own transaction** — which,
+/// together with [`begin_repeatable_read`], is what makes "the counts shown before the act are the
+/// counts the act took" (PRD D13) true of one snapshot rather than of two.
 async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Option<DeleteReach>> {
     let counted = sqlx::query!(
         r#"
@@ -1967,11 +2008,71 @@ impl WriteStore for PgStore {
     /// Counts inside the transaction, then lets the cascade do the deleting
     /// (`0001_init.sql:162,174`). Projects survive it.
     ///
+    /// [`DELETE_ATTEMPTS`] tries, because the transaction is
+    /// [`REPEATABLE READ`](begin_repeatable_read) and a link or a box path committed under it
+    /// raises `40001` rather than slipping past the count (review M1).
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] for an unknown id.
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] when every attempt
+    /// lost the race, in which case nothing was deleted.
     async fn delete_workspace(&self, id: WorkspaceId) -> Result<DeleteReach> {
-        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        for _ in 0..DELETE_ATTEMPTS {
+            if let Some(reach) = self.delete_workspace_once(id).await? {
+                return Ok(reach);
+            }
+        }
+        Err(StoreError::Constraint(concurrent_write(
+            "workspace",
+            id,
+            "links",
+        )))
+    }
+
+    /// One `DELETE FROM project` and twenty tables of `ON DELETE CASCADE` behind it (PRD D13),
+    /// with the counts taken in the same transaction **and the same snapshot** so the report is the
+    /// act.
+    ///
+    /// [`DELETE_ATTEMPTS`] tries, for the reason
+    /// [`delete_workspace`](WriteStore::delete_workspace) has them.
+    ///
+    /// The mirror rebuild afterwards is the caller's, not the seam's (D5): `PgStore` holds no
+    /// `CacheStore`, and milestone 3's store worker is the one handle that holds both.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] when every attempt
+    /// lost the race, in which case nothing was deleted.
+    async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
+        for _ in 0..DELETE_ATTEMPTS {
+            if let Some(reach) = self.delete_project_once(id).await? {
+                return Ok(reach);
+            }
+        }
+        Err(StoreError::Constraint(concurrent_write(
+            "project",
+            id,
+            "rows the cascade would take",
+        )))
+    }
+}
+
+/// The refusal a delete gets after [`DELETE_ATTEMPTS`] serialization failures (review M1).
+///
+/// It says what happened and that nothing happened, because the alternative a caller might assume —
+/// a partial delete — is the one thing a transaction cannot leave behind.
+fn concurrent_write(entity: &str, id: impl core::fmt::Display, what: &str) -> String {
+    format!(
+        "{entity} {id} is being written to: {DELETE_ATTEMPTS} attempts each found {what} committed \
+         after the count, and the delete took nothing"
+    )
+}
+
+impl PgStore {
+    /// One attempt of [`WriteStore::delete_workspace`]'s count-and-delete; `Ok(None)` is the
+    /// `40001` the caller retries (review M1).
+    async fn delete_workspace_once(&self, id: WorkspaceId) -> Result<Option<DeleteReach>> {
+        let mut tx = begin_repeatable_read(&self.pool).await?;
 
         let Some(reach) = workspace_reach(&mut tx, id).await? else {
             return Err(StoreError::NotFound {
@@ -1979,26 +2080,27 @@ impl WriteStore for PgStore {
                 id: id.to_string(),
             });
         };
-        sqlx::query!("DELETE FROM workspace WHERE id = $1", id.as_uuid())
+        match sqlx::query!("DELETE FROM workspace WHERE id = $1", id.as_uuid())
             .execute(&mut *tx)
             .await
-            .map_err(map_sqlx)?;
+        {
+            Ok(_) => {}
+            Err(err) if is_serialization_failure(&err) => return Ok(None),
+            Err(err) => return Err(map_sqlx(err)),
+        }
 
         tx.commit().await.map_err(map_sqlx)?;
-        Ok(reach)
+        Ok(Some(reach))
     }
 
-    /// One `DELETE FROM project` and nineteen tables of `ON DELETE CASCADE` behind it (PRD D13),
-    /// with the counts taken in the same transaction so the report is the act.
+    /// One attempt of [`WriteStore::delete_project`]'s count-and-delete; `Ok(None)` is the `40001`
+    /// the caller retries (review M1).
     ///
-    /// The mirror rebuild afterwards is the caller's, not the seam's (D5): `PgStore` holds no
-    /// `CacheStore`, and milestone 3's store worker is the one handle that holds both.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::NotFound`] for an unknown id.
-    async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
-        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+    /// The count is the transaction's first statement after the isolation level is set, so it is
+    /// the statement that takes the snapshot the cascade is then crosschecked against: only the
+    /// `DELETE` can raise the serialization failure, which is why only it is matched on.
+    async fn delete_project_once(&self, id: ProjectId) -> Result<Option<DeleteReach>> {
+        let mut tx = begin_repeatable_read(&self.pool).await?;
 
         let Some(reach) = project_reach(&mut tx, id).await? else {
             return Err(StoreError::NotFound {
@@ -2006,17 +2108,19 @@ impl WriteStore for PgStore {
                 id: id.to_string(),
             });
         };
-        sqlx::query!("DELETE FROM project WHERE id = $1", id.as_uuid())
+        match sqlx::query!("DELETE FROM project WHERE id = $1", id.as_uuid())
             .execute(&mut *tx)
             .await
-            .map_err(map_sqlx)?;
+        {
+            Ok(_) => {}
+            Err(err) if is_serialization_failure(&err) => return Ok(None),
+            Err(err) => return Err(map_sqlx(err)),
+        }
 
         tx.commit().await.map_err(map_sqlx)?;
-        Ok(reach)
+        Ok(Some(reach))
     }
-}
 
-impl PgStore {
     /// Which half of the `item_kind` writers' folded `EXISTS` guard refused, in the sentence
     /// `MemStore` uses for it (D11).
     ///
