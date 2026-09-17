@@ -247,3 +247,10 @@ async fn cas<T>(writer: &Writer, scope: &Scope, outcome: &CasOutcome<T>) -> Resu
 /// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a fourth
 /// request cannot be named in one place and matched in the other.
 pub const REQUEST_NAMES: [&str; 3] = ["prompt_settings", "set_setting", "clear_setting"];
+
+/// The **read**'s name, the one of the three a `Failed` is treated differently for: a refused read
+/// leaves the section with no tree at all, where a refused write leaves the editor over its text.
+///
+/// Named rather than reached for as `REQUEST_NAMES[0]`, so the section's `Failed` arms say which
+/// request they mean instead of relying on the order of the array above.
+pub const READ_NAME: &str = REQUEST_NAMES[0];

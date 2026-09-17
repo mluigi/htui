@@ -23,6 +23,7 @@
 //! twice is a range that can disagree with itself.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -38,7 +39,7 @@ use htui_core::store::SettingRung;
 use serde_json::Value;
 
 use crate::app::{Ctx, Handled};
-use crate::prompt_settings::{AppEntry, ProjectEntry, REQUEST_NAMES, SettingsSnapshot};
+use crate::prompt_settings::{AppEntry, ProjectEntry, READ_NAME, REQUEST_NAMES, SettingsSnapshot};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
@@ -606,7 +607,9 @@ impl PromptSection {
                 theme.base
             };
             match row {
-                Row::AppHeader => lines.push(Line::styled(APP_HEADER.to_owned(), style)),
+                // `&'static str` rather than an owned copy: `Line<'static>` borrows a constant
+                // happily, and the group header is drawn on every frame.
+                Row::AppHeader => lines.push(Line::styled(APP_HEADER, style)),
                 Row::ProjectHeader { p } => {
                     if let Some(entry) = self.project(p) {
                         lines.push(Line::styled(
@@ -849,7 +852,7 @@ impl SettingsSection for PromptSection {
             StoreReply::PromptSettingsStale(snapshot) => self.on_stale(snapshot),
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
-            StoreReply::Failed { request, message } if *request == REQUEST_NAMES[0] => {
+            StoreReply::Failed { request, message } if *request == READ_NAME => {
                 self.unavailable = Some(message.clone());
             }
             // Every other refusal of this section's own: the shell has already put
@@ -999,13 +1002,15 @@ fn effective(
 /// The widest key of the registry, so the rows line up whatever the registry holds.
 ///
 /// Computed rather than a constant: a longer key added tomorrow widens the column by itself.
-fn key_width() -> usize {
+/// Computed **once**: [`SettingKey::ALL`] is compiled in and cannot change between frames, where
+/// calling this per row walked the ten keys thirteen times a frame.
+static KEY_WIDTH: LazyLock<usize> = LazyLock::new(|| {
     SettingKey::ALL
         .iter()
         .map(|key| key.key().chars().count())
         .max()
         .unwrap_or(0)
-}
+});
 
 /// One value row: the key, what the rung stores, what the reader would use, which rung answered,
 /// and the unit the registry counts in (D9).
@@ -1019,7 +1024,7 @@ fn value_line(key: SettingKey, stored: Option<&Value>, effective: &Effective) ->
         effective.text,
         effective.source.as_str(),
         key.spec().unit,
-        width = key_width(),
+        width = *KEY_WIDTH,
     )
 }
 
@@ -1077,13 +1082,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// B-3: the presence rule and the reader's own `source` are the same fact for the four
-    /// combinations of project-holds × app-holds, so the label a row carries cannot drift from the
-    /// rung the assembler actually used.
-    ///
-    /// Asserted through `token_budget`, the one key that both rules describe: `resolve_budget`
-    /// records its provenance and the presence rule derives it. The other nine have no resolver
-    /// that records one, which is why the rule exists at all.
     /// The blob a project holds when it stores `key` — built from the registry, because no key is
     /// spelled in this file (acceptance line 4).
     fn blob(key: SettingKey, value: Value) -> Value {
@@ -1122,6 +1120,13 @@ mod tests {
         );
     }
 
+    /// B-3: the presence rule and the reader's own `source` are the same fact for the four
+    /// combinations of project-holds × app-holds, so the label a row carries cannot drift from the
+    /// rung the assembler actually used.
+    ///
+    /// Asserted through `token_budget`, the one key that both rules describe: `resolve_budget`
+    /// records its provenance and the presence rule derives it. The other nine have no resolver
+    /// that records one, which is why the rule exists at all.
     #[test]
     fn the_source_label_matches_resolve_budget_for_all_four_combinations() {
         let key = SettingKey::TokenBudget;
