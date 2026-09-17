@@ -11,6 +11,9 @@
 //! deferred until `PgStore` read latency has actually been measured against a populated database;
 //! until then the queue depth is bounded in practice by the keystrokes a user can produce.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use chrono::{DateTime, Utc};
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, PermissionRequestId};
@@ -34,7 +37,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::agent_worker::{AgentRuntime, Served};
 use crate::catalogue::{self, CatalogueSnapshot};
-use crate::connection::{self, ConnectionSnapshot};
+use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::ui::overlay::OverlayId;
@@ -1049,11 +1052,13 @@ pub fn spawn_with(
         events_tx,
         projects,
         settings,
-        reconnect,
-        // MOD-15 M6 D20: what `connect::apply_dsn` needs. Bound and ignored until the `SetDsn`
-        // arm below claims it (blueprint §2.2); named rather than `..` so a later field cannot
-        // be added to `Started` and silently dropped here.
-        connect: _,
+        // `mut` since MOD-15 M6: a `SetDsn` replaces the closure so every later tick dials the
+        // **new** server, and a `ClearDsn` drops it so none dials a credential the user just
+        // deleted (D11 step 7, D13).
+        mut reconnect,
+        // What `connect::apply_dsn` needs (D20); `None` from `detached`, which is what makes
+        // `SetDsn` refuse under `--demo` and in a test that did not ask for one.
+        connect,
     } = started;
 
     tokio::spawn(async move {
@@ -1063,6 +1068,15 @@ pub fn spawn_with(
         let mut refresher: Option<Refresher> = None;
         // The refresher's last pass outcome, for as long as there is a refresher.
         let mut health: Option<watch::Receiver<Option<StoreError>>> = None;
+        // The last dial's outcome, for the connection section's Status row (MOD-15 M6, B-5).
+        // Forgotten by a `SetDsn`, whose swap makes the previous server's outcome a fact about a
+        // database this session has left.
+        let mut last_attempt: Option<Attempt> = None;
+        // Which server the spawned dials are for (ruling O-1, hazard H-6). Every dial captures the
+        // generation it was spawned under and drops its `ConnEvent` when `SetDsn` has moved it:
+        // otherwise the old server's `PgStore` is installed over the **new** mirror, and this
+        // database's reads are answered from another database's cache (PRD `:373`).
+        let dials = Arc::new(AtomicU64::new(0));
         // `interval_at`, not `interval`: the first tick of an `interval` completes immediately,
         // which would re-dial in the same breath as `start`'s own attempt.
         let mut ticker = tokio::time::interval_at(
@@ -1112,6 +1126,136 @@ pub fn spawn_with(
                                 },
                                 None => StoreReply::MigrationsApplied { applied: 0 },
                             }
+                        }
+                        // The four connection requests, kept by the loop for the reason
+                        // `ApplyMigrations` above is kept: the read needs this loop's memory of the
+                        // last dial and of `--offline`, and each writer rewires at least two of
+                        // `backend`, `refresher`, `health`, `held`, `reconnect` and `dials`, none
+                        // of which `try_serve`'s `&Backend` can reach (MOD-15 M6 D9, flag K).
+                        StoreRequest::ConnectionInfo => {
+                            connection::snapshot(&backend, last_attempt.as_ref(), connect.as_ref())
+                                .await
+                                .map_or_else(
+                                    |err| failed("connection_info", &err),
+                                    StoreReply::Connection,
+                                )
+                        }
+                        // D11's eight steps, in this order and no other. Everything that can fail
+                        // happens **before** the swap at (6); nothing after it may fail, because a
+                        // half-applied swap is a mirror handle for one database answering another
+                        // database's reads.
+                        StoreRequest::SetDsn(dsn) => 'set: {
+                            // (0) A demo session has no keyring and no mirror (D10).
+                            if matches!(backend, Backend::Memory(_)) {
+                                break 'set StoreReply::Failed {
+                                    request: "set_dsn",
+                                    message: connection::DEMO_SESSION.to_owned(),
+                                };
+                            }
+                            // (0') No context is `Started::detached` outside `--demo`: there is no
+                            // config root to open a mirror under and no timeout to dial with.
+                            let Some(ctx) = connect.as_ref() else {
+                                break 'set StoreReply::Failed {
+                                    request: "set_dsn",
+                                    message: connection::NO_WORKER.to_owned(),
+                                };
+                            };
+                            // (1) The DSN parsed on the UI side of the seam - it is a `Dsn`, so it
+                            // parsed. (2) the keyring write and (3) the new mirror are
+                            // `apply_dsn`'s, in that order: a mirror opened for a DSN that was
+                            // never stored is a lie the next launch inherits. A failure in either
+                            // leaves `backend`, `refresher`, `health`, `held` and `reconnect`
+                            // exactly as they were.
+                            let applied = match connect::apply_dsn(dsn.clone(), ctx).await {
+                                Ok(applied) => applied,
+                                Err(err) => break 'set failed("set_dsn", &err),
+                            };
+                            // (4) The refresher mirrored the **old** server and the health watch
+                            // was armed for it. Aborted before the close below, so its last write
+                            // is not in flight while the pool goes.
+                            if let Some(previous) = refresher.take() {
+                                previous.abort();
+                            }
+                            health = None;
+                            // (5) The old mirror's pool, closed rather than dropped: dropping the
+                            // last handle closes it asynchronously, which is the race
+                            // `CacheStore::close` exists to avoid (`cache/mod.rs:216-224`).
+                            if let Some(old) = backend.cache() {
+                                old.close().await;
+                            }
+                            // (6) Nothing from here on can fail. The old `PgStore`, and the one
+                            // held aside for a migration prompt, both belong to the old server;
+                            // their pools close when the old backend drops. The generation moves
+                            // here, so every dial spawned before this point discards its event.
+                            held = None;
+                            pending = None;
+                            dials.fetch_add(1, Ordering::SeqCst);
+                            backend = Backend::Offline {
+                                cache: applied.cache,
+                                // `since: None` renders `connecting`, which is what the top bar
+                                // should say while the dial is in flight; `--offline` never reads
+                                // `connecting`, because nothing is in flight (D12).
+                                since: if ctx.offline { Some(Utc::now()) } else { None },
+                            };
+                            // (7) Every later tick dials the new server - unless this session was
+                            // started with `--offline`, which is a choice the user typed.
+                            reconnect = if ctx.offline {
+                                None
+                            } else {
+                                Some(applied.reconnect)
+                            };
+                            // (8) One immediate dial, on the channel the ticker uses.
+                            if let Some(dial) = reconnect.clone() {
+                                spawn_dial(dial, events_tx.clone(), &dials);
+                            }
+                            // The previous server's outcome is not this one's.
+                            last_attempt = None;
+                            connection::snapshot(&backend, None, connect.as_ref())
+                                .await
+                                .map_or_else(|err| failed("set_dsn", &err), StoreReply::Connection)
+                        }
+                        // D13: the keyring entry goes and the dial is disarmed, because the
+                        // closure captured the deleted credential by move. A live `Online` backend
+                        // is **not** torn down - the pool is not the secret, and throwing a working
+                        // connection and its refresher away serves no security end.
+                        StoreRequest::ClearDsn => 'clear: {
+                            if matches!(backend, Backend::Memory(_)) {
+                                break 'clear StoreReply::Failed {
+                                    request: "clear_dsn",
+                                    message: connection::DEMO_SESSION.to_owned(),
+                                };
+                            }
+                            if let Err(err) = connect::forget_dsn().await {
+                                break 'clear failed("clear_dsn", &err);
+                            }
+                            reconnect = None;
+                            connection::snapshot(&backend, last_attempt.as_ref(), connect.as_ref())
+                                .await
+                                .map_or_else(
+                                    |err| failed("clear_dsn", &err),
+                                    StoreReply::Connection,
+                                )
+                        }
+                        // D14: the same `rebuild` the two production callers make
+                        // (`hierarchy.rs:339`, `catalogue.rs:171-177`). The refresher, if one is
+                        // running, refills from cursor zero on its next pass exactly as it does
+                        // after those.
+                        StoreRequest::RebuildCache => 'rebuild: {
+                            let Some(cache) = backend.cache() else {
+                                break 'rebuild StoreReply::Failed {
+                                    request: "rebuild_cache",
+                                    message: connection::DEMO_SESSION.to_owned(),
+                                };
+                            };
+                            if let Err(err) = cache.rebuild().await {
+                                break 'rebuild failed("rebuild_cache", &err);
+                            }
+                            connection::snapshot(&backend, last_attempt.as_ref(), connect.as_ref())
+                                .await
+                                .map_or_else(
+                                    |err| failed("rebuild_cache", &err),
+                                    StoreReply::Connection,
+                                )
                         }
                         // The chat requests need this loop's own state - the live sessions - and
                         // the probe, the installs and the logins need the runtime that owns their
@@ -1163,6 +1307,8 @@ pub fn spawn_with(
                     }
                 }
 
+                // Every event that reaches here was sent by a dial whose generation still matched
+                // when it finished (ruling O-1), so the outcome recorded below is this server's.
                 Some(event) = events.recv() => match event {
                     ConnEvent::Online(pg) => {
                         pending = None;
@@ -1171,6 +1317,7 @@ pub fn spawn_with(
                             &mut backend, pg, &mut refresher, &mut health, &projects, settings,
                         )
                         .await;
+                        last_attempt = Some(Attempt { at: Utc::now(), outcome: AttemptOutcome::Online });
                         tracing::info!(label = backend.label(), "store online");
                     }
                     ConnEvent::MigrationsPending(pg, n) => {
@@ -1180,10 +1327,18 @@ pub fn spawn_with(
                         // `connecting`: nothing reads through a schema this binary refuses to
                         // use until the user has answered the prompt.
                         backend.gave_up();
+                        last_attempt = Some(Attempt {
+                            at: Utc::now(),
+                            outcome: AttemptOutcome::MigrationsPending(n),
+                        });
                         tracing::warn!(pending = n, "schema has pending migrations");
                     }
                     ConnEvent::Failed(why) => {
                         backend.gave_up();
+                        last_attempt = Some(Attempt {
+                            at: Utc::now(),
+                            outcome: AttemptOutcome::Failed(why.clone()),
+                        });
                         tracing::warn!(%why, "connect failed");
                     }
                 },
@@ -1197,10 +1352,7 @@ pub fn spawn_with(
                     if reconnect.is_some() && !backend.is_writable() && held.is_none() =>
                 {
                     if let Some(dial) = reconnect.clone() {
-                        let sender = events_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = sender.send(dial().await).await;
-                        });
+                        spawn_dial(dial, events_tx.clone(), &dials);
                     }
                 }
             }
@@ -1215,6 +1367,30 @@ pub fn spawn_with(
             refresher.abort();
         }
     })
+}
+
+/// Runs one dial on its own task and reports it, **unless the DSN changed while it ran**.
+///
+/// The generation is read when the dial is spawned and again when it finishes; `SetDsn` bumps it
+/// at the moment of the swap (D11 step 6), so a dial that was in flight across a swap answers for
+/// a server this session has left and its [`ConnEvent`] is dropped rather than delivered. Without
+/// this, an `Online` from the old server would be installed by [`go_online`] over the **new**
+/// mirror — this database's reads answered from another database's cache (ruling O-1, hazard H-6).
+///
+/// Both call sites go through here — the reconnect ticker's and `SetDsn`'s own — so there is one
+/// guard rather than two that can disagree.
+fn spawn_dial(dial: connect::Reconnect, sender: mpsc::Sender<ConnEvent>, dials: &Arc<AtomicU64>) {
+    let dials = Arc::clone(dials);
+    let generation = dials.load(Ordering::SeqCst);
+    tokio::spawn(async move {
+        let event = dial().await;
+        if dials.load(Ordering::SeqCst) != generation {
+            tracing::debug!("a dial for a previous DSN finished; dropping its outcome");
+            return;
+        }
+        // The worker is gone if this fails, and there is nobody left to tell.
+        let _ = sender.send(event).await;
+    });
 }
 
 /// Swaps `Offline { cache, .. }` for `Online { pg, cache }` and (re)starts the refresher.

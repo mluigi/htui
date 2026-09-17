@@ -498,11 +498,13 @@ async fn rebuild_cache_empties_the_mirrored_tables_and_keeps_the_meta() {
         .await
         .expect("the mirror is seeded");
     let before = cache.meta().await.expect("a seeded mirror has meta");
-    let items: i64 = sqlx::query_scalar("SELECT count(*) FROM item")
+    // `project`, not `item`: `seed_mirror` writes the six unscoped tables an offline *write* path
+    // needs, and the cursor-driven ones are not among them. It is one of the sixteen either way.
+    let projects: i64 = sqlx::query_scalar("SELECT count(*) FROM project")
         .fetch_one(cache.pool())
         .await
         .expect("the mirror answers");
-    assert!(items > 0, "the fixture put rows in");
+    assert!(projects > 0, "the fixture put rows in");
 
     let mut started = Started::detached(Backend::Offline {
         cache: cache.clone(),
@@ -522,11 +524,19 @@ async fn rebuild_cache_empties_the_mirrored_tables_and_keeps_the_meta() {
         "nothing has been fully pulled into this content yet"
     );
 
-    let items: i64 = sqlx::query_scalar("SELECT count(*) FROM item")
+    let projects: i64 = sqlx::query_scalar("SELECT count(*) FROM project")
         .fetch_one(cache.pool())
         .await
         .expect("the mirror answers");
-    assert_eq!(items, 0, "the mirrored tables are empty");
+    assert_eq!(projects, 0, "the mirrored tables are empty");
+    let cursors: i64 = sqlx::query_scalar("SELECT count(*) FROM cache_cursor")
+        .fetch_one(cache.pool())
+        .await
+        .expect("the mirror answers");
+    assert_eq!(
+        cursors, 0,
+        "and so is the cursor the next pass restarts from"
+    );
 
     worker.shutdown().await;
     cache.close().await;
