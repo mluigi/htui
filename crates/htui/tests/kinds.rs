@@ -11,10 +11,10 @@ use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     ItemKind, ItemKindId, ItemKindPatch, NewProject, PhaseId, PhasePatch, ProjectId, Scope,
-    StepGraphId, StepGraphPatch, WorkspaceId,
+    StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
 };
-use htui_core::seed::PHASES_PER_PROJECT;
-use htui_core::store::{MemStore, ReadStore, StoreError, WriteStore};
+use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
+use htui_core::store::{MemStore, ReadStore, StoreError, WriteStore, reserved_phase_name};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 
 /// The demo world behind a memory backend: a `Writer::Memory` and the seeded catalogue M2 gave
@@ -461,5 +461,215 @@ async fn create_graph_and_update_graph() {
     assert!(
         matches!(reply, StoreReply::CatalogueStale(_)),
         "the first token is spent: {reply:?}"
+    );
+}
+
+/// One graph's phases, in position order.
+#[track_caller]
+fn phases(snapshot: &CatalogueSnapshot, graph: StepGraphId) -> &[StepGraphPhase] {
+    &snapshot.projects[0]
+        .graph(graph)
+        .unwrap_or_else(|| panic!("the catalogue still names {graph}"))
+        .phases
+}
+
+/// A created phase is the seeder's own row with exactly the request's five columns written over
+/// it: the eight frozen ones come from `seed::phase_row` and from nowhere else (D9, D17b, H-2).
+#[tokio::test]
+async fn create_phase_is_the_seeders_row_plus_five_columns() {
+    let backend = demo();
+
+    let snapshot = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::CreatePhase {
+                scope: vulkan_scope(),
+                graph: ids::GRAPH_VULKAN_ANA,
+                name: "triage".to_owned(),
+                position: 7,
+                template_name: "triage".to_owned(),
+                gate_hard: true,
+                input_kinds: vec!["verdict".to_owned()],
+            },
+        )
+        .await,
+    );
+
+    let rows = phases(&snapshot, ids::GRAPH_VULKAN_ANA);
+    assert_eq!(rows.len(), 3);
+    let created = rows.last().expect("the new phase sorts last by position");
+    assert_eq!(created.name, "triage");
+    assert_eq!(
+        created.output_kind, "triage",
+        "a created phase takes the seeder's rule: output_kind is the name (D17b)"
+    );
+    assert_eq!(created.template_name, "triage");
+    assert_eq!(created.position, 7);
+    assert!(created.gate_hard);
+    assert_eq!(created.input_kinds, ["verdict"]);
+
+    let frozen = phase_row(
+        PhaseId::new(),
+        ids::GRAPH_VULKAN_ANA,
+        7,
+        &PhaseSeed {
+            name: "",
+            input_kinds: &[],
+            gate_hard: true,
+        },
+        Utc::now(),
+    );
+    assert_eq!(created.fan_out, frozen.fan_out);
+    assert_eq!(created.gate, frozen.gate);
+    assert_eq!(created.retry_limit, frozen.retry_limit);
+    assert_eq!(created.isolation, frozen.isolation);
+    assert_eq!(created.command_queue, frozen.command_queue);
+    assert_eq!(created.verify_command, frozen.verify_command);
+    assert_eq!(created.template_version, frozen.template_version);
+    assert_eq!(created.token_budget, frozen.token_budget);
+    assert_eq!(
+        created.token_budget, None,
+        "a phase is born inheriting (B-3)"
+    );
+}
+
+/// `judge` and `handoff` are template roles, not phase names: the store refuses them, so nothing
+/// in the app re-checks it (F-8).
+#[tokio::test]
+async fn create_phase_with_a_reserved_name_is_refused() {
+    let (request, message) = refusal(
+        serve(
+            &demo(),
+            &StoreRequest::CreatePhase {
+                scope: vulkan_scope(),
+                graph: ids::GRAPH_VULKAN_ANA,
+                name: "judge".to_owned(),
+                position: 7,
+                template_name: "judge".to_owned(),
+                gate_hard: false,
+                input_kinds: Vec::new(),
+            },
+        )
+        .await,
+    );
+
+    assert_eq!(request, "create_phase");
+    assert!(
+        message.contains(&reserved_phase_name("judge")),
+        "the seam's own sentence reaches the section: {message}"
+    );
+}
+
+/// `input_kinds` is replaced whole, empty list included (D13).
+#[tokio::test]
+async fn update_phase_replaces_input_kinds_whole() {
+    let backend = demo();
+    let before = demo_catalogue(&backend).await;
+    let verdict = &phases(&before, ids::GRAPH_VULKAN_ANA)[1];
+    assert_eq!(verdict.input_kinds, ["research"], "the seeded list");
+    let expected = verdict.updated_at;
+    let id = verdict.id;
+
+    let snapshot = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::UpdatePhase {
+                scope: vulkan_scope(),
+                id,
+                expected,
+                patch: PhasePatch {
+                    input_kinds: Some(Vec::new()),
+                    ..PhasePatch::default()
+                },
+            },
+        )
+        .await,
+    );
+
+    let after = &phases(&snapshot, ids::GRAPH_VULKAN_ANA)[1];
+    assert!(after.input_kinds.is_empty());
+    assert_ne!(after.updated_at, expected, "the CAS token moved");
+}
+
+/// `token_budget` rides the `Phase` rung and nothing else (D6, D16): `Some` sets, `None` clears so
+/// the rung below answers, a number the column cannot hold is the store's own refusal (B-1), and a
+/// spent token is a CAS miss (B-2).
+#[tokio::test]
+async fn set_phase_budget_sets_then_clears() {
+    let backend = demo();
+    let before = demo_catalogue(&backend).await;
+    let seeded = &phases(&before, ids::GRAPH_VULKAN_ANA)[0];
+    let phase = seeded.id;
+    assert_eq!(seeded.token_budget, None, "the seed inherits");
+
+    let set = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::SetPhaseBudget {
+                scope: vulkan_scope(),
+                phase,
+                expected: seeded.updated_at,
+                budget: Some(60_000),
+            },
+        )
+        .await,
+    );
+    let after_set = &phases(&set, ids::GRAPH_VULKAN_ANA)[0];
+    assert_eq!(after_set.token_budget, Some(60_000));
+
+    let stale = serve(
+        &backend,
+        &StoreRequest::SetPhaseBudget {
+            scope: vulkan_scope(),
+            phase,
+            expected: seeded.updated_at,
+            budget: Some(90_000),
+        },
+    )
+    .await;
+    assert!(
+        matches!(stale, StoreReply::CatalogueStale(_)),
+        "the token the set spent does not write twice: {stale:?}"
+    );
+
+    let (request, message) = refusal(
+        serve(
+            &backend,
+            &StoreRequest::SetPhaseBudget {
+                scope: vulkan_scope(),
+                phase,
+                expected: after_set.updated_at,
+                budget: Some(i64::MAX),
+            },
+        )
+        .await,
+    );
+    assert_eq!(request, "set_phase_budget");
+    // The blueprint (B-1, H-5) expected the column's `does not fit … which is INTEGER` sentence
+    // here. `validate` runs first and the `Phase` rung's range is already `1..=i32::MAX`, so what
+    // actually reaches the section is the range refusal; the INTEGER cast below it is defence in
+    // depth a validated value never reaches. Either way the store is the one validator (M1 D7) and
+    // the section re-implements no bound.
+    assert!(
+        message.contains("is outside 1..=2147483647 tokens"),
+        "the store's own sentence reaches the section: {message}"
+    );
+
+    let cleared = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::SetPhaseBudget {
+                scope: vulkan_scope(),
+                phase,
+                expected: after_set.updated_at,
+                budget: None,
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        phases(&cleared, ids::GRAPH_VULKAN_ANA)[0].token_budget,
+        None,
+        "clearing lets the project rung answer rather than writing a guessed default"
     );
 }

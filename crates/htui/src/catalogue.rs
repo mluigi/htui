@@ -8,12 +8,16 @@
 //! Nothing here resolves an identity: no row this module writes carries a `created_by` or a box, so
 //! unlike [`crate::hierarchy`] there is no `this_user` and no `box_info` call in the file.
 
+use chrono::Utc;
 use htui_core::model::{
-    ItemKind, ItemKindId, NewItemKind, NewStepGraph, Project, Scope, StepGraph, StepGraphId,
-    StepGraphPhase,
+    ItemKind, ItemKindId, NewItemKind, NewStepGraph, PhaseId, Project, Scope, StepGraph,
+    StepGraphId, StepGraphPhase,
 };
-use htui_core::store::{CasOutcome, ReadStore, Result, StoreError, WriteStore};
+use htui_core::prompt::SettingKey;
+use htui_core::seed;
+use htui_core::store::{CasOutcome, ReadStore, Result, SettingRung, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
+use serde_json::Value;
 
 use crate::store_worker::{StoreReply, StoreRequest};
 
@@ -176,6 +180,82 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let outcome = writer
                 .update_step_graph(*id, *expected, patch.clone())
                 .await?;
+            cas(&writer, scope, &outcome).await
+        }
+        StoreRequest::CreatePhase {
+            scope,
+            graph,
+            name,
+            position,
+            template_name,
+            gate_hard,
+            input_kinds,
+        } => {
+            // D9/F-6: `PhaseSeed`'s `name` and `input_kinds` are `&'static`, so typed text cannot
+            // travel through them. The seed carries `gate_hard` alone and the four text columns are
+            // written over the row `phase_row` returned — the eight frozen ones (`fan_out`, `gate`,
+            // `retry_limit`, `isolation`, `command_queue`, `verify_command`, `template_version`,
+            // `token_budget`) are never named here, so the app is not a second source of ANA-2's
+            // defaults. `create_phase` ignores the row's `updated_at` and returns the store's own
+            // clock, so the `now` below is not this crate setting the column by hand.
+            let mut row = seed::phase_row(
+                PhaseId::new(),
+                *graph,
+                *position,
+                &seed::PhaseSeed {
+                    name: "",
+                    input_kinds: &[],
+                    gate_hard: *gate_hard,
+                },
+                Utc::now(),
+            );
+            row.name = name.clone();
+            row.output_kind = name.clone();
+            row.template_name = template_name.clone();
+            row.input_kinds = input_kinds.clone();
+            writer.create_phase(&row).await?;
+            reread(&writer, scope).await
+        }
+        StoreRequest::UpdatePhase {
+            scope,
+            id,
+            expected,
+            patch,
+        } => {
+            let outcome = writer.update_phase(*id, *expected, patch.clone()).await?;
+            cas(&writer, scope, &outcome).await
+        }
+        // `set` and `clear` are separate operations because clearing lets the compiled default
+        // answer rather than the editor guessing at a constant (PRD D7, D16). `expected` is always
+        // `Some` on the set: the Phase rung refuses `None` with a constraint, not a CAS miss (B-2,
+        // H-4), and the editor always has the row's token.
+        StoreRequest::SetPhaseBudget {
+            scope,
+            phase,
+            expected,
+            budget,
+        } => {
+            let outcome = match budget {
+                Some(number) => {
+                    writer
+                        .set_setting(
+                            SettingRung::Phase(*phase),
+                            SettingKey::TokenBudget,
+                            Value::from(*number),
+                            Some(*expected),
+                        )
+                        .await?
+                }
+                None => {
+                    writer
+                        .clear_setting(
+                            SettingRung::Phase(*phase),
+                            SettingKey::TokenBudget,
+                            *expected,
+                        )
+                        .await?
+                }
+            };
             cas(&writer, scope, &outcome).await
         }
         // `try_serve` routes exactly this module's nine variants here, so the last arm is
