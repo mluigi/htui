@@ -311,3 +311,24 @@ async fn the_fake_keyring_round_trips() {
     assert_eq!(secret::get_dsn().expect("read"), None);
     secret::clear_dsn().expect("clearing twice is not an error");
 }
+
+/// A keyring that cannot be opened is **not** a keyring with nothing in it (the M6 follow-up fix).
+///
+/// Mapping the failure to `Ok(None)` here would tell a user whose collection is merely locked that
+/// they have no DSN, and invite them to retype a credential into a store that cannot hold it. The
+/// distinction is the asset; it is `connect::start` that decides to launch anyway.
+#[tokio::test]
+async fn a_broken_keyring_is_an_error_and_not_an_empty_one() {
+    let _keyring = testkit::mock_keyring_broken().await;
+
+    let err = secret::get_dsn().expect_err("an unreadable keyring is not an empty keyring");
+    let sentence = err.to_string();
+    assert!(
+        sentence.contains("cannot read the keyring entry (htui/postgres-dsn)")
+            && sentence.contains(testkit::BROKEN_KEYRING),
+        "the seam names the entry and quotes the platform: {sentence}"
+    );
+
+    secret::set_dsn("postgres://u@h/d").expect_err("a write fails too");
+    secret::clear_dsn().expect_err("and so does a delete");
+}

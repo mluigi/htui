@@ -281,3 +281,85 @@ async fn the_mirror_directory_is_the_dsn_fingerprint() {
 
     close(&started).await;
 }
+
+/// A keyring that cannot be read starts the shell offline rather than refusing to launch.
+///
+/// The box this exists for has a session bus and no unlocked collection — a minimal window
+/// manager, a container, most CI images — and `keyring` answers `NoStorageAccess` there, not
+/// `NoEntry`. Before this fix `start` propagated it and the binary never drew a frame, which is
+/// the exact opposite of the rule this module opens with: a first launch must still open offline.
+///
+/// `get_dsn` keeps reporting the failure as an error; what changed is that `start` treats it as
+/// "no DSN this session" — an offline backend already at an age, with no reconnect armed and no
+/// dial spawned — instead of an abort.
+#[tokio::test]
+async fn a_broken_keyring_starts_offline_instead_of_refusing_to_launch() {
+    let _keyring = common::mock_keyring_broken().await;
+    let root = tempfile::tempdir().expect("temp root");
+
+    assert!(
+        htui_store::secret::get_dsn().is_err(),
+        "the seam still tells an unreadable keyring apart from an empty one"
+    );
+
+    let mut started = start(StartOptions::new(root.path().to_owned()))
+        .await
+        .expect("a keyring that cannot be read is not a reason to abort");
+
+    assert!(
+        matches!(started.backend, Backend::Offline { since: Some(_), .. }),
+        "no dial is coming, so the top bar reads an age rather than `connecting`"
+    );
+    assert_eq!(started.backend.label(), "offline · 0s");
+    assert!(
+        started.reconnect.is_none(),
+        "there is no DSN to re-dial with"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), started.events.recv())
+            .await
+            .is_err(),
+        "nothing was spawned, so no event ever arrives"
+    );
+    assert_eq!(
+        started
+            .backend
+            .cache()
+            .expect("the mirror is opened anyway")
+            .dir(),
+        root.path().join("cache").join("offline"),
+        "the no-DSN mirror, the same one an empty keyring gets"
+    );
+
+    close(&started).await;
+}
+
+/// An explicit DSN never consults the keyring, so a broken one cannot spoil `--set-dsn`'s session
+/// or a test's own override.
+#[tokio::test]
+async fn a_broken_keyring_does_not_override_an_explicit_dsn() {
+    let _keyring = common::mock_keyring_broken().await;
+    let root = tempfile::tempdir().expect("temp root");
+
+    let started = start(StartOptions {
+        dsn: Some("postgres://nobody:nothing@127.0.0.1:1/none".to_owned()),
+        offline: true,
+        ..StartOptions::new(root.path().to_owned())
+    })
+    .await
+    .expect("start offline over an explicit DSN");
+
+    assert_eq!(
+        started
+            .backend
+            .cache()
+            .expect("an offline backend owns the mirror")
+            .dir(),
+        root.path().join("cache").join(
+            htui_store::identity::db_fingerprint("postgres://nobody:nothing@127.0.0.1:1/none")
+        ),
+        "the explicit DSN's mirror, not the no-DSN one"
+    );
+
+    close(&started).await;
+}

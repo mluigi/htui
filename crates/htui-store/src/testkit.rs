@@ -300,7 +300,31 @@ impl Drop for KeyringGuard {
 /// the slot run one after the other rather than overwriting each other's DSN.
 pub async fn mock_keyring() -> KeyringGuard {
     let lock = KEYRING.lock().await;
-    *crate::secret::fake() = Some(None);
+    *crate::secret::fake() = Some(crate::secret::Fake::Slot(None));
+    KeyringGuard { _lock: lock }
+}
+
+/// What a keyring that cannot be opened at all answers with.
+///
+/// The sentence a Linux box with a session bus and **no unlocked collection** produces — a minimal
+/// window manager, a container, most CI images. It is `keyring`'s own `NoStorageAccess` text, so a
+/// test asserting on it is asserting on what a user would actually see.
+pub const BROKEN_KEYRING: &str =
+    "Couldn't access platform secure storage: Secret Service: no result found";
+
+/// [`mock_keyring`] for a keyring that answers **nothing**: every read, write and delete fails
+/// with [`BROKEN_KEYRING`] until the guard drops.
+///
+/// Not "empty": an empty keyring is [`mock_keyring`], and the difference between the two is the
+/// point. `get_dsn` keeps reporting the failure as an error, and what the callers do with it —
+/// [`crate::connect::start`] launches offline anyway, the connection section shows the reason —
+/// is what these tests pin.
+///
+/// Shares [`KEYRING`] and [`KeyringGuard`] with [`mock_keyring`]: there is one process-wide slot,
+/// so the two must not be installable at the same time.
+pub async fn mock_keyring_broken() -> KeyringGuard {
+    let lock = KEYRING.lock().await;
+    *crate::secret::fake() = Some(crate::secret::Fake::Broken(BROKEN_KEYRING.to_owned()));
     KeyringGuard { _lock: lock }
 }
 
@@ -309,12 +333,19 @@ pub async fn mock_keyring() -> KeyringGuard {
 /// # Panics
 ///
 /// Outside a [`mock_keyring`] guard — reading the real keyring from a test is exactly what this
-/// helper exists to make impossible.
+/// helper exists to make impossible — and under a [`mock_keyring_broken`] one, which holds no DSN
+/// to report and answers every call with an error instead.
 #[must_use]
 pub fn fake_dsn() -> Option<String> {
-    crate::secret::fake()
+    match crate::secret::fake()
         .clone()
         .expect("fake keyring not installed; take a `mock_keyring()` guard first")
+    {
+        crate::secret::Fake::Slot(slot) => slot,
+        crate::secret::Fake::Broken(_) => {
+            panic!("the fake keyring is broken; it holds no DSN to read")
+        }
+    }
 }
 
 /// Writes the six unscoped tables of a [`DemoData`] straight into a mirror, with no server.

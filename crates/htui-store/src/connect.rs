@@ -233,11 +233,18 @@ const EVENT_QUEUE: usize = 4;
 /// With `offline` or without a DSN the backend starts at `since: Some(now)`, so the top bar reads
 /// `offline · 0s` rather than a `connecting` that will never resolve.
 ///
+/// A keyring that **cannot be read** is the same start, plus a `warn!`: a box with a session bus
+/// and no unlocked collection — a minimal window manager, a container, most CI images — answers
+/// `NoStorageAccess` rather than `NoEntry`, and propagating that meant the binary never drew a
+/// frame at all. It is not mapped to "no DSN stored" anywhere below [`secret::get_dsn`], which
+/// keeps reporting it as an error: the session simply has no DSN to dial with, and the connection
+/// section says *why* rather than claiming the keyring is empty.
+///
 /// # Errors
 ///
-/// [`htui_core::store::StoreError::Backend`] when `box.toml` cannot be read or minted, when the
-/// keyring refuses to answer, or when the mirror cannot be opened. A *missing* DSN is not an
-/// error: a first launch must still open offline (blueprint C.15).
+/// [`htui_core::store::StoreError::Backend`] when `box.toml` cannot be read or minted, or when the
+/// mirror cannot be opened. Neither a *missing* DSN nor an *unreadable* keyring is an error: a
+/// first launch must still open offline (blueprint C.15).
 pub async fn start(opts: StartOptions) -> Result<Started> {
     let root = opts.config_root.clone();
     // Minted here so the failure is reported to the caller rather than swallowed by the spawned
@@ -247,7 +254,19 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
     // goes, and `attempt` gets a fresh plain copy per dial that it consumes and drops.
     let dsn: Option<Zeroizing<String>> = match opts.dsn {
         Some(dsn) => Some(Zeroizing::new(dsn)),
-        None => secret::get_dsn()?.map(Zeroizing::new),
+        // A keyring that refuses to answer starts the session with no DSN rather than killing it.
+        // The sentence names the entry and quotes the platform; neither carries a DSN, because
+        // this is the path on which nothing was read.
+        None => match secret::get_dsn() {
+            Ok(stored) => stored.map(Zeroizing::new),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the keyring could not be read; starting offline with no DSN"
+                );
+                None
+            }
+        },
     };
 
     let fingerprint = dsn.as_deref().map_or_else(
