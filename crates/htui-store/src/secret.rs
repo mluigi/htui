@@ -7,6 +7,11 @@
 //! crate at run time.
 //!
 //! TLS is whatever the DSN's `sslmode=` says; `PgConnectOptions::from_str` handles it (`R-STO-2`).
+//!
+//! Under `--cfg feature = "test-support"` — which the binary never enables — the three functions
+//! consult [`FAKE`] first, so a test can round-trip a DSN without touching the developer's OS
+//! store. Nothing installs it but [`crate::testkit::mock_keyring`]; with it uninstalled the
+//! production path below is what runs, unchanged (blueprint flag L, ruling §0.3).
 
 use htui_core::store::{Result, StoreError};
 use keyring::{Entry, Error as KeyringError};
@@ -16,6 +21,24 @@ pub const SERVICE: &str = "htui";
 
 /// Keyring user name of the DSN entry.
 pub const USER: &str = "postgres-dsn";
+
+/// A process-wide stand-in for the keyring, for tests that must round-trip a DSN (D18, flag L).
+///
+/// `keyring::mock` keeps the secret **in the entry** and this module opens a fresh [`Slot`] per
+/// call (see [`Slot`]'s own note), so the crate's mock cannot see a [`set_dsn`] from a later
+/// [`get_dsn`]. Outer `None`: not installed, the real keyring answers — which is the only state a
+/// binary can ever be in, because the binary does not enable `test-support` and nothing but
+/// [`crate::testkit::mock_keyring`] writes this. `Some(slot)`: every call reads and writes `slot`.
+#[cfg(feature = "test-support")]
+pub(crate) static FAKE: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+
+/// The fake slot, poison-tolerant: a test that panicked mid-assertion must not poison every later
+/// one.
+#[cfg(feature = "test-support")]
+pub(crate) fn fake() -> std::sync::MutexGuard<'static, Option<Option<String>>> {
+    FAKE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The stored DSN, or `None` when nothing is stored.
 ///
@@ -27,6 +50,10 @@ pub const USER: &str = "postgres-dsn";
 /// [`StoreError::Backend`] for every other keyring failure — a locked keychain, a missing secret
 /// service, a platform that has none.
 pub fn get_dsn() -> Result<Option<String>> {
+    #[cfg(feature = "test-support")]
+    if let Some(slot) = &*fake() {
+        return Ok(slot.clone().filter(|dsn| !dsn.trim().is_empty()));
+    }
     Slot::open(SERVICE, USER)?.get()
 }
 
@@ -36,6 +63,11 @@ pub fn get_dsn() -> Result<Option<String>> {
 ///
 /// [`StoreError::Backend`] when the keyring refuses the write.
 pub fn set_dsn(dsn: &str) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(slot) = &mut *fake() {
+        *slot = Some(dsn.to_owned());
+        return Ok(());
+    }
     Slot::open(SERVICE, USER)?.set(dsn)
 }
 
@@ -45,6 +77,11 @@ pub fn set_dsn(dsn: &str) -> Result<()> {
 ///
 /// [`StoreError::Backend`] when the keyring refuses the delete.
 pub fn clear_dsn() -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(slot) = &mut *fake() {
+        *slot = None;
+        return Ok(());
+    }
     Slot::open(SERVICE, USER)?.clear()
 }
 

@@ -270,6 +270,49 @@ pub fn parse_dsn(dsn: &str) -> PgConnectOptions {
     PgConnectOptions::from_str(dsn).expect("a parseable DSN")
 }
 
+/// Serialises the tests that touch the fake keyring: it is one process-wide slot.
+static KEYRING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Holds the fake keyring installed and empty until dropped (MOD-15 M6 D18).
+#[derive(Debug)]
+pub struct KeyringGuard(tokio::sync::MutexGuard<'static, ()>);
+
+impl Drop for KeyringGuard {
+    fn drop(&mut self) {
+        *crate::secret::fake() = None;
+    }
+}
+
+/// Routes [`crate::secret::get_dsn`], [`crate::secret::set_dsn`] and
+/// [`crate::secret::clear_dsn`] to an empty in-process slot until the guard drops (D18).
+///
+/// **Never the developer's keyring.** A test that forgets the guard and calls `set_dsn` writes to
+/// the OS store, which is why every case that can reach the keyring takes one as its first
+/// statement. `keyring::mock` is not enough on its own: it keeps the secret in the `Entry` and
+/// `secret.rs` opens a fresh `Slot` per call, so a `set_dsn` there is invisible to the next
+/// `get_dsn` (blueprint flag L).
+///
+/// The returned guard also holds a process-wide lock, so two `#[tokio::test]`s that both install
+/// the slot run one after the other rather than overwriting each other's DSN.
+pub async fn mock_keyring() -> KeyringGuard {
+    let guard = KEYRING.lock().await;
+    *crate::secret::fake() = Some(None);
+    KeyringGuard(guard)
+}
+
+/// What the fake keyring holds, for assertions.
+///
+/// # Panics
+///
+/// Outside a [`mock_keyring`] guard — reading the real keyring from a test is exactly what this
+/// helper exists to make impossible.
+#[must_use]
+pub fn fake_dsn() -> Option<String> {
+    crate::secret::fake()
+        .clone()
+        .expect("fake keyring not installed; take a `mock_keyring()` guard first")
+}
+
 /// Writes the six unscoped tables of a [`DemoData`] straight into a mirror, with no server.
 ///
 /// The refresher is the only *production* writer of `cache.sqlite` and it needs a `PgPool`; a test
