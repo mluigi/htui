@@ -1,15 +1,23 @@
 //! One single-line text field with a char cursor and an optional mask (MOD-15 milestone 3, D1;
-//! PRD D1). The widget MOD-22, MOD-23 and milestone 6's DSN entry consume; the mask has no
-//! consumer until milestone 6.
+//! PRD D1). The widget MOD-22, MOD-23 and the connection section's DSN entry consume.
 //!
 //! Width is counted in `char`s, not display columns: no `unicode-width` is declared anywhere in
-//! the workspace, and every field this milestone opens holds a slug, a name, a branch or a path.
-//! Multi-line, history, bracketed paste, a reveal toggle, validation and `Zeroizing` are
-//! deliberately not built — milestone 6 owns the secret-handling half.
+//! the workspace, and every field this widget opens holds a slug, a name, a branch, a path or a
+//! DSN. Multi-line, history, bracketed paste, a reveal toggle and validation are deliberately not
+//! built.
+//!
+//! **`Zeroizing` arrived with milestone 6** (D3), and it covers exactly this much: the buffer is
+//! wiped when the field drops, when [`clear`](TextField::clear) is called, and — because
+//! [`masked`](TextField::masked) reserves 256 bytes — without a trail of half-typed reallocations
+//! behind it. What it does not reach is priced rather than claimed: the terminal's own input
+//! buffering, the kernel's, and any allocation a `with_text` field outgrew before this. The one
+//! secret this widget ever holds leaves it through [`take`](TextField::take), which **moves** the
+//! allocation to a caller that wraps it in `Zeroizing` on the same line.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::ui::Theme;
 
@@ -31,7 +39,11 @@ pub enum FieldOutcome {
 #[derive(Clone, Default)]
 pub struct TextField {
     /// What was typed. Never printed by [`Debug`](core::fmt::Debug).
-    text: String,
+    ///
+    /// Wiped on drop (D3). For a slug that costs nothing; for a DSN it is the point — and it is
+    /// the reason the type is the same for both, since a field that zeroized only when masked
+    /// would be one `masked: false` away from not zeroizing at all.
+    text: Zeroizing<String>,
     /// Char index, `0..=text.chars().count()`.
     cursor: usize,
     /// Whether [`line`](TextField::line) draws `•` per char and [`text`](TextField::text) refuses.
@@ -60,16 +72,20 @@ impl TextField {
 
     /// An empty masked field: it draws `•` per char and [`text`](TextField::text) is `None`.
     ///
-    /// The mask is a **rendering** guarantee, not a storage one: the buffer is a plain `String`,
-    /// it is not zeroized on drop, and `TextField: Clone` duplicates it. Milestone 6 is the first
-    /// caller with an actual secret and owns both halves — the zeroizing buffer here, and the
-    /// other end of the same rule: **a DSN must not reach the worker as a plain `String` field on
-    /// [`StoreRequest`](crate::store_worker::StoreRequest)**, which derives `Debug` and is printed
-    /// by every test that reports an unexpected reply. It owes a redacting newtype instead.
+    /// Reserves 256 bytes, so a DSN of ordinary length never reallocates — a `String` that grows
+    /// past its capacity copies its bytes into a new allocation and frees the old one **unwiped**,
+    /// which would leave a secret behind at every intermediate size on the way to being typed.
+    ///
+    /// The mask is still a **rendering** guarantee and the reservation a storage one; neither is
+    /// the whole story. The other half of the rule lives one crate over: **a DSN must not reach
+    /// the worker as a plain `String`** on [`StoreRequest`](crate::store_worker::StoreRequest),
+    /// which derives `Debug` and is printed by every test that reports an unexpected reply. It
+    /// travels as [`htui_store::Dsn`], whose `Debug` is `Dsn(<redacted>)`.
     #[must_use]
     pub fn masked() -> Self {
         Self {
             masked: true,
+            text: Zeroizing::new(String::with_capacity(256)),
             ..Self::default()
         }
     }
@@ -78,7 +94,7 @@ impl TextField {
     #[must_use]
     pub fn with_text(text: &str) -> Self {
         Self {
-            text: text.to_owned(),
+            text: Zeroizing::new(text.to_owned()),
             cursor: text.chars().count(),
             masked: false,
         }
@@ -154,18 +170,30 @@ impl TextField {
     /// secret by accident and cannot read one twice.
     #[must_use]
     pub fn text(&self) -> Option<&str> {
-        if self.masked { None } else { Some(&self.text) }
+        if self.masked {
+            None
+        } else {
+            Some(self.text.as_str())
+        }
     }
 
     /// Moves the buffer out, leaving the field empty. The only read of a masked field.
+    ///
+    /// The allocation **moves**: nothing is copied, so a masked caller that wraps the result in
+    /// `Zeroizing` on the same line is holding the very bytes that were typed and is the only one
+    /// holding them. What it leaves behind is a fresh empty `String`, so a field that is going to
+    /// be typed into again wants a new [`masked`](TextField::masked) rather than this one reused.
     pub fn take(&mut self) -> String {
         self.cursor = 0;
-        core::mem::take(&mut self.text)
+        core::mem::take(&mut *self.text)
     }
 
-    /// Empties the field.
+    /// Empties the field, wiping the buffer where it is (D3).
+    ///
+    /// `String::clear` would set the length to zero and leave every byte of what was typed in the
+    /// allocation; this writes over the whole capacity and keeps it.
     pub fn clear(&mut self) {
-        self.text.clear();
+        self.text.zeroize();
         self.cursor = 0;
     }
 
@@ -492,6 +520,79 @@ mod tests {
         let mut cleared = TextField::with_text("gone");
         cleared.clear();
         assert!(cleared.is_empty());
+    }
+
+    /// D3: a masked field reserves its buffer up front, so a DSN typed one key at a time never
+    /// reallocates.
+    ///
+    /// The reservation is not decoration. [`Zeroizing`] wipes the allocation a `String` **holds**;
+    /// a `push` that outgrows the current capacity copies the bytes into a new allocation and
+    /// frees the old one with the secret still in it, and nothing in safe Rust can go back for it.
+    /// 256 bytes is past any DSN a person types, so the wipe on drop covers the whole life of the
+    /// buffer rather than its last few characters.
+    #[test]
+    fn a_masked_field_reserves_its_buffer() {
+        let mut field = TextField::masked();
+        let reserved = field.text.capacity();
+        assert!(
+            reserved >= 256,
+            "a masked field starts with room for a DSN, not with nothing: {reserved}"
+        );
+
+        for c in "postgres://htui:s3cret@db.example.internal:5432/htui?sslmode=require".chars() {
+            field.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(field.len(), 68, "a DSN of ordinary length");
+        assert_eq!(
+            field.text.capacity(),
+            reserved,
+            "and it fitted in the first allocation, so there is no trail of half-typed copies"
+        );
+
+        // The unmasked field makes no such promise and should not pay for one: it holds a slug, a
+        // name or a path, and it is not what this reservation exists for.
+        assert_eq!(TextField::new().text.capacity(), 0);
+    }
+
+    /// D3: `clear` wipes the buffer where it is instead of dropping it.
+    ///
+    /// `String::clear` would set the length to zero and leave every byte of the secret in the
+    /// allocation, which the next `Debug` of a heap dump still reads. `Zeroize` writes the whole
+    /// capacity — the initialised bytes and the spare — and keeps the allocation, which is what
+    /// the unchanged capacity below pins: a wipe in place, not a free and a new one somewhere else.
+    ///
+    /// What it cannot assert is the bytes themselves: reading a `String`'s spare capacity needs
+    /// `unsafe`, which the workspace forbids. The reachable half is what is asserted; the rest is
+    /// `zeroize`'s own contract for `String` and is priced as such in the module doc.
+    #[test]
+    fn clear_wipes_the_buffer_in_place() {
+        let mut field = TextField::masked();
+        for c in "hunter2".chars() {
+            field.on_key(key(KeyCode::Char(c)));
+        }
+        let reserved = field.text.capacity();
+
+        field.clear();
+
+        assert!(field.is_empty(), "nothing is left to read");
+        assert_eq!(field.len(), 0);
+        assert_eq!(field.cursor, 0, "and the cursor came back with it");
+        assert_eq!(
+            field.text.capacity(),
+            reserved,
+            "the same allocation, zeroed, rather than a freed one still holding the secret"
+        );
+
+        // `take` is the other disposal point, and it moves the buffer out rather than copying it:
+        // the field is left empty, and what the caller holds is the very allocation that was
+        // typed into, for it to wipe in turn.
+        let mut taken = TextField::masked();
+        for c in "hunter2".chars() {
+            taken.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(taken.take(), "hunter2");
+        assert!(taken.is_empty());
+        assert_eq!(taken.cursor, 0);
     }
 
     #[test]
