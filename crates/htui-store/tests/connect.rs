@@ -355,9 +355,11 @@ async fn a_broken_keyring_does_not_override_an_explicit_dsn() {
             .cache()
             .expect("an offline backend owns the mirror")
             .dir(),
-        root.path().join("cache").join(
-            htui_store::identity::db_fingerprint("postgres://nobody:nothing@127.0.0.1:1/none")
-        ),
+        root.path()
+            .join("cache")
+            .join(htui_store::identity::db_fingerprint(
+                "postgres://nobody:nothing@127.0.0.1:1/none"
+            )),
         "the explicit DSN's mirror, not the no-DSN one"
     );
 
