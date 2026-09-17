@@ -1750,6 +1750,107 @@ async fn a_patch_and_budget_change_is_two_writes_in_order() {
     assert!(bench.drained().is_empty(), "with nothing left to send");
 }
 
+/// The budget half of B-4's chain is retried by a second `Enter` when it comes back stale: the
+/// editor's stored budget still holds what the *row* said, so the retry is the `set_phase_budget`
+/// that never landed and not a no-op `update_phase` that would close the editor with the number
+/// the user typed never written (D8, `R-ENT-10`).
+#[tokio::test]
+async fn a_stale_budget_follow_up_is_retried_by_enter() {
+    let backend = demo();
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let stored = research(&snapshot);
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "2");
+    for _ in 0..5 {
+        bench.key(&mut section, "tab");
+    }
+    type_at(&bench, &mut section, "60000");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    // The patch lands, and its reply is what the budget write is sent from.
+    let fresh = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::UpdatePhase {
+                scope: vulkan_scope(),
+                id: stored.id,
+                expected: stored.updated_at,
+                patch: PhasePatch {
+                    name: Some("research2".to_owned()),
+                    ..PhasePatch::default()
+                },
+            },
+        )
+        .await,
+    );
+    let moved = research(&fresh);
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(fresh)));
+    let asked = bench.drained();
+    assert!(
+        matches!(
+            asked.as_slice(),
+            [Action::Store(StoreRequest::SetPhaseBudget { .. })]
+        ),
+        "the budget follows the patch: {asked:?}"
+    );
+
+    // Someone else moved the row while that budget write was out, so it never applied.
+    let current = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::SetPhaseBudget {
+                scope: vulkan_scope(),
+                phase: stored.id,
+                expected: moved.updated_at,
+                budget: Some(1_000),
+            },
+        )
+        .await,
+    );
+    bench.reply(
+        &mut section,
+        &StoreReply::CatalogueStale(Box::new(current.clone())),
+    );
+    assert!(
+        section.captures_input(),
+        "the editor stays open over the number that was typed"
+    );
+    assert!(
+        bench.drained().is_empty(),
+        "a miss retries nothing by itself"
+    );
+
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetPhaseBudget {
+            phase,
+            expected,
+            budget,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("the retry is the budget write, once and alone: {asked:?}");
+    };
+    assert_eq!(*phase, stored.id);
+    assert_eq!(
+        *budget,
+        Some(60_000),
+        "the number that was typed, not the one the other writer left"
+    );
+    assert_eq!(
+        *expected,
+        research(&current).updated_at,
+        "against the token the miss re-took, not the one the patch's reply carried"
+    );
+}
+
 /// `n` on a graph or a phase row creates a phase in that graph, prefilled with the position after
 /// its last one (B-8) and `gate_hard` at `n` (B-3: a phase is born inheriting its budget).
 #[tokio::test]

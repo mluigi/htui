@@ -1026,10 +1026,14 @@ impl KindsSection {
             self.say(DELETED_ELSEWHERE);
             return true;
         };
+        // `stored_budget` is left where it was, holding what the *row* said when the editor opened.
+        // Writing the typed text here would say the number had landed before its write had even
+        // been answered: a `CatalogueStale` or a `Failed` on it would leave the retry `Enter` with
+        // `budget_changed == false`, sending a no-op `update_phase` that closes the editor with the
+        // budget never written. The editor closes on the budget's own reply either way.
         if let Mode::Editing(editor) = &mut self.mode {
             editor.expected = Some(expected);
             editor.follow_up = None;
-            editor.stored_budget = Some(budget.map_or_else(String::new, |n| n.to_string()));
         }
         self.send(
             StoreRequest::SetPhaseBudget {
