@@ -113,6 +113,11 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 /// `None` — including for the read, so the section's `unavailable` path is the same sentence every
 /// other request gets there.
 ///
+/// Known residue, the same one [`crate::hierarchy::serve`] carries and milestone 3 recorded: every
+/// write arm answers `Failed` if the re-read *after* an applied write fails, so the section is told
+/// nothing happened when the row has in fact changed — separating the two needs a seam method that
+/// returns the write's own outcome without a read, and this milestone adds none.
+///
 /// # Errors
 /// Whatever the seam reports, plus [`StoreError::Unreachable`] offline and
 /// [`StoreError::Backend`] for a request that is not one of this module's nine.
