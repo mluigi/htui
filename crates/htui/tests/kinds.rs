@@ -1819,3 +1819,126 @@ async fn a_gate_hard_that_is_not_y_or_n_is_refused() {
     assert!(bench.drained().is_empty());
     assert!(error_text(&bench, &section, 100).contains(&"`gate_hard (y/n)` is y or n".to_owned()));
 }
+
+/// `d` on a kind asks once and writes nothing until `y` (D11).
+///
+/// One confirmation and not PRD D13's two: a kind any item holds cannot be deleted at all, so the
+/// destructive case the typed slug exists for does not arise here.
+#[tokio::test]
+async fn d_on_a_kind_asks_once() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    // project, ANA, its two phases, FEAT.
+    for _ in 0..4 {
+        bench.key(&mut section, "j");
+    }
+
+    bench.key(&mut section, "d");
+
+    assert!(bench.drained().is_empty(), "the question is not a write");
+    assert!(section.captures_input(), "and it is modal while it is up");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        error_text(&bench, &section, 100).contains(
+            &"delete kind feature (FEAT)? a kind any item uses is refused. y delete \u{b7} n/Esc \
+              stop"
+                .to_owned()
+        ),
+        "the question names the kind and what the store will refuse: {frame}"
+    );
+    insta::assert_snapshot!("delete_ask", frame);
+}
+
+/// `y` sends the delete, and a kind an item holds comes back refused in the seam's own words
+/// (D11, F-7) — the section neither counts the items nor phrases the refusal.
+#[tokio::test]
+async fn y_sends_delete_kind_and_a_refusal_is_the_seams_sentence() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    for _ in 0..4 {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "d");
+
+    bench.key(&mut section, "y");
+
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::DeleteKind { scope, id })] = asked.as_slice() else {
+        panic!("`y` deletes once: {asked:?}");
+    };
+    assert_eq!(*scope, bench_scope().await);
+    assert_eq!(*id, ids::KIND_VULKAN_FEAT);
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "delete_kind",
+            message: item_kind_is_held("FEAT", 1),
+        },
+    );
+
+    assert!(!section.captures_input(), "the question has been answered");
+    assert!(
+        error_text(&bench, &section, 100).contains(&"item_kind FEAT is held by 1 items".to_owned()),
+        "the seam's sentence reaches the user untouched"
+    );
+}
+
+/// A kind that is gone reports what happened to the mirror with it (D12): the Backlog must not
+/// keep offering a kind no row answers for.
+#[tokio::test]
+async fn a_kind_delete_reports_the_mirror() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "d");
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    let mut after = snapshot.clone();
+    after.projects[0]
+        .kinds
+        .retain(|k| k.id != ids::KIND_VULKAN_ANA);
+    bench.reply(
+        &mut section,
+        &StoreReply::KindDeleted {
+            mirror: MirrorAfterDelete::Rebuilt,
+            catalogue: Box::new(after),
+        },
+    );
+
+    assert!(!section.captures_input(), "back to the tree");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("deleted kind `ANA`; mirror rebuilt"),
+        "the notice says what went and what was rebuilt: {frame}"
+    );
+    assert!(
+        !frame.contains("ANA  analysis"),
+        "the kind is gone: {frame}"
+    );
+    assert!(
+        frame.contains("analysis \u{b7} graph, no kind"),
+        "and its graph is now the one nothing points at (D4, D5): {frame}"
+    );
+}
+
+/// `d` elsewhere says where deletes live: graphs and phases have no seam method at all (D5), and
+/// projects belong to the hierarchy section (B-13).
+#[tokio::test]
+async fn d_on_a_phase_or_graph_is_refused() {
+    let (bench, mut section, _) = bench_with_demo().await;
+
+    bench.key(&mut section, "d");
+    assert!(bench.drained().is_empty());
+    assert!(
+        error_text(&bench, &section, 100).contains(&"projects are edited in Hierarchy".to_owned())
+    );
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "d");
+    assert!(bench.drained().is_empty());
+    assert!(
+        error_text(&bench, &section, 100)
+            .contains(&"graphs and phases are not deleted here".to_owned()),
+        "a phase row says so in this section's own words"
+    );
+}

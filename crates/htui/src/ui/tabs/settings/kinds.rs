@@ -26,6 +26,7 @@ use htui_core::model::{
 
 use crate::app::{Ctx, Handled};
 use crate::catalogue::{CatalogueSnapshot, GraphEntry, ProjectCatalogue, REQUEST_NAMES};
+use crate::hierarchy::MirrorAfterDelete;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{SectionId, SettingsSection, message};
 use crate::ui::{FieldOutcome, TextField, Theme};
@@ -84,6 +85,13 @@ const BUDGET_IS_A_NUMBER: &str = "`token_budget` is a whole number or empty";
 
 /// What the phase editor says when `gate_hard` is neither `y` nor `n` (B-10).
 const GATE_IS_Y_OR_N: &str = "`gate_hard (y/n)` is y or n";
+
+/// The delete confirmation's keys (D11).
+const HINT_DELETING: &str = "y delete \u{b7} n/Esc stop";
+
+/// What `d` says on a graph or a phase row: the seam has `delete_item_kind` and nothing else in
+/// this area, and this milestone adds no method to it (D5).
+const NOT_DELETED_HERE: &str = "graphs and phases are not deleted here";
 
 /// The tail of the read-only detail line (D15): the columns are MOD-4's to give semantics to, so
 /// they are shown and not edited.
@@ -242,6 +250,17 @@ enum Mode {
     Browse,
     /// One row being typed into.
     Editing(Editor),
+    /// One kind being deleted, behind D11's single confirmation.
+    Deleting {
+        /// The kind the question is about.
+        id: ItemKindId,
+        /// Its name, for the question.
+        name: String,
+        /// Its prefix, for the question and for the notice afterwards.
+        prefix: String,
+        /// How far the confirmation has got.
+        stage: DeleteStage,
+    },
     /// A kind edit whose prefix changed, held in front of the user before it is written (D10).
     ///
     /// The editor is kept whole, so `n`/`Esc` return to it with its text and `y` writes exactly
@@ -254,6 +273,15 @@ enum Mode {
         /// The prefix that was typed.
         new: String,
     },
+}
+
+/// The two stages of a kind delete (D11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteStage {
+    /// The question is on screen and `y` answers it.
+    Asking,
+    /// `delete_kind` is out; there is nothing left to answer.
+    InFlight,
 }
 
 /// The last outcome, and whether it is one the user has to act on.
@@ -603,6 +631,66 @@ impl KindsSection {
         );
     }
 
+    /// `d`: the one destructive key this section has (D11).
+    ///
+    /// One confirmation rather than PRD D13's two: a kind any item holds cannot be deleted at all
+    /// (D6), so the destructive case the typed slug exists for does not arise — and two
+    /// confirmations over an act the database refuses would train the reflex D13 exists to defeat.
+    fn begin_delete(&mut self, row: Row) {
+        match row {
+            Row::Project { .. } => self.refuse(PROJECTS_ELSEWHERE.to_owned()),
+            Row::Graph { .. } | Row::Phase { .. } => self.refuse(NOT_DELETED_HERE.to_owned()),
+            Row::Kind { p, k } => {
+                let Some(kind) = self.project(p).and_then(|project| project.kinds.get(k)) else {
+                    return;
+                };
+                let (id, name, prefix) = (kind.id, kind.name.clone(), kind.prefix.clone());
+                self.notice = None;
+                self.mode = Mode::Deleting {
+                    id,
+                    name,
+                    prefix,
+                    stage: DeleteStage::Asking,
+                };
+            }
+        }
+    }
+
+    /// One key while a kind delete is being confirmed.
+    ///
+    /// Modal over the shell as well as over the tree, as the prefix warning is: an unlisted key is
+    /// swallowed so a `q` at the question does not quit the application, with `CONTROL` chords
+    /// excepted so `ctrl-c` still does.
+    fn on_deleting_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Handled::Pass;
+        }
+        let Mode::Deleting { id, stage, .. } = &mut self.mode else {
+            return Handled::Pass;
+        };
+        let id = *id;
+        match stage {
+            DeleteStage::Asking => match key.code {
+                KeyCode::Char('y') => {
+                    *stage = DeleteStage::InFlight;
+                    self.notice = None;
+                    self.send(
+                        StoreRequest::DeleteKind {
+                            scope: ctx.scope.clone(),
+                            id,
+                        },
+                        ctx,
+                    );
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.mode = Mode::Browse,
+                _ => {}
+            },
+            // Nothing to answer: the row is already going.
+            DeleteStage::InFlight => {}
+        }
+        Handled::Consumed
+    }
+
     /// Sends one write and remembers its name until the reply.
     fn send(&mut self, request: StoreRequest, ctx: &Ctx<'_>) {
         self.busy = Some(request.name());
@@ -620,7 +708,9 @@ impl KindsSection {
                 Some(field) => field.input.on_key(key),
                 None => FieldOutcome::Pass,
             },
-            Mode::Browse | Mode::ConfirmPrefix { .. } => return Handled::Pass,
+            Mode::Browse | Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => {
+                return Handled::Pass;
+            }
         };
         match outcome {
             FieldOutcome::Consumed => Handled::Consumed,
@@ -953,6 +1043,23 @@ impl KindsSection {
         true
     }
 
+    /// A kind is gone, with what the worker did to the mirror afterwards (D12).
+    ///
+    /// The prefix comes from the mode when there is one; a reply that arrives with none — a scope
+    /// change dropped it, say — still reports the mirror rather than panicking (H-16).
+    fn on_deleted(&mut self, mirror: &MirrorAfterDelete, snapshot: &CatalogueSnapshot) {
+        self.busy = None;
+        let prefix = match &self.mode {
+            Mode::Deleting { prefix, .. } => Some(prefix.clone()),
+            Mode::Browse | Mode::Editing(_) | Mode::ConfirmPrefix { .. } => None,
+        };
+        self.mode = Mode::Browse;
+        self.unavailable = None;
+        self.snapshot = Some(snapshot.clone());
+        self.clamp_cursor();
+        self.say(&deleted_notice(prefix.as_deref(), mirror));
+    }
+
     /// A compare-and-set miss (D8): the tree is replaced, the editor keeps its text and takes the
     /// current row's token, and the retry is a second `Enter` rather than an automatic write.
     fn on_stale(&mut self, snapshot: &CatalogueSnapshot) {
@@ -967,7 +1074,7 @@ impl KindsSection {
         }
         let reloaded = match &self.mode {
             Mode::Editing(editor) => Some(reload(snapshot, editor.kind)),
-            Mode::Browse | Mode::ConfirmPrefix { .. } => None,
+            Mode::Browse | Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => None,
         };
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
@@ -1099,6 +1206,7 @@ impl KindsSection {
         let keys = match &self.mode {
             Mode::Editing(_) => HINT_EDITING,
             Mode::ConfirmPrefix { .. } => HINT_CONFIRM_PREFIX,
+            Mode::Deleting { .. } => HINT_DELETING,
             Mode::Browse => {
                 if self.unavailable.is_some() {
                     HINT_UNAVAILABLE
@@ -1123,11 +1231,32 @@ impl KindsSection {
         }
     }
 
-    /// The pane under the rows: the open editor, or nothing at all in Browse.
+    /// The pane under the rows: the open editor, the question being answered, or nothing at all in
+    /// Browse.
+    ///
+    /// Takes the width because both questions are sentences rather than rows and have to wrap
+    /// inside the pane they are measured for — the layout needs the height first.
     fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         match &self.mode {
             Mode::Browse => Vec::new(),
             Mode::Editing(editor) => editor.lines(width, theme),
+            // The question, and while the delete is out, what it is waiting for.
+            Mode::Deleting {
+                name,
+                prefix,
+                stage,
+                ..
+            } => {
+                let mut lines: Vec<Line<'static>> =
+                    wrapped(&delete_question(name, prefix), usize::from(width).max(1))
+                        .into_iter()
+                        .map(|line| Line::styled(line, theme.error))
+                        .collect();
+                if matches!(stage, DeleteStage::InFlight) {
+                    lines.push(Line::styled("delete_kind in flight".to_owned(), theme.dim));
+                }
+                lines
+            }
             // The warning and nothing else: what is being answered is the sentence, and the fields
             // behind it are one `n` away.
             Mode::ConfirmPrefix { old, new, .. } => {
@@ -1210,6 +1339,9 @@ impl SettingsSection for KindsSection {
         if matches!(self.mode, Mode::ConfirmPrefix { .. }) {
             return self.on_confirm_key(key, ctx);
         }
+        if matches!(self.mode, Mode::Deleting { .. }) {
+            return self.on_deleting_key(key, ctx);
+        }
         // Browse. `j`, `k`, `n`, `N`, `e`, `g`, `r` are free: the global table binds `q`, `?`, the
         // digits, `ctrl-c` and `-`, and the tab consumes `h`/`l`/`[`/`]`/arrows before a section is
         // offered the key.
@@ -1246,6 +1378,14 @@ impl SettingsSection for KindsSection {
                 }
                 Handled::Consumed
             }
+            KeyCode::Char('d') => {
+                if !self.blocked()
+                    && let Some(row) = self.selected()
+                {
+                    self.begin_delete(row);
+                }
+                Handled::Consumed
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_cursor(true);
                 Handled::Consumed
@@ -1275,6 +1415,7 @@ impl SettingsSection for KindsSection {
         match reply {
             StoreReply::Catalogue(snapshot) => self.on_catalogue(snapshot, ctx),
             StoreReply::CatalogueStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::KindDeleted { mirror, catalogue } => self.on_deleted(mirror, catalogue),
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
             StoreReply::Failed { request, message } if *request == "catalogue" => {
@@ -1287,7 +1428,12 @@ impl SettingsSection for KindsSection {
             StoreReply::Failed { request, message } if REQUEST_NAMES.contains(request) => {
                 self.busy = None;
                 // The editor stays open over its text: a refused write is retried by fixing what
-                // was refused and pressing `Enter` again.
+                // was refused and pressing `Enter` again. A refused **delete** is not: the seam
+                // answered the question the confirmation asked, so leaving `delete_kind in flight`
+                // on screen would be waiting for something that already came back.
+                if matches!(self.mode, Mode::Deleting { .. }) {
+                    self.mode = Mode::Browse;
+                }
                 self.refuse(message.clone());
             }
             _ => {}
@@ -1580,6 +1726,28 @@ fn prefix_warning(old: &str, new: &str) -> String {
         "items keyed {old}-* keep their keys and their counter; the next item minted under this \
          kind is {new}-1."
     )
+}
+
+/// D11's question, verbatim: what is being deleted, and the one refusal the store may answer with.
+fn delete_question(name: &str, prefix: &str) -> String {
+    format!(
+        "delete kind {name} ({prefix})? a kind any item uses is refused. y delete \u{b7} n/Esc \
+         stop"
+    )
+}
+
+/// What a delete that happened reports, mirror included (D12).
+fn deleted_notice(prefix: Option<&str>, mirror: &MirrorAfterDelete) -> String {
+    let mirror = match mirror {
+        MirrorAfterDelete::Rebuilt => "mirror rebuilt".to_owned(),
+        MirrorAfterDelete::NoMirror => "no mirror".to_owned(),
+        MirrorAfterDelete::NotNeeded => "no rebuild needed".to_owned(),
+        MirrorAfterDelete::Failed(err) => format!("mirror not rebuilt: {err}"),
+    };
+    match prefix {
+        Some(prefix) => format!("deleted kind `{prefix}`; {mirror}"),
+        None => format!("deleted kind; {mirror}"),
+    }
 }
 
 /// What a second write of the same kind is told while the first is still out.
