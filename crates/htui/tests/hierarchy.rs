@@ -1155,6 +1155,9 @@ async fn a_refused_read_is_echoed_and_then_cleared() {
 /// missing instead of rendering a workspace that is not there (E-16).
 #[tokio::test]
 async fn offline_says_it_needs_postgres() {
+    // `App::start` issues `ConnectionInfo` since MOD-15 M6, and over a non-`Memory` backend that
+    // read reaches `secret::get_dsn` - the developer's own OS keyring without this guard.
+    let _keyring = htui_store::testkit::mock_keyring().await;
     // The mirror outlives the harness: dropping the directory deletes it mid-test.
     let root = tempfile::tempdir().expect("a throwaway config root");
     let cache = CacheStore::open(root.path(), "hierarchy-section", PgStore::schema_version())

@@ -876,6 +876,9 @@ async fn no_workspace_says_so() {
 /// write (D7) — so the section says what is missing, in `theme.error`, instead of an empty tree.
 #[tokio::test]
 async fn offline_is_unavailable_with_the_worker_sentence() {
+    // `App::start` issues `ConnectionInfo` since MOD-15 M6, and over a non-`Memory` backend that
+    // read reaches `secret::get_dsn` - the developer's own OS keyring without this guard.
+    let _keyring = htui_store::testkit::mock_keyring().await;
     // The mirror outlives the harness: dropping the directory deletes it mid-test.
     let root = tempfile::tempdir().expect("a throwaway config root");
     let cache = CacheStore::open(root.path(), "kinds-section", PgStore::schema_version())

@@ -8,14 +8,18 @@
 //! **Every case that can reach the keyring takes `common::mock_keyring()` as its first
 //! statement.** The guard installs a process-wide fake slot and holds a lock for as long as it
 //! lives, so a case here can store a DSN and read it back without the developer's OS store ever
-//! being opened (blueprint flag L). The two cases that deliberately take no guard are the ones
-//! asserting that `Backend::Memory` never consults a keyring at all (D10): if they were wrong,
-//! they would be wrong against the real one.
+//! being opened (blueprint flag L). "Can reach the keyring" is **any** backend but `Memory`, and
+//! not only through `ConnectionInfo`: every one of the three writers answers with the same
+//! `connection::snapshot`, which is how `rebuild_cache_empties_the_mirrored_tables_and_keeps_the_meta`
+//! read the developer's real store until the M6 review. The cases that take no guard are the ones
+//! that cannot reach one — those asserting that `Backend::Memory` never consults a keyring at all
+//! (D10), where a guard would hide the bug they exist to catch, the name case, which touches no
+//! backend, and the section half, whose snapshots are literals.
 //!
-//! Four cases are Postgres-gated and return without asserting when `HTUI_TEST_DATABASE_URL` is
-//! unset, as every other Postgres-backed suite in this crate does. One of them,
-//! `set_dsn_goes_online_without_a_restart`, is the milestone's whole point: a box that started
-//! with an empty keyring reaches `online` **in the same process**.
+//! Two cases are Postgres-gated and return without asserting when `HTUI_TEST_DATABASE_URL` is
+//! unset, as every other Postgres-backed suite in this crate does: `set_dsn_goes_online_without_a_restart`
+//! and `a_second_set_dsn_swaps_the_mirror_and_leaves_the_old_file`. The first is the milestone's
+//! whole point: a box that started with an empty keyring reaches `online` **in the same process**.
 //!
 //! The **section half** is T3's and starts at "Settings > Connection: the section" below. It has
 //! no worker at all: a [`SectionBench`] hands the section a [`ConnectionSnapshot`] built here and
@@ -516,6 +520,9 @@ async fn set_dsn_under_offline_stores_but_does_not_dial() {
 /// identity (D14, `cache/mod.rs:166-171`).
 #[tokio::test]
 async fn rebuild_cache_empties_the_mirrored_tables_and_keeps_the_meta() {
+    // `RebuildCache` answers with a `connection::snapshot`, which reads the keyring over any
+    // backend but `Memory`: without this guard the reply is the OS store's refusal, not a snapshot.
+    let _keyring = common::mock_keyring().await;
     let (root, cache) = mirror("connection-rebuild").await;
     common::seed_mirror(&cache, &htui_core::fixtures::demo_data())
         .await

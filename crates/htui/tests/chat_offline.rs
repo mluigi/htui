@@ -134,13 +134,20 @@ async fn offline_mirror(agent_id: AgentId) -> (tempfile::TempDir, CacheStore) {
 /// characters on top of a header that already carries an agent, a model, a project name and a
 /// 41-character session id, and a truncated header would hide the very words the snapshot exists
 /// to pin.
-fn offline_harness(cache: &CacheStore, script: Script) -> Harness {
+///
+/// The [`testkit::KeyringGuard`] comes back with the harness rather than being taken by each case:
+/// since MOD-15 M6 `App::start` issues a `ConnectionInfo`, and over a non-`Memory` backend that
+/// read reaches `secret::get_dsn`. Returned rather than installed and dropped here because the
+/// guard has to outlive `settle()`, and returned rather than left to the caller because a case
+/// added later would otherwise open the developer's own OS keyring and nothing would say so.
+async fn offline_harness(cache: &CacheStore, script: Script) -> (testkit::KeyringGuard, Harness) {
+    let keyring = testkit::mock_keyring().await;
     let adapter = Arc::new(FakeAdapter::new());
     adapter.load(script);
     let mut factory = DriverFactory::new();
     factory.register("acp", Box::new(SharedAdapter(Arc::clone(&adapter))));
 
-    Harness::over_backend(Backend::Offline {
+    let harness = Harness::over_backend(Backend::Offline {
         cache: cache.clone(),
         since: Some(Utc::now()),
     })
@@ -149,7 +156,8 @@ fn offline_harness(cache: &CacheStore, script: Script) -> Harness {
     // `offline · 0s` would age between the render and the next tick; the top bar is not what this
     // suite is about, and the harness override is how every other suite pins it.
     .with_store_state("offline · 0s", None)
-    .size(140, 30)
+    .size(140, 30);
+    (keyring, harness)
 }
 
 /// The turn every case plays: a thought, some text, a tool call and its result, a usage report and
@@ -243,7 +251,7 @@ fn sealed_buffer(cache: &CacheStore) -> (ProjectId, Vec<SessionEvent>) {
 async fn an_offline_chat_is_refused_with_the_unreachable_warning() {
     let agent_id = AgentId::new();
     let (_root, cache) = offline_mirror(agent_id).await;
-    let mut harness = offline_harness(&cache, one_turn());
+    let (_keyring, mut harness) = offline_harness(&cache, one_turn()).await;
     harness.drive().await;
 
     compose(&mut harness, "what is in main.rs");
@@ -286,7 +294,7 @@ async fn an_offline_chat_is_refused_with_the_unreachable_warning() {
 async fn an_offline_chat_is_accepted_and_its_header_says_it_is_buffered() {
     let agent_id = AgentId::new();
     let (_root, cache) = offline_mirror(agent_id).await;
-    let mut harness = offline_harness(&cache, one_turn());
+    let (_keyring, mut harness) = offline_harness(&cache, one_turn()).await;
     harness.drive().await;
 
     compose(&mut harness, "what is in main.rs");
@@ -314,7 +322,7 @@ async fn an_offline_chat_is_accepted_and_its_header_says_it_is_buffered() {
 async fn an_offline_chat_writes_its_rows_to_the_pending_buffer_in_seq_order() {
     let agent_id = AgentId::new();
     let (_root, cache) = offline_mirror(agent_id).await;
-    let mut harness = offline_harness(&cache, one_turn());
+    let (_keyring, mut harness) = offline_harness(&cache, one_turn()).await;
     harness.drive().await;
 
     compose(&mut harness, "what is in main.rs");
@@ -364,7 +372,7 @@ async fn an_offline_chat_writes_its_rows_to_the_pending_buffer_in_seq_order() {
 async fn a_buffered_chat_lands_in_postgres_on_the_next_connection() {
     let agent_id = AgentId::new();
     let (_root, cache) = offline_mirror(agent_id).await;
-    let mut harness = offline_harness(&cache, one_turn());
+    let (_keyring, mut harness) = offline_harness(&cache, one_turn()).await;
     harness.drive().await;
     compose(&mut harness, "what is in main.rs");
     harness.drive().await;
@@ -458,7 +466,7 @@ async fn an_offline_box_that_never_synced_this_user_refuses_and_says_so() {
         .await
         .expect("the mirror is seeded");
 
-    let mut harness = offline_harness(&cache, one_turn());
+    let (_keyring, mut harness) = offline_harness(&cache, one_turn()).await;
     harness.drive().await;
     compose(&mut harness, "what is in main.rs");
     harness.drive().await;
