@@ -8,9 +8,9 @@
 //! Nothing here resolves an identity: no row this module writes carries a `created_by` or a box, so
 //! unlike [`crate::hierarchy`] there is no `this_user` and no `box_info` call in the file.
 
-use htui_core::model::{ItemKind, Project, StepGraph, StepGraphId, StepGraphPhase};
-use htui_core::store::{Result, StoreError};
-use htui_store::{Backend, DATABASE_UNREACHABLE};
+use htui_core::model::{ItemKind, Project, Scope, StepGraph, StepGraphId, StepGraphPhase};
+use htui_core::store::{ReadStore, Result, StoreError, WriteStore};
+use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
 use crate::store_worker::{StoreReply, StoreRequest};
 
@@ -62,6 +62,43 @@ impl ProjectCatalogue {
     }
 }
 
+/// One read of the whole scope: every project of `scope.project_ids` that still names a row, with
+/// its kinds, its graphs and each graph's phases.
+///
+/// N+1 reads on purpose (D3, M3 D5's trade, same words): they happen per event — activation, a
+/// scope change, after a write — never per keystroke, and a joined reader would be a seam method
+/// six implementors would owe for a read nothing else wants.
+///
+/// The bound is `ReadStore + WriteStore` rather than `ReadStore` alone because `item_kinds`,
+/// `step_graphs` and `phases` live on [`WriteStore`] (which extends [`ReadStore`]); only
+/// `project` is on the read half. Same shape as [`crate::hierarchy::snapshot`]'s bound.
+///
+/// # Errors
+/// Whatever the store reports.
+pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
+    store: &S,
+    scope: &Scope,
+) -> Result<CatalogueSnapshot> {
+    let mut projects = Vec::with_capacity(scope.project_ids.len());
+    for id in &scope.project_ids {
+        let Some(project) = store.project(*id).await? else {
+            continue;
+        };
+        let kinds = store.item_kinds(*id).await?;
+        let mut graphs = Vec::new();
+        for graph in store.step_graphs(*id).await? {
+            let phases = store.phases(graph.id).await?;
+            graphs.push(GraphEntry { graph, phases });
+        }
+        projects.push(ProjectCatalogue {
+            project,
+            kinds,
+            graphs,
+        });
+    }
+    Ok(CatalogueSnapshot { projects })
+}
+
 /// Serves one catalogue request, off the UI task.
 ///
 /// `Err(StoreError::Unreachable)` on [`Backend::Offline`], whose [`writer`](Backend::writer) is
@@ -72,15 +109,26 @@ impl ProjectCatalogue {
 /// Whatever the seam reports, plus [`StoreError::Unreachable`] offline and
 /// [`StoreError::Backend`] for a request that is not one of this module's nine.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
-    let _writer = backend
+    let writer = backend
         .writer()
         .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
 
-    // The nine arms land in the commits that follow; `try_serve` routes exactly this module's
-    // variants here, so the sentence below names what a caller sent rather than panicking on it.
-    Err(StoreError::Backend(format!(
-        "not a catalogue request: {}",
-        request.name()
+    match request {
+        StoreRequest::Catalogue(scope) => reread(&writer, scope).await,
+        // `try_serve` routes exactly this module's nine variants here, so the last arm is
+        // unreachable from the shell; a caller that reached it anyway is better told which request
+        // it sent than killed.
+        other => Err(StoreError::Backend(format!(
+            "not a catalogue request: {}",
+            other.name()
+        ))),
+    }
+}
+
+/// The catalogue as it is now, for a read or for a write that applied.
+async fn reread(writer: &Writer, scope: &Scope) -> Result<StoreReply> {
+    Ok(StoreReply::Catalogue(Box::new(
+        snapshot(writer, scope).await?,
     )))
 }
 
