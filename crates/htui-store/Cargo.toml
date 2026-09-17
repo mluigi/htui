@@ -21,6 +21,7 @@ test-support = ["demo"]
 htui-core   = { workspace = true, features = ["sqlx"] }
 sqlx        = { workspace = true }
 keyring     = { workspace = true }
+zeroize     = { workspace = true }
 dirs        = { workspace = true }
 gethostname = { workspace = true }
 sha2        = { workspace = true }

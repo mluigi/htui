@@ -43,6 +43,10 @@ sqlx               = { version = "0.9.0", default-features = false, features = [
                        "chrono", "uuid", "json", "tls-rustls-ring-native-roots"] }
 keyring            = { version = "3.6.3", default-features = false, features = [
                        "windows-native", "apple-native", "sync-secret-service", "crypto-rust"] }
+# MOD-15 M6 D3 (ANA-10 §4.9 (6)): already compiled in as a dependency of `keyring`, `rustls` and
+# `dbus-secret-service`, so this promotes a transitive crate to a declared one and compiles nothing
+# new. It is what wipes the DSN's buffer in `htui_store::Dsn` and in the masked `TextField`.
+zeroize            = "1.9"
 dirs               = "6"
 gethostname        = "1.1"
 sha2               = "0.10"
