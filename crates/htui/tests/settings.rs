@@ -9,7 +9,8 @@ use htui::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{
-    AgentsSection, HierarchySection, KindsSection, SectionId, SettingsSection, SettingsTab, message,
+    AgentsSection, HierarchySection, KindsSection, PromptSection, SectionId, SettingsSection,
+    SettingsTab, message,
 };
 use htui_agent::acp::Handshake;
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
@@ -944,6 +945,7 @@ fn the_section_strip_fits_the_frame() {
         Box::new(AgentsSection::new()),
         Box::new(HierarchySection::new()),
         Box::new(KindsSection::new()),
+        Box::new(PromptSection::new()),
     ];
     let width: usize = sections
         .iter()

@@ -723,10 +723,20 @@ fn error_text(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -
         .collect()
 }
 
-/// The value rows of the frame: every line that starts with two spaces and then a registry key.
-fn value_rows(frame: &str) -> Vec<&str> {
+/// One frame's lines with the Settings block's border stripped, so a `Harness` frame and a
+/// `SectionBench` frame read the same.
+fn body(frame: &str) -> Vec<&str> {
     frame
         .lines()
+        .map(|line| line.strip_prefix('\u{2502}').unwrap_or(line))
+        .map(|line| line.strip_suffix('\u{2502}').unwrap_or(line))
+        .collect()
+}
+
+/// The value rows of the frame: every line that starts with two spaces and then a registry key.
+fn value_rows(frame: &str) -> Vec<&str> {
+    body(frame)
+        .into_iter()
         .filter(|line| {
             line.starts_with("  ")
                 && SettingKey::from_key(line.split_whitespace().next().unwrap_or("")).is_some()
@@ -736,7 +746,7 @@ fn value_rows(frame: &str) -> Vec<&str> {
 
 /// The row of one key, or a panic naming the frame that has none.
 #[track_caller]
-fn row_of<'a>(frame: &'a str, key: SettingKey, nth: usize) -> &'a str {
+fn row_of(frame: &str, key: SettingKey, nth: usize) -> &str {
     let rows: Vec<&str> = value_rows(frame)
         .into_iter()
         .filter(|line| line.split_whitespace().next() == Some(key.key()))
@@ -761,7 +771,7 @@ async fn the_demo_snapshot_renders_the_tree() {
         "the strip carries the fourth section: {frame}"
     );
     assert!(
-        frame.lines().any(|line| line.trim() == "app"),
+        body(&frame).iter().any(|line| line.trim_end() == "app"),
         "the `App` group is headed: {frame}"
     );
     assert!(
@@ -805,7 +815,10 @@ async fn no_workspace_lists_the_app_group_alone() {
     let mut harness = prompt_over(MemStore::new()).await;
     let frame = harness.render();
 
-    assert!(frame.lines().any(|line| line.trim() == "app"), "{frame}");
+    assert!(
+        body(&frame).iter().any(|line| line.trim_end() == "app"),
+        "{frame}"
+    );
     assert!(
         !frame.contains("project "),
         "no project rung is listed: {frame}"

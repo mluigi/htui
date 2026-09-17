@@ -11,6 +11,7 @@
 pub mod agents;
 pub mod hierarchy;
 pub mod kinds;
+pub mod prompt;
 
 use htui_core::model::Scope;
 use ratatui::Frame;
@@ -28,6 +29,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 pub use agents::AgentsSection;
 pub use hierarchy::HierarchySection;
 pub use kinds::KindsSection;
+pub use prompt::PromptSection;
 
 /// An optional column: an empty field clears it rather than storing `""`.
 ///

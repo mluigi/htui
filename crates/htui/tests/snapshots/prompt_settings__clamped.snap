@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/prompt_settings.rs
+expression: frame
+---
+app
+  excerpt_file_line_cap         10 | 10 (app_setting)   lines
+  excerpt_head_lines            50 | 10 (app_setting)   lines
+  excerpt_max_file_bytes        unset | 524288 (app_setting_default)   bytes
+  excerpt_max_files             unset | 12 (app_setting_default)   files
+  excerpt_max_scan_files        unset | 20000 (app_setting_default)   files
+  excerpt_provider_deadline_ms  unset | 1500 (app_setting_default)   ms
+  max_skill_tokens              unset | 20000 (app_setting_default)   tokens
+  prompt_reserve_fraction       unset | 0.1 (1000 bp) (app_setting_default)   bp
+  prompt_upstream_hops          unset | 2 (app_setting_default)   hops
+  token_budget                  unset | 120000 (app_setting_default)   tokens
+project Vulkan Tutorials
+  prompt_upstream_hops          unset | 2 (app_setting_default)   hops
+  token_budget                  120000 | 120000 (project)   tokens
+
+
+
+
+
+
+
+
+
+
+
+
+Lines quoted from the top of a file; the reader clamps it to excerpt_file_line_cap.
+range 1..=4294967295 lines · rungs app
+clamped to excerpt_file_line_cap = 10
+j/k · e edit · r reload
