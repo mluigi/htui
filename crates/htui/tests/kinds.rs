@@ -1501,3 +1501,321 @@ async fn y_on_the_prefix_warning_writes_once() {
         error_text(&bench, &section, 100).contains(&"`update_kind` is still in flight".to_owned())
     );
 }
+
+/// The phase a bench's demo catalogue draws first: the analysis graph's `research`.
+fn research(snapshot: &CatalogueSnapshot) -> StepGraphPhase {
+    snapshot.projects[0]
+        .graph(ids::GRAPH_VULKAN_ANA)
+        .expect("the analysis graph")
+        .phases[0]
+        .clone()
+}
+
+/// `e` on a phase opens exactly PRD D2's six columns — MOD-4's are on the read-only line, not in
+/// the editor — and `Enter` sends one `update_phase` with `input_kinds` replaced whole (D13).
+#[tokio::test]
+async fn e_on_a_phase_opens_six_fields_and_enter_sends_update_phase() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let stored = research(&snapshot);
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+
+    bench.key(&mut section, "e");
+    let frame = bench.render_section(&section, 100);
+    for label in [
+        "name",
+        "position",
+        "template_name",
+        "gate_hard (y/n)",
+        "input_kinds",
+        "token_budget",
+    ] {
+        assert!(
+            frame.contains(label),
+            "`{label}` is an editable column: {frame}"
+        );
+    }
+    assert!(
+        !frame.contains("fan_out  "),
+        "MOD-4's columns are not editable here: {frame}"
+    );
+    insta::assert_snapshot!("editor_phase", frame);
+
+    for _ in 0..4 {
+        bench.key(&mut section, "tab");
+    }
+    type_at(&bench, &mut section, "plan,");
+    bench.key(&mut section, "space");
+    type_at(&bench, &mut section, "review,,");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::UpdatePhase {
+            id,
+            expected,
+            patch,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("a patch-only change is one write: {asked:?}");
+    };
+    assert_eq!(*id, stored.id);
+    assert_eq!(*expected, stored.updated_at);
+    assert_eq!(
+        patch.input_kinds.as_deref(),
+        Some(["plan".to_owned(), "review".to_owned()].as_slice()),
+        "split on `,`, trimmed, empties dropped, order kept (D13)"
+    );
+    assert_eq!(patch.name.as_deref(), Some(stored.name.as_str()));
+    assert_eq!(patch.position, Some(stored.position));
+    assert_eq!(
+        patch.template_name.as_deref(),
+        Some(stored.template_name.as_str())
+    );
+    assert_eq!(patch.gate_hard, Some(stored.gate_hard));
+}
+
+/// `token_budget` is not in `PhasePatch` at all: it rides the `Phase` rung, so a budget-only change
+/// is one `set_phase_budget` and no `update_phase` (D6, D16).
+#[tokio::test]
+async fn a_budget_only_change_sends_set_phase_budget() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let stored = research(&snapshot);
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+
+    for _ in 0..5 {
+        bench.key(&mut section, "tab");
+    }
+    type_at(&bench, &mut section, "60000");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetPhaseBudget {
+            phase,
+            expected,
+            budget,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("a budget-only change is one write, on the rung: {asked:?}");
+    };
+    assert_eq!(*phase, stored.id);
+    assert_eq!(*expected, stored.updated_at, "the phase's own token (B-2)");
+    assert_eq!(*budget, Some(60_000));
+}
+
+/// An emptied budget field clears the setting rather than writing a default: clearing lets the
+/// project or app rung answer (D16, PRD D7).
+#[tokio::test]
+async fn clearing_the_budget_sends_none() {
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let mut snapshot = demo_catalogue(&demo()).await;
+    snapshot.projects[0]
+        .graphs
+        .iter_mut()
+        .find(|entry| entry.graph.id == ids::GRAPH_VULKAN_ANA)
+        .expect("the analysis graph")
+        .phases[0]
+        .token_budget = Some(60_000);
+    bench.reply(
+        &mut section,
+        &StoreReply::Catalogue(Box::new(snapshot.clone())),
+    );
+    let _ = bench.drained();
+    assert!(
+        bench.render_section(&section, 100).contains("budget 60000"),
+        "the row prints the number it holds"
+    );
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    for _ in 0..5 {
+        bench.key(&mut section, "tab");
+    }
+    for _ in 0.."60000".len() {
+        bench.key(&mut section, "backspace");
+    }
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::SetPhaseBudget { budget, .. })] = asked.as_slice() else {
+        panic!("an emptied field is one clear: {asked:?}");
+    };
+    assert_eq!(*budget, None, "empty means inherit, not zero");
+}
+
+/// A budget that is not a number is refused here; every other bound on the column is the store's
+/// (B-1), so the section never re-implements a minimum or a maximum.
+#[tokio::test]
+async fn a_non_number_budget_is_refused() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    for _ in 0..5 {
+        bench.key(&mut section, "tab");
+    }
+    type_at(&bench, &mut section, "lots");
+
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty());
+    assert!(
+        error_text(&bench, &section, 100)
+            .contains(&"`token_budget` is a whole number or empty".to_owned())
+    );
+}
+
+/// One `Enter` that changed both the patch columns and the budget is two writes, in order (B-4):
+/// the second is sent from the first one's reply, with the token that reply carries, because `busy`
+/// is one slot and the second's token would otherwise be stale by construction.
+#[tokio::test]
+async fn a_patch_and_budget_change_is_two_writes_in_order() {
+    let backend = demo();
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let stored = research(&snapshot);
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "2");
+    for _ in 0..5 {
+        bench.key(&mut section, "tab");
+    }
+    type_at(&bench, &mut section, "60000");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::UpdatePhase { patch, .. })] = asked.as_slice() else {
+        panic!("the patch goes first: {asked:?}");
+    };
+    assert_eq!(patch.name.as_deref(), Some("research2"));
+
+    // The worker's reply to that write, with the phase's token moved.
+    let fresh = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::UpdatePhase {
+                scope: vulkan_scope(),
+                id: stored.id,
+                expected: stored.updated_at,
+                patch: PhasePatch {
+                    name: Some("research2".to_owned()),
+                    ..PhasePatch::default()
+                },
+            },
+        )
+        .await,
+    );
+    let moved = research(&fresh);
+    assert_ne!(moved.updated_at, stored.updated_at);
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(fresh)));
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetPhaseBudget {
+            phase,
+            expected,
+            budget,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("the budget follows, once: {asked:?}");
+    };
+    assert_eq!(*phase, stored.id);
+    assert_eq!(
+        *expected, moved.updated_at,
+        "against the token the first reply carried, not the one the editor opened on"
+    );
+    assert_eq!(*budget, Some(60_000));
+    assert!(
+        section.captures_input(),
+        "the editor closes on the *second* reply, not the first"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Catalogue(Box::new(demo_catalogue(&backend).await)),
+    );
+    assert!(!section.captures_input(), "and then it closes");
+    assert!(bench.drained().is_empty(), "with nothing left to send");
+}
+
+/// `n` on a graph or a phase row creates a phase in that graph, prefilled with the position after
+/// its last one (B-8) and `gate_hard` at `n` (B-3: a phase is born inheriting its budget).
+#[tokio::test]
+async fn n_on_a_phase_creates_in_its_graph() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+
+    bench.key(&mut section, "n");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        !frame.contains("token_budget"),
+        "a new phase inherits its budget; the column is set by `e` afterwards (B-3): {frame}"
+    );
+    type_at(&bench, &mut section, "triage");
+    bench.key(&mut section, "tab");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "triage");
+    bench.key(&mut section, "tab");
+    for _ in 0.."n".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "y");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "verdict");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::CreatePhase {
+            graph,
+            name,
+            position,
+            template_name,
+            gate_hard,
+            input_kinds,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`n` on a phase row creates in its graph: {asked:?}");
+    };
+    assert_eq!(*graph, ids::GRAPH_VULKAN_ANA);
+    assert_eq!(name, "triage");
+    assert_eq!(*position, 2, "after `research` and `verdict`");
+    assert_eq!(template_name, "triage");
+    assert!(*gate_hard);
+    assert_eq!(input_kinds, &["verdict".to_owned()]);
+}
+
+/// A `gate_hard` field that is neither `y` nor `n` is refused rather than guessed at (B-10), by the
+/// parser both sections share (D14).
+#[tokio::test]
+async fn a_gate_hard_that_is_not_y_or_n_is_refused() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    for _ in 0..3 {
+        bench.key(&mut section, "tab");
+    }
+    bench.key(&mut section, "backspace");
+    type_at(&bench, &mut section, "maybe");
+
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty());
+    assert!(error_text(&bench, &section, 100).contains(&"`gate_hard (y/n)` is y or n".to_owned()));
+}

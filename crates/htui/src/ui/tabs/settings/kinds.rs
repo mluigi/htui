@@ -20,8 +20,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    ItemKind, ItemKindId, ItemKindPatch, ProjectId, Scope, StepGraphId, StepGraphPatch,
-    StepGraphPhase,
+    ItemKind, ItemKindId, ItemKindPatch, PhaseId, PhasePatch, ProjectId, Scope, StepGraphId,
+    StepGraphPatch, StepGraphPhase,
 };
 
 use crate::app::{Ctx, Handled};
@@ -75,6 +75,15 @@ const NO_GRAPH_NAMED: &str = "`graph` names no graph in this project";
 
 /// What an editor says when a `position` field is not a number (B-8).
 const POSITION_IS_A_NUMBER: &str = "`position` is a whole number";
+
+/// What the phase editor says when its budget is neither empty nor a number (B-1).
+///
+/// The only bound this section checks: every other one — the range, the column's width — is the
+/// store's, and it answers with its own sentence (M1 D7).
+const BUDGET_IS_A_NUMBER: &str = "`token_budget` is a whole number or empty";
+
+/// What the phase editor says when `gate_hard` is neither `y` nor `n` (B-10).
+const GATE_IS_Y_OR_N: &str = "`gate_hard (y/n)` is y or n";
 
 /// The tail of the read-only detail line (D15): the columns are MOD-4's to give semantics to, so
 /// they are shown and not edited.
@@ -131,7 +140,37 @@ enum EditorKind {
     NewGraph(ProjectId),
     /// `e` on a graph row, and `g` on a kind, phase or graph row (D19).
     EditGraph(StepGraphId),
+    /// `n` on a graph or phase row.
+    NewPhase(StepGraphId),
+    /// `e` on a phase row.
+    EditPhase(PhaseId),
 }
+
+/// The second write of a phase edit that changed both the patch columns and the budget (B-4).
+///
+/// Held on the editor until the first write's reply carries the token the second one needs: two
+/// requests sent on one tick are both delivered, but the second's compare-and-set token would be
+/// stale by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowUp {
+    /// `set_phase_budget`, with what the field said.
+    Budget(Option<i64>),
+}
+
+/// What an editor remembers of the row it opened on, beyond the text in its fields.
+///
+/// Two values, because two comparisons are made at submit: the prefix D10 warns about and the
+/// budget B-4 decides the second write from. Everything else goes out whole (B-5).
+#[derive(Debug, Default)]
+struct Stored {
+    /// The kind's prefix as it is stored.
+    prefix: Option<String>,
+    /// The phase's budget as the field renders it (`""` for inherit).
+    budget: Option<String>,
+}
+
+/// One `Enter`'s outcome: the request that goes out now, and the one it owes afterwards (B-4).
+type Built = (StoreRequest, Option<FollowUp>);
 
 /// One labelled input of an editor.
 #[derive(Debug)]
@@ -156,6 +195,10 @@ struct Editor {
     expected: Option<DateTime<Utc>>,
     /// A kind edit's stored prefix, for D10's comparison; `None` for every other editor.
     stored_prefix: Option<String>,
+    /// A phase edit's stored budget as text, for B-4's comparison; `None` for every other editor.
+    stored_budget: Option<String>,
+    /// The write this editor still owes after the one in flight (B-4).
+    follow_up: Option<FollowUp>,
 }
 
 impl Editor {
@@ -393,17 +436,22 @@ impl KindsSection {
 
     /// Opens an editor, clearing whatever the last one said.
     fn open(&mut self, kind: EditorKind, fields: Vec<Field>, expected: Option<DateTime<Utc>>) {
-        self.open_with(kind, fields, expected, None);
+        self.open_with(kind, fields, expected, Stored::default());
     }
 
-    /// The same, for the one editor that carries the stored prefix D10 compares against.
+    /// The same, for the two editors that carry a stored value to compare what was typed against:
+    /// a kind edit's prefix (D10) and a phase edit's budget (B-4).
     fn open_with(
         &mut self,
         kind: EditorKind,
         fields: Vec<Field>,
         expected: Option<DateTime<Utc>>,
-        stored_prefix: Option<String>,
+        stored: Stored,
     ) {
+        let Stored {
+            prefix: stored_prefix,
+            budget: stored_budget,
+        } = stored;
         self.notice = None;
         self.mode = Mode::Editing(Editor {
             kind,
@@ -411,6 +459,8 @@ impl KindsSection {
             focus: 0,
             expected,
             stored_prefix,
+            stored_budget,
+            follow_up: None,
         });
     }
 
@@ -422,6 +472,15 @@ impl KindsSection {
             let id = project.project.id;
             let fields = new_kind_fields(project);
             self.open(EditorKind::NewKind(id), fields, None);
+            return;
+        }
+        // On a graph or a phase row, `n` is a phase of that graph.
+        if let Row::Graph { p, g } | Row::Phase { p, g, .. } = row
+            && let Some(entry) = self.graph_at(p, g)
+        {
+            let id = entry.graph.id;
+            let fields = new_phase_fields(entry);
+            self.open(EditorKind::NewPhase(id), fields, None);
         }
     }
 
@@ -461,7 +520,10 @@ impl KindsSection {
                     EditorKind::EditKind(id),
                     fields,
                     Some(expected),
-                    Some(prefix),
+                    Stored {
+                        prefix: Some(prefix),
+                        budget: None,
+                    },
                 );
             }
             Row::Graph { p, g } => {
@@ -477,7 +539,23 @@ impl KindsSection {
                     );
                 }
             }
-            Row::Phase { .. } => {}
+            Row::Phase { p, g, i } => {
+                let Some(phase) = self.phase_at(p, g, i) else {
+                    return;
+                };
+                let (id, expected) = (phase.id, phase.updated_at);
+                let budget = budget_text(phase.token_budget);
+                let fields = edit_phase_fields(phase);
+                self.open_with(
+                    EditorKind::EditPhase(id),
+                    fields,
+                    Some(expected),
+                    Stored {
+                        prefix: None,
+                        budget: Some(budget),
+                    },
+                );
+            }
         }
     }
 
@@ -614,7 +692,10 @@ impl KindsSection {
             return;
         }
         match built {
-            Ok(request) => {
+            Ok((request, follow_up)) => {
+                if let Mode::Editing(editor) = &mut self.mode {
+                    editor.follow_up = follow_up;
+                }
                 self.notice = None;
                 self.send(request, ctx);
             }
@@ -641,7 +722,10 @@ impl KindsSection {
                 // `CatalogueStale` has to find something to re-take the token for (D8).
                 self.mode = Mode::Editing(editor);
                 match built {
-                    Ok(request) => {
+                    Ok((request, follow_up)) => {
+                        if let Mode::Editing(editor) = &mut self.mode {
+                            editor.follow_up = follow_up;
+                        }
                         self.notice = None;
                         self.send(request, ctx);
                     }
@@ -663,21 +747,24 @@ impl KindsSection {
     ///
     /// Every editable column goes out on an edit whether or not it changed (B-5): one habit across
     /// both sections, and the compare-and-set token is what makes it safe.
-    fn build(&self, editor: &Editor, scope: &Scope) -> Result<StoreRequest, String> {
+    fn build(&self, editor: &Editor, scope: &Scope) -> Result<Built, String> {
         match editor.kind {
             EditorKind::NewKind(project) => {
                 let owner = self
                     .project_by_id(project)
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
-                Ok(StoreRequest::CreateKind {
-                    scope: scope.clone(),
-                    project,
-                    prefix: editor.text(0),
-                    name: editor.text(1),
-                    description: editor.text(2),
-                    graph: graph_named(owner, &editor.text(3))?,
-                    position: position(&editor.text(4))?,
-                })
+                Ok((
+                    StoreRequest::CreateKind {
+                        scope: scope.clone(),
+                        project,
+                        prefix: editor.text(0),
+                        name: editor.text(1),
+                        description: editor.text(2),
+                        graph: graph_named(owner, &editor.text(3))?,
+                        position: position(&editor.text(4))?,
+                    },
+                    None,
+                ))
             }
             EditorKind::EditKind(id) => {
                 let expected = editor
@@ -686,40 +773,137 @@ impl KindsSection {
                 let (owner, _) = self
                     .locate_kind(id)
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
-                Ok(StoreRequest::UpdateKind {
-                    scope: scope.clone(),
-                    id,
-                    expected,
-                    patch: ItemKindPatch {
-                        prefix: Some(editor.text(0)),
-                        name: Some(editor.text(1)),
-                        description: Some(editor.text(2)),
-                        default_graph_id: Some(graph_named(owner, &editor.text(3))?),
-                        position: Some(position(&editor.text(4))?),
+                Ok((
+                    StoreRequest::UpdateKind {
+                        scope: scope.clone(),
+                        id,
+                        expected,
+                        patch: ItemKindPatch {
+                            prefix: Some(editor.text(0)),
+                            name: Some(editor.text(1)),
+                            description: Some(editor.text(2)),
+                            default_graph_id: Some(graph_named(owner, &editor.text(3))?),
+                            position: Some(position(&editor.text(4))?),
+                        },
                     },
-                })
+                    None,
+                ))
             }
-            EditorKind::NewGraph(project) => Ok(StoreRequest::CreateGraph {
-                scope: scope.clone(),
-                project,
-                name: editor.text(0),
-                description: editor.text(1),
-            }),
+            EditorKind::NewGraph(project) => Ok((
+                StoreRequest::CreateGraph {
+                    scope: scope.clone(),
+                    project,
+                    name: editor.text(0),
+                    description: editor.text(1),
+                },
+                None,
+            )),
             EditorKind::EditGraph(id) => {
                 let expected = editor
                     .expected
                     .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
-                Ok(StoreRequest::UpdateGraph {
-                    scope: scope.clone(),
-                    id,
-                    expected,
-                    patch: StepGraphPatch {
-                        name: Some(editor.text(0)),
-                        description: Some(editor.text(1)),
+                Ok((
+                    StoreRequest::UpdateGraph {
+                        scope: scope.clone(),
+                        id,
+                        expected,
+                        patch: StepGraphPatch {
+                            name: Some(editor.text(0)),
+                            description: Some(editor.text(1)),
+                        },
                     },
-                })
+                    None,
+                ))
             }
+            EditorKind::NewPhase(graph) => Ok((
+                StoreRequest::CreatePhase {
+                    scope: scope.clone(),
+                    graph,
+                    name: editor.text(0),
+                    position: position(&editor.text(1))?,
+                    template_name: editor.text(2),
+                    gate_hard: super::yes_or_no(&editor.text(3))
+                        .ok_or_else(|| GATE_IS_Y_OR_N.to_owned())?,
+                    input_kinds: input_kinds(&editor.text(4)),
+                },
+                None,
+            )),
+            EditorKind::EditPhase(id) => self.build_phase_edit(editor, scope, id),
         }
+    }
+
+    /// The one editor that can owe two writes (B-4).
+    ///
+    /// `token_budget` is not a `PhasePatch` column at all — it rides the `Phase` rung (D6, F-14) —
+    /// so an `Enter` that moved both sends `update_phase` now and keeps `set_phase_budget` for the
+    /// reply that carries the row's new token. An `Enter` that moved only one sends only that one.
+    fn build_phase_edit(
+        &self,
+        editor: &Editor,
+        scope: &Scope,
+        id: PhaseId,
+    ) -> Result<Built, String> {
+        let expected = editor
+            .expected
+            .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
+        let stored = self
+            .phase_by_id(id)
+            .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
+
+        let name = editor.text(0);
+        let position = position(&editor.text(1))?;
+        let template_name = editor.text(2);
+        let gate_hard =
+            super::yes_or_no(&editor.text(3)).ok_or_else(|| GATE_IS_Y_OR_N.to_owned())?;
+        let input_kinds = input_kinds(&editor.text(4));
+        let budget = budget(&editor.text(5))?;
+
+        let patch_changed = name != stored.name
+            || position != stored.position
+            || template_name != stored.template_name
+            || gate_hard != stored.gate_hard
+            || input_kinds != stored.input_kinds;
+        let budget_changed = editor.stored_budget.as_deref() != Some(editor.text(5).trim());
+
+        let patch = PhasePatch {
+            name: Some(name),
+            position: Some(position),
+            template_name: Some(template_name),
+            gate_hard: Some(gate_hard),
+            input_kinds: Some(input_kinds),
+        };
+        // A budget-only change is one write on the rung; anything else starts with the patch.
+        if budget_changed && !patch_changed {
+            return Ok((
+                StoreRequest::SetPhaseBudget {
+                    scope: scope.clone(),
+                    phase: id,
+                    expected,
+                    budget,
+                },
+                None,
+            ));
+        }
+        Ok((
+            StoreRequest::UpdatePhase {
+                scope: scope.clone(),
+                id,
+                expected,
+                patch,
+            },
+            budget_changed.then_some(FollowUp::Budget(budget)),
+        ))
+    }
+
+    /// One phase of the snapshot, by id.
+    fn phase_by_id(&self, id: PhaseId) -> Option<&StepGraphPhase> {
+        self.snapshot
+            .as_ref()?
+            .projects
+            .iter()
+            .flat_map(|project| project.graphs.iter())
+            .flat_map(|entry| entry.phases.iter())
+            .find(|phase| phase.id == id)
     }
 
     /// One project of the snapshot, by id.
@@ -729,6 +913,44 @@ impl KindsSection {
             .projects
             .iter()
             .find(|project| project.project.id == id)
+    }
+
+    /// The second write of B-4's chain, sent from the first one's reply.
+    ///
+    /// Answers whether it took the reply: the editor stays open until the budget lands, so the
+    /// caller must not close it. The token comes from the snapshot that just arrived — the one the
+    /// first write moved — because the editor's own is spent by construction.
+    fn follow_up(&mut self, ctx: &Ctx<'_>) -> bool {
+        let Mode::Editing(editor) = &self.mode else {
+            return false;
+        };
+        let EditorKind::EditPhase(id) = editor.kind else {
+            return false;
+        };
+        let Some(FollowUp::Budget(budget)) = editor.follow_up else {
+            return false;
+        };
+        let Some(expected) = self.phase_by_id(id).map(|phase| phase.updated_at) else {
+            // The row went while the patch was in flight: there is nothing left to set a budget on.
+            self.mode = Mode::Browse;
+            self.say(DELETED_ELSEWHERE);
+            return true;
+        };
+        if let Mode::Editing(editor) = &mut self.mode {
+            editor.expected = Some(expected);
+            editor.follow_up = None;
+            editor.stored_budget = Some(budget.map_or_else(String::new, |n| n.to_string()));
+        }
+        self.send(
+            StoreRequest::SetPhaseBudget {
+                scope: ctx.scope.clone(),
+                phase: id,
+                expected,
+                budget,
+            },
+            ctx,
+        );
+        true
     }
 
     /// A compare-and-set miss (D8): the tree is replaced, the editor keeps its text and takes the
@@ -935,13 +1157,16 @@ impl KindsSection {
     ///
     /// Only a reply to a **write** closes an open editor (H-9): `r` sets no `busy`, so a reload that
     /// lands while something is being typed leaves the typing alone.
-    fn on_catalogue(&mut self, snapshot: &CatalogueSnapshot) {
+    fn on_catalogue(&mut self, snapshot: &CatalogueSnapshot, ctx: &Ctx<'_>) {
         let write = self.busy.take();
         // A read that answered is the end of an outage: leaving `unavailable` set would say the
         // catalogue is unavailable over a store that just spoke.
         self.unavailable = None;
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
+        if write == Some("update_phase") && self.follow_up(ctx) {
+            return;
+        }
         if write.is_some() {
             self.notice = None;
             if matches!(self.mode, Mode::Editing(_)) {
@@ -1046,9 +1271,9 @@ impl SettingsSection for KindsSection {
         }
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
-            StoreReply::Catalogue(snapshot) => self.on_catalogue(snapshot),
+            StoreReply::Catalogue(snapshot) => self.on_catalogue(snapshot, ctx),
             StoreReply::CatalogueStale(snapshot) => self.on_stale(snapshot),
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
@@ -1213,6 +1438,63 @@ fn edit_kind_fields(project: &ProjectCatalogue, kind: &ItemKind) -> Vec<Field> {
     ]
 }
 
+/// The five columns a new phase carries (D9, B-3).
+///
+/// No `token_budget`: a phase is born inheriting it, and the sixth column is set by `e` afterwards
+/// — a create followed by a budget write would need the new row's id, which only the reply knows.
+fn new_phase_fields(entry: &GraphEntry) -> Vec<Field> {
+    vec![
+        Field::required("name", ""),
+        Field::required(
+            "position",
+            &next_position(entry.phases.iter().map(|phase| phase.position)),
+        ),
+        Field::required("template_name", ""),
+        Field::required("gate_hard (y/n)", "n"),
+        Field::optional("input_kinds", ""),
+    ]
+}
+
+/// PRD D2's six editable columns of an existing phase, in editor order.
+fn edit_phase_fields(phase: &StepGraphPhase) -> Vec<Field> {
+    vec![
+        Field::required("name", &phase.name),
+        Field::required("position", &phase.position.to_string()),
+        Field::required("template_name", &phase.template_name),
+        Field::required("gate_hard (y/n)", if phase.gate_hard { "y" } else { "n" }),
+        Field::optional("input_kinds", &phase.input_kinds.join(",")),
+        Field::optional("token_budget", &budget_text(phase.token_budget)),
+    ]
+}
+
+/// `token_budget` as the editor holds it: empty is `inherit` (D16).
+fn budget_text(budget: Option<i32>) -> String {
+    budget.map_or_else(String::new, |n| n.to_string())
+}
+
+/// `input_kinds` as D13 reads it: split on `,`, each part trimmed, empty parts dropped, order
+/// preserved, no de-duplication, replaced whole.
+///
+/// De-duplicating would silently edit what was typed; the store takes the list as given.
+fn input_kinds(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The budget field as a number, or `None` for "inherit" (B-1, D16).
+fn budget(text: &str) -> Result<Option<i64>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<i64>()
+        .map(Some)
+        .map_err(|_| BUDGET_IS_A_NUMBER.to_owned())
+}
+
 /// One past the largest position, or `0` when there is none.
 fn next_position(positions: impl Iterator<Item = i32>) -> String {
     positions
@@ -1272,6 +1554,19 @@ fn reload(snapshot: &CatalogueSnapshot, kind: EditorKind) -> Reload {
             .flat_map(|project| project.graphs.iter())
             .find(|entry| entry.graph.id == id)
             .map_or(Reload::Gone, |entry| Reload::Token(entry.graph.updated_at)),
+        EditorKind::NewPhase(graph) => snapshot
+            .projects
+            .iter()
+            .flat_map(|project| project.graphs.iter())
+            .find(|entry| entry.graph.id == graph)
+            .map_or(Reload::Gone, |_| Reload::Keep),
+        EditorKind::EditPhase(id) => snapshot
+            .projects
+            .iter()
+            .flat_map(|project| project.graphs.iter())
+            .flat_map(|entry| entry.phases.iter())
+            .find(|phase| phase.id == id)
+            .map_or(Reload::Gone, |phase| Reload::Token(phase.updated_at)),
     }
 }
 
