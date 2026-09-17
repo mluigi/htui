@@ -19,6 +19,7 @@ use htui_core::store::{CasOutcome, ReadStore, Result, SettingRung, StoreError, W
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 use serde_json::Value;
 
+use crate::hierarchy::MirrorAfterDelete;
 use crate::store_worker::{StoreReply, StoreRequest};
 
 /// One read of the scope: one entry per `scope.project_ids`, in scope order.
@@ -154,6 +155,25 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .update_item_kind(*id, *expected, patch.clone())
                 .await?;
             cas(&writer, scope, &outcome).await
+        }
+        StoreRequest::DeleteKind { scope, id } => {
+            writer.delete_item_kind(*id).await?;
+            // `item_kind` is a mirrored table whose deletes have no propagation of their own — the
+            // refresh pass rides `updated_at` and only `item_link` is tombstoned — so without this
+            // the Backlog keeps offering a kind that is gone (D12). The row is gone before this
+            // line, so a failed rebuild is reported *inside* a successful reply rather than turning
+            // a delete that happened into a `Failed` that claims nothing did.
+            let mirror = match backend.cache() {
+                Some(cache) => match cache.rebuild().await {
+                    Ok(()) => MirrorAfterDelete::Rebuilt,
+                    Err(err) => MirrorAfterDelete::Failed(err.to_string()),
+                },
+                None => MirrorAfterDelete::NoMirror,
+            };
+            Ok(StoreReply::KindDeleted {
+                mirror,
+                catalogue: Box::new(snapshot(&writer, scope).await?),
+            })
         }
         StoreRequest::CreateGraph {
             scope,

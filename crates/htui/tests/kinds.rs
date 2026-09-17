@@ -7,6 +7,7 @@
 
 use chrono::{Duration, Utc};
 use htui::catalogue::{self, CatalogueSnapshot, REQUEST_NAMES};
+use htui::hierarchy::MirrorAfterDelete;
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui_core::fixtures::ids;
 use htui_core::model::{
@@ -14,7 +15,9 @@ use htui_core::model::{
     StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
 };
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
-use htui_core::store::{MemStore, ReadStore, StoreError, WriteStore, reserved_phase_name};
+use htui_core::store::{
+    MemStore, ReadStore, StoreError, WriteStore, item_kind_is_held, reserved_phase_name,
+};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 
 /// The demo world behind a memory backend: a `Writer::Memory` and the seeded catalogue M2 gave
@@ -671,5 +674,67 @@ async fn set_phase_budget_sets_then_clears() {
         phases(&cleared, ids::GRAPH_VULKAN_ANA)[0].token_budget,
         None,
         "clearing lets the project rung answer rather than writing a guessed default"
+    );
+}
+
+/// A kind any item holds cannot be deleted at all, so the destructive case PRD D13's typed slug
+/// exists for does not arise here: the seam refuses by name and says what holds it (D11, F-7).
+#[tokio::test]
+async fn delete_kind_of_a_held_kind_is_refused_with_the_seam_sentence() {
+    let backend = demo();
+
+    let (request, message) = refusal(
+        serve(
+            &backend,
+            &StoreRequest::DeleteKind {
+                scope: vulkan_scope(),
+                id: ids::KIND_VULKAN_FEAT,
+            },
+        )
+        .await,
+    );
+
+    assert_eq!(request, "delete_kind");
+    assert!(
+        message.contains(&item_kind_is_held("FEAT", 1)),
+        "the sentence names what holds it: {message}"
+    );
+    assert_eq!(
+        demo_catalogue(&backend).await.projects[0].kinds.len(),
+        5,
+        "the refused delete took nothing"
+    );
+}
+
+/// A kind that is gone is reported with what the worker did to the mirror afterwards (D12): the
+/// Backlog must not keep offering a kind no row answers for, and a memory backend has no mirror to
+/// rebuild.
+#[tokio::test]
+async fn delete_kind_of_an_unreferenced_kind_reports_the_mirror() {
+    let backend = demo();
+
+    let reply = serve(
+        &backend,
+        &StoreRequest::DeleteKind {
+            scope: vulkan_scope(),
+            id: ids::KIND_VULKAN_ANA,
+        },
+    )
+    .await;
+
+    let StoreReply::KindDeleted { mirror, catalogue } = reply else {
+        panic!("a delete that happened answers KindDeleted: {reply:?}");
+    };
+    assert_eq!(mirror, MirrorAfterDelete::NoMirror);
+    let kinds = &catalogue.projects[0].kinds;
+    assert_eq!(kinds.len(), 4);
+    assert!(
+        kinds.iter().all(|k| k.prefix != "ANA"),
+        "the catalogue in the reply is the tree without it"
+    );
+    assert_eq!(
+        catalogue.projects[0].graphs.len(),
+        5,
+        "the kind's graph survives it; nothing here deletes a graph (D5)"
     );
 }
