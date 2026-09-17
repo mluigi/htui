@@ -459,7 +459,7 @@ project Vulkan renderer
 | 4.. | each of `eff.notes` in `theme.error` | `resolve_hops` made one |
 | last | `{key}: {field}` — `Span::styled(format!("{key}: "), theme.accent)` + `input.line(room, true, theme).spans` (kinds `Editor::lines`, `:1587-1612`, one field) | `Mode::Editing` |
 
-`wrapped` is copied from `kinds.rs:1893-1913` (private there; a three-line helper is cheaper than a fourth `pub(crate)` promotion — O-5). A header row selected → empty pane.
+`wrapped` — **superseded at review (M-1)**: `hierarchy.rs` and `kinds.rs` already held byte-identical copies, so this would have been the third. It is now `pub(crate) fn wrapped` in `settings/mod.rs` beside `is_error`, and all three sections call it. A header row selected → empty pane.
 
 ### 4.8 Hint line
 
@@ -651,5 +651,5 @@ Gates per plan T1/T2/T3; `--demo` smoke: no TTY in the agent environment — the
 | O-2 | `SetPhaseBudget` is not folded into `SetSetting`: the two differ in reply type, not request (D8). If a third caller wants the phase rung, the *reply* generalises. |
 | O-3 | Flag H: a `Stale` that could carry "no row" (`CasOutcome::Stale(Option<StoredSetting>)` or a `NoRow` outcome) would let the `App` editor self-heal after a clear elsewhere; a seam change, so a later milestone's. |
 | O-4 | Flag G: the effective column is one exhaustive match per key; an eleventh key is a compile error here rather than invisible. |
-| O-5 | `wrapped` is copied from `kinds.rs:1893`; a third copy would justify promoting it beside `is_error`. |
+| O-5 | **Closed at review (M-1).** `prompt.rs` would have been `wrapped`'s *third* byte-identical copy, not its second — `hierarchy.rs:1423` and `kinds.rs:1880` both held one. It is promoted to `pub(crate) fn wrapped` in `settings/mod.rs` and all three sections call it (`6835c73`). |
 | O-6 | `resolve_hops`'s clamp note reaches the pane only for a row `validate` never saw (hand SQL); with the editor as the only writer it never fires. |

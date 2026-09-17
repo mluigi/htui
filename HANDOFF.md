@@ -457,7 +457,65 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   overtaken, which is why milestone 3 allows it — documented, plus a notice that says nothing was
   written), and a re-read that fails **after** an applied write still answers `Failed`, which
   `hierarchy::serve` does too and which needs a seam method this milestone does not add.
-  Milestones 5 and 6 remain: the ten settings, and the connection
+  **Milestone 5 landed (`ec54b6e`..`a0dc3e8`, 2026-09-17): the prompt is tunable from the app.**
+  Plan at `.claude/plans/mod-15-prompt-settings.plan.md`, blueprint beside it. Two things shipped.
+  (1) **`htui::prompt_settings`** (`crates/htui/src/prompt_settings.rs`): one `SettingsSnapshot` per
+  read — the ten `app_setting` keys on the `App` rung each with its own compare-and-set token, plus
+  every project of the scope with the keys its spec admits — and three served requests
+  (`StoreRequest` 47 → **50**, names in `htui::prompt_settings::REQUEST_NAMES`, two new replies
+  taking `StoreReply` to 28), routed through **one `try_serve` arm of three or-ed patterns** as
+  milestones 3 and 4's twelve and nine are. Every stored value is read through
+  `WriteStore::setting`, never by indexing `project.settings` here, so M1's live coordinate 2 — the
+  `project_key` spelling — is applied by the seam and cannot drift. (2) **`PromptSection`**
+  (`SectionId("prompt")`, `ui/tabs/settings/prompt.rs`), registered **after** `kinds`: rows, labels,
+  units, ranges, doc lines and accepted rungs all read from `SettingKey::ALL` / `SPECS` — **no key
+  name is spelled in the section**, and a test greps the source to keep it that way. Each row shows
+  `stored | effective (source)`: the effective number is the reader's own
+  (`resolve_budget`, `resolve_hops`, `resolve_max_skill_tokens`, `resolve_excerpt_caps`) and the
+  label is `BudgetSource`'s own spelling, the one `trim_record.budget_source` already writes. `e`
+  opens a one-field editor; an **empty field clears** so the rung below answers (PRD D7), and a
+  rung that holds nothing sends no request and says so. The section parses **shape only** — integer
+  or finite fraction — and every range, `not_above` and Phase-narrowing refusal arrives as the
+  seam's own sentence, verbatim. **No seam change, no migration, no `query!`**: `CASES` stays 36,
+  `EXPECTED_CASES` 36, `.sqlx/` byte-identical, and `0003_orchestration.sql` is still MOD-4's and
+  still next. **Live coordinates milestone 6 needs.** (1) On the `App` rung a token over a row
+  **cleared elsewhere** answers `NotFound`, **not** `Stale` — `CasOutcome::Stale` needs a row to
+  carry — so the reload-and-retry habit does not run on that one path; the refusal names
+  ``app_setting `token_budget` not found``, recovery is `Esc`, `r`, `e`, and closing it is a seam
+  change (open item **O-3**). (2) Every demo project is born holding `token_budget: 120000` in its
+  `settings` blob (`fixtures.rs:644-648`) — the blob is **not** `{}` — and `DEFAULTS.token_budget`
+  is `120_000`, so in the demo world `prompt_upstream_hops` is the only genuinely unset
+  `Project`-rung row. (3) `MemStore` starts with **no** `app_setting` rows while a migrated Postgres
+  holds all ten (`0002_agent_probe.sql:68-79`), which is what makes `set_setting`'s
+  `expected: None` insert-after-clear path real on one store and not the other; both are tested.
+  (4) `resolve_reserve_bp` is **private** (the reserve comes from `resolve_budget(..).reserve_bp`),
+  `resolve_hops` takes a third `notes: &mut Vec<String>` argument, and none of the resolvers are
+  re-exported from `htui_core::prompt` — they are reached through `prompt::settings`.
+  (5) `SettingKey`'s `Display` is `f.write_str`, so it **ignores format width**: pad `key.key()`,
+  not the key. (6) `settings/mod.rs` now also owns `CHANGED_ELSEWHERE`, `CHANGED_ELSEWHERE_CLOSED`,
+  `DELETED_ELSEWHERE` (promoted out of `kinds.rs`) and `wrapped` (which was on its third
+  byte-identical copy) — milestone 6's section inherits both rather than copying. (7) `SetPhaseBudget`
+  was **not** folded into `SetSetting`: the two differ in their *reply* — a catalogue tree versus a
+  settings snapshot — not in their request (**O-2**). (8) **This repo has no CI**: no `.github/`
+  was ever committed, and `crates/htui/tests/prompt_settings.rs` is `#![cfg(feature = "testkit")]`,
+  so a plain `cargo test` runs none of it; `cargo test --workspace --all-features` (README `:457`)
+  is the only thing that does. **1198 passed, 0 failed, 30 ignored** workspace-wide with Postgres
+  live; `tests/prompt_settings.rs` is 42 tests, 6 new `prompt_settings__*.snap`, and **no existing
+  snapshot moved at all** (the strip tests build their own section vectors). The `--demo` smoke was
+  **not** run (no TTY in the agent environment) — the provenance flip it would show is pinned by
+  `a_project_row_flips_to_project_and_back` instead. Reviewed by `rust-reviewer`: no CRITICAL, no
+  HIGH, three MEDIUM and seven LOW; the three MEDIUM and four LOW fixed (`6835c73`..`a0dc3e8`).
+  Three LOW deferred with reasons: the tree still shows a value cleared elsewhere until `r` after
+  an `App` `NotFound` (honest residue, an auto re-read is a behaviour change this milestone did not
+  design); the seam's refusal echoes the submitted **number** into `Notice`, which derives `Debug`
+  (numbers are not secrets, but milestone 6 should give `Notice` the hand-written `Debug` that
+  `Editor` and `Mode` already have, independently of the DSN newtype); and a write's reply arriving
+  after a scope change installs the old scope's tree for one event, which `kinds` and `catalogue`
+  do too and which belongs in the shell's reply filter. One lesson worth carrying: the shell echoes
+  `set_setting: {message}` on the status line, so a naive "the seam's sentence reached the screen"
+  assertion passes even when the section does nothing with it — the test filters the echo out and
+  was mutation-checked against exactly that.
+  Milestone 6 remains: the connection
   section, which is where `TextField::masked()` gets its first consumer and where a DSN must arrive
   as a redacting newtype rather than a `String` on `StoreRequest` (review L-9, doc'd at both ends).
 
