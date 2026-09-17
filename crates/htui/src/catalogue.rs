@@ -8,8 +8,11 @@
 //! Nothing here resolves an identity: no row this module writes carries a `created_by` or a box, so
 //! unlike [`crate::hierarchy`] there is no `this_user` and no `box_info` call in the file.
 
-use htui_core::model::{ItemKind, Project, Scope, StepGraph, StepGraphId, StepGraphPhase};
-use htui_core::store::{ReadStore, Result, StoreError, WriteStore};
+use htui_core::model::{
+    ItemKind, ItemKindId, NewItemKind, NewStepGraph, Project, Scope, StepGraph, StepGraphId,
+    StepGraphPhase,
+};
+use htui_core::store::{CasOutcome, ReadStore, Result, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -115,6 +118,66 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
 
     match request {
         StoreRequest::Catalogue(scope) => reread(&writer, scope).await,
+        StoreRequest::CreateKind {
+            scope,
+            project,
+            prefix,
+            name,
+            description,
+            graph,
+            position,
+        } => {
+            writer
+                .create_item_kind(NewItemKind {
+                    id: ItemKindId::new(),
+                    project_id: *project,
+                    prefix: prefix.clone(),
+                    name: name.clone(),
+                    description: description.clone(),
+                    default_graph_id: *graph,
+                    position: *position,
+                })
+                .await?;
+            reread(&writer, scope).await
+        }
+        StoreRequest::UpdateKind {
+            scope,
+            id,
+            expected,
+            patch,
+        } => {
+            let outcome = writer
+                .update_item_kind(*id, *expected, patch.clone())
+                .await?;
+            cas(&writer, scope, &outcome).await
+        }
+        StoreRequest::CreateGraph {
+            scope,
+            project,
+            name,
+            description,
+        } => {
+            writer
+                .create_step_graph(NewStepGraph {
+                    id: StepGraphId::new(),
+                    project_id: *project,
+                    name: name.clone(),
+                    description: description.clone(),
+                })
+                .await?;
+            reread(&writer, scope).await
+        }
+        StoreRequest::UpdateGraph {
+            scope,
+            id,
+            expected,
+            patch,
+        } => {
+            let outcome = writer
+                .update_step_graph(*id, *expected, patch.clone())
+                .await?;
+            cas(&writer, scope, &outcome).await
+        }
         // `try_serve` routes exactly this module's nine variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
         // it sent than killed.
@@ -130,6 +193,20 @@ async fn reread(writer: &Writer, scope: &Scope) -> Result<StoreReply> {
     Ok(StoreReply::Catalogue(Box::new(
         snapshot(writer, scope).await?,
     )))
+}
+
+/// A compare-and-set outcome as a reply: `Applied` answers the fresh catalogue, `Stale` answers the
+/// same catalogue under [`StoreReply::CatalogueStale`] so the editor reloads and retries by hand
+/// (D8).
+///
+/// The worker re-reads rather than handing the section the single row `Stale` carries: the section
+/// renders a tree, and a row patched in locally would be a second source of truth (D3).
+async fn cas<T>(writer: &Writer, scope: &Scope, outcome: &CasOutcome<T>) -> Result<StoreReply> {
+    let fresh = Box::new(snapshot(writer, scope).await?);
+    Ok(match outcome {
+        CasOutcome::Applied(_) => StoreReply::Catalogue(fresh),
+        CasOutcome::Stale(_) => StoreReply::CatalogueStale(fresh),
+    })
 }
 
 /// The nine request names, in [`StoreRequest`] order.

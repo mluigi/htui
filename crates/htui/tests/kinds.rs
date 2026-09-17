@@ -5,16 +5,16 @@
 //! half is milestone 4's task 2 and lands below this one.
 #![cfg(feature = "testkit")]
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use htui::catalogue::{self, CatalogueSnapshot, REQUEST_NAMES};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    ItemKindId, ItemKindPatch, NewProject, PhaseId, PhasePatch, ProjectId, Scope, StepGraphId,
-    StepGraphPatch, WorkspaceId,
+    ItemKind, ItemKindId, ItemKindPatch, NewProject, PhaseId, PhasePatch, ProjectId, Scope,
+    StepGraphId, StepGraphPatch, WorkspaceId,
 };
 use htui_core::seed::PHASES_PER_PROJECT;
-use htui_core::store::{MemStore, StoreError, WriteStore};
+use htui_core::store::{MemStore, ReadStore, StoreError, WriteStore};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 
 /// The demo world behind a memory backend: a `Writer::Memory` and the seeded catalogue M2 gave
@@ -254,5 +254,212 @@ async fn serve_refuses_a_foreign_request_by_name() {
     assert_eq!(
         err,
         StoreError::Backend("not a catalogue request: hierarchy".to_owned())
+    );
+}
+
+/// The kind of a snapshot's one project, by id.
+#[track_caller]
+fn kind(snapshot: &CatalogueSnapshot, id: ItemKindId) -> &ItemKind {
+    snapshot.projects[0]
+        .kinds
+        .iter()
+        .find(|k| k.id == id)
+        .unwrap_or_else(|| panic!("the catalogue still names {id}"))
+}
+
+/// A create lands and the reply is the tree as it is now, not the row that was written (D5, D7).
+#[tokio::test]
+async fn create_kind_lands_and_rereads() {
+    let backend = demo();
+
+    let snapshot = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::CreateKind {
+                scope: vulkan_scope(),
+                project: ids::PROJECT_VULKAN,
+                prefix: "DOC".to_owned(),
+                name: "docs".to_owned(),
+                description: String::new(),
+                graph: ids::GRAPH_VULKAN_TOOL,
+                position: 5,
+            },
+        )
+        .await,
+    );
+
+    let kinds = &snapshot.projects[0].kinds;
+    assert_eq!(kinds.len(), 6);
+    let created = kinds.last().expect("the new kind sorts last by position");
+    assert_eq!(created.prefix, "DOC");
+    assert_eq!(created.name, "docs");
+    assert_eq!(created.default_graph_id, ids::GRAPH_VULKAN_TOOL);
+    assert_eq!(created.position, 5);
+}
+
+/// An edit against the current token applies and moves it (D8).
+#[tokio::test]
+async fn update_kind_applies_against_the_current_token() {
+    let backend = demo();
+    let before = demo_catalogue(&backend).await;
+    let expected = kind(&before, ids::KIND_VULKAN_FEAT).updated_at;
+
+    let snapshot = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::UpdateKind {
+                scope: vulkan_scope(),
+                id: ids::KIND_VULKAN_FEAT,
+                expected,
+                patch: ItemKindPatch {
+                    name: Some("features".to_owned()),
+                    ..ItemKindPatch::default()
+                },
+            },
+        )
+        .await,
+    );
+
+    let after = kind(&snapshot, ids::KIND_VULKAN_FEAT);
+    assert_eq!(after.name, "features");
+    assert_ne!(after.updated_at, expected, "the CAS token moved");
+}
+
+/// PRD D12's half the seam owns: renaming a prefix changes what the *next* mint spells and leaves
+/// every key already minted under the old one exactly as it is (F-17).
+#[tokio::test]
+async fn a_prefix_rename_leaves_existing_keys_alone() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store);
+    let before = demo_catalogue(&backend).await;
+    let expected = kind(&before, ids::KIND_VULKAN_FEAT).updated_at;
+
+    let snapshot = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::UpdateKind {
+                scope: vulkan_scope(),
+                id: ids::KIND_VULKAN_FEAT,
+                expected,
+                patch: ItemKindPatch {
+                    prefix: Some("FT".to_owned()),
+                    ..ItemKindPatch::default()
+                },
+            },
+        )
+        .await,
+    );
+
+    assert_eq!(kind(&snapshot, ids::KIND_VULKAN_FEAT).prefix, "FT");
+    let item = backend
+        .item(ids::VULKAN_FEAT_1)
+        .await
+        .expect("the store answers")
+        .expect("the fixture's `FEAT-1`");
+    assert_eq!(item.key_prefix, "FEAT");
+    assert_eq!(item.key, "FEAT-1");
+}
+
+/// A token from before someone else's write answers `CatalogueStale` with the tree as it is now:
+/// the write did not happen and the editor retries only on a second `Enter` (D8, `R-ENT-10`).
+#[tokio::test]
+async fn update_kind_with_a_stale_token_answers_stale() {
+    let backend = demo();
+    let before = demo_catalogue(&backend).await;
+    let stored = kind(&before, ids::KIND_VULKAN_FEAT);
+    let expected = stored.updated_at - Duration::seconds(1);
+
+    let reply = serve(
+        &backend,
+        &StoreRequest::UpdateKind {
+            scope: vulkan_scope(),
+            id: ids::KIND_VULKAN_FEAT,
+            expected,
+            patch: ItemKindPatch {
+                name: Some("features".to_owned()),
+                ..ItemKindPatch::default()
+            },
+        },
+    )
+    .await;
+
+    let StoreReply::CatalogueStale(snapshot) = reply else {
+        panic!("a missed token answers stale: {reply:?}");
+    };
+    assert_eq!(
+        kind(&snapshot, ids::KIND_VULKAN_FEAT).name,
+        "feature",
+        "the refused write left the row alone"
+    );
+}
+
+/// A graph is created empty and edited under CAS, and a second edit with the first token is stale
+/// (D5, D8).
+#[tokio::test]
+async fn create_graph_and_update_graph() {
+    let backend = demo();
+
+    let created = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::CreateGraph {
+                scope: vulkan_scope(),
+                project: ids::PROJECT_VULKAN,
+                name: "docs".to_owned(),
+                description: String::new(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(created.projects[0].graphs.len(), 6);
+    let entry = created.projects[0]
+        .graphs
+        .iter()
+        .find(|g| g.graph.name == "docs")
+        .expect("the new graph");
+    assert!(entry.phases.is_empty(), "a graph is created without phases");
+    let id = entry.graph.id;
+    let expected = entry.graph.updated_at;
+
+    let renamed = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::UpdateGraph {
+                scope: vulkan_scope(),
+                id,
+                expected,
+                patch: StepGraphPatch {
+                    name: Some("documentation".to_owned()),
+                    description: None,
+                },
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        renamed.projects[0]
+            .graph(id)
+            .expect("the renamed graph")
+            .graph
+            .name,
+        "documentation"
+    );
+
+    let reply = serve(
+        &backend,
+        &StoreRequest::UpdateGraph {
+            scope: vulkan_scope(),
+            id,
+            expected,
+            patch: StepGraphPatch {
+                name: Some("docs again".to_owned()),
+                description: None,
+            },
+        },
+    )
+    .await;
+    assert!(
+        matches!(reply, StoreReply::CatalogueStale(_)),
+        "the first token is spent: {reply:?}"
     );
 }
