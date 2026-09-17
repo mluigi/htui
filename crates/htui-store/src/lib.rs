@@ -13,6 +13,7 @@
 pub mod backend;
 pub mod cache;
 pub mod connect;
+pub mod dsn;
 pub mod error;
 pub mod identity;
 pub mod pg;
@@ -24,6 +25,7 @@ pub mod writer;
 pub use backend::Backend;
 pub use cache::{CacheMeta, CacheStore};
 pub use connect::{ConnEvent, StartOptions, Started};
+pub use dsn::{Dsn, DsnError};
 pub use error::map_sqlx;
 pub use identity::Identity;
 pub use pg::{Connected, MigrationState, PgStore};
