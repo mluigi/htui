@@ -72,6 +72,19 @@ echo postgres://postgres:htui@localhost:5439/htui | htui --set-dsn
 
 TLS is whatever the DSN asks for (`?sslmode=require`, …); nothing overrides it (`R-STO-2`).
 
+Since MOD-15 milestone 6 the two flags are no longer the only way in: **Settings › Connection**
+does the same thing from inside the running program, which is where the DSN's second, third and
+fourth change belong. `e` opens a masked field — one `•` per character and a count, no reveal
+toggle, and the text is wiped rather than dropped — and `Enter` stores it, re-opens the mirror
+under the new database's fingerprint and connects **without a restart**. A DSN that does not parse
+is refused at the field with one of five fixed sentences (`not a URL`, `no host`,
+`unsupported sslmode`, `port out of range`, `unrecognised parameter`); nothing is stored, echoed or
+logged on that path. `c` removes the entry (this session keeps its current connection until you
+quit) and `R` rebuilds the local mirror, naming what survives and what goes before it acts.
+
+A box whose keyring is empty opens **on that field**, rather than parking offline pointing at a
+flag it cannot reach. `--set-dsn` remains, unchanged, for scripted and headless use.
+
 ### A development server
 
 `compose.yaml` at the repo root runs the minimum supported server, `postgres:16`, on host port
