@@ -17,6 +17,7 @@ pub mod event_loop;
 pub mod hierarchy;
 pub mod keymap;
 pub mod preview;
+pub mod prompt_settings;
 pub mod store_worker;
 pub mod terminal;
 pub mod ui;

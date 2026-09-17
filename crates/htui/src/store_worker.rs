@@ -22,15 +22,20 @@ use htui_core::model::{
     RepoId, RepoPatch, RunSummary, Scope, SessionEvent, StepGraphId, StepGraphPatch, StepId,
     WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
-use htui_core::store::{DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, StoreError};
+use htui_core::prompt::SettingKey;
+use htui_core::store::{
+    DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung, StoreError,
+};
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
 use htui_store::{Backend, ConnEvent, PgStore, Started, connect};
+use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
 use crate::agent_worker::{AgentRuntime, Served};
 use crate::catalogue::{self, CatalogueSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, MirrorAfterDelete};
+use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
 
@@ -439,6 +444,34 @@ pub enum StoreRequest {
         /// The budget to set, or `None` to clear it and let the rung below answer (D16).
         budget: Option<i64>,
     },
+    /// The ten prompt keys on `App` plus the `Project`-rung keys of every scope project (M5 D3).
+    PromptSettings(Scope),
+    /// `set_setting` on `App` or `Project` (M5 D7). `expected: None` is "I expect no row", accepted
+    /// on `App` only (`traits.rs:553-560`); the section always passes `Some(project.updated_at)`
+    /// for a project. CAS on the rung row's `updated_at`.
+    SetSetting {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// Which rung is written; never `Phase` from the prompt section (M5 D8).
+        rung: SettingRung,
+        /// Which key.
+        key: SettingKey,
+        /// The JSON to store: an integer, or an `f64` for the one fraction key (M5 D12).
+        value: Value,
+        /// The rung row's `updated_at` the editor opened on; `None` for an absent `App` row.
+        expected: Option<DateTime<Utc>>,
+    },
+    /// `clear_setting` on `App` or `Project`, so the rung below answers (M5 D10).
+    ClearSetting {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// Which rung is cleared.
+        rung: SettingRung,
+        /// Which key.
+        key: SettingKey,
+        /// The rung row's `updated_at` the editor opened on.
+        expected: DateTime<Utc>,
+    },
 }
 
 impl StoreRequest {
@@ -496,6 +529,10 @@ impl StoreRequest {
             Self::CreatePhase { .. } => "create_phase",
             Self::UpdatePhase { .. } => "update_phase",
             Self::SetPhaseBudget { .. } => "set_phase_budget",
+            // The three of `prompt_settings::REQUEST_NAMES`, in that order (MOD-15 M5 D7).
+            Self::PromptSettings(..) => "prompt_settings",
+            Self::SetSetting { .. } => "set_setting",
+            Self::ClearSetting { .. } => "clear_setting",
         }
     }
 }
@@ -637,6 +674,12 @@ pub enum StoreReply {
         /// The scope's catalogue without the kind.
         catalogue: Box<CatalogueSnapshot>,
     },
+    /// The scope's prompt settings, freshly read: the answer to [`StoreRequest::PromptSettings`]
+    /// and to every settings write that applied (M5 D3/D7).
+    PromptSettings(Box<SettingsSnapshot>),
+    /// A settings write missed its CAS token (M5 D14, PRD D8): the rungs as they are now, for the
+    /// editor to reload against. The editor keeps its typed text and retries only on `Enter`.
+    PromptSettingsStale(Box<SettingsSnapshot>),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -900,6 +943,12 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::CreatePhase { .. }
         | StoreRequest::UpdatePhase { .. }
         | StoreRequest::SetPhaseBudget { .. } => catalogue::serve(backend, request).await?,
+        // The three prompt settings requests, or-ed for the same reason the twenty-one above are:
+        // a guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …`
+        // would be an E0004 here (MOD-15 M3 plan F-12, M5 plan F-13).
+        StoreRequest::PromptSettings(..)
+        | StoreRequest::SetSetting { .. }
+        | StoreRequest::ClearSetting { .. } => prompt_settings::serve(backend, request).await?,
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,
