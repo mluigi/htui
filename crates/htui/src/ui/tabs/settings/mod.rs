@@ -225,6 +225,24 @@ impl SettingsRegistry {
         }
     }
 
+    /// Activates the section with this id (`TabAction::FocusSection`, MOD-15 M6 D7).
+    ///
+    /// `false` when it is not registered, and nothing moves: a build that dropped a section must
+    /// not land the user on a different one than the action named, and must not die either.
+    ///
+    /// The first *addressable* jump this registry has — `cycle_next`/`cycle_prev` are the only
+    /// other movement — and [`TabRegistry::focus`](crate::ui::tabs::registry::TabRegistry::focus)
+    /// one level up is the shape it copies.
+    pub fn focus(&mut self, id: SectionId) -> bool {
+        match self.sections.iter().position(|section| section.id() == id) {
+            Some(idx) => {
+                self.active = idx;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Every section's id and title, in strip order.
     #[must_use]
     pub fn titles(&self) -> Vec<(SectionId, &str)> {
@@ -324,6 +342,15 @@ impl Tab for SettingsTab {
         for section in &mut self.sections.sections {
             section.on_reply(reply, ctx);
         }
+    }
+
+    /// The one tab that has sections to focus (MOD-15 M6 D7).
+    ///
+    /// No re-activation is needed on the way in: [`wants_requests`](Tab::wants_requests) above
+    /// collects **every** section's reads, not the active one's, so a section switched to has
+    /// already been handed whatever the tab was handed.
+    fn focus_section(&mut self, section: SectionId) -> bool {
+        self.sections.focus(section)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

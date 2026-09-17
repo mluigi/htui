@@ -8,6 +8,8 @@ use htui_core::model::{Scope, StepId, WorkspaceId, WorkspaceSummary};
 use crate::app::action::{Action, OverlayAction, TabAction};
 use crate::app::state::{App, Ctx};
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
+use crate::ui::tabs::SettingsTab;
+use crate::ui::tabs::settings::ConnectionSection;
 
 /// The top bar's run count is re-read once a second, i.e. every fourth 250 ms tick.
 const TICKS_PER_REFRESH: u64 = 4;
@@ -44,6 +46,18 @@ impl App {
             }
             TabAction::Focus(id) => {
                 self.tabs.focus(id);
+            }
+            // The tab first, then the section inside it (D7). A section id nothing registers
+            // leaves the tab focused and the section where it was, which is the honest outcome:
+            // the addressed tab *is* on screen, and moving its cursor somewhere unasked-for
+            // would be worse than not moving it.
+            TabAction::FocusSection(id, section) => {
+                if self.tabs.focus(id)
+                    && let Some(tab) = self.tabs.by_id_mut(id)
+                    && !tab.focus_section(section)
+                {
+                    tracing::debug!(tab = %id, %section, "no such section to focus");
+                }
             }
         }
         if self.tabs.active_id() != before {
@@ -275,6 +289,27 @@ impl App {
                     }
                 }
             }
+        }
+
+        // MOD-15 M6 D6: a box whose keyring is empty is redirected rather than stranded.
+        //
+        // Without this it parks at `offline · 0s` forever — the reconnect ticker is guarded on a
+        // `reconnect` that a box with no DSN never has — pointing at a CLI flag the user cannot
+        // reach without quitting. `Some(false)` and nothing else: `None` is `--demo`, which has
+        // no keyring story at all and must not be steered anywhere.
+        //
+        // Once per session, for the reason `migration_prompt_shown` exists: `ConnectionInfo` is
+        // re-issued whenever the shell asks again, and a redirect that fired on every reply would
+        // drag the user back to Settings from whatever they had moved on to.
+        if let StoreReply::Connection(snapshot) = reply
+            && snapshot.dsn_stored == Some(false)
+            && !self.connection_redirect_done
+        {
+            self.connection_redirect_done = true;
+            self.update(Action::Tab(TabAction::FocusSection(
+                SettingsTab::ID,
+                ConnectionSection::ID,
+            )));
         }
     }
 }

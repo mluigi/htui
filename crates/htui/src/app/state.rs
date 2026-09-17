@@ -182,6 +182,12 @@ pub struct App {
     /// `StoreState` is re-read every fourth tick, so without this an answered `n` would re-open
     /// the prompt a second later, forever (blueprint D.5).
     pub(super) migration_prompt_shown: bool,
+    /// Whether the no-DSN redirect has already fired this session (MOD-15 M6 D6).
+    ///
+    /// `ConnectionInfo` is re-issued whenever the shell asks again, so without this a box with an
+    /// empty keyring would be dragged back to `Settings > Connection` from wherever the user had
+    /// moved on to — the defect `migration_prompt_shown` exists to prevent, one reply across.
+    pub(super) connection_redirect_done: bool,
 }
 
 impl App {
@@ -216,6 +222,7 @@ impl App {
             migration_overlay: None,
             replay_tab: None,
             migration_prompt_shown: false,
+            connection_redirect_done: false,
         }
     }
 

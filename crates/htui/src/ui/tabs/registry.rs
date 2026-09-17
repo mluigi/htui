@@ -14,6 +14,7 @@ use ratatui::widgets::Paragraph;
 use crate::app::{Ctx, Handled};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
+use crate::ui::tabs::settings::SectionId;
 use crossterm::event::KeyEvent;
 
 /// Stable identity of a tab. The string is also the key of its [`KeyScope`](crate::keymap::KeyScope).
@@ -46,6 +47,16 @@ pub trait Tab {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws into the body region.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
+    /// Moves this tab's own focus to `section` (MOD-15 M6 D7).
+    ///
+    /// `false` when the tab has no such section — which is every tab but Settings, and is what
+    /// the default body says. Defaulted so that adding an addressable jump to one tab changes no
+    /// other tab's file; this is the trait's first default, and the same move
+    /// [`SettingsSection::captures_input`](crate::ui::tabs::settings::SettingsSection::captures_input)
+    /// made one level down.
+    fn focus_section(&mut self, _section: SectionId) -> bool {
+        false
+    }
 }
 
 /// Every registered tab, in registration order, plus which one is active.

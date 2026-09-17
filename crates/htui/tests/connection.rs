@@ -29,7 +29,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use chrono::{TimeZone as _, Utc};
+use chrono::{DateTime, TimeZone as _, Utc};
 use htui::app::{Action, Handled, TabAction};
 use htui::connection::{
     Attempt, AttemptOutcome, ConnectionSnapshot, DEMO_SESSION, MirrorInfo, NO_WORKER, READ_NAME,
@@ -332,7 +332,7 @@ async fn an_offline_backend_reports_a_stored_dsn_by_summary_only() {
 
     let mut worker = Worker::spawn(Started::detached(Backend::Offline {
         cache: cache.clone(),
-        since: Some(chrono::Utc::now()),
+        since: Some(Utc::now()),
     }));
     let snapshot = worker.info().await;
 
@@ -370,7 +370,7 @@ async fn an_unparseable_stored_dsn_reports_stored_without_a_summary() {
 
     let mut worker = Worker::spawn(Started::detached(Backend::Offline {
         cache: cache.clone(),
-        since: Some(chrono::Utc::now()),
+        since: Some(Utc::now()),
     }));
     let snapshot = worker.info().await;
 
@@ -396,7 +396,7 @@ async fn set_dsn_without_a_context_fails_and_changes_nothing() {
     // `detached` is `connect: None`, which is what `--demo` and every harness carries.
     let mut worker = Worker::spawn(Started::detached(Backend::Offline {
         cache: cache.clone(),
-        since: Some(chrono::Utc::now()),
+        since: Some(Utc::now()),
     }));
     let (failed, message) = refusal(
         worker
@@ -434,7 +434,7 @@ async fn clear_dsn_empties_the_keyring_and_keeps_the_backend() {
 
     let mut worker = Worker::spawn(Started::detached(Backend::Offline {
         cache: cache.clone(),
-        since: Some(chrono::Utc::now()),
+        since: Some(Utc::now()),
     }));
     let before = worker.info().await;
     assert_eq!(before.dsn_stored, Some(true));
@@ -466,7 +466,7 @@ async fn set_dsn_under_offline_stores_but_does_not_dial() {
 
     let mut started = Started::detached(Backend::Offline {
         cache: cache.clone(),
-        since: Some(chrono::Utc::now()),
+        since: Some(Utc::now()),
     });
     started.connect = Some(context(&root, Duration::from_millis(250), true));
     let mut worker = Worker::spawn(started);
@@ -524,7 +524,7 @@ async fn rebuild_cache_empties_the_mirrored_tables_and_keeps_the_meta() {
 
     let mut started = Started::detached(Backend::Offline {
         cache: cache.clone(),
-        since: Some(chrono::Utc::now()),
+        since: Some(Utc::now()),
     });
     started.connect = Some(context(&root, Duration::from_millis(250), false));
     let mut worker = Worker::spawn(started);
@@ -616,7 +616,7 @@ async fn a_dial_in_flight_across_a_set_dsn_is_discarded() {
 
     let mut started = Started::detached(Backend::Offline {
         cache: cache.clone(),
-        since: Some(chrono::Utc::now()),
+        since: Some(Utc::now()),
     });
     // A minute: neither dial may end on a timeout, only when this test releases its socket.
     started.connect = Some(context(&root, Duration::from_secs(60), false));
@@ -684,7 +684,7 @@ async fn set_dsn_goes_online_without_a_restart() {
     // Exactly the shape `connect::start` hands back for an empty keyring: offline, no reconnect.
     let mut started = Started::detached(Backend::Offline {
         cache: cache.clone(),
-        since: Some(chrono::Utc::now()),
+        since: Some(Utc::now()),
     });
     started.connect = Some(context(&root, Duration::from_secs(10), false));
     let mut worker = Worker::spawn(started);
@@ -762,7 +762,7 @@ async fn a_second_set_dsn_swaps_the_mirror_and_leaves_the_old_file() {
 
     let mut started = Started::detached(Backend::Offline {
         cache: cache.clone(),
-        since: Some(chrono::Utc::now()),
+        since: Some(Utc::now()),
     });
     started.connect = Some(context(&root, Duration::from_secs(10), false));
     let mut worker = Worker::spawn(started);
@@ -803,7 +803,7 @@ const SECRET: &str = "s3cr3tword";
 const TYPED: &str = "postgres://u:pw@h/d";
 
 /// A fixed clock, so a snapshot of the Mirror row is the same on every run.
-fn at(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
+fn at(hour: u32, minute: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 15, hour, minute, 0)
         .single()
         .expect("a real instant")

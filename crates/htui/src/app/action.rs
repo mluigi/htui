@@ -8,6 +8,7 @@ use htui_core::model::{StepId, WorkspaceSummary};
 use crate::store_worker::{ReplyEnvelope, StoreRequest};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
+use crate::ui::tabs::settings::SectionId;
 
 /// One state change of the shell.
 #[derive(Debug, Clone)]
@@ -57,6 +58,12 @@ pub enum TabAction {
     Select(usize),
     /// The tab with this id; ignored when it is not registered.
     Focus(TabId),
+    /// Focus `tab` and, within it, `section` (MOD-15 M6 D7): the shell's redirect to the
+    /// connection section when no DSN is stored.
+    ///
+    /// Either id being unregistered is a no-op, as [`Focus`](TabAction::Focus)'s is — a build
+    /// that dropped a view must not kill the shell, and must not silently land somewhere else.
+    FocusSection(TabId, SectionId),
 }
 
 /// Opening and closing overlays.

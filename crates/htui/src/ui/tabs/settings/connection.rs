@@ -900,7 +900,7 @@ mod tests {
     fn an_editor_never_prints_its_buffer() {
         let mut input = TextField::masked();
         for c in "postgres://u:pw@h/d".chars() {
-            input.on_key(crossterm::event::KeyEvent::from(KeyCode::Char(c)));
+            input.on_key(KeyEvent::from(KeyCode::Char(c)));
         }
         let section = ConnectionSection {
             mode: Mode::Editing(Editor { input }),
@@ -939,10 +939,8 @@ mod tests {
         assert_eq!(
             [REQUEST_NAMES[1], REQUEST_NAMES[2], REQUEST_NAMES[3]],
             [
-                StoreRequest::SetDsn(
-                    htui_store::Dsn::parse("postgres://h:5432/d").expect("a parseable DSN")
-                )
-                .name(),
+                StoreRequest::SetDsn(Dsn::parse("postgres://h:5432/d").expect("a parseable DSN"))
+                    .name(),
                 StoreRequest::ClearDsn.name(),
                 StoreRequest::RebuildCache.name(),
             ],
