@@ -28,7 +28,10 @@ use crate::app::{Ctx, Handled};
 use crate::catalogue::{CatalogueSnapshot, GraphEntry, ProjectCatalogue, REQUEST_NAMES};
 use crate::hierarchy::MirrorAfterDelete;
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::tabs::settings::{SectionId, SettingsSection, message};
+use crate::ui::tabs::settings::{
+    CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
+    message,
+};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -59,22 +62,6 @@ const HINT_EDITING: &str = "Tab/Shift+Tab field \u{b7} Enter save \u{b7} Esc can
 
 /// The prefix warning's keys (D10).
 const HINT_CONFIRM_PREFIX: &str = "y write \u{b7} n/Esc back to the editor";
-
-/// What a compare-and-set miss says while an editor is open (D8, PRD D8): the text is kept, the
-/// token is not, and the retry is the user's.
-const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
-
-/// What the same miss says with **no editor open** to retry from.
-///
-/// `Enter retries against the current row` would name a row that is not on screen: the editor went
-/// with a scope change (B-12), or a `Catalogue` that answered something else was taken for this
-/// write's reply and closed it (H-9). The write did not apply either way, and this is the only line
-/// that can say so and say what to do about it.
-const CHANGED_ELSEWHERE_CLOSED: &str =
-    "changed elsewhere; nothing was written \u{2014} reopen the editor and retry";
-
-/// What a compare-and-set miss says when the row the editor opened on is gone from the reload.
-const DELETED_ELSEWHERE: &str = "deleted elsewhere \u{2014} the editor was closed";
 
 /// What `e`, `d` and `g` say on a project row: this section owns what is inside a project, and the
 /// hierarchy section owns the project (B-13).

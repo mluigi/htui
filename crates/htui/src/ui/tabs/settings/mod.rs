@@ -52,11 +52,31 @@ pub(crate) fn yes_or_no(text: &str) -> Option<bool> {
 /// Whether a notice is one the user has to act on rather than read, and so belongs in
 /// `theme.error`.
 ///
-/// Both sections coin their compare-and-set sentences from the same two openings — the row moved
-/// under an open editor, or it is gone — and both draw them the same way (M4 D14).
+/// The kinds section, the hierarchy section and the prompt section coin their compare-and-set
+/// sentences from the same two openings — the row moved under an open editor, or it is gone — and
+/// all of them draw them the same way (M4 D14).
 pub(crate) fn is_error(notice: &str) -> bool {
     notice.starts_with("changed elsewhere") || notice.starts_with("deleted elsewhere")
 }
+
+/// What a compare-and-set miss says while an editor is open (M4 D8, PRD D8): the text is kept, the
+/// token is not, and the retry is the user's. (M4 D14, promoted for M5.)
+pub(crate) const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
+
+/// What the same miss says with **no editor open** to retry from.
+///
+/// `Enter retries against the current row` would name a row that is not on screen: the editor went
+/// with a scope change (M4 B-12), or a read that answered something else was taken for this write's
+/// reply and closed it (M4 H-9). The write did not apply either way, and this is the only line that
+/// can say so and say what to do about it. (M4 D14, promoted for M5.)
+pub(crate) const CHANGED_ELSEWHERE_CLOSED: &str =
+    "changed elsewhere; nothing was written \u{2014} reopen the editor and retry";
+
+/// What a compare-and-set miss says when the row the editor opened on is gone from the reload.
+///
+/// The hierarchy section keeps its own, differently worded, sentence: M3's snapshots pin it.
+/// (M4 D14, promoted for M5.)
+pub(crate) const DELETED_ELSEWHERE: &str = "deleted elsewhere \u{2014} the editor was closed";
 
 /// Stable identity of a Settings section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
