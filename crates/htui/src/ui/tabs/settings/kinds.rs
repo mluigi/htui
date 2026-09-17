@@ -64,6 +64,15 @@ const HINT_CONFIRM_PREFIX: &str = "y write \u{b7} n/Esc back to the editor";
 /// token is not, and the retry is the user's.
 const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
 
+/// What the same miss says with **no editor open** to retry from.
+///
+/// `Enter retries against the current row` would name a row that is not on screen: the editor went
+/// with a scope change (B-12), or a `Catalogue` that answered something else was taken for this
+/// write's reply and closed it (H-9). The write did not apply either way, and this is the only line
+/// that can say so and say what to do about it.
+const CHANGED_ELSEWHERE_CLOSED: &str =
+    "changed elsewhere; nothing was written \u{2014} reopen the editor and retry";
+
 /// What a compare-and-set miss says when the row the editor opened on is gone from the reload.
 const DELETED_ELSEWHERE: &str = "deleted elsewhere \u{2014} the editor was closed";
 
@@ -1116,7 +1125,10 @@ impl KindsSection {
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
         match reloaded {
-            None | Some(Reload::Keep) => self.say(CHANGED_ELSEWHERE),
+            // Nothing is open to press `Enter` on, so the sentence has to carry what the editor
+            // would otherwise stand for: the write did not apply, and the way back is to reopen.
+            None => self.say(CHANGED_ELSEWHERE_CLOSED),
+            Some(Reload::Keep) => self.say(CHANGED_ELSEWHERE),
             Some(Reload::Gone) => {
                 self.mode = Mode::Browse;
                 self.say(DELETED_ELSEWHERE);
@@ -1323,6 +1335,19 @@ impl KindsSection {
     ///
     /// Only a reply to a **write** closes an open editor (H-9): `r` sets no `busy`, so a reload that
     /// lands while something is being typed leaves the typing alone.
+    ///
+    /// `busy` is the whole of the attribution, and a `Catalogue` carries nothing that says which
+    /// request it answers — so a read that lands between a write and its reply is taken for that
+    /// reply and closes the editor early. The case the reviewer of M4 names is a re-read issued in
+    /// the middle of B-4's two-write chain: the first `Catalogue` sends `set_phase_budget` and the
+    /// *read's* reply, arriving next, is counted as the budget's. `r` is not that door today —
+    /// `on_key` hands every key to the open editor, where `r` is a letter (`:1336`), and every write
+    /// this section sends leaves `Browse` behind — but a scope change, a tab re-activation
+    /// (`app/state.rs`'s `wants_requests`) or a future read on the Browse side all are. `r` stays
+    /// allowed anyway: re-reading is how a section that lost a reply recovers, and refusing it while
+    /// busy would wedge exactly the section that needs it. The loss is bounded and deliberate — the
+    /// write itself has already been sent, so all that goes is the retry affordance if it comes back
+    /// `CatalogueStale`, and [`CHANGED_ELSEWHERE_CLOSED`] says so when it does.
     fn on_catalogue(&mut self, snapshot: &CatalogueSnapshot, ctx: &Ctx<'_>) {
         let write = self.busy.take();
         // A read that answered is the end of an outage: leaving `unavailable` set would say the
@@ -1433,7 +1458,9 @@ impl SettingsSection for KindsSection {
             }
             // Allowed whatever else is going on: re-reading is how a section that lost a reply
             // recovers, and a read cannot lose a write's reply — the staleness index is keyed by
-            // request kind.
+            // request kind. What it *can* do is be mistaken for one, because a `Catalogue` says
+            // nothing about which request it answers; that trade is argued where the mistake is
+            // made, in `on_catalogue` (H-9).
             KeyCode::Char('r') => {
                 ctx.request(StoreRequest::Catalogue(ctx.scope.clone()));
                 Handled::Consumed

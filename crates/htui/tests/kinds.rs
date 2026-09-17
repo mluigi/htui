@@ -1400,6 +1400,39 @@ async fn a_stale_reply_with_the_row_gone_closes_the_editor() {
     );
 }
 
+/// A miss that outlives the editor it was raised from says what the ordinary sentence cannot.
+///
+/// `Enter retries against the current row` names a row that is not on screen: the editor went with
+/// the scope change (B-12), or a `Catalogue` that answered something else was taken for this
+/// write's reply and closed it (H-9). Either way the write did **not** apply, and the notice is the
+/// only thing that can say so and say how to get back to it.
+#[tokio::test]
+async fn a_stale_reply_with_no_editor_open_says_nothing_was_written() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "x");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    // The workspace changed under the write: the editor and its token went with it.
+    section.on_scope_change(&nil_scope());
+    assert!(!section.captures_input(), "nothing is being typed into");
+
+    bench.reply(
+        &mut section,
+        &StoreReply::CatalogueStale(Box::new(snapshot.clone())),
+    );
+
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.iter().any(|line| line
+            == "changed elsewhere; nothing was written \u{2014} reopen the editor and retry"),
+        "the miss says the write did not apply, and how to resume: {flagged:?}"
+    );
+}
+
 /// A prefix change is a warning before it is a write (PRD D12, D10): the old keys and their counter
 /// survive, and the next item minted under the kind spells the new one. Nothing is sent until that
 /// sentence has been on screen.
