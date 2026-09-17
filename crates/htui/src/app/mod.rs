@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::keymap::{Binding, KeyChord, KeyScope};
 use crate::ui::overlay::{MigrationPrompt, WorkspaceSwitcher};
-use crate::ui::tabs::settings::{AgentsSection, HierarchySection};
+use crate::ui::tabs::settings::{AgentsSection, HierarchySection, KindsSection};
 use crate::ui::tabs::{BacklogTab, ChatTab, SettingsTab, SkillsTab};
 
 /// Registers every tab and every overlay factory, and names the workspace switcher as the
@@ -47,6 +47,7 @@ pub fn register_all(app: &mut App) {
     app.register_tab(Box::new(SettingsTab::with_sections(vec![
         Box::new(AgentsSection::new()),
         Box::new(HierarchySection::new()),
+        Box::new(KindsSection::new()),
     ])));
     app.register_tab(Box::new(ChatTab::new()));
 

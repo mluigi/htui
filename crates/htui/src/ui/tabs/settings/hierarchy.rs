@@ -361,7 +361,7 @@ impl HierarchySection {
         let Some(notice) = &self.notice else {
             return Line::styled(keys, theme.dim);
         };
-        let style = if is_error(notice) {
+        let style = if super::is_error(notice) {
             theme.error
         } else {
             theme.dim
@@ -879,14 +879,14 @@ impl HierarchySection {
                 }
             }
             EditorKind::NewRepo(project) => {
-                let Some(is_primary) = yes_or_no(&editor.text(3)) else {
+                let Some(is_primary) = super::yes_or_no(&editor.text(3)) else {
                     self.notice = Some("`primary (y/n)` is y or n".to_owned());
                     return;
                 };
                 StoreRequest::CreateRepo {
                     project,
                     name: editor.text(0),
-                    remote_url: some_text(editor.text(1)),
+                    remote_url: super::some_text(editor.text(1)),
                     default_branch: editor.text(2),
                     is_primary,
                 }
@@ -902,7 +902,7 @@ impl HierarchySection {
                     expected,
                     patch: RepoPatch {
                         name: Some(editor.text(0)),
-                        remote_url: Some(some_text(editor.text(1))),
+                        remote_url: Some(super::some_text(editor.text(1))),
                         default_branch: Some(editor.text(2)),
                         // Never the flag: `p` is its only writer (D12).
                         is_primary: None,
@@ -1441,24 +1441,4 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
         lines.push(line);
     }
     lines
-}
-
-/// Whether a notice is one the user has to act on rather than read (D7): both come from a row that
-/// moved under an open editor.
-fn is_error(notice: &str) -> bool {
-    notice == CHANGED_ELSEWHERE || notice == DELETED_ELSEWHERE
-}
-
-/// An optional column: an empty field clears it rather than storing `""`.
-fn some_text(text: String) -> Option<String> {
-    if text.is_empty() { None } else { Some(text) }
-}
-
-/// The `y`/`n` field of the repo editor; anything else is refused rather than guessed at.
-fn yes_or_no(text: &str) -> Option<bool> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => Some(true),
-        "n" | "no" => Some(false),
-        _ => None,
-    }
 }

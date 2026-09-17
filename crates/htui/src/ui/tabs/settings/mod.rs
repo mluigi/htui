@@ -10,6 +10,7 @@
 
 pub mod agents;
 pub mod hierarchy;
+pub mod kinds;
 
 use htui_core::model::Scope;
 use ratatui::Frame;
@@ -26,6 +27,36 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 pub use agents::AgentsSection;
 pub use hierarchy::HierarchySection;
+pub use kinds::KindsSection;
+
+/// An optional column: an empty field clears it rather than storing `""`.
+///
+/// Here rather than in one section because both of them have a field whose empty text means "no
+/// value" (MOD-15 M4 D14): one parser for one convention, so the two cannot drift on what `""`
+/// stores.
+pub(crate) fn some_text(text: String) -> Option<String> {
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// The `y`/`n` fields of the section editors; anything else is refused rather than guessed at
+/// (M4 D14 — the repo editor's `primary (y/n)` and the phase editor's `gate_hard (y/n)` are one
+/// convention).
+pub(crate) fn yes_or_no(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether a notice is one the user has to act on rather than read, and so belongs in
+/// `theme.error`.
+///
+/// Both sections coin their compare-and-set sentences from the same two openings — the row moved
+/// under an open editor, or it is gone — and both draw them the same way (M4 D14).
+pub(crate) fn is_error(notice: &str) -> bool {
+    notice.starts_with("changed elsewhere") || notice.starts_with("deleted elsewhere")
+}
 
 /// Stable identity of a Settings section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
