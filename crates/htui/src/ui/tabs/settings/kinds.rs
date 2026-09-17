@@ -18,14 +18,18 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use htui_core::model::{Scope, StepGraphPhase};
+use chrono::{DateTime, Utc};
+use htui_core::model::{
+    ItemKind, ItemKindId, ItemKindPatch, ProjectId, Scope, StepGraphId, StepGraphPatch,
+    StepGraphPhase,
+};
 
 use crate::app::{Ctx, Handled};
 use crate::catalogue::{CatalogueSnapshot, GraphEntry, ProjectCatalogue, REQUEST_NAMES};
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::Theme;
 use crate::ui::tabs::settings::{SectionId, SettingsSection, message};
-use crossterm::event::{KeyCode, KeyEvent};
+use crate::ui::{FieldOutcome, TextField, Theme};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// What the rows pane says before any catalogue has arrived.
 const NO_WORKSPACE: &str = "no workspace: nothing to list";
@@ -48,6 +52,26 @@ const HINT_NO_WORKSPACE: &str = "r reload";
 /// Browse's keys with the read refused: nothing here can be written against a store that did not
 /// answer.
 const HINT_UNAVAILABLE: &str = "r reload";
+
+/// An open editor's keys.
+const HINT_EDITING: &str = "Tab/Shift+Tab field \u{b7} Enter save \u{b7} Esc cancel";
+
+/// What a compare-and-set miss says while an editor is open (D8, PRD D8): the text is kept, the
+/// token is not, and the retry is the user's.
+const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
+
+/// What a compare-and-set miss says when the row the editor opened on is gone from the reload.
+const DELETED_ELSEWHERE: &str = "deleted elsewhere \u{2014} the editor was closed";
+
+/// What `e`, `d` and `g` say on a project row: this section owns what is inside a project, and the
+/// hierarchy section owns the project (B-13).
+const PROJECTS_ELSEWHERE: &str = "projects are edited in Hierarchy";
+
+/// What the kind editor says when its `graph` field names nothing (B-7).
+const NO_GRAPH_NAMED: &str = "`graph` names no graph in this project";
+
+/// What an editor says when a `position` field is not a number (B-8).
+const POSITION_IS_A_NUMBER: &str = "`position` is a whole number";
 
 /// The tail of the read-only detail line (D15): the columns are MOD-4's to give semantics to, so
 /// they are shown and not edited.
@@ -93,6 +117,102 @@ enum Row {
     },
 }
 
+/// Which row an open editor writes back to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorKind {
+    /// `n` on a project or kind row.
+    NewKind(ProjectId),
+    /// `e` on a kind row.
+    EditKind(ItemKindId),
+    /// `N` on any row.
+    NewGraph(ProjectId),
+    /// `e` on a graph row, and `g` on a kind, phase or graph row (D19).
+    EditGraph(StepGraphId),
+}
+
+/// One labelled input of an editor.
+#[derive(Debug)]
+struct Field {
+    /// What the pane prints in front of it.
+    label: &'static str,
+    /// The buffer; its `Debug` never prints the text.
+    input: TextField,
+    /// Whether `Enter` refuses while it is empty.
+    required: bool,
+}
+
+/// The open editor: which row, its fields, which one has focus, and the token it opened on.
+struct Editor {
+    /// The row this writes back to.
+    kind: EditorKind,
+    /// The inputs, in tab order.
+    fields: Vec<Field>,
+    /// Index into `fields`.
+    focus: usize,
+    /// The `updated_at` of the row this opened on; `None` for a create (M1 D3).
+    expected: Option<DateTime<Utc>>,
+}
+
+/// Labels, never what was typed into them (H-7).
+///
+/// Hand-written because [`KindsSection`] derives `Debug` and one `tracing::debug!` of a section is
+/// all it takes for a field's text to reach a log. [`TextField`]'s own `Debug` holds the same line.
+impl core::fmt::Debug for Editor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Editor")
+            .field("kind", &self.kind)
+            .field(
+                "fields",
+                &self
+                    .fields
+                    .iter()
+                    .map(|field| field.label)
+                    .collect::<Vec<_>>(),
+            )
+            .field("focus", &self.focus)
+            .field("expected", &self.expected)
+            .finish()
+    }
+}
+
+/// What the section is doing. `Browse` is not a mode in the modal sense: it captures nothing.
+#[derive(Debug, Default)]
+enum Mode {
+    /// The rows, the cursor and the tab's own `h`/`l`.
+    #[default]
+    Browse,
+    /// One row being typed into.
+    Editing(Editor),
+}
+
+/// The last outcome, and whether it is one the user has to act on.
+///
+/// Carried with the text rather than derived from it: a refusal is often the **seam's** own
+/// sentence (`item_kind FEAT is held by 4 items`), and no string rule can tell one of those from a
+/// line of good news. The two sentences both sections coin are classified by the shared
+/// [`is_error`](super::is_error), so those two cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Notice {
+    /// One line of report.
+    Info(String),
+    /// One line the user has to act on, drawn in `theme.error`.
+    Error(String),
+}
+
+impl Notice {
+    /// The sentence.
+    fn text(&self) -> &str {
+        match self {
+            Self::Info(text) | Self::Error(text) => text,
+        }
+    }
+
+    /// Whether it belongs in `theme.error`.
+    fn is_error(&self) -> bool {
+        matches!(self, Self::Error(_))
+    }
+}
+
 /// The catalogue of the scope, with the keys that edit it.
 #[derive(Debug, Default)]
 pub struct KindsSection {
@@ -102,8 +222,14 @@ pub struct KindsSection {
     unavailable: Option<String>,
     /// The highlighted row, an index into [`rows`](KindsSection::rows).
     cursor: usize,
+    /// Browsing, or typing.
+    mode: Mode,
+    /// The write in flight, by [`StoreRequest::name`]. A second one is refused until the reply: the
+    /// staleness index keeps only the newest request of a kind, so two writes of one kind racing
+    /// would lose the reply about the one that landed.
+    busy: Option<&'static str>,
     /// The last outcome, one line on the hint row.
-    notice: Option<String>,
+    notice: Option<Notice>,
 }
 
 impl KindsSection {
@@ -197,6 +323,343 @@ impl KindsSection {
         self.graph_at(p, g)?.phases.get(i)
     }
 
+    /// The row under the cursor, or `None` while there is no tree.
+    fn selected(&self) -> Option<Row> {
+        self.rows().get(self.cursor).copied()
+    }
+
+    /// The project a kind belongs to, with the kind.
+    fn locate_kind(&self, id: ItemKindId) -> Option<(&ProjectCatalogue, &ItemKind)> {
+        self.snapshot.as_ref()?.projects.iter().find_map(|project| {
+            project
+                .kinds
+                .iter()
+                .find(|kind| kind.id == id)
+                .map(|kind| (project, kind))
+        })
+    }
+
+    /// The project a graph belongs to, with the graph.
+    fn locate_graph(&self, id: StepGraphId) -> Option<(&ProjectCatalogue, &GraphEntry)> {
+        self.snapshot.as_ref()?.projects.iter().find_map(|project| {
+            project
+                .graphs
+                .iter()
+                .find(|entry| entry.graph.id == id)
+                .map(|entry| (project, entry))
+        })
+    }
+
+    /// Whether a key that opens an editor is refused right now, with the notice that says why.
+    ///
+    /// One write of a kind at a time (M3's rule): a second one would have the staleness index drop
+    /// the first one's reply, and the first is the one about the write that landed. `r` is
+    /// deliberately not on this path — re-reading is how a section that lost a reply recovers.
+    fn blocked(&mut self) -> bool {
+        if let Some(busy) = self.busy {
+            self.refuse(in_flight(busy));
+            return true;
+        }
+        self.snapshot.is_none()
+    }
+
+    /// Opens an editor, clearing whatever the last one said.
+    fn open(&mut self, kind: EditorKind, fields: Vec<Field>, expected: Option<DateTime<Utc>>) {
+        self.notice = None;
+        self.mode = Mode::Editing(Editor {
+            kind,
+            fields,
+            focus: 0,
+            expected,
+        });
+    }
+
+    /// `n`: a kind under a project or a kind row (B-13).
+    fn open_new_child(&mut self, row: Row) {
+        if let Row::Project { p } | Row::Kind { p, .. } = row
+            && let Some(project) = self.project(p)
+        {
+            let id = project.project.id;
+            let fields = new_kind_fields(project);
+            self.open(EditorKind::NewKind(id), fields, None);
+        }
+    }
+
+    /// `N`: a graph in the row's project.
+    fn open_new_graph(&mut self, row: Row) {
+        let (Row::Project { p }
+        | Row::Kind { p, .. }
+        | Row::Graph { p, .. }
+        | Row::Phase { p, .. }) = row;
+        if let Some(project) = self.project(p) {
+            let id = project.project.id;
+            self.open(
+                EditorKind::NewGraph(id),
+                vec![
+                    Field::required("name", ""),
+                    Field::optional("description", ""),
+                ],
+                None,
+            );
+        }
+    }
+
+    /// `e`: the row under the cursor, prefilled, with its `updated_at` as the token.
+    fn open_edit(&mut self, row: Row) {
+        match row {
+            Row::Project { .. } => self.refuse(PROJECTS_ELSEWHERE.to_owned()),
+            Row::Kind { p, k } => {
+                let Some(project) = self.project(p) else {
+                    return;
+                };
+                let Some(kind) = project.kinds.get(k) else {
+                    return;
+                };
+                let (id, expected) = (kind.id, kind.updated_at);
+                let fields = edit_kind_fields(project, kind);
+                self.open(EditorKind::EditKind(id), fields, Some(expected));
+            }
+            Row::Graph { p, g } => {
+                if let Some(entry) = self.graph_at(p, g) {
+                    let graph = entry.graph.clone();
+                    self.open(
+                        EditorKind::EditGraph(graph.id),
+                        vec![
+                            Field::required("name", &graph.name),
+                            Field::optional("description", &graph.description),
+                        ],
+                        Some(graph.updated_at),
+                    );
+                }
+            }
+            Row::Phase { .. } => {}
+        }
+    }
+
+    /// `g`: the editor of the graph this row belongs to (D19).
+    ///
+    /// The answer to H-6: D4 gives a `Graph` row only to a graph no kind points at, so without this
+    /// key the five seeded graphs — every graph that matters — would have no editable name or
+    /// description. One key reaching the editor `e` already opens beats a fifth row variant that
+    /// would double the tree.
+    fn open_graph(&mut self, row: Row) {
+        let id = match row {
+            Row::Project { .. } => {
+                self.refuse(PROJECTS_ELSEWHERE.to_owned());
+                return;
+            }
+            Row::Kind { p, k } => {
+                let Some(kind) = self.project(p).and_then(|project| project.kinds.get(k)) else {
+                    return;
+                };
+                let id = kind.default_graph_id;
+                if self.locate_graph(id).is_none() {
+                    self.refuse(GRAPH_MISSING.to_owned());
+                    return;
+                }
+                id
+            }
+            Row::Graph { p, g } | Row::Phase { p, g, .. } => {
+                let Some(entry) = self.graph_at(p, g) else {
+                    return;
+                };
+                entry.graph.id
+            }
+        };
+        let Some((_, entry)) = self.locate_graph(id) else {
+            return;
+        };
+        let graph = entry.graph.clone();
+        self.open(
+            EditorKind::EditGraph(graph.id),
+            vec![
+                Field::required("name", &graph.name),
+                Field::optional("description", &graph.description),
+            ],
+            Some(graph.updated_at),
+        );
+    }
+
+    /// Sends one write and remembers its name until the reply.
+    fn send(&mut self, request: StoreRequest, ctx: &Ctx<'_>) {
+        self.busy = Some(request.name());
+        ctx.request(request);
+    }
+
+    /// One key while an editor is open.
+    ///
+    /// The focused field answers first, so `l`, `q` and the digits are letters here; what it passes
+    /// on is the form's own navigation, and everything left over is swallowed rather than offered
+    /// to the shell — with `CONTROL` chords excepted, so `ctrl-c` still quits.
+    fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let outcome = match &mut self.mode {
+            Mode::Editing(editor) => match editor.fields.get_mut(editor.focus) {
+                Some(field) => field.input.on_key(key),
+                None => FieldOutcome::Pass,
+            },
+            Mode::Browse => return Handled::Pass,
+        };
+        match outcome {
+            FieldOutcome::Consumed => Handled::Consumed,
+            FieldOutcome::Submit => {
+                self.submit(ctx);
+                Handled::Consumed
+            }
+            FieldOutcome::Cancel => {
+                self.mode = Mode::Browse;
+                self.notice = None;
+                Handled::Consumed
+            }
+            FieldOutcome::Pass => {
+                let Mode::Editing(editor) = &mut self.mode else {
+                    return Handled::Pass;
+                };
+                let len = editor.fields.len().max(1);
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        editor.focus = (editor.focus + 1) % len;
+                        Handled::Consumed
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        editor.focus = (editor.focus + len - 1) % len;
+                        Handled::Consumed
+                    }
+                    _ if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
+                    _ => Handled::Consumed,
+                }
+            }
+        }
+    }
+
+    /// `Enter` in an editor: the required fields, then one request per [`EditorKind`].
+    ///
+    /// The editor **stays open** until the reply lands, so a refusal leaves the text where it was
+    /// and a second `Enter` retries it. Which is why the first statement is the refusal the Browse
+    /// keys get: the editor being open is not a reply, and a second `Enter` before one arrives
+    /// would re-send a write that already landed.
+    fn submit(&mut self, ctx: &mut Ctx<'_>) {
+        if let Some(busy) = self.busy {
+            self.refuse(in_flight(busy));
+            return;
+        }
+        let Mode::Editing(editor) = &self.mode else {
+            return;
+        };
+        if let Some(missing) = editor
+            .fields
+            .iter()
+            .find(|field| field.required && field.text().is_empty())
+        {
+            let label = missing.label;
+            self.refuse(required(label));
+            return;
+        }
+        match self.build(editor, ctx.scope) {
+            Ok(request) => {
+                self.notice = None;
+                self.send(request, ctx);
+            }
+            Err(why) => self.refuse(why),
+        }
+    }
+
+    /// The request one editor stands for, or the sentence that says why there is none.
+    ///
+    /// Every editable column goes out on an edit whether or not it changed (B-5): one habit across
+    /// both sections, and the compare-and-set token is what makes it safe.
+    fn build(&self, editor: &Editor, scope: &Scope) -> Result<StoreRequest, String> {
+        match editor.kind {
+            EditorKind::NewKind(project) => {
+                let owner = self
+                    .project_by_id(project)
+                    .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
+                Ok(StoreRequest::CreateKind {
+                    scope: scope.clone(),
+                    project,
+                    prefix: editor.text(0),
+                    name: editor.text(1),
+                    description: editor.text(2),
+                    graph: graph_named(owner, &editor.text(3))?,
+                    position: position(&editor.text(4))?,
+                })
+            }
+            EditorKind::EditKind(id) => {
+                let expected = editor
+                    .expected
+                    .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
+                let (owner, _) = self
+                    .locate_kind(id)
+                    .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
+                Ok(StoreRequest::UpdateKind {
+                    scope: scope.clone(),
+                    id,
+                    expected,
+                    patch: ItemKindPatch {
+                        prefix: Some(editor.text(0)),
+                        name: Some(editor.text(1)),
+                        description: Some(editor.text(2)),
+                        default_graph_id: Some(graph_named(owner, &editor.text(3))?),
+                        position: Some(position(&editor.text(4))?),
+                    },
+                })
+            }
+            EditorKind::NewGraph(project) => Ok(StoreRequest::CreateGraph {
+                scope: scope.clone(),
+                project,
+                name: editor.text(0),
+                description: editor.text(1),
+            }),
+            EditorKind::EditGraph(id) => {
+                let expected = editor
+                    .expected
+                    .ok_or_else(|| DELETED_ELSEWHERE.to_owned())?;
+                Ok(StoreRequest::UpdateGraph {
+                    scope: scope.clone(),
+                    id,
+                    expected,
+                    patch: StepGraphPatch {
+                        name: Some(editor.text(0)),
+                        description: Some(editor.text(1)),
+                    },
+                })
+            }
+        }
+    }
+
+    /// One project of the snapshot, by id.
+    fn project_by_id(&self, id: ProjectId) -> Option<&ProjectCatalogue> {
+        self.snapshot
+            .as_ref()?
+            .projects
+            .iter()
+            .find(|project| project.project.id == id)
+    }
+
+    /// A compare-and-set miss (D8): the tree is replaced, the editor keeps its text and takes the
+    /// current row's token, and the retry is a second `Enter` rather than an automatic write.
+    fn on_stale(&mut self, snapshot: &CatalogueSnapshot) {
+        self.busy = None;
+        let reloaded = match &self.mode {
+            Mode::Editing(editor) => Some(reload(snapshot, editor.kind)),
+            Mode::Browse => None,
+        };
+        self.snapshot = Some(snapshot.clone());
+        self.clamp_cursor();
+        match reloaded {
+            None | Some(Reload::Keep) => self.say(CHANGED_ELSEWHERE),
+            Some(Reload::Gone) => {
+                self.mode = Mode::Browse;
+                self.say(DELETED_ELSEWHERE);
+            }
+            Some(Reload::Token(token)) => {
+                if let Mode::Editing(editor) = &mut self.mode {
+                    editor.expected = Some(token);
+                }
+                self.say(CHANGED_ELSEWHERE);
+            }
+        }
+    }
+
     /// One line per row, in [`rows`](KindsSection::rows) order, plus the read-only detail of the
     /// selected phase (D15, B-11).
     ///
@@ -270,10 +733,12 @@ impl KindsSection {
         let Some(notice) = &self.notice else {
             return Line::styled(keys, theme.dim);
         };
-        // Every notice this milestone's browse half can raise is a refusal: the seam's own
-        // sentence, or this section's answer to a key that cannot act here.
-        let style = theme.error;
-        let text = notice.clone();
+        let style = if notice.is_error() {
+            theme.error
+        } else {
+            theme.dim
+        };
+        let text = notice.text().to_owned();
         // The outcome wins the line when both do not fit: the keys are on screen every other
         // frame, and this is the only place the outcome appears.
         let room = usize::from(width);
@@ -286,34 +751,73 @@ impl KindsSection {
         ])
     }
 
-    /// The keys half of the hint line.
+    /// The keys half of the hint line, plus what a write in flight adds to it.
     fn hint_text(&self) -> String {
-        let keys = if self.unavailable.is_some() {
-            HINT_UNAVAILABLE
-        } else if self
-            .snapshot
-            .as_ref()
-            .is_none_or(|snapshot| snapshot.projects.is_empty())
-        {
-            HINT_NO_WORKSPACE
-        } else {
-            HINT_BROWSE
+        let keys = match &self.mode {
+            Mode::Editing(_) => HINT_EDITING,
+            Mode::Browse => {
+                if self.unavailable.is_some() {
+                    HINT_UNAVAILABLE
+                } else if self
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.projects.is_empty())
+                {
+                    HINT_NO_WORKSPACE
+                } else {
+                    HINT_BROWSE
+                }
+            }
         };
-        keys.to_owned()
+        match self.busy {
+            // Only in Browse: an editor's own hint says what `Enter` is for, and a write in flight
+            // is why `Enter` is not answering.
+            Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
+                format!("{keys} \u{b7} {busy} in flight")
+            }
+            _ => keys.to_owned(),
+        }
+    }
+
+    /// The pane under the rows: the open editor, or nothing at all in Browse.
+    fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        match &self.mode {
+            Mode::Browse => Vec::new(),
+            Mode::Editing(editor) => editor.lines(width, theme),
+        }
+    }
+
+    /// Reports an outcome, classified by the rule both sections share (D14).
+    fn say(&mut self, text: &str) {
+        self.notice = Some(if super::is_error(text) {
+            Notice::Error(text.to_owned())
+        } else {
+            Notice::Info(text.to_owned())
+        });
     }
 
     /// Reports a refusal: the seam's own sentence, or one of this section's.
     fn refuse(&mut self, text: String) {
-        self.notice = Some(text);
+        self.notice = Some(Notice::Error(text));
     }
 
     /// A fresh catalogue: the tree is replaced whole and the cursor put back inside it (D3).
+    ///
+    /// Only a reply to a **write** closes an open editor (H-9): `r` sets no `busy`, so a reload that
+    /// lands while something is being typed leaves the typing alone.
     fn on_catalogue(&mut self, snapshot: &CatalogueSnapshot) {
+        let write = self.busy.take();
         // A read that answered is the end of an outage: leaving `unavailable` set would say the
         // catalogue is unavailable over a store that just spoke.
         self.unavailable = None;
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
+        if write.is_some() {
+            self.notice = None;
+            if matches!(self.mode, Mode::Editing(_)) {
+                self.mode = Mode::Browse;
+            }
+        }
     }
 }
 
@@ -331,14 +835,59 @@ impl SettingsSection for KindsSection {
     }
 
     fn on_scope_change(&mut self, _scope: &Scope) {
-        // The tree and the cursor belong to the workspace that was left (B-12). The notice
-        // survives, because the scope change is often the *consequence* of what it is reporting.
+        // The tree, the cursor and any open editor belong to the workspace that was left, and that
+        // editor's compare-and-set token with them (B-12). The notice survives, because the scope
+        // change is often the *consequence* of what it is reporting.
         self.snapshot = None;
+        self.mode = Mode::Browse;
+        self.busy = None;
         self.cursor = 0;
     }
 
+    fn captures_input(&self) -> bool {
+        !matches!(self.mode, Mode::Browse)
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if matches!(self.mode, Mode::Editing(_)) {
+            return self.on_editor_key(key, ctx);
+        }
+        // Browse. `j`, `k`, `n`, `N`, `e`, `g`, `r` are free: the global table binds `q`, `?`, the
+        // digits, `ctrl-c` and `-`, and the tab consumes `h`/`l`/`[`/`]`/arrows before a section is
+        // offered the key.
         match key.code {
+            KeyCode::Char('n') => {
+                if !self.blocked()
+                    && let Some(row) = self.selected()
+                {
+                    self.open_new_child(row);
+                }
+                Handled::Consumed
+            }
+            KeyCode::Char('N') => {
+                if !self.blocked()
+                    && let Some(row) = self.selected()
+                {
+                    self.open_new_graph(row);
+                }
+                Handled::Consumed
+            }
+            KeyCode::Char('e') => {
+                if !self.blocked()
+                    && let Some(row) = self.selected()
+                {
+                    self.open_edit(row);
+                }
+                Handled::Consumed
+            }
+            KeyCode::Char('g') => {
+                if !self.blocked()
+                    && let Some(row) = self.selected()
+                {
+                    self.open_graph(row);
+                }
+                Handled::Consumed
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_cursor(true);
                 Handled::Consumed
@@ -367,15 +916,20 @@ impl SettingsSection for KindsSection {
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Catalogue(snapshot) => self.on_catalogue(snapshot),
+            StoreReply::CatalogueStale(snapshot) => self.on_stale(snapshot),
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
             StoreReply::Failed { request, message } if *request == "catalogue" => {
+                self.busy = None;
                 self.unavailable = Some(message.clone());
             }
             // Every other refusal of this section's own: the shell has already put
             // `{request}: {message}` on the status line, so all this owes is the sentence and a
             // state the next key can start from.
             StoreReply::Failed { request, message } if REQUEST_NAMES.contains(request) => {
+                self.busy = None;
+                // The editor stays open over its text: a refused write is retried by fixing what
+                // was refused and pressing `Enter` again.
                 self.refuse(message.clone());
             }
             _ => {}
@@ -383,8 +937,13 @@ impl SettingsSection for KindsSection {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let [rows, hint] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+        let pane = self.pane(area.width, ctx.theme);
+        let [rows, pane_area, hint] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
         match (&self.unavailable, &self.snapshot) {
             // The refusal wins the pane even with a tree behind it: what is on screen would
@@ -414,8 +973,183 @@ impl SettingsSection for KindsSection {
                 );
             }
         }
+        if !pane.is_empty() {
+            frame.render_widget(Paragraph::new(pane), pane_area);
+        }
         frame.render_widget(Paragraph::new(self.hint(area.width, ctx.theme)), hint);
     }
+}
+
+impl Field {
+    /// A field `Enter` refuses while it is empty.
+    fn required(label: &'static str, text: &str) -> Self {
+        Self {
+            label,
+            input: TextField::with_text(text),
+            required: true,
+        }
+    }
+
+    /// A field that may stay empty: an empty `description` is `""` and an empty `input_kinds` is
+    /// the empty list.
+    fn optional(label: &'static str, text: &str) -> Self {
+        Self {
+            label,
+            input: TextField::with_text(text),
+            required: false,
+        }
+    }
+
+    /// What was typed. Never masked here, so [`TextField::text`] always answers.
+    fn text(&self) -> &str {
+        self.input.text().unwrap_or_default()
+    }
+}
+
+impl Editor {
+    /// The text of field `index`, or `""` when the editor has no such field.
+    fn text(&self, index: usize) -> String {
+        self.fields
+            .get(index)
+            .map_or_else(String::new, |field| field.text().to_owned())
+    }
+
+    /// One line per field, the focused label accented and the focused field carrying the cursor.
+    fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let label_width = self
+            .fields
+            .iter()
+            .map(|field| field.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        self.fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let focused = index == self.focus;
+                let padding = " ".repeat(label_width - field.label.chars().count());
+                let style = if focused { theme.accent } else { theme.dim };
+                let mut spans = vec![Span::styled(format!("{}{padding}: ", field.label), style)];
+                let room = usize::from(width).saturating_sub(label_width + 2);
+                spans.extend(
+                    field
+                        .input
+                        .line(u16::try_from(room).unwrap_or(u16::MAX), focused, theme)
+                        .spans,
+                );
+                Line::from(spans)
+            })
+            .collect()
+    }
+}
+
+/// The fields of a new kind: the first graph of the project by name, and the position after its
+/// last kind (B-7, B-8).
+///
+/// The position prefill is a courtesy and not a guard: `(project_id, position)` is not unique on
+/// `item_kind` (H-11), so two kinds may share one — it is simply the one value that cannot
+/// surprise.
+fn new_kind_fields(project: &ProjectCatalogue) -> Vec<Field> {
+    let graph = project
+        .graphs
+        .first()
+        .map_or("", |entry| entry.graph.name.as_str());
+    vec![
+        Field::required("prefix", ""),
+        Field::required("name", ""),
+        Field::optional("description", ""),
+        Field::required("graph", graph),
+        Field::required(
+            "position",
+            &next_position(project.kinds.iter().map(|k| k.position)),
+        ),
+    ]
+}
+
+/// The same five fields, prefilled from the row (B-5's whole patch goes out from them).
+fn edit_kind_fields(project: &ProjectCatalogue, kind: &ItemKind) -> Vec<Field> {
+    let graph = project
+        .graph(kind.default_graph_id)
+        .map_or("", |entry| entry.graph.name.as_str());
+    vec![
+        Field::required("prefix", &kind.prefix),
+        Field::required("name", &kind.name),
+        Field::optional("description", &kind.description),
+        Field::required("graph", graph),
+        Field::required("position", &kind.position.to_string()),
+    ]
+}
+
+/// One past the largest position, or `0` when there is none.
+fn next_position(positions: impl Iterator<Item = i32>) -> String {
+    positions
+        .max()
+        .map_or(0, |last| last.saturating_add(1))
+        .to_string()
+}
+
+/// The graph of this project that carries the typed name (B-7).
+///
+/// A name rather than an id because that is what is on screen; the store checks the project again
+/// on the write, so this resolution is a convenience and not the guard.
+fn graph_named(project: &ProjectCatalogue, name: &str) -> Result<StepGraphId, String> {
+    project
+        .graphs
+        .iter()
+        .find(|entry| entry.graph.name == name)
+        .map(|entry| entry.graph.id)
+        .ok_or_else(|| NO_GRAPH_NAMED.to_owned())
+}
+
+/// A `position` field as a number (B-8).
+fn position(text: &str) -> Result<i32, String> {
+    text.trim()
+        .parse::<i32>()
+        .map_err(|_| POSITION_IS_A_NUMBER.to_owned())
+}
+
+/// What a reloaded catalogue does to an open editor's token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reload {
+    /// The editor's row is not in the reloaded tree.
+    Gone,
+    /// The row's `updated_at` as it is now.
+    Token(DateTime<Utc>),
+    /// The editor has no token to refresh (a create).
+    Keep,
+}
+
+/// The token an open editor should retry against after a reload.
+fn reload(snapshot: &CatalogueSnapshot, kind: EditorKind) -> Reload {
+    match kind {
+        EditorKind::NewKind(project) | EditorKind::NewGraph(project) => snapshot
+            .projects
+            .iter()
+            .find(|entry| entry.project.id == project)
+            .map_or(Reload::Gone, |_| Reload::Keep),
+        EditorKind::EditKind(id) => snapshot
+            .projects
+            .iter()
+            .flat_map(|project| project.kinds.iter())
+            .find(|kind| kind.id == id)
+            .map_or(Reload::Gone, |kind| Reload::Token(kind.updated_at)),
+        EditorKind::EditGraph(id) => snapshot
+            .projects
+            .iter()
+            .flat_map(|project| project.graphs.iter())
+            .find(|entry| entry.graph.id == id)
+            .map_or(Reload::Gone, |entry| Reload::Token(entry.graph.updated_at)),
+    }
+}
+
+/// What a second write of the same kind is told while the first is still out.
+fn in_flight(busy: &str) -> String {
+    format!("`{busy}` is still in flight")
+}
+
+/// What an empty required field is told, before the store is asked anything.
+fn required(label: &str) -> String {
+    format!("`{label}` is required")
 }
 
 /// One phase row: the six columns this section edits, in editor order (D2's six, minus the ones

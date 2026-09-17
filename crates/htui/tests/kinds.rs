@@ -6,7 +6,7 @@
 #![cfg(feature = "testkit")]
 
 use chrono::{Duration, Utc};
-use htui::app::Action;
+use htui::app::{Action, Handled};
 use htui::catalogue::{self, CatalogueSnapshot, GraphEntry, REQUEST_NAMES};
 use htui::hierarchy::MirrorAfterDelete;
 use htui::store_worker::{StoreReply, StoreRequest, serve};
@@ -1020,11 +1020,15 @@ async fn r_reloads_and_esc_clears_the_notice() {
     assert!(!bench.render_section(&section, 100).contains("nope"));
 }
 
-/// A scope change drops what belongs to the other workspace and keeps the notice, which is often
-/// the *consequence* of the switch (B-12).
+/// A scope change drops what belongs to the other workspace — the editor included, because its
+/// compare-and-set token is the other workspace's — and keeps the notice, which is often the
+/// *consequence* of the switch (B-12).
 #[tokio::test]
-async fn a_scope_change_drops_the_tree_and_keeps_the_notice() {
+async fn a_scope_change_drops_the_editor_and_keeps_the_notice() {
     let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    assert!(section.captures_input());
     bench.reply(
         &mut section,
         &StoreReply::Failed {
@@ -1039,6 +1043,7 @@ async fn a_scope_change_drops_the_tree_and_keeps_the_notice() {
 
     section.on_scope_change(&other);
 
+    assert!(!section.captures_input(), "the editor did not survive it");
     let wanted = section.wants_requests(&other);
     let [StoreRequest::Catalogue(scope)] = wanted.as_slice() else {
         panic!("the read the section wants is the new scope's, whole (D2): {wanted:?}");
@@ -1047,4 +1052,350 @@ async fn a_scope_change_drops_the_tree_and_keeps_the_notice() {
     let frame = bench.render_section(&section, 100);
     assert!(!frame.contains("vulkan-tutorials"), "{frame}");
     assert!(frame.contains("nope"), "the notice survives: {frame}");
+}
+
+/// Types one key per char into a section, as a user would: the focused field is the only thing that
+/// sees them.
+fn type_at(bench: &SectionBench, section: &mut dyn SettingsSection, text: &str) {
+    for c in text.chars() {
+        bench.key(section, &c.to_string());
+    }
+}
+
+/// While an editor is open every printable key is text, `l` included, so the tab's own section
+/// cycle is off for as long as something is being typed (M3 D2).
+#[tokio::test]
+async fn l_is_a_letter_while_editing() {
+    let (bench, mut section, _) = bench_with_demo().await;
+
+    assert_eq!(bench.key(&mut section, "n"), Handled::Consumed);
+    assert!(section.captures_input(), "an open editor takes every key");
+
+    assert_eq!(bench.key(&mut section, "l"), Handled::Consumed);
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("prefix     : l"),
+        "`l` went into the field, not to the strip: {frame}"
+    );
+    assert!(bench.drained().is_empty(), "typing asks the store nothing");
+}
+
+/// `n` on a kind row opens a new kind for that kind's project, prefilled with the first graph and
+/// the position after the last one (B-7, B-8), and `Enter` sends exactly one create (D5).
+#[tokio::test]
+async fn n_on_a_kind_opens_the_kind_editor_and_enter_creates() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+
+    bench.key(&mut section, "n");
+    type_at(&bench, &mut section, "DOC");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "docs");
+    // description, then the prefilled `graph` and `position`.
+    bench.key(&mut section, "tab");
+    bench.key(&mut section, "tab");
+    bench.key(&mut section, "tab");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::CreateKind {
+            scope,
+            project,
+            prefix,
+            name,
+            description,
+            graph,
+            position,
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` creates once: {asked:?}");
+    };
+    assert_eq!(*scope, bench_scope().await, "every write carries the scope");
+    assert_eq!(*project, ids::PROJECT_VULKAN);
+    assert_eq!(prefix, "DOC");
+    assert_eq!(name, "docs");
+    assert_eq!(description, "");
+    assert_eq!(*graph, ids::GRAPH_VULKAN_ANA, "the first graph by name");
+    assert_eq!(*position, 5, "after the five seeded kinds");
+
+    // One write of a kind at a time: the staleness index would drop the first reply.
+    bench.key(&mut section, "enter");
+    assert!(bench.drained().is_empty());
+    assert!(
+        error_text(&bench, &section, 100).contains(&"`create_kind` is still in flight".to_owned()),
+        "a second Enter says why it did nothing"
+    );
+}
+
+/// A required field that is empty is refused here, before the store is asked anything.
+#[tokio::test]
+async fn a_required_field_is_refused_before_any_request() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "n");
+
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty());
+    assert!(
+        error_text(&bench, &section, 100).contains(&"`prefix` is required".to_owned()),
+        "the refusal names the field"
+    );
+}
+
+/// The kind editor's `graph` field is a graph **name**, resolved among the project's graphs at
+/// submit; a name that matches none is refused rather than guessed at (B-7).
+#[tokio::test]
+async fn an_unknown_graph_name_is_refused() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "n");
+    type_at(&bench, &mut section, "DOC");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "docs");
+    bench.key(&mut section, "tab");
+    bench.key(&mut section, "tab");
+    // `graph`: clear the prefill, then a name no graph carries.
+    for _ in 0.."analysis".len() {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "nope");
+
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty());
+    assert!(
+        error_text(&bench, &section, 100)
+            .contains(&"`graph` names no graph in this project".to_owned()),
+        "the refusal says what could not be resolved"
+    );
+}
+
+/// `e` on a kind sends the whole patch against the row's token, changed columns or not (B-5): one
+/// habit across both sections, and compare-and-set is what makes it safe.
+#[tokio::test]
+async fn e_on_a_kind_then_enter_sends_the_whole_patch_with_the_token() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let stored = snapshot.projects[0]
+        .kinds
+        .iter()
+        .find(|k| k.id == ids::KIND_VULKAN_ANA)
+        .expect("the ANA kind")
+        .clone();
+    bench.key(&mut section, "j");
+
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "tab");
+    bench.key(&mut section, "space");
+    type_at(&bench, &mut section, "2");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::UpdateKind {
+            id,
+            expected,
+            patch,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` edits once: {asked:?}");
+    };
+    assert_eq!(*id, ids::KIND_VULKAN_ANA);
+    assert_eq!(*expected, stored.updated_at, "the row's own token (D8)");
+    assert_eq!(patch.prefix.as_deref(), Some("ANA"));
+    assert_eq!(patch.name.as_deref(), Some("analysis 2"));
+    assert_eq!(
+        patch.description.as_deref(),
+        Some(stored.description.as_str()),
+        "an untouched column still goes out, prefilled (B-5)"
+    );
+    assert_eq!(patch.default_graph_id, Some(ids::GRAPH_VULKAN_ANA));
+    assert_eq!(patch.position, Some(0));
+}
+
+/// D19: `g` reaches the owning graph's editor from a kind row and from a phase row, because a graph
+/// every kind points at has no `Graph` row of its own — without this key the five seeded graphs
+/// would have no editable name or description at all (H-6).
+#[tokio::test]
+async fn g_opens_the_owning_graphs_editor_from_a_kind_and_from_a_phase() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let graph = snapshot.projects[0]
+        .graph(ids::GRAPH_VULKAN_ANA)
+        .expect("the analysis graph")
+        .graph
+        .clone();
+
+    // On the kind row.
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "g");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("name       : analysis"), "{frame}");
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::UpdateGraph {
+            id,
+            expected,
+            patch,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`g` opens the editor `e` opens on a graph row: {asked:?}");
+    };
+    assert_eq!(*id, ids::GRAPH_VULKAN_ANA);
+    assert_eq!(*expected, graph.updated_at);
+    assert_eq!(patch.name.as_deref(), Some("analysis"));
+
+    // And on a phase row, where it means the graph the phase belongs to.
+    bench.reply(
+        &mut section,
+        &StoreReply::Catalogue(Box::new(snapshot.clone())),
+    );
+    let _ = bench.drained();
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "g");
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::UpdateGraph { id, .. })] = asked.as_slice() else {
+        panic!("a phase row's `g` is its graph: {asked:?}");
+    };
+    assert_eq!(*id, ids::GRAPH_VULKAN_ANA);
+}
+
+/// `N` opens a graph for the row's project, and a project row is read-only here: the hierarchy
+/// section owns projects, this one owns what is inside them (B-13).
+#[tokio::test]
+async fn n_upper_creates_a_graph_and_a_project_row_points_at_hierarchy() {
+    let (bench, mut section, _) = bench_with_demo().await;
+
+    bench.key(&mut section, "e");
+    assert!(bench.drained().is_empty());
+    assert!(
+        error_text(&bench, &section, 100).contains(&"projects are edited in Hierarchy".to_owned()),
+        "a project row says where it is edited"
+    );
+
+    bench.key(&mut section, "N");
+    type_at(&bench, &mut section, "docs");
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::CreateGraph {
+            project,
+            name,
+            description,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`N` creates a graph once: {asked:?}");
+    };
+    assert_eq!(*project, ids::PROJECT_VULKAN);
+    assert_eq!(name, "docs");
+    assert_eq!(description, "");
+}
+
+/// A compare-and-set miss keeps the editor and its text, moves the token to the row as it is now,
+/// and waits for a second `Enter` (D8, PRD D8): retyping is the cost the PRD said not to pay.
+#[tokio::test]
+async fn a_stale_reply_keeps_the_text_and_retakes_the_token() {
+    let backend = demo();
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    let opened = snapshot.projects[0]
+        .kinds
+        .iter()
+        .find(|k| k.id == ids::KIND_VULKAN_ANA)
+        .expect("the ANA kind")
+        .clone();
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "x");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    // Someone else wrote to the row this editor opened on.
+    let current = catalogue(
+        serve(
+            &backend,
+            &StoreRequest::UpdateKind {
+                scope: vulkan_scope(),
+                id: ids::KIND_VULKAN_ANA,
+                expected: opened.updated_at,
+                patch: ItemKindPatch {
+                    name: Some("analysis, renamed".to_owned()),
+                    ..ItemKindPatch::default()
+                },
+            },
+        )
+        .await,
+    );
+    bench.reply(
+        &mut section,
+        &StoreReply::CatalogueStale(Box::new(current.clone())),
+    );
+
+    insta::assert_snapshot!("stale", bench.render_section(&section, 100));
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged
+            .iter()
+            .any(|line| line.starts_with("changed elsewhere since you opened it")),
+        "the miss is reported in `theme.error`: {flagged:?}"
+    );
+
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::UpdateKind {
+            expected, patch, ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` retries by hand, once: {asked:?}");
+    };
+    let reloaded = current.projects[0]
+        .kinds
+        .iter()
+        .find(|k| k.id == ids::KIND_VULKAN_ANA)
+        .expect("the ANA kind")
+        .updated_at;
+    assert_eq!(
+        *expected, reloaded,
+        "the retry carries the reloaded row's token, not the one the editor opened on"
+    );
+    assert_eq!(
+        patch.name.as_deref(),
+        Some("analysisx"),
+        "and the text that was typed survived the reload"
+    );
+}
+
+/// The same miss with the row gone: there is nothing to retry against, so the editor closes and
+/// says why.
+#[tokio::test]
+async fn a_stale_reply_with_the_row_gone_closes_the_editor() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let mut without = snapshot.clone();
+    without.projects[0]
+        .kinds
+        .retain(|k| k.id != ids::KIND_VULKAN_ANA);
+    bench.reply(&mut section, &StoreReply::CatalogueStale(Box::new(without)));
+
+    assert!(!section.captures_input(), "the editor is gone");
+    assert!(
+        error_text(&bench, &section, 100)
+            .contains(&"deleted elsewhere \u{2014} the editor was closed".to_owned()),
+        "and it says why"
+    );
 }
