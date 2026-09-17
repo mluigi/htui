@@ -1060,6 +1060,45 @@ async fn a_shape_refusal_names_the_key() {
     );
 }
 
+/// H-6: `inf` and `nan` are the shape refusals `parse::<f64>()` does **not** make.
+///
+/// `"abc"` never reaches the guard — it fails the parse — so the `is_finite()` filter is what this
+/// pins: on this toolchain `"inf".parse::<f64>()` is `Ok(f64::INFINITY)` and `"nan"` is `Ok(NaN)`,
+/// and `Value::from` turns either into `Null`. Without the filter a `SetSetting` carrying `Null`
+/// would leave for the seam and come back "not a finite JSON number" one round trip later; with it
+/// the section says the fraction sentence and asks nothing at all.
+#[tokio::test]
+async fn inf_and_nan_are_refused_by_shape_and_never_leave_the_section() {
+    for typed in ["inf", "nan"] {
+        let (bench, mut section, _) = bench_with(&demo()).await;
+        move_to(
+            &bench,
+            &mut section,
+            app_row(SettingKey::PromptReserveFraction),
+        );
+
+        bench.key(&mut section, "e");
+        clear_field(&bench, &mut section);
+        type_at(&bench, &mut section, typed);
+        bench.key(&mut section, "enter");
+
+        assert!(
+            bench.drained().is_empty(),
+            "`{typed}` parses but is not a number to store, so nothing leaves the section"
+        );
+        let errors = error_text(&bench, &section, 100);
+        assert!(
+            errors.iter().any(|line| line
+                .contains("`prompt_reserve_fraction` is a decimal fraction, or empty to clear")),
+            "`{typed}` gets the fraction sentence: {errors:?}"
+        );
+        assert!(
+            section.captures_input(),
+            "`{typed}` leaves the editor open over its text, as any shape refusal does"
+        );
+    }
+}
+
 /// D14/PRD D8: a compare-and-set miss keeps the typed text, takes the reloaded token, and retries
 /// only on a second `Enter`.
 #[tokio::test]
