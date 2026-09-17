@@ -16,19 +16,35 @@
 //! unset, as every other Postgres-backed suite in this crate does. One of them,
 //! `set_dsn_goes_online_without_a_restart`, is the milestone's whole point: a box that started
 //! with an empty keyring reaches `online` **in the same process**.
+//!
+//! The **section half** is T3's and starts at "Settings > Connection: the section" below. It has
+//! no worker at all: a [`SectionBench`] hands the section a [`ConnectionSnapshot`] built here and
+//! reads back what the section emitted, and a [`Harness`] is used for the three cases that are
+//! about the *shell* — the focus action and the no-DSN redirect — rather than about the section.
+//! Every snapshot the section half builds is a literal, so no case in it can reach a keyring, a
+//! mirror or a clock.
 #![cfg(feature = "testkit")]
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use chrono::{TimeZone as _, Utc};
+use htui::app::{Action, Handled, TabAction};
 use htui::connection::{
-    Attempt, AttemptOutcome, ConnectionSnapshot, DEMO_SESSION, NO_WORKER, READ_NAME, REQUEST_NAMES,
+    Attempt, AttemptOutcome, ConnectionSnapshot, DEMO_SESSION, MirrorInfo, NO_WORKER, READ_NAME,
+    REQUEST_NAMES,
 };
 use htui::store_worker::{
     self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest, serve,
 };
-use htui::ui::tabs::settings::SettingsTab;
+use htui::testkit::{Harness, SectionBench};
+use htui::ui::tabs::BacklogTab;
+use htui::ui::tabs::settings::{
+    AgentsSection, ConnectionSection, HierarchySection, KindsSection, PromptSection, SectionId,
+    SettingsSection, SettingsTab,
+};
+use htui_core::model::Scope;
 use htui_core::store::MemStore;
 use htui_store::testkit as common;
 use htui_store::{Backend, CacheStore, ConnEvent, ConnectContext, Dsn, PgStore, Started, secret};
@@ -773,4 +789,911 @@ async fn a_second_set_dsn_swaps_the_mirror_and_leaves_the_old_file() {
     drop(root);
     first.drop_db().await;
     second.drop_db().await;
+}
+
+// -------------------------------------------------------------------------------------------
+// Settings > Connection: the section (T3; D8, D15-D17, D19)
+// -------------------------------------------------------------------------------------------
+
+/// A password that appears in no constant this section renders, so `contains` finding it means
+/// the section leaked it and nothing else.
+const SECRET: &str = "s3cr3tword";
+
+/// The DSN the editor cases type. Nineteen characters, so the masked count is assertable.
+const TYPED: &str = "postgres://u:pw@h/d";
+
+/// A fixed clock, so a snapshot of the Mirror row is the same on every run.
+fn at(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 9, 15, hour, minute, 0)
+        .single()
+        .expect("a real instant")
+}
+
+/// The mirror the Mirror row reads, with a fingerprint long enough to be truncated to twelve.
+fn mirror_info() -> MirrorInfo {
+    MirrorInfo {
+        db_fingerprint: "0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_owned(),
+        schema_version: 3,
+        built_at: at(9, 30),
+        last_full_refresh_at: Some(at(10, 15)),
+    }
+}
+
+/// A box with a DSN in its keyring and a mirror behind it: the section's ordinary screen.
+fn stored_snapshot() -> ConnectionSnapshot {
+    ConnectionSnapshot {
+        label: "offline \u{b7} 0s".to_owned(),
+        dsn_stored: Some(true),
+        dsn_summary: Some("postgres://htui@db.example:5432/htui \u{b7} sslmode=require".to_owned()),
+        mirror: Some(mirror_info()),
+        last_attempt: Some(Attempt {
+            at: at(10, 20),
+            outcome: AttemptOutcome::Failed("connection refused".to_owned()),
+        }),
+        offline: false,
+    }
+}
+
+/// The box this milestone exists for: a keyring with nothing in it (D6, D8).
+fn empty_snapshot() -> ConnectionSnapshot {
+    ConnectionSnapshot {
+        label: "offline \u{b7} 0s".to_owned(),
+        dsn_stored: Some(false),
+        dsn_summary: None,
+        mirror: Some(mirror_info()),
+        last_attempt: None,
+        offline: false,
+    }
+}
+
+/// `--demo`: no keyring was consulted and there is no mirror (D10).
+fn demo_snapshot() -> ConnectionSnapshot {
+    ConnectionSnapshot {
+        label: "memory".to_owned(),
+        dsn_stored: None,
+        dsn_summary: None,
+        mirror: None,
+        last_attempt: None,
+        offline: false,
+    }
+}
+
+/// A bench and a section with `snapshot` already delivered as the read's reply.
+async fn bench_with(snapshot: &ConnectionSnapshot) -> (SectionBench, ConnectionSection) {
+    let bench = SectionBench::new().await;
+    let mut section = ConnectionSection::new();
+    feed(&bench, &mut section, snapshot);
+    (bench, section)
+}
+
+/// Hands the section one read's reply and drops whatever it emitted.
+fn feed(bench: &SectionBench, section: &mut ConnectionSection, snapshot: &ConnectionSnapshot) {
+    bench.reply(section, &StoreReply::Connection(snapshot.clone()));
+    let _ = bench.drained();
+}
+
+/// Types `text` one key at a time, as a paste arrives (ANA-10 §4.9 (4): a paste is a burst of
+/// `Char` events, not a separate code path).
+fn typed(bench: &SectionBench, section: &mut ConnectionSection, text: &str) {
+    for c in text.chars() {
+        assert_eq!(
+            bench.key(section, &c.to_string()),
+            Handled::Consumed,
+            "`{c}` is a character while the field is open, not a section key"
+        );
+    }
+}
+
+/// The section's own frame, at the width every snapshot in this crate is pinned to.
+fn frame_of(bench: &SectionBench, section: &ConnectionSection) -> String {
+    bench.render_section(section, 100)
+}
+
+/// The hint line: the last row of the section's own layout.
+fn hint_of(frame: &str) -> String {
+    frame
+        .lines()
+        .nth(29)
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned()
+}
+
+/// The frame as one line, so an assertion about a sentence is not defeated by where it wrapped.
+fn flattened(frame: &str) -> String {
+    frame.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Every `Action::Store` the section emitted since the last drain.
+fn requested(bench: &SectionBench) -> Vec<StoreRequest> {
+    bench
+        .drained()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Store(request) => Some(request),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The five sections in the product's own registration order (D19).
+fn sections() -> Vec<Box<dyn SettingsSection>> {
+    vec![
+        Box::new(AgentsSection::new()),
+        Box::new(HierarchySection::new()),
+        Box::new(KindsSection::new()),
+        Box::new(PromptSection::new()),
+        Box::new(ConnectionSection::new()),
+    ]
+}
+
+/// A two-tab shell over `backend`: Backlog on `1`, Settings on `2`.
+///
+/// Registered by hand rather than through `register_all` on purpose: `register_all` also names
+/// the workspace switcher as the startup overlay, and a backend with no workspaces in it would
+/// open the switcher over every frame these cases want to read. The product's own registration is
+/// pinned separately, by `the_product_registers_connection_after_prompt`.
+fn shell(backend: Backend) -> Harness {
+    Harness::over_backend(backend)
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_tab(Box::new(SettingsTab::with_sections(sections())))
+}
+
+// --- the masked field ------------------------------------------------------------------------
+
+/// The hard rule (`R-TUI-8`, `R-SEC-2`): what is typed reaches neither the frame nor a `Debug`.
+///
+/// Both halves matter. The frame is what a shoulder or a screen recording sees; the `Debug` is
+/// what one `tracing::debug!` of a section puts in the `--log` file, which is a *file*, and the
+/// requirement's words are "not echoed, **not logged**, not written to any file".
+#[tokio::test]
+async fn the_field_renders_dots_and_a_count_never_the_text() {
+    let (bench, mut section) = bench_with(&empty_snapshot()).await;
+    // The empty snapshot opened the editor itself (D8); this is the screen the redirect lands on.
+    assert!(section.captures_input(), "the field is open");
+    typed(&bench, &mut section, TYPED);
+
+    let frame = frame_of(&bench, &section);
+    assert!(
+        frame.contains("\u{2022}\u{2022}\u{2022}"),
+        "one dot per character: {frame}"
+    );
+    assert!(frame.contains("(19)"), "and the count beside them: {frame}");
+    assert!(
+        !frame.contains("postgres://"),
+        "nothing recoverable is drawn: {frame}"
+    );
+    assert!(!frame.contains("pw"), "least of all the password: {frame}");
+
+    let printed = format!("{section:?}");
+    assert!(
+        !printed.contains("postgres://") && !printed.contains("pw"),
+        "and no `Debug` of the section prints the buffer: {printed}"
+    );
+    assert!(
+        printed.contains("len: 19"),
+        "the length is legible, the text is not: {printed}"
+    );
+}
+
+/// D3: there is no reveal toggle, and a section that held a secret has none to hold after `Esc`.
+#[tokio::test]
+async fn esc_disposes_the_field() {
+    let (bench, mut section) = bench_with(&empty_snapshot()).await;
+    typed(&bench, &mut section, TYPED);
+
+    assert_eq!(bench.key(&mut section, "Esc"), Handled::Consumed);
+    assert!(!section.captures_input(), "the editor is gone");
+    assert!(
+        requested(&bench).is_empty(),
+        "and nothing was sent on the way out"
+    );
+
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    let frame = frame_of(&bench, &section);
+    assert!(
+        frame.contains("(0)"),
+        "the reopened field is empty, not the one that was abandoned: {frame}"
+    );
+}
+
+/// The other disposal point (ANA-10 §4.9 (6)): entering another workspace.
+#[tokio::test]
+async fn a_scope_change_disposes_the_field() {
+    let (bench, mut section) = bench_with(&empty_snapshot()).await;
+    typed(&bench, &mut section, TYPED);
+
+    section.on_scope_change(&Scope {
+        workspace_id: htui_core::model::WorkspaceId::default(),
+        project_ids: Vec::new(),
+    });
+
+    assert!(!section.captures_input(), "the editor went with the scope");
+    assert!(
+        !format!("{section:?}").contains("pw"),
+        "and took the buffer with it"
+    );
+}
+
+/// D17 / ANA-10 §4.9 (2): `l`, `h`, `[` and `]` are characters while the field is open.
+///
+/// This is the fix the hook shipped in milestone 3 was built for: the Settings tab consumes those
+/// four for section cycling *before* a section sees them, unless the section says it is taking
+/// typed text. A DSN containing an `l` is not exotic — `postgres://localhost/...` has three.
+#[tokio::test]
+async fn l_h_and_brackets_are_characters_while_editing() {
+    let (bench, mut section) = bench_with(&empty_snapshot()).await;
+    typed(&bench, &mut section, "postgres://");
+    assert!(frame_of(&bench, &section).contains("(11)"));
+
+    assert!(
+        section.captures_input(),
+        "which is what the tab checks before it takes `l`"
+    );
+    typed(&bench, &mut section, "lh[]");
+
+    let frame = frame_of(&bench, &section);
+    assert!(
+        frame.contains("(15)"),
+        "all four landed in the buffer: {frame}"
+    );
+}
+
+// --- validation ------------------------------------------------------------------------------
+
+/// D2, and the milestone's second hard rule: a refused DSN emits **no request at all**.
+///
+/// The parse runs in the section, so a string that is not a DSN never becomes one, never reaches
+/// the keyring, never reaches sqlx's parser — which would log an unrecognised parameter's value —
+/// and never reaches the worker's `Failed` path, which would put the request's name on the status
+/// line for a mistake that is nobody's business but the typist's.
+#[tokio::test]
+async fn a_refused_dsn_emits_no_store_request() {
+    let (bench, mut section) = bench_with(&empty_snapshot()).await;
+    typed(&bench, &mut section, "nope");
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+
+    assert!(
+        bench.drained().is_empty(),
+        "not one action, not even an error on the status line"
+    );
+
+    let frame = frame_of(&bench, &section);
+    assert!(frame.contains("not a URL"), "the fixed sentence: {frame}");
+    assert!(section.captures_input(), "and the field is still open");
+    assert!(
+        frame.contains("(0)"),
+        "over an empty buffer, so the retype starts clean: {frame}"
+    );
+}
+
+/// D2: five inputs, five fixed sentences, and not a fragment of any of them on screen.
+#[tokio::test]
+async fn each_refusal_is_one_of_five_sentences() {
+    let cases = [
+        ("nope", "not a URL"),
+        ("postgres:///htui", "no host"),
+        ("postgres://h/d?sslmode=maybe", "unsupported sslmode"),
+        ("postgres://h:70000/d", "port out of range"),
+        ("postgres://h/d?foo=bar", "unrecognised parameter"),
+    ];
+
+    for (input, sentence) in cases {
+        let (bench, mut section) = bench_with(&empty_snapshot()).await;
+        typed(&bench, &mut section, input);
+        bench.key(&mut section, "Enter");
+
+        assert!(
+            bench.drained().is_empty(),
+            "`{input}` sent something it should not have"
+        );
+        let frame = flattened(&frame_of(&bench, &section));
+        assert!(frame.contains(sentence), "`{input}`: {frame}");
+        for (_, other) in cases {
+            assert!(
+                other == sentence || !frame.contains(other),
+                "`{input}` showed `{other}` as well as `{sentence}`"
+            );
+        }
+        assert!(
+            !frame.contains("70000") && !frame.contains("maybe") && !frame.contains("foo"),
+            "`{input}` echoed part of what was typed: {frame}"
+        );
+    }
+}
+
+/// The accepting half: one `SetDsn` carrying the newtype, and the section says it is waiting.
+#[tokio::test]
+async fn a_valid_dsn_emits_set_dsn_and_marks_busy() {
+    let (bench, mut section) = bench_with(&empty_snapshot()).await;
+    typed(
+        &bench,
+        &mut section,
+        &format!("postgres://htui:{SECRET}@db.example:5432/htui?sslmode=require"),
+    );
+    bench.key(&mut section, "Enter");
+
+    let sent = requested(&bench);
+    assert_eq!(sent.len(), 1, "exactly one request: {sent:?}");
+    assert!(
+        matches!(sent.first(), Some(StoreRequest::SetDsn(_))),
+        "{sent:?}"
+    );
+    assert!(
+        !format!("{sent:?}").contains(SECRET),
+        "and the request prints redacted: {sent:?}"
+    );
+
+    assert!(!section.captures_input(), "the field closed behind it");
+    let frame = frame_of(&bench, &section);
+    assert!(
+        hint_of(&frame).ends_with("set_dsn in flight"),
+        "the hint says what is out: {frame}"
+    );
+
+    // A second write is refused until the first answers (the one-write-in-flight guard, D5).
+    bench.key(&mut section, "e");
+    assert!(!section.captures_input(), "{:?}", section);
+    assert!(
+        flattened(&frame_of(&bench, &section)).contains("set_dsn"),
+        "and says why"
+    );
+}
+
+/// An `Enter` over nothing is not a write: there is no DSN to store and the stored one stays.
+#[tokio::test]
+async fn an_empty_field_stores_nothing() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    bench.key(&mut section, "Enter");
+
+    assert!(bench.drained().is_empty());
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("nothing typed; the stored DSN is unchanged"),
+        "{frame}"
+    );
+}
+
+// --- the rows --------------------------------------------------------------------------------
+
+/// D16: what a box with a DSN shows, and D15's rule — the label is rendered, never parsed.
+#[tokio::test]
+async fn the_rows_show_the_snapshot_and_derive_nothing() {
+    let (bench, section) = bench_with(&stored_snapshot()).await;
+    let frame = flattened(&frame_of(&bench, &section));
+
+    assert!(frame.contains("offline \u{b7} 0s"), "{frame}");
+    assert!(
+        frame.contains(
+            "stored \u{2014} postgres://htui@db.example:5432/htui \u{b7} sslmode=require"
+        ),
+        "the DSN row is the summary and nothing else: {frame}"
+    );
+    assert!(
+        frame.contains("last dial 10:20:00: failed: connection refused"),
+        "the last dial is shown in the app, not only in a log: {frame}"
+    );
+    assert!(
+        frame.contains("0f1e2d3c4b5a \u{b7} built 2026-09-15 09:30"),
+        "the fingerprint is truncated to twelve: {frame}"
+    );
+    assert!(
+        frame.contains("last full refresh 2026-09-15 10:15 \u{b7} schema 3"),
+        "{frame}"
+    );
+    assert!(!frame.contains("0f1e2d3c4b5a6"), "and no further: {frame}");
+
+    insta::assert_snapshot!("stored", frame_of(&bench, &section));
+}
+
+/// B-7: a DSN one `--set-dsn` wrote raw is reported as stored, without a summary it cannot build.
+#[tokio::test]
+async fn an_unreadable_stored_dsn_says_so_rather_than_guessing() {
+    let mut snapshot = stored_snapshot();
+    snapshot.dsn_summary = None;
+    let (bench, section) = bench_with(&snapshot).await;
+
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("stored \u{2014} not readable by this build; e replaces it"),
+        "{frame}"
+    );
+}
+
+/// D10: a `--demo` session has no keyring and no mirror, and the rows say so rather than lying.
+#[tokio::test]
+async fn a_demo_snapshot_never_opens_the_editor() {
+    let (bench, section) = bench_with(&demo_snapshot()).await;
+
+    assert!(
+        !section.captures_input(),
+        "nothing to type a DSN into: {section:?}"
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(frame.contains("n/a in a demo session"), "{frame}");
+    assert!(frame.contains("memory"), "{frame}");
+    assert!(frame.contains("no dial yet this session"), "{frame}");
+}
+
+/// D8: the editor opens itself once for an empty keyring, and not again after the fourth-tick
+/// re-read that lands a minute later.
+#[tokio::test]
+async fn an_empty_snapshot_opens_the_editor_once() {
+    let (bench, mut section) = bench_with(&empty_snapshot()).await;
+    assert!(section.captures_input(), "it opened itself");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("no DSN is stored; type one and press Enter"),
+        "{frame}"
+    );
+    assert!(frame.contains("not stored"), "and the row says so: {frame}");
+    insta::assert_snapshot!("empty", frame_of(&bench, &section));
+
+    bench.key(&mut section, "Esc");
+    assert!(!section.captures_input());
+
+    feed(&bench, &mut section, &empty_snapshot());
+    assert!(
+        !section.captures_input(),
+        "a re-read does not reopen a field the user closed: {section:?}"
+    );
+}
+
+/// The editor over a box that already has a DSN: `e` replaces rather than reveals.
+#[tokio::test]
+async fn e_opens_a_replacement_field_over_a_stored_dsn() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    typed(&bench, &mut section, TYPED);
+
+    let frame = frame_of(&bench, &section);
+    assert!(frame.contains("(19)"), "{frame}");
+    assert!(
+        frame.contains("Enter store"),
+        "and the hint is the editor's: {frame}"
+    );
+    insta::assert_snapshot!("editor", frame);
+}
+
+/// D16: `j`/`k` move within the four rows and stop at the ends.
+#[tokio::test]
+async fn j_and_k_move_between_the_four_rows() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    for _ in 0..8 {
+        assert_eq!(bench.key(&mut section, "j"), Handled::Consumed);
+    }
+    // The cursor is a style, so the assertion is that `Enter` now means the Rebuild row (B-9).
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+    assert!(
+        flattened(&frame_of(&bench, &section)).contains("Rebuild the mirror?"),
+        "eight `j` stopped on the last row rather than wrapping"
+    );
+}
+
+// --- the two confirmations ---------------------------------------------------------------------
+
+/// D16: `c` asks before it clears, and `n` is an answer.
+#[tokio::test]
+async fn c_needs_a_confirmation() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+
+    assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
+    assert!(
+        bench.drained().is_empty(),
+        "nothing is sent by the question"
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("Remove the DSN from the keyring?"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("the next launch starts offline"),
+        "and says what it costs: {frame}"
+    );
+    assert!(section.captures_input(), "the question is modal");
+
+    bench.key(&mut section, "n");
+    assert!(!section.captures_input());
+    assert!(bench.drained().is_empty(), "`n` sends nothing either");
+
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    let sent = requested(&bench);
+    assert!(
+        matches!(sent.as_slice(), [StoreRequest::ClearDsn]),
+        "one clear, and only after the `y`: {sent:?}"
+    );
+}
+
+/// There is nothing to clear on a box with no DSN, so `c` refuses instead of asking.
+#[tokio::test]
+async fn c_refuses_when_nothing_is_stored() {
+    let (bench, mut section) = bench_with(&empty_snapshot()).await;
+    bench.key(&mut section, "Esc");
+
+    assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
+    assert!(bench.drained().is_empty());
+    assert!(!section.captures_input(), "no question was asked");
+    assert!(
+        flattened(&frame_of(&bench, &section)).contains("not stored"),
+        "{section:?}"
+    );
+}
+
+/// D14: the rebuild confirmation names **both** lists, and a second `y` is inert.
+///
+/// The copy is derived from `CacheStore::rebuild`'s own body, not from memory, and this is the
+/// test that keeps it that way: if the action is ever extended to clear something else, one of
+/// these two lists stops being true and this case is where it shows.
+#[tokio::test]
+async fn rebuild_needs_a_confirmation_and_names_both_lists() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    assert_eq!(bench.key(&mut section, "R"), Handled::Consumed);
+    assert!(bench.drained().is_empty());
+
+    let frame = flattened(&frame_of(&bench, &section));
+    for survives in ["schema_version", "db_fingerprint", "built_at", "pending/"] {
+        assert!(frame.contains(survives), "`{survives}` survives: {frame}");
+    }
+    for goes in ["16 mirrored tables", "cache_cursor", "last_full_refresh_at"] {
+        assert!(frame.contains(goes), "`{goes}` goes: {frame}");
+    }
+    assert!(
+        frame.contains("Survives:") && frame.contains("Goes:"),
+        "and the two are told apart: {frame}"
+    );
+    insta::assert_snapshot!("confirm", frame_of(&bench, &section));
+
+    bench.key(&mut section, "y");
+    let sent = requested(&bench);
+    assert!(
+        matches!(sent.as_slice(), [StoreRequest::RebuildCache]),
+        "{sent:?}"
+    );
+    assert!(
+        flattened(&frame_of(&bench, &section)).contains("rebuilding"),
+        "the question became a report"
+    );
+
+    bench.key(&mut section, "y");
+    assert!(
+        bench.drained().is_empty(),
+        "a second `y` on a rebuild already out sends nothing"
+    );
+}
+
+/// B-9: `Enter` on the Rebuild row is `R`, so the row is not a label with no key.
+#[tokio::test]
+async fn enter_on_the_rebuild_row_is_r() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    for _ in 0..3 {
+        bench.key(&mut section, "j");
+    }
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+
+    assert!(
+        flattened(&frame_of(&bench, &section)).contains("Rebuild the mirror?"),
+        "{section:?}"
+    );
+    assert!(bench.drained().is_empty());
+}
+
+/// A rebuild needs a mirror, and `--demo` has none.
+#[tokio::test]
+async fn rebuild_refuses_in_a_demo_session() {
+    let (bench, mut section) = bench_with(&demo_snapshot()).await;
+    assert_eq!(bench.key(&mut section, "R"), Handled::Consumed);
+
+    assert!(bench.drained().is_empty());
+    assert!(!section.captures_input(), "no question was asked");
+    assert!(
+        flattened(&frame_of(&bench, &section)).contains("n/a in a demo session"),
+        "{section:?}"
+    );
+}
+
+// --- replies ------------------------------------------------------------------------------------
+
+/// D12: the `--offline` notice says what happened rather than leaving `offline \u{b7} 0s` to be
+/// read as a failure.
+#[tokio::test]
+async fn the_offline_notice_after_set_dsn() {
+    for offline in [false, true] {
+        let (bench, mut section) = bench_with(&empty_snapshot()).await;
+        typed(&bench, &mut section, "postgres://h:5432/d");
+        bench.key(&mut section, "Enter");
+        let _ = bench.drained();
+
+        let mut answer = stored_snapshot();
+        answer.offline = offline;
+        feed(&bench, &mut section, &answer);
+
+        let hint = hint_of(&frame_of(&bench, &section));
+        if offline {
+            assert_eq!(
+                hint,
+                "stored; this session was started with --offline, so it takes effect on the next launch",
+                "the sentence wins the line when the keys do not fit beside it"
+            );
+        } else {
+            assert!(hint.ends_with("\u{b7} stored"), "{hint}");
+        }
+    }
+}
+
+/// D13: the clear reply says what it did **and** what it deliberately did not do.
+#[tokio::test]
+async fn clear_reply_says_the_session_keeps_its_connection() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    let mut answer = stored_snapshot();
+    answer.dsn_stored = Some(false);
+    answer.dsn_summary = None;
+    answer.label = "online".to_owned();
+    feed(&bench, &mut section, &answer);
+
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains(
+            "the DSN is gone from the keyring \u{2014} this session keeps its current connection until you quit"
+        ),
+        "{frame}"
+    );
+    assert!(
+        !section.captures_input(),
+        "and the clear did not reopen the editor over its own report: {section:?}"
+    );
+}
+
+/// D14's reply: the mirror is empty and the section says what refills it.
+#[tokio::test]
+async fn the_rebuild_reply_says_what_refills_the_mirror() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    bench.key(&mut section, "R");
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    let mut answer = stored_snapshot();
+    answer.mirror = Some(MirrorInfo {
+        last_full_refresh_at: None,
+        ..mirror_info()
+    });
+    feed(&bench, &mut section, &answer);
+
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("mirror rebuilt; the next refresh pass refills it"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("last full refresh never"),
+        "and the row agrees with it: {frame}"
+    );
+    assert!(!section.captures_input(), "the question is answered");
+}
+
+/// A refused **read** leaves the section with no rows to trust, and says so instead of showing
+/// rows nothing has confirmed since the outage started.
+#[tokio::test]
+async fn a_failed_read_blocks_e() {
+    let bench = SectionBench::new().await;
+    let mut section = ConnectionSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: READ_NAME,
+            message: NO_WORKER.to_owned(),
+        },
+    );
+    let _ = bench.drained();
+
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(frame.contains("connection info is unavailable"), "{frame}");
+    assert!(frame.contains(NO_WORKER), "{frame}");
+
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    assert!(
+        !section.captures_input(),
+        "a field over rows nobody can see: {section:?}"
+    );
+}
+
+/// A refused **write** is the seam's own sentence, verbatim, and the section is ready for the
+/// next key.
+#[tokio::test]
+async fn a_failed_write_shows_the_seams_sentence() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    bench.key(&mut section, "R");
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "rebuild_cache",
+            message: DEMO_SESSION.to_owned(),
+        },
+    );
+
+    let frame = frame_of(&bench, &section);
+    assert!(flattened(&frame).contains(DEMO_SESSION), "{frame}");
+    assert!(
+        !hint_of(&frame).contains("in flight"),
+        "and nothing is still out: {frame}"
+    );
+    assert!(
+        !section.captures_input(),
+        "the question it refused is closed: {section:?}"
+    );
+}
+
+/// `r` is the way back from a lost reply, so it is allowed whatever else is going on (M3's rule).
+#[tokio::test]
+async fn r_re_reads_and_is_never_refused() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+    bench.key(&mut section, "R");
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    // The rebuild is out; `r` still asks.
+    assert_eq!(
+        bench.key(&mut section, "r"),
+        Handled::Pass,
+        "modal while the question is in flight"
+    );
+    feed(&bench, &mut section, &stored_snapshot());
+    assert_eq!(bench.key(&mut section, "r"), Handled::Consumed);
+    assert!(
+        matches!(requested(&bench).as_slice(), [StoreRequest::ConnectionInfo]),
+        "one read"
+    );
+}
+
+/// The read every section names for itself (B-6), so the tab activating populates it.
+#[tokio::test]
+async fn the_section_asks_for_the_connection_and_nothing_else() {
+    let section = ConnectionSection::new();
+    let scope = Scope {
+        workspace_id: htui_core::model::WorkspaceId::default(),
+        project_ids: Vec::new(),
+    };
+    let wants = section.wants_requests(&scope);
+
+    assert_eq!(wants.len(), 1, "{wants:?}");
+    assert_eq!(wants[0].name(), READ_NAME);
+    assert_eq!(section.id(), SectionId("connection"));
+    assert_eq!(section.title(), "Connection");
+}
+
+// --- the shell: the focus action and the redirect ------------------------------------------------
+
+/// D7: `FocusSection` reaches the section from a tab that is not even Settings.
+#[tokio::test]
+async fn focus_section_selects_from_any_tab() {
+    let mut harness = shell(Backend::memory(MemStore::demo()));
+    harness.settle().await;
+    assert!(
+        !harness.render().contains("Rebuild cache"),
+        "the shell starts on Backlog"
+    );
+
+    harness.app().update(Action::Tab(TabAction::FocusSection(
+        SettingsTab::ID,
+        ConnectionSection::ID,
+    )));
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("Rebuild cache"),
+        "one action reached the tab and the section inside it: {frame}"
+    );
+
+    // An id nothing registers moves nothing: the shell must not die because a build dropped a
+    // section, and it must not silently land somewhere else either.
+    harness.app().update(Action::Tab(TabAction::FocusSection(
+        SettingsTab::ID,
+        SectionId("nothing-registers-this"),
+    )));
+    harness.settle().await;
+    assert!(
+        harness.render().contains("Rebuild cache"),
+        "the active section did not move"
+    );
+}
+
+/// D6: a box with an empty keyring lands on the field that fixes it — once per session.
+#[tokio::test]
+async fn the_redirect_fires_once() {
+    let _keyring = common::mock_keyring().await;
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(
+        root.path(),
+        "connection-redirect",
+        PgStore::schema_version(),
+    )
+    .await
+    .expect("a fresh mirror");
+
+    let mut harness = shell(Backend::Offline {
+        cache: cache.clone(),
+        since: Some(Utc::now()),
+    });
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("no DSN is stored; type one and press Enter"),
+        "the shell steered to the field without the user finding the tab: {frame}"
+    );
+    assert!(
+        frame.contains("typed text is never shown"),
+        "and it is open: {frame}"
+    );
+
+    // The user closes it and goes back to work.
+    harness.key("Esc");
+    harness.key("1");
+    harness.settle().await;
+    assert!(
+        !harness.render().contains("Rebuild cache"),
+        "back on Backlog"
+    );
+
+    // The shell re-reads under `Origin::App`, as the fourth tick does. It must not fight the user.
+    harness
+        .app()
+        .update(Action::Store(StoreRequest::ConnectionInfo));
+    harness.settle().await;
+    assert!(
+        !harness.render().contains("Rebuild cache"),
+        "the redirect is once per session, not once per reply: {}",
+        harness.render()
+    );
+
+    cache.close().await;
+    drop(root);
+}
+
+/// D10: `--demo` answers `dsn_stored: None`, which is not "no DSN" and must not redirect.
+#[tokio::test]
+async fn a_demo_session_never_redirects() {
+    let mut harness = shell(Backend::memory(MemStore::demo()));
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        !frame.contains("Rebuild cache") && !frame.contains("no DSN is stored"),
+        "a demo session has nothing to fix and is left where it was: {frame}"
+    );
+}
+
+/// D19: the product registers `Connection` **after** `Prompt`, so the strip reads
+/// `Agents  Hierarchy  Kinds  Prompt  Connection` and four `l` reach it.
+#[tokio::test]
+async fn the_product_registers_connection_after_prompt() {
+    let mut harness = Harness::demo();
+    htui::app::register_all(harness.app());
+    harness.settle().await;
+    harness.key("3");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("Agents") && frame.contains("Prompt") && frame.contains("Connection"),
+        "five sections in the strip: {frame}"
+    );
+
+    for _ in 0..4 {
+        harness.key("l");
+    }
+    harness.settle().await;
+    assert!(
+        harness.render().contains("Rebuild cache"),
+        "the fifth `l` would wrap; four reach the last section"
+    );
 }

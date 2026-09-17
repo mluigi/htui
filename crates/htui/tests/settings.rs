@@ -9,8 +9,8 @@ use htui::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{
-    AgentsSection, HierarchySection, KindsSection, PromptSection, SectionId, SettingsSection,
-    SettingsTab, message,
+    AgentsSection, ConnectionSection, HierarchySection, KindsSection, PromptSection, SectionId,
+    SettingsSection, SettingsTab, message,
 };
 use htui_agent::acp::Handshake;
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
@@ -937,8 +937,13 @@ async fn a_capturing_section_receives_l_and_a_plain_one_cycles() {
 ///
 /// `render_strip` draws `format!(" {title} ")` per registered section, so the joined width is
 /// `Σ (title chars + 2)`. The pin is over the sections the product registers, not over a test
-/// fixture: the moment a fifth section makes the strip 101 columns wide this fails, and that is
-/// the one warning a snapshot of a clipped strip could not give.
+/// fixture: the moment a section makes the strip 101 columns wide this fails, and that is the one
+/// warning a snapshot of a clipped strip could not give.
+///
+/// The fifth section is MOD-15 milestone 6's `Connection` (D19), which is what this test was
+/// written to catch. It costs 12 of the 100 columns and the five together cost 46, so the pin is
+/// re-run rather than relaxed — if a sixth ever does not fit, the fix is the strip's, not a
+/// shorter title.
 #[test]
 fn the_section_strip_fits_the_frame() {
     let sections: Vec<Box<dyn SettingsSection>> = vec![
@@ -946,6 +951,7 @@ fn the_section_strip_fits_the_frame() {
         Box::new(HierarchySection::new()),
         Box::new(KindsSection::new()),
         Box::new(PromptSection::new()),
+        Box::new(ConnectionSection::new()),
     ];
     let width: usize = sections
         .iter()
