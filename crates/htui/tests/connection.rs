@@ -41,8 +41,8 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone as _, Utc};
 use htui::app::{Action, Handled, TabAction};
 use htui::connection::{
-    Attempt, AttemptOutcome, ConnectionSnapshot, DEMO_SESSION, MirrorInfo, NO_WORKER, READ_NAME,
-    REQUEST_NAMES,
+    Attempt, AttemptOutcome, ConnectionSnapshot, DEMO_SESSION, DsnState, MirrorInfo, NO_WORKER,
+    READ_NAME, REQUEST_NAMES,
 };
 use htui::store_worker::{
     self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest, serve,
@@ -296,17 +296,21 @@ async fn try_serve_refuses_every_writer_by_name() {
     }
 }
 
-/// `Backend::Memory` answers `dsn_stored: None` and never opens a keyring (D10).
+/// `Backend::Memory` answers `DsnState::NotApplicable` and never opens a keyring (D10).
 ///
 /// **No `mock_keyring` guard on purpose**: this is the case that would reach the developer's own
 /// credential store if the arm were wrong, and `Harness::settle` serves `ConnectionInfo` through
 /// exactly this path on every `--demo` snapshot in the suite.
 #[tokio::test]
-async fn memory_answers_none_for_dsn_stored_and_never_opens_the_keyring() {
+async fn memory_answers_not_applicable_and_never_opens_the_keyring() {
     let snapshot = connection(serve(&demo(), &StoreRequest::ConnectionInfo).await);
 
     assert_eq!(snapshot.label, "memory");
-    assert_eq!(snapshot.dsn_stored, None, "no keyring story in this build");
+    assert_eq!(
+        snapshot.dsn_state,
+        DsnState::NotApplicable,
+        "no keyring story in this build"
+    );
     assert_eq!(snapshot.dsn_summary, None);
     assert_eq!(snapshot.mirror, None, "a memory backend has no mirror");
     assert_eq!(snapshot.last_attempt, None);
@@ -347,7 +351,7 @@ async fn an_offline_backend_reports_a_stored_dsn_by_summary_only() {
     }));
     let snapshot = worker.info().await;
 
-    assert_eq!(snapshot.dsn_stored, Some(true));
+    assert_eq!(snapshot.dsn_state, DsnState::Stored);
     assert_eq!(
         snapshot.dsn_summary,
         Some(Dsn::parse(DEAD_DSN).expect("parses").summary()),
@@ -385,8 +389,47 @@ async fn an_unparseable_stored_dsn_reports_stored_without_a_summary() {
     }));
     let snapshot = worker.info().await;
 
-    assert_eq!(snapshot.dsn_stored, Some(true));
+    assert_eq!(snapshot.dsn_state, DsnState::Stored);
     assert_eq!(snapshot.dsn_summary, None, "it fails closed, not open");
+
+    worker.shutdown().await;
+    cache.close().await;
+    drop(root);
+}
+
+/// A keyring that cannot be read is a **row**, not a failed read (the M6 follow-up fix).
+///
+/// The `Option<bool>` this field started as could not say it: `Some(false)` would claim the box has no DSN
+/// over a keyring nobody could open, and `None` was the demo session's answer. Propagating the
+/// error instead would lose the mirror, the label and the last dial along with it — four rows
+/// replaced by one sentence because one of them could not be filled in.
+#[tokio::test]
+async fn an_unreadable_keyring_is_a_row_and_not_a_failed_read() {
+    let _keyring = common::mock_keyring_broken().await;
+    let (root, cache) = mirror("connection-unreadable").await;
+
+    let mut worker = Worker::spawn(Started::detached(Backend::Offline {
+        cache: cache.clone(),
+        since: Some(Utc::now()),
+    }));
+    let snapshot = worker.info().await;
+
+    match &snapshot.dsn_state {
+        DsnState::Unreadable(why) => assert!(
+            why.contains(common::BROKEN_KEYRING),
+            "the seam's own sentence, so the section can show what to fix: {why}"
+        ),
+        other => panic!("expected Unreadable, got {other:?}"),
+    }
+    assert_eq!(snapshot.dsn_summary, None, "nothing was read to summarise");
+    assert_eq!(
+        snapshot
+            .mirror
+            .as_ref()
+            .expect("the rest of the read still answers")
+            .db_fingerprint,
+        "connection-unreadable"
+    );
 
     worker.shutdown().await;
     cache.close().await;
@@ -419,7 +462,11 @@ async fn set_dsn_without_a_context_fails_and_changes_nothing() {
     assert_eq!(message, NO_WORKER);
 
     let snapshot = worker.info().await;
-    assert_eq!(snapshot.dsn_stored, Some(false), "nothing was stored");
+    assert_eq!(
+        snapshot.dsn_state,
+        DsnState::NotStored,
+        "nothing was stored"
+    );
     assert_eq!(
         snapshot
             .mirror
@@ -448,10 +495,10 @@ async fn clear_dsn_empties_the_keyring_and_keeps_the_backend() {
         since: Some(Utc::now()),
     }));
     let before = worker.info().await;
-    assert_eq!(before.dsn_stored, Some(true));
+    assert_eq!(before.dsn_state, DsnState::Stored);
 
     let after = connection(worker.ask(StoreRequest::ClearDsn).await);
-    assert_eq!(after.dsn_stored, Some(false));
+    assert_eq!(after.dsn_state, DsnState::NotStored);
     assert_eq!(after.dsn_summary, None);
     assert_eq!(common::fake_dsn(), None, "the keyring entry is gone");
     assert_eq!(
@@ -483,7 +530,7 @@ async fn set_dsn_under_offline_stores_but_does_not_dial() {
     let mut worker = Worker::spawn(started);
 
     let snapshot = connection(worker.ask(StoreRequest::SetDsn(dsn)).await);
-    assert_eq!(snapshot.dsn_stored, Some(true));
+    assert_eq!(snapshot.dsn_state, DsnState::Stored);
     assert!(snapshot.offline, "the snapshot carries the session's flag");
     assert!(
         snapshot.label.starts_with("offline · "),
@@ -876,13 +923,13 @@ async fn set_dsn_goes_online_without_a_restart() {
     let mut worker = Worker::spawn(started);
 
     assert_eq!(
-        worker.info().await.dsn_stored,
-        Some(false),
+        worker.info().await.dsn_state,
+        DsnState::NotStored,
         "an empty keyring is where this box starts"
     );
 
     let stored = connection(worker.ask(StoreRequest::SetDsn(dsn)).await);
-    assert_eq!(stored.dsn_stored, Some(true));
+    assert_eq!(stored.dsn_state, DsnState::Stored);
     assert_eq!(stored.label, "connecting", "the dial is already in flight");
     assert_eq!(
         stored
@@ -1009,7 +1056,7 @@ fn mirror_info() -> MirrorInfo {
 fn stored_snapshot() -> ConnectionSnapshot {
     ConnectionSnapshot {
         label: "offline \u{b7} 0s".to_owned(),
-        dsn_stored: Some(true),
+        dsn_state: DsnState::Stored,
         dsn_summary: Some("postgres://htui@db.example:5432/htui \u{b7} sslmode=require".to_owned()),
         mirror: Some(mirror_info()),
         last_attempt: Some(Attempt {
@@ -1024,7 +1071,24 @@ fn stored_snapshot() -> ConnectionSnapshot {
 fn empty_snapshot() -> ConnectionSnapshot {
     ConnectionSnapshot {
         label: "offline \u{b7} 0s".to_owned(),
-        dsn_stored: Some(false),
+        dsn_state: DsnState::NotStored,
+        dsn_summary: None,
+        mirror: Some(mirror_info()),
+        last_attempt: None,
+        offline: false,
+    }
+}
+
+/// The sentence a box with a session bus and no unlocked collection produces, as
+/// `secret::get_dsn` shapes it.
+const UNREADABLE_WHY: &str = "cannot read the keyring entry (htui/postgres-dsn): Couldn't access \
+                              platform secure storage: Secret Service: no result found";
+
+/// A box whose keyring answers nothing at all: not empty, *unreadable*.
+fn unreadable_snapshot() -> ConnectionSnapshot {
+    ConnectionSnapshot {
+        label: "offline \u{b7} 0s".to_owned(),
+        dsn_state: DsnState::Unreadable(UNREADABLE_WHY.to_owned()),
         dsn_summary: None,
         mirror: Some(mirror_info()),
         last_attempt: None,
@@ -1036,7 +1100,7 @@ fn empty_snapshot() -> ConnectionSnapshot {
 fn demo_snapshot() -> ConnectionSnapshot {
     ConnectionSnapshot {
         label: "memory".to_owned(),
-        dsn_stored: None,
+        dsn_state: DsnState::NotApplicable,
         dsn_summary: None,
         mirror: None,
         last_attempt: None,
@@ -1387,6 +1451,72 @@ async fn an_unreadable_stored_dsn_says_so_rather_than_guessing() {
     );
 }
 
+/// The row an unreadable keyring gets: the reason, and **not** `not stored`.
+///
+/// The editor does not open itself here either. D8's redirect exists to put a user who has no DSN
+/// in front of the field that fixes it; a user whose collection is locked has nothing to type that
+/// would help, and a masked field over a store that cannot be written is an invitation to lose a
+/// credential.
+#[tokio::test]
+async fn an_unreadable_keyring_shows_the_reason_and_never_opens_the_editor() {
+    let (bench, section) = bench_with(&unreadable_snapshot()).await;
+
+    assert!(
+        !section.captures_input(),
+        "no field was opened over a keyring nobody can write: {section:?}"
+    );
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains(&flattened(&format!(
+            "the keyring could not be read: {UNREADABLE_WHY}"
+        ))),
+        "the row says what failed: {frame}"
+    );
+    assert!(
+        !frame.contains("not stored") && !frame.contains("n/a in a demo session"),
+        "and never claims the box has no DSN: {frame}"
+    );
+    assert!(
+        frame.contains("0f1e2d3c4b5a"),
+        "the other rows still answer: {frame}"
+    );
+    assert!(
+        frame.contains("e edit DSN"),
+        "and the keys are the ordinary ones: {frame}"
+    );
+    insta::assert_snapshot!("unreadable", frame_of(&bench, &section));
+}
+
+/// `c` refuses over an unreadable keyring — there is nothing known to clear — and says why.
+///
+/// `e` is deliberately still offered: the user may want to store a DSN anyway, and the seam
+/// answers if that write fails too. What `e` must not do is open by itself.
+#[tokio::test]
+async fn c_refuses_over_an_unreadable_keyring_and_e_still_opens() {
+    let (bench, mut section) = bench_with(&unreadable_snapshot()).await;
+
+    assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
+    assert!(bench.drained().is_empty(), "nothing was sent");
+    assert!(!section.captures_input(), "no question was asked");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("the keyring could not be read"),
+        "the refusal is the row's own words: {frame}"
+    );
+    assert!(
+        !frame.contains("Remove the DSN from the keyring?"),
+        "{frame}"
+    );
+
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    assert!(section.captures_input(), "`e` is still available");
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        !frame.contains("no DSN is stored"),
+        "and the guide line does not claim an empty keyring: {frame}"
+    );
+}
+
 /// D10: a `--demo` session has no keyring and no mirror, and the rows say so rather than lying.
 #[tokio::test]
 async fn a_demo_snapshot_never_opens_the_editor() {
@@ -1626,7 +1756,7 @@ async fn clear_reply_says_the_session_keeps_its_connection() {
     let _ = bench.drained();
 
     let mut answer = stored_snapshot();
-    answer.dsn_stored = Some(false);
+    answer.dsn_state = DsnState::NotStored;
     answer.dsn_summary = None;
     answer.label = "online".to_owned();
     feed(&bench, &mut section, &answer);
@@ -1861,7 +1991,7 @@ async fn the_redirect_fires_once() {
     drop(root);
 }
 
-/// D10: `--demo` answers `dsn_stored: None`, which is not "no DSN" and must not redirect.
+/// D10: `--demo` answers `DsnState::NotApplicable`, which is not "no DSN" and must not redirect.
 #[tokio::test]
 async fn a_demo_session_never_redirects() {
     let mut harness = shell(Backend::memory(MemStore::demo()));
@@ -1872,6 +2002,40 @@ async fn a_demo_session_never_redirects() {
         !frame.contains("Rebuild cache") && !frame.contains("no DSN is stored"),
         "a demo session has nothing to fix and is left where it was: {frame}"
     );
+}
+
+/// A keyring that cannot be read must **not** redirect: that is the failure mode this fix exists
+/// to avoid.
+///
+/// The redirect (D6) sends a user to a masked credential field. Doing that because their
+/// collection is locked would ask them to retype a DSN into a store that cannot hold it — and the
+/// one they already have would still be there, unreadable, when it unlocks.
+#[tokio::test]
+async fn an_unreadable_keyring_never_redirects() {
+    let _keyring = common::mock_keyring_broken().await;
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(
+        root.path(),
+        "connection-no-redirect",
+        PgStore::schema_version(),
+    )
+    .await
+    .expect("a fresh mirror");
+
+    let mut harness = shell(Backend::Offline {
+        cache: cache.clone(),
+        since: Some(Utc::now()),
+    });
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        !frame.contains("Rebuild cache") && !frame.contains("no DSN is stored"),
+        "the shell left the user where they were: {frame}"
+    );
+
+    cache.close().await;
+    drop(root);
 }
 
 /// D19: the product registers `Connection` **after** `Prompt`, so the strip reads

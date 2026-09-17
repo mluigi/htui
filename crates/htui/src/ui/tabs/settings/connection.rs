@@ -34,7 +34,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use zeroize::Zeroizing;
 
 use crate::app::{Ctx, Handled};
-use crate::connection::{AttemptOutcome, ConnectionSnapshot, READ_NAME, REQUEST_NAMES};
+use crate::connection::{AttemptOutcome, ConnectionSnapshot, DsnState, READ_NAME, REQUEST_NAMES};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
@@ -95,6 +95,20 @@ const DEMO_ROW: &str = "n/a in a demo session";
 
 /// The DSN row with nothing behind it.
 const NOT_STORED: &str = "not stored";
+
+/// The DSN row over a keyring that could not be opened; the seam's sentence follows it.
+///
+/// A different row from [`NOT_STORED`] because it is a different fact, and the one thing this
+/// section must never do is report an unreadable keyring as an empty one: a user whose collection
+/// is locked still has their DSN, and telling them otherwise invites a retype into a store that
+/// cannot hold it.
+const UNREADABLE: &str = "the keyring could not be read";
+
+/// The guide line under an open field when the keyring could not be read.
+///
+/// Neither [`NO_DSN_YET`] nor [`REPLACES`] is true here — nobody knows whether there is a DSN —
+/// so the field says what it is about to attempt instead of claiming a state.
+const UNREADABLE_GUIDE: &str = "the keyring could not be read; Enter tries to store a DSN in it";
 
 /// B-7: one `--set-dsn` may have written a string this build's parser refuses. It is still the
 /// DSN the next launch will dial with, so it is reported as stored — without a summary that would
@@ -290,11 +304,9 @@ impl ConnectionSection {
         Self::default()
     }
 
-    /// Whether a DSN is in the keyring: `None` on a demo session, which is not "no DSN" (D10).
-    fn dsn_stored(&self) -> Option<bool> {
-        self.snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.dsn_stored)
+    /// What the last read said about the keyring, or `None` before the first one.
+    fn dsn_state(&self) -> Option<&DsnState> {
+        self.snapshot.as_ref().map(|snapshot| &snapshot.dsn_state)
     }
 
     /// Whether there is a mirror to act on.
@@ -350,11 +362,15 @@ impl ConnectionSection {
     /// What `c` says when there is nothing to clear: the DSN row's own words, so the refusal and
     /// the row cannot disagree about why.
     fn dsn_row_refusal(&self) -> String {
-        if self.dsn_stored().is_none() {
-            DEMO_ROW.to_owned()
-        } else {
-            NOT_STORED.to_owned()
-        }
+        self.dsn_state().map_or_else(
+            || NOT_READ.to_owned(),
+            |state| {
+                dsn_row(
+                    state,
+                    self.snapshot.as_ref().and_then(|s| s.dsn_summary.as_ref()),
+                )
+            },
+        )
     }
 
     /// `R`, and `Enter` on the Rebuild row (B-9): one path, so the two keys cannot drift.
@@ -487,12 +503,7 @@ impl ConnectionSection {
         match row {
             // D15: the label is the backend's own string, rendered and never parsed.
             Row::Status => format!("{} \u{b7} {}", snapshot.label, attempt_text(snapshot)),
-            Row::Dsn => match (snapshot.dsn_stored, &snapshot.dsn_summary) {
-                (None, _) => DEMO_ROW.to_owned(),
-                (Some(false), _) => NOT_STORED.to_owned(),
-                (Some(true), Some(summary)) => format!("{STORED} \u{2014} {summary}"),
-                (Some(true), None) => STORED_UNREADABLE.to_owned(),
-            },
+            Row::Dsn => dsn_row(&snapshot.dsn_state, snapshot.dsn_summary.as_ref()),
             Row::Mirror => match &snapshot.mirror {
                 None => DEMO_ROW.to_owned(),
                 Some(mirror) => {
@@ -558,10 +569,10 @@ impl ConnectionSection {
                 let mut lines = vec![Line::from(spans)];
                 // Under the field rather than on the hint line: a refusal is about what was just
                 // typed, and it belongs where the typing is.
-                let guide = if self.dsn_stored() == Some(true) {
-                    REPLACES
-                } else {
-                    NO_DSN_YET
+                let guide = match self.dsn_state() {
+                    Some(DsnState::Stored) => REPLACES,
+                    Some(DsnState::Unreadable(_)) => UNREADABLE_GUIDE,
+                    _ => NO_DSN_YET,
                 };
                 let (text, style) = match &self.notice {
                     Some(notice) if notice.is_error() => (notice.text(), theme.error),
@@ -687,8 +698,11 @@ impl ConnectionSection {
         // overwritten by the editor it would otherwise pop open over it — the box genuinely has
         // no DSN at that moment, and `e` is one key away, but `CLEARED` is the sentence that
         // answers the key the user just pressed.
+        // `NotStored` and nothing else: a keyring that could not be *read* knows nothing about a
+        // DSN, and opening a masked field over it would ask for a credential the store cannot
+        // hold — with the user's real one still there, unreadable, when it unlocks.
         if write.is_none()
-            && snapshot.dsn_stored == Some(false)
+            && snapshot.dsn_state == DsnState::NotStored
             && !self.opened_for_empty
             && matches!(self.mode, Mode::Browse)
         {
@@ -748,12 +762,14 @@ impl SettingsSection for ConnectionSection {
             }
             KeyCode::Char('c') => {
                 if !self.blocked() {
-                    if self.dsn_stored() == Some(true) {
+                    if self.dsn_state().is_some_and(DsnState::is_stored) {
                         self.notice = None;
                         self.mode = Mode::ConfirmClear;
                     } else {
-                        // `Some(false)` and `None` both: there is no keyring entry to remove, and
-                        // in a demo session there is no keyring at all.
+                        // The other three: there is no keyring entry to remove, there is no
+                        // keyring at all in a demo session, and over an unreadable one there is
+                        // nothing *known* to clear — a delete there would be a guess at a store
+                        // that has not answered.
                         self.refuse(self.dsn_row_refusal());
                     }
                 }
@@ -857,6 +873,19 @@ fn label_width() -> usize {
         .map(|row| row.label().chars().count())
         .max()
         .unwrap_or(0)
+}
+
+/// The DSN row's value column, and the sentence `c` refuses with when there is nothing to clear.
+///
+/// One function for both so the row and the refusal cannot disagree about why a key did nothing.
+fn dsn_row(state: &DsnState, summary: Option<&String>) -> String {
+    match (state, summary) {
+        (DsnState::NotApplicable, _) => DEMO_ROW.to_owned(),
+        (DsnState::NotStored, _) => NOT_STORED.to_owned(),
+        (DsnState::Unreadable(why), _) => format!("{UNREADABLE}: {why}"),
+        (DsnState::Stored, Some(summary)) => format!("{STORED} \u{2014} {summary}"),
+        (DsnState::Stored, None) => STORED_UNREADABLE.to_owned(),
+    }
 }
 
 /// The Status row's second half: the last dial and how it ended (B-5).

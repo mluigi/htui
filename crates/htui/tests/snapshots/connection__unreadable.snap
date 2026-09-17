@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/connection.rs
+expression: "frame_of(&bench, &section)"
+---
+  Status         offline · 0s · no dial yet this session
+  DSN            the keyring could not be read: cannot read the keyring entry (htui/postgres-dsn):
+                 Couldn't access platform secure storage: Secret Service: no result found
+  Mirror         0f1e2d3c4b5a · built 2026-09-15 09:30 · last full refresh 2026-09-15 10:15 · schema
+                 3
+  Rebuild cache  press Enter or R
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+e edit DSN · c clear DSN · R rebuild cache · r reload · j/k rows

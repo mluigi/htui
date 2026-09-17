@@ -7,6 +7,7 @@ use htui_core::model::{Scope, StepId, WorkspaceId, WorkspaceSummary};
 
 use crate::app::action::{Action, OverlayAction, TabAction};
 use crate::app::state::{App, Ctx};
+use crate::connection::DsnState;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
 use crate::ui::tabs::SettingsTab;
 use crate::ui::tabs::settings::ConnectionSection;
@@ -295,14 +296,18 @@ impl App {
         //
         // Without this it parks at `offline · 0s` forever — the reconnect ticker is guarded on a
         // `reconnect` that a box with no DSN never has — pointing at a CLI flag the user cannot
-        // reach without quitting. `Some(false)` and nothing else: `None` is `--demo`, which has
-        // no keyring story at all and must not be steered anywhere.
+        // reach without quitting.
+        //
+        // `NotStored` and nothing else. `NotApplicable` is `--demo`, which has no keyring story at
+        // all; `Unreadable` is a keyring nobody could open, and sending that user to a masked
+        // credential field would ask them to retype a DSN into a store that cannot hold it, over a
+        // stored one that is still there and will read again when the collection unlocks.
         //
         // Once per session, for the reason `migration_prompt_shown` exists: `ConnectionInfo` is
         // re-issued whenever the shell asks again, and a redirect that fired on every reply would
         // drag the user back to Settings from whatever they had moved on to.
         if let StoreReply::Connection(snapshot) = reply
-            && snapshot.dsn_stored == Some(false)
+            && snapshot.dsn_state == DsnState::NotStored
             && !self.connection_redirect_done
         {
             self.connection_redirect_done = true;

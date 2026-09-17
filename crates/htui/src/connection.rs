@@ -26,9 +26,8 @@ pub struct ConnectionSnapshot {
     /// [`Backend::label`] at the time of the read: `memory`, `online`, `connecting` or
     /// `offline · <age>`. The section renders this string and never parses it (D15).
     pub label: String,
-    /// `Some(true)`: a DSN is in the keyring; `Some(false)`: none; `None`: [`Backend::Memory`], no
-    /// keyring is consulted at all (D10).
-    pub dsn_stored: Option<bool>,
+    /// What the keyring answered, including the answer "nothing at all" (see [`DsnState`]).
+    pub dsn_state: DsnState,
     /// [`Dsn::summary`] of the stored DSN; `None` when nothing is stored **and** when the stored
     /// text does not pass [`Dsn::parse`] — one `--set-dsn` may have written it raw (B-7).
     pub dsn_summary: Option<String>,
@@ -40,6 +39,42 @@ pub struct ConnectionSnapshot {
     /// `--offline` (D12): the DSN is stored and the mirror re-opened, but nothing dials until the
     /// next launch. `false` whenever the read has no context to ask.
     pub offline: bool,
+}
+
+/// What the keyring said when the snapshot was taken.
+///
+/// Four states rather than the `Option<bool>` this started as, because a keyring has **two** ways
+/// of not holding a DSN and they are not the same fact. An entry that is not there is a first
+/// launch. A store that cannot be opened — a locked collection, a session with no secret service,
+/// which is what most CI images and a minimal window manager are — knows nothing either way, and
+/// reporting it as [`Self::NotStored`] would tell a user with a perfectly good stored DSN that
+/// they have none, and invite them to retype a credential into a store that cannot hold it.
+///
+/// [`htui_store::secret::get_dsn`] keeps the distinction at the seam: it maps only `NoEntry` and a
+/// blank entry to `Ok(None)`, and every other failure stays an `Err`. This enum is where that
+/// `Err` stops being fatal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DsnState {
+    /// [`Backend::Memory`]: no keyring is consulted at all, so there is nothing to report (D10).
+    NotApplicable,
+    /// A DSN is in the keyring. [`ConnectionSnapshot::dsn_summary`] carries its redacted summary,
+    /// or `None` when this build's parser refuses the stored text (B-7).
+    Stored,
+    /// The keyring answered, and it holds nothing: a first launch, or a `--clear-dsn`.
+    NotStored,
+    /// The keyring could not be read, and the seam's own sentence says why.
+    ///
+    /// Never a DSN: the text is [`htui_store::secret`]'s `cannot read the keyring entry
+    /// (<service>/<user>): <platform>`, produced on the path where nothing was read.
+    Unreadable(String),
+}
+
+impl DsnState {
+    /// Whether there is a stored DSN to replace or to clear.
+    #[must_use]
+    pub const fn is_stored(&self) -> bool {
+        matches!(self, Self::Stored)
+    }
 }
 
 /// `CacheMeta` as the Mirror row reads it.
@@ -91,10 +126,16 @@ pub enum AttemptOutcome {
 /// for both, so the same read is available to a build with no loop — with two fields honestly
 /// empty rather than guessed at (flag K, open item O-4).
 ///
+/// A keyring that **refuses to answer** is a [`DsnState::Unreadable`] row rather than an error:
+/// the other three rows — the label, the mirror, the last dial — are all still known, and
+/// replacing them with one sentence because the keyring could not be opened would lose more than
+/// it reports. It is not flattened into [`DsnState::NotStored`] anywhere: see [`DsnState`].
+///
 /// # Errors
 ///
-/// [`StoreError::Backend`] when the keyring refuses to answer or its blocking task fails to join,
-/// and whatever `CacheStore::meta` reports. A *missing* DSN is not an error.
+/// [`StoreError::Backend`] when the keyring's blocking task fails to *join* — a failure of this
+/// process, not of the keyring — and whatever `CacheStore::meta` reports. Neither a *missing* DSN
+/// nor an unreadable keyring is an error.
 pub async fn snapshot(
     backend: &Backend,
     attempt: Option<&Attempt>,
@@ -106,7 +147,7 @@ pub async fn snapshot(
     if matches!(backend, Backend::Memory(_)) {
         return Ok(ConnectionSnapshot {
             label,
-            dsn_stored: None,
+            dsn_state: DsnState::NotApplicable,
             dsn_summary: None,
             mirror: None,
             last_attempt,
@@ -114,15 +155,21 @@ pub async fn snapshot(
         });
     }
 
-    let stored = tokio::task::spawn_blocking(secret::get_dsn)
+    let read = tokio::task::spawn_blocking(secret::get_dsn)
         .await
-        .map_err(|err| StoreError::Backend(format!("keyring task failed: {err}")))??
-        .map(Zeroizing::new);
+        .map_err(|err| StoreError::Backend(format!("keyring task failed: {err}")))?;
     // The one place a raw stored text meets the newtype, and the only reader of it: `summary`
     // carries no password because `PgConnectOptions` has no getter for one.
-    let (dsn_stored, dsn_summary) = match stored {
-        None => (Some(false), None),
-        Some(text) => (Some(true), Dsn::parse(&text).ok().map(|dsn| dsn.summary())),
+    let (dsn_state, dsn_summary) = match read.map(|stored| stored.map(Zeroizing::new)) {
+        Ok(None) => (DsnState::NotStored, None),
+        Ok(Some(text)) => (
+            DsnState::Stored,
+            Dsn::parse(&text).ok().map(|dsn| dsn.summary()),
+        ),
+        // The seam's sentence without `StoreError`'s own prefix: this is rendered in a row, and
+        // `store backend error: ` is the shell's wording for a store failure, which the section
+        // already argues this is not (see `serve` below).
+        Err(err) => (DsnState::Unreadable(seam_sentence(&err)), None),
     };
 
     let mirror = match backend.cache() {
@@ -140,12 +187,25 @@ pub async fn snapshot(
 
     Ok(ConnectionSnapshot {
         label,
-        dsn_stored,
+        dsn_state,
         dsn_summary,
         mirror,
         last_attempt,
         offline: context.is_some_and(|context| context.offline),
     })
+}
+
+/// The seam's own sentence, without the `StoreError` wrapper the shell puts on a store failure.
+///
+/// [`StoreError::Backend`]'s `Display` is `store backend error: {0}`, which is the status line's
+/// vocabulary for a store that failed. A keyring the section is *reporting on* is a row, so the
+/// row shows what `htui_store::secret` wrote and nothing else. Every other variant is rendered
+/// whole, because only `Backend` has a prefix worth dropping.
+fn seam_sentence(err: &StoreError) -> String {
+    match err {
+        StoreError::Backend(message) => message.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// `try_serve`'s arm: the read without the loop's memory, and a refusal for each writer (D9).
