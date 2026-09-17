@@ -243,7 +243,7 @@ impl core::fmt::Debug for Editor {
 }
 
 /// What the section is doing. `Browse` is not a mode in the modal sense: it captures nothing.
-#[derive(Debug, Default)]
+#[derive(Default)]
 enum Mode {
     /// The rows, the cursor and the tab's own `h`/`l`.
     #[default]
@@ -273,6 +273,39 @@ enum Mode {
         /// The prefix that was typed.
         new: String,
     },
+}
+
+/// Everything the mode is *about*, never what was typed into it (H-7).
+///
+/// Hand-written for the same reason [`Editor`]'s is: [`KindsSection`] derives `Debug` through this
+/// enum, so a variant that prints one of its own fields' text needs only one `tracing::debug!` of a
+/// section to reach a log. `ConfirmPrefix`'s `new` **is** field 0's typed text — it is read off the
+/// editor at submit — so it is the one value this printer drops. `old` comes from the row and
+/// stays.
+impl core::fmt::Debug for Mode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Browse => f.write_str("Browse"),
+            Self::Editing(editor) => f.debug_tuple("Editing").field(editor).finish(),
+            Self::Deleting {
+                id,
+                name,
+                prefix,
+                stage,
+            } => f
+                .debug_struct("Deleting")
+                .field("id", id)
+                .field("name", name)
+                .field("prefix", prefix)
+                .field("stage", stage)
+                .finish(),
+            Self::ConfirmPrefix { editor, old, .. } => f
+                .debug_struct("ConfirmPrefix")
+                .field("editor", editor)
+                .field("old", old)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// The two stages of a kind delete (D11).
@@ -1838,4 +1871,45 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
         lines.push(line);
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H-7 reaches the *mode* as well as the editor: [`KindsSection`] derives `Debug` through
+    /// [`Mode`], so a variant that prints a field's own text puts it in a log the moment one
+    /// `tracing::debug!` names the section. The prefix is only the first such field — milestone 6's
+    /// masked column is the one that makes the rule load-bearing.
+    #[test]
+    fn a_confirm_prefix_never_prints_the_typed_prefix() {
+        let editor = Editor {
+            kind: EditorKind::EditKind(ItemKindId::default()),
+            fields: vec![Field::required("prefix", "ZZTOP")],
+            focus: 0,
+            expected: None,
+            stored_prefix: Some("ANA".to_owned()),
+            stored_budget: None,
+            follow_up: None,
+        };
+        let section = KindsSection {
+            mode: Mode::ConfirmPrefix {
+                editor,
+                old: "ANA".to_owned(),
+                new: "ZZTOP".to_owned(),
+            },
+            ..KindsSection::new()
+        };
+
+        let printed = format!("{section:?}");
+
+        assert!(
+            !printed.contains("ZZTOP"),
+            "what was typed stays out of the line: {printed}"
+        );
+        assert!(
+            printed.contains("ConfirmPrefix") && printed.contains("ANA"),
+            "the variant and the stored prefix are still legible: {printed}"
+        );
+    }
 }
