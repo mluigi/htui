@@ -24,7 +24,7 @@ pub mod writer;
 
 pub use backend::Backend;
 pub use cache::{CacheMeta, CacheStore};
-pub use connect::{ConnEvent, StartOptions, Started};
+pub use connect::{Applied, ConnEvent, ConnectContext, StartOptions, Started};
 pub use dsn::{Dsn, DsnError};
 pub use error::map_sqlx;
 pub use identity::Identity;

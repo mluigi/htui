@@ -275,7 +275,11 @@ static KEYRING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Holds the fake keyring installed and empty until dropped (MOD-15 M6 D18).
 #[derive(Debug)]
-pub struct KeyringGuard(tokio::sync::MutexGuard<'static, ()>);
+pub struct KeyringGuard {
+    /// [`KEYRING`], held for the length of the test. Underscored because nothing reads it — the
+    /// whole of its job is to be released when this guard drops.
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
 
 impl Drop for KeyringGuard {
     fn drop(&mut self) {
@@ -295,9 +299,9 @@ impl Drop for KeyringGuard {
 /// The returned guard also holds a process-wide lock, so two `#[tokio::test]`s that both install
 /// the slot run one after the other rather than overwriting each other's DSN.
 pub async fn mock_keyring() -> KeyringGuard {
-    let guard = KEYRING.lock().await;
+    let lock = KEYRING.lock().await;
     *crate::secret::fake() = Some(None);
-    KeyringGuard(guard)
+    KeyringGuard { _lock: lock }
 }
 
 /// What the fake keyring holds, for assertions.

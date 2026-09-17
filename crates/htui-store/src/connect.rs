@@ -17,12 +17,14 @@ use std::time::Duration;
 
 use chrono::Utc;
 use htui_core::model::ProjectId;
-use htui_core::store::Result;
+use htui_core::store::{Result, StoreError};
 use tokio::sync::{mpsc, watch};
+use zeroize::Zeroizing;
 
 use crate::backend::Backend;
 use crate::cache::CacheStore;
 use crate::cache::refresh::RefreshSettings;
+use crate::dsn::Dsn;
 use crate::error::map_sqlx;
 use crate::identity::{self, Identity};
 use crate::pg::{Connected, MigrationState, PgStore};
@@ -68,6 +70,46 @@ pub type ConnFuture = Pin<Box<dyn Future<Output = ConnEvent> + Send>>;
 /// A closure rather than the arguments themselves so the store worker never has to hold a DSN:
 /// `R-STO-1` keeps the secret in the keyring and in the connect path, not in the shell.
 pub type Reconnect = Arc<dyn Fn() -> ConnFuture + Send + Sync>;
+
+/// What [`apply_dsn`] needs from the session [`start`] set up (MOD-15 M6 D20).
+///
+/// Carried on [`Started`] rather than re-derived in the store worker: calling
+/// [`identity::config_root`] there would reach the developer's real configuration directory from
+/// every test, and the worker has neither the root nor the timeout today.
+#[derive(Debug, Clone)]
+pub struct ConnectContext {
+    /// The directory `cache/<fingerprint>/` is opened under.
+    pub config_root: PathBuf,
+    /// Passed to every dial.
+    pub connect_timeout: Duration,
+    /// `--offline`: the DSN is stored and the mirror re-opened, but nothing dials (D12).
+    pub offline: bool,
+}
+
+/// What a stored DSN produced, for the worker to install (D1, D11).
+///
+/// Nothing here is the DSN: the text stayed inside [`apply_dsn`], and what comes back out is a
+/// mirror, a closure that holds its own zeroizing copy, a directory name and a redacted summary.
+pub struct Applied {
+    /// The mirror for the new server, opened and migrated.
+    pub cache: CacheStore,
+    /// One dial per call, over the new DSN.
+    pub reconnect: Reconnect,
+    /// [`identity::db_fingerprint`] of the new DSN — the mirror's directory name.
+    pub fingerprint: String,
+    /// The redacted summary the section shows.
+    pub summary: String,
+}
+
+impl core::fmt::Debug for Applied {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Applied")
+            .field("cache", &self.cache)
+            .field("fingerprint", &self.fingerprint)
+            .field("summary", &self.summary)
+            .finish_non_exhaustive()
+    }
+}
 
 /// How the shell wants to start.
 #[derive(Debug, Clone)]
@@ -116,6 +158,9 @@ pub struct Started {
     pub settings: RefreshSettings,
     /// One reconnect attempt, or `None` with `--offline`, with `--demo` and when no DSN is stored.
     pub reconnect: Option<Reconnect>,
+    /// What [`apply_dsn`] needs (D20). `None` from [`Started::detached`] and therefore under
+    /// `--demo`, which is what makes `SetDsn` refuse there.
+    pub connect: Option<ConnectContext>,
 }
 
 impl core::fmt::Debug for Started {
@@ -124,6 +169,7 @@ impl core::fmt::Debug for Started {
             .field("backend", &self.backend)
             .field("settings", &self.settings)
             .field("reconnect", &self.reconnect.is_some())
+            .field("connect", &self.connect)
             .finish_non_exhaustive()
     }
 }
@@ -145,6 +191,7 @@ impl Started {
             projects,
             settings: RefreshSettings::default(),
             reconnect: None,
+            connect: None,
         }
     }
 }
@@ -176,14 +223,17 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
     // Minted here so the failure is reported to the caller rather than swallowed by the spawned
     // attempt, which re-reads the file per try to pick up an adopted id (plan D6).
     identity::load_or_mint(&root)?;
-    let dsn = match opts.dsn {
-        Some(dsn) => Some(dsn),
-        None => secret::get_dsn()?,
+    // Zeroizing from the keyring read onwards (D3): the buffer the DSN lands in is wiped when it
+    // goes, and `attempt` gets a fresh plain copy per dial that it consumes and drops.
+    let dsn: Option<Zeroizing<String>> = match opts.dsn {
+        Some(dsn) => Some(Zeroizing::new(dsn)),
+        None => secret::get_dsn()?.map(Zeroizing::new),
     };
 
-    let fingerprint = dsn
-        .as_deref()
-        .map_or_else(|| NO_DSN_FINGERPRINT.to_owned(), identity::db_fingerprint);
+    let fingerprint = dsn.as_deref().map_or_else(
+        || NO_DSN_FINGERPRINT.to_owned(),
+        |text| identity::db_fingerprint(text),
+    );
     let cache = CacheStore::open(&root, &fingerprint, PgStore::schema_version()).await?;
 
     let connecting = !opts.offline && dsn.is_some();
@@ -196,13 +246,7 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
     let (projects, _) = watch::channel(Vec::new());
     let timeout = opts.connect_timeout;
     let reconnect: Option<Reconnect> = if connecting {
-        let dsn = dsn.clone();
-        let root = root.clone();
-        Some(Arc::new(move || {
-            let dsn = dsn.clone();
-            let root = root.clone();
-            Box::pin(attempt(dsn, root, timeout)) as ConnFuture
-        }))
+        Some(reconnect_over(dsn.clone(), root.clone(), timeout))
     } else {
         None
     };
@@ -210,7 +254,7 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
     if connecting {
         let sender = events_tx.clone();
         tokio::spawn(async move {
-            let event = attempt(dsn, root, timeout).await;
+            let event = attempt(dsn.as_deref().cloned(), root, timeout).await;
             // The worker is gone if this fails, and there is nobody left to tell.
             let _ = sender.send(event).await;
         });
@@ -228,6 +272,11 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
         projects,
         settings: RefreshSettings::default(),
         reconnect,
+        connect: Some(ConnectContext {
+            config_root: opts.config_root,
+            connect_timeout: timeout,
+            offline: opts.offline,
+        }),
     })
 }
 
@@ -252,6 +301,78 @@ pub async fn attempt(dsn: Option<String>, root: PathBuf, connect_timeout: Durati
         },
         Err(err) => ConnEvent::Failed(err.to_string()),
     }
+}
+
+/// One dial per call over `dsn`, copied into a plain `String` for the length of the dial only.
+///
+/// The `Arc` holds the text in a zeroizing buffer, so the closure the store worker keeps for the
+/// life of the session does not park a bare `String` on the heap; [`attempt`]'s signature is
+/// deliberately unchanged (blueprint flag C), because `--set-dsn` may have stored a DSN that
+/// [`Dsn::parse`] would now refuse and M1's startup behaviour must not change.
+fn reconnect_over(
+    dsn: Option<Zeroizing<String>>,
+    root: PathBuf,
+    connect_timeout: Duration,
+) -> Reconnect {
+    Arc::new(move || {
+        let dsn = dsn.as_deref().cloned();
+        let root = root.clone();
+        Box::pin(attempt(dsn, root, connect_timeout)) as ConnFuture
+    })
+}
+
+/// [`reconnect_over`] for a validated DSN (D20): what the worker arms after a `SetDsn`.
+#[must_use]
+pub fn reconnect_for(dsn: &Dsn, root: PathBuf, connect_timeout: Duration) -> Reconnect {
+    reconnect_over(
+        Some(Zeroizing::new(dsn.as_str().to_owned())),
+        root,
+        connect_timeout,
+    )
+}
+
+/// Stores `dsn` in the keyring and opens the mirror it names (D11 steps 2–3, 7).
+///
+/// The keyring write runs on the blocking pool with a clone of the `Dsn` moved into it — platform
+/// FFI, and `R-NF-3` binds it even though it is not network I/O (ANA-10 §4.9 (6), (7)). The order
+/// is the point: the keyring **first**, because a mirror opened for a DSN that was never stored is
+/// a lie the next launch inherits.
+///
+/// Nothing here touches the running backend; the worker installs the result.
+///
+/// # Errors
+///
+/// The keyring's refusal, the blocking task's join failure, or [`CacheStore::open`]'s. On any of
+/// them nothing was installed and the caller's backend is untouched — but a keyring write that
+/// succeeded before `open` failed **stays written**, so the next launch uses the new DSN and a
+/// re-read of the connection reports it as stored. That is the honest state, not a rollback.
+pub async fn apply_dsn(dsn: Dsn, ctx: &ConnectContext) -> Result<Applied> {
+    let stored = dsn.clone();
+    tokio::task::spawn_blocking(move || secret::set_dsn(stored.as_str()))
+        .await
+        .map_err(|err| StoreError::Backend(format!("keyring task failed: {err}")))??;
+
+    let fingerprint = dsn.fingerprint();
+    let cache = CacheStore::open(&ctx.config_root, &fingerprint, PgStore::schema_version()).await?;
+    let reconnect = reconnect_for(&dsn, ctx.config_root.clone(), ctx.connect_timeout);
+    let summary = dsn.summary();
+    Ok(Applied {
+        cache,
+        reconnect,
+        fingerprint,
+        summary,
+    })
+}
+
+/// Removes the keyring entry (D13). A missing entry is `Ok(())`, as [`secret::clear_dsn`] is.
+///
+/// # Errors
+///
+/// The keyring's refusal or the blocking task's join failure.
+pub async fn forget_dsn() -> Result<()> {
+    tokio::task::spawn_blocking(secret::clear_dsn)
+        .await
+        .map_err(|err| StoreError::Backend(format!("keyring task failed: {err}")))?
 }
 
 /// Connects and persists an adopted box id (plan D6).
