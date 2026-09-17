@@ -1142,6 +1142,16 @@ impl KindsSection {
                     if editor.stored_prefix.is_some() {
                         editor.stored_prefix = stored;
                     }
+                    // `stored_budget` is **not** refreshed with it, which is where this departs
+                    // from blueprint §4.9's "`stored_prefix`/`stored_budget` refreshed from the
+                    // current row". The two are not symmetric: `stored_prefix` decides whether a
+                    // *question* is asked, so asking it against the row as it is now is right,
+                    // while `stored_budget` decides whether a *write* goes out at all (B-4). Taken
+                    // from the row the other writer just moved, an untouched `token_budget` field
+                    // would read as changed and this editor's `Enter` would write the old number
+                    // back over theirs. Left alone, it still means what it meant when the editor
+                    // opened — what this user found there — so only a user who typed in the column
+                    // writes it.
                 }
                 self.say(CHANGED_ELSEWHERE);
             }
@@ -1482,8 +1492,10 @@ impl SettingsSection for KindsSection {
             StoreReply::KindDeleted { mirror, catalogue } => self.on_deleted(mirror, catalogue),
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
+            // `busy` is deliberately left alone: a read never sets it, so the only thing clearing
+            // it here could do is orphan a write that is still in flight — and let a second
+            // `Enter` re-send it.
             StoreReply::Failed { request, message } if *request == "catalogue" => {
-                self.busy = None;
                 self.unavailable = Some(message.clone());
             }
             // Every other refusal of this section's own: the shell has already put
