@@ -6,19 +6,30 @@
 #![cfg(feature = "testkit")]
 
 use chrono::{Duration, Utc};
-use htui::catalogue::{self, CatalogueSnapshot, REQUEST_NAMES};
+use htui::app::Action;
+use htui::catalogue::{self, CatalogueSnapshot, GraphEntry, REQUEST_NAMES};
 use htui::hierarchy::MirrorAfterDelete;
 use htui::store_worker::{StoreReply, StoreRequest, serve};
+use htui::testkit::{Harness, SectionBench};
+use htui::ui::Theme;
+use htui::ui::tabs::settings::{
+    AgentsSection, HierarchySection, KindsSection, SettingsSection, SettingsTab,
+};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     ItemKind, ItemKindId, ItemKindPatch, NewProject, PhaseId, PhasePatch, ProjectId, Scope,
-    StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
 };
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
 use htui_core::store::{
     MemStore, ReadStore, StoreError, WriteStore, item_kind_is_held, reserved_phase_name,
 };
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
 /// The demo world behind a memory backend: a `Writer::Memory` and the seeded catalogue M2 gave
 /// every project (F-9), so no worker test here writes a row by hand.
@@ -737,4 +748,303 @@ async fn delete_kind_of_an_unreferenced_kind_reports_the_mirror() {
         5,
         "the kind's graph survives it; nothing here deletes a graph (D5)"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// ---- section (T2) ----
+//
+// The same catalogue from the other end: a `Harness` for the frames a user sees and a
+// `SectionBench` for the keys and replies a frame cannot show (a request that was emitted, a
+// scope that moved).
+// -------------------------------------------------------------------------------------------
+
+/// A settled Settings tab over `store`, all three sections registered and the strip already cycled
+/// onto `Kinds` — the product's own registration order (D17), so two `l` are what reach it.
+async fn kinds_over(store: MemStore) -> Harness {
+    let mut harness = Harness::over(store).with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(HierarchySection::new()),
+        Box::new(KindsSection::new()),
+    ])));
+    harness.settle().await;
+    harness.key("l");
+    harness.key("l");
+    harness.settle().await;
+    harness
+}
+
+/// The scope a [`SectionBench`] issues against: the demo fixture's first workspace, exactly as the
+/// bench builds it (the field itself is private).
+async fn bench_scope() -> Scope {
+    let workspaces = MemStore::demo()
+        .workspaces()
+        .await
+        .expect("the memory store never fails");
+    Scope::from_workspace(workspaces.first().expect("the fixture has a workspace"))
+}
+
+/// A bench, a section and the demo catalogue already delivered to it.
+async fn bench_with_demo() -> (SectionBench, KindsSection, CatalogueSnapshot) {
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let snapshot = demo_catalogue(&demo()).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Catalogue(Box::new(snapshot.clone())),
+    );
+    let _ = bench.drained();
+    (bench, section, snapshot)
+}
+
+/// One section drawn into a `width`x30 buffer.
+///
+/// [`SectionBench::render_section`] answers text, and the thing below is a *style*: a refusal that
+/// is not in `theme.error` reads as a row of the tree, and a snapshot records symbols only.
+fn drawn(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -> Buffer {
+    let area = Rect::new(0, 0, width, 30);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, 30),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// What the section drew in the theme's error colour, one entry per row that has any.
+fn error_text(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -> Vec<String> {
+    let error = Theme::default().error.fg.unwrap_or(Color::Reset);
+    let buffer = drawn(bench, section, width);
+    (0..buffer.area.height)
+        .filter_map(|y| {
+            let text: String = (0..width)
+                .filter(|x| buffer[(*x, y)].fg == error)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let text = text.trim().to_owned();
+            (!text.is_empty()).then_some(text)
+        })
+        .collect()
+}
+
+/// The demo catalogue as the section draws it (D4): the project, then each kind with the phases of
+/// its default graph under it, and no `Graph` row at all — the seed is one graph per kind, so every
+/// graph is spoken for.
+#[tokio::test]
+async fn the_demo_catalogue_renders_the_tree() {
+    let mut harness = kinds_over(MemStore::demo()).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" Agents  Hierarchy  Kinds "),
+        "the strip carries the third section: {frame}"
+    );
+    assert!(
+        !frame.contains("graph, no kind"),
+        "every seeded graph has a kind pointing at it: {frame}"
+    );
+    insta::assert_snapshot!("demo", frame);
+}
+
+/// Browse is not a mode: `captures_input` is false there, so the global table still owns `q`.
+#[tokio::test]
+async fn q_quits_from_browse() {
+    let mut harness = kinds_over(MemStore::demo()).await;
+    harness.key("q");
+    harness.settle().await;
+    assert!(
+        harness.app().should_quit,
+        "Browse binds no `q`, so the global binding takes it"
+    );
+}
+
+/// An empty store answers an empty catalogue: the pane says the scope holds no project rather than
+/// drawing a blank box.
+#[tokio::test]
+async fn no_workspace_says_so() {
+    let mut harness = kinds_over(MemStore::new()).await;
+    let frame = harness.render();
+    assert!(frame.contains("no project in scope"), "{frame}");
+    insta::assert_snapshot!("no_workspace", frame);
+}
+
+/// Offline the catalogue is one refused read — the read goes through `Backend::writer()` like every
+/// write (D7) — so the section says what is missing, in `theme.error`, instead of an empty tree.
+#[tokio::test]
+async fn offline_is_unavailable_with_the_worker_sentence() {
+    // The mirror outlives the harness: dropping the directory deletes it mid-test.
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(root.path(), "kinds-section", PgStore::schema_version())
+        .await
+        .expect("a fresh mirror");
+    let mut harness = Harness::over_backend(Backend::Offline {
+        cache,
+        since: Some(Utc::now()),
+    })
+    .with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(HierarchySection::new()),
+        Box::new(KindsSection::new()),
+    ])))
+    // `offline · 3s` would age between the render and the next tick.
+    .with_store_state("offline \u{b7} 0s", None);
+    harness.settle().await;
+    harness.key("l");
+    harness.key("l");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("catalogue unavailable"),
+        "a refused read says what is missing: {frame}"
+    );
+    assert!(frame.contains(DATABASE_UNREACHABLE), "{frame}");
+    insta::assert_snapshot!("offline", frame);
+}
+
+/// The selected phase prints MOD-4's columns under it, dimmed and unselectable, and says who owns
+/// them (D15, B-11): editing a column nothing reads would invent MOD-4's semantics a milestone
+/// early, hiding it would pretend the column is not there.
+#[tokio::test]
+async fn the_selected_phase_shows_the_read_only_line() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    // project → the ANA kind → its first phase.
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("MOD-4 owns these"),
+        "the detail line names its owner: {frame}"
+    );
+    assert!(
+        error_text(&bench, &section, 100).is_empty(),
+        "read-only is dim, not an error"
+    );
+    insta::assert_snapshot!("phase_detail", frame);
+}
+
+/// A kind whose `default_graph_id` names no graph of its project renders `graph missing` and
+/// contributes no phase rows; the graph nothing points at is then listed on its own (D4).
+#[tokio::test]
+async fn a_kind_whose_graph_is_missing_says_so() {
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let mut snapshot = demo_catalogue(&demo()).await;
+    snapshot.projects[0].kinds[0].default_graph_id = StepGraphId::new();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let _ = bench.drained();
+
+    let frame = bench.render_section(&section, 100);
+    let lines: Vec<&str> = frame.lines().collect();
+    assert_eq!(
+        lines[1].trim(),
+        "ANA  analysis · graph missing",
+        "the kind says what it cannot resolve: {frame}"
+    );
+    assert!(
+        lines[2].trim().starts_with("FEAT"),
+        "and contributes no phase rows: {frame}"
+    );
+    assert!(
+        error_text(&bench, &section, 100).contains(&"graph missing".to_owned()),
+        "the tail is in `theme.error`: {frame}"
+    );
+    assert!(
+        frame.contains("analysis · graph, no kind"),
+        "the graph nobody points at is listed on its own: {frame}"
+    );
+}
+
+/// A graph no kind names is listed after the kinds with its own phases under it — without it a
+/// graph created here would be invisible the moment no kind pointed at it (D4).
+#[tokio::test]
+async fn an_unreferenced_graph_is_listed_after_the_kinds() {
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let mut snapshot = demo_catalogue(&demo()).await;
+    let now = Utc::now();
+    snapshot.projects[0].graphs.push(GraphEntry {
+        graph: StepGraph {
+            id: StepGraphId::new(),
+            project_id: ids::PROJECT_VULKAN,
+            name: "orphan".to_owned(),
+            description: String::new(),
+            created_at: now,
+            updated_at: now,
+        },
+        phases: Vec::new(),
+    });
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let _ = bench.drained();
+
+    let frame = bench.render_section(&section, 100);
+    let last = frame
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .nth_back(1)
+        .expect("the tree has rows above the hint");
+    assert_eq!(
+        last.trim(),
+        "orphan · graph, no kind",
+        "the unreferenced graph is the last row: {frame}"
+    );
+}
+
+/// `r` re-reads the scope and `Esc` clears whatever the last reply said (T2 keys).
+#[tokio::test]
+async fn r_reloads_and_esc_clears_the_notice() {
+    let (bench, mut section, _) = bench_with_demo().await;
+
+    bench.key(&mut section, "r");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::Catalogue(scope))] = asked.as_slice() else {
+        panic!("`r` asks for the scope's catalogue, once: {asked:?}");
+    };
+    assert_eq!(*scope, bench_scope().await);
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "update_kind",
+            message: "nope".to_owned(),
+        },
+    );
+    assert!(bench.render_section(&section, 100).contains("nope"));
+
+    bench.key(&mut section, "esc");
+    assert!(!bench.render_section(&section, 100).contains("nope"));
+}
+
+/// A scope change drops what belongs to the other workspace and keeps the notice, which is often
+/// the *consequence* of the switch (B-12).
+#[tokio::test]
+async fn a_scope_change_drops_the_tree_and_keeps_the_notice() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "update_kind",
+            message: "nope".to_owned(),
+        },
+    );
+    let other = Scope {
+        workspace_id: WorkspaceId::new(),
+        project_ids: vec![ProjectId::new()],
+    };
+
+    section.on_scope_change(&other);
+
+    let wanted = section.wants_requests(&other);
+    let [StoreRequest::Catalogue(scope)] = wanted.as_slice() else {
+        panic!("the read the section wants is the new scope's, whole (D2): {wanted:?}");
+    };
+    assert_eq!(*scope, other);
+    let frame = bench.render_section(&section, 100);
+    assert!(!frame.contains("vulkan-tutorials"), "{frame}");
+    assert!(frame.contains("nope"), "the notice survives: {frame}");
 }
