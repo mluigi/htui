@@ -66,6 +66,12 @@ pub enum DsnError {
 /// The query keys sqlx-postgres 0.9.0 handles (`options/parse.rs:51-105`), plus the
 /// `options[<name>]` family checked separately. Anything else reaches the `warn!` arm with its
 /// value, which is what the scan exists to prevent.
+///
+/// One key is refused without being a `warn!`: an **unclosed** `options[search_path` matches
+/// sqlx's `k if k.starts_with("options[")` arm first, its `strip_suffix(']')` answers `None`, and
+/// the key and its value are dropped in silence (`options/parse.rs:101-105`). The refusal stands
+/// anyway — a parameter the user wrote and the driver ignored is a DSN that does not mean what it
+/// says — it is simply not the logging hazard the rest of this list is about.
 const KNOWN_PARAMETERS: [&str; 18] = [
     "sslmode",
     "ssl-mode",

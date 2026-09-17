@@ -139,7 +139,11 @@ fn an_unknown_parameter_is_refused_before_sqlx_sees_it() {
         assert!(Dsn::parse(&dsn).is_ok(), "{key} is a key sqlx handles");
     }
     assert!(Dsn::parse("postgres://h/d?options[search_path]=htui").is_ok());
-    // `options[` without its `]` falls through to sqlx's `warn!` arm, so it is not recognised.
+    // `options[` without its `]` does **not** reach sqlx's `warn!` arm: the
+    // `k if k.starts_with("options[")` arm matches first and its `strip_suffix(']')` answers
+    // `None`, so the key and its value are dropped in silence (`options/parse.rs:101-105`).
+    // Refused all the same - a parameter the driver ignores is a DSN that does not mean what it
+    // says - which is why this assertion is here and must not change.
     assert_eq!(
         refusal("postgres://h/d?options[search_path=htui"),
         DsnError::UnrecognisedParameter
