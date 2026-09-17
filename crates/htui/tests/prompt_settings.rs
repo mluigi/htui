@@ -2,9 +2,10 @@
 //!
 //! The worker half drives `htui::store_worker::serve` directly over a `Backend`, exactly as
 //! `tests/kinds.rs` does: one request in, one reply out, no channels and no shell. The section
-//! half is milestone 5's task 2 and lands below this one.
+//! half is milestone 5's task 2 and follows it below, through a `Harness` for the frames a user
+//! sees and a `SectionBench` for the keys and replies a frame cannot show.
 //!
-//! The last case is Postgres-gated and returns without asserting when
+//! The worker half's last case is Postgres-gated and returns without asserting when
 //! `HTUI_TEST_DATABASE_URL` is unset, as every other Postgres-backed suite in this crate does: it
 //! is the only store where the ten `app_setting` rows exist before anything writes one
 //! (`0002_agent_probe.sql:68-79`), and therefore the only one where a set carries a token rather
@@ -14,13 +15,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+use htui::app::{Action, Handled};
 use htui::prompt_settings::{self, REQUEST_NAMES, SettingsSnapshot, project_keys};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
+use htui::testkit::{Harness, SectionBench};
+use htui::ui::Theme;
+use htui::ui::tabs::settings::{
+    AgentsSection, HierarchySection, KindsSection, PromptSection, SettingsSection, SettingsTab,
+};
 use htui_core::fixtures::ids;
 use htui_core::model::{ProjectId, Scope, WorkspaceId};
-use htui_core::prompt::{DEFAULTS, SettingKey};
+use htui_core::prompt::{DEFAULTS, Rungs, SettingKey};
 use htui_core::store::{MemStore, SettingRung, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::{Value, json};
 
 /// The demo world behind a memory backend: `MemStore` starts with an empty `app_settings` map and
@@ -528,4 +540,1016 @@ async fn a_migrated_postgres_presents_ten_app_rows_with_tokens() {
     assert_eq!(snapshot.app_map(), expected);
 
     db.drop_db().await;
+}
+
+// -------------------------------------------------------------------------------------------
+// ---- section (T2) ----
+//
+// The same settings from the other end: a `Harness` for the frames a user sees and a
+// `SectionBench` for the keys and replies a frame cannot show (a request that was emitted, a
+// scope that moved).
+//
+// A section holds no store (`R-NF-3`), so a test that needs a stored value seeds it through
+// `store_worker::serve` and hands the section the snapshot that came back — exactly the path the
+// shell takes.
+// -------------------------------------------------------------------------------------------
+
+/// A settled Settings tab over `store`, all four sections registered and the strip already cycled
+/// onto `Prompt` — the product's own registration order (D15), so three `l` are what reach it.
+async fn prompt_over(store: MemStore) -> Harness {
+    let mut harness = Harness::over(store).with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(HierarchySection::new()),
+        Box::new(KindsSection::new()),
+        Box::new(PromptSection::new()),
+    ])));
+    harness.settle().await;
+    harness.key("l");
+    harness.key("l");
+    harness.key("l");
+    harness.settle().await;
+    harness
+}
+
+/// The scope a [`SectionBench`] issues against: the demo fixture's first workspace, exactly as the
+/// bench builds it (the field itself is private).
+async fn bench_scope() -> Scope {
+    let workspaces = MemStore::demo()
+        .workspaces()
+        .await
+        .expect("the memory store never fails");
+    Scope::from_workspace(workspaces.first().expect("the fixture has a workspace"))
+}
+
+/// A bench and a section with `snapshot` already delivered as a read's reply.
+async fn bench_from(snapshot: &SettingsSnapshot) -> (SectionBench, PromptSection) {
+    let bench = SectionBench::new().await;
+    let mut section = PromptSection::new();
+    feed(&bench, &mut section, snapshot);
+    (bench, section)
+}
+
+/// A bench, a section and the demo settings already delivered to it.
+async fn bench_with(backend: &Backend) -> (SectionBench, PromptSection, SettingsSnapshot) {
+    let snapshot = demo_settings(backend).await;
+    let (bench, section) = bench_from(&snapshot).await;
+    (bench, section, snapshot)
+}
+
+/// Hands the section one read's reply and drops whatever it emitted.
+fn feed(bench: &SectionBench, section: &mut PromptSection, snapshot: &SettingsSnapshot) {
+    bench.reply(
+        section,
+        &StoreReply::PromptSettings(Box::new(snapshot.clone())),
+    );
+    let _ = bench.drained();
+}
+
+/// One write through the worker, and the settings it left behind.
+async fn applied(backend: &Backend, request: StoreRequest) -> SettingsSnapshot {
+    settings(serve(backend, &request).await)
+}
+
+/// A set on the `App` rung of the demo scope.
+fn set_app(key: SettingKey, value: Value, expected: Option<DateTime<Utc>>) -> StoreRequest {
+    StoreRequest::SetSetting {
+        scope: vulkan_scope(),
+        rung: SettingRung::App,
+        key,
+        value,
+        expected,
+    }
+}
+
+/// A set on the demo project's rung.
+fn set_project(key: SettingKey, value: Value, expected: DateTime<Utc>) -> StoreRequest {
+    StoreRequest::SetSetting {
+        scope: vulkan_scope(),
+        rung: SettingRung::Project(ids::PROJECT_VULKAN),
+        key,
+        value,
+        expected: Some(expected),
+    }
+}
+
+/// A clear on the demo project's rung.
+fn clear_project(key: SettingKey, expected: DateTime<Utc>) -> StoreRequest {
+    StoreRequest::ClearSetting {
+        scope: vulkan_scope(),
+        rung: SettingRung::Project(ids::PROJECT_VULKAN),
+        key,
+        expected,
+    }
+}
+
+/// The demo project's compare-and-set token as the snapshot carries it.
+fn project_token(snapshot: &SettingsSnapshot) -> DateTime<Utc> {
+    snapshot.projects[0].project.updated_at
+}
+
+/// Which row of the tree one `App` key is: the `app` header is row 0 and the ten keys follow in
+/// `SettingKey::ALL` order (D9).
+fn app_row(key: SettingKey) -> usize {
+    1 + SettingKey::ALL
+        .iter()
+        .position(|candidate| *candidate == key)
+        .expect("one of the ten")
+}
+
+/// Which row of the tree one `Project`-rung key of the scope's single project is: the ten `App`
+/// rows and their header, then the `project` header.
+fn project_row(key: SettingKey) -> usize {
+    SettingKey::ALL.len()
+        + 2
+        + project_keys()
+            .position(|candidate| candidate == key)
+            .expect("a key the project rung accepts")
+}
+
+/// Puts the cursor on `row`, from the top.
+fn move_to(bench: &SectionBench, section: &mut PromptSection, row: usize) {
+    for _ in 0..row {
+        bench.key(section, "j");
+    }
+}
+
+/// Types one key per char into a section, as a user would.
+fn type_at(bench: &SectionBench, section: &mut dyn SettingsSection, text: &str) {
+    for c in text.chars() {
+        bench.key(section, &c.to_string());
+    }
+}
+
+/// Empties the focused field, whatever it was prefilled with.
+fn clear_field(bench: &SectionBench, section: &mut PromptSection) {
+    for _ in 0..40 {
+        bench.key(section, "backspace");
+    }
+}
+
+/// One section drawn into a `width`x30 buffer.
+///
+/// [`SectionBench::render_section`] answers text, and the thing below is a *style*: a clamp line
+/// that is not in `theme.error` reads as a row of the tree, and a snapshot records symbols only.
+fn drawn(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -> Buffer {
+    let area = Rect::new(0, 0, width, 30);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(width, 30),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .expect("a test terminal");
+    let ctx = bench.ctx();
+    terminal
+        .draw(|frame| section.render(frame, frame.area(), &ctx))
+        .expect("the section draws");
+    terminal.backend().buffer().clone()
+}
+
+/// What the section drew in the theme's error colour, one entry per row that has any.
+fn error_text(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -> Vec<String> {
+    let error = Theme::default().error.fg.unwrap_or(Color::Reset);
+    let buffer = drawn(bench, section, width);
+    (0..buffer.area.height)
+        .filter_map(|y| {
+            let text: String = (0..width)
+                .filter(|x| buffer[(*x, y)].fg == error)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let text = text.trim().to_owned();
+            (!text.is_empty()).then_some(text)
+        })
+        .collect()
+}
+
+/// The value rows of the frame: every line that starts with two spaces and then a registry key.
+fn value_rows(frame: &str) -> Vec<&str> {
+    frame
+        .lines()
+        .filter(|line| {
+            line.starts_with("  ")
+                && SettingKey::from_key(line.split_whitespace().next().unwrap_or("")).is_some()
+        })
+        .collect()
+}
+
+/// The row of one key, or a panic naming the frame that has none.
+#[track_caller]
+fn row_of<'a>(frame: &'a str, key: SettingKey, nth: usize) -> &'a str {
+    let rows: Vec<&str> = value_rows(frame)
+        .into_iter()
+        .filter(|line| line.split_whitespace().next() == Some(key.key()))
+        .collect();
+    rows.get(nth)
+        .unwrap_or_else(|| panic!("no row {nth} for `{key}`: {frame}"))
+}
+
+/// The demo world as the section draws it (D9): the `app` group with the ten registry keys, then
+/// one group per project of the scope with the keys the `Project` rung accepts.
+///
+/// The demo project's blob already holds `token_budget` (`fixtures.rs:644-648`), so that row reads
+/// `(project)` from the first frame and `prompt_upstream_hops` is the one genuinely unset
+/// `Project`-rung row.
+#[tokio::test]
+async fn the_demo_snapshot_renders_the_tree() {
+    let mut harness = prompt_over(MemStore::demo()).await;
+    let frame = harness.render();
+
+    assert!(
+        frame.contains(" Agents  Hierarchy  Kinds  Prompt "),
+        "the strip carries the fourth section: {frame}"
+    );
+    assert!(
+        frame.lines().any(|line| line.trim() == "app"),
+        "the `App` group is headed: {frame}"
+    );
+    assert!(
+        frame.contains("project Vulkan Tutorials"),
+        "and the scope's one project: {frame}"
+    );
+
+    for key in SettingKey::ALL {
+        let row = row_of(&frame, key, 0);
+        assert!(
+            row.contains("unset |"),
+            "`{key}` holds nothing on a fresh MemStore: {row}"
+        );
+        assert!(
+            row.contains("(app_setting_default)"),
+            "so the compiled table answers for it: {row}"
+        );
+        let expected = DEFAULTS.value_of(key).to_string();
+        assert!(
+            row.contains(&format!("| {expected}")),
+            "`{key}` shows the number the reader would use ({expected}): {row}"
+        );
+    }
+
+    assert!(
+        row_of(&frame, SettingKey::UpstreamHops, 1).contains("unset | 2 (app_setting_default)"),
+        "the project's hops are genuinely unset: {frame}"
+    );
+    assert!(
+        row_of(&frame, SettingKey::TokenBudget, 1).contains("120000 | 120000 (project)"),
+        "the project's blob already holds the budget: {frame}"
+    );
+
+    insta::assert_snapshot!("demo", frame);
+}
+
+/// A scope with no project is the `app` group alone: there is no rung below it to list, and the
+/// ten `App` rows are never empty.
+#[tokio::test]
+async fn no_workspace_lists_the_app_group_alone() {
+    let mut harness = prompt_over(MemStore::new()).await;
+    let frame = harness.render();
+
+    assert!(frame.lines().any(|line| line.trim() == "app"), "{frame}");
+    assert!(
+        !frame.contains("project "),
+        "no project rung is listed: {frame}"
+    );
+    assert_eq!(value_rows(&frame).len(), SettingKey::ALL.len(), "{frame}");
+
+    insta::assert_snapshot!("app_only", frame);
+}
+
+/// Offline the read is refused like every write (the worker's `writer()` is `None`), so the
+/// section says what is missing, in `theme.error`, instead of a tree nothing confirmed.
+#[tokio::test]
+async fn offline_is_unavailable_with_the_worker_sentence() {
+    // The mirror outlives the harness: dropping the directory deletes it mid-test.
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(root.path(), "prompt-section", PgStore::schema_version())
+        .await
+        .expect("a fresh mirror");
+    let mut harness = Harness::over_backend(Backend::Offline {
+        cache,
+        since: Some(Utc::now()),
+    })
+    .with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(HierarchySection::new()),
+        Box::new(KindsSection::new()),
+        Box::new(PromptSection::new()),
+    ])))
+    // `offline · 3s` would age between the render and the next tick.
+    .with_store_state("offline \u{b7} 0s", None);
+    harness.settle().await;
+    harness.key("l");
+    harness.key("l");
+    harness.key("l");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("settings unavailable"),
+        "a refused read says what is missing: {frame}"
+    );
+    assert!(frame.contains(DATABASE_UNREACHABLE), "{frame}");
+
+    insta::assert_snapshot!("offline", frame);
+}
+
+/// D9: a key is listed on a rung only when its spec admits it. The `App` group is the ten of
+/// `SettingKey::ALL`; a project group is `project_keys()` and nothing else.
+#[tokio::test]
+async fn no_key_is_listed_on_a_rung_its_spec_refuses() {
+    let (bench, section, _) = bench_with(&demo()).await;
+    let frame = bench.render_section(&section, 100);
+    let rows = value_rows(&frame);
+
+    assert_eq!(
+        rows.len(),
+        SettingKey::ALL.len() + project_keys().count(),
+        "ten app rows and one group of project rows: {frame}"
+    );
+
+    let project_rows = &rows[SettingKey::ALL.len()..];
+    assert_eq!(project_rows.len(), project_keys().count());
+    for row in project_rows {
+        let key = SettingKey::from_key(row.split_whitespace().next().unwrap_or(""))
+            .expect("every row names a registry key");
+        assert!(
+            key.spec().rungs.contains(Rungs::PROJECT),
+            "`{key}` is offered on a rung its spec refuses: {row}"
+        );
+    }
+}
+
+/// Acceptance line 4: every row, label, unit, range and doc line is read from `SPECS`, so no key
+/// name is spelled in the section at all.
+#[test]
+fn no_key_name_is_spelled_in_the_section() {
+    let source = include_str!("../src/ui/tabs/settings/prompt.rs");
+
+    for key in SettingKey::ALL {
+        let literal = format!("\"{}\"", key.key());
+        assert!(
+            !source.contains(&literal),
+            "`{key}` is spelled in the section; rows come from the registry"
+        );
+    }
+}
+
+/// `e` then a number then `Enter` is one `SetSetting` carrying the entry's own token — `None` on
+/// an `App` rung that holds no row (D4, F-2).
+#[tokio::test]
+async fn e_then_a_number_then_enter_sends_set_setting_with_the_entrys_token() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "4000");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetSetting {
+            scope,
+            rung,
+            key,
+            value,
+            expected,
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` writes once: {asked:?}");
+    };
+    assert_eq!(*scope, bench_scope().await, "every write carries the scope");
+    assert_eq!(*rung, SettingRung::App);
+    assert_eq!(*key, SettingKey::TokenBudget);
+    assert_eq!(*value, json!(4_000));
+    assert_eq!(*expected, None, "no row: `expected: None` is the token");
+}
+
+/// On a project row the compare-and-set token is the project row's own `updated_at`, held once
+/// per project rather than per key (D4).
+#[tokio::test]
+async fn e_on_a_project_row_carries_the_projects_updated_at() {
+    let (bench, mut section, snapshot) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, project_row(SettingKey::UpstreamHops));
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "1");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetSetting {
+            rung,
+            key,
+            expected,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` writes once: {asked:?}");
+    };
+    assert_eq!(*rung, SettingRung::Project(ids::PROJECT_VULKAN));
+    assert_eq!(*key, SettingKey::UpstreamHops);
+    assert_eq!(*expected, Some(project_token(&snapshot)));
+}
+
+/// D10: an empty field **clears** rather than writing a guessed constant, so the rung below — and
+/// in the end the compiled table — answers.
+#[tokio::test]
+async fn an_empty_field_clears_when_the_rung_holds_a_value() {
+    let backend = demo();
+    let seeded = applied(
+        &backend,
+        set_app(SettingKey::MaxSkillTokens, json!(4_000), None),
+    )
+    .await;
+    let token = app_token(&seeded, SettingKey::MaxSkillTokens);
+    let (bench, mut section) = bench_from(&seeded).await;
+    move_to(&bench, &mut section, app_row(SettingKey::MaxSkillTokens));
+
+    bench.key(&mut section, "e");
+    clear_field(&bench, &mut section);
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::ClearSetting {
+            rung,
+            key,
+            expected,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("an empty field clears, once: {asked:?}");
+    };
+    assert_eq!(*rung, SettingRung::App);
+    assert_eq!(*key, SettingKey::MaxSkillTokens);
+    assert_eq!(*expected, token);
+}
+
+/// The other half of D10: clearing a rung that holds nothing is not a write at all, and saying so
+/// beats a refusal from a store that was never asked.
+#[tokio::test]
+async fn an_empty_field_on_an_unset_rung_sends_nothing_and_says_so() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty(), "nothing was asked of the store");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("nothing is set on this rung"), "{frame}");
+    assert!(
+        !error_text(&bench, &section, 100)
+            .iter()
+            .any(|line| line.contains("nothing is set")),
+        "it is a report, not something to act on"
+    );
+}
+
+/// D11: the section parses shape and nothing else, and its two sentences name the key the registry
+/// spells.
+#[tokio::test]
+async fn a_shape_refusal_names_the_key() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "abc");
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty(), "a shape refusal asks nothing");
+    assert!(
+        error_text(&bench, &section, 100)
+            .iter()
+            .any(|line| line.contains("`token_budget` is a whole number, or empty to clear")),
+        "{:?}",
+        error_text(&bench, &section, 100)
+    );
+
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(
+        &bench,
+        &mut section,
+        app_row(SettingKey::PromptReserveFraction),
+    );
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "abc");
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty());
+    assert!(
+        error_text(&bench, &section, 100).iter().any(|line| line
+            .contains("`prompt_reserve_fraction` is a decimal fraction, or empty to clear")),
+        "{:?}",
+        error_text(&bench, &section, 100)
+    );
+}
+
+/// D14/PRD D8: a compare-and-set miss keeps the typed text, takes the reloaded token, and retries
+/// only on a second `Enter`.
+#[tokio::test]
+async fn a_stale_reply_keeps_the_text_and_retakes_the_token() {
+    let backend = demo();
+    let seeded = applied(
+        &backend,
+        set_app(SettingKey::TokenBudget, json!(5_000), None),
+    )
+    .await;
+    let first = app_token(&seeded, SettingKey::TokenBudget);
+    let (bench, mut section) = bench_from(&seeded).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+
+    bench.key(&mut section, "e");
+    clear_field(&bench, &mut section);
+    type_at(&bench, &mut section, "7000");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    // Somebody else writes the row while the first `Enter` is out.
+    let moved = applied(
+        &backend,
+        set_app(SettingKey::TokenBudget, json!(6_000), Some(first)),
+    )
+    .await;
+    let second = app_token(&moved, SettingKey::TokenBudget);
+    bench.reply(
+        &mut section,
+        &StoreReply::PromptSettingsStale(Box::new(moved)),
+    );
+    let _ = bench.drained();
+
+    assert!(section.captures_input(), "the editor is still open");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("7000"), "the typed text survives: {frame}");
+    assert!(
+        frame.contains("changed elsewhere since you opened it"),
+        "{frame}"
+    );
+    insta::assert_snapshot!("stale", frame);
+
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetSetting {
+            value, expected, ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("the retry is one write: {asked:?}");
+    };
+    assert_eq!(*value, json!(7_000), "the text is what is retried");
+    assert_eq!(*expected, Some(second), "against the reloaded token");
+}
+
+/// B-5: an `App` row that is gone from the reload leaves the editor with no token at all, so the
+/// next set passes `expected: None` rather than a dead one.
+#[tokio::test]
+async fn a_stale_reply_over_a_cleared_app_row_passes_no_token() {
+    let backend = demo();
+    let seeded = applied(
+        &backend,
+        set_app(SettingKey::TokenBudget, json!(5_000), None),
+    )
+    .await;
+    let token = app_token(&seeded, SettingKey::TokenBudget);
+    let (bench, mut section) = bench_from(&seeded).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+
+    bench.key(&mut section, "e");
+    clear_field(&bench, &mut section);
+    type_at(&bench, &mut section, "7000");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let cleared = applied(
+        &backend,
+        StoreRequest::ClearSetting {
+            scope: vulkan_scope(),
+            rung: SettingRung::App,
+            key: SettingKey::TokenBudget,
+            expected: token,
+        },
+    )
+    .await;
+    bench.reply(
+        &mut section,
+        &StoreReply::PromptSettingsStale(Box::new(cleared)),
+    );
+    let _ = bench.drained();
+
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::SetSetting { expected, .. })] = asked.as_slice() else {
+        panic!("the retry is one write: {asked:?}");
+    };
+    assert_eq!(*expected, None, "no row means `expected: None` (D4, F-2)");
+}
+
+/// A project that is gone from the reload has nothing left to retry against: the editor closes and
+/// says so.
+#[tokio::test]
+async fn a_stale_reply_for_a_vanished_project_closes_the_editor() {
+    let (bench, mut section, snapshot) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, project_row(SettingKey::UpstreamHops));
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "1");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let mut gone = snapshot.clone();
+    gone.projects.clear();
+    bench.reply(
+        &mut section,
+        &StoreReply::PromptSettingsStale(Box::new(gone)),
+    );
+
+    assert!(!section.captures_input(), "the editor went with the row");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("deleted elsewhere \u{2014} the editor was closed"),
+        "{frame}"
+    );
+}
+
+/// M4's H-9 residue, inherited with the sentence: a miss with no editor open cannot say "Enter
+/// retries", so it says what did not happen instead.
+#[tokio::test]
+async fn a_stale_reply_with_no_editor_open_says_nothing_was_written() {
+    let (bench, mut section, snapshot) = bench_with(&demo()).await;
+
+    bench.reply(
+        &mut section,
+        &StoreReply::PromptSettingsStale(Box::new(snapshot)),
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("changed elsewhere; nothing was written"),
+        "{frame}"
+    );
+}
+
+/// D11: every bound is the store's, and its sentence reaches the editor verbatim.
+#[tokio::test]
+async fn a_failed_write_shows_the_seams_sentence_verbatim() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "0");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let message = "`token_budget` = 0 is outside 1..=9223372036854775807 tokens";
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "set_setting",
+            message: message.to_owned(),
+        },
+    );
+
+    assert!(
+        section.captures_input(),
+        "the editor stays open over its text"
+    );
+    let errors = error_text(&bench, &section, 100);
+    assert!(
+        errors.iter().any(|line| line.contains("is outside 1..=")),
+        "the seam's own sentence: {errors:?}"
+    );
+
+    // `busy` was cleared with the refusal, so a corrected value goes out on the next `Enter`.
+    clear_field(&bench, &mut section);
+    type_at(&bench, &mut section, "1");
+    bench.key(&mut section, "enter");
+    assert_eq!(bench.drained().len(), 1, "the retry is not blocked");
+}
+
+/// One write of a kind in flight at a time (D14): the staleness index keeps only the newest
+/// request of a variant, so two racing writes would lose the reply about the one that landed.
+#[tokio::test]
+async fn a_second_write_while_one_is_in_flight_is_refused() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "4000");
+
+    bench.key(&mut section, "enter");
+    bench.key(&mut section, "enter");
+
+    assert_eq!(bench.drained().len(), 1, "the second `Enter` asks nothing");
+    let errors = error_text(&bench, &section, 100);
+    assert!(
+        errors
+            .iter()
+            .any(|line| line.contains("`set_setting` is still in flight")),
+        "{errors:?}"
+    );
+}
+
+/// D5's `--demo` smoke, pinned: a project row's source flips to `project` when the rung is written
+/// and back when it is cleared.
+///
+/// The flip is shown on `prompt_upstream_hops`, which the demo blob genuinely lacks; the mirror
+/// image is shown on `token_budget`, which it already holds (`fixtures.rs:644-648`).
+#[tokio::test]
+async fn a_project_row_flips_to_project_and_back() {
+    let backend = demo();
+    let (bench, mut section, base) = bench_with(&backend).await;
+    assert!(
+        row_of(
+            &bench.render_section(&section, 100),
+            SettingKey::UpstreamHops,
+            1
+        )
+        .contains("unset | 2 (app_setting_default)")
+    );
+
+    let seeded = applied(
+        &backend,
+        set_project(SettingKey::UpstreamHops, json!(1), project_token(&base)),
+    )
+    .await;
+    feed(&bench, &mut section, &seeded);
+    assert!(
+        row_of(
+            &bench.render_section(&section, 100),
+            SettingKey::UpstreamHops,
+            1
+        )
+        .contains("1 | 1 (project)"),
+        "{}",
+        bench.render_section(&section, 100)
+    );
+
+    let cleared = applied(
+        &backend,
+        clear_project(SettingKey::UpstreamHops, project_token(&seeded)),
+    )
+    .await;
+    feed(&bench, &mut section, &cleared);
+    assert!(
+        row_of(
+            &bench.render_section(&section, 100),
+            SettingKey::UpstreamHops,
+            1
+        )
+        .contains("unset | 2 (app_setting_default)"),
+        "cleared, the rung below answers again"
+    );
+
+    // The mirror image, on the key the demo project already holds.
+    let dropped = applied(
+        &backend,
+        clear_project(SettingKey::TokenBudget, project_token(&cleared)),
+    )
+    .await;
+    feed(&bench, &mut section, &dropped);
+    assert!(
+        row_of(
+            &bench.render_section(&section, 100),
+            SettingKey::TokenBudget,
+            1
+        )
+        .contains("unset | 120000 (app_setting_default)"),
+        "{}",
+        bench.render_section(&section, 100)
+    );
+
+    let back = applied(
+        &backend,
+        set_project(
+            SettingKey::TokenBudget,
+            json!(90_000),
+            project_token(&dropped),
+        ),
+    )
+    .await;
+    feed(&bench, &mut section, &back);
+    assert!(
+        row_of(
+            &bench.render_section(&section, 100),
+            SettingKey::TokenBudget,
+            1
+        )
+        .contains("90000 | 90000 (project)"),
+        "{}",
+        bench.render_section(&section, 100)
+    );
+}
+
+/// D13: the `not_above` rule is one-directional, so a cap lowered under a stored head leaves the
+/// row describing something the reader will not use. The pane says what it will use instead.
+#[tokio::test]
+async fn a_head_above_the_cap_renders_the_clamp_line() {
+    let backend = demo();
+    let _ = applied(
+        &backend,
+        set_app(SettingKey::ExcerptHeadLines, json!(50), None),
+    )
+    .await;
+    let seeded = applied(
+        &backend,
+        set_app(SettingKey::ExcerptFileLineCap, json!(10), None),
+    )
+    .await;
+    let (bench, mut section) = bench_from(&seeded).await;
+    move_to(&bench, &mut section, app_row(SettingKey::ExcerptHeadLines));
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        row_of(&frame, SettingKey::ExcerptHeadLines, 0).contains("50 | 10 (app_setting)"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("clamped to excerpt_file_line_cap = 10"),
+        "{frame}"
+    );
+    let errors = error_text(&bench, &section, 100);
+    assert!(
+        errors
+            .iter()
+            .any(|line| line.contains("clamped to excerpt_file_line_cap = 10")),
+        "the consequence is something to act on: {errors:?}"
+    );
+
+    insta::assert_snapshot!("clamped", frame);
+}
+
+/// D12: a fraction renders as what it is and what it means, and the editor round-trips the stored
+/// text rather than the basis points its range is written in.
+#[tokio::test]
+async fn the_fraction_row_renders_both_units_and_round_trips() {
+    let backend = demo();
+    let seeded = applied(
+        &backend,
+        set_app(SettingKey::PromptReserveFraction, json!(0.1), None),
+    )
+    .await;
+    let token = app_token(&seeded, SettingKey::PromptReserveFraction);
+    let (bench, mut section) = bench_from(&seeded).await;
+    move_to(
+        &bench,
+        &mut section,
+        app_row(SettingKey::PromptReserveFraction),
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        row_of(&frame, SettingKey::PromptReserveFraction, 0)
+            .contains("0.1 | 0.1 (1000 bp) (app_setting)"),
+        "{frame}"
+    );
+
+    bench.key(&mut section, "e");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("prompt_reserve_fraction: 0.1"),
+        "the field opens on the stored text: {frame}"
+    );
+    insta::assert_snapshot!("editor_fraction", frame);
+
+    bench.key(&mut section, "enter");
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetSetting {
+            value, expected, ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` writes once: {asked:?}");
+    };
+    assert_eq!(*value, json!(0.1), "the float, never the basis points");
+    assert_eq!(*expected, Some(token));
+}
+
+/// The pane under the cursor is the registry's own row: the doc line, the range in its unit, and
+/// the rungs the key accepts.
+#[tokio::test]
+async fn the_pane_prints_doc_range_and_rungs() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+
+    let frame = bench.render_section(&section, 100);
+    let spec = SettingKey::TokenBudget.spec();
+    assert!(
+        frame.contains(spec.doc.split(';').next().unwrap_or(spec.doc)),
+        "the registry's doc line: {frame}"
+    );
+    assert!(
+        frame.contains("range 1..=9223372036854775807 tokens"),
+        "{frame}"
+    );
+    assert!(frame.contains("rungs app|project|phase"), "{frame}");
+}
+
+/// While an editor is open every printable key is text, `l` included, so the tab's own section
+/// cycle is off for as long as something is being typed (M3 D2).
+#[tokio::test]
+async fn l_is_a_letter_while_editing() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    assert!(!section.captures_input(), "Browse captures nothing");
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    assert!(section.captures_input(), "an open editor takes every key");
+
+    assert_eq!(bench.key(&mut section, "l"), Handled::Consumed);
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("token_budget: l"),
+        "`l` went into the field, not to the strip: {frame}"
+    );
+    assert!(bench.drained().is_empty(), "typing asks the store nothing");
+}
+
+/// B-1: a group header is a row, so the cursor index is the line index — and `e` on one says what
+/// it edits instead of opening an editor over nothing.
+#[tokio::test]
+async fn e_on_a_header_edits_nothing() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+
+    bench.key(&mut section, "e");
+
+    assert!(!section.captures_input(), "no editor opened");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("`e` edits a value row"), "{frame}");
+}
+
+/// `r` re-reads the scope and `Esc` clears whatever the last reply said (T2 keys).
+#[tokio::test]
+async fn r_reloads_and_esc_clears_the_notice() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+
+    bench.key(&mut section, "r");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::PromptSettings(scope))] = asked.as_slice() else {
+        panic!("`r` asks for the scope's settings, once: {asked:?}");
+    };
+    assert_eq!(*scope, bench_scope().await);
+
+    assert_eq!(
+        bench.key(&mut section, "esc"),
+        Handled::Pass,
+        "with nothing to clear, `Esc` belongs to the shell"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "set_setting",
+            message: "nope".to_owned(),
+        },
+    );
+    assert!(bench.render_section(&section, 100).contains("nope"));
+
+    assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
+    assert!(!bench.render_section(&section, 100).contains("nope"));
+}
+
+/// A scope change drops what belongs to the other workspace — the editor included, because its
+/// compare-and-set token is the other workspace's — and keeps the notice.
+#[tokio::test]
+async fn a_scope_change_drops_the_editor_and_keeps_the_notice() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    bench.key(&mut section, "e");
+    assert!(section.captures_input());
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "set_setting",
+            message: "nope".to_owned(),
+        },
+    );
+    let other = Scope {
+        workspace_id: WorkspaceId::new(),
+        project_ids: vec![ProjectId::new()],
+    };
+
+    section.on_scope_change(&other);
+
+    assert!(!section.captures_input(), "the editor did not survive it");
+    let wanted = section.wants_requests(&other);
+    let [StoreRequest::PromptSettings(scope)] = wanted.as_slice() else {
+        panic!("the read the section wants is the new scope's, whole: {wanted:?}");
+    };
+    assert_eq!(*scope, other);
+    let frame = bench.render_section(&section, 100);
+    assert!(!frame.contains("Vulkan Tutorials"), "{frame}");
+    assert!(frame.contains("nope"), "the notice survives: {frame}");
+}
+
+/// Browse is not a mode: `captures_input` is false there, so the global table still owns `q`.
+#[tokio::test]
+async fn q_quits_from_browse() {
+    let mut harness = prompt_over(MemStore::demo()).await;
+    harness.key("q");
+    harness.settle().await;
+    assert!(
+        harness.app().should_quit,
+        "Browse binds no `q`, so the global binding takes it"
+    );
 }
