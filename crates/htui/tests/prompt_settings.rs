@@ -709,11 +709,17 @@ fn drawn(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -> Buf
 
 /// What the section drew in the theme's error colour, one entry per row that has any.
 fn error_text(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -> Vec<String> {
+    error_lines(&drawn(bench, section, width))
+}
+
+/// The cells of a drawn buffer that carry the theme's error foreground, one entry per row that has
+/// any — whoever drew it. Shared by the bench-level [`error_text`] and the shell-level
+/// [`shell_error_text`], so the two cannot disagree on what "in the error colour" means.
+fn error_lines(buffer: &Buffer) -> Vec<String> {
     let error = Theme::default().error.fg.unwrap_or(Color::Reset);
-    let buffer = drawn(bench, section, width);
     (0..buffer.area.height)
         .filter_map(|y| {
-            let text: String = (0..width)
+            let text: String = (0..buffer.area.width)
                 .filter(|x| buffer[(*x, y)].fg == error)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect();
@@ -721,6 +727,19 @@ fn error_text(bench: &SectionBench, section: &dyn SettingsSection, width: u16) -
             (!text.is_empty()).then_some(text)
         })
         .collect()
+}
+
+/// What the **shell** drew in the theme's error colour: the whole app, not one section on a bench.
+///
+/// [`Harness::render`] answers text alone, and a sentence that reached the screen in the ordinary
+/// colour is a sentence nobody is being asked to act on. Drawn at the harness's own 100x30 so the
+/// layout is the one every other `Harness` case photographs.
+fn shell_error_text(harness: &mut Harness) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("a test terminal");
+    terminal
+        .draw(|frame| harness.app().render(frame))
+        .expect("the shell draws");
+    error_lines(terminal.backend().buffer())
 }
 
 /// One frame's lines with the Settings block's border stripped, so a `Harness` frame and a
@@ -1277,6 +1296,45 @@ async fn a_failed_write_shows_the_seams_sentence_verbatim() {
     type_at(&bench, &mut section, "1");
     bench.key(&mut section, "enter");
     assert_eq!(bench.drained().len(), 1, "the retry is not blocked");
+}
+
+/// The same claim as above, with nobody authoring the sentence.
+///
+/// The case above hands the section a hand-written `Failed`, so a drift in `validate`'s wording
+/// would break no test at all: it pins the section's *handling*, not the seam's words. Here the
+/// only thing typed is `0`, and the sentence on screen is whatever `validate` wrote, carried by
+/// `set_setting` through `store_worker::serve` to the section and into the frame. Nothing in this
+/// test spells any part of it but the fragment that must survive the trip.
+#[tokio::test]
+async fn the_seams_sentence_reaches_the_screen_with_nobody_writing_it_down() {
+    let mut harness = prompt_over(MemStore::demo()).await;
+    for _ in 0..app_row(SettingKey::TokenBudget) {
+        harness.key("j");
+    }
+
+    harness.key("e");
+    harness.key("0");
+    harness.key("enter");
+    harness.settle().await;
+
+    let frame = harness.render();
+    // The shell echoes `{request}: {message}` on the status line under the block, and that line
+    // proves only that the worker answered. What this case is about is the line *inside* the
+    // Settings block: the section's own hint row, carrying a sentence it never composed.
+    let echo = format!("{}: ", REQUEST_NAMES[1]);
+    let inside: Vec<String> = shell_error_text(&mut harness)
+        .into_iter()
+        .filter(|line| !line.starts_with(&echo))
+        .collect();
+    assert!(
+        inside.iter().any(|line| line.contains("is outside 1..=")),
+        "the section's own hint carries the store's range refusal, in the error colour: \
+         {inside:?}\n{frame}"
+    );
+    assert!(
+        frame.contains("token_budget: 0"),
+        "the editor is still open over the text that was refused: {frame}"
+    );
 }
 
 /// One write of a kind in flight at a time (D14): the staleness index keeps only the newest
