@@ -421,12 +421,16 @@ impl PromptSection {
     ///
     /// One write of a kind at a time (M3's rule). `r` is deliberately not on this path —
     /// re-reading is how a section that lost a reply recovers.
+    ///
+    /// `unavailable` blocks as firmly as a missing tree: `render` hides the rows behind the
+    /// refusal and the hint drops to `r reload`, so an `e` that still opened an editor would aim
+    /// it at a row nobody can see, over a store whose last word was that it could not answer.
     fn blocked(&mut self) -> bool {
         if let Some(busy) = self.busy {
             self.refuse(in_flight(busy));
             return true;
         }
-        self.snapshot.is_none()
+        self.snapshot.is_none() || self.unavailable.is_some()
     }
 
     /// `e`: the row under the cursor, prefilled with what the rung stores.

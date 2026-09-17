@@ -1478,6 +1478,42 @@ async fn l_is_a_letter_while_editing() {
     assert!(bench.drained().is_empty(), "typing asks the store nothing");
 }
 
+/// A refused read hides the tree, so `e` has nothing to offer an editor over: the hint already
+/// says `r reload` and a write from behind the refusal could only be refused again.
+///
+/// The snapshot is deliberately still held — `unavailable` is set over a tree that was read
+/// before the outage — so this is the case `snapshot.is_none()` alone does not cover.
+#[tokio::test]
+async fn e_is_refused_while_the_read_is_unavailable() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "prompt_settings",
+            message: DATABASE_UNREACHABLE.to_owned(),
+        },
+    );
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+
+    assert!(
+        !section.captures_input(),
+        "no editor opened over a hidden tree"
+    );
+    assert!(
+        bench.drained().is_empty(),
+        "and nothing was asked of the store"
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("settings unavailable"), "{frame}");
+    assert!(
+        frame.contains("r reload"),
+        "the hint is the only offer: {frame}"
+    );
+}
+
 /// B-1: a group header is a row, so the cursor index is the line index — and `e` on one says what
 /// it edits instead of opening an editor over nothing.
 #[tokio::test]
