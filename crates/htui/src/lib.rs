@@ -11,6 +11,7 @@
 
 pub mod agent_worker;
 pub mod app;
+pub mod catalogue;
 pub mod cli;
 pub mod event_loop;
 pub mod hierarchy;

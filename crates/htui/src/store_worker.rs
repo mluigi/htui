@@ -17,8 +17,9 @@ use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, Permissi
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemSummary, LinkGraph,
-    Note, ProjectId, ProjectPatch, RepoId, RepoPatch, RunSummary, Scope, SessionEvent, StepId,
+    AgentId, AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemKindId,
+    ItemKindPatch, ItemSummary, LinkGraph, Note, PhaseId, PhasePatch, ProjectId, ProjectPatch,
+    RepoId, RepoPatch, RunSummary, Scope, SessionEvent, StepGraphId, StepGraphPatch, StepId,
     WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::store::{DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, StoreError};
@@ -28,6 +29,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
 use crate::agent_worker::{AgentRuntime, Served};
+use crate::catalogue::{self, CatalogueSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, MirrorAfterDelete};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
@@ -327,6 +329,116 @@ pub enum StoreRequest {
     DeleteWorkspace(WorkspaceId),
     /// Removes a project and its whole history, then rebuilds the mirror from the worker (D10).
     DeleteProject(ProjectId),
+
+    // MOD-15 milestone 4 (D5): the nine catalogue requests, served by [`crate::catalogue`]. Every
+    // write carries the `Scope` because the tree the reply re-reads *is* the scope (M4 D7), and all
+    // nine are served through one further or-ed arm of [`try_serve`].
+    /// The catalogue of every project in the scope (M4 D2): kinds, graphs, phases. One request per
+    /// event, never one per project — the staleness index keeps only the newest of a variant, so N
+    /// requests of one variant would leave all but one project undrawn.
+    Catalogue(Scope),
+    /// Creates a kind in `project` with `graph` as its default graph. Answers
+    /// [`StoreReply::Catalogue`].
+    CreateKind {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The project the kind belongs to.
+        project: ProjectId,
+        /// `item_kind.prefix`, checked by `ItemKind::prefix_is_valid` before the statement.
+        prefix: String,
+        /// `item_kind.name`, unique within the project.
+        name: String,
+        /// `item_kind.description`.
+        description: String,
+        /// `item_kind.default_graph_id`, which must belong to `project`.
+        graph: StepGraphId,
+        /// `item_kind.position`.
+        position: i32,
+    },
+    /// CAS on `item_kind.updated_at` (M1 D3): `Stale` answers [`StoreReply::CatalogueStale`]. A
+    /// prefix change touches no `item` and no counter (PRD D12).
+    UpdateKind {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The row to edit.
+        id: ItemKindId,
+        /// The `updated_at` the editor opened on.
+        expected: DateTime<Utc>,
+        /// The columns to write.
+        patch: ItemKindPatch,
+    },
+    /// Deletes a kind no item holds; a held kind is refused by the seam with its own sentence
+    /// (PRD D6/D10). Answers [`StoreReply::KindDeleted`] with the mirror rebuilt (M4 D12).
+    DeleteKind {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The row to delete.
+        id: ItemKindId,
+    },
+    /// Creates an empty graph in `project`; phases are added one at a time. Answers
+    /// [`StoreReply::Catalogue`].
+    CreateGraph {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The project the graph belongs to.
+        project: ProjectId,
+        /// `step_graph.name`, unique within the project.
+        name: String,
+        /// `step_graph.description`.
+        description: String,
+    },
+    /// CAS on `step_graph.updated_at` (M1 D3): `Stale` answers [`StoreReply::CatalogueStale`].
+    UpdateGraph {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The row to edit.
+        id: StepGraphId,
+        /// The `updated_at` the editor opened on.
+        expected: DateTime<Utc>,
+        /// The columns to write.
+        patch: StepGraphPatch,
+    },
+    /// Creates a phase from `seed::phase_row`'s frozen defaults plus these five columns (M4 D9):
+    /// the app is never a second source of ANA-2's defaults.
+    CreatePhase {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The graph the phase belongs to.
+        graph: StepGraphId,
+        /// `step_graph_phase.name`, which is also its `output_kind` at create time (D17b).
+        name: String,
+        /// `step_graph_phase.position`, unique within the graph.
+        position: i32,
+        /// `step_graph_phase.template_name`.
+        template_name: String,
+        /// `step_graph_phase.gate_hard`.
+        gate_hard: bool,
+        /// `step_graph_phase.input_kinds`, replaced whole.
+        input_kinds: Vec<String>,
+    },
+    /// CAS on `step_graph_phase.updated_at` (M1 D3) over [`PhasePatch`]'s five columns.
+    UpdatePhase {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The row to edit.
+        id: PhaseId,
+        /// The `updated_at` the editor opened on.
+        expected: DateTime<Utc>,
+        /// The columns to write.
+        patch: PhasePatch,
+    },
+    /// `token_budget` on the `Phase` rung (M1 D8, M4 D6): `Some` is `set_setting`, `None` is
+    /// `clear_setting` so the project or app rung answers. CAS on the phase's `updated_at`.
+    SetPhaseBudget {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The phase whose `token_budget` is written.
+        phase: PhaseId,
+        /// The phase's `updated_at` the editor opened on.
+        expected: DateTime<Utc>,
+        /// The budget to set, or `None` to clear it and let the rung below answer (D16).
+        budget: Option<i64>,
+    },
 }
 
 impl StoreRequest {
@@ -374,6 +486,16 @@ impl StoreRequest {
             Self::DeleteReach(..) => "delete_reach",
             Self::DeleteWorkspace(..) => "delete_workspace",
             Self::DeleteProject(..) => "delete_project",
+            // The nine of `catalogue::REQUEST_NAMES`, in that order (MOD-15 M4 D5).
+            Self::Catalogue(..) => "catalogue",
+            Self::CreateKind { .. } => "create_kind",
+            Self::UpdateKind { .. } => "update_kind",
+            Self::DeleteKind { .. } => "delete_kind",
+            Self::CreateGraph { .. } => "create_graph",
+            Self::UpdateGraph { .. } => "update_graph",
+            Self::CreatePhase { .. } => "create_phase",
+            Self::UpdatePhase { .. } => "update_phase",
+            Self::SetPhaseBudget { .. } => "set_phase_budget",
         }
     }
 }
@@ -498,6 +620,22 @@ pub enum StoreReply {
         reach: DeleteReach,
         /// What the worker did to the mirror afterwards.
         mirror: MirrorAfterDelete,
+    },
+    /// The scope's catalogue, freshly read: the answer to [`StoreRequest::Catalogue`] and to every
+    /// catalogue write that applied (M4 D2/D7).
+    Catalogue(Box<CatalogueSnapshot>),
+    /// A catalogue write missed its CAS token (M4 D8, PRD D8): the tree as it is now, for the
+    /// editor to reload against. The editor keeps its typed text and retries only on `Enter`.
+    CatalogueStale(Box<CatalogueSnapshot>),
+    /// A kind is gone and the mirror was rebuilt, or could not be (M4 D12).
+    ///
+    /// Its own variant rather than [`StoreReply::Deleted`] because `DeleteTarget` is `Workspace`
+    /// or `Project` only, and widening it would be a seam change this milestone does not make.
+    KindDeleted {
+        /// What the worker did to the mirror after the delete.
+        mirror: MirrorAfterDelete,
+        /// The scope's catalogue without the kind.
+        catalogue: Box<CatalogueSnapshot>,
     },
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
@@ -750,6 +888,18 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::DeleteReach(..)
         | StoreRequest::DeleteWorkspace(..)
         | StoreRequest::DeleteProject(..) => hierarchy::serve(backend, request).await?,
+        // The nine catalogue requests, or-ed for the same reason the twelve above are: a guard
+        // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
+        // E0004 here (MOD-15 M3 plan F-12, M4 plan F-2).
+        StoreRequest::Catalogue(..)
+        | StoreRequest::CreateKind { .. }
+        | StoreRequest::UpdateKind { .. }
+        | StoreRequest::DeleteKind { .. }
+        | StoreRequest::CreateGraph { .. }
+        | StoreRequest::UpdateGraph { .. }
+        | StoreRequest::CreatePhase { .. }
+        | StoreRequest::UpdatePhase { .. }
+        | StoreRequest::SetPhaseBudget { .. } => catalogue::serve(backend, request).await?,
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,
