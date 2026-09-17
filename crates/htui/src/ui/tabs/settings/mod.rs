@@ -9,6 +9,7 @@
 //! `on_item_change`: a section is scoped to a workspace, not to an item.
 
 pub mod agents;
+pub mod connection;
 pub mod hierarchy;
 pub mod kinds;
 pub mod prompt;
@@ -27,6 +28,7 @@ use crate::ui::tabs::registry::{Tab, TabId};
 use crossterm::event::{KeyCode, KeyEvent};
 
 pub use agents::AgentsSection;
+pub use connection::ConnectionSection;
 pub use hierarchy::HierarchySection;
 pub use kinds::KindsSection;
 pub use prompt::PromptSection;

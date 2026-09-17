@@ -1253,6 +1253,14 @@ async fn e_opens_a_replacement_field_over_a_stored_dsn() {
         frame.contains("Enter store"),
         "and the hint is the editor's: {frame}"
     );
+    assert!(
+        frame.contains("Enter replaces the stored DSN"),
+        "the guide line is the one for a box that has a DSN, not the empty box's: {frame}"
+    );
+    assert!(
+        !frame.contains("no DSN is stored"),
+        "which would be the screen lying about the state it is reporting: {frame}"
+    );
     insta::assert_snapshot!("editor", frame);
 }
 
@@ -1536,21 +1544,29 @@ async fn a_failed_write_shows_the_seams_sentence() {
 #[tokio::test]
 async fn r_re_reads_and_is_never_refused() {
     let (bench, mut section) = bench_with(&stored_snapshot()).await;
-    bench.key(&mut section, "R");
+    bench.key(&mut section, "c");
     bench.key(&mut section, "y");
     let _ = bench.drained();
 
-    // The rebuild is out; `r` still asks.
-    assert_eq!(
-        bench.key(&mut section, "r"),
-        Handled::Pass,
-        "modal while the question is in flight"
-    );
-    feed(&bench, &mut section, &stored_snapshot());
+    // `clear_dsn` is out, so `e` would be refused. `r` is deliberately not on that path.
     assert_eq!(bench.key(&mut section, "r"), Handled::Consumed);
     assert!(
         matches!(requested(&bench).as_slice(), [StoreRequest::ConnectionInfo]),
-        "one read"
+        "one read, with a write still out"
+    );
+
+    // A question, on the other hand, is modal over everything — `r` included. It is swallowed
+    // rather than passed to the shell, so a `q` at a question cannot quit the application either.
+    feed(&bench, &mut section, &stored_snapshot());
+    bench.key(&mut section, "R");
+    assert_eq!(
+        bench.key(&mut section, "r"),
+        Handled::Consumed,
+        "swallowed, not offered to the shell"
+    );
+    assert!(
+        bench.drained().is_empty(),
+        "and nothing is asked behind a question on screen"
     );
 }
 
