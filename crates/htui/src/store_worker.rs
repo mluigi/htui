@@ -1020,6 +1020,10 @@ pub fn spawn_with(
         projects,
         settings,
         reconnect,
+        // MOD-15 M6 D20: what `connect::apply_dsn` needs. Bound and ignored until the `SetDsn`
+        // arm below claims it (blueprint §2.2); named rather than `..` so a later field cannot
+        // be added to `Started` and silently dropped here.
+        connect: _,
     } = started;
 
     tokio::spawn(async move {
