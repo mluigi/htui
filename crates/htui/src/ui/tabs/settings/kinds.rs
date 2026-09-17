@@ -597,17 +597,12 @@ impl KindsSection {
                 );
             }
             Row::Graph { p, g } => {
-                if let Some(entry) = self.graph_at(p, g) {
-                    let graph = entry.graph.clone();
-                    self.open(
-                        EditorKind::EditGraph(graph.id),
-                        vec![
-                            Field::required("name", &graph.name),
-                            Field::optional("description", &graph.description),
-                        ],
-                        Some(graph.updated_at),
-                    );
-                }
+                let Some(entry) = self.graph_at(p, g) else {
+                    return;
+                };
+                let (id, expected) = (entry.graph.id, entry.graph.updated_at);
+                let fields = edit_graph_fields(entry);
+                self.open(EditorKind::EditGraph(id), fields, Some(expected));
             }
             Row::Phase { p, g, i } => {
                 let Some(phase) = self.phase_at(p, g, i) else {
@@ -662,15 +657,9 @@ impl KindsSection {
         let Some((_, entry)) = self.locate_graph(id) else {
             return;
         };
-        let graph = entry.graph.clone();
-        self.open(
-            EditorKind::EditGraph(graph.id),
-            vec![
-                Field::required("name", &graph.name),
-                Field::optional("description", &graph.description),
-            ],
-            Some(graph.updated_at),
-        );
+        let expected = entry.graph.updated_at;
+        let fields = edit_graph_fields(entry);
+        self.open(EditorKind::EditGraph(id), fields, Some(expected));
     }
 
     /// `d`: the one destructive key this section has (D11).
@@ -1657,6 +1646,18 @@ fn edit_kind_fields(project: &ProjectCatalogue, kind: &ItemKind) -> Vec<Field> {
         Field::optional("description", &kind.description),
         Field::required("graph", graph),
         Field::required("position", &kind.position.to_string()),
+    ]
+}
+
+/// A graph's two columns, prefilled from the row — the fields `e` on a graph row and `g` on any
+/// row both open (D19).
+///
+/// Takes the entry rather than a cloned row: two `&str` are read out of it, and the editor's own
+/// fields own their text from there.
+fn edit_graph_fields(entry: &GraphEntry) -> Vec<Field> {
+    vec![
+        Field::required("name", &entry.graph.name),
+        Field::optional("description", &entry.graph.description),
     ]
 }
 
