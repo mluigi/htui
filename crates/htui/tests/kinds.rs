@@ -1399,3 +1399,105 @@ async fn a_stale_reply_with_the_row_gone_closes_the_editor() {
         "and it says why"
     );
 }
+
+/// A prefix change is a warning before it is a write (PRD D12, D10): the old keys and their counter
+/// survive, and the next item minted under the kind spells the new one. Nothing is sent until that
+/// sentence has been on screen.
+#[tokio::test]
+async fn a_prefix_change_asks_before_it_writes() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    for _ in 0..3 {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "AN");
+
+    bench.key(&mut section, "enter");
+
+    assert!(
+        bench.drained().is_empty(),
+        "the warning is read before the write"
+    );
+    assert!(section.captures_input(), "and it is modal while it is up");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("y write \u{b7} n/Esc back to the editor"),
+        "the hint names both answers: {frame}"
+    );
+    assert!(
+        error_text(&bench, &section, 100).contains(
+            &"items keyed ANA-* keep their keys and their counter; the next item minted under this \
+              kind is AN-1."
+                .to_owned()
+        ),
+        "the warning states PRD D12's semantics, in `theme.error`: {frame}"
+    );
+    insta::assert_snapshot!("prefix_warn", frame);
+}
+
+/// `n` on the warning is a way back, not a cancel: the editor comes back with its text, and a
+/// second `Enter` asks again (D10).
+#[tokio::test]
+async fn n_on_the_prefix_warning_returns_to_the_editor_with_its_text() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    for _ in 0..3 {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "AN");
+    bench.key(&mut section, "enter");
+
+    bench.key(&mut section, "n");
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("Tab/Shift+Tab field"),
+        "the editor is back: {frame}"
+    );
+    assert!(frame.contains("prefix     : AN"), "with its text: {frame}");
+    assert!(bench.drained().is_empty());
+
+    bench.key(&mut section, "enter");
+    bench.key(&mut section, "y");
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::UpdateKind { patch, .. })] = asked.as_slice() else {
+        panic!("`y` writes once: {asked:?}");
+    };
+    assert_eq!(patch.prefix.as_deref(), Some("AN"));
+}
+
+/// `y` writes once, and the editor stays open until the reply so a compare-and-set miss can
+/// re-take the token (D8, D10).
+#[tokio::test]
+async fn y_on_the_prefix_warning_writes_once() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    for _ in 0..3 {
+        bench.key(&mut section, "backspace");
+    }
+    type_at(&bench, &mut section, "AN");
+    bench.key(&mut section, "enter");
+    assert!(
+        bench.drained().is_empty(),
+        "`Enter` only raised the warning"
+    );
+
+    bench.key(&mut section, "y");
+
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::UpdateKind { id, patch, .. })] = asked.as_slice() else {
+        panic!("`y` is the only key that writes: {asked:?}");
+    };
+    assert_eq!(*id, ids::KIND_VULKAN_ANA);
+    assert_eq!(patch.prefix.as_deref(), Some("AN"));
+    assert!(section.captures_input(), "the editor is still open");
+
+    bench.key(&mut section, "enter");
+    assert!(bench.drained().is_empty(), "one write of a kind at a time");
+    assert!(
+        error_text(&bench, &section, 100).contains(&"`update_kind` is still in flight".to_owned())
+    );
+}

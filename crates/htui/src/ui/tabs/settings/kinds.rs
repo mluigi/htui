@@ -56,6 +56,9 @@ const HINT_UNAVAILABLE: &str = "r reload";
 /// An open editor's keys.
 const HINT_EDITING: &str = "Tab/Shift+Tab field \u{b7} Enter save \u{b7} Esc cancel";
 
+/// The prefix warning's keys (D10).
+const HINT_CONFIRM_PREFIX: &str = "y write \u{b7} n/Esc back to the editor";
+
 /// What a compare-and-set miss says while an editor is open (D8, PRD D8): the text is kept, the
 /// token is not, and the retry is the user's.
 const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
@@ -151,6 +154,19 @@ struct Editor {
     focus: usize,
     /// The `updated_at` of the row this opened on; `None` for a create (M1 D3).
     expected: Option<DateTime<Utc>>,
+    /// A kind edit's stored prefix, for D10's comparison; `None` for every other editor.
+    stored_prefix: Option<String>,
+}
+
+impl Editor {
+    /// The prefix this edit would change, as `(old, new)`, or `None` when it changes none.
+    ///
+    /// Only a kind edit has one: a create mints nothing yet, and no other row carries a prefix.
+    fn prefix_change(&self) -> Option<(String, String)> {
+        let old = self.stored_prefix.clone()?;
+        let new = self.text(0);
+        (new != old).then_some((old, new))
+    }
 }
 
 /// Labels, never what was typed into them (H-7).
@@ -183,6 +199,18 @@ enum Mode {
     Browse,
     /// One row being typed into.
     Editing(Editor),
+    /// A kind edit whose prefix changed, held in front of the user before it is written (D10).
+    ///
+    /// The editor is kept whole, so `n`/`Esc` return to it with its text and `y` writes exactly
+    /// what was read.
+    ConfirmPrefix {
+        /// The editor the warning was raised from.
+        editor: Editor,
+        /// The prefix the kind carries now.
+        old: String,
+        /// The prefix that was typed.
+        new: String,
+    },
 }
 
 /// The last outcome, and whether it is one the user has to act on.
@@ -365,12 +393,24 @@ impl KindsSection {
 
     /// Opens an editor, clearing whatever the last one said.
     fn open(&mut self, kind: EditorKind, fields: Vec<Field>, expected: Option<DateTime<Utc>>) {
+        self.open_with(kind, fields, expected, None);
+    }
+
+    /// The same, for the one editor that carries the stored prefix D10 compares against.
+    fn open_with(
+        &mut self,
+        kind: EditorKind,
+        fields: Vec<Field>,
+        expected: Option<DateTime<Utc>>,
+        stored_prefix: Option<String>,
+    ) {
         self.notice = None;
         self.mode = Mode::Editing(Editor {
             kind,
             fields,
             focus: 0,
             expected,
+            stored_prefix,
         });
     }
 
@@ -415,9 +455,14 @@ impl KindsSection {
                 let Some(kind) = project.kinds.get(k) else {
                     return;
                 };
-                let (id, expected) = (kind.id, kind.updated_at);
+                let (id, expected, prefix) = (kind.id, kind.updated_at, kind.prefix.clone());
                 let fields = edit_kind_fields(project, kind);
-                self.open(EditorKind::EditKind(id), fields, Some(expected));
+                self.open_with(
+                    EditorKind::EditKind(id),
+                    fields,
+                    Some(expected),
+                    Some(prefix),
+                );
             }
             Row::Graph { p, g } => {
                 if let Some(entry) = self.graph_at(p, g) {
@@ -497,7 +542,7 @@ impl KindsSection {
                 Some(field) => field.input.on_key(key),
                 None => FieldOutcome::Pass,
             },
-            Mode::Browse => return Handled::Pass,
+            Mode::Browse | Mode::ConfirmPrefix { .. } => return Handled::Pass,
         };
         match outcome {
             FieldOutcome::Consumed => Handled::Consumed,
@@ -554,13 +599,64 @@ impl KindsSection {
             self.refuse(required(label));
             return;
         }
-        match self.build(editor, ctx.scope) {
+        // Built before the warning of D10 is raised, so a `graph` or `position` this section
+        // cannot parse is refused first: a warning about a write that could not happen anyway
+        // would be one question too many.
+        let built = self.build(editor, ctx.scope);
+        if built.is_ok()
+            && let Some((old, new)) = editor.prefix_change()
+        {
+            let Mode::Editing(editor) = core::mem::take(&mut self.mode) else {
+                return;
+            };
+            self.notice = None;
+            self.mode = Mode::ConfirmPrefix { editor, old, new };
+            return;
+        }
+        match built {
             Ok(request) => {
                 self.notice = None;
                 self.send(request, ctx);
             }
             Err(why) => self.refuse(why),
         }
+    }
+
+    /// One key while the prefix warning is up (D10).
+    ///
+    /// Modal over the shell as well as over the tree: every key that is not listed is swallowed, so
+    /// a `q` typed at the warning does not quit the application (H-10). A `CONTROL` chord is the
+    /// carve-out, so `ctrl-c` still does.
+    fn on_confirm_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Handled::Pass;
+        }
+        match key.code {
+            KeyCode::Char('y') => {
+                let Mode::ConfirmPrefix { editor, .. } = core::mem::take(&mut self.mode) else {
+                    return Handled::Consumed;
+                };
+                let built = self.build(&editor, ctx.scope);
+                // The editor is put back rather than closed: the write is in flight and a
+                // `CatalogueStale` has to find something to re-take the token for (D8).
+                self.mode = Mode::Editing(editor);
+                match built {
+                    Ok(request) => {
+                        self.notice = None;
+                        self.send(request, ctx);
+                    }
+                    Err(why) => self.refuse(why),
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                let Mode::ConfirmPrefix { editor, .. } = core::mem::take(&mut self.mode) else {
+                    return Handled::Consumed;
+                };
+                self.mode = Mode::Editing(editor);
+            }
+            _ => {}
+        }
+        Handled::Consumed
     }
 
     /// The request one editor stands for, or the sentence that says why there is none.
@@ -639,9 +735,17 @@ impl KindsSection {
     /// current row's token, and the retry is a second `Enter` rather than an automatic write.
     fn on_stale(&mut self, snapshot: &CatalogueSnapshot) {
         self.busy = None;
+        // A warning collapses back to the editor it was raised from: the prefix it compared
+        // against may be the very thing that moved, so the question is asked again against the row
+        // as it is now (D10).
+        if matches!(self.mode, Mode::ConfirmPrefix { .. })
+            && let Mode::ConfirmPrefix { editor, .. } = core::mem::take(&mut self.mode)
+        {
+            self.mode = Mode::Editing(editor);
+        }
         let reloaded = match &self.mode {
             Mode::Editing(editor) => Some(reload(snapshot, editor.kind)),
-            Mode::Browse => None,
+            Mode::Browse | Mode::ConfirmPrefix { .. } => None,
         };
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
@@ -652,12 +756,29 @@ impl KindsSection {
                 self.say(DELETED_ELSEWHERE);
             }
             Some(Reload::Token(token)) => {
+                let stored = self.stored_prefix_of(&self.mode);
                 if let Mode::Editing(editor) = &mut self.mode {
                     editor.expected = Some(token);
+                    // The comparison D10 makes is against the row as it is now, not as it was when
+                    // the editor opened.
+                    if editor.stored_prefix.is_some() {
+                        editor.stored_prefix = stored;
+                    }
                 }
                 self.say(CHANGED_ELSEWHERE);
             }
         }
+    }
+
+    /// The prefix the edited kind carries in the current snapshot, for D10's comparison.
+    fn stored_prefix_of(&self, mode: &Mode) -> Option<String> {
+        let Mode::Editing(editor) = mode else {
+            return None;
+        };
+        let EditorKind::EditKind(id) = editor.kind else {
+            return None;
+        };
+        self.locate_kind(id).map(|(_, kind)| kind.prefix.clone())
     }
 
     /// One line per row, in [`rows`](KindsSection::rows) order, plus the read-only detail of the
@@ -755,6 +876,7 @@ impl KindsSection {
     fn hint_text(&self) -> String {
         let keys = match &self.mode {
             Mode::Editing(_) => HINT_EDITING,
+            Mode::ConfirmPrefix { .. } => HINT_CONFIRM_PREFIX,
             Mode::Browse => {
                 if self.unavailable.is_some() {
                     HINT_UNAVAILABLE
@@ -784,6 +906,14 @@ impl KindsSection {
         match &self.mode {
             Mode::Browse => Vec::new(),
             Mode::Editing(editor) => editor.lines(width, theme),
+            // The warning and nothing else: what is being answered is the sentence, and the fields
+            // behind it are one `n` away.
+            Mode::ConfirmPrefix { old, new, .. } => {
+                wrapped(&prefix_warning(old, new), usize::from(width).max(1))
+                    .into_iter()
+                    .map(|line| Line::styled(line, theme.error))
+                    .collect()
+            }
         }
     }
 
@@ -851,6 +981,9 @@ impl SettingsSection for KindsSection {
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if matches!(self.mode, Mode::Editing(_)) {
             return self.on_editor_key(key, ctx);
+        }
+        if matches!(self.mode, Mode::ConfirmPrefix { .. }) {
+            return self.on_confirm_key(key, ctx);
         }
         // Browse. `j`, `k`, `n`, `N`, `e`, `g`, `r` are free: the global table binds `q`, `?`, the
         // digits, `ctrl-c` and `-`, and the tab consumes `h`/`l`/`[`/`]`/arrows before a section is
@@ -1140,6 +1273,18 @@ fn reload(snapshot: &CatalogueSnapshot, kind: EditorKind) -> Reload {
             .find(|entry| entry.graph.id == id)
             .map_or(Reload::Gone, |entry| Reload::Token(entry.graph.updated_at)),
     }
+}
+
+/// PRD D12's sentence, verbatim: what a prefix change does and what it leaves alone.
+///
+/// The old keys keep their text, the old counter row survives, and the new prefix mints from 1 —
+/// three facts a user cannot check afterwards, so they are put in front of the write rather than
+/// reported after it (D10).
+fn prefix_warning(old: &str, new: &str) -> String {
+    format!(
+        "items keyed {old}-* keep their keys and their counter; the next item minted under this \
+         kind is {new}-1."
+    )
 }
 
 /// What a second write of the same kind is told while the first is still out.
