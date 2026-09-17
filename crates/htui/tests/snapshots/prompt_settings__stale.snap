@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/prompt_settings.rs
+expression: frame
+---
+app
+  excerpt_file_line_cap         unset | 400 (app_setting_default)   lines
+  excerpt_head_lines            unset | 200 (app_setting_default)   lines
+  excerpt_max_file_bytes        unset | 524288 (app_setting_default)   bytes
+  excerpt_max_files             unset | 12 (app_setting_default)   files
+  excerpt_max_scan_files        unset | 20000 (app_setting_default)   files
+  excerpt_provider_deadline_ms  unset | 1500 (app_setting_default)   ms
+  max_skill_tokens              unset | 20000 (app_setting_default)   tokens
+  prompt_reserve_fraction       unset | 0.1 (1000 bp) (app_setting_default)   bp
+  prompt_upstream_hops          unset | 2 (app_setting_default)   hops
+  token_budget                  6000 | 6000 (app_setting)   tokens
+project Vulkan Tutorials
+  prompt_upstream_hops          unset | 2 (app_setting_default)   hops
+  token_budget                  120000 | 120000 (project)   tokens
+
+
+
+
+
+
+
+
+
+
+
+
+Prompt budget; the phase column is INTEGER, so that rung caps at i32::MAX.
+range 1..=9223372036854775807 tokens · rungs app|project|phase
+token_budget: 7000
+changed elsewhere since you opened it — reloaded; Enter retries against the current row
