@@ -1307,9 +1307,23 @@ pub fn spawn_with(
                     }
                 }
 
-                // Every event that reaches here was sent by a dial whose generation still matched
-                // when it finished (ruling O-1), so the outcome recorded below is this server's.
-                Some(event) = events.recv() => match event {
+                // The **one** generation check (ruling O-1, hazard H-6, review HIGH-1). It is at
+                // consumption rather than at the send for two reasons that between them cover
+                // every path an event can take: `connect::start`'s own launch dial never passes
+                // through `spawn_dial` at all - it reports under `connect::LAUNCH_GENERATION` -
+                // and an event a dial queued in the instant before the `fetch_add` at D11 step (6)
+                // is already past any send-side check by the time the generation moves.
+                //
+                // A `select!` precondition cannot do this job: it is evaluated before the future
+                // is polled, so it cannot see the generation that arrives *with* the message, and
+                // a stale event left at the head of the queue would block every later event behind
+                // it for the rest of the session.
+                Some((generation, event)) = events.recv() => {
+                    if generation != dials.load(Ordering::SeqCst) {
+                        discard_stale(event).await;
+                        continue;
+                    }
+                    match event {
                     ConnEvent::Online(pg) => {
                         pending = None;
                         held = None;
@@ -1341,7 +1355,8 @@ pub fn spawn_with(
                         });
                         tracing::warn!(%why, "connect failed");
                     }
-                },
+                    }
+                }
 
                 err = lost_the_server(health.clone()) => {
                     // The refresher passes every `interval`, so it usually notices first.
@@ -1369,28 +1384,54 @@ pub fn spawn_with(
     })
 }
 
-/// Runs one dial on its own task and reports it, **unless the DSN changed while it ran**.
+/// Runs one dial on its own task and reports it under the generation it was spawned in.
 ///
-/// The generation is read when the dial is spawned and again when it finishes; `SetDsn` bumps it
-/// at the moment of the swap (D11 step 6), so a dial that was in flight across a swap answers for
-/// a server this session has left and its [`ConnEvent`] is dropped rather than delivered. Without
-/// this, an `Online` from the old server would be installed by [`go_online`] over the **new**
-/// mirror — this database's reads answered from another database's cache (ruling O-1, hazard H-6).
+/// The generation is read when the dial is spawned and sent **with** the outcome; `SetDsn` bumps
+/// it at the moment of the swap (D11 step 6), so a dial that was in flight across a swap answers
+/// for a server this session has left and the worker's one check drops its [`ConnEvent`] rather
+/// than delivering it. Without that, an `Online` from the old server would be installed by
+/// [`go_online`] over the **new** mirror — this database's reads answered from another database's
+/// cache (ruling O-1, hazard H-6).
 ///
-/// Both call sites go through here — the reconnect ticker's and `SetDsn`'s own — so there is one
-/// guard rather than two that can disagree.
-fn spawn_dial(dial: connect::Reconnect, sender: mpsc::Sender<ConnEvent>, dials: &Arc<AtomicU64>) {
+/// The check below is an **early out**, not the guard: it only saves a queue slot and closes the
+/// old pool sooner. The guard that cannot be raced is the one in the loop, because it is the only
+/// one a dial finishing during `apply_dsn` cannot slip past (review HIGH-1 gap (b)).
+///
+/// Both call sites go through here — the reconnect ticker's and `SetDsn`'s own.
+fn spawn_dial(
+    dial: connect::Reconnect,
+    sender: mpsc::Sender<(u64, ConnEvent)>,
+    dials: &Arc<AtomicU64>,
+) {
     let dials = Arc::clone(dials);
     let generation = dials.load(Ordering::SeqCst);
     tokio::spawn(async move {
         let event = dial().await;
         if dials.load(Ordering::SeqCst) != generation {
-            tracing::debug!("a dial for a previous DSN finished; dropping its outcome");
+            discard_stale(event).await;
             return;
         }
         // The worker is gone if this fails, and there is nobody left to tell.
-        let _ = sender.send(event).await;
+        let _ = sender.send((generation, event)).await;
     });
+}
+
+/// Lets go of a [`ConnEvent`] that answers for a server this session has left.
+///
+/// Not a plain drop: an `Online` and a `MigrationsPending` each carry a [`PgStore`] holding a pool
+/// of up to eight server connections, and dropping the last `PgPool` handle closes it
+/// *asynchronously* — the same race `CacheStore::close` exists to avoid (`cache/mod.rs:216-224`),
+/// for the same reason D11 step (5) closes the old mirror rather than dropping it.
+async fn discard_stale(event: ConnEvent) {
+    match event {
+        ConnEvent::Online(pg) | ConnEvent::MigrationsPending(pg, _) => {
+            tracing::debug!("a dial for a previous DSN connected; closing its pool");
+            pg.pool().close().await;
+        }
+        ConnEvent::Failed(why) => {
+            tracing::debug!(%why, "a dial for a previous DSN failed; dropping its outcome");
+        }
+    }
 }
 
 /// Swaps `Offline { cache, .. }` for `Online { pg, cache }` and (re)starts the refresher.
@@ -1900,8 +1941,13 @@ mod tests {
         };
         assert_eq!(label, "connecting", "no attempt has answered yet");
 
+        // `LAUNCH_GENERATION`: nothing here ever calls `SetDsn`, so generation zero is current and
+        // this injection is delivered (review HIGH-1).
         events_tx
-            .send(ConnEvent::Failed("no server".to_owned()))
+            .send((
+                connect::LAUNCH_GENERATION,
+                ConnEvent::Failed("no server".to_owned()),
+            ))
             .await
             .expect("the worker is alive");
 

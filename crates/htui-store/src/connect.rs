@@ -65,6 +65,19 @@ pub enum ConnEvent {
 /// One attempt's future, as the store worker's reconnect ticker spawns it.
 pub type ConnFuture = Pin<Box<dyn Future<Output = ConnEvent> + Send>>;
 
+/// The generation [`start`]'s own launch dial reports under (MOD-15 M6 review HIGH-1).
+///
+/// Every [`ConnEvent`] travels with the generation of the DSN it answers for, and the store worker
+/// drops one whose generation is not the current one: a dial in flight across a `SetDsn` answers
+/// for a server the session has left, and installing its `PgStore` over the **new** mirror is one
+/// database's rows written into another's `cache.sqlite` (PRD `:373`).
+///
+/// [`start`] runs before the worker exists, so it has no counter to read. It sends zero — the
+/// counter's initial value, and therefore the current one until the first `SetDsn` bumps it. That
+/// is what puts the launch dial, which never passes through the worker's `spawn_dial`, under the
+/// same single check as every other dial.
+pub const LAUNCH_GENERATION: u64 = 0;
+
 /// Re-runs [`attempt`] with the arguments [`start`] was given.
 ///
 /// A closure rather than the arguments themselves so the store worker never has to hold a DSN:
@@ -145,11 +158,18 @@ impl StartOptions {
 pub struct Started {
     /// The backend to move into the worker: [`Backend::Offline`] over the opened cache, always.
     pub backend: Backend,
-    /// One [`ConnEvent`] per attempt. Empty and never written when `offline` is set.
-    pub events: mpsc::Receiver<ConnEvent>,
+    /// One [`ConnEvent`] per attempt, tagged with the generation of the DSN it answers for. Empty
+    /// and never written when `offline` is set.
+    ///
+    /// The tag travels **with** the event rather than being checked before the send, because the
+    /// two shapes that a send-side check cannot see are exactly the dangerous ones: [`start`]'s own
+    /// launch dial, which never passes through the worker's `spawn_dial`, and a dial that reached
+    /// the queue in the instant before a `SetDsn` moved the generation (review HIGH-1).
+    /// [`LAUNCH_GENERATION`] says what zero means.
+    pub events: mpsc::Receiver<(u64, ConnEvent)>,
     /// The other end of [`Started::events`], for the worker's own reconnect attempts. Held here so
     /// the receiver never closes while the worker lives.
-    pub events_tx: mpsc::Sender<ConnEvent>,
+    pub events_tx: mpsc::Sender<(u64, ConnEvent)>,
     /// The scope the worker publishes on every `Items` request; the refresher reads it.
     pub projects: watch::Sender<Vec<ProjectId>>,
     /// Cursor-pass tuning the worker starts from. `this_box`, `this_user`, the interval and the
@@ -255,8 +275,13 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
         let sender = events_tx.clone();
         tokio::spawn(async move {
             let event = attempt(dsn.as_deref().cloned(), root, timeout).await;
+            // `LAUNCH_GENERATION`, not a counter: this dial was spawned before the worker and its
+            // `dials` existed. The worker drops it if a `SetDsn` has moved on since - which is a
+            // ten-second window here, because a blackholed SYN burns the whole `CONNECT_TIMEOUT`
+            // and is exactly what sends a user to Settings to change the DSN (review HIGH-1).
+            //
             // The worker is gone if this fails, and there is nobody left to tell.
-            let _ = sender.send(event).await;
+            let _ = sender.send((LAUNCH_GENERATION, event)).await;
         });
     } else {
         tracing::info!(

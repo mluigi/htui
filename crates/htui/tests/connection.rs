@@ -23,6 +23,11 @@
 //! about the *shell* — the focus action and the no-DSN redirect — rather than about the section.
 //! Every snapshot the section half builds is a literal, so no case in it can reach a keyring, a
 //! mirror or a clock.
+//!
+//! A case that injects on `started.events_tx` sends a `(generation, ConnEvent)` pair, and
+//! `htui_store::connect::LAUNCH_GENERATION` — zero — is the launch dial's shape. Such an injection
+//! is delivered while no `SetDsn` has run and **dropped** after one, which is the point of the two
+//! `a_launch_dial_*` cases below.
 #![cfg(feature = "testkit")]
 
 use std::collections::BTreeSet;
@@ -44,10 +49,12 @@ use htui::ui::tabs::settings::{
     AgentsSection, ConnectionSection, HierarchySection, KindsSection, PromptSection, SectionId,
     SettingsSection, SettingsTab,
 };
-use htui_core::model::Scope;
+use htui_core::model::{BoxId, Scope};
 use htui_core::store::MemStore;
 use htui_store::testkit as common;
-use htui_store::{Backend, CacheStore, ConnEvent, ConnectContext, Dsn, PgStore, Started, secret};
+use htui_store::{
+    Backend, CacheStore, ConnEvent, ConnectContext, Dsn, Identity, PgStore, Started, secret,
+};
 use tokio::sync::mpsc;
 
 /// A DSN that parses and names a port nothing listens on, for the cases about *storing* rather
@@ -575,7 +582,10 @@ async fn a_failed_dial_is_the_last_attempt() {
     assert_eq!(worker.info().await.last_attempt, None, "nothing yet");
 
     events
-        .send(ConnEvent::Failed("refused".to_owned()))
+        .send((
+            htui_store::connect::LAUNCH_GENERATION,
+            ConnEvent::Failed("refused".to_owned()),
+        ))
         .await
         .expect("the worker is listening");
 
@@ -659,6 +669,175 @@ async fn a_dial_in_flight_across_a_set_dsn_is_discarded() {
         "the current generation's dial is still delivered: {live:?}"
     );
 
+    worker.shutdown().await;
+    cache.close().await;
+    drop(root);
+}
+
+/// A store over a pool that has never dialled, standing in for the one a stale dial carries.
+///
+/// `PgStore::lazy` opens no socket, so an event built with it is the *shape* of an `Online` from a
+/// server this session has left without needing a second server to leave.
+fn unreachable_store() -> PgStore {
+    let identity = Identity {
+        box_id: BoxId::new(),
+        hostname: "HTUI-TEST".to_owned(),
+    };
+    PgStore::lazy(
+        "postgres://nobody:nothing@127.0.0.1:1/none",
+        &identity,
+        Duration::from_millis(250),
+    )
+    .expect("a lazy pool opens no socket")
+}
+
+/// Waits until the worker has taken every queued event off the connect channel.
+///
+/// The permit a `send` takes is returned when `recv` hands the message over, so
+/// `capacity() == max_capacity()` is "the loop has consumed it" — an assertion about the channel
+/// rather than a sleep long enough to be a guess. Every case that uses this holds its dial open on
+/// a [`SilentServer`], so the injected event is the only one in flight.
+async fn drained(events: &mpsc::Sender<(u64, ConnEvent)>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while events.capacity() < events.max_capacity() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the worker never took the injected event"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A worker over a fresh mirror with a dial that cannot answer, plus the connect channel.
+///
+/// The timeout is a minute and the DSN names a socket that accepts and says nothing, so the dial
+/// `SetDsn` spawns at step (8) is still in flight for the whole of the case: anything the
+/// assertions see came from the injected event and from nothing else.
+async fn stalled_worker(
+    root: &tempfile::TempDir,
+    cache: &CacheStore,
+    server: &SilentServer,
+    database: &str,
+) -> (Worker, mpsc::Sender<(u64, ConnEvent)>, String) {
+    let mut started = Started::detached(Backend::Offline {
+        cache: cache.clone(),
+        since: Some(Utc::now()),
+    });
+    started.connect = Some(context(root, Duration::from_secs(60), false));
+    let events = started.events_tx.clone();
+    let mut worker = Worker::spawn(started);
+
+    let dsn = server.dsn(database);
+    let fingerprint = dsn.fingerprint();
+    let after = connection(worker.ask(StoreRequest::SetDsn(dsn)).await);
+    assert_eq!(
+        after
+            .mirror
+            .as_ref()
+            .expect("the new mirror is open")
+            .db_fingerprint,
+        fingerprint,
+        "the swap happened, so the generation has moved"
+    );
+    assert_eq!(after.last_attempt, None, "a swap forgets the last dial");
+
+    (worker, events, fingerprint)
+}
+
+/// The launch dial's `Online` is dropped after a `SetDsn` (review HIGH-1 gap (a)).
+///
+/// [`htui_store::connect::start`] spawns its own dial **before** the worker exists and sends the
+/// outcome straight on `events_tx`; it never passes through `spawn_dial`, so no send-side check
+/// can see it. It reports under [`htui_store::connect::LAUNCH_GENERATION`], and a `SetDsn` has
+/// left that generation behind. Without the check at consumption, `go_online` installs the old
+/// server's `PgStore` over the **new** mirror and the refresher writes one database's rows into
+/// another's `cache.sqlite` (PRD `:373`).
+///
+/// This is also the shape of gap (b): an event that reached the queue without being filtered on
+/// the way in — which is what a dial finishing in the instant before the `fetch_add` produces.
+#[tokio::test]
+async fn a_launch_dial_online_is_dropped_after_a_set_dsn() {
+    let _keyring = common::mock_keyring().await;
+    let (root, cache) = mirror("connection-launch-online").await;
+    let mut server = SilentServer::start().await;
+    let (mut worker, events, fingerprint) =
+        stalled_worker(&root, &cache, &server, "launch-online").await;
+
+    events
+        .send((
+            htui_store::connect::LAUNCH_GENERATION,
+            ConnEvent::Online(unreachable_store()),
+        ))
+        .await
+        .expect("the worker is listening");
+    drained(&events).await;
+
+    let snapshot = worker.info().await;
+    assert_eq!(
+        snapshot.label, "connecting",
+        "the old server's store was installed: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot
+            .mirror
+            .as_ref()
+            .expect("still mirrored")
+            .db_fingerprint,
+        fingerprint,
+        "and it would have been read through the new DSN's mirror"
+    );
+    assert_eq!(
+        snapshot.last_attempt, None,
+        "a dropped event is not this server's attempt"
+    );
+
+    server.release();
+    worker.shutdown().await;
+    cache.close().await;
+    drop(root);
+}
+
+/// The same shape carrying a pending-migration store: nothing is held aside for the prompt.
+///
+/// The count and the store belong to the **old** server's schema, so a `y` answered against them
+/// would run this binary's migrations on a database the session has left. `held` is not readable
+/// from a test, and `ApplyMigrations` is what reads it: with nothing held the loop's arm does not
+/// fire and `try_serve` answers `applied: 0` (`store_worker.rs:989`).
+#[tokio::test]
+async fn a_launch_dial_migrations_pending_is_dropped_after_a_set_dsn() {
+    let _keyring = common::mock_keyring().await;
+    let (root, cache) = mirror("connection-launch-pending").await;
+    let mut server = SilentServer::start().await;
+    let (mut worker, events, _) = stalled_worker(&root, &cache, &server, "launch-pending").await;
+
+    events
+        .send((
+            htui_store::connect::LAUNCH_GENERATION,
+            ConnEvent::MigrationsPending(unreachable_store(), 3),
+        ))
+        .await
+        .expect("the worker is listening");
+    drained(&events).await;
+
+    let StoreReply::StoreState {
+        migrations_pending, ..
+    } = worker.ask(StoreRequest::StoreState).await
+    else {
+        panic!("wrong reply variant")
+    };
+    assert_eq!(
+        migrations_pending, None,
+        "the old server's schema opened the prompt"
+    );
+
+    let StoreReply::MigrationsApplied { applied } = worker.ask(StoreRequest::ApplyMigrations).await
+    else {
+        panic!("wrong reply variant")
+    };
+    assert_eq!(applied, 0, "nothing was held aside to apply");
+    assert_eq!(worker.info().await.last_attempt, None);
+
+    server.release();
     worker.shutdown().await;
     cache.close().await;
     drop(root);

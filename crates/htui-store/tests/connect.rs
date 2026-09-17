@@ -20,7 +20,8 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The next `ConnEvent`, or a panic naming what was being waited for.
 async fn next_event(started: &mut Started, what: &str) -> ConnEvent {
     match tokio::time::timeout(EVENT_TIMEOUT, started.events.recv()).await {
-        Ok(Some(event)) => event,
+        // The generation the launch dial reports under; there is no worker here to move it.
+        Ok(Some((_, event))) => event,
         Ok(None) => panic!("the connect task closed the channel without an event ({what})"),
         Err(_) => panic!("no ConnEvent within {EVENT_TIMEOUT:?} ({what})"),
     }
