@@ -432,11 +432,18 @@ app
   excerpt_file_line_cap         unset | 400 (app_setting_default)   lines
   …
   prompt_reserve_fraction       0.1 | 0.1 (1000 bp) (app_setting)   bp
-  token_budget                  unset | 100000 (app_setting_default)   tokens
+  token_budget                  unset | 120000 (app_setting_default)   tokens
 project Vulkan renderer
-  prompt_upstream_hops          2 | 2 (project)   hops
-  token_budget                  unset | 100000 (app_setting_default)   tokens
+  prompt_upstream_hops          unset | 2 (app_setting_default)   hops
+  token_budget                  120000 | 120000 (project)   tokens
 ```
+
+**Corrected after T1** (the demo world, not an illustration): `DEFAULTS.token_budget` is `120_000`
+(`settings.rs:37`, matching `0002_agent_probe.sql:68`), and every demo project's `settings` blob is
+`{"token_budget": 120000, "retention_days": null, "keep_raw_events": false}`
+(`crates/htui-core/src/fixtures.rs:644-648`) — **not** `{}`. So in the demo the project's
+`token_budget` row starts at `(project)` and `prompt_upstream_hops` is the one genuinely unset
+`Project`-rung row.
 
 `fn value_line(key, stored: Option<&Value>, eff: &Effective) -> String` = `format!("  {key:<width$}  {stored} | {} ({})   {unit}", eff.text, eff.source.as_str())` where `width = key_width()` (max `key().chars().count()` over `SettingKey::ALL`, computed, not a constant), `stored = stored.map_or(UNSET, Value::to_string)` (B-2), `unit = key.spec().unit`. Header lines are `APP_HEADER` and `format!("{PROJECT_HEADER} {}", entry.project.name)`. Selected row in `theme.selected`, headers and value rows in `theme.base`. Everything spelled from `SettingKey::key()`/`SettingSpec` — no key literal in the file (acceptance line 4; a test greps the source for the ten key strings).
 
@@ -561,7 +568,7 @@ Helpers as `tests/kinds.rs:763-838`, `:1059-1065`: `prompt_over(store) -> Harnes
 
 | Test | Asserts | Snapshot |
 |---|---|---|
-| `the_demo_snapshot_renders_the_tree` | render contains `app`, ten key lines each `unset | … (app_setting_default)`, `project Vulkan…` with two rows; the ten effective numbers equal `DEFAULTS.value_of(key)` rendered | `prompt_settings__demo` |
+| `the_demo_snapshot_renders_the_tree` | render contains `app`, ten `App` key lines each `unset | … (app_setting_default)`, `project Vulkan…` with two rows — and, **corrected after T1**, those two are `prompt_upstream_hops  unset | 2 (app_setting_default)` and `token_budget  120000 | 120000 (project)`, because the demo blob already holds `token_budget` (`fixtures.rs:644-648`); the ten `App` effective numbers equal `DEFAULTS.value_of(key)` rendered | `prompt_settings__demo` |
 | `no_workspace_lists_the_app_group_alone` | nil scope → `app` header + ten rows, no project header | `prompt_settings__app_only` |
 | `offline_is_unavailable_with_the_worker_sentence` | frame contains `settings unavailable` and `DATABASE_UNREACHABLE` | `prompt_settings__offline` |
 | `no_key_is_listed_on_a_rung_its_spec_refuses` | for every `Row::Project{p,v}` the key's `spec().rungs.contains(PROJECT)`; count of project rows == `project_keys().count()` per project; ten `Row::App` | |
@@ -578,7 +585,7 @@ Helpers as `tests/kinds.rs:763-838`, `:1059-1065`: `prompt_over(store) -> Harnes
 | `a_failed_write_shows_the_seams_sentence_verbatim` | feed `Failed { request: "set_setting", … }` → `busy` cleared, editor open, error text carries the message | |
 | `a_second_write_while_one_is_in_flight_is_refused` | `enter` twice → one request, `` `set_setting` is still in flight `` | |
 | `the_source_label_matches_resolve_budget_for_all_four_combinations` | `present_source(project.get("token_budget"), app.contains_key(..)) == resolve_budget(None, project, &app).source` over the four combinations (B-3) | |
-| `a_project_row_flips_to_project_and_back` | seed `token_budget` on the project → `(project)`; clear → `(app_setting_default)` (the `--demo` smoke, pinned) | |
+| `a_project_row_flips_to_project_and_back` | **corrected after T1**: the demo's project `token_budget` already reads `(project)`, so the flip is pinned on `prompt_upstream_hops`, which the blob genuinely lacks — seed it through `serve` → `(project)`; clear → `(app_setting_default)`. The `token_budget` row gets the mirror-image assertion: clear it first → `(app_setting_default)`, set it again → `(project)` (the `--demo` smoke, pinned) | |
 | `a_head_above_the_cap_renders_the_clamp_line` | `SetSetting(App, ExcerptHeadLines, 50, None)` then `SetSetting(App, ExcerptFileLineCap, 10, None)` (accepted: one-directional, F-12); pane has `clamped to excerpt_file_line_cap = 10` in error colour; row shows `50 | 10 (app_setting)` | `prompt_settings__clamped` |
 | `the_fraction_row_renders_both_units_and_round_trips` | seed `0.1` → row `0.1 | 0.1 (1000 bp) (app_setting)`; `e` → field `0.1`; `enter` → `SetSetting { value: 0.1 }` | `prompt_settings__editor_fraction` |
 | `the_pane_prints_doc_range_and_rungs` | `token_budget` (App) → pane has `spec.doc`, `range 1..=9223372036854775807 tokens`, `rungs app|project|phase` | |
