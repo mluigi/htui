@@ -27,13 +27,14 @@ use htui_core::store::{
     DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung, StoreError,
 };
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
-use htui_store::{Backend, ConnEvent, PgStore, Started, connect};
+use htui_store::{Backend, ConnEvent, Dsn, PgStore, Started, connect};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
 use crate::agent_worker::{AgentRuntime, Served};
 use crate::catalogue::{self, CatalogueSnapshot};
+use crate::connection::{self, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::ui::overlay::OverlayId;
@@ -472,6 +473,18 @@ pub enum StoreRequest {
         /// The rung row's `updated_at` the editor opened on.
         expected: DateTime<Utc>,
     },
+    /// The connection as the Settings > Connection section shows it (MOD-15 M6, D4): backend
+    /// label, whether a DSN is stored (never the DSN), the mirror's `cache_meta`, the last dial.
+    ConnectionInfo,
+    /// Store `dsn` in the keyring, open its mirror and start dialling it, without a restart
+    /// (D11). Carries the redacting newtype, never a `String` (M5 review L-9).
+    SetDsn(Dsn),
+    /// Remove the keyring entry and stop dialling. The live connection, if any, is kept until
+    /// quit (D13).
+    ClearDsn,
+    /// `CacheStore::rebuild()` on the current mirror: the sixteen mirrored tables and the cursor
+    /// go, the file and its `cache_meta` stay (D14).
+    RebuildCache,
 }
 
 impl StoreRequest {
@@ -533,6 +546,11 @@ impl StoreRequest {
             Self::PromptSettings(..) => "prompt_settings",
             Self::SetSetting { .. } => "set_setting",
             Self::ClearSetting { .. } => "clear_setting",
+            // The four of `connection::REQUEST_NAMES`, in that order (MOD-15 M6 D4).
+            Self::ConnectionInfo => "connection_info",
+            Self::SetDsn(_) => "set_dsn",
+            Self::ClearDsn => "clear_dsn",
+            Self::RebuildCache => "rebuild_cache",
         }
     }
 }
@@ -680,6 +698,9 @@ pub enum StoreReply {
     /// A settings write missed its CAS token (M5 D14, PRD D8): the rungs as they are now, for the
     /// editor to reload against. The editor keeps its typed text and retries only on `Enter`.
     PromptSettingsStale(Box<SettingsSnapshot>),
+    /// `ConnectionInfo`, and every connection writer's success (D4): the section re-renders from
+    /// it and never patches a field of its own into what it already had.
+    Connection(ConnectionSnapshot),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -949,6 +970,15 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::PromptSettings(..)
         | StoreRequest::SetSetting { .. }
         | StoreRequest::ClearSetting { .. } => prompt_settings::serve(backend, request).await?,
+        // The four connection requests, or-ed for the same reason the twenty-four above are: a
+        // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
+        // be an E0004 here (MOD-15 M3 plan F-12, M6 plan D9). Only the read is answered: the three
+        // writers need `reconnect`, `refresher` and the connect context, none of which a function
+        // over `&Backend` can reach, so they are refused here and served by the loop below.
+        StoreRequest::ConnectionInfo
+        | StoreRequest::SetDsn(_)
+        | StoreRequest::ClearDsn
+        | StoreRequest::RebuildCache => connection::serve(backend, request).await?,
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,

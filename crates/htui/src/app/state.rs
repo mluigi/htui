@@ -219,16 +219,23 @@ impl App {
         }
     }
 
-    /// Issues the reads the shell itself needs: the workspace list, this box's row and the store
-    /// state.
+    /// Issues the reads the shell itself needs: the workspace list, this box's row, the store
+    /// state and the connection.
     ///
     /// The first `Workspaces` reply also picks the startup scope (blueprint D, "Startup"); the
     /// `StoreState` one is what makes the top bar right on the first frame rather than a second
     /// later, and what carries a pending-migration count into the shell (plan D11).
+    ///
+    /// `ConnectionInfo` is the shell's own read rather than the section's (MOD-15 M6 D6): a box
+    /// whose keyring is empty has to be steered to the field *before* the user finds the Settings
+    /// tab, and no section that has never been activated can ask for anything. It is addressed
+    /// under `Origin::App`, so the section's own read — which is keyed by origin — is not stale to
+    /// it and it is not stale to the section's.
     pub fn start(&mut self) {
         self.dispatch(Origin::App, StoreRequest::Workspaces);
         self.dispatch(Origin::App, StoreRequest::BoxInfo);
         self.dispatch(Origin::App, StoreRequest::StoreState);
+        self.dispatch(Origin::App, StoreRequest::ConnectionInfo);
     }
 
     /// Registers a tab and, when it becomes the active one, issues its requests.

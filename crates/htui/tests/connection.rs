@@ -47,7 +47,7 @@ fn demo() -> Backend {
 #[track_caller]
 fn connection(reply: StoreReply) -> ConnectionSnapshot {
     match reply {
-        StoreReply::Connection(snapshot) => *snapshot,
+        StoreReply::Connection(snapshot) => snapshot,
         other => panic!("expected a connection snapshot: {other:?}"),
     }
 }
@@ -262,11 +262,7 @@ fn connection_names_are_stable() {
 #[tokio::test]
 async fn try_serve_refuses_every_writer_by_name() {
     let backend = demo();
-    for (request, name) in connection_requests()
-        .into_iter()
-        .zip(REQUEST_NAMES)
-        .skip(1)
-    {
+    for (request, name) in connection_requests().into_iter().zip(REQUEST_NAMES).skip(1) {
         let (failed, message) = refusal(serve(&backend, &request).await);
         assert_eq!(failed, name);
         assert_eq!(message, NO_WORKER);
@@ -295,14 +291,13 @@ async fn memory_answers_none_for_dsn_stored_and_never_opens_the_keyring() {
 async fn the_worker_refuses_the_writers_on_memory() {
     let mut worker = Worker::spawn(Started::detached(demo()));
 
-    for (request, name) in connection_requests()
-        .into_iter()
-        .zip(REQUEST_NAMES)
-        .skip(1)
-    {
+    for (request, name) in connection_requests().into_iter().zip(REQUEST_NAMES).skip(1) {
         let (failed, message) = refusal(worker.ask(request).await);
         assert_eq!(failed, name);
-        assert_eq!(message, DEMO_SESSION, "a demo session, not a missing worker");
+        assert_eq!(
+            message, DEMO_SESSION,
+            "a demo session, not a missing worker"
+        );
     }
 
     worker.shutdown().await;
@@ -331,7 +326,10 @@ async fn an_offline_backend_reports_a_stored_dsn_by_summary_only() {
         Some(Dsn::parse(DEAD_DSN).expect("parses").summary()),
         "the summary is the newtype's, not a second rendering"
     );
-    let mirror = snapshot.mirror.as_ref().expect("an offline backend mirrors");
+    let mirror = snapshot
+        .mirror
+        .as_ref()
+        .expect("an offline backend mirrors");
     assert_eq!(mirror.db_fingerprint, "connection-read");
 
     let printed = format!("{snapshot:?}");
@@ -603,7 +601,11 @@ async fn a_dial_in_flight_across_a_set_dsn_is_discarded() {
     assert_eq!(first.label, "connecting", "the swap dialled at once");
 
     // Generation 1: the stale dial is now answering for a server this session has left.
-    let second = connection(worker.ask(StoreRequest::SetDsn(current.dsn("second"))).await);
+    let second = connection(
+        worker
+            .ask(StoreRequest::SetDsn(current.dsn("second")))
+            .await,
+    );
     assert_eq!(second.last_attempt, None, "a swap forgets the last dial");
 
     stale.release();
@@ -681,14 +683,20 @@ async fn set_dsn_goes_online_without_a_restart() {
     );
 
     let online = worker
-        .poll_until(Duration::from_secs(30), |snapshot| snapshot.label == "online")
+        .poll_until(Duration::from_secs(30), |snapshot| {
+            snapshot.label == "online"
+        })
         .await;
     assert_eq!(
         online.label, "online",
         "the same process reached the server: {online:?}"
     );
     assert_eq!(
-        online.mirror.as_ref().expect("still mirrored").db_fingerprint,
+        online
+            .mirror
+            .as_ref()
+            .expect("still mirrored")
+            .db_fingerprint,
         fingerprint
     );
     assert!(
