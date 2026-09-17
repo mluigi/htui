@@ -411,7 +411,53 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   and its re-read are still two seam calls, so a connection lost between them reports `Failed` for
   a write that applied (closing it needs a seam method this item does not add); and
   `chat/composer.rs` was **not** rebuilt on `TextField` (plan D3) — a CLEAN candidate for this
-  item's close-out. Milestones 4–6 remain: kinds and graphs, the ten settings, and the connection
+  item's close-out.
+  **Milestone 4 landed (`5e0f24a`..`b1672b8`, 2026-09-17): kinds and graphs are editable.** Plan at
+  `.claude/plans/mod-15-kinds-graphs.plan.md`, blueprint beside it. Two things shipped.
+  (1) **`htui::catalogue`** (`crates/htui/src/catalogue.rs`): one scope-wide snapshot per read —
+  every project of the scope with its kinds, its graphs and each graph's phases — and nine served
+  requests (`StoreRequest` 38 → **47**, names in `htui::catalogue::REQUEST_NAMES`, three new
+  replies taking `StoreReply` to 26), routed through **one `try_serve` arm of nine or-ed patterns**
+  as milestone 3's twelve are. The read is scope-wide and **not** one request per project because
+  the staleness index is keyed by `(Origin, Discriminant<StoreRequest>)` (`app/state.rs:158`): N
+  requests of one variant would leave only the newest reply delivered. (2) **`KindsSection`**
+  (`SectionId("kinds")`, `ui/tabs/settings/kinds.rs`), registered **after** `hierarchy`: the tree is
+  project → each kind with the phases of its default graph → each graph no kind points at; kind
+  create/edit/delete, graph create/edit and phase create/edit all land through milestone 1's CAS
+  methods; a prefix change is read before it is written (PRD D12, a modal stage naming the surviving
+  keys and counter); a kind delete asks once and rebuilds the mirror, because `item_kind` is one of
+  the 16 `MIRRORED_TABLES` and cursor-based refresh propagates no delete. **No seam change, no
+  migration, no `query!`**: `CASES` stays 36, `EXPECTED_CASES` 36, `.sqlx/` byte-identical, and
+  `0003_orchestration.sql` is still MOD-4's and still next. **`token_budget` is the app's first
+  settings writer**, scoped to one key on the `Phase` rung through
+  `set_setting`/`clear_setting` (an empty field clears, so the project/app rung answers); milestone
+  5 widens it to the ten keys on `App` and `Project`. **Live coordinates.** (1) `catalogue::snapshot`
+  is bound `ReadStore + WriteStore`: `item_kinds`, `step_graphs` and `phases` live on **`WriteStore`**
+  (`traits.rs:472`, `:508`, `:537`), not on `ReadStore`, which ends at `:126`. (2) A phase created
+  from the app is `seed::phase_row`'s row with four text columns overwritten — `PhaseSeed`'s fields
+  are `&'static str`, so runtime text cannot flow through it, and ANA-2's eight frozen columns stay
+  named in `seed.rs` alone. (3) An out-of-range budget refuses with
+  ``constraint violated: `token_budget` = N is outside 1..=2147483647 tokens``:
+  `prompt::settings::validate` runs **before** the `i32` cast, so `mem.rs`'s "does not fit … which is
+  INTEGER" branch is unreachable for a validated value. (4) `step_graph_phase.output_kind` is set at
+  create (`= name`) and **never followed on a rename** — `PhasePatch` has no field for it; whether a
+  rename should follow it is **MOD-4's** call (M4 open item O-1). (5) A graph every kind points at has
+  no row of its own, so **`g`** on a kind or phase row opens the owning graph's editor (M4 D19, added
+  after the blueprint found the hole). (6) In this section `Browse` with a write in flight is
+  unreachable — the editor consumes every printable key — so the "a read's reply is taken for the
+  write's" hazard has exactly two open doors, a scope change and a tab re-activation, both argued at
+  `on_catalogue`. **1154 passed, 0 failed, 30 ignored** workspace-wide with Postgres live;
+  `tests/kinds.rs` is 51 tests, 8 new `kinds__*.snap`, and **no existing snapshot moved** (the
+  hierarchy and agents tests build their own two-section tab). The `--demo` smoke was **not** run (no
+  TTY in the agent environment). Reviewed by `rust-reviewer`: no CRITICAL, one HIGH, two MEDIUM, four
+  LOW; the HIGH, one MEDIUM and three LOW fixed (`2debc42`..`2016911`) — the HIGH being the two-write
+  budget chain rewriting its own comparison baseline before the second write landed, so a `Stale`
+  follow-up silently dropped the budget. Two recorded rather than fixed: an `r` issued mid-chain can
+  be taken for the write's reply (refusing `r` while busy would wedge a section whose reply was
+  overtaken, which is why milestone 3 allows it — documented, plus a notice that says nothing was
+  written), and a re-read that fails **after** an applied write still answers `Failed`, which
+  `hierarchy::serve` does too and which needs a seam method this milestone does not add.
+  Milestones 5 and 6 remain: the ten settings, and the connection
   section, which is where `TextField::masked()` gets its first consumer and where a DSN must arrive
   as a redacting newtype rather than a `String` on `StoreRequest` (review L-9, doc'd at both ends).
 
