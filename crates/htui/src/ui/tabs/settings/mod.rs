@@ -61,6 +61,38 @@ pub(crate) fn is_error(notice: &str) -> bool {
     notice.starts_with("changed elsewhere") || notice.starts_with("deleted elsewhere")
 }
 
+/// One sentence broken into lines of at most `width` chars, on spaces.
+///
+/// Wrapped here rather than by `Paragraph`'s own `Wrap`, because the layout needs the height
+/// *before* the pane is drawn and a count that disagreed with the widget's wrapping would clip the
+/// last line of a warning — the one line that says nothing can be undone.
+///
+/// Shared by the hierarchy, kinds and prompt sections. It was copied twice on the argument that a
+/// three-line helper is cheaper than a promotion (M5 O-5); the third copy is what the argument
+/// named as the price, so this is it. Byte-identical to all three, so no frame moves.
+pub(crate) fn wrapped(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let extra = if line.is_empty() {
+            word.chars().count()
+        } else {
+            word.chars().count() + 1
+        };
+        if !line.is_empty() && line.chars().count() + extra > width {
+            lines.push(core::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 /// What a compare-and-set miss says while an editor is open (M4 D8, PRD D8): the text is kept, the
 /// token is not, and the retry is the user's. (M4 D14, promoted for M5.)
 pub(crate) const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";

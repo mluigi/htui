@@ -30,7 +30,7 @@ use crate::hierarchy::MirrorAfterDelete;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    message,
+    message, wrapped,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1874,30 +1874,6 @@ fn detail_lines(phase: &StepGraphPhase, width: u16, theme: &Theme) -> Vec<Line<'
         .into_iter()
         .map(|line| Line::styled(format!("      {line}"), theme.dim))
         .collect()
-}
-
-/// One sentence broken into lines of at most `width` chars, on spaces.
-fn wrapped(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        let extra = if line.is_empty() {
-            word.chars().count()
-        } else {
-            word.chars().count() + 1
-        };
-        if !line.is_empty() && line.chars().count() + extra > width {
-            lines.push(core::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
 }
 
 #[cfg(test)]

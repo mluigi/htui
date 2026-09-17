@@ -30,7 +30,7 @@ use crate::hierarchy::{
     reach_totals,
 };
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::tabs::settings::{SectionId, SettingsSection, message};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, message, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -1411,34 +1411,6 @@ fn delete_pane(
                 .spans,
         );
         lines.push(Line::from(spans));
-    }
-    lines
-}
-
-/// One sentence broken into lines of at most `width` chars, on spaces.
-///
-/// Wrapped here rather than by `Paragraph`'s own `Wrap`, because the layout needs the height
-/// *before* the pane is drawn and a count that disagreed with the widget's wrapping would clip the
-/// last line of a warning — the one line that says nothing can be undone.
-fn wrapped(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        let extra = if line.is_empty() {
-            word.chars().count()
-        } else {
-            word.chars().count() + 1
-        };
-        if !line.is_empty() && line.chars().count() + extra > width {
-            lines.push(core::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        lines.push(line);
     }
     lines
 }

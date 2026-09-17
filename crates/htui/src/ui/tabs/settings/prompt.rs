@@ -42,7 +42,7 @@ use crate::prompt_settings::{AppEntry, ProjectEntry, REQUEST_NAMES, SettingsSnap
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    message,
+    message, wrapped,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use chrono::{DateTime, Utc};
@@ -1070,34 +1070,6 @@ fn reload(snapshot: &SettingsSnapshot, target: Target) -> Reload {
 /// D13's line: what the reader will use instead of what this row holds, and which peer decided it.
 fn clamp_line(peer: SettingKey, used: i64) -> String {
     format!("clamped to {peer} = {used}")
-}
-
-/// One sentence broken into lines of at most `width` chars, on spaces.
-///
-/// Copied from the kinds section rather than promoted beside [`is_error`](super::is_error): two
-/// copies of three lines are cheaper than a third shared helper, and a third copy is what would
-/// justify the promotion (O-5).
-fn wrapped(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        let extra = if line.is_empty() {
-            word.chars().count()
-        } else {
-            word.chars().count() + 1
-        };
-        if !line.is_empty() && line.chars().count() + extra > width {
-            lines.push(core::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
 }
 
 #[cfg(test)]
