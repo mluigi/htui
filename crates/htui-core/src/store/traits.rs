@@ -669,8 +669,9 @@ pub trait WriteStore: ReadStore {
 
     // ---- ANA-2 §8: graph runs (MOD-4 milestone 1) --------------------------------------------
     //
-    // In §8's order. Five are transactions on every backend, `MemStore` included (plan D6):
-    // `create_run`, `claim_run`, `select_fanout`, `write_document` and `close_out`. Every writer
+    // In §8's order. Seven are transactions on every backend, `MemStore` included (plan M1 D6,
+    // M2 D7): `create_run`, `claim_run`, `select_fanout`, `write_document`, `promote_step`,
+    // `finish_run` and `close_out`. Every writer
     // that stamps a clock takes the instant from the caller (blueprint F-S); `updated_at` stays
     // the trigger's and is never set by hand.
 
@@ -883,6 +884,41 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the run is already
     /// terminal.
     async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> Result<()>;
+
+    /// Ends a graph run and mirrors the item in the same transaction (ANA-2 §4.3 verdict 3 and
+    /// the propagation rule at `:660-664`; milestone 2 plan D7, blueprint R-1 option (b)).
+    ///
+    /// `to` must be terminal (`done`, `failed`, `cancelled`). The run moves `<current> -> to`
+    /// under [`legal_move`], `finished_at = COALESCE(finished_at, at)`, and `failure` is written
+    /// when `to = failed`. Then, **only when no other run of the item is non-terminal**, the item
+    /// moves:
+    ///
+    /// | `to`        | item, from -> to                                                 |
+    /// |-------------|------------------------------------------------------------------|
+    /// | `done`      | `in_progress -> done`                                            |
+    /// | `failed`    | `in_progress -> failed`, `awaiting_approval -> failed`            |
+    /// | `cancelled` | `queued -> open`, `in_progress -> open`, `awaiting_approval -> open` |
+    ///
+    /// An item at any other status is left alone (plan D17: the row may not have passed through
+    /// `can_move_to`), and an item that still has a live run is held where it is — the second leg
+    /// of the conformance case. A chat run (`item_id IS NULL`) moves only the run.
+    ///
+    /// [`transition_run`](WriteStore::transition_run) and [`fail_run`](WriteStore::fail_run) are
+    /// unchanged and remain the run-only writers the chat path uses.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) with
+    /// [`finish_run_needs_a_terminal_status`] when `to` is not terminal, with
+    /// [`failure_disagrees_with_status`] when `failure.is_some() != (to == Failed)`, and with
+    /// [`illegal_move`]'s sentence when the run is already terminal.
+    async fn finish_run(
+        &self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<()>;
 
     /// `R-TUI-9`'s three effects, one transaction (plan D6): the summary document at its next
     /// version, the commits upserted, the item moved to `closed` under the law with `closed_at`
@@ -1122,6 +1158,30 @@ pub fn step_is_not_promotable(step: StepId, status: StepStatus) -> String {
 #[must_use]
 pub fn run_is_terminal(run: RunId, status: RunStatus) -> String {
     format!("run {run} is terminal (`{status}`)")
+}
+
+/// M2 D7: [`finish_run`](WriteStore::finish_run) was asked to leave a run non-terminal.
+///
+/// It is a separate sentence from [`illegal_move`] on purpose: `running -> awaiting_approval` is a
+/// *sanctioned* pair, so the law has nothing to say about it — what refuses it here is that this
+/// writer ends runs, and `transition_run` is the one that moves them.
+#[must_use]
+pub fn finish_run_needs_a_terminal_status(run: RunId, to: RunStatus) -> String {
+    format!("run {run}: `finish_run` moves to a terminal status, not `{to}` (ANA-2 §4.3)")
+}
+
+/// M2 D7: `finish_run`'s `failure` and `to` disagree — text on a non-failure, or none on a failure.
+///
+/// D12's failure strings are `run.failure` text, so a terminal `failed` that carried none would
+/// leave the column NULL and force the second write the composite exists to avoid; and a `done`
+/// that carried one would file a reason under a run that has none.
+#[must_use]
+pub fn failure_disagrees_with_status(run: RunId, to: RunStatus, has_failure: bool) -> String {
+    if has_failure {
+        format!("run {run}: a failure text is refused on a move to `{to}`")
+    } else {
+        format!("run {run}: a move to `failed` needs a failure text")
+    }
 }
 
 /// D8: the CAS token a rung whose row always exists must be given.

@@ -41,10 +41,11 @@ use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
     WriteStore, already_exists, chat_step_status, close_out_needs_a_summary, expected_on_row,
-    graph_not_in_project, invalid_prefix, item_has_a_live_run, item_kind_is_held,
-    item_not_in_project, legal_move, not_a_fanout_candidate, not_a_terminal_status,
-    references_no_row, reserved_phase_name, row_names_another_step, run_is_terminal,
-    step_is_not_promotable, step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
+    failure_disagrees_with_status, finish_run_needs_a_terminal_status, graph_not_in_project,
+    invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
+    not_a_fanout_candidate, not_a_terminal_status, references_no_row, reserved_phase_name,
+    row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
+    summary_names_another_item, winner_is_not_settled,
 };
 use uuid::Uuid;
 
@@ -3741,6 +3742,79 @@ impl State {
         Ok(())
     }
 
+    /// Plan M2 D7: the run's terminal move and the item's mirror, one closure.
+    ///
+    /// The item half is [`State::promote_step`]'s shape — derive the target, then route it through
+    /// [`State::transition`] so `closed_at` and `updated_at` follow one rule — and the run half is
+    /// [`State::transition_run`]'s. What is new is the guard between them: the mirror is written
+    /// only when no *other* run of the item is still active, so a second live run holds the item
+    /// where it is rather than being lost.
+    fn finish_run(
+        &mut self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        // Plan D14's order, and every refusal is decided before the first write: lookup, then the
+        // two rules this writer owns, then the law.
+        let row = self.require_run(run)?;
+        let (from, item_id) = (row.status, row.item_id);
+        if !to.is_terminal() {
+            return Err(StoreError::Constraint(finish_run_needs_a_terminal_status(
+                run, to,
+            )));
+        }
+        if failure.is_some() != (to == RunStatus::Failed) {
+            return Err(StoreError::Constraint(failure_disagrees_with_status(
+                run,
+                to,
+                failure.is_some(),
+            )));
+        }
+        // A terminal row reaches nothing, so `run_is_terminal` would only say the same thing in a
+        // second sentence: the law already refuses `done -> done`.
+        legal_move(from, to)?;
+
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.status = to;
+            if let Some(text) = failure {
+                row.failure = Some(text.to_owned());
+            }
+            row.finished_at = row.finished_at.or(Some(at));
+            row.updated_at = now;
+        }
+
+        let Some(item) = item_id else {
+            // A chat run has no item to mirror (§5.8: `item_id` is nullable for `kind = 'chat'`).
+            return Ok(());
+        };
+        if self
+            .runs
+            .values()
+            .any(|other| other.item_id == Some(item) && other.id != run && other.status.is_active())
+        {
+            return Ok(());
+        }
+        let Some(status) = self.items.get(&item).map(|row| row.status) else {
+            return Ok(());
+        };
+        let target = match (to, status) {
+            (RunStatus::Done, Status::InProgress) => Status::Done,
+            (RunStatus::Failed, Status::InProgress | Status::AwaitingApproval) => Status::Failed,
+            (
+                RunStatus::Cancelled,
+                Status::Queued | Status::InProgress | Status::AwaitingApproval,
+            ) => Status::Open,
+            // Plan D17: MOD-2's chat path and the offline upload path insert rows outside §4.3, so
+            // an item at an unexpected status is left alone rather than forced through the law.
+            _ => return Ok(()),
+        };
+        self.transition(item, status, target, now)?;
+        Ok(())
+    }
+
     /// `R-TUI-9`'s three effects, one closure: everything refusable is decided first.
     fn close_out(
         &mut self,
@@ -4270,9 +4344,10 @@ impl WriteStore for MemStore {
         self.write(|state| state.delete_project(id))
     }
 
-    // MOD-4 milestone 1, in ANA-2 §8's order. `create_run`, `claim_run`, `select_fanout`,
-    // `write_document` and `close_out` are each a **single** `write` closure, so plan D6's five
-    // transactions are atomic here by construction and not by discipline.
+    // MOD-4 milestones 1 and 2, in ANA-2 §8's order. `create_run`, `claim_run`, `select_fanout`,
+    // `write_document`, `promote_step`, `finish_run` and `close_out` are each a **single** `write`
+    // closure, so plan M1 D6's and M2 D7's seven transactions are atomic here by construction and
+    // not by discipline.
 
     async fn create_run(&self, new: NewRun) -> Result<Run> {
         let now = Utc::now();
@@ -4387,6 +4462,17 @@ impl WriteStore for MemStore {
     async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> Result<()> {
         let now = Utc::now();
         self.write(|state| state.fail_run(run, failure, at, now))
+    }
+
+    async fn finish_run(
+        &self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.finish_run(run, to, failure, at, now))
     }
 
     async fn close_out(

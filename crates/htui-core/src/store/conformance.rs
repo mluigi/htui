@@ -81,6 +81,7 @@ pub const CASES: &[&str] = &[
     "write_document_allocates_its_version",
     "close_out_refuses_a_live_run",
     "illegal_transitions_are_constraint",
+    "finish_run_moves_run_and_item_together",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -159,6 +160,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "write_document_allocates_its_version" => write_document_allocates_its_version(store).await,
         "close_out_refuses_a_live_run" => close_out_refuses_a_live_run(store).await,
         "illegal_transitions_are_constraint" => illegal_transitions_are_constraint(store).await,
+        "finish_run_moves_run_and_item_together" => {
+            finish_run_moves_run_and_item_together(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -5661,6 +5665,231 @@ async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
     );
 }
 
+/// MOD-4 milestone 2, plan D7: the run's terminal move and the item's mirror are one act
+/// (ANA-2 §4.3's verdict table and the propagation rule at `:660-664`).
+///
+/// Six legs, in the order the writer's own checks run. The one the plan's Risks row names is the
+/// second: an item whose *other* run is still live stays where it is, so a store that derived the
+/// item from the finishing run alone would lose the second run. Getting two live graph runs onto
+/// one item takes a detour, because `create_run` admits only `open | failed` items and its own
+/// move leaves the item at `queued` — so the item is walked back `queued -> open` between the two
+/// creates, which is a sanctioned pair (`item.rs:46-60`) and the only way through the seam as
+/// milestone 1 shipped it.
+///
+/// The Postgres twin is `pg_criteria.rs::finish_run_holds_the_item_while_another_run_is_live`,
+/// which repeats that leg against a real server and adds the `closed_at` column this seam sets
+/// but does not project.
+async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
+    const CASE: &str = "finish_run_moves_run_and_item_together";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let until = at + TimeDelta::minutes(5);
+
+    // Leg 1: `done` reaches the item, and the finish stamps the caller's instant.
+    let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
+    let first = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert!(
+        store
+            .claim_run(first, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        "{CASE}: the run is admitted, so the item is in_progress"
+    );
+    store
+        .finish_run(first, RunStatus::Done, None, at)
+        .await
+        .expect(CASE);
+    let finished = run_row(CASE, store, first).await;
+    assert_eq!(finished.status, RunStatus::Done, "{CASE}: the run is done");
+    assert_eq!(
+        finished.finished_at,
+        Some(at),
+        "{CASE}: `finished_at` is the caller's clock, not the store's"
+    );
+    assert_eq!(
+        finished.failure, None,
+        "{CASE}: a `done` run has no failure"
+    );
+    let item = item_row(CASE, store, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        item.status,
+        Status::Done,
+        "{CASE}: the item moved with the run"
+    );
+    assert!(
+        item.closed_at.is_some(),
+        "{CASE}: `done` is terminal, so `closed_at` follows"
+    );
+    assert_eq!(
+        item.version, before.version,
+        "{CASE}: a transition writes no revision, so the version stands"
+    );
+
+    // Leg 2: the item is held while another run of it is still live (the plan's Risks row).
+    let held = ids::AGY_FEAT_1;
+    let left = store
+        .create_run(new_run(ids::PROJECT_AGY, held, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert!(
+        store
+            .transition(held, Status::Queued, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: the item is walked back so a second run can be queued on it"
+    );
+    let right = store
+        .create_run(new_run(ids::PROJECT_AGY, held, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    for run in [left, right] {
+        assert!(
+            store
+                .claim_run(run, ids::BOX, owner, at, until)
+                .await
+                .expect(CASE),
+            "{CASE}: both runs fit the box's two slots"
+        );
+    }
+    assert_eq!(
+        item_row(CASE, store, held).await.status,
+        Status::InProgress,
+        "{CASE}: the first claim took the item to in_progress"
+    );
+    store
+        .finish_run(left, RunStatus::Done, None, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        item_row(CASE, store, held).await.status,
+        Status::InProgress,
+        "{CASE}: the item is held while its other run is still live"
+    );
+    store
+        .finish_run(right, RunStatus::Done, None, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        item_row(CASE, store, held).await.status,
+        Status::Done,
+        "{CASE}: the last run out moves the item"
+    );
+
+    // Leg 3: `failed` carries its reason onto the run and its verdict onto the item.
+    let failing = store
+        .create_run(new_run(ids::PROJECT_AGY, ids::AGY_FIX_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert!(
+        store
+            .claim_run(failing, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        "{CASE}: the box is free again"
+    );
+    store
+        .finish_run(failing, RunStatus::Failed, Some("missing_output"), at)
+        .await
+        .expect(CASE);
+    let failed = run_row(CASE, store, failing).await;
+    assert_eq!(failed.status, RunStatus::Failed, "{CASE}: the run failed");
+    assert_eq!(
+        failed.failure.as_deref(),
+        Some("missing_output"),
+        "{CASE}: the reason is the caller's, written in the same act"
+    );
+    let failed_item = item_row(CASE, store, ids::AGY_FIX_1).await;
+    assert_eq!(
+        failed_item.status,
+        Status::Failed,
+        "{CASE}: in_progress -> failed mirrors the run"
+    );
+    assert_eq!(
+        failed_item.closed_at, None,
+        "{CASE}: `failed` is not terminal for an item, so `closed_at` stays clear"
+    );
+
+    // Leg 4: a `cancelled` run releases its item rather than ending it, from `queued` and with no
+    // claim in between — the only row of the table whose `from` is `queued`.
+    let cancelled = store
+        .create_run(new_run(ids::PROJECT_VULKAN, ids::VULKAN_TOOL_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    store
+        .finish_run(cancelled, RunStatus::Cancelled, None, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        run_row(CASE, store, cancelled).await.status,
+        RunStatus::Cancelled,
+        "{CASE}: the run is cancelled"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::VULKAN_TOOL_1).await.status,
+        Status::Open,
+        "{CASE}: a cancelled run hands the item back to the backlog"
+    );
+
+    // Leg 5: the three refusals, each decided before any write.
+    let live = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    for (to, failure, fragment) in [
+        (RunStatus::Running, None, "terminal status"),
+        (RunStatus::Done, Some("x"), "refused on a move to `done`"),
+        (RunStatus::Failed, None, "needs a failure text"),
+    ] {
+        let refused = store.finish_run(live, to, failure, at).await;
+        let Err(StoreError::Constraint(sentence)) = refused else {
+            panic!("{CASE}: `finish_run({to}, {failure:?})` is Constraint, got {refused:?}")
+        };
+        assert!(
+            sentence.contains(fragment),
+            "{CASE}: the refusal says `{fragment}`, got `{sentence}`"
+        );
+    }
+    assert_eq!(
+        run_row(CASE, store, live).await.status,
+        RunStatus::Queued,
+        "{CASE}: a refused finish writes nothing to the run"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_CLEAN_1).await.status,
+        Status::Queued,
+        "{CASE}: nor to its item"
+    );
+
+    // Leg 6: plan D14's precedence — the row is looked up before the target is judged, so an
+    // unknown run answers `NotFound` even when `to` is also wrong.
+    let unknown = store
+        .finish_run(RunId::new(), RunStatus::Running, None, at)
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
+        "{CASE}: an unknown run is NotFound before the terminal check, got {unknown:?}"
+    );
+
+    // Leg 7: a terminal run reaches nothing, `done -> done` included.
+    let again = store.finish_run(first, RunStatus::Done, None, at).await;
+    let Err(StoreError::Constraint(sentence)) = again else {
+        panic!("{CASE}: finishing a finished run is Constraint, got {again:?}")
+    };
+    assert!(
+        sentence.contains(RunStatus::Done.as_str()) && sentence.contains("§4.3"),
+        "{CASE}: the refusal is `illegal_move`'s sentence, got `{sentence}`"
+    );
+}
+
 // ------------------------------------------------------------------------------------------------
 // READ_CASES: the read-only half, so the mirror can be a target too (plan D96)
 // ------------------------------------------------------------------------------------------------
@@ -6393,7 +6622,7 @@ mod tests {
         /// `.rs` instead - which is how these four shipped - is no longer possible: a span that
         /// joins two snake_case halves with `::` and whose right half reads like a test name is a
         /// failure below, because that shape reaches neither arm and was silently skipped.
-        const PENDING: &[&str] = &[];
+        const PENDING: &[&str] = &["finish_run_holds_the_item_while_another_run_is_live"];
 
         // Another crate's integration test binary, so it is read at run time rather than through
         // `include_str!`: `htui-core` must not take a compile-time dependency on `htui-store`.
