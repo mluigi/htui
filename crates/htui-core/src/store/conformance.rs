@@ -4951,10 +4951,7 @@ async fn select_fanout_is_one_transaction<S: WriteStore>(store: &S) {
     let arbiter = settled(broken).await;
     assert_eq!(
         (arbiter.status, arbiter.gate_note.as_deref()),
-        (
-            StepStatus::Failed,
-            Some("the verdict block did not parse")
-        ),
+        (StepStatus::Failed, Some("the verdict block did not parse")),
         "{CASE}: a judge that failed keeps the status and the reason the human picked from"
     );
     assert_eq!(

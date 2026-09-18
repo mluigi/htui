@@ -42,10 +42,9 @@ use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
     WriteStore, already_exists, chat_step_status, close_out_needs_a_summary, expected_on_row,
     graph_not_in_project, invalid_prefix, item_has_a_live_run, item_kind_is_held,
-    item_not_in_project, legal_move,
-    not_a_fanout_candidate, not_a_terminal_status, references_no_row, reserved_phase_name,
-    row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
-    summary_names_another_item, winner_is_not_settled,
+    item_not_in_project, legal_move, not_a_fanout_candidate, not_a_terminal_status,
+    references_no_row, reserved_phase_name, row_names_another_step, run_is_terminal,
+    step_is_not_promotable, step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
 };
 use uuid::Uuid;
 
