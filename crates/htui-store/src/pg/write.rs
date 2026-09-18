@@ -17,23 +17,23 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, GateOutcome, Isolation, Item, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
-    Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptTemplateId, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, BoxSettings, ChatRunSpec, DEFAULT_MAX_CONCURRENT_ITEMS,
+    Document, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemRevision, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun,
+    NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId,
+    VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung, StoreError,
-    StoredSetting, UpdateOutcome, WriteStore, chat_step_status, expected_on_row,
-    graph_not_in_project, invalid_prefix, item_kind_is_held, not_a_terminal_status,
-    reserved_phase_name,
+    StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, chat_step_status, expected_on_row,
+    graph_not_in_project, illegal_move, invalid_prefix, item_kind_is_held, legal_move,
+    not_a_terminal_status, reserved_phase_name,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -72,6 +72,31 @@ fn cas_miss<T>(
             entity,
             id: id.to_string(),
         })
+}
+
+/// The refusal a pair outside ANA-2 §4.3 gets, in plan D14's order (MOD-4 T2).
+///
+/// The law is checked **before** the update, so an illegal pair never writes; but precedence says
+/// the row is looked up first, and an id that names nothing is [`StoreError::NotFound`] even when
+/// its `(from, to)` is also illegal. `exists` is that lookup's answer, which the caller runs
+/// because `query_scalar!` needs a literal table name.
+///
+/// The cost is one extra round trip on a path that is already an error: every legal `(from, to)`
+/// goes straight to its compare-and-set and never reaches here (blueprint §3.6).
+fn refuse_illegal_move<T: TransitionLaw, R>(
+    exists: bool,
+    id: impl core::fmt::Display,
+    from: T,
+    to: T,
+) -> Result<R> {
+    if exists {
+        Err(StoreError::Constraint(illegal_move(T::ENTITY, from, to)))
+    } else {
+        Err(StoreError::NotFound {
+            entity: T::ENTITY,
+            id: id.to_string(),
+        })
+    }
 }
 
 /// A `count(*)` as the `u64` [`DeleteReach`] holds. Postgres counts as `bigint` and never
@@ -446,7 +471,21 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] when the item does not exist. A `from` that does not match the
     /// current status is `Ok(false)`, not an error, exactly as `MemStore` answers.
+    ///
+    /// [`StoreError::Constraint`] when `(from, to)` is outside the §4.3 table, decided in
+    /// `htui-core` by [`legal_move`] and **before** the `UPDATE`, so a refused pair leaves the row
+    /// byte-identical (plan D15). The `NotFound` above still wins on an unknown id (plan D14),
+    /// which is what the existence probe in that branch is for.
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
+        if !from.can_move_to(to) {
+            let exists = sqlx::query_scalar!("SELECT 1 FROM item WHERE id = $1", id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?
+                .is_some();
+            return refuse_illegal_move(exists, id, from, to);
+        }
+
         let moved = sqlx::query!(
             "UPDATE item \
                 SET status    = $3, \
@@ -2126,70 +2165,550 @@ impl WriteStore for PgStore {
     // -------------------------------------------------------------------------------------------
     // ANA-2 §8's eighteen run writers (MOD-4 milestone 1, plan D1).
     //
-    // Declared here, unwritten, from the commit that makes the crate compile again (blueprint
-    // H-8): the trait has no default bodies, so `PgStore` cannot satisfy `WriteStore` without
-    // them, and the SQL of each lands in the blueprint §3.11 commit that owns it — creation,
-    // admission, lease and CAS in 4; settle, gates, fan-out, trees and commits in 5; documents,
-    // close-out and failure in 6. The conformance cases that call them (37-47) are red until
-    // then, which is exactly what `EXPECTED_CASES` still saying 36 records.
+    // Declared here from the commit that makes the crate compile again (blueprint H-8): the trait
+    // has no default bodies, so `PgStore` cannot satisfy `WriteStore` without them, and the SQL of
+    // each lands in the blueprint §3.11 commit that owns it — creation, admission, lease and CAS
+    // in 4; settle, gates, fan-out, trees and commits in 5; documents, close-out and failure in 6.
+    // The conformance cases that call the still-unwritten ones are red until then, which is what
+    // `EXPECTED_CASES` still saying 36 records.
     // -------------------------------------------------------------------------------------------
 
-    async fn create_run(&self, _new: NewRun) -> Result<Run> {
-        todo!("MOD-4 T2 commit 4")
+    /// The `run` row and the item's move to `queued`, together or not at all (plan D6, ANA-2 §5.1).
+    ///
+    /// The item is locked `FOR UPDATE` before the law is consulted, so the status the refusal
+    /// names and the status the `UPDATE` matches on are the same one: between them nothing else
+    /// can move the row. That lock is also what makes the "impossible" zero-row branch below
+    /// impossible rather than merely unlikely.
+    ///
+    /// Every other rule is the schema's: `project_id`, `target_box_id`, `started_by` and each
+    /// `repo_scope` entry are foreign keys, a repeated `id` is the primary key, and a `graph` run
+    /// without a snapshot is `ck_run_graph_snapshot` — all `23xxx`, all
+    /// [`StoreError::Constraint`] through [`map_sqlx`], which is the same answer `MemStore` spells
+    /// out by hand.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
+    /// [`StoreError::Constraint`] when the item cannot reach `queued`, when the id is taken, or on
+    /// any of the keys above. Nothing is written on any of them.
+    async fn create_run(&self, new: NewRun) -> Result<Run> {
+        let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
+            StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
+        })?;
+        let scope: Vec<Uuid> = new
+            .repo_scope
+            .iter()
+            .copied()
+            .map(RepoId::as_uuid)
+            .collect();
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let status = sqlx::query_scalar!(
+            r#"SELECT status AS "status: Status" FROM item WHERE id = $1 FOR UPDATE"#,
+            new.item_id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "item",
+            id: new.item_id.to_string(),
+        })?;
+        legal_move(status, Status::Queued)?;
+
+        let run = sqlx::query_as!(
+            Run,
+            r#"
+            INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,
+                             executing_box_id, graph_snapshot, started_by, queued_at, repo_scope)
+            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[])
+            RETURNING id               AS "id: RunId",
+                      project_id       AS "project_id: ProjectId",
+                      item_id          AS "item_id: ItemId",
+                      kind             AS "kind: RunKind",
+                      mode             AS "mode: RunMode",
+                      status           AS "status: RunStatus",
+                      target_box_id    AS "target_box_id: BoxId",
+                      executing_box_id AS "executing_box_id: BoxId",
+                      graph_snapshot,
+                      started_by       AS "started_by: UserId",
+                      queued_at,
+                      started_at,
+                      finished_at,
+                      failure,
+                      repo_scope       AS "repo_scope: Vec<RepoId>",
+                      lease_box_id     AS "lease_box_id: BoxId",
+                      lease_expires_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.project_id.as_uuid(),
+            new.item_id.as_uuid(),
+            new.mode.as_str(),
+            new.target_box_id.as_uuid(),
+            snapshot,
+            new.started_by.as_uuid(),
+            new.queued_at,
+            &scope,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        // `closed_at` follows the *current* status, exactly as `transition` writes it: `queued` is
+        // not terminal, so a retry out of `failed` clears the stamp the failure left.
+        let moved = sqlx::query!(
+            "UPDATE item SET status = 'queued', closed_at = NULL WHERE id = $1 AND status = $2",
+            new.item_id.as_uuid(),
+            status.as_str(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        if moved != 1 {
+            return Err(StoreError::Constraint(concurrent_write(
+                "item",
+                new.item_id,
+                "the status the run was queued against",
+            )));
+        }
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(run)
     }
 
+    /// ANA-2 §4.7's admission, one transaction with the box row locked for its whole length.
+    ///
+    /// `SELECT ... FOR UPDATE` on `box` is the critical section (§4.7, `docs/ANA-2.md:1094`): the
+    /// slot count and the overlap check are read-then-write decisions, and without the lock two
+    /// claimers can both read "one slot free" and both take it. The Postgres-only pin is
+    /// `pg_criteria.rs::admission_is_serialised_by_the_box_row_lock`.
+    ///
+    /// **Two predicates over two sets**, which §4.7 draws apart on purpose. The slot count is
+    /// `status = 'running'` alone — "an `awaiting_approval` run consumes no compute and must not
+    /// hold a slot" (`docs/ANA-2.md:1110`) — while the overlap predicate ranges over the
+    /// non-terminal set, `awaiting_approval` included, because a parked run still owns its trees
+    /// and its unmerged branch (invariant 6). A `queued` run is in neither: it has no
+    /// `executing_box_id`.
+    ///
+    /// An empty `repo_scope` intersects nothing — `'{}' && anything` is false — so a run that
+    /// declared no scope is never refused for overlap (hazard H-10).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run" }` or `{ entity: "box" }`, the run looked up
+    /// first. Every refusal that is not an error is `Ok(false)` with nothing written.
     async fn claim_run(
         &self,
-        _run: RunId,
-        _box_id: BoxId,
-        _owner: Uuid,
-        _at: DateTime<Utc>,
-        _lease_until: DateTime<Utc>,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        at: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T2 commit 4")
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let claimed = sqlx::query!(
+            r#"
+            SELECT status        AS "status: RunStatus",
+                   target_box_id AS "target_box_id: BoxId",
+                   repo_scope    AS "repo_scope: Vec<RepoId>"
+              FROM run WHERE id = $1 FOR UPDATE
+            "#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: run.to_string(),
+        })?;
+
+        let settings = sqlx::query_scalar!(
+            "SELECT settings FROM box WHERE id = $1 FOR UPDATE",
+            box_id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "box",
+            id: box_id.to_string(),
+        })?;
+
+        if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
+            return Ok(false);
+        }
+
+        let limit = match serde_json::from_value::<BoxSettings>(settings)
+            .ok()
+            .and_then(|settings| settings.max_concurrent_items)
+        {
+            Some(limit) => limit,
+            None => sqlx::query_scalar!(
+                "SELECT value FROM app_setting WHERE key = 'max_concurrent_items'"
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_ITEMS),
+        };
+
+        let running = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM run WHERE executing_box_id = $1 AND status = 'running'",
+            box_id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .unwrap_or(0);
+        if rows(running) >= u64::from(limit) {
+            return Ok(false);
+        }
+
+        let scope: Vec<Uuid> = claimed
+            .repo_scope
+            .iter()
+            .copied()
+            .map(RepoId::as_uuid)
+            .collect();
+        let overlaps = sqlx::query_scalar!(
+            "SELECT EXISTS (SELECT 1 FROM run \
+              WHERE executing_box_id = $1 \
+                AND status IN ('running','awaiting_approval') \
+                AND repo_scope && $2::uuid[])",
+            box_id.as_uuid(),
+            &scope,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .unwrap_or(false);
+        if overlaps {
+            return Ok(false);
+        }
+
+        sqlx::query!(
+            "UPDATE run \
+                SET status           = 'running', \
+                    executing_box_id = $2, \
+                    started_at       = COALESCE(started_at, $4), \
+                    lease_box_id     = $2, \
+                    lease_owner      = $3, \
+                    lease_expires_at = $5 \
+              WHERE id = $1 AND status = 'queued'",
+            run.as_uuid(),
+            box_id.as_uuid(),
+            owner,
+            at,
+            lease_until,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        // A stale item status is not a refusal: the run is what is being claimed, and zero rows
+        // here means someone else already moved the item on.
+        sqlx::query!(
+            "UPDATE item SET status = 'in_progress', closed_at = NULL \
+              WHERE id = (SELECT item_id FROM run WHERE id = $1) AND status = 'queued'",
+            run.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(true)
     }
 
-    async fn refresh_lease(
-        &self,
-        _run: RunId,
-        _owner: Uuid,
-        _until: DateTime<Utc>,
-    ) -> Result<bool> {
-        todo!("MOD-4 T2 commit 4")
+    /// ANA-2 §4.9's heartbeat: a compare-and-set on `lease_owner`, not on the expiry.
+    ///
+    /// Zero rows is the abandon signal, and it is `Ok(false)` rather than an error — the caller is
+    /// meant to stop working, not to crash. `lease_owner` is not a [`Run`] field (blueprint F-S),
+    /// so this answer is the only way ownership is observable.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
+    /// from "not ours" by the one follow-up read [`WriteStore::transition`] has always used.
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
+        let moved = sqlx::query!(
+            "UPDATE run SET lease_expires_at = $3 WHERE id = $1 AND lease_owner = $2",
+            run.as_uuid(),
+            owner,
+            until,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if moved == 1 {
+            return Ok(true);
+        }
+
+        let exists = sqlx::query_scalar!("SELECT 1 FROM run WHERE id = $1", run.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .is_some();
+
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            })
+        }
     }
 
+    /// ANA-2 §4.9's sweep: every `running` run on the box whose lease is `NULL` or expired at
+    /// `now` becomes `owner`'s, in one statement.
+    ///
+    /// `RETURNING` cannot carry an `ORDER BY`, so the update is a CTE and the ordering is the
+    /// `SELECT` over it — `queued_at`, as the contract says. A box that does not exist matches
+    /// nothing and adopts nothing, which is an empty vector rather than a refusal.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
     async fn adopt_runs(
         &self,
-        _box_id: BoxId,
-        _owner: Uuid,
-        _now: DateTime<Utc>,
-        _lease_until: DateTime<Utc>,
+        box_id: BoxId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
     ) -> Result<Vec<Run>> {
-        todo!("MOD-4 T2 commit 4")
+        sqlx::query_as!(
+            Run,
+            r#"
+            WITH swept AS (
+                UPDATE run
+                   SET lease_owner      = $2,
+                       lease_box_id     = $1,
+                       lease_expires_at = $4
+                 WHERE executing_box_id = $1
+                   AND status = 'running'
+                   AND (lease_expires_at IS NULL OR lease_expires_at <= $3)
+             RETURNING *
+            )
+            SELECT id               AS "id: RunId",
+                   project_id       AS "project_id: ProjectId",
+                   item_id          AS "item_id: ItemId",
+                   kind             AS "kind: RunKind",
+                   mode             AS "mode: RunMode",
+                   status           AS "status: RunStatus",
+                   target_box_id    AS "target_box_id: BoxId",
+                   executing_box_id AS "executing_box_id: BoxId",
+                   graph_snapshot,
+                   started_by       AS "started_by: UserId",
+                   queued_at,
+                   started_at,
+                   finished_at,
+                   failure,
+                   repo_scope       AS "repo_scope: Vec<RepoId>",
+                   lease_box_id     AS "lease_box_id: BoxId",
+                   lease_expires_at,
+                   updated_at
+              FROM swept
+             ORDER BY queued_at
+            "#,
+            box_id.as_uuid(),
+            owner,
+            now,
+            lease_until,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
-    async fn create_step(&self, _new: NewRunStep) -> Result<RunStep> {
-        todo!("MOD-4 T2 commit 4")
+    /// A `run_step` at `pending` with every settle column `NULL`; `fanout_index = -1` is the judge
+    /// and is accepted, because no `CHECK` on that column exists or may be added (ANA-2 risk 12).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] on an unknown run or agent (foreign key), a repeated `id`
+    /// (primary key) or a repeated `(run_id, position, attempt, fanout_index)` — the table's own
+    /// `UNIQUE`, which is why this writer has no guard of its own.
+    async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
+        sqlx::query_as!(
+            RunStep,
+            r#"
+            INSERT INTO run_step (id, run_id, position, attempt, fanout_index, phase_name,
+                                  agent_id, model, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+            RETURNING id                  AS "id: StepId",
+                      run_id              AS "run_id: RunId",
+                      position,
+                      attempt,
+                      fanout_index,
+                      phase_name,
+                      agent_id            AS "agent_id: AgentId",
+                      model,
+                      status              AS "status: StepStatus",
+                      gate_outcome        AS "gate_outcome: GateOutcome",
+                      gate_note,
+                      selected,
+                      exit_code,
+                      prompt_digest,
+                      trim_record,
+                      usage,
+                      isolation_path,
+                      started_at,
+                      finished_at,
+                      verify_outcome      AS "verify_outcome: VerifyOutcome",
+                      verify_exit_code,
+                      promoted_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.run_id.as_uuid(),
+            new.position,
+            new.attempt,
+            new.fanout_index,
+            new.phase_name,
+            new.agent_id.map(AgentId::as_uuid),
+            new.model,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
+    /// §4.3's compare-and-set on `run.status`, in [`WriteStore::transition`]'s shape with §4.3's
+    /// two stamps: `started_at` on the move to `running`, `finished_at` on a move to a terminal
+    /// status, both `COALESCE`d so a second arrival never re-stamps.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run" }`; [`StoreError::Constraint`] for a pair outside
+    /// [`RunStatus::can_move_to`], refused before the `UPDATE` (plan D14/D15).
     async fn transition_run(
         &self,
-        _run: RunId,
-        _from: RunStatus,
-        _to: RunStatus,
-        _at: DateTime<Utc>,
+        run: RunId,
+        from: RunStatus,
+        to: RunStatus,
+        at: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T2 commit 4")
+        if !from.can_move_to(to) {
+            let exists = sqlx::query_scalar!("SELECT 1 FROM run WHERE id = $1", run.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?
+                .is_some();
+            return refuse_illegal_move(exists, run, from, to);
+        }
+
+        let moved = sqlx::query!(
+            "UPDATE run \
+                SET status      = $3, \
+                    started_at  = CASE WHEN $3 = 'running' \
+                                       THEN COALESCE(started_at, $4) ELSE started_at END, \
+                    finished_at = CASE WHEN $3 IN ('done','failed','cancelled') \
+                                       THEN COALESCE(finished_at, $4) ELSE finished_at END \
+              WHERE id = $1 AND status = $2",
+            run.as_uuid(),
+            from.as_str(),
+            to.as_str(),
+            at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if moved == 1 {
+            return Ok(true);
+        }
+
+        let exists = sqlx::query_scalar!("SELECT 1 FROM run WHERE id = $1", run.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .is_some();
+
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            })
+        }
     }
 
+    /// The `run_step` twin of [`transition_run`](WriteStore::transition_run). Its terminal set is
+    /// the narrower one of [`StepStatus::is_terminal`]: `failed` is **not** in it, because a
+    /// failed step can still be promoted to a gate (§4.8).
+    ///
+    /// `awaiting_approval -> awaiting_approval` is the one self-move §4.3 sanctions, and it goes
+    /// through this compare-and-set unremarkably: the `WHERE` matches the row it is already on.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] for a pair
+    /// outside [`StepStatus::can_move_to`], refused before the `UPDATE`.
     async fn transition_step(
         &self,
-        _step: StepId,
-        _from: StepStatus,
-        _to: StepStatus,
-        _at: DateTime<Utc>,
+        step: StepId,
+        from: StepStatus,
+        to: StepStatus,
+        at: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T2 commit 4")
+        if !from.can_move_to(to) {
+            let exists =
+                sqlx::query_scalar!("SELECT 1 FROM run_step WHERE id = $1", step.as_uuid())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_sqlx)?
+                    .is_some();
+            return refuse_illegal_move(exists, step, from, to);
+        }
+
+        let moved = sqlx::query!(
+            "UPDATE run_step \
+                SET status      = $3, \
+                    started_at  = CASE WHEN $3 = 'running' \
+                                       THEN COALESCE(started_at, $4) ELSE started_at END, \
+                    finished_at = CASE WHEN $3 IN ('done','cancelled','superseded') \
+                                       THEN COALESCE(finished_at, $4) ELSE finished_at END \
+              WHERE id = $1 AND status = $2",
+            step.as_uuid(),
+            from.as_str(),
+            to.as_str(),
+            at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if moved == 1 {
+            return Ok(true);
+        }
+
+        let exists = sqlx::query_scalar!("SELECT 1 FROM run_step WHERE id = $1", step.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .is_some();
+
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })
+        }
     }
 
     async fn finish_step(&self, _step: StepId, _outcome: StepOutcome) -> Result<()> {
@@ -2217,8 +2736,50 @@ impl WriteStore for PgStore {
         todo!("MOD-4 T2 commit 5")
     }
 
-    async fn supersede_step(&self, _step: StepId) -> Result<()> {
-        todo!("MOD-4 T2 commit 4")
+    /// §4.4's loop half: `pending | awaiting_approval | done -> superseded`, and nothing else.
+    ///
+    /// The refusal is the law's table and not a stale compare-and-set, so the follow-up read has
+    /// to fetch the *status* rather than a bare `SELECT 1`: it is what
+    /// [`illegal_move`] names in the sentence.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] from any
+    /// other status.
+    async fn supersede_step(&self, step: StepId) -> Result<()> {
+        let moved = sqlx::query!(
+            "UPDATE run_step SET status = 'superseded' \
+              WHERE id = $1 AND status IN ('pending','awaiting_approval','done')",
+            step.as_uuid(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if moved == 1 {
+            return Ok(());
+        }
+
+        let current = sqlx::query_scalar!(
+            r#"SELECT status AS "status: StepStatus" FROM run_step WHERE id = $1"#,
+            step.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        match current {
+            Some(status) => Err(StoreError::Constraint(illegal_move(
+                "run_step",
+                status,
+                StepStatus::Superseded,
+            ))),
+            None => Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            }),
+        }
     }
 
     async fn upsert_step_tree(&self, _step: StepId, _trees: &[RunStepTree]) -> Result<()> {

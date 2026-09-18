@@ -263,7 +263,13 @@ pub struct RunStep {
 }
 
 /// Fractional-second digits Postgres `timestamptz` keeps: microseconds (§5.8).
-const TIMESTAMPTZ_DIGITS: u16 = 6;
+///
+/// Public because [`ChatRunSpec::mint`] is no longer the only caller that has to respect it. Every
+/// ANA-2 §8 writer takes its `started_at` / `finished_at` / `lease_expires_at` / `promoted_at` from
+/// the caller (blueprint F-S) and hands the stored value back, so a clock reading finer than this
+/// comes back from Postgres different from the one the caller still holds — while `MemStore` keeps
+/// it whole, and the two backends disagree about a column neither of them changed.
+pub const TIMESTAMPTZ_DIGITS: u16 = 6;
 
 /// The two rows a free-standing chat needs before its first event can be recorded: one `run`
 /// (`kind = 'chat'`, `item_id NULL`) and one `run_step` (`phase_name = 'chat'`, position 0)

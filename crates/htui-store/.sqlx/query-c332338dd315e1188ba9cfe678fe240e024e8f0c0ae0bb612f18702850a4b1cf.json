@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET status      = $3, started_at  = CASE WHEN $3 = 'running' THEN COALESCE(started_at, $4) ELSE started_at END, finished_at = CASE WHEN $3 IN ('done','cancelled','superseded') THEN COALESCE(finished_at, $4) ELSE finished_at END WHERE id = $1 AND status = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c332338dd315e1188ba9cfe678fe240e024e8f0c0ae0bb612f18702850a4b1cf"
+}

@@ -14,13 +14,14 @@
 
 use htui_store::testkit as common;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
-    NewItem, NewProject, NewWorkspace, ProjectId, Status, StepId, Transport, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch,
+    Agent, AgentBox, AgentId, Billing, BoxId, GraphSnapshot, Isolation, ItemFilter, ItemId,
+    ItemKindId, ItemKindPatch, ItemPatch, NewItem, NewProject, NewRun, NewWorkspace, ProjectId,
+    RunId, RunMode, RunStatus, SnapshotGraph, SnapshotSettings, Status, StepId, Transport,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -468,6 +469,15 @@ async fn a_diverged_edit_writes_no_revision() {
 
 /// The status compare-and-set never touches `version`, and `closed_at` follows the current status
 /// in both directions (§4.2, blueprint H.12).
+///
+/// Plan D4's fourth call site (blueprint §3.9(a)): `open -> done` is **not** in the ANA-2 §4.3
+/// table, so since MOD-4 T2 it is [`StoreError::Constraint`] rather than a landed move. The legs
+/// that follow need the row actually sitting at `done` with `closed_at` set, so the item is driven
+/// there along the sanctioned path `open -> queued -> in_progress -> done` — the same shape
+/// `conformance.rs::status_cas_keeps_version` now uses. The two legs after it stay exactly as they
+/// were: `done -> open` is a sanctioned reopen and `done -> closed` from a row that is at `open`
+/// is a *stale* `from` on a *legal* pair, which is the `Ok(false)` this case exists to tell apart
+/// from the new `Constraint`.
 #[tokio::test(flavor = "multi_thread")]
 async fn status_cas_never_bumps_version() {
     let Some(db) = common::demo_db().await else {
@@ -482,13 +492,27 @@ async fn status_cas_never_bumps_version() {
     assert_eq!(before.status, Status::Open, "fixture precondition");
     assert_eq!(before.closed_at, None, "fixture precondition");
 
+    let illegal = db
+        .store
+        .transition(before.id, Status::Open, Status::Done)
+        .await;
     assert!(
-        db.store
-            .transition(before.id, Status::Open, Status::Done)
-            .await
-            .expect("transition must not fail"),
-        "open -> done matches"
+        matches!(illegal, Err(htui_core::store::StoreError::Constraint(_))),
+        "open -> done is outside §4.3 and is refused before the UPDATE, got {illegal:?}"
     );
+    for (from, to) in [
+        (Status::Open, Status::Queued),
+        (Status::Queued, Status::InProgress),
+        (Status::InProgress, Status::Done),
+    ] {
+        assert!(
+            db.store
+                .transition(before.id, from, to)
+                .await
+                .expect("transition must not fail"),
+            "{from} -> {to} matches"
+        );
+    }
     let done = db
         .store
         .item(before.id)
@@ -530,16 +554,160 @@ async fn status_cas_never_bumps_version() {
             .expect("transition must not fail"),
         "a stale `from` is refused rather than applied"
     );
+    // Plan D14's precedence, and the reason this leg keeps the pair the first one now refuses: the
+    // id names nothing, so the answer is `NotFound` **even though** `open -> done` is also illegal.
     let missing = db
         .store
         .transition(ItemId::new(), Status::Open, Status::Done)
         .await;
     assert!(
         matches!(missing, Err(htui_core::store::StoreError::NotFound { .. })),
-        "an unknown item is NotFound, not `false`, got {missing:?}"
+        "an unknown item is NotFound, not `false` and not Constraint, got {missing:?}"
     );
 
     db.drop_db().await;
+}
+
+/// ANA-2 §4.7's critical section, and the one thing about it no `MemStore` case can show: two
+/// concurrent `claim_run`s against a box with a single free slot, and exactly one `true`.
+///
+/// The rules of admission are decided by `conformance.rs::claim_run_admits_one_and_refuses_the_second`
+/// and `mem.rs::claim_run_refuses_an_overlapping_scope_and_a_full_box`. What is decided *here* is
+/// that the decision is **serialised**: the slot count is a read followed by a write, and under
+/// `READ COMMITTED` without the `SELECT ... FOR UPDATE` on the `box` row (§4.7,
+/// `docs/ANA-2.md:1094`) both claimers count zero `running` runs — neither has committed one yet —
+/// and both take the last slot. The lock is what makes the second claimer block until the first
+/// commits and then count the run the first started.
+///
+/// Two independent pools, as §11.3's race cases use: one pool would only serialise the claims if
+/// it happened to be size 1, which is not a property this case may lean on.
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_is_serialised_by_the_box_row_lock() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    // One slot, so "both won" and "one won" are answers that differ. The fixture box seeds two.
+    sqlx::query!(
+        r#"UPDATE box SET settings = '{"max_concurrent_items": 1}'::jsonb WHERE id = $1"#,
+        ids::BOX.as_uuid(),
+    )
+    .execute(&db.pool)
+    .await
+    .expect("narrow the box to one slot");
+
+    // Empty `repo_scope` on both, so the only thing that can refuse the second claim is the slot
+    // count: a scope overlap would make the case pass for the wrong reason (hazard H-10).
+    let mut queued = Vec::new();
+    for item in [ids::HTUI_ANA_2, ids::HTUI_CLEAN_1] {
+        queued.push(
+            db.store
+                .create_run(race_run(item))
+                .await
+                .expect("queue a graph run")
+                .id,
+        );
+    }
+    let [first, second] = queued[..] else {
+        panic!("two runs were queued")
+    };
+
+    let other = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let at = Utc::now();
+    let until = at + TimeDelta::minutes(5);
+    let (one, two) = tokio::join!(
+        db.store
+            .claim_run(first, ids::BOX, uuid::Uuid::now_v7(), at, until),
+        other.claim_run(second, ids::BOX, uuid::Uuid::now_v7(), at, until),
+    );
+    let one = one.expect("the first claim must not fail");
+    let two = two.expect("the second claim must not fail");
+
+    assert_eq!(
+        usize::from(one) + usize::from(two),
+        1,
+        "exactly one claim may take the last slot, got ({one}, {two})"
+    );
+    assert_eq!(
+        count_running_on_box(&db.pool, ids::BOX).await,
+        1,
+        "the box that was allowed one concurrent run holds one"
+    );
+
+    let loser = if one { second } else { first };
+    let refused = db
+        .store
+        .run(loser)
+        .await
+        .expect("read must not fail")
+        .expect("the refused run still exists");
+    assert_eq!(
+        refused.status,
+        RunStatus::Queued,
+        "the refused claim left its run queued"
+    );
+    assert_eq!(
+        (
+            refused.executing_box_id,
+            refused.started_at,
+            refused.lease_expires_at
+        ),
+        (None, None, None),
+        "and wrote neither the box, the start nor the lease"
+    );
+
+    db.drop_db().await;
+}
+
+/// The `running` runs of one box, counted straight from the table so the assertion does not rest
+/// on the reader under test.
+async fn count_running_on_box(pool: &PgPool, box_id: BoxId) -> i64 {
+    sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM run WHERE executing_box_id = $1 AND status = 'running'",
+        box_id.as_uuid(),
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count the running runs")
+    .unwrap_or(0)
+}
+
+/// A graph-run request for `item` with an empty `repo_scope`, on the fixture's box and user.
+///
+/// The snapshot is the shortest value `ck_run_graph_snapshot` accepts and §5.1 decodes: this case
+/// never reads it back, so there is nothing to gain from the fixture's fuller one.
+fn race_run(item: ItemId) -> NewRun {
+    NewRun {
+        id: RunId::new(),
+        project_id: ids::PROJECT_HTUI,
+        item_id: item,
+        mode: RunMode::Manual,
+        target_box_id: ids::BOX,
+        started_by: ids::USER,
+        graph_snapshot: GraphSnapshot {
+            v: GraphSnapshot::V,
+            graph: SnapshotGraph {
+                id: ids::GRAPH_HTUI_FEAT,
+                name: "feature".to_owned(),
+                is_override: false,
+            },
+            topology: "sha256:pg_criteria".to_owned(),
+            mode: RunMode::Manual,
+            phases: Vec::new(),
+            settings: SnapshotSettings {
+                default_isolation: Isolation::Worktree,
+                per_token_cap_run: None,
+                per_token_cap_batch: None,
+                max_fan_out: 4,
+                max_agents_per_run: 6,
+            },
+        },
+        repo_scope: Vec::new(),
+        queued_at: Utc::now(),
+    }
 }
 
 /// §11.4, Postgres half: 5 000 events inserted out of order replay in `seq` order, content equal.
@@ -796,7 +964,7 @@ async fn chat_run_rows_converge_with_the_offline_mint() {
     );
 
     // Closing it is what takes it back out of the active count (assumption A1).
-    let closed_at = chat.started_at + chrono::TimeDelta::seconds(5);
+    let closed_at = chat.started_at + TimeDelta::seconds(5);
     db.store
         .finish_chat_run(chat.run_id, chat.step_id, RunStatus::Done, closed_at)
         .await
@@ -857,7 +1025,7 @@ async fn an_offline_first_chat_keeps_the_uploaded_columns() {
 
     // Event stamps deliberately away from `chat.started_at`, so a row carrying the spec's stamp is
     // distinguishable from one carrying the buffer's.
-    let first_at = chat.started_at + chrono::TimeDelta::seconds(30);
+    let first_at = chat.started_at + TimeDelta::seconds(30);
     let events: Vec<SessionEvent> = (0..3)
         .map(|seq| SessionEvent {
             run_step_id: chat.step_id,
@@ -868,10 +1036,10 @@ async fn an_offline_first_chat_keeps_the_uploaded_columns() {
             tool_call_id: None,
             payload: serde_json::json!({ "text": format!("offline chunk {seq}") }),
             raw: None,
-            at: first_at + chrono::TimeDelta::seconds(i64::from(seq)),
+            at: first_at + TimeDelta::seconds(i64::from(seq)),
         })
         .collect();
-    let last_at = first_at + chrono::TimeDelta::seconds(2);
+    let last_at = first_at + TimeDelta::seconds(2);
 
     let root = tempfile::tempdir().expect("temp cache root");
     append_pending(root.path(), chat.project_id, chat.run_id, &events)
@@ -1019,7 +1187,7 @@ async fn an_uploaded_offline_chat_carries_its_digest_and_usage() {
         Some(ids::AGENT_CLAUDE),
         None,
     );
-    let at = |seq: i64| chat.started_at + chrono::TimeDelta::seconds(seq);
+    let at = |seq: i64| chat.started_at + TimeDelta::seconds(seq);
     let row =
         |seq: i32, kind: EventKind, role: EventRole, payload: serde_json::Value| SessionEvent {
             run_step_id: chat.step_id,
@@ -1182,7 +1350,7 @@ async fn a_duplicated_line_in_a_buffer_is_counted_once() {
             tool_call_id: None,
             payload,
             raw: None,
-            at: chat.started_at + chrono::TimeDelta::seconds(i64::from(seq)),
+            at: chat.started_at + TimeDelta::seconds(i64::from(seq)),
         };
     let events = vec![
         row(
@@ -1926,7 +2094,7 @@ async fn an_upsert_can_neither_set_nor_clear_the_quota_columns() {
     /// `quota`, `quota_at` and the one probe column, straight out of SQL.
     async fn columns(
         pool: &PgPool,
-        box_id: htui_core::model::BoxId,
+        box_id: BoxId,
     ) -> (
         Option<serde_json::Value>,
         Option<DateTime<Utc>>,
@@ -2150,7 +2318,7 @@ async fn inherent_prompt_reads_answer_the_fixture() {
     );
     assert!(
         db.store
-            .box_profile(htui_core::model::BoxId::new())
+            .box_profile(BoxId::new())
             .await
             .expect("an unknown box is not an error")
             .is_none(),

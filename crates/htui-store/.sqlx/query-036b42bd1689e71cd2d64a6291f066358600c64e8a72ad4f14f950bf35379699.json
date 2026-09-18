@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT status        AS \"status: RunStatus\",\n                   target_box_id AS \"target_box_id: BoxId\",\n                   repo_scope    AS \"repo_scope: Vec<RepoId>\"\n              FROM run WHERE id = $1 FOR UPDATE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status: RunStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "target_box_id: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "target_box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "repo_scope: Vec<RepoId>",
+        "type_info": "UuidArray",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "repo_scope"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "036b42bd1689e71cd2d64a6291f066358600c64e8a72ad4f14f950bf35379699"
+}

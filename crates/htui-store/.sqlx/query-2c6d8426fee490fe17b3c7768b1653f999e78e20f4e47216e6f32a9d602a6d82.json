@@ -1,0 +1,299 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO run_step (id, run_id, position, attempt, fanout_index, phase_name,\n                                  agent_id, model, status)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')\n            RETURNING id                  AS \"id: StepId\",\n                      run_id              AS \"run_id: RunId\",\n                      position,\n                      attempt,\n                      fanout_index,\n                      phase_name,\n                      agent_id            AS \"agent_id: AgentId\",\n                      model,\n                      status              AS \"status: StepStatus\",\n                      gate_outcome        AS \"gate_outcome: GateOutcome\",\n                      gate_note,\n                      selected,\n                      exit_code,\n                      prompt_digest,\n                      trim_record,\n                      usage,\n                      isolation_path,\n                      started_at,\n                      finished_at,\n                      verify_outcome      AS \"verify_outcome: VerifyOutcome\",\n                      verify_exit_code,\n                      promoted_at,\n                      updated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "run_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "attempt",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "attempt"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "fanout_index",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "fanout_index"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "phase_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "phase_name"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "agent_id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "model"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "status: StepStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "gate_outcome: GateOutcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "gate_outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "gate_note",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "gate_note"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "selected",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "selected"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "exit_code",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "exit_code"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "prompt_digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "prompt_digest"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "trim_record",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "trim_record"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "usage",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "usage"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "isolation_path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "isolation_path"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "finished_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "finished_at"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "verify_outcome: VerifyOutcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "verify_outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "verify_exit_code",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "verify_exit_code"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "promoted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "promoted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Text",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "2c6d8426fee490fe17b3c7768b1653f999e78e20f4e47216e6f32a9d602a6d82"
+}

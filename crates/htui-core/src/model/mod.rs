@@ -125,7 +125,7 @@ pub use run::{
     ChatRunSpec, GateOutcome, GraphSnapshot, NewRun, NewRunStep, Run, RunKind, RunMode, RunStatus,
     RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, SnapshotCandidate,
     SnapshotGraph, SnapshotJudge, SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepOutcome,
-    StepStatus, VerifyOutcome, prompt_summary,
+    StepStatus, TIMESTAMPTZ_DIGITS, VerifyOutcome, prompt_summary,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{BoundSkill, Skill, SkillBinding, SkillVersion};

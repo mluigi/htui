@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run SET status           = 'running', executing_box_id = $2, started_at       = COALESCE(started_at, $4), lease_box_id     = $2, lease_owner      = $3, lease_expires_at = $5 WHERE id = $1 AND status = 'queued'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "108d76eb32dc1d9de79c1eab067f14b1625eef07d9aea8c57a7a9bce7bbb9bc5"
+}

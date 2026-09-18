@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE box SET settings = '{\"max_concurrent_items\": 1}'::jsonb WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a96fc9aef16dfebcc115981ca6b904bcad5f026a966eeab97d0d6ac78690ab5e"
+}

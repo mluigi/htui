@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE item SET status = 'in_progress', closed_at = NULL WHERE id = (SELECT item_id FROM run WHERE id = $1) AND status = 'queued'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "41080a5aaac51102b579a045e986a9227417493b7bc39d497eda7a0a3dff0d9b"
+}

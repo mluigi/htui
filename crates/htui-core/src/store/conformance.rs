@@ -8,7 +8,7 @@
 
 use core::future::Future;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -21,9 +21,9 @@ use crate::model::{
     NewRunStep, NewStepGraph, NewWorkspace, NoteId, PhaseId, PhasePatch, ProjectId, ProjectPatch,
     PromptScope, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
     RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph, SnapshotSettings, Status,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, Transport,
-    UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -3730,6 +3730,21 @@ async fn settings_phase_rung_writes_token_budget_only<S: WriteStore>(store: &S) 
 // ANA-2 §8: the run seam (MOD-4 milestone 1, plan D12)
 // ------------------------------------------------------------------------------------------------
 
+/// The caller's clock at `timestamptz`'s own resolution, which is what every §8 writer's stamp has
+/// to be.
+///
+/// Blueprint F-S puts the clock in the caller's hands for `started_at`, `finished_at`,
+/// `lease_expires_at` and `promoted_at`, and the cases below read those columns back and compare
+/// them with the value they passed. A raw [`Utc::now`] is nanoseconds on Linux; Postgres keeps
+/// [`TIMESTAMPTZ_DIGITS`] of them and `MemStore` keeps all of them, so an untruncated reading makes
+/// the two backends disagree about a column neither of them changed. [`ChatRunSpec::mint`] has
+/// truncated for the same reason since MOD-2; this is the §8 writers' half of it, and `PgStore`
+/// cannot fix it on its own — a store that truncated on the way in would still hand back something
+/// the caller's own variable no longer equals.
+fn seam_clock() -> DateTime<Utc> {
+    Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS)
+}
+
 /// The smallest `R-ORCH-11` snapshot [`WriteStore::create_run`] accepts: the `htui` FEAT graph,
 /// no phases, and the settings the seed rungs resolve to.
 ///
@@ -3768,7 +3783,7 @@ fn new_run(project: ProjectId, item: ItemId, scope: Vec<RepoId>) -> NewRun {
         started_by: ids::USER,
         graph_snapshot: run_snapshot(),
         repo_scope: scope,
-        queued_at: Utc::now(),
+        queued_at: seam_clock(),
     }
 }
 
@@ -3796,7 +3811,7 @@ fn new_document(item: ItemId, kind: &str, step: Option<StepId>) -> NewDocument {
         body: String::new(),
         produced_by_step_id: step,
         created_by: ids::USER,
-        created_at: Utc::now(),
+        created_at: seam_clock(),
     }
 }
 
@@ -3809,7 +3824,7 @@ fn new_note(item: ItemId, author: UserId, step: Option<StepId>) -> NewNote {
         created_by: author,
         box_id: Some(ids::BOX),
         via_step_id: step,
-        created_at: Utc::now(),
+        created_at: seam_clock(),
     }
 }
 
@@ -3817,7 +3832,7 @@ fn new_note(item: ItemId, author: UserId, step: Option<StepId>) -> NewNote {
 /// gate answer needs to have something to answer.
 async fn gated_step<S: WriteStore>(case: &str, store: &S, spec: NewRunStep) -> StepId {
     let id = spec.id;
-    let at = Utc::now();
+    let at = seam_clock();
     store.create_step(spec).await.expect(case);
     for (from, to) in [
         (StepStatus::Pending, StepStatus::Running),
@@ -4023,7 +4038,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     };
 
     let owner = Uuid::now_v7();
-    let at = Utc::now();
+    let at = seam_clock();
     let until = at + TimeDelta::minutes(5);
 
     assert!(
@@ -4162,7 +4177,7 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
     const CASE: &str = "lease_refresh_is_a_cas_on_owner";
     let first_owner = Uuid::now_v7();
     let second_owner = Uuid::now_v7();
-    let at = Utc::now();
+    let at = seam_clock();
     let until = at + TimeDelta::minutes(5);
     let run = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
@@ -4326,7 +4341,7 @@ async fn step_create_and_transition_law<S: WriteStore>(store: &S) {
         "{CASE}: (position, attempt, fanout_index) order puts the judge first"
     );
 
-    let started = Utc::now();
+    let started = seam_clock();
     let finished = started + TimeDelta::minutes(1);
     assert!(
         store
@@ -4464,7 +4479,7 @@ async fn step_create_and_transition_law<S: WriteStore>(store: &S) {
 /// back through the `RunStepSummary` the Runs sub-tab reads, on every backend.
 async fn finish_step_records_the_settle<S: WriteStore>(store: &S) {
     const CASE: &str = "finish_step_records_the_settle";
-    let finished = Utc::now();
+    let finished = seam_clock();
     store
         .finish_step(
             ids::STEP_R2_PRD,
@@ -4586,7 +4601,7 @@ async fn finish_step_records_the_settle<S: WriteStore>(store: &S) {
 /// `mem.rs::add_note_writes_the_row_and_refuses_every_dangling_reference`.
 async fn gate_answers_write_their_outcome<S: WriteStore>(store: &S) {
     const CASE: &str = "gate_answers_write_their_outcome";
-    let at = Utc::now();
+    let at = seam_clock();
     let approved = gated_step(CASE, store, new_run_step(ids::RUN_2, 1, 1, 0)).await;
     let rejected = gated_step(CASE, store, new_run_step(ids::RUN_2, 2, 1, 0)).await;
     let retried = gated_step(CASE, store, new_run_step(ids::RUN_2, 3, 1, 0)).await;
@@ -4731,7 +4746,7 @@ async fn gate_answers_write_their_outcome<S: WriteStore>(store: &S) {
 /// `mem.rs::resolve_inputs_prefers_this_run_and_skips_a_loser`.
 async fn select_fanout_is_one_transaction<S: WriteStore>(store: &S) {
     const CASE: &str = "select_fanout_is_one_transaction";
-    let at = Utc::now();
+    let at = seam_clock();
     let winner = gated_step(CASE, store, new_run_step(ids::RUN_2, 1, 1, 0)).await;
     let loser = gated_step(CASE, store, new_run_step(ids::RUN_2, 1, 1, 1)).await;
     let failed = gated_step(CASE, store, new_run_step(ids::RUN_2, 1, 1, 2)).await;
@@ -5391,7 +5406,7 @@ async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
         );
     }
 
-    let at = Utc::now();
+    let at = seam_clock();
     for (from, to) in [
         (RunStatus::Queued, RunStatus::Running),
         (RunStatus::Running, RunStatus::AwaitingApproval),
@@ -6247,7 +6262,6 @@ mod tests {
         /// joins two snake_case halves with `::` and whose right half reads like a test name is a
         /// failure below, because that shape reaches neither arm and was silently skipped.
         const PENDING: &[&str] = &[
-            "admission_is_serialised_by_the_box_row_lock",
             "ck_run_graph_snapshot_is_not_valid_for_old_rows_and_checked_for_new",
             "document_versions_do_not_collide_under_contention",
             "step_tree_rows_cascade_with_their_step",
