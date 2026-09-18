@@ -11,6 +11,14 @@ inherent reads, one migration pair, 14 new conformance cases).
 **Routing**: routed as **PRD** by `/handoff-run MOD-4` (criteria C2, C3, C4 fired). Ultracode
 recommended for implement and review; **the maintainer scoped it to implement only**. Reviewer:
 `rust-reviewer` (`.claude/workflow-config.json:2`).
+**Status**: **complete, 2026-09-18** (`33277b1`..`e3163ca`, 37 commits). Workspace green at
+`--test-threads=1`: 1304 passed, 0 failed, 63 binaries; `cargo sqlx prepare --check` exit 0;
+clippy and fmt clean. Implemented as three ultracode workflows (T1/T2/T3), each closing with an
+adversarial verify fan-out whose confirmed findings were fixed before the next task began; the
+`rust-reviewer` gate then blocked on one HIGH (`select_fanout` forcing a failed judge to `done` and
+erasing its `gate_note`, against ANA-2 §4.5), which is fixed in `d622814`. Two of its findings are
+recorded for milestone 2 in the blueprint's §4.6 (R-1, R-2) rather than implemented here: both
+argue against settled decisions of this plan.
 
 ## Summary
 
@@ -196,10 +204,10 @@ cd crates/htui-store && \
 
 ## Acceptance
 
-- [ ] All three tasks complete, each committed incrementally
-- [ ] `CASES` 47 / `READ_CASES` 9, both pins moved, `run_case` exhaustive
-- [ ] Both migrations applied on a clean database; `cargo sqlx prepare --check` green
-- [ ] Every new offline **refusal** answers MOD-25's single sentence — `BufferedWriter`'s
+- [x] All three tasks complete, each committed incrementally
+- [x] `CASES` 47 / `READ_CASES` 9, both pins moved, `run_case` exhaustive
+- [x] Both migrations applied on a clean database; `cargo sqlx prepare --check` green
+- [x] Every new offline **refusal** answers MOD-25's single sentence — `BufferedWriter`'s
       twenty-three and `Backend::Offline`'s eleven inherent orchestration reads, pinned by
       `writer_buffered.rs`'s `every_run_seam_method_is_unreachable_offline` and
       `every_inherent_orchestration_read_is_unreachable_offline`. Not "every new offline *path*":
@@ -207,12 +215,12 @@ cd crates/htui-store && \
       `resolve_inputs`) all read a `MIRRORED_TABLES` table, so plan D12's read-dispatch rule has
       `Backend::Offline` answer them **off the mirror** rather than refuse; they refuse only on
       `BufferedWriter`, which no backend has handed out since MOD-25
-- [ ] Validation block passes at `--test-threads=1` with Postgres live, **except
+- [x] Validation block passes at `--test-threads=1` with Postgres live, **except
       `cargo doc --workspace --no-deps`**, which exits 101 on six pre-existing `htui-store`
       intra-doc links (`dsn.rs` ×4, `secret.rs` ×2). MOD-4 added none of them: `git diff
       0cf232d..HEAD` touches neither file, and `cargo doc -p htui` is exit 0. Not this milestone's
       to fix — a CLEAN item; see blueprint §4.6
-- [ ] Patterns mirrored, not reinvented
+- [x] Patterns mirrored, not reinvented
 
 ## Verified claims (fact-check, 2026-09-18)
 

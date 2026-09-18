@@ -214,6 +214,25 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   call, not the assembler's. Also inherited: `available()` skips every quota status that is not
   exactly `"allowed"`, so this box's `claude-cli` row reports `Skip(Status("allowed_warning"))` the
   moment there is a selection loop (`quota.rs:403-408`).
+  **Milestone 1 landed (`33277b1`..`e3163ca`, 2026-09-18): the seam knows what a run is.** 37
+  commits, 120 files; workspace green at `--test-threads=1` (1304 passed), `sqlx prepare --check`
+  clean. `WriteStore` 42 → 60, `ReadStore` +5 (including ANA-2 §4.2's `resolve_inputs`, which
+  `documents_of_kinds` deliberately is not), 11 `Backend`-inherent reads, the three §4.3 tables as
+  `can_move_to` with the refusal in the seam, `MemStore` + `PgStore` over
+  `0003_orchestration.sql` and its `cache_migrations/0003` companion, `run_step_tree` as the
+  seventeenth mirrored table, `CASES` 36 → 47 and `READ_CASES` 6 → 9. **Six milestones, not the
+  seven PRD D1 approved**: the traits carry no default bodies, so PRD milestones 1 and 2 cannot
+  each close on a green workspace and are one milestone (plan D0); ANA-2 §9's build order is
+  unchanged. **Two fixture corrections of this item's list are now applied** (`attempt` 1-based, a
+  real `graph_snapshot` on both graph runs); the other two were already MOD-15's. **Two seam
+  questions the review gate raised are deferred to milestone 2**, recorded in
+  `.claude/plans/mod-4-orch-seam.blueprint.md` §4.6 R-1/R-2: a terminal `transition_run`/`fail_run`
+  does not write the item mirror in the same transaction, which ANA-2 §4.3:543 asks for and ANA-2
+  §8's writer table does not provide; and `claim_run`'s overlap predicate is repo-set-on-one-box,
+  so §4.7's isolation-aware rules I and P cannot be evaluated inside the admission critical
+  section — two worktree-isolated runs on one repo are refused, which is safe but narrower than
+  `R-ORCH-9`. Plan: `.claude/plans/mod-4-orch-seam.plan.md`; blueprint:
+  `.claude/plans/mod-4-orch-seam.blueprint.md`.
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
   per-box paths, agent autodiscovery hook. Not blocked (MOD-6 landed,
@@ -426,6 +445,17 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   item must either keep the upload path or state that enough releases have passed that no unuploaded
   buffer can exist. `MIRRORED_TABLES` keeps `agent` either way — the Backlog and the agents section
   read that row off the mirror too.
+- [ ] **CLEAN-3 - `cargo doc --workspace --no-deps` has never been green** (found at MOD-4 milestone
+  1 close-out, 2026-09-18). The plan's own validation block runs `cargo doc --workspace --no-deps`,
+  and it exits 101 — at MOD-4's HEAD **and at `0cf232d` before it**, verified in a worktree. Six
+  pre-existing errors, all intra-doc links in `htui-store`: `reconnect_for` → private
+  `reconnect_over`, `dsn` and `Dsn` → private `Dsn::as_str`, `parse` → private `scan`, unresolved
+  `FAKE`, unresolved `crate::testkit::mock_keyring`. **The scope is not "six links".** The default
+  and `--all-features` runs fail on **disjoint** sets (6 vs 9), so the item must first decide *which
+  feature set the workspace doc gate documents*, then fix that set and keep it green. Files:
+  `crates/htui-store/src/{dsn.rs,secret.rs,connect.rs}`, `crates/htui-core/src/prompt/fixtures.rs`,
+  `crates/htui-agent/src/conformance.rs`. MOD-4 milestone 1 added 17 doc errors of its own and
+  **cleared all 17** (`3f095eb`), so this item inherits only what predates it. Not blocked.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -464,5 +494,5 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-11 requirements/decisions models, ANA-14 Redis research, ANA-16 execution environments, ANA-17 per-model prompt framing)                                 |
 | MOD-N   | 23 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-29 Bugsink integration, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 1 (CLEAN-2 delete the disabled offline buffer)                                            |
+| CLEAN-N | 2 (CLEAN-2 delete the disabled offline buffer, CLEAN-3 the workspace doc gate)             |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

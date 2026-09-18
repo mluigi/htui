@@ -302,7 +302,7 @@ Concretely in scope:
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | The seam knows what a run is | Eighteen `WriteStore` methods, five `ReadStore` reads, sixteen `Backend`-inherent reads and the three `can_move_to` tables, over `MemStore` and `PgStore`, on `0003_orchestration.sql` and its mirror companion. No engine, no git, no UI. | in-progress | [plan](../plans/mod-4-orch-seam.plan.md) |
+| 1 | The seam knows what a run is | Eighteen `WriteStore` methods, five `ReadStore` reads, **eleven** `Backend`-inherent reads (not sixteen: five of ANA-2 §8's already existed) and the three `can_move_to` tables, over `MemStore` and `PgStore`, on `0003_orchestration.sql` and its mirror companion. No engine, no git, no UI. | complete (`33277b1`..`e3163ca`, 2026-09-18) | [plan](../plans/mod-4-orch-seam.plan.md), [blueprint](../plans/mod-4-orch-seam.blueprint.md) |
 | 2 | A graph walks | `htui-orch` exists and runs `prd → plan → implement → review` against `FakeDriver` and `FakeIsolator`: the six-stage walk, the gate table, the review loop and its no-progress predicate — with no git, no Postgres and no agent. | pending | — |
 | 3 | Work happens in a real tree | The `Isolator` over `gix`: four isolation modes, `run_step_tree` rows, before/after hashes per repo, winner reconciliation, cleanup, and `verify_command` with its three outcomes. | pending | — |
 | 4 | Three candidates, one winner | Fan-out with the verification prefilter, the two-order judge call, the selection transaction, and `R-AGT-8`'s walk with the three skip conditions and the empty-candidate fallback. | pending | — |
