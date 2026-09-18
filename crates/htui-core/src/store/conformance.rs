@@ -202,6 +202,9 @@ pub const READ_CASES: &[&str] = &[
     "upstream_diamond_dedup",
     "upstream_in_scope_no_summary",
     "upstream_out_of_scope_stub",
+    "run_and_steps_round_trip",
+    "trees_and_commits_read_back",
+    "resolve_inputs_prefers_this_run_and_skips_losers",
 ];
 
 /// Runs one [`READ_CASES`] case by name against an already-loaded store.
@@ -219,6 +222,11 @@ pub async fn run_read_case<S: ReadStore>(name: &str, store: &S) {
         "upstream_diamond_dedup" => upstream_diamond_dedup(store).await,
         "upstream_in_scope_no_summary" => upstream_in_scope_no_summary(store).await,
         "upstream_out_of_scope_stub" => upstream_out_of_scope_stub(store).await,
+        "run_and_steps_round_trip" => run_and_steps_round_trip(store).await,
+        "trees_and_commits_read_back" => trees_and_commits_read_back(store).await,
+        "resolve_inputs_prefers_this_run_and_skips_losers" => {
+            resolve_inputs_prefers_this_run_and_skips_losers(store).await;
+        }
         other => panic!("unknown read case `{other}`; READ_CASES and run_read_case disagree"),
     }
 }
@@ -5828,6 +5836,315 @@ async fn upstream_out_of_scope_stub<S: ReadStore>(store: &S) {
             .and_then(|entry| entry.summary.as_deref()),
         None,
         "upstream_out_of_scope_stub: an out-of-scope item's summary is not read, though it exists"
+    );
+}
+
+/// The fixture's `run` row for one id, so a case asserts against the seed rather than against a
+/// copy of it a fixture edit would leave stale.
+fn fixture_run(id: RunId) -> Run {
+    crate::fixtures::demo_data()
+        .runs
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("the fixture holds that run")
+}
+
+/// The fixture's `run_step` rows of one run, in the order [`ReadStore::run_steps`] promises.
+fn fixture_steps(run: RunId) -> Vec<RunStep> {
+    let mut rows: Vec<RunStep> = crate::fixtures::demo_data()
+        .steps
+        .into_iter()
+        .filter(|row| row.run_id == run)
+        .collect();
+    rows.sort_by_key(|row| (row.position, row.attempt, row.fanout_index));
+    rows
+}
+
+/// `run` and `run_steps` answer the seeded rows whole, in `(position, attempt, fanout_index)`
+/// order, and a list read is total where a row read is optional.
+///
+/// Leg (g) is the three-builder pin: `RunStepSummary` is assembled separately by `MemStore`, by
+/// `PgStore`'s SQL and by the mirror's, and the only thing that keeps the three from drifting is a
+/// case that reads the same columns both ways on all three. `updated_at` is deliberately taken
+/// from the answer rather than compared: it is the trigger's on Postgres and the store's own in
+/// memory, and is never asserted equal across backends (blueprint F-S).
+async fn run_and_steps_round_trip<S: ReadStore>(store: &S) {
+    const CASE: &str = "run_and_steps_round_trip";
+    let seeded = fixture_run(ids::RUN_1);
+    let found = run_row(CASE, store, ids::RUN_1).await;
+    assert_eq!(
+        found,
+        Run {
+            updated_at: found.updated_at,
+            ..seeded
+        },
+        "{CASE}: every column of the seeded run reads back"
+    );
+    assert!(
+        found.repo_scope.is_empty(),
+        "{CASE}: a run seeded before 0003 declares no scope"
+    );
+    assert_eq!(
+        (found.lease_box_id, found.lease_expires_at),
+        (None, None),
+        "{CASE}: and holds no lease"
+    );
+    let snapshot: GraphSnapshot = serde_json::from_value(
+        found
+            .graph_snapshot
+            .clone()
+            .unwrap_or_else(|| panic!("{CASE}: a graph run carries its snapshot")),
+    )
+    .unwrap_or_else(|error| panic!("{CASE}: the snapshot decodes as §5.1's type, got {error}"));
+    assert_eq!(snapshot.v, 1, "{CASE}: at the version this crate writes");
+    assert_eq!(
+        snapshot.phases.len(),
+        4,
+        "{CASE}: the `feature` graph's four phases survive the round trip through JSONB"
+    );
+
+    assert_eq!(
+        run_row(CASE, store, ids::RUN_2).await.status,
+        RunStatus::Queued,
+        "{CASE}: the fixture's only active run"
+    );
+    assert_eq!(
+        run_row(CASE, store, ids::RUN_3).await.item_id,
+        Some(ids::HTUI_ANA_1),
+        "{CASE}: the fan-out run belongs to ANA-1"
+    );
+    assert_eq!(
+        store.run(RunId::new()).await.expect(CASE),
+        None,
+        "{CASE}: an unknown run is None, not an error"
+    );
+
+    let steps = store.run_steps(ids::RUN_1).await.expect(CASE);
+    assert_eq!(
+        steps.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![
+            ids::STEP_PRD,
+            ids::STEP_PLAN,
+            ids::STEP_IMPL,
+            ids::STEP_REVIEW
+        ],
+        "{CASE}: position order"
+    );
+    assert!(
+        steps.iter().all(|row| row.attempt == 1),
+        "{CASE}: ANA-2 §4.4 counts attempts from one (plan D13)"
+    );
+    assert!(
+        steps
+            .iter()
+            .all(|row| row.verify_outcome.is_none() && row.promoted_at.is_none()),
+        "{CASE}: the 0003 columns are NULL on a row seeded before them"
+    );
+    assert_eq!(
+        steps,
+        fixture_steps(ids::RUN_1)
+            .into_iter()
+            .zip(&steps)
+            .map(|(seeded, found)| RunStep {
+                updated_at: found.updated_at,
+                ..seeded
+            })
+            .collect::<Vec<_>>(),
+        "{CASE}: every other column of every seeded step reads back"
+    );
+
+    let fanout = store.run_steps(ids::RUN_3).await.expect(CASE);
+    assert_eq!(
+        fanout
+            .iter()
+            .map(|row| (row.id, row.fanout_index, row.selected, row.status))
+            .collect::<Vec<_>>(),
+        vec![
+            (ids::STEP_R3_RESEARCH_A, 0, Some(true), StepStatus::Done),
+            (
+                ids::STEP_R3_RESEARCH_B,
+                1,
+                Some(false),
+                StepStatus::Superseded
+            ),
+        ],
+        "{CASE}: the winner sorts first and only it is selected"
+    );
+    assert!(
+        store.run_steps(RunId::new()).await.expect(CASE).is_empty(),
+        "{CASE}: an unknown run has no steps, and is not NotFound"
+    );
+
+    for item in [ids::HTUI_ANA_1, ids::HTUI_FEAT_1] {
+        for summary in store.runs(item).await.expect(CASE) {
+            let rows = store.run_steps(summary.id).await.expect(CASE);
+            for listed in &summary.steps {
+                let row = rows
+                    .iter()
+                    .find(|row| row.id == listed.id)
+                    .unwrap_or_else(|| panic!("{CASE}: step {} is a row of its run", listed.id));
+                assert_eq!(
+                    (
+                        listed.usage.clone(),
+                        listed.selected,
+                        listed.exit_code,
+                        listed.verify_outcome,
+                        listed.promoted_at,
+                    ),
+                    (
+                        row.usage.clone(),
+                        row.selected,
+                        row.exit_code,
+                        row.verify_outcome,
+                        row.promoted_at,
+                    ),
+                    "{CASE}: the summary projection and the row agree on step {}",
+                    listed.id
+                );
+                let expected = match row.agent_id {
+                    Some(id) if id == ids::AGENT_CLAUDE => Some("claude"),
+                    Some(id) if id == ids::AGENT_AGY => Some("agy"),
+                    _ => None,
+                };
+                assert_eq!(
+                    listed.agent_name.as_deref(),
+                    expected,
+                    "{CASE}: agent_name is denormalised from agent_id on step {}",
+                    listed.id
+                );
+            }
+        }
+    }
+}
+
+/// `step_trees` and `step_commits` are total reads: an empty answer for a step with no rows, and
+/// for an id nothing has, never `NotFound`.
+///
+/// The fixture seeds no `repo`, so no tree or commit row can exist here (blueprint F-P); row
+/// content is `trees_and_commits_round_trip` on both writers and
+/// `pg_criteria::step_tree_rows_cascade_with_their_step` on Postgres.
+async fn trees_and_commits_read_back<S: ReadStore>(store: &S) {
+    const CASE: &str = "trees_and_commits_read_back";
+    for step in [
+        ids::STEP_PRD,
+        ids::STEP_PLAN,
+        ids::STEP_IMPL,
+        ids::STEP_REVIEW,
+        ids::STEP_R2_PRD,
+        ids::STEP_R3_RESEARCH_A,
+        ids::STEP_R3_RESEARCH_B,
+        StepId::new(),
+    ] {
+        assert_eq!(
+            store.step_trees(step).await.expect(CASE),
+            Vec::new(),
+            "{CASE}: step {step} has no tree row, and asking is not an error"
+        );
+        assert_eq!(
+            store.step_commits(step).await.expect(CASE),
+            Vec::new(),
+            "{CASE}: step {step} has no commit row, and asking is not an error"
+        );
+    }
+}
+
+/// ANA-2 §4.2's resolver on the seeded fan-out: this run's selected output wins, a loser's higher
+/// version is skipped, and a kind the item has no eligible row for comes back as `None`.
+///
+/// The writer-side twin is `write_document_allocates_its_version`, which builds the same shape by
+/// hand; this one proves the mirror answers it too.
+async fn resolve_inputs_prefers_this_run_and_skips_losers<S: ReadStore>(store: &S) {
+    const CASE: &str = "resolve_inputs_prefers_this_run_and_skips_losers";
+    let asked = [
+        "research".to_owned(),
+        "verdict".to_owned(),
+        "missing".to_owned(),
+    ];
+    let resolved = store
+        .resolve_inputs(ids::HTUI_ANA_1, ids::RUN_3, &asked)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        resolved
+            .iter()
+            .map(|row| (
+                row.kind.as_str(),
+                row.document.as_ref().map(|document| document.id)
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("research", Some(ids::DOC_ANA_1_RESEARCH_V2)),
+            ("verdict", Some(ids::DOC_ANA_1_VERDICT)),
+            ("missing", None),
+        ],
+        "{CASE}: one entry per requested kind in request order; the loser's v3 is skipped"
+    );
+    assert_eq!(
+        store
+            .documents_of_kinds(ids::HTUI_ANA_1, &["research".to_owned()])
+            .await
+            .expect(CASE)
+            .first()
+            .map(|row| row.id),
+        Some(ids::DOC_ANA_1_RESEARCH_V3),
+        "{CASE}: documents_of_kinds ranks by version alone — plan D2's contrast"
+    );
+
+    let other_run = store
+        .resolve_inputs(ids::HTUI_ANA_1, ids::RUN_1, &["research".to_owned()])
+        .await
+        .expect(CASE);
+    assert_eq!(
+        other_run
+            .first()
+            .and_then(|row| row.document.as_ref())
+            .map(|row| row.id),
+        Some(ids::DOC_ANA_1_RESEARCH_V2),
+        "{CASE}: another run's selected output still outranks the hand-written v1"
+    );
+
+    let every_kind = store
+        .resolve_inputs(ids::HTUI_ANA_1, ids::RUN_3, &[])
+        .await
+        .expect(CASE);
+    assert_eq!(
+        every_kind
+            .iter()
+            .map(|row| row.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["research", "summary", "verdict"],
+        "{CASE}: an empty `kinds` is every kind the item has, in byte order"
+    );
+    assert!(
+        every_kind.iter().all(|row| row.document.is_some()),
+        "{CASE}: each of those kinds has an eligible row"
+    );
+
+    let not_a_loser = store
+        .resolve_inputs(ids::HTUI_FEAT_1, ids::RUN_1, &["plan".to_owned()])
+        .await
+        .expect(CASE);
+    assert_eq!(
+        not_a_loser
+            .first()
+            .and_then(|row| row.document.as_ref())
+            .map(|row| row.id),
+        Some(ids::DOC_FEAT_1_PLAN_V2),
+        "{CASE}: a NULL `selected` is not a loser, so the latest version of this run's output wins"
+    );
+
+    let unknown = store
+        .resolve_inputs(ItemId::new(), ids::RUN_1, &["x".to_owned()])
+        .await
+        .expect(CASE);
+    assert_eq!(
+        unknown.len(),
+        1,
+        "{CASE}: an unknown item still answers one entry per requested kind"
+    );
+    assert!(
+        unknown.first().is_some_and(|row| row.document.is_none()),
+        "{CASE}: and resolves it to None rather than refusing"
     );
 }
 

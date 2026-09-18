@@ -42,7 +42,8 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::READ_CASES.len(),
-        6,
-        "milestone 9's four `ReadStore` additions, the upstream walk taking three cases (D96)"
+        9,
+        "milestone 9's four `ReadStore` additions, the upstream walk taking three cases (D96), \
+         and MOD-4 milestone 1's three for ANA-2 §8's mirrored reads (plan D12)"
     );
 }
