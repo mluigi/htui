@@ -13,16 +13,26 @@
 //! are both empty on `MemStore::demo()` — the fake carries an explicit per-phase candidates map as
 //! its documented stand-in (plan D20, blueprint A-1).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
-use htui_agent::conformance::epoch;
+use htui_agent::conformance::{Script, ScriptEvent, epoch};
+use htui_agent::driver::DriverCaps;
+use htui_agent::event::{DoneEvent, DriverEvent, ErrorEvent, StopReason};
+use htui_agent::fake::{FAKE_AGENT_NAME, FakeDriver};
+use htui_core::fixtures::ids;
 use htui_core::model::{
-    Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId, TIMESTAMPTZ_DIGITS,
+    Agent, AgentId, BoxId, Document, DocumentId, Isolation, Item, ItemId, NewDocument, PhaseAgent,
+    PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId, RunStep, RunStepCommit,
+    RunStepTree, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, UserId,
 };
+use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
+use uuid::Uuid;
 
+use crate::command::{Command, CommandOutcome, EngineError};
+use crate::graph::GraphSource;
 use crate::isolate::{Clock, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree};
 
 /// The root every synthetic tree path hangs from. Nothing ever creates it.
@@ -222,15 +232,593 @@ impl Clock for TestClock {
     }
 }
 
+/// The model the fake's stand-in candidate names (plan D20, blueprint A-1).
+///
+/// `(AGENT_CLAUDE, "sonnet")` is the pair the fixture's own `RUN_1` steps carry
+/// (`crates/htui-core/src/fixtures.rs:1428-1438`), so a snapshot resolved by the fake matches the
+/// recorded one. It has to be spelled out because `SnapshotCandidate::model` is **not** nullable
+/// while `agent.default_model` is, and the seeded `claude` row's is `null` with an empty `models`
+/// list (`crates/htui-core/seeds/agent_claude.json`): `graph::candidates` falls through to
+/// `NoCandidate` rather than hand a driver an empty string, so a fake that did not name a model
+/// would refuse every phase.
+const STAND_IN_MODEL: &str = "sonnet";
+
+/// The four inherent orchestration reads of `MemStore`, as the trait `graph.rs` defines
+/// (blueprint F-N).
+///
+/// Implemented on `MemStore` itself rather than on `&MemStore`: a trait impl on the reference would
+/// make the engine's `G` be `&MemStore` and every call site `&&MemStore`. The engine borrows `&G`,
+/// so the source is used "over `&MemStore`" exactly as plan D19 says either way. Local trait,
+/// foreign type — the orphan rule permits it, and it lives behind `test-support` because
+/// `MemStore` is the fake harness's store; milestone 6's `Backend` impl lives in `htui`.
+///
+/// Each body calls the *inherent* method of the same name. Method resolution prefers inherent
+/// candidates over trait ones, so this is delegation and not recursion — and
+/// [`the trait's own unit test`](self) calls all four through the trait to prove it.
+impl GraphSource for MemStore {
+    async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
+        self.resolve_graph(item).await
+    }
+
+    async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
+        self.phase_agents(phase).await
+    }
+
+    async fn prompt_template(
+        &self,
+        project: ProjectId,
+        name: &str,
+        version: Option<i32>,
+    ) -> Result<Option<PromptTemplate>> {
+        self.prompt_template(project, name, version).await
+    }
+
+    async fn agent(&self, id: AgentId) -> Result<Option<Agent>> {
+        Ok(self
+            .agents()
+            .await?
+            .into_iter()
+            .map(|summary| summary.agent)
+            .find(|agent| agent.id == id))
+    }
+}
+
+/// A [`GraphSource`] over `MemStore` with a per-phase candidates map (plan D20).
+///
+/// **Rungs 1 and 3 of ANA-2 §4.1's candidate chain are both structurally empty here**, which is why
+/// this type exists. Rung 1 is `phase_agent`, and `MemStore` holds no such table — `phase_agents`
+/// returns `Vec::new()` unconditionally (`crates/htui-core/src/store/mem.rs:470-473`). Rung 3 is
+/// "the single enabled agent on the box", and the demo fixture's three agents are all `enabled`
+/// from one seed literal (`crates/htui-core/src/model/agent.rs:156`), so there is no *single* one.
+/// Rung 2 — `project.settings.default_agent_id` — stays real in `graph.rs` and is empty on the
+/// fixture too. A resolution with no stand-in would therefore refuse every phase with
+/// `NoCandidate`, for a reason that is about the fixture and not about the walk.
+///
+/// The map is keyed by **phase name** because that is what a case knows; the `PhaseId -> name`
+/// index is built as a side effect of [`resolve_graph`](GraphSource::resolve_graph), which
+/// `graph::resolve` always calls before it asks for any phase's candidates.
+#[derive(Debug)]
+pub struct FakeGraphSource<'a> {
+    store: &'a MemStore,
+    /// Explicit per-phase candidates; an empty vec is "this phase has none" (the rung-4 case).
+    candidates: BTreeMap<String, Vec<(AgentId, String)>>,
+    /// What every phase the map does not name resolves to.
+    fallback: Vec<(AgentId, String)>,
+    /// Learned from `resolve_graph`, so `phase_agents` can answer by name.
+    names: Mutex<BTreeMap<PhaseId, String>>,
+}
+
+impl<'a> FakeGraphSource<'a> {
+    /// A source over `store` where every phase resolves to `(AGENT_CLAUDE, "sonnet")`.
+    #[must_use]
+    pub fn new(store: &'a MemStore) -> Self {
+        Self {
+            store,
+            candidates: BTreeMap::new(),
+            fallback: vec![(ids::AGENT_CLAUDE, STAND_IN_MODEL.to_owned())],
+            names: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Name `phase`'s candidates explicitly, in preference order.
+    #[must_use]
+    pub fn with_candidates(mut self, phase: &str, agents: Vec<(AgentId, &str)>) -> Self {
+        self.candidates.insert(
+            phase.to_owned(),
+            agents
+                .into_iter()
+                .map(|(id, model)| (id, model.to_owned()))
+                .collect(),
+        );
+        self
+    }
+
+    /// Give `phase` no candidate at all: `graph::resolve` then walks to rung 2, finds the demo
+    /// project names no `default_agent_id` either, and refuses with `ResolveError::NoCandidate` —
+    /// ANA-2 §4.1's rung 4 (`docs/ANA-2.md:288`).
+    #[must_use]
+    pub fn without_candidates(mut self, phase: &str) -> Self {
+        self.candidates.insert(phase.to_owned(), Vec::new());
+        self
+    }
+
+    /// The candidates registered for a phase id, by the name `resolve_graph` learned for it.
+    ///
+    /// A phase id this source has never seen answers the fallback: the alternative is a silent
+    /// empty walk, which is the failure mode plan D20 exists to prevent.
+    fn registered(&self, phase: PhaseId) -> Vec<(AgentId, String)> {
+        let names = self
+            .names
+            .lock()
+            .expect("no panic holds the fake source's lock");
+        names
+            .get(&phase)
+            .and_then(|name| self.candidates.get(name))
+            .unwrap_or(&self.fallback)
+            .clone()
+    }
+}
+
+impl GraphSource for FakeGraphSource<'_> {
+    async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
+        let resolved = GraphSource::resolve_graph(self.store, item).await?;
+        if let Some(graph) = &resolved {
+            let mut names = self
+                .names
+                .lock()
+                .expect("no panic holds the fake source's lock");
+            for row in &graph.phases {
+                names.insert(row.phase.id, row.phase.name.clone());
+            }
+        }
+        Ok(resolved)
+    }
+
+    async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
+        Ok(self
+            .registered(phase)
+            .into_iter()
+            .enumerate()
+            .map(|(position, (agent_id, model))| PhaseAgent {
+                phase_id: phase,
+                position: i32::try_from(position).expect("a handful of candidates"),
+                agent_id,
+                model,
+            })
+            .collect())
+    }
+
+    async fn prompt_template(
+        &self,
+        project: ProjectId,
+        name: &str,
+        version: Option<i32>,
+    ) -> Result<Option<PromptTemplate>> {
+        GraphSource::prompt_template(self.store, project, name, version).await
+    }
+
+    async fn agent(&self, id: AgentId) -> Result<Option<Agent>> {
+        GraphSource::agent(self.store, id).await
+    }
+}
+
+/// One phase attempt's scripted behaviour: what the driver plays, and what the step "produced".
+///
+/// The `output` half is plan D13's, and it is the reason the engine writes no document ever: stage
+/// 5 requires one and criterion 1 asserts four, but `document_write` is MOD-11's and MOD-11 is
+/// blocked on MOD-4 (ANA-2 risk 4, `docs/ANA-2.md:2067`). Putting the stand-in producer in the
+/// harness rather than in `engine.rs` keeps that gap honest: nothing in the engine will have to be
+/// removed when MOD-11 lands.
+#[derive(Debug, Clone)]
+pub struct ScriptedStep {
+    /// What `FakeDriver` plays for this attempt's session.
+    pub script: Script,
+    /// The body of the document written after `Done`, or `None` for a step that produced nothing.
+    pub output: Option<String>,
+}
+
+impl ScriptedStep {
+    /// The happy path: one turn ending `Done { EndTurn }`, and a document with `body`.
+    #[must_use]
+    pub fn done_with_output(body: &str) -> Self {
+        Self {
+            script: Self::ends(StopReason::EndTurn),
+            output: Some(body.to_owned()),
+        }
+    }
+
+    /// A turn that ends cleanly and writes nothing: the `missing_output` path (`:430`).
+    #[must_use]
+    pub fn done_without_output() -> Self {
+        Self {
+            script: Self::ends(StopReason::EndTurn),
+            output: None,
+        }
+    }
+
+    /// A `review` document whose body opens with ANA-5's three-line front matter.
+    ///
+    /// The grammar is fixed by `docs/ANA-5.md:1327-1331` and is exactly three lines — `---`,
+    /// `verdict: <approve|request-changes>`, `---` — at the very start of the body, with no other
+    /// keys. `verdict` is taken as given rather than typed, so a case can script a malformed one
+    /// and pin ANA-5's "unreadable reads as `request-changes`" rule.
+    #[must_use]
+    pub fn review(verdict: &str, body: &str) -> Self {
+        Self {
+            script: Self::ends(StopReason::EndTurn),
+            output: Some(format!("---\nverdict: {verdict}\n---\n{body}")),
+        }
+    }
+
+    /// A turn that ends on a stop reason ANA-2 `:439` settles `failed`: `Refusal`, `MaxTokens` or
+    /// `MaxTurnRequests`.
+    #[must_use]
+    pub fn failing(stop: StopReason) -> Self {
+        Self {
+            script: Self::ends(stop),
+            output: None,
+        }
+    }
+
+    /// A turn that emits `DriverEvent::Error` and then **no** `done`.
+    ///
+    /// The missing `done` is deliberate: `FakeDriver` answers the pull past the end of a turn with
+    /// `DriverError::Transport` (`crates/htui-agent/src/fake.rs:426-428`), so this drives settle's
+    /// first rule — a driver result that is `Err`, which §5.3 says a closed stream is — as well as
+    /// leaving the error row ANA-2 `:439` names.
+    #[must_use]
+    pub fn erroring(code: &str, message: &str) -> Self {
+        Self {
+            script: Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Error(ErrorEvent {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            }))]),
+            output: None,
+        }
+    }
+
+    /// One turn whose only event is `done`.
+    fn ends(stop: StopReason) -> Script {
+        Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+            stop_reason: stop,
+        }))])
+    }
+}
+
+/// `MemStore` + `FakeDriver` + [`FakeIsolator`] + [`TestClock`] + [`FakeGraphSource`], which is
+/// ANA-2's own description of the fake orchestrator (`docs/ANA-2.md:1764-1766`).
+///
+/// **`dispatch` is T4's.** Everything the walk needs from the harness is here and is public —
+/// [`graphs`](Self::graphs), [`driver_for`](Self::driver_for), [`after_done`](Self::after_done),
+/// [`box_id`](Self::box_id), [`user`](Self::user), [`owner`](Self::owner) — so T4 builds an
+/// `Engine` over borrowed parts and forwards to it, rather than re-deciding any of this.
+#[derive(Debug)]
+pub struct FakeOrchestrator {
+    /// The store every case asserts against. Fresh per case, so `claim_run`'s per-box concurrency
+    /// cap (`max_concurrent_items`, 2 on the fixture box) never leaks between them (blueprint
+    /// H-15).
+    pub store: MemStore,
+    /// The isolator, so a case can script `after_hash` values.
+    pub isolator: FakeIsolator,
+    /// The clock, so a case can elapse a step deadline without sleeping.
+    pub clock: TestClock,
+    scripts: Mutex<BTreeMap<(String, i32), ScriptedStep>>,
+    candidates: Mutex<BTreeMap<String, Vec<(AgentId, String)>>>,
+    after_done_advance: Mutex<Option<TimeDelta>>,
+    default_script: ScriptedStep,
+    caps: DriverCaps,
+    box_id: BoxId,
+    user: UserId,
+    owner: Uuid,
+}
+
+impl FakeOrchestrator {
+    /// The demo fixture, full driver capabilities, and a happy-path default script.
+    ///
+    /// The box is `ids::BOX` because `demo_data()` sets `this_box: Some(ids::BOX)`
+    /// (`crates/htui-core/src/fixtures.rs:375`) and the user is `MemStore::this_user()`, which the
+    /// one seeded `app_user` makes unambiguous.
+    ///
+    /// # Panics
+    /// When the demo fixture seeds no `app_user`, which it always does.
+    #[must_use]
+    pub fn demo() -> Self {
+        let store = MemStore::demo();
+        let user = store
+            .this_user()
+            .expect("the demo fixture seeds exactly one `app_user`");
+        Self {
+            store,
+            isolator: FakeIsolator::new(),
+            clock: TestClock::new(),
+            scripts: Mutex::new(BTreeMap::new()),
+            candidates: Mutex::new(BTreeMap::new()),
+            after_done_advance: Mutex::new(None),
+            default_script: ScriptedStep::done_with_output("scripted output"),
+            caps: FakeDriver::full_caps(),
+            box_id: ids::BOX,
+            user,
+            owner: Uuid::now_v7(),
+        }
+    }
+
+    /// Script one `(phase name, attempt)`. An unscripted attempt plays the default.
+    pub fn script(&self, phase: &str, attempt: i32, step: ScriptedStep) {
+        self.scripts
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert((phase.to_owned(), attempt), step);
+    }
+
+    /// Replace the driver capabilities every session is built with.
+    ///
+    /// The CLI-shaped profile — `permission_requests` and `edit_proposals` both false — is what
+    /// stage 1's interlock refuses at a gated phase (`docs/ANA-2.md:476-482`). Note that the
+    /// interlock reads `registry::caps_for(&agent)` from the *agent row*, not from the driver
+    /// (plan D6), so this knob changes the session and the candidates map changes the refusal.
+    #[must_use]
+    pub fn with_caps(mut self, caps: DriverCaps) -> Self {
+        self.caps = caps;
+        self
+    }
+
+    /// Name a phase's candidates, overriding the `(AGENT_CLAUDE, "sonnet")` stand-in.
+    pub fn with_candidates(&self, phase: &str, agents: Vec<(AgentId, &str)>) {
+        self.candidates
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert(
+                phase.to_owned(),
+                agents
+                    .into_iter()
+                    .map(|(id, model)| (id, model.to_owned()))
+                    .collect(),
+            );
+    }
+
+    /// Give a phase no candidate at all, for the rung-4 refusal.
+    pub fn without_candidates(&self, phase: &str) {
+        self.with_candidates(phase, Vec::new());
+    }
+
+    /// Elapse `by` between the driver's `done` and the settle, so a step outlives its deadline
+    /// without anything sleeping (ANA-2 `:439`, plan D8).
+    pub fn advance_after_done(&self, by: TimeDelta) {
+        *self
+            .after_done_advance
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock") = Some(by);
+    }
+
+    /// The [`GraphSource`] the walk resolves through, built fresh so its `PhaseId -> name` index
+    /// belongs to one resolution.
+    #[must_use]
+    pub fn graphs(&self) -> FakeGraphSource<'_> {
+        let registered = self
+            .candidates
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .clone();
+        let mut source = FakeGraphSource::new(&self.store);
+        source.candidates = registered;
+        source
+    }
+
+    /// The script for one `(phase, attempt)`, or the default.
+    #[must_use]
+    pub fn script_for(&self, phase: &str, attempt: i32) -> ScriptedStep {
+        self.scripts
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .get(&(phase.to_owned(), attempt))
+            .cloned()
+            .unwrap_or_else(|| self.default_script.clone())
+    }
+
+    /// One driver per session, which is `FakeDriver`'s own rule: it plays its script once and
+    /// refuses a second `start` (`crates/htui-agent/src/fake.rs:178-180`, blueprint H-12).
+    #[must_use]
+    pub fn driver_for(&self, phase: &str, attempt: i32) -> FakeDriver {
+        FakeDriver::new(
+            FAKE_AGENT_NAME,
+            self.caps,
+            self.script_for(phase, attempt).script,
+        )
+    }
+
+    /// Plan D13's stand-in for MOD-11's `document_write`, called between stage 4 and stage 5.
+    ///
+    /// Elapses any [`advance_after_done`](Self::advance_after_done) first — that is what "after the
+    /// session and before the settle" means for a deadline case — then writes the scripted output
+    /// document, or none. T4's `impl SessionSink for FakeOrchestrator` forwards to this and adds
+    /// nothing.
+    ///
+    /// # Errors
+    /// The store's own refusals.
+    pub async fn after_done(
+        &self,
+        item: ItemId,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+    ) -> Result<Option<Document>> {
+        if let Some(by) = *self
+            .after_done_advance
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+        {
+            self.clock.advance(by);
+        }
+        let Some(body) = self.script_for(&step.phase_name, step.attempt).output else {
+            return Ok(None);
+        };
+        let document = self
+            .store
+            .write_document(NewDocument {
+                id: DocumentId::new(),
+                item_id: item,
+                kind: phase.output_kind.clone(),
+                title: format!("{} (attempt {})", phase.output_kind, step.attempt),
+                body,
+                produced_by_step_id: Some(step.id),
+                created_by: self.user,
+                created_at: self.clock.now(),
+            })
+            .await?;
+        Ok(Some(document))
+    }
+
+    /// `run.target_box_id` for every run this harness starts.
+    #[must_use]
+    pub const fn box_id(&self) -> BoxId {
+        self.box_id
+    }
+
+    /// `run.started_by` and `document.created_by`.
+    #[must_use]
+    pub const fn user(&self) -> UserId {
+        self.user
+    }
+
+    /// `claim_run`'s owner token, minted once per orchestrator.
+    #[must_use]
+    pub const fn owner(&self) -> Uuid {
+        self.owner
+    }
+
+    /// The driver capabilities every session is built with.
+    #[must_use]
+    pub const fn caps(&self) -> DriverCaps {
+        self.caps
+    }
+
+    /// Build an `Engine` over this harness's parts and dispatch one command (blueprint §4.4).
+    ///
+    /// **T4 fills this in.** Every part it needs is already public on this type and none of them
+    /// is a decision left open: the store is [`store`](Self::store), the graph source is
+    /// [`graphs`](Self::graphs), the isolator and clock are the two public fields, the driver
+    /// factory is [`driver_for`](Self::driver_for), the session sink is
+    /// [`after_done`](Self::after_done), and the three identities are
+    /// [`box_id`](Self::box_id) / [`user`](Self::user) / [`owner`](Self::owner). What is missing is
+    /// `engine.rs` itself.
+    ///
+    /// # Errors
+    /// Every [`EngineError`], once there is an engine to raise one.
+    ///
+    /// # Panics
+    /// Until T4 lands, always.
+    pub async fn dispatch(
+        &self,
+        command: Command,
+    ) -> std::result::Result<CommandOutcome, EngineError> {
+        let _ = command;
+        todo!(
+            "T4 wires `Engine::dispatch` here; every part it borrows is already public on \
+             `FakeOrchestrator`"
+        )
+    }
+
+    /// The run's steps in `(position, attempt, fanout_index)` order.
+    ///
+    /// # Panics
+    /// Never: `MemStore` fails no read.
+    #[must_use]
+    pub async fn steps(&self, run: RunId) -> Vec<RunStep> {
+        self.store
+            .run_steps(run)
+            .await
+            .expect("MemStore never fails a read")
+    }
+
+    /// One item row.
+    ///
+    /// # Panics
+    /// When the item is not there, which in a case means the fixture moved.
+    #[must_use]
+    pub async fn item(&self, id: ItemId) -> Item {
+        self.store
+            .item(id)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the case names an item the fixture holds")
+    }
+
+    /// One run row.
+    ///
+    /// # Panics
+    /// When the run is not there, which in a case means the walk never created it.
+    #[must_use]
+    pub async fn run(&self, id: RunId) -> Run {
+        self.store
+            .run(id)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the case names a run the walk created")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use chrono::TimeDelta;
     use htui_agent::conformance::epoch;
-    use htui_core::fixtures::ids;
-    use htui_core::model::{Isolation, RepoId, StepId};
+    use htui_agent::driver::{AgentDriver as _, DriverCaps};
+    use htui_agent::event::StopReason;
+    use htui_agent::fake::FakeDriver;
+    use htui_core::fixtures::{demo_data, ids};
+    use htui_core::model::{
+        Isolation, RepoId, RunMode, RunStep, SnapshotCandidate, SnapshotPhase, StepId,
+    };
+    use htui_core::store::{MemStore, ReadStore as _};
 
-    use super::{FakeIsolator, TestClock};
+    use super::{
+        FakeGraphSource, FakeIsolator, FakeOrchestrator, GraphSource, ScriptedStep, TestClock,
+    };
+    use crate::graph::{ResolveError, Resolved, resolve};
     use crate::isolate::{Clock as _, Isolator as _};
+
+    /// `graph::resolve` of `HTUI_FEAT-1`, manual, no `app_setting`, no requested scope.
+    async fn resolve_feat<G: GraphSource>(
+        store: &MemStore,
+        source: &G,
+    ) -> Result<Resolved, ResolveError> {
+        let item = store
+            .item(ids::HTUI_FEAT_1)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture holds HTUI_FEAT-1");
+        resolve(
+            store,
+            source,
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+        )
+        .await
+    }
+
+    /// `RUN_1`'s first step, forced to attempt 1: the fixture's own `attempt: 0` is the bug ANA-2
+    /// `:485-486` says MOD-4 corrects, and nothing here is a test of it.
+    fn prd_step() -> RunStep {
+        let mut step = demo_data()
+            .steps
+            .into_iter()
+            .find(|step| step.run_id == ids::RUN_1 && step.position == 0)
+            .expect("RUN_1 has a step at position 0");
+        step.attempt = 1;
+        step
+    }
+
+    /// The `prd` phase of the resolved `feature` snapshot.
+    async fn prd_phase(store: &MemStore) -> SnapshotPhase {
+        resolve_feat(store, &FakeGraphSource::new(store))
+            .await
+            .expect("the stand-in supplies rung 1")
+            .snapshot
+            .phases
+            .remove(0)
+    }
 
     fn repos() -> Vec<RepoId> {
         vec![RepoId::new(), RepoId::new()]
@@ -322,6 +910,217 @@ mod tests {
             Some(format!("fake:after:{step}:3"))
         );
         assert_ne!(synthetic[0].after_hash, synthetic[1].after_hash);
+    }
+
+    /// `impl GraphSource for MemStore` delegates to the four inherent reads of the same names.
+    ///
+    /// Method resolution prefers an inherent candidate over a trait one, so the bodies are
+    /// delegation — but "prefers" is the kind of rule that is worth a test rather than a comment,
+    /// because getting it wrong is an infinite recursion and not a compile error.
+    #[tokio::test]
+    async fn the_store_answers_the_source_without_recursing() {
+        let store = MemStore::demo();
+        let resolved = GraphSource::resolve_graph(&store, ids::HTUI_FEAT_1)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("FEAT-1 resolves to the `feature` graph");
+        assert_eq!(resolved.phases.len(), 4);
+
+        assert!(
+            GraphSource::phase_agents(&store, resolved.phases[0].phase.id)
+                .await
+                .expect("MemStore never fails a read")
+                .is_empty(),
+            "`MemStore` holds no `phase_agent` table (blueprint H-3)"
+        );
+        assert!(
+            GraphSource::prompt_template(&store, ids::PROJECT_HTUI, "prd", None)
+                .await
+                .expect("MemStore never fails a read")
+                .is_some()
+        );
+        let agent = GraphSource::agent(&store, ids::AGENT_CLAUDE)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture seeds `claude`");
+        assert_eq!(agent.name, "claude");
+        assert_eq!(
+            (agent.default_model, agent.models),
+            (None, Vec::new()),
+            "which is exactly why the fake has to name a model itself"
+        );
+    }
+
+    /// Plan D20's whole content: with the stand-in, the seeded `feature` graph resolves; the
+    /// project's `token_budget` reaches the snapshot; and every phase names a model, which
+    /// `SnapshotCandidate` requires and the `claude` row cannot supply.
+    #[tokio::test]
+    async fn the_stand_in_is_what_makes_the_demo_graph_resolve() {
+        let store = MemStore::demo();
+        let resolved = resolve_feat(&store, &FakeGraphSource::new(&store))
+            .await
+            .expect("the stand-in supplies rung 1");
+
+        assert_eq!(
+            resolved
+                .snapshot
+                .phases
+                .iter()
+                .map(|phase| phase.name.as_str())
+                .collect::<Vec<_>>(),
+            ["prd", "plan", "implement", "review"]
+        );
+        for phase in &resolved.snapshot.phases {
+            assert_eq!(
+                phase.candidates,
+                vec![SnapshotCandidate {
+                    agent_id: ids::AGENT_CLAUDE,
+                    agent_name: "claude".to_owned(),
+                    model: "sonnet".to_owned(),
+                }],
+                "`{}` resolves to the stand-in",
+                phase.name
+            );
+            assert_eq!(
+                phase.token_budget,
+                Some(120_000),
+                "the demo project's settings carry it"
+            );
+        }
+        assert!(resolved.snapshot.topology.starts_with("sha256:"));
+    }
+
+    /// The map is keyed by phase *name*, and the `PhaseId -> name` index it needs is built by
+    /// `resolve_graph` on the way past: registering `prd` must move `prd` and nothing else.
+    #[tokio::test]
+    async fn candidates_are_registered_by_phase_name() {
+        let store = MemStore::demo();
+        let source =
+            FakeGraphSource::new(&store).with_candidates("prd", vec![(ids::AGENT_CLAUDE_CLI, "x")]);
+        let resolved = resolve_feat(&store, &source)
+            .await
+            .expect("every other phase keeps the stand-in");
+
+        assert_eq!(
+            resolved.snapshot.phases[0].candidates[0].agent_id,
+            ids::AGENT_CLAUDE_CLI
+        );
+        assert_eq!(
+            resolved.snapshot.phases[0].candidates[0].agent_name,
+            "claude-cli"
+        );
+        assert_eq!(resolved.snapshot.phases[0].candidates[0].model, "x");
+        for phase in &resolved.snapshot.phases[1..] {
+            assert_eq!(phase.candidates[0].agent_id, ids::AGENT_CLAUDE);
+        }
+    }
+
+    /// ANA-2 §4.1 rung 4 (`docs/ANA-2.md:288`): no `phase_agent`, no project default, no guess.
+    /// A named refusal, never a silent empty walk.
+    #[tokio::test]
+    async fn a_phase_with_no_candidate_is_refused_by_name() {
+        let store = MemStore::demo();
+        let source = FakeGraphSource::new(&store).without_candidates("implement");
+        let refused = resolve_feat(&store, &source)
+            .await
+            .expect_err("rung 4 is a refusal");
+        assert!(
+            matches!(&refused, ResolveError::NoCandidate { phase } if phase == "implement"),
+            "{refused}"
+        );
+    }
+
+    /// ANA-5's grammar is three lines at the very start of the body, no other keys
+    /// (`docs/ANA-5.md:1327-1331`), and it is this constructor that has to produce them.
+    #[test]
+    fn a_scripted_review_opens_with_ana5s_front_matter() {
+        let step = ScriptedStep::review("request-changes", "no tests");
+        let body = step.output.expect("a review always writes a document");
+        assert_eq!(body, "---\nverdict: request-changes\n---\nno tests");
+        assert_eq!(
+            body.lines().take(3).collect::<Vec<_>>(),
+            ["---", "verdict: request-changes", "---"]
+        );
+
+        assert!(ScriptedStep::done_without_output().output.is_none());
+        assert_eq!(
+            ScriptedStep::done_with_output("prd v1").output.as_deref(),
+            Some("prd v1")
+        );
+        assert_eq!(
+            ScriptedStep::failing(StopReason::Refusal)
+                .script
+                .turns
+                .len(),
+            1
+        );
+        assert_eq!(
+            ScriptedStep::erroring("boom", "nope").script.turns[0]
+                .events
+                .len(),
+            1,
+            "an error and no `done`: the pull past the end is the driver error settle wants"
+        );
+    }
+
+    /// One driver per session is `FakeDriver`'s rule, and the script is chosen by
+    /// `(phase, attempt)` so the review loop's second attempt can differ from its first.
+    #[test]
+    fn the_orchestrator_scripts_by_phase_and_attempt() {
+        let orch = FakeOrchestrator::demo();
+        orch.script("implement", 2, ScriptedStep::done_without_output());
+
+        assert_eq!(
+            orch.script_for("implement", 1).output.as_deref(),
+            Some("scripted output"),
+            "an unscripted attempt plays the default"
+        );
+        assert!(orch.script_for("implement", 2).output.is_none());
+
+        assert_eq!(orch.driver_for("implement", 1).name(), "fake");
+        assert!(orch.caps().permission_requests);
+        let cli = FakeOrchestrator::demo().with_caps(DriverCaps {
+            permission_requests: false,
+            edit_proposals: false,
+            ..FakeDriver::full_caps()
+        });
+        assert!(!cli.driver_for("prd", 1).caps().edit_proposals);
+    }
+
+    /// Plan D13: the harness is the document producer, the clock moves only here, and a step that
+    /// scripted no output writes nothing at all — which is the `missing_output` path.
+    #[tokio::test]
+    async fn after_done_writes_the_scripted_document_and_elapses_time() {
+        let orch = FakeOrchestrator::demo();
+        orch.script("prd", 1, ScriptedStep::done_with_output("prd v1"));
+        orch.advance_after_done(TimeDelta::seconds(3));
+
+        let step = prd_step();
+        let phase = prd_phase(&orch.store).await;
+        let document = orch
+            .after_done(ids::HTUI_FEAT_1, &step, &phase)
+            .await
+            .expect("the store accepts the write")
+            .expect("the step scripted an output");
+
+        assert_eq!(document.kind, "prd");
+        assert_eq!(document.body, "prd v1");
+        assert_eq!(document.title, "prd (attempt 1)");
+        assert_eq!(document.produced_by_step_id, Some(step.id));
+        assert_eq!(document.created_by, orch.user());
+        assert_eq!(orch.clock.now(), epoch() + TimeDelta::seconds(3));
+        assert_eq!(document.created_at, orch.clock.now());
+
+        let quiet = FakeOrchestrator::demo();
+        quiet.script("prd", 1, ScriptedStep::done_without_output());
+        assert!(
+            quiet
+                .after_done(ids::HTUI_FEAT_1, &step, &phase)
+                .await
+                .expect("the store is not asked")
+                .is_none(),
+            "no scripted body, no document (ANA-2 `:429-430`)"
+        );
     }
 
     /// Plan D8: the origin is the fake driver's, the resolution is the column's, and time moves
