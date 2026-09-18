@@ -20,15 +20,18 @@ use serde_json::Value;
 
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProfile,
-    BoxRow, BoxTool, ChatRunSpec, Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRevision, ItemSummary, LinkEdge,
-    LinkGraph, LinkKind, LinkNode, NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph,
-    NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
-    PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Run,
-    RunId, RunKind, RunMode, RunStatus, RunStep, RunStepSummary, RunSummary, Scope, SessionEvent,
-    Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, prompt_summary,
+    BoxRow, BoxSettings, BoxTool, ChatRunSpec, DEFAULT_MAX_CONCURRENT_ITEMS, Document,
+    DocumentHead, DocumentId, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemLink, ItemPatch, ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind,
+    LinkNode, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep,
+    NewStepGraph, NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath,
+    RepoId, RepoPatch, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    prompt_summary,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -37,9 +40,13 @@ use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
-    WriteStore, chat_step_status, expected_on_row, graph_not_in_project, invalid_prefix,
-    item_kind_is_held, legal_move, not_a_terminal_status, reserved_phase_name,
+    WriteStore, already_exists, chat_step_status, close_out_needs_a_summary, expected_on_row,
+    graph_not_in_project, invalid_prefix, item_has_a_live_run, item_kind_is_held, legal_move,
+    not_a_fanout_candidate, not_a_terminal_status, references_no_row, reserved_phase_name,
+    row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
+    summary_names_another_item, winner_is_not_settled,
 };
+use uuid::Uuid;
 
 /// The store the TUI runs against in MOD-1: every row in process memory, cloned out under a lock
 /// that is never held across an `.await` (plan D6).
@@ -114,6 +121,17 @@ struct State {
     runs: HashMap<RunId, Run>,
     /// `run_step`.
     steps: HashMap<StepId, RunStep>,
+    /// `run_step_tree` (ANA-2 §4.6) keyed by the table's primary key, so
+    /// [`ReadStore::step_trees`] comes out in `repo_id` order for free. No fixture loads it:
+    /// MOD-4 is the table's first writer anywhere.
+    step_trees: BTreeMap<(StepId, RepoId), RunStepTree>,
+    /// `run_step_commit`, keyed the same way. `MemStore` held no such rows before MOD-4, which is
+    /// why [`DeleteReach::run_step_commits`] used to be a hard-coded `0`.
+    step_commits: BTreeMap<(StepId, RepoId), RunStepCommit>,
+    /// `run.lease_owner`, which is deliberately not a [`Run`] field: the mirror does not carry it
+    /// and a reader has no use for another process's liveness token (blueprint F-S). Kept beside
+    /// the run so [`WriteStore::refresh_lease`] can compare against it.
+    lease_owners: HashMap<RunId, Uuid>,
     /// `session_event`.
     events: Vec<SessionEvent>,
 }
@@ -195,6 +213,9 @@ impl MemStore {
             documents: data.documents,
             runs: data.runs.into_iter().map(|row| (row.id, row)).collect(),
             steps: data.steps.into_iter().map(|row| (row.id, row)).collect(),
+            step_trees: BTreeMap::new(),
+            step_commits: BTreeMap::new(),
+            lease_owners: HashMap::new(),
             events: data.events,
         };
         Self {
@@ -420,6 +441,207 @@ impl MemStore {
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
     pub async fn item_kind(&self, id: ItemKindId) -> Result<Option<ItemKind>> {
         Ok(self.read(|state| state.kinds.get(&id).cloned()))
+    }
+
+    // ---- MOD-4 milestone 1: the eleven inherent reads of ANA-2 §8 ------------------------------
+    //
+    // Inherent rather than [`ReadStore`] methods for the reason [`MemStore::agents`] is: none of
+    // `step_graph`, `step_graph_phase`, `phase_agent`, `prompt_template`, `agent_box`, `box`,
+    // `repo_box_path` or `app_setting` is mirrored, so no offline backend could answer them and
+    // `Backend` dispatches with a `match self` (plan D1, blueprint F-N). The five §8 names that
+    // already existed — `agents`, `app_settings`, `item_kind`, `phases`, `repos` — are not
+    // repeated here.
+
+    /// One `step_graph` row, or `None`.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn step_graph(&self, id: StepGraphId) -> Result<Option<StepGraph>> {
+        Ok(self.read(|state| state.graphs.get(&id).cloned()))
+    }
+
+    /// A phase's candidate agents in `position` order. Always empty here: `phase_agent` is a table
+    /// this store does not hold, and the snapshot builder falls back to
+    /// `project.settings.default_agent_id` when a phase has no candidate.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
+        let _ = phase;
+        Ok(Vec::new())
+    }
+
+    /// One `prompt_template` by `(project, name)`: the pinned `version` when there is one, else
+    /// the highest. `None` when the pin cannot be honoured, which is
+    /// [`SkillBinding::version_in_force`]'s rule for the same shape of question.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn prompt_template(
+        &self,
+        project: ProjectId,
+        name: &str,
+        version: Option<i32>,
+    ) -> Result<Option<PromptTemplate>> {
+        Ok(self.read(|state| {
+            state
+                .templates
+                .iter()
+                .filter(|row| row.project_id == project && row.name == name)
+                .filter(|row| version.is_none_or(|want| row.version == want))
+                .max_by_key(|row| row.version)
+                .cloned()
+        }))
+    }
+
+    /// The graph an item runs under — its own `step_graph_id`, else its kind's default — with the
+    /// phases in `position` order (ANA-2 §8). `None` when the item, its kind or the graph is gone.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
+        Ok(self.read(|state| state.resolve_graph(item)))
+    }
+
+    /// Every `agent_box` row of one box, in `agent_id` byte order.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
+        Ok(self.read(|state| {
+            let mut rows: Vec<AgentBox> = state
+                .agent_boxes
+                .values()
+                .filter(|row| row.box_id == box_id)
+                .cloned()
+                .collect();
+            rows.sort_by_key(|row| row.agent_id);
+            rows
+        }))
+    }
+
+    /// One whole `box` row, unlike [`MemStore::box_info`]'s top-bar projection: the admission of
+    /// §4.7 needs `settings`, and `R-ORCH-10`'s matching needs both tag lists.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn box_row(&self, id: BoxId) -> Result<Option<BoxRow>> {
+        Ok(self.read(|state| state.boxes.get(&id).cloned()))
+    }
+
+    /// Every repo checkout path on one box, in `repo_id` byte order (`R-BOX-4`).
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn repo_paths(&self, box_id: BoxId) -> Result<Vec<RepoBoxPath>> {
+        Ok(self.read(|state| {
+            let mut rows: Vec<RepoBoxPath> = state
+                .repo_box_paths
+                .iter()
+                .filter(|row| row.box_id == box_id)
+                .cloned()
+                .collect();
+            rows.sort_by_key(|row| row.repo_id);
+            rows
+        }))
+    }
+
+    /// The scope's ready items this box can actually take: §7.4's store-side half, then
+    /// `R-ORCH-10`'s capability half — `required_tags` must be a subset of the box's
+    /// `probed_tags ∪ declared_tags`. Ordered as [`ReadStore::items`] orders.
+    ///
+    /// The capability half lives here rather than in [`ItemFilter`] because the filter's `tags`
+    /// conjunct is the caller's own vocabulary; this one is the machine's, and MOD-4 is the first
+    /// caller that has a box to match against.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn ready_items(&self, scope: &Scope, box_id: BoxId) -> Result<Vec<ItemSummary>> {
+        Ok(self.read(|state| {
+            let capabilities = state.box_capabilities(box_id);
+            state
+                .item_summaries(
+                    scope,
+                    &ItemFilter {
+                        ready: Some(true),
+                        ..ItemFilter::default()
+                    },
+                )
+                .into_iter()
+                .filter(|row| {
+                    row.required_tags
+                        .iter()
+                        .all(|tag| capabilities.contains(tag))
+                })
+                .collect()
+        }))
+    }
+
+    /// The `required_tags` of one item the box has neither probed nor declared, in byte order:
+    /// what the Backlog renders beside an item it cannot start here (`R-ORCH-10`).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] for an unknown item (`"item"`) or box (`"box"`), the item looked
+    /// up first.
+    pub async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
+        self.read(|state| {
+            let required = state.require_item(item)?.required_tags.clone();
+            if !state.boxes.contains_key(&box_id) {
+                return Err(StoreError::NotFound {
+                    entity: "box",
+                    id: box_id.to_string(),
+                });
+            }
+            let capabilities = state.box_capabilities(box_id);
+            let mut missing: Vec<String> = required
+                .into_iter()
+                .filter(|tag| !capabilities.contains(tag))
+                .collect();
+            missing.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            missing.dedup();
+            Ok(missing)
+        })
+    }
+
+    /// How many runs hold a slot on one box: §4.7's admission count, which is `running` and
+    /// `awaiting_approval` and **not** `queued` — a queued run occupies nothing yet.
+    ///
+    /// Distinct from [`MemStore::active_runs`], which counts a scope's live runs for the top bar
+    /// and does count `queued`.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn active_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+        Ok(self.read(|state| {
+            state
+                .runs
+                .values()
+                .filter(|row| {
+                    row.executing_box_id == Some(box_id)
+                        && matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
+                })
+                .count()
+        }))
+    }
+
+    /// Every active run whose `repo_scope` intersects `scope`, in `queued_at` order: what §4.7's
+    /// overlap refusal names. An empty `scope` intersects nothing (hazard H-10).
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn overlapping_runs(&self, scope: &[RepoId]) -> Result<Vec<Run>> {
+        Ok(self.read(|state| {
+            let mut rows: Vec<Run> = state
+                .runs
+                .values()
+                .filter(|row| {
+                    row.status.is_active() && row.repo_scope.iter().any(|repo| scope.contains(repo))
+                })
+                .cloned()
+                .collect();
+            rows.sort_by_key(|row| (row.queued_at, row.id));
+            rows
+        }))
     }
 
     /// Takes the read lock, runs `f`, drops the guard and returns `f`'s owned result.
@@ -2500,9 +2722,10 @@ impl State {
     ///
     /// The counts and the id sets come out of the same predicates, which is what makes
     /// `delete_reach`'s report and `delete_project`'s act equal by construction rather than by two
-    /// lists kept in step by hand. `phase_agents`, `run_step_commits` and `command_runs` are `0`
-    /// because this store holds none of the three tables, and `workspace_box_paths` because a
-    /// project is not a workspace.
+    /// lists kept in step by hand. `phase_agents` and `command_runs` are `0` because this store
+    /// holds neither table, and `workspace_box_paths` because a project is not a workspace;
+    /// `run_step_commits` and `run_step_trees` were `0` for the same reason until MOD-4 gave this
+    /// store the two maps (plan D12).
     fn project_reach(&self, id: ProjectId) -> Option<(DeleteReach, ProjectReach)> {
         if !self.projects.contains_key(&id) {
             return None;
@@ -2597,8 +2820,18 @@ impl State {
                     .filter(|row| steps.contains(&row.run_step_id))
                     .count(),
             ),
-            run_step_commits: 0,
-            run_step_trees: 0,
+            run_step_commits: rows(
+                self.step_commits
+                    .keys()
+                    .filter(|(step, _)| steps.contains(step))
+                    .count(),
+            ),
+            run_step_trees: rows(
+                self.step_trees
+                    .keys()
+                    .filter(|(step, _)| steps.contains(step))
+                    .count(),
+            ),
             command_runs: 0,
             notes: rows(
                 self.notes
@@ -2669,8 +2902,13 @@ impl State {
         })?;
         self.events
             .retain(|row| !gone.steps.contains(&row.run_step_id));
+        self.step_trees
+            .retain(|(step, _), _| !gone.steps.contains(step));
+        self.step_commits
+            .retain(|(step, _), _| !gone.steps.contains(step));
         self.steps.retain(|id, _| !gone.steps.contains(id));
         self.runs.retain(|id, _| !gone.runs.contains(id));
+        self.lease_owners.retain(|id, _| !gone.runs.contains(id));
         self.documents
             .retain(|row| !gone.items.contains(&row.item_id));
         self.notes.retain(|row| !gone.items.contains(&row.item_id));
@@ -2693,6 +2931,900 @@ impl State {
         self.workspace_projects.retain(|row| row.project_id != id);
         self.projects.remove(&id);
         Ok(reach)
+    }
+
+    // ---- MOD-4 milestone 1: graph runs (ANA-2 §8) --------------------------------------------
+    //
+    // Same discipline as the MOD-15 block above, and one more reason for it: the five writers
+    // plan D6 calls transactions are single `write` closures on the arms below, so every rule
+    // that can refuse one of them has to be reachable without taking the lock a second time.
+    // Nothing here sets `updated_at` on a table that has none: `run_step_tree` and
+    // `run_step_commit` ride their parent step's, as the mirror's cursor does (plan D9).
+
+    /// One `run` row, or the `NotFound` every writer of it opens with (plan D14).
+    fn require_run(&self, id: RunId) -> Result<&Run> {
+        self.runs.get(&id).ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: id.to_string(),
+        })
+    }
+
+    /// [`State::require_run`] for a `run_step`.
+    fn require_step(&self, id: StepId) -> Result<&RunStep> {
+        self.steps.get(&id).ok_or_else(|| StoreError::NotFound {
+            entity: "run_step",
+            id: id.to_string(),
+        })
+    }
+
+    /// [`State::require_run`] for an `item`.
+    fn require_item(&self, id: ItemId) -> Result<&Item> {
+        self.items.get(&id).ok_or_else(|| StoreError::NotFound {
+            entity: "item",
+            id: id.to_string(),
+        })
+    }
+
+    /// The capability vocabulary of a box: `probed_tags ∪ declared_tags` (`R-ORCH-10`). Empty for
+    /// a box this store does not hold, which is what makes every tagged item unready rather than
+    /// ready for a machine nobody has described.
+    fn box_capabilities(&self, box_id: BoxId) -> HashSet<String> {
+        self.boxes
+            .get(&box_id)
+            .map(|row| {
+                row.probed_tags
+                    .iter()
+                    .chain(row.declared_tags.iter())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `R-ORCH-9`'s three rungs: the box's own setting, else `app_setting`, else
+    /// [`DEFAULT_MAX_CONCURRENT_ITEMS`]. A box whose `settings` blob does not decode falls through
+    /// exactly as one that names no key does — the column is free-form JSON and a reader that
+    /// refused would take the box out of service over a typo.
+    fn max_concurrent_items(&self, box_id: BoxId) -> u32 {
+        self.boxes
+            .get(&box_id)
+            .and_then(|row| serde_json::from_value::<BoxSettings>(row.settings.clone()).ok())
+            .and_then(|settings| settings.max_concurrent_items)
+            .or_else(|| {
+                self.app_settings
+                    .get("max_concurrent_items")
+                    .and_then(|(value, _)| value.as_u64())
+                    .and_then(|value| u32::try_from(value).ok())
+            })
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_ITEMS)
+    }
+
+    /// A run's steps in `(position, attempt, fanout_index)` order: the judge (`-1`) first.
+    ///
+    /// Named apart from [`State::run_steps`], which is the same order projected to
+    /// [`RunStepSummary`] for the Runs sub-tab; this one is the seam's row read.
+    fn run_step_rows(&self, run: RunId) -> Vec<RunStep> {
+        let mut rows: Vec<RunStep> = self
+            .steps
+            .values()
+            .filter(|row| row.run_id == run)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| (row.position, row.attempt, row.fanout_index));
+        rows
+    }
+
+    /// The step's `run_step_tree` rows; the map's key order is `repo_id` order.
+    fn step_tree_rows(&self, step: StepId) -> Vec<RunStepTree> {
+        self.step_trees
+            .iter()
+            .filter(|((id, _), _)| *id == step)
+            .map(|(_, row)| row.clone())
+            .collect()
+    }
+
+    /// The step's `run_step_commit` rows, ordered as [`State::step_tree_rows`] is.
+    fn step_commit_rows(&self, step: StepId) -> Vec<RunStepCommit> {
+        self.step_commits
+            .iter()
+            .filter(|((id, _), _)| *id == step)
+            .map(|(_, row)| row.clone())
+            .collect()
+    }
+
+    /// `ORDER BY (s.run_id = $run) DESC NULLS LAST` spelled out: this run's output, then another
+    /// run's, then a document no step produced. Postgres sorts the `NULL` of the outer join last,
+    /// and a `produced_by_step_id` whose step is gone joins to the same `NULL`.
+    fn input_rank(&self, document: &Document, run: RunId) -> u8 {
+        match document
+            .produced_by_step_id
+            .and_then(|id| self.steps.get(&id))
+        {
+            Some(step) if step.run_id == run => 0,
+            Some(_) => 1,
+            None => 2,
+        }
+    }
+
+    /// One kind of ANA-2 §4.2's resolver: the eligible documents ranked, best first.
+    fn resolve_input(&self, item: ItemId, run: RunId, kind: &str) -> Option<Document> {
+        self.documents
+            .iter()
+            .filter(|document| document.item_id == item && document.kind == kind)
+            .filter(|document| {
+                // `s.selected IS NOT FALSE`: a fan-out loser is excluded, `NULL` is not.
+                document
+                    .produced_by_step_id
+                    .and_then(|id| self.steps.get(&id))
+                    .is_none_or(|step| step.selected != Some(false))
+            })
+            .min_by_key(|document| {
+                (
+                    self.input_rank(document, run),
+                    std::cmp::Reverse(document.version),
+                )
+            })
+            .cloned()
+    }
+
+    /// ANA-2 §4.2's resolver: one entry per requested kind, in request order (plan D2).
+    ///
+    /// The empty-`kinds` case is [`State::documents_of_kinds`]'s — every kind the item has, in
+    /// byte order — and cannot recurse the way that one had to guard against, because the kind
+    /// list is resolved before the per-kind walk rather than by calling back into this function.
+    fn resolve_inputs(&self, item: ItemId, run: RunId, kinds: &[String]) -> Vec<ResolvedInput> {
+        let owned;
+        let wanted = if kinds.is_empty() {
+            let mut all: Vec<String> = self
+                .documents
+                .iter()
+                .filter(|document| document.item_id == item)
+                .map(|document| document.kind.clone())
+                .collect();
+            all.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            all.dedup();
+            owned = all;
+            owned.as_slice()
+        } else {
+            kinds
+        };
+        wanted
+            .iter()
+            .map(|kind| ResolvedInput {
+                kind: kind.clone(),
+                document: self.resolve_input(item, run, kind),
+            })
+            .collect()
+    }
+
+    /// The `run` row and the item's move to `queued`, together or not at all (plan D6).
+    fn create_run(&mut self, new: NewRun, now: DateTime<Utc>) -> Result<Run> {
+        if self.runs.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists("run", new.id)));
+        }
+        if !self.projects.contains_key(&new.project_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "run.project_id",
+                new.project_id,
+                "project",
+            )));
+        }
+        if !self.boxes.contains_key(&new.target_box_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "run.target_box_id",
+                new.target_box_id,
+                "box",
+            )));
+        }
+        self.require_user(new.started_by, "run.started_by")?;
+        for repo in &new.repo_scope {
+            if !self.repos.contains_key(repo) {
+                return Err(StoreError::Constraint(references_no_row(
+                    "run.repo_scope",
+                    repo,
+                    "repo",
+                )));
+            }
+        }
+        let status = self.require_item(new.item_id)?.status;
+        legal_move(status, Status::Queued)?;
+        let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
+            StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
+        })?;
+
+        let row = Run {
+            id: new.id,
+            project_id: new.project_id,
+            item_id: Some(new.item_id),
+            kind: RunKind::Graph,
+            mode: new.mode,
+            status: RunStatus::Queued,
+            target_box_id: new.target_box_id,
+            executing_box_id: None,
+            graph_snapshot: Some(snapshot),
+            started_by: new.started_by,
+            queued_at: new.queued_at,
+            started_at: None,
+            finished_at: None,
+            failure: None,
+            repo_scope: new.repo_scope,
+            lease_box_id: None,
+            lease_expires_at: None,
+            updated_at: now,
+        };
+        self.runs.insert(row.id, row.clone());
+        self.transition(new.item_id, status, Status::Queued, now)?;
+        Ok(row)
+    }
+
+    /// ANA-2 §4.7's admission, decided before the first write so a refusal writes nothing.
+    fn claim_run(
+        &mut self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        at: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let claimed = self.require_run(run)?.clone();
+        if !self.boxes.contains_key(&box_id) {
+            return Err(StoreError::NotFound {
+                entity: "box",
+                id: box_id.to_string(),
+            });
+        }
+        if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
+            return Ok(false);
+        }
+
+        let live: Vec<&Run> = self
+            .runs
+            .values()
+            .filter(|row| {
+                row.executing_box_id == Some(box_id)
+                    && matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
+            })
+            .collect();
+        if rows(live.len()) >= u64::from(self.max_concurrent_items(box_id)) {
+            return Ok(false);
+        }
+        // An empty `repo_scope` intersects nothing, so a run that declared none is never refused
+        // for overlap — the resolver, not the seam, is what turns an empty `touched_paths` into a
+        // scope (hazard H-10).
+        if live.iter().any(|row| {
+            row.repo_scope
+                .iter()
+                .any(|repo| claimed.repo_scope.contains(repo))
+        }) {
+            return Ok(false);
+        }
+
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.status = RunStatus::Running;
+            row.executing_box_id = Some(box_id);
+            row.started_at = row.started_at.or(Some(at));
+            row.lease_box_id = Some(box_id);
+            row.lease_expires_at = Some(lease_until);
+            row.updated_at = now;
+        }
+        self.lease_owners.insert(run, owner);
+        if let Some(item) = claimed.item_id
+            && self
+                .items
+                .get(&item)
+                .is_some_and(|row| row.status == Status::Queued)
+        {
+            // A stale item status is not a refusal: the run is what is being claimed.
+            self.transition(item, Status::Queued, Status::InProgress, now)?;
+        }
+        Ok(true)
+    }
+
+    /// ANA-2 §4.9's heartbeat: a compare-and-set on `lease_owner`, not on the expiry.
+    fn refresh_lease(
+        &mut self,
+        run: RunId,
+        owner: Uuid,
+        until: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.require_run(run)?;
+        if self.lease_owners.get(&run) != Some(&owner) {
+            return Ok(false);
+        }
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.lease_expires_at = Some(until);
+            row.updated_at = now;
+        }
+        Ok(true)
+    }
+
+    /// ANA-2 §4.9's sweep: every abandoned lease on the box becomes `owner`'s.
+    fn adopt_runs(
+        &mut self,
+        box_id: BoxId,
+        owner: Uuid,
+        at: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Vec<Run> {
+        let mut abandoned: Vec<(DateTime<Utc>, RunId)> = self
+            .runs
+            .values()
+            .filter(|row| {
+                row.status == RunStatus::Running
+                    && row.executing_box_id == Some(box_id)
+                    && row.lease_expires_at.is_none_or(|until| until <= at)
+            })
+            .map(|row| (row.queued_at, row.id))
+            .collect();
+        abandoned.sort_unstable();
+
+        let mut adopted = Vec::with_capacity(abandoned.len());
+        for (_, id) in abandoned {
+            self.lease_owners.insert(id, owner);
+            if let Some(row) = self.runs.get_mut(&id) {
+                row.lease_box_id = Some(box_id);
+                row.lease_expires_at = Some(lease_until);
+                row.updated_at = now;
+                adopted.push(row.clone());
+            }
+        }
+        adopted
+    }
+
+    /// A `run_step` at `pending` with every settle column `NULL`.
+    fn create_step(&mut self, new: NewRunStep, now: DateTime<Utc>) -> Result<RunStep> {
+        if self.steps.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists("run_step", new.id)));
+        }
+        if !self.runs.contains_key(&new.run_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "run_step.run_id",
+                new.run_id,
+                "run",
+            )));
+        }
+        if let Some(agent) = new.agent_id
+            && !self.agents.contains_key(&agent)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "run_step.agent_id",
+                agent,
+                "agent",
+            )));
+        }
+        if self.steps.values().any(|row| {
+            row.run_id == new.run_id
+                && row.position == new.position
+                && row.attempt == new.attempt
+                && row.fanout_index == new.fanout_index
+        }) {
+            return Err(StoreError::Constraint(step_slot_is_taken(
+                new.run_id,
+                new.position,
+                new.attempt,
+                new.fanout_index,
+            )));
+        }
+
+        let row = RunStep {
+            id: new.id,
+            run_id: new.run_id,
+            position: new.position,
+            attempt: new.attempt,
+            fanout_index: new.fanout_index,
+            phase_name: new.phase_name,
+            agent_id: new.agent_id,
+            model: new.model,
+            status: StepStatus::Pending,
+            gate_outcome: None,
+            gate_note: None,
+            selected: None,
+            exit_code: None,
+            prompt_digest: None,
+            trim_record: None,
+            usage: None,
+            isolation_path: None,
+            started_at: None,
+            finished_at: None,
+            verify_outcome: None,
+            verify_exit_code: None,
+            promoted_at: None,
+            updated_at: now,
+        };
+        self.steps.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// [`State::transition`]'s shape for `run.status`, with §4.3's two stamps.
+    fn transition_run(
+        &mut self,
+        run: RunId,
+        from: RunStatus,
+        to: RunStatus,
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let row = self
+            .runs
+            .get_mut(&run)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            })?;
+        legal_move(from, to)?;
+        if row.status != from {
+            return Ok(false);
+        }
+        row.status = to;
+        if to == RunStatus::Running {
+            row.started_at = row.started_at.or(Some(at));
+        }
+        if to.is_terminal() {
+            row.finished_at = row.finished_at.or(Some(at));
+        }
+        row.updated_at = now;
+        Ok(true)
+    }
+
+    /// The `run_step` twin of [`State::transition_run`].
+    fn transition_step(
+        &mut self,
+        step: StepId,
+        from: StepStatus,
+        to: StepStatus,
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let row = self
+            .steps
+            .get_mut(&step)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })?;
+        legal_move(from, to)?;
+        if row.status != from {
+            return Ok(false);
+        }
+        row.status = to;
+        if to == StepStatus::Running {
+            row.started_at = row.started_at.or(Some(at));
+        }
+        if to.is_terminal() {
+            row.finished_at = row.finished_at.or(Some(at));
+        }
+        row.updated_at = now;
+        Ok(true)
+    }
+
+    /// The settle columns of [`StepOutcome`] and never `status`.
+    fn finish_step(
+        &mut self,
+        step: StepId,
+        outcome: StepOutcome,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let row = self
+            .steps
+            .get_mut(&step)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })?;
+        row.exit_code = outcome.exit_code;
+        // The two the assembler and the usage summer own: `None` leaves the column.
+        if outcome.usage.is_some() {
+            row.usage = outcome.usage;
+        }
+        if outcome.trim_record.is_some() {
+            row.trim_record = outcome.trim_record;
+        }
+        row.verify_outcome = outcome.verify_outcome;
+        row.verify_exit_code = outcome.verify_exit_code;
+        row.finished_at = Some(outcome.finished_at);
+        row.updated_at = now;
+        Ok(())
+    }
+
+    /// `R-ORCH-2`'s four answers, a compare-and-set on `awaiting_approval`.
+    fn answer_gate(
+        &mut self,
+        step: StepId,
+        outcome: GateOutcome,
+        note: Option<String>,
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let row = self
+            .steps
+            .get_mut(&step)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })?;
+        if row.status != StepStatus::AwaitingApproval {
+            return Ok(false);
+        }
+        row.status = match outcome {
+            GateOutcome::Approved | GateOutcome::Skipped => StepStatus::Done,
+            GateOutcome::Rejected => StepStatus::Failed,
+            GateOutcome::Retried => StepStatus::Superseded,
+        };
+        row.gate_outcome = Some(outcome);
+        row.gate_note = note;
+        row.finished_at = row.finished_at.or(Some(at));
+        row.updated_at = now;
+        Ok(true)
+    }
+
+    /// ANA-2 §4.5's bookkeeping: everything is validated before the first candidate is touched,
+    /// which is what makes the whole selection one transaction (plan D6).
+    ///
+    /// The judge row is settled directly rather than through [`legal_move`]: §4.5 makes the
+    /// judge's `done` part of the winner's outcome, so a judge that never left `pending` — a
+    /// human answering the fan-out itself — must not turn the selection into a refusal.
+    fn select_fanout(
+        &mut self,
+        run: RunId,
+        position: i32,
+        attempt: i32,
+        winner: StepId,
+        reason: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let row = self.require_step(winner)?;
+        if row.run_id != run
+            || row.position != position
+            || row.attempt != attempt
+            || row.fanout_index < 0
+        {
+            return Err(StoreError::Constraint(not_a_fanout_candidate(
+                winner, run, position, attempt,
+            )));
+        }
+        if !matches!(row.status, StepStatus::AwaitingApproval | StepStatus::Done) {
+            return Err(StoreError::Constraint(winner_is_not_settled(
+                winner, row.status,
+            )));
+        }
+
+        let slot =
+            |row: &RunStep| row.run_id == run && row.position == position && row.attempt == attempt;
+        let losers: Vec<StepId> = self
+            .steps
+            .values()
+            .filter(|row| slot(row) && row.fanout_index >= 0 && row.id != winner)
+            .map(|row| row.id)
+            .collect();
+        let judges: Vec<StepId> = self
+            .steps
+            .values()
+            .filter(|row| slot(row) && row.fanout_index < 0)
+            .map(|row| row.id)
+            .collect();
+
+        if let Some(row) = self.steps.get_mut(&winner) {
+            row.selected = Some(true);
+            row.status = StepStatus::Done;
+            row.updated_at = now;
+        }
+        for id in losers {
+            if let Some(row) = self.steps.get_mut(&id) {
+                row.selected = Some(false);
+                if matches!(
+                    row.status,
+                    StepStatus::Pending | StepStatus::AwaitingApproval | StepStatus::Done
+                ) {
+                    row.status = StepStatus::Superseded;
+                }
+                row.updated_at = now;
+            }
+        }
+        for id in judges {
+            if let Some(row) = self.steps.get_mut(&id) {
+                row.status = StepStatus::Done;
+                row.gate_note.clone_from(&reason);
+                row.updated_at = now;
+            }
+        }
+        Ok(())
+    }
+
+    /// §4.4's loop half; the law's table is what refuses, not a stale compare-and-set.
+    fn supersede_step(&mut self, step: StepId, now: DateTime<Utc>) -> Result<()> {
+        let row = self
+            .steps
+            .get_mut(&step)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })?;
+        legal_move(row.status, StepStatus::Superseded)?;
+        row.status = StepStatus::Superseded;
+        row.updated_at = now;
+        Ok(())
+    }
+
+    /// Every row of a tree or commit batch belongs to `step` and names a repo that exists; the
+    /// whole batch is checked before the first insert, as [`State::append_events`] does.
+    fn check_step_batch(
+        &self,
+        table: &str,
+        step: StepId,
+        rows: impl IntoIterator<Item = (StepId, RepoId)>,
+    ) -> Result<()> {
+        self.require_step(step)?;
+        for (run_step_id, repo_id) in rows {
+            if run_step_id != step {
+                return Err(StoreError::Constraint(row_names_another_step(
+                    table,
+                    run_step_id,
+                    step,
+                )));
+            }
+            if !self.repos.contains_key(&repo_id) {
+                return Err(StoreError::Constraint(references_no_row(
+                    &format!("{table}.repo_id"),
+                    repo_id,
+                    "repo",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `run_step_tree` upserted on `(run_step_id, repo_id)` (ANA-2 §4.6).
+    fn upsert_step_tree(&mut self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+        self.check_step_batch(
+            "run_step_tree",
+            step,
+            trees.iter().map(|row| (row.run_step_id, row.repo_id)),
+        )?;
+        for row in trees {
+            self.step_trees.insert((step, row.repo_id), row.clone());
+        }
+        Ok(())
+    }
+
+    /// `run_step_commit` upserted on the same key (`R-ORCH-11`).
+    fn record_commits(&mut self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
+        self.check_step_batch(
+            "run_step_commit",
+            step,
+            commits.iter().map(|row| (row.run_step_id, row.repo_id)),
+        )?;
+        for row in commits {
+            self.step_commits.insert((step, row.repo_id), row.clone());
+        }
+        Ok(())
+    }
+
+    /// The document at `max(version) + 1` for its `(item, kind)` (plan D6).
+    fn write_document(&mut self, new: NewDocument) -> Result<Document> {
+        self.require_item(new.item_id)?;
+        if self.documents.iter().any(|row| row.id == new.id) {
+            return Err(StoreError::Constraint(already_exists("document", new.id)));
+        }
+        self.require_user(new.created_by, "document.created_by")?;
+        if let Some(step) = new.produced_by_step_id
+            && !self.steps.contains_key(&step)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "document.produced_by_step_id",
+                step,
+                "run_step",
+            )));
+        }
+        let version = self
+            .documents
+            .iter()
+            .filter(|row| row.item_id == new.item_id && row.kind == new.kind)
+            .map(|row| row.version)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let row = Document {
+            id: new.id,
+            item_id: new.item_id,
+            kind: new.kind,
+            version,
+            title: new.title,
+            body: new.body,
+            produced_by_step_id: new.produced_by_step_id,
+            created_by: new.created_by,
+            created_at: new.created_at,
+        };
+        self.documents.push(row.clone());
+        Ok(row)
+    }
+
+    /// §4.8's promotion: the step, its run and its item, in one closure (plan D6).
+    fn promote_step(&mut self, step: StepId, at: DateTime<Utc>, now: DateTime<Utc>) -> Result<()> {
+        let row = self.require_step(step)?;
+        if !matches!(
+            row.status,
+            StepStatus::Failed | StepStatus::AwaitingApproval
+        ) {
+            return Err(StoreError::Constraint(step_is_not_promotable(
+                step, row.status,
+            )));
+        }
+        let run_id = row.run_id;
+        let run = self.require_run(run_id)?;
+        if run.status.is_terminal() {
+            return Err(StoreError::Constraint(run_is_terminal(run_id, run.status)));
+        }
+        let run_status = run.status;
+        let item_id = run.item_id;
+
+        if let Some(row) = self.steps.get_mut(&step) {
+            row.status = StepStatus::AwaitingApproval;
+            row.promoted_at = Some(at);
+            row.updated_at = now;
+        }
+        if run_status == RunStatus::Running
+            && let Some(row) = self.runs.get_mut(&run_id)
+        {
+            row.status = RunStatus::AwaitingApproval;
+            row.updated_at = now;
+        }
+        if let Some(item) = item_id
+            && self
+                .items
+                .get(&item)
+                .is_some_and(|row| row.status == Status::InProgress)
+        {
+            self.transition(item, Status::InProgress, Status::AwaitingApproval, now)?;
+        }
+        Ok(())
+    }
+
+    /// §4.3's failure row, from any non-terminal status.
+    fn fail_run(
+        &mut self,
+        run: RunId,
+        failure: &str,
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let row = self
+            .runs
+            .get_mut(&run)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            })?;
+        legal_move(row.status, RunStatus::Failed)?;
+        row.status = RunStatus::Failed;
+        row.failure = Some(failure.to_owned());
+        row.finished_at = row.finished_at.or(Some(at));
+        row.updated_at = now;
+        Ok(())
+    }
+
+    /// `R-TUI-9`'s three effects, one closure: everything refusable is decided first.
+    fn close_out(
+        &mut self,
+        item: ItemId,
+        summary: NewDocument,
+        commits: &[RunStepCommit],
+        now: DateTime<Utc>,
+    ) -> Result<Document> {
+        let status = self.require_item(item)?.status;
+        if let Some(live) = self
+            .runs
+            .values()
+            .filter(|row| row.item_id == Some(item) && row.status.is_active())
+            .min_by_key(|row| (row.queued_at, row.id))
+        {
+            return Err(StoreError::Constraint(item_has_a_live_run(
+                item,
+                live.id,
+                live.status,
+            )));
+        }
+        if summary.kind != "summary" {
+            return Err(StoreError::Constraint(close_out_needs_a_summary(
+                &summary.kind,
+            )));
+        }
+        if summary.item_id != item {
+            return Err(StoreError::Constraint(summary_names_another_item(
+                item,
+                summary.item_id,
+            )));
+        }
+        legal_move(status, Status::Closed)?;
+        for row in commits {
+            self.check_step_batch(
+                "run_step_commit",
+                row.run_step_id,
+                std::iter::once((row.run_step_id, row.repo_id)),
+            )?;
+        }
+
+        let document = self.write_document(summary)?;
+        for row in commits {
+            self.step_commits
+                .insert((row.run_step_id, row.repo_id), row.clone());
+        }
+        self.transition(item, status, Status::Closed, now)?;
+        Ok(document)
+    }
+
+    /// ANA-2 invariant 7's refusal note; every foreign key is checked before the insert.
+    fn add_note(&mut self, note: NewNote) -> Result<Note> {
+        if self.notes.iter().any(|row| row.id == note.id) {
+            return Err(StoreError::Constraint(already_exists("item_note", note.id)));
+        }
+        if !self.items.contains_key(&note.item_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "item_note.item_id",
+                note.item_id,
+                "item",
+            )));
+        }
+        self.require_user(note.created_by, "item_note.created_by")?;
+        if let Some(box_id) = note.box_id
+            && !self.boxes.contains_key(&box_id)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "item_note.box_id",
+                box_id,
+                "box",
+            )));
+        }
+        if let Some(step) = note.via_step_id
+            && !self.steps.contains_key(&step)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "item_note.via_step_id",
+                step,
+                "run_step",
+            )));
+        }
+        let row = Note {
+            id: note.id,
+            item_id: note.item_id,
+            body: note.body,
+            created_by: note.created_by,
+            box_id: note.box_id,
+            via_step_id: note.via_step_id,
+            created_at: note.created_at,
+        };
+        self.notes.push(row.clone());
+        Ok(row)
+    }
+
+    /// `step_graph_id` of the item, else its kind's default (ANA-2 §8's `resolve_graph`).
+    fn resolve_graph(&self, item: ItemId) -> Option<ResolvedGraph> {
+        let row = self.items.get(&item)?;
+        let graph_id = row.step_graph_id.or_else(|| {
+            self.kinds
+                .get(&row.kind_id)
+                .map(|kind| kind.default_graph_id)
+        })?;
+        let graph = self.graphs.get(&graph_id)?.clone();
+        let mut phases: Vec<&StepGraphPhase> = self
+            .phases
+            .iter()
+            .filter(|phase| phase.graph_id == graph_id)
+            .collect();
+        phases.sort_by_key(|phase| phase.position);
+        Some(ResolvedGraph {
+            graph,
+            phases: phases
+                .into_iter()
+                .map(|phase| ResolvedPhase {
+                    phase: phase.clone(),
+                    // `phase_agent` is not a table this store holds (blueprint F-N).
+                    agents: Vec::new(),
+                })
+                .collect(),
+        })
     }
 }
 
@@ -2800,6 +3932,34 @@ impl ReadStore for MemStore {
 
     async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
         Ok(self.read(|state| state.projects.get(&id).cloned()))
+    }
+
+    // MOD-4 milestone 1: the five run reads of ANA-2 §8 that a mirrored table makes trait methods
+    // (plan D1). All five are total; only the writers refuse.
+
+    async fn run(&self, id: RunId) -> Result<Option<Run>> {
+        Ok(self.read(|state| state.runs.get(&id).cloned()))
+    }
+
+    async fn run_steps(&self, run: RunId) -> Result<Vec<RunStep>> {
+        Ok(self.read(|state| state.run_step_rows(run)))
+    }
+
+    async fn step_trees(&self, step: StepId) -> Result<Vec<RunStepTree>> {
+        Ok(self.read(|state| state.step_tree_rows(step)))
+    }
+
+    async fn step_commits(&self, step: StepId) -> Result<Vec<RunStepCommit>> {
+        Ok(self.read(|state| state.step_commit_rows(step)))
+    }
+
+    async fn resolve_inputs(
+        &self,
+        item: ItemId,
+        run: RunId,
+        kinds: &[String],
+    ) -> Result<Vec<ResolvedInput>> {
+        Ok(self.read(|state| state.resolve_inputs(item, run, kinds)))
     }
 }
 
@@ -3073,6 +4233,139 @@ impl WriteStore for MemStore {
     async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
         self.write(|state| state.delete_project(id))
     }
+
+    // MOD-4 milestone 1, in ANA-2 §8's order. `create_run`, `claim_run`, `select_fanout`,
+    // `write_document` and `close_out` are each a **single** `write` closure, so plan D6's five
+    // transactions are atomic here by construction and not by discipline.
+
+    async fn create_run(&self, new: NewRun) -> Result<Run> {
+        let now = Utc::now();
+        self.write(|state| state.create_run(new, now))
+    }
+
+    async fn claim_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        at: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        self.write(|state| state.claim_run(run, box_id, owner, at, lease_until, now))
+    }
+
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
+        let now = Utc::now();
+        self.write(|state| state.refresh_lease(run, owner, until, now))
+    }
+
+    async fn adopt_runs(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        at: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+    ) -> Result<Vec<Run>> {
+        let now = Utc::now();
+        Ok(self.write(|state| state.adopt_runs(box_id, owner, at, lease_until, now)))
+    }
+
+    async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
+        let now = Utc::now();
+        self.write(|state| state.create_step(new, now))
+    }
+
+    async fn transition_run(
+        &self,
+        run: RunId,
+        from: RunStatus,
+        to: RunStatus,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        self.write(|state| state.transition_run(run, from, to, at, now))
+    }
+
+    async fn transition_step(
+        &self,
+        step: StepId,
+        from: StepStatus,
+        to: StepStatus,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        self.write(|state| state.transition_step(step, from, to, at, now))
+    }
+
+    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.finish_step(step, outcome, now))
+    }
+
+    async fn answer_gate(
+        &self,
+        step: StepId,
+        outcome: GateOutcome,
+        note: Option<String>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        self.write(|state| state.answer_gate(step, outcome, note, at, now))
+    }
+
+    async fn select_fanout(
+        &self,
+        run: RunId,
+        position: i32,
+        attempt: i32,
+        winner: StepId,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.select_fanout(run, position, attempt, winner, reason, now))
+    }
+
+    async fn supersede_step(&self, step: StepId) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.supersede_step(step, now))
+    }
+
+    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+        self.write(|state| state.upsert_step_tree(step, trees))
+    }
+
+    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
+        self.write(|state| state.record_commits(step, commits))
+    }
+
+    async fn write_document(&self, new: NewDocument) -> Result<Document> {
+        self.write(|state| state.write_document(new))
+    }
+
+    async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.promote_step(step, at, now))
+    }
+
+    async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.fail_run(run, failure, at, now))
+    }
+
+    async fn close_out(
+        &self,
+        item: ItemId,
+        summary: NewDocument,
+        commits: &[RunStepCommit],
+    ) -> Result<Document> {
+        let now = Utc::now();
+        self.write(|state| state.close_out(item, summary, commits, now))
+    }
+
+    async fn add_note(&self, note: NewNote) -> Result<Note> {
+        self.write(|state| state.add_note(note))
+    }
 }
 
 #[cfg(all(test, feature = "test-support"))]
@@ -3080,15 +4373,19 @@ mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
     use crate::model::{
-        AgentBox, AgentId, ChatRunSpec, ItemId, ItemKindPatch, NewItem, NewProject, ProjectId,
-        RunStatus, StepId, StepStatus,
+        AgentBox, AgentId, BoxId, ChatRunSpec, DocumentId, GateOutcome, GraphSnapshot, Isolation,
+        ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject, NewRepo, NewRun,
+        NewRunStep, NoteId, ProjectId, RepoId, RunId, RunKind, RunMode, RunStatus, RunStepCommit,
+        RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
+        StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
     use crate::store::error::StoreError;
-    use crate::store::{CasOutcome, ReadStore as _, SettingRung, WriteStore as _};
-    use chrono::Utc;
+    use crate::store::{CasOutcome, DeleteTarget, ReadStore as _, SettingRung, WriteStore as _};
+    use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
+    use uuid::Uuid;
 
     /// The columns `store::conformance` cannot see, because §6.1 returns neither `run_step.usage`
     /// nor `run_step.prompt_digest` (plan D15(a)). Read straight out of `State`, which is what a
@@ -3253,7 +4550,7 @@ mod tests {
     async fn upstream_walk_is_directed_and_kind_filtered() {
         let store = MemStore::demo();
         let scope = crate::model::PromptScope::from_scope(
-            &crate::model::Scope {
+            &Scope {
                 workspace_id: ids::WORKSPACE_PLATFORM,
                 project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
             },
@@ -3295,7 +4592,7 @@ mod tests {
         // Directed. `htui:ANA-1` has four live edges and every one of them points *at* it, so the
         // undirected `links` finds four neighbours and the upstream walk finds nothing at all.
         let htui = crate::model::PromptScope::from_scope(
-            &crate::model::Scope {
+            &Scope {
                 workspace_id: ids::WORKSPACE_PLATFORM,
                 project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
             },
@@ -3342,7 +4639,7 @@ mod tests {
     async fn a_chat_run_mints_the_two_rows_the_offline_upload_would() {
         let store = MemStore::demo();
         let before = store
-            .active_runs(&crate::model::Scope {
+            .active_runs(&Scope {
                 workspace_id: ids::WORKSPACE_PLATFORM,
                 project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
             })
@@ -3368,8 +4665,8 @@ mod tests {
                     .expect("the step row"),
             )
         });
-        assert_eq!(run.kind, crate::model::RunKind::Chat, "run.kind");
-        assert_eq!(run.mode, crate::model::RunMode::Manual, "run.mode");
+        assert_eq!(run.kind, RunKind::Chat, "run.kind");
+        assert_eq!(run.mode, RunMode::Manual, "run.mode");
         assert_eq!(run.item_id, None, "run.item_id is NULL for a chat");
         assert_eq!(run.status, RunStatus::Running, "run.status");
         assert_eq!(run.finished_at, None, "run.finished_at");
@@ -3381,7 +4678,7 @@ mod tests {
         assert_eq!(step.status, StepStatus::Running, "run_step.status");
         assert_eq!(step.agent_id, Some(ids::AGENT_CLAUDE), "run_step.agent_id");
 
-        let scope = crate::model::Scope {
+        let scope = Scope {
             workspace_id: ids::WORKSPACE_PLATFORM,
             project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
         };
@@ -3520,7 +4817,7 @@ mod tests {
     async fn set_agent_box_quota_leaves_probe_and_version_alone() {
         let store = MemStore::demo();
         let snapshot = serde_json::json!({ "status": "ready", "source": "probe" });
-        let probed_at = Utc::now() - chrono::TimeDelta::hours(3);
+        let probed_at = Utc::now() - TimeDelta::hours(3);
         store
             .upsert_agent_box(&AgentBox {
                 agent_id: ids::AGENT_CLAUDE,
@@ -3999,6 +5296,19 @@ mod tests {
             );
             assert!(
                 state
+                    .step_trees
+                    .keys()
+                    .all(|(step, _)| state.steps.contains_key(step))
+                    && state
+                        .step_commits
+                        .keys()
+                        .all(|(step, _)| state.steps.contains_key(step)),
+                "every surviving tree and commit has a surviving step (MOD-4's two new maps; the \
+                 fixture seeds neither, so `trees_and_commits_upsert_on_their_repo_key_and_the_\
+                 delete_counts_them` is where they are populated first)"
+            );
+            assert!(
+                state
                     .repo_box_paths
                     .iter()
                     .all(|row| state.repos.contains_key(&row.repo_id)),
@@ -4200,5 +5510,1458 @@ mod tests {
         assert_eq!(minted.key, "ANL-1");
         assert_eq!(counter("ANL"), Some(1));
         assert_eq!(counter("ANA"), Some(2), "still");
+    }
+
+    // ---- MOD-4 milestone 1: the run seam (blueprint §2.8, §2.9) -------------------------------
+    //
+    // The fourteen conformance cases are the next commit's and pin these rules on every backend.
+    // What follows is the narrowest per-method coverage this commit needs: the outcome, the
+    // refusal and — for the five transactions of plan D6 — that a refusal leaves no half-written
+    // row behind.
+
+    /// A snapshot with no phases: enough to prove the column is written and decodes at `v = 1`.
+    fn test_snapshot() -> GraphSnapshot {
+        GraphSnapshot {
+            v: GraphSnapshot::V,
+            graph: SnapshotGraph {
+                id: ids::GRAPH_HTUI_FEAT,
+                name: "FEAT".to_owned(),
+                is_override: false,
+            },
+            topology: "sha256:test".to_owned(),
+            mode: RunMode::Manual,
+            phases: Vec::new(),
+            settings: SnapshotSettings {
+                default_isolation: Isolation::Worktree,
+                per_token_cap_run: None,
+                per_token_cap_batch: None,
+                max_fan_out: 4,
+                max_agents_per_run: 6,
+            },
+        }
+    }
+
+    fn graph_run(item: ItemId, project: ProjectId, scope: Vec<RepoId>) -> NewRun {
+        NewRun {
+            id: RunId::new(),
+            project_id: project,
+            item_id: item,
+            mode: RunMode::Manual,
+            target_box_id: ids::BOX,
+            started_by: ids::USER,
+            graph_snapshot: test_snapshot(),
+            repo_scope: scope,
+            queued_at: Utc::now(),
+        }
+    }
+
+    fn new_step(run: RunId, position: i32, attempt: i32, fanout_index: i32) -> NewRunStep {
+        NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position,
+            attempt,
+            fanout_index,
+            phase_name: "implement".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: Some("opus".to_owned()),
+        }
+    }
+
+    async fn a_repo(store: &MemStore, name: &str) -> RepoId {
+        store
+            .create_repo(NewRepo {
+                id: RepoId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: name.to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            })
+            .await
+            .expect("the repo lands")
+            .id
+    }
+
+    fn a_document(item: ItemId, kind: &str, step: Option<StepId>) -> NewDocument {
+        NewDocument {
+            id: DocumentId::new(),
+            item_id: item,
+            kind: kind.to_owned(),
+            title: format!("{kind} of {item}"),
+            body: String::new(),
+            produced_by_step_id: step,
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Drives a fresh step of `run` to `awaiting_approval` through the two legal moves.
+    async fn gated_step(store: &MemStore, spec: NewRunStep) -> StepId {
+        let id = spec.id;
+        store.create_step(spec).await.expect("the step lands");
+        let now = Utc::now();
+        store
+            .transition_step(id, StepStatus::Pending, StepStatus::Running, now)
+            .await
+            .expect("pending -> running is legal");
+        store
+            .transition_step(id, StepStatus::Running, StepStatus::AwaitingApproval, now)
+            .await
+            .expect("running -> awaiting_approval is legal");
+        id
+    }
+
+    /// `create_run` is one transaction (plan D6): the `run` row and the item's move to `queued`
+    /// land together, and an item the §4.3 law cannot move leaves no run row behind.
+    #[tokio::test]
+    async fn create_run_moves_the_item_and_writes_nothing_when_the_law_refuses() {
+        let store = MemStore::demo();
+        let new = graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new());
+        let id = new.id;
+        let row = store
+            .create_run(new)
+            .await
+            .expect("open -> queued is legal");
+
+        assert_eq!(row.status, RunStatus::Queued, "a new run starts queued");
+        assert_eq!(row.kind, RunKind::Graph, "create_run mints graph runs");
+        assert_eq!(row.item_id, Some(ids::HTUI_ANA_2));
+        assert_eq!(row.executing_box_id, None, "nothing has claimed it yet");
+        assert_eq!(row.lease_box_id, None);
+        assert_eq!(row.lease_expires_at, None);
+        let snapshot: GraphSnapshot =
+            serde_json::from_value(row.graph_snapshot.clone().expect("the snapshot is written"))
+                .expect("it decodes as the typed form the caller passed");
+        assert_eq!(snapshot.v, GraphSnapshot::V);
+        assert_eq!(
+            store.run(id).await.expect("the run reads back"),
+            Some(row),
+            "`run` answers the row `create_run` returned"
+        );
+
+        let item = store
+            .item(ids::HTUI_ANA_2)
+            .await
+            .expect("the item reads back")
+            .expect("the fixture item");
+        assert_eq!(item.status, Status::Queued, "the item moved with the run");
+
+        let blocked = graph_run(ids::HTUI_FEAT_1, ids::PROJECT_HTUI, Vec::new());
+        let blocked_id = blocked.id;
+        assert!(
+            matches!(
+                store.create_run(blocked).await,
+                Err(StoreError::Constraint(_))
+            ),
+            "in_progress cannot move to queued (ANA-2 §4.3)"
+        );
+        assert_eq!(
+            store.run(blocked_id).await.expect("the read is total"),
+            None,
+            "the refusal wrote no run row: create_run is one transaction"
+        );
+
+        let missing = graph_run(ItemId::new(), ids::PROJECT_HTUI, Vec::new());
+        assert!(
+            matches!(
+                store.create_run(missing).await,
+                Err(StoreError::NotFound { entity: "item", .. })
+            ),
+            "an unknown item is NotFound before the law is asked (plan D14)"
+        );
+    }
+
+    /// ANA-2 §4.7's admission: the repo-scope overlap refuses before the slot count does, and the
+    /// slot count is `box.settings.max_concurrent_items`.
+    #[tokio::test]
+    async fn claim_run_refuses_an_overlapping_scope_and_a_full_box() {
+        let store = MemStore::demo();
+        let repo = a_repo(&store, "core").await;
+        let owner = Uuid::now_v7();
+        let at = Utc::now();
+        let until = at + TimeDelta::minutes(5);
+
+        let queue = |item, project, scope: Vec<RepoId>| {
+            let store = &store;
+            async move {
+                store
+                    .create_run(graph_run(item, project, scope))
+                    .await
+                    .expect("the run is queued")
+                    .id
+            }
+        };
+        let first = queue(ids::HTUI_ANA_2, ids::PROJECT_HTUI, vec![repo]).await;
+        let second = queue(ids::HTUI_CLEAN_1, ids::PROJECT_HTUI, vec![repo]).await;
+        let third = queue(ids::AGY_FEAT_1, ids::PROJECT_AGY, Vec::new()).await;
+        let fourth = queue(ids::AGY_FIX_1, ids::PROJECT_AGY, Vec::new()).await;
+
+        assert!(
+            store
+                .claim_run(first, ids::BOX, owner, at, until)
+                .await
+                .expect("the claim is answered"),
+            "the first run is admitted"
+        );
+        let claimed = store
+            .run(first)
+            .await
+            .expect("the run reads back")
+            .expect("it exists");
+        assert_eq!(claimed.status, RunStatus::Running);
+        assert_eq!(claimed.executing_box_id, Some(ids::BOX));
+        assert_eq!(claimed.started_at, Some(at), "`at` is the caller's clock");
+        assert_eq!(claimed.lease_box_id, Some(ids::BOX));
+        assert_eq!(claimed.lease_expires_at, Some(until));
+        assert_eq!(
+            store
+                .item(ids::HTUI_ANA_2)
+                .await
+                .expect("the item reads back")
+                .expect("it exists")
+                .status,
+            Status::InProgress,
+            "the item moved queued -> in_progress with the claim"
+        );
+
+        assert!(
+            !store
+                .claim_run(second, ids::BOX, owner, at, until)
+                .await
+                .expect("the claim is answered"),
+            "an overlapping repo_scope is refused while one slot is still free"
+        );
+        assert_eq!(
+            store
+                .run(second)
+                .await
+                .expect("the run reads back")
+                .expect("it exists")
+                .status,
+            RunStatus::Queued,
+            "a refused claim writes nothing"
+        );
+
+        assert!(
+            store
+                .claim_run(third, ids::BOX, owner, at, until)
+                .await
+                .expect("the claim is answered"),
+            "an empty scope overlaps nothing"
+        );
+        assert!(
+            !store
+                .claim_run(fourth, ids::BOX, owner, at, until)
+                .await
+                .expect("the claim is answered"),
+            "`max_concurrent_items` is 2 on the fixture box"
+        );
+        assert!(
+            !store
+                .claim_run(first, ids::BOX, owner, at, until)
+                .await
+                .expect("the claim is answered"),
+            "a run that is not queued is not claimable"
+        );
+
+        assert!(
+            matches!(
+                store
+                    .claim_run(second, BoxId::new(), owner, at, until)
+                    .await,
+                Err(StoreError::NotFound { entity: "box", .. })
+            ),
+            "the box is looked up after the run"
+        );
+        assert!(
+            matches!(
+                store
+                    .claim_run(RunId::new(), BoxId::new(), owner, at, until)
+                    .await,
+                Err(StoreError::NotFound { entity: "run", .. })
+            ),
+            "the run is looked up first"
+        );
+        assert_eq!(
+            store
+                .active_runs_on_box(ids::BOX)
+                .await
+                .expect("the count is answered"),
+            2,
+            "two runs hold the box"
+        );
+    }
+
+    /// ANA-2 §4.9: the heartbeat is a compare-and-set on `lease_owner`, and the sweep takes an
+    /// expired lease from whoever held it.
+    #[tokio::test]
+    async fn a_lease_refresh_is_a_cas_on_its_owner_and_the_sweep_adopts_it() {
+        let store = MemStore::demo();
+        let first_owner = Uuid::now_v7();
+        let second_owner = Uuid::now_v7();
+        let at = Utc::now();
+        let until = at + TimeDelta::minutes(5);
+
+        let run = store
+            .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("the run is queued")
+            .id;
+        assert!(
+            store
+                .claim_run(run, ids::BOX, first_owner, at, until)
+                .await
+                .expect("the claim is answered")
+        );
+
+        let extended = until + TimeDelta::minutes(5);
+        assert!(
+            store
+                .refresh_lease(run, first_owner, extended)
+                .await
+                .expect("the refresh is answered"),
+            "the owner extends its own lease"
+        );
+        assert_eq!(
+            store
+                .run(run)
+                .await
+                .expect("the run reads back")
+                .expect("it exists")
+                .lease_expires_at,
+            Some(extended)
+        );
+        assert!(
+            !store
+                .refresh_lease(run, second_owner, extended + TimeDelta::minutes(5))
+                .await
+                .expect("the refresh is answered"),
+            "a stranger's heartbeat is zero rows, which means abandon"
+        );
+        assert!(
+            matches!(
+                store
+                    .refresh_lease(RunId::new(), first_owner, extended)
+                    .await,
+                Err(StoreError::NotFound { entity: "run", .. })
+            ),
+            "an unknown run is NotFound"
+        );
+
+        let swept = extended + TimeDelta::minutes(5);
+        assert!(
+            store
+                .adopt_runs(
+                    ids::BOX,
+                    second_owner,
+                    extended - TimeDelta::seconds(1),
+                    swept
+                )
+                .await
+                .expect("the sweep is answered")
+                .is_empty(),
+            "a live lease is not abandoned"
+        );
+        let adopted = store
+            .adopt_runs(
+                ids::BOX,
+                second_owner,
+                extended + TimeDelta::seconds(1),
+                swept,
+            )
+            .await
+            .expect("the sweep is answered");
+        assert_eq!(
+            adopted.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![run],
+            "the expired lease is adopted"
+        );
+        assert_eq!(adopted[0].lease_expires_at, Some(swept));
+        assert!(
+            !store
+                .refresh_lease(run, first_owner, swept)
+                .await
+                .expect("the refresh is answered"),
+            "the old owner has lost it"
+        );
+        assert!(
+            store
+                .refresh_lease(run, second_owner, swept)
+                .await
+                .expect("the refresh is answered"),
+            "the new owner holds it"
+        );
+        assert!(
+            store
+                .adopt_runs(BoxId::new(), second_owner, swept, swept)
+                .await
+                .expect("the sweep is answered")
+                .is_empty(),
+            "a box that does not exist adopts nothing"
+        );
+    }
+
+    /// `create_step`, the two compare-and-sets and the order `run_steps` returns: the judge
+    /// (`fanout_index = -1`) sorts before its candidates.
+    #[tokio::test]
+    async fn step_creation_and_the_two_compare_and_sets_follow_the_law() {
+        let store = MemStore::demo();
+        let candidate = new_step(ids::RUN_2, 1, 1, 0);
+        let step = candidate.id;
+        let row = store
+            .create_step(candidate)
+            .await
+            .expect("a step of an existing run lands");
+        assert_eq!(row.status, StepStatus::Pending, "a step starts pending");
+        assert_eq!(row.started_at, None);
+        assert_eq!(row.selected, None);
+        assert_eq!(row.promoted_at, None);
+
+        assert!(
+            matches!(
+                store.create_step(new_step(ids::RUN_2, 1, 1, 0)).await,
+                Err(StoreError::Constraint(_))
+            ),
+            "`(run_id, position, attempt, fanout_index)` is unique"
+        );
+        assert!(
+            matches!(
+                store.create_step(new_step(RunId::new(), 0, 1, 0)).await,
+                Err(StoreError::Constraint(_))
+            ),
+            "an unknown run is a foreign key refusal, like append_events"
+        );
+
+        let judge = new_step(ids::RUN_2, 1, 1, -1);
+        let judge_id = judge.id;
+        store
+            .create_step(judge)
+            .await
+            .expect("-1 is the judge step");
+        let ids_in_order: Vec<StepId> = store
+            .run_steps(ids::RUN_2)
+            .await
+            .expect("the steps read back")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            ids_in_order,
+            vec![ids::STEP_R2_PRD, judge_id, step],
+            "(position, attempt, fanout_index) order puts the judge first"
+        );
+        assert!(
+            store
+                .run_steps(RunId::new())
+                .await
+                .expect("a list read is total")
+                .is_empty(),
+            "an unknown run has no steps, and is not NotFound"
+        );
+
+        let started = Utc::now();
+        let finished = started + TimeDelta::minutes(1);
+        assert!(
+            store
+                .transition_step(step, StepStatus::Pending, StepStatus::Running, started)
+                .await
+                .expect("the CAS is answered")
+        );
+        assert!(
+            !store
+                .transition_step(step, StepStatus::Pending, StepStatus::Running, started)
+                .await
+                .expect("the CAS is answered"),
+            "a stale `from` on a legal pair is Ok(false)"
+        );
+        assert!(
+            store
+                .transition_step(step, StepStatus::Running, StepStatus::Done, finished)
+                .await
+                .expect("the CAS is answered")
+        );
+        let settled = store
+            .run_steps(ids::RUN_2)
+            .await
+            .expect("the steps read back")
+            .into_iter()
+            .find(|row| row.id == step)
+            .expect("the step");
+        assert_eq!(settled.started_at, Some(started));
+        assert_eq!(settled.finished_at, Some(finished));
+        assert!(
+            matches!(
+                store
+                    .transition_step(step, StepStatus::Done, StepStatus::Running, finished)
+                    .await,
+                Err(StoreError::Constraint(_))
+            ),
+            "done reaches only superseded"
+        );
+        assert!(
+            matches!(
+                store
+                    .transition_step(
+                        StepId::new(),
+                        StepStatus::Done,
+                        StepStatus::Running,
+                        finished
+                    )
+                    .await,
+                Err(StoreError::NotFound {
+                    entity: "run_step",
+                    ..
+                })
+            ),
+            "a missing row is NotFound even when the pair is illegal (plan D14)"
+        );
+
+        assert!(
+            store
+                .transition_run(ids::RUN_2, RunStatus::Queued, RunStatus::Running, started)
+                .await
+                .expect("the CAS is answered")
+        );
+        assert!(
+            store
+                .transition_run(ids::RUN_2, RunStatus::Running, RunStatus::Done, finished)
+                .await
+                .expect("the CAS is answered")
+        );
+        let run = store
+            .run(ids::RUN_2)
+            .await
+            .expect("the run reads back")
+            .expect("it exists");
+        assert_eq!(run.started_at, Some(started));
+        assert_eq!(run.finished_at, Some(finished));
+        assert!(
+            matches!(
+                store
+                    .transition_run(ids::RUN_2, RunStatus::Done, RunStatus::Queued, finished)
+                    .await,
+                Err(StoreError::Constraint(_))
+            ),
+            "a terminal run reaches nothing"
+        );
+        assert_eq!(
+            store
+                .item(ids::HTUI_FEAT_3)
+                .await
+                .expect("the item reads back")
+                .expect("it exists")
+                .status,
+            Status::Queued,
+            "no run or step move touches the item"
+        );
+    }
+
+    /// `supersede_step` is §4.4's loop half and `fail_run` is §4.3's failure row; both refuse
+    /// through the law rather than through a stale compare-and-set.
+    #[tokio::test]
+    async fn supersede_and_fail_run_refuse_what_the_law_forbids() {
+        let store = MemStore::demo();
+        store
+            .supersede_step(ids::STEP_R2_PRD)
+            .await
+            .expect("pending -> superseded is legal");
+        assert!(
+            matches!(
+                store.supersede_step(ids::STEP_R2_PRD).await,
+                Err(StoreError::Constraint(_))
+            ),
+            "superseded reaches nothing"
+        );
+        assert!(matches!(
+            store.supersede_step(StepId::new()).await,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ));
+
+        let at = Utc::now();
+        store
+            .fail_run(ids::RUN_2, "boom", at)
+            .await
+            .expect("queued -> failed is legal");
+        let run = store
+            .run(ids::RUN_2)
+            .await
+            .expect("the run reads back")
+            .expect("it exists");
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.failure.as_deref(), Some("boom"));
+        assert_eq!(run.finished_at, Some(at));
+        assert!(
+            matches!(
+                store.fail_run(ids::RUN_2, "again", at).await,
+                Err(StoreError::Constraint(_))
+            ),
+            "a terminal run cannot fail twice"
+        );
+        assert!(matches!(
+            store.fail_run(RunId::new(), "boom", at).await,
+            Err(StoreError::NotFound { entity: "run", .. })
+        ));
+    }
+
+    /// `finish_step` writes the settle columns and never `status`; `usage` and `trim_record`
+    /// `None` leave the column, every other field overwrites.
+    #[tokio::test]
+    async fn finish_step_settles_the_columns_and_leaves_usage_when_it_is_none() {
+        let store = MemStore::demo();
+        let finished = Utc::now();
+        store
+            .finish_step(
+                ids::STEP_R2_PRD,
+                StepOutcome {
+                    exit_code: Some(0),
+                    usage: Some(json!({ "input_tokens": 3 })),
+                    trim_record: Some(json!({ "trimmed": [] })),
+                    verify_outcome: Some(VerifyOutcome::Pass),
+                    verify_exit_code: Some(0),
+                    finished_at: finished,
+                },
+            )
+            .await
+            .expect("the settle lands");
+        store
+            .finish_step(
+                ids::STEP_R2_PRD,
+                StepOutcome {
+                    exit_code: Some(1),
+                    finished_at: finished,
+                    ..StepOutcome::default()
+                },
+            )
+            .await
+            .expect("the second settle lands");
+
+        let row = store.read(|state| {
+            state
+                .steps
+                .get(&ids::STEP_R2_PRD)
+                .cloned()
+                .expect("the fixture step")
+        });
+        assert_eq!(
+            row.status,
+            StepStatus::Pending,
+            "finish_step never moves status"
+        );
+        assert_eq!(row.exit_code, Some(1), "exit_code overwrites");
+        assert_eq!(
+            row.usage,
+            Some(json!({ "input_tokens": 3 })),
+            "a `None` usage leaves the column"
+        );
+        assert_eq!(
+            row.trim_record,
+            Some(json!({ "trimmed": [] })),
+            "a `None` trim_record leaves the column"
+        );
+        assert_eq!(
+            row.verify_outcome, None,
+            "verify_outcome is not one of the two that leave"
+        );
+        assert!(matches!(
+            store
+                .finish_step(StepId::new(), StepOutcome::default())
+                .await,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ));
+    }
+
+    /// `R-ORCH-2`'s four answers and §4.8's promotion, which lifts the step, its run and its item
+    /// in one transaction.
+    #[tokio::test]
+    async fn gate_answers_write_their_outcome_and_promotion_lifts_the_run_and_the_item() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let approved = gated_step(&store, new_step(ids::RUN_2, 1, 1, 0)).await;
+        let rejected = gated_step(&store, new_step(ids::RUN_2, 2, 1, 0)).await;
+        let retried = gated_step(&store, new_step(ids::RUN_2, 3, 1, 0)).await;
+        let skipped = gated_step(&store, new_step(ids::RUN_2, 4, 1, 0)).await;
+
+        assert!(
+            store
+                .answer_gate(approved, GateOutcome::Approved, Some("ok".to_owned()), at)
+                .await
+                .expect("the answer is recorded")
+        );
+        assert!(
+            !store
+                .answer_gate(approved, GateOutcome::Approved, None, at)
+                .await
+                .expect("the answer is recorded"),
+            "a step that is not awaiting cannot be answered twice"
+        );
+        for (step, outcome) in [
+            (rejected, GateOutcome::Rejected),
+            (retried, GateOutcome::Retried),
+            (skipped, GateOutcome::Skipped),
+        ] {
+            assert!(
+                store
+                    .answer_gate(step, outcome, None, at)
+                    .await
+                    .expect("the answer is recorded")
+            );
+        }
+        let by_id =
+            |id: StepId| store.read(move |state| state.steps.get(&id).cloned().expect("the step"));
+        assert_eq!(by_id(approved).status, StepStatus::Done);
+        assert_eq!(by_id(approved).gate_outcome, Some(GateOutcome::Approved));
+        assert_eq!(by_id(approved).gate_note.as_deref(), Some("ok"));
+        assert_eq!(by_id(approved).finished_at, Some(at));
+        assert_eq!(by_id(rejected).status, StepStatus::Failed);
+        assert_eq!(by_id(retried).status, StepStatus::Superseded);
+        assert_eq!(by_id(skipped).status, StepStatus::Done);
+        assert!(matches!(
+            store
+                .answer_gate(StepId::new(), GateOutcome::Approved, None, at)
+                .await,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ));
+
+        store
+            .transition_run(ids::RUN_2, RunStatus::Queued, RunStatus::Running, at)
+            .await
+            .expect("the run starts");
+        store
+            .transition(ids::HTUI_FEAT_3, Status::Queued, Status::InProgress)
+            .await
+            .expect("the item starts");
+        store
+            .promote_step(rejected, at)
+            .await
+            .expect("a failed step under a live run can be promoted");
+        assert_eq!(by_id(rejected).status, StepStatus::AwaitingApproval);
+        assert_eq!(by_id(rejected).promoted_at, Some(at));
+        assert_eq!(
+            store
+                .run(ids::RUN_2)
+                .await
+                .expect("the run reads back")
+                .expect("it exists")
+                .status,
+            RunStatus::AwaitingApproval
+        );
+        assert_eq!(
+            store
+                .item(ids::HTUI_FEAT_3)
+                .await
+                .expect("the item reads back")
+                .expect("it exists")
+                .status,
+            Status::AwaitingApproval
+        );
+        assert!(
+            matches!(
+                store.promote_step(approved, at).await,
+                Err(StoreError::Constraint(_))
+            ),
+            "a done step is not promotable"
+        );
+        assert!(matches!(
+            store.promote_step(StepId::new(), at).await,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ));
+    }
+
+    /// ANA-2 §4.5's bookkeeping is one transaction (plan D6): a refused winner leaves every
+    /// candidate exactly as it was.
+    #[tokio::test]
+    async fn select_fanout_settles_every_candidate_or_none() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let winner = gated_step(&store, new_step(ids::RUN_2, 1, 1, 0)).await;
+        let loser = gated_step(&store, new_step(ids::RUN_2, 1, 1, 1)).await;
+        let failed = gated_step(&store, new_step(ids::RUN_2, 1, 1, 2)).await;
+        let elsewhere = gated_step(&store, new_step(ids::RUN_2, 2, 1, 0)).await;
+        let judge = new_step(ids::RUN_2, 1, 1, -1);
+        let judge_id = judge.id;
+        store.create_step(judge).await.expect("the judge lands");
+        store
+            .answer_gate(failed, GateOutcome::Rejected, None, at)
+            .await
+            .expect("the third candidate fails");
+
+        assert!(
+            matches!(
+                store.select_fanout(ids::RUN_2, 1, 1, elsewhere, None).await,
+                Err(StoreError::Constraint(_))
+            ),
+            "a winner from another position is refused"
+        );
+        assert!(matches!(
+            store
+                .select_fanout(ids::RUN_2, 1, 1, StepId::new(), None)
+                .await,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ));
+        let by_id =
+            |id: StepId| store.read(move |state| state.steps.get(&id).cloned().expect("the step"));
+        assert_eq!(
+            by_id(loser).selected,
+            None,
+            "a refused selection writes nothing at all"
+        );
+
+        store
+            .select_fanout(ids::RUN_2, 1, 1, winner, Some("shorter diff".to_owned()))
+            .await
+            .expect("the selection lands");
+        assert_eq!(by_id(winner).selected, Some(true));
+        assert_eq!(by_id(winner).status, StepStatus::Done);
+        assert_eq!(by_id(loser).selected, Some(false));
+        assert_eq!(by_id(loser).status, StepStatus::Superseded);
+        assert_eq!(by_id(failed).selected, Some(false));
+        assert_eq!(
+            by_id(failed).status,
+            StepStatus::Failed,
+            "a failed loser keeps its status"
+        );
+        assert_eq!(by_id(judge_id).status, StepStatus::Done);
+        assert_eq!(by_id(judge_id).gate_note.as_deref(), Some("shorter diff"));
+        assert_eq!(
+            by_id(elsewhere).selected,
+            None,
+            "another position is not part of this fan-out"
+        );
+    }
+
+    /// `run_step_tree` and `run_step_commit` upsert on `(run_step_id, repo_id)` and read back in
+    /// `repo_id` order, and a project delete counts both — two tables `MemStore` has never held.
+    #[tokio::test]
+    async fn trees_and_commits_upsert_on_their_repo_key_and_the_delete_counts_them() {
+        let store = MemStore::demo();
+        let core = a_repo(&store, "core").await;
+        let docs = a_repo(&store, "docs").await;
+        let (first, second) = if core < docs {
+            (core, docs)
+        } else {
+            (docs, core)
+        };
+        let tree = |repo: RepoId, dirty: bool| RunStepTree {
+            run_step_id: ids::STEP_R2_PRD,
+            repo_id: repo,
+            mode: Isolation::Worktree,
+            path: "/tmp/tree".to_owned(),
+            base_ref: "main".to_owned(),
+            dirty,
+        };
+
+        store
+            .upsert_step_tree(ids::STEP_R2_PRD, &[tree(second, false), tree(first, false)])
+            .await
+            .expect("both rows land");
+        let rows = store
+            .step_trees(ids::STEP_R2_PRD)
+            .await
+            .expect("the trees read back");
+        assert_eq!(
+            rows.iter().map(|row| row.repo_id).collect::<Vec<_>>(),
+            vec![first, second],
+            "repo_id order regardless of input order"
+        );
+        store
+            .upsert_step_tree(ids::STEP_R2_PRD, &[tree(first, true)])
+            .await
+            .expect("the upsert replaces rather than inserts");
+        let rows = store
+            .step_trees(ids::STEP_R2_PRD)
+            .await
+            .expect("the trees read back");
+        assert_eq!(rows.len(), 2, "still two rows");
+        assert!(rows[0].dirty, "the row was replaced on its key");
+
+        let stray = RunStepTree {
+            run_step_id: ids::STEP_PLAN,
+            ..tree(first, false)
+        };
+        assert!(
+            matches!(
+                store.upsert_step_tree(ids::STEP_R2_PRD, &[stray]).await,
+                Err(StoreError::Constraint(_))
+            ),
+            "a row for another step is refused"
+        );
+        assert!(
+            matches!(
+                store
+                    .upsert_step_tree(ids::STEP_R2_PRD, &[tree(RepoId::new(), false)])
+                    .await,
+                Err(StoreError::Constraint(_))
+            ),
+            "an unknown repo is a foreign key refusal"
+        );
+        assert!(matches!(
+            store.upsert_step_tree(StepId::new(), &[]).await,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ));
+        store
+            .upsert_step_tree(ids::STEP_R2_PRD, &[])
+            .await
+            .expect("an empty slice checks the step and writes nothing");
+
+        let commit = |repo: RepoId, after: Option<&str>| RunStepCommit {
+            run_step_id: ids::STEP_R2_PRD,
+            repo_id: repo,
+            before_hash: "abc".to_owned(),
+            after_hash: after.map(ToOwned::to_owned),
+        };
+        store
+            .record_commits(
+                ids::STEP_R2_PRD,
+                &[commit(second, None), commit(first, None)],
+            )
+            .await
+            .expect("both rows land");
+        store
+            .record_commits(ids::STEP_R2_PRD, &[commit(first, Some("def"))])
+            .await
+            .expect("the upsert replaces");
+        let commits = store
+            .step_commits(ids::STEP_R2_PRD)
+            .await
+            .expect("the commits read back");
+        assert_eq!(
+            commits.iter().map(|row| row.repo_id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(commits[0].after_hash.as_deref(), Some("def"));
+        assert!(matches!(
+            store.record_commits(StepId::new(), &[]).await,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ));
+        assert!(
+            store
+                .step_trees(StepId::new())
+                .await
+                .expect("a list read is total")
+                .is_empty(),
+            "an unknown step has no trees, and is not NotFound"
+        );
+
+        let reach = store
+            .delete_reach(DeleteTarget::Project(ids::PROJECT_HTUI))
+            .await
+            .expect("the reach is counted")
+            .expect("the project exists");
+        assert_eq!(reach.run_step_trees, 2, "MemStore now holds run_step_tree");
+        assert_eq!(reach.run_step_commits, 2, "and run_step_commit");
+        let taken = store
+            .delete_project(ids::PROJECT_HTUI)
+            .await
+            .expect("the delete lands");
+        assert_eq!(taken, reach, "the report equals the act (PRD D13)");
+        assert!(
+            store
+                .step_trees(ids::STEP_R2_PRD)
+                .await
+                .expect("the read is total")
+                .is_empty(),
+            "the rows went with their step"
+        );
+        assert!(
+            store
+                .step_commits(ids::STEP_R2_PRD)
+                .await
+                .expect("the read is total")
+                .is_empty()
+        );
+    }
+
+    /// The version is allocated inside the transaction, per `(item, kind)` (plan D6).
+    #[tokio::test]
+    async fn write_document_allocates_the_next_version_of_its_kind() {
+        let store = MemStore::demo();
+        let third = store
+            .write_document(a_document(ids::HTUI_FEAT_1, "plan", Some(ids::STEP_PLAN)))
+            .await
+            .expect("the document lands");
+        assert_eq!(third.version, 3, "the fixture holds plan v1 and v2");
+        let fourth = store
+            .write_document(a_document(ids::HTUI_FEAT_1, "plan", None))
+            .await
+            .expect("the document lands");
+        assert_eq!(fourth.version, 4);
+        let fresh = store
+            .write_document(a_document(ids::HTUI_FEAT_1, "review", None))
+            .await
+            .expect("the document lands");
+        assert_eq!(fresh.version, 1, "a kind with no rows starts at 1");
+
+        assert!(matches!(
+            store
+                .write_document(a_document(ItemId::new(), "plan", None))
+                .await,
+            Err(StoreError::NotFound { entity: "item", .. })
+        ));
+        assert!(
+            matches!(
+                store
+                    .write_document(a_document(ids::HTUI_FEAT_1, "plan", Some(StepId::new())))
+                    .await,
+                Err(StoreError::Constraint(_))
+            ),
+            "an unknown producing step is a foreign key refusal"
+        );
+        let duplicate = NewDocument {
+            id: third.id,
+            ..a_document(ids::HTUI_FEAT_1, "plan", None)
+        };
+        assert!(matches!(
+            store.write_document(duplicate).await,
+            Err(StoreError::Constraint(_))
+        ));
+    }
+
+    /// Plan D2: `resolve_inputs` prefers this run's output, skips a fan-out loser and reports a
+    /// kind the item has no eligible row for — none of which `documents_of_kinds` does.
+    #[tokio::test]
+    async fn resolve_inputs_prefers_this_run_and_skips_a_loser() {
+        let store = MemStore::demo();
+        let winner = gated_step(&store, new_step(ids::RUN_2, 1, 1, 0)).await;
+        let loser = gated_step(&store, new_step(ids::RUN_2, 1, 1, 1)).await;
+        let by_winner = store
+            .write_document(a_document(ids::HTUI_FEAT_3, "implementation", Some(winner)))
+            .await
+            .expect("v1 lands");
+        let by_loser = store
+            .write_document(a_document(ids::HTUI_FEAT_3, "implementation", Some(loser)))
+            .await
+            .expect("v2 lands");
+        assert_eq!((by_winner.version, by_loser.version), (1, 2));
+        store
+            .select_fanout(ids::RUN_2, 1, 1, winner, None)
+            .await
+            .expect("the selection lands");
+
+        let kinds = ["implementation".to_owned(), "nope".to_owned()];
+        let resolved = store
+            .resolve_inputs(ids::HTUI_FEAT_3, ids::RUN_2, &kinds)
+            .await
+            .expect("the resolver answers");
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|row| row.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["implementation", "nope"],
+            "one entry per requested kind, in request order"
+        );
+        assert_eq!(
+            resolved[0].document.as_ref().map(|row| row.id),
+            Some(by_winner.id),
+            "`selected IS NOT FALSE` excludes the loser's higher version"
+        );
+        assert_eq!(
+            resolved[1].document, None,
+            "a kind the item has no eligible row for is carried as None"
+        );
+        assert_eq!(
+            store
+                .documents_of_kinds(ids::HTUI_FEAT_3, &["implementation".to_owned()])
+                .await
+                .expect("the shipped read answers")
+                .first()
+                .map(|row| row.id),
+            Some(by_loser.id),
+            "documents_of_kinds excludes no loser (plan D2's contrast)"
+        );
+
+        let hand = store
+            .write_document(a_document(ids::HTUI_FEAT_1, "plan", None))
+            .await
+            .expect("v3 lands");
+        let preferred = store
+            .resolve_inputs(ids::HTUI_FEAT_1, ids::RUN_1, &["plan".to_owned()])
+            .await
+            .expect("the resolver answers");
+        assert_eq!(
+            preferred[0].document.as_ref().map(|row| row.id),
+            Some(ids::DOC_FEAT_1_PLAN_V2),
+            "this run's output outranks a later hand-written version"
+        );
+        assert_ne!(
+            preferred[0].document.as_ref().map(|row| row.id),
+            Some(hand.id)
+        );
+
+        let all = store
+            .resolve_inputs(ids::HTUI_FEAT_1, ids::RUN_1, &[])
+            .await
+            .expect("the resolver answers");
+        assert_eq!(
+            all.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>(),
+            vec!["plan", "prd"],
+            "an empty `kinds` is every kind the item has, in byte order"
+        );
+        assert!(
+            store
+                .resolve_inputs(ItemId::new(), ids::RUN_1, &["plan".to_owned()])
+                .await
+                .expect("the read is total")[0]
+                .document
+                .is_none(),
+            "an unknown item resolves every kind to None rather than refusing"
+        );
+    }
+
+    /// `R-TUI-9`'s close-out is one transaction, refused while any run of the item is active.
+    #[tokio::test]
+    async fn close_out_refuses_a_live_run_and_otherwise_writes_all_three_effects() {
+        let store = MemStore::demo();
+        let repo = a_repo(&store, "core").await;
+        let summary = |item: ItemId, kind: &str| NewDocument {
+            ..a_document(item, kind, None)
+        };
+        let commits = [RunStepCommit {
+            run_step_id: ids::STEP_IMPL,
+            repo_id: repo,
+            before_hash: "abc".to_owned(),
+            after_hash: Some("def".to_owned()),
+        }];
+
+        assert!(
+            matches!(
+                store
+                    .close_out(ids::HTUI_FEAT_3, summary(ids::HTUI_FEAT_3, "summary"), &[])
+                    .await,
+                Err(StoreError::Constraint(_))
+            ),
+            "RUN_2 is queued, so FEAT-3 cannot be closed out"
+        );
+        assert!(
+            matches!(
+                store
+                    .close_out(ids::HTUI_FEAT_1, summary(ids::HTUI_FEAT_1, "plan"), &[])
+                    .await,
+                Err(StoreError::Constraint(_))
+            ),
+            "the document must be a summary"
+        );
+        assert!(
+            matches!(
+                store
+                    .close_out(ids::HTUI_FEAT_1, summary(ids::HTUI_ANA_2, "summary"), &[])
+                    .await,
+                Err(StoreError::Constraint(_))
+            ),
+            "the summary must name the item being closed"
+        );
+        assert!(
+            matches!(
+                store
+                    .close_out(ids::HTUI_ANA_2, summary(ids::HTUI_ANA_2, "summary"), &[])
+                    .await,
+                Err(StoreError::Constraint(_))
+            ),
+            "open does not reach closed (ANA-2 §4.3)"
+        );
+        assert!(matches!(
+            store
+                .close_out(ItemId::new(), summary(ItemId::new(), "summary"), &[])
+                .await,
+            Err(StoreError::NotFound { entity: "item", .. })
+        ));
+        assert_eq!(
+            store
+                .documents(ids::HTUI_FEAT_1)
+                .await
+                .expect("the heads read back")
+                .len(),
+            3,
+            "no refusal wrote a document"
+        );
+
+        store
+            .transition(ids::HTUI_FEAT_1, Status::InProgress, Status::Done)
+            .await
+            .expect("the item finishes");
+        let written = store
+            .close_out(
+                ids::HTUI_FEAT_1,
+                summary(ids::HTUI_FEAT_1, "summary"),
+                &commits,
+            )
+            .await
+            .expect("the close-out lands");
+        assert_eq!(written.version, 1, "the first summary of the item");
+        let item = store
+            .item(ids::HTUI_FEAT_1)
+            .await
+            .expect("the item reads back")
+            .expect("it exists");
+        assert_eq!(item.status, Status::Closed);
+        assert!(item.closed_at.is_some(), "closed_at tracks the status");
+        assert_eq!(
+            store
+                .step_commits(ids::STEP_IMPL)
+                .await
+                .expect("the commits read back")
+                .len(),
+            1
+        );
+    }
+
+    /// ANA-2 invariant 7's refusal note: every foreign key is checked before the insert.
+    #[tokio::test]
+    async fn add_note_writes_the_row_and_refuses_every_dangling_reference() {
+        let store = MemStore::demo();
+        let note = |item: ItemId, author, step| NewNote {
+            id: NoteId::new(),
+            item_id: item,
+            body: "refused".to_owned(),
+            created_by: author,
+            box_id: Some(ids::BOX),
+            via_step_id: step,
+            created_at: Utc::now(),
+        };
+        let written = store
+            .add_note(note(ids::HTUI_FEAT_1, ids::USER, Some(ids::STEP_IMPL)))
+            .await
+            .expect("the note lands");
+        assert_eq!(
+            store
+                .notes(ids::HTUI_FEAT_1)
+                .await
+                .expect("the notes read back")
+                .last(),
+            Some(&written),
+            "the returned row is the stored row"
+        );
+        for bad in [
+            note(ItemId::new(), ids::USER, None),
+            note(ids::HTUI_FEAT_1, UserId::new(), None),
+            note(ids::HTUI_FEAT_1, ids::USER, Some(StepId::new())),
+        ] {
+            assert!(
+                matches!(store.add_note(bad).await, Err(StoreError::Constraint(_))),
+                "a dangling reference is a foreign key refusal"
+            );
+        }
+        let duplicate = NewNote {
+            id: written.id,
+            ..note(ids::HTUI_FEAT_1, ids::USER, None)
+        };
+        assert!(matches!(
+            store.add_note(duplicate).await,
+            Err(StoreError::Constraint(_))
+        ));
+    }
+
+    /// The eleven inherent reads of ANA-2 §8 that `Backend`'s `match self` will dispatch (plan
+    /// D1, blueprint F-N): each answers from the fixture, and the two that take an id refuse an
+    /// unknown one.
+    #[tokio::test]
+    async fn the_eleven_inherent_reads_answer_from_the_fixture() {
+        let store = MemStore::demo();
+        assert_eq!(
+            store
+                .step_graph(ids::GRAPH_HTUI_FEAT)
+                .await
+                .expect("the graph reads back")
+                .map(|row| row.id),
+            Some(ids::GRAPH_HTUI_FEAT)
+        );
+        assert!(
+            store
+                .phase_agents(ids::PHASE_HTUI_IMPLEMENT)
+                .await
+                .expect("the read is total")
+                .is_empty(),
+            "MemStore holds no phase_agent table"
+        );
+        assert!(
+            store
+                .prompt_template(ids::PROJECT_HTUI, "implement", None)
+                .await
+                .expect("the template reads back")
+                .is_some(),
+            "no version pin means the latest"
+        );
+        assert!(
+            store
+                .prompt_template(ids::PROJECT_HTUI, "implement", Some(99))
+                .await
+                .expect("the template reads back")
+                .is_none(),
+            "a pin that cannot be honoured resolves to nothing"
+        );
+        let resolved = store
+            .resolve_graph(ids::HTUI_FEAT_1)
+            .await
+            .expect("the graph resolves")
+            .expect("FEAT items have a default graph");
+        assert_eq!(resolved.graph.id, ids::GRAPH_HTUI_FEAT);
+        assert_eq!(
+            resolved
+                .phases
+                .iter()
+                .map(|row| row.phase.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "phases in position order"
+        );
+        assert!(
+            resolved.phases.iter().all(|row| row.agents.is_empty()),
+            "no phase_agent table here either"
+        );
+        assert!(
+            store
+                .agent_boxes(ids::BOX)
+                .await
+                .expect("the read is total")
+                .is_empty(),
+            "no fixture probes a box"
+        );
+        assert_eq!(
+            store
+                .box_row(ids::BOX)
+                .await
+                .expect("the box reads back")
+                .map(|row| row.hostname),
+            Some("DESKTOP-HTUI".to_owned())
+        );
+        assert!(
+            store
+                .repo_paths(ids::BOX)
+                .await
+                .expect("the read is total")
+                .is_empty()
+        );
+
+        let needs_cuda = store
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_HTUI,
+                kind_id: ids::KIND_HTUI_FEAT,
+                title: "needs a GPU toolchain".to_owned(),
+                body: String::new(),
+                required_tags: vec!["cuda".to_owned()],
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the mint lands")
+            .id;
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        let ready: Vec<ItemId> = store
+            .ready_items(&scope, ids::BOX)
+            .await
+            .expect("the read is total")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert!(
+            ready.contains(&ids::HTUI_ANA_2),
+            "an open, untagged item is ready"
+        );
+        assert!(
+            !ready.contains(&needs_cuda),
+            "a tag the box has neither probed nor declared holds the item back"
+        );
+        assert_eq!(
+            store
+                .missing_tags(needs_cuda, ids::BOX)
+                .await
+                .expect("the tags read back"),
+            vec!["cuda".to_owned()]
+        );
+        assert!(matches!(
+            store.missing_tags(ItemId::new(), ids::BOX).await,
+            Err(StoreError::NotFound { entity: "item", .. })
+        ));
+        assert!(matches!(
+            store.missing_tags(needs_cuda, BoxId::new()).await,
+            Err(StoreError::NotFound { entity: "box", .. })
+        ));
+
+        assert_eq!(
+            store
+                .active_runs_on_box(ids::BOX)
+                .await
+                .expect("the count is answered"),
+            0,
+            "the fixture's only active run has not been claimed"
+        );
+        let repo = a_repo(&store, "core").await;
+        let run = store
+            .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, vec![repo]))
+            .await
+            .expect("the run is queued")
+            .id;
+        let at = Utc::now();
+        store
+            .claim_run(
+                run,
+                ids::BOX,
+                Uuid::now_v7(),
+                at,
+                at + TimeDelta::minutes(5),
+            )
+            .await
+            .expect("the claim is answered");
+        assert_eq!(
+            store
+                .active_runs_on_box(ids::BOX)
+                .await
+                .expect("the count is answered"),
+            1
+        );
+        assert_eq!(
+            store
+                .overlapping_runs(&[repo])
+                .await
+                .expect("the read is total")
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![run]
+        );
+        assert!(
+            store
+                .overlapping_runs(&[RepoId::new()])
+                .await
+                .expect("the read is total")
+                .is_empty()
+        );
+        assert!(
+            store
+                .overlapping_runs(&[])
+                .await
+                .expect("the read is total")
+                .is_empty(),
+            "an empty scope overlaps nothing (hazard H-10)"
+        );
     }
 }

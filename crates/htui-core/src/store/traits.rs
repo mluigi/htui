@@ -28,15 +28,17 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, Item,
-    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision, ItemSummary,
-    LinkGraph, NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph, NewWorkspace, Note,
-    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId,
-    RepoPatch, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, UpstreamEntry, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, GateOutcome,
+    Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision,
+    ItemSummary, LinkGraph, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo,
+    NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run, RunId,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::store::error::Result;
@@ -124,6 +126,59 @@ pub trait ReadStore: Send + Sync {
     /// [`MemStore::project_settings`](crate::store::MemStore::project_settings) — the column
     /// alone, for the per-run token cap — stays inherent beside it.
     async fn project(&self, id: ProjectId) -> Result<Option<Project>>;
+
+    // ---- ANA-2 §8: the run tables (MOD-4 milestone 1, plan D1) -------------------------------
+    //
+    // All five read a table the cache mirrors, which is §8's test for a trait method rather than
+    // an inherent one: `run`, `run_step` and `run_step_commit` are mirrored already, and
+    // `run_step_tree` becomes mirrored in this milestone.
+
+    /// One `run` row, or `None`. Mirrored (`cache_migrations/0001_mirror.sql:103`), so every
+    /// backend answers it.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn run(&self, id: RunId) -> Result<Option<Run>>;
+
+    /// Every `run_step` of a run in `(position, attempt, fanout_index)` order — the judge
+    /// (`fanout_index = -1`) sorts before its candidates. Empty for an unknown run: a list read is
+    /// total, like [`documents`](ReadStore::documents).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn run_steps(&self, run: RunId) -> Result<Vec<RunStep>>;
+
+    /// The step's `run_step_tree` rows in `repo_id` order; empty for an unknown step.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn step_trees(&self, step: StepId) -> Result<Vec<RunStepTree>>;
+
+    /// The step's `run_step_commit` rows in `repo_id` order; empty for an unknown step.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn step_commits(&self, step: StepId) -> Result<Vec<RunStepCommit>>;
+
+    /// ANA-2 §4.2's resolver, which [`documents_of_kinds`](ReadStore::documents_of_kinds) is not
+    /// (plan D2): per requested kind, the latest document of the item whose producing step is not
+    /// a fan-out loser (`selected IS NOT FALSE`), preferring one produced by a step of `run`;
+    /// hand-written documents rank after any run's output (`ORDER BY (s.run_id = $run) DESC
+    /// NULLS LAST, d.version DESC`). One entry per kind in `kinds` order, a missing kind carried
+    /// as `document: None`. An empty `kinds` means every kind the item has, in kind byte order.
+    ///
+    /// Total, like the two list reads above: an unknown item resolves every requested kind to
+    /// `None` rather than refusing, because a caller that asks for inputs of an item that is gone
+    /// has the same problem either way and the step's own failure names the missing kinds.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn resolve_inputs(
+        &self,
+        item: ItemId,
+        run: RunId,
+        kinds: &[String],
+    ) -> Result<Vec<ResolvedInput>>;
 }
 
 /// Everything a write path needs.
@@ -268,7 +323,7 @@ pub trait WriteStore: ReadStore {
     ///
     /// Without this the chat would count towards `active_runs` forever. `status` must be one of
     /// the three terminal values [`RunStatus`] and
-    /// [`StepStatus`](crate::model::StepStatus) share - `done`, `failed`, `cancelled` - because a
+    /// [`StepStatus`] share - `done`, `failed`, `cancelled` - because a
     /// live status has no `run_step` counterpart to write.
     ///
     /// # Errors
@@ -611,6 +666,229 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id.
     async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach>;
+
+    // ---- ANA-2 §8: graph runs (MOD-4 milestone 1) --------------------------------------------
+    //
+    // In §8's order. Five are transactions on every backend, `MemStore` included (plan D6):
+    // `create_run`, `claim_run`, `select_fanout`, `write_document` and `close_out`. Every writer
+    // that stamps a clock takes the instant from the caller (blueprint F-S); `updated_at` stays
+    // the trigger's and is never set by hand.
+
+    /// Inserts a `kind = 'graph'` run at `queued` with its snapshot and moves the item to
+    /// `queued` under the §4.3 law, in one transaction (plan D6).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "item" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the item's status
+    /// cannot move to `queued` (only `open` and `failed` can), when `id` already exists, or on any
+    /// foreign key.
+    async fn create_run(&self, new: NewRun) -> Result<Run>;
+
+    /// ANA-2 §4.7's admission, one transaction: lock the box row, count its live runs against
+    /// [`BoxSettings::max_concurrent_items`](crate::model::BoxSettings::max_concurrent_items)
+    /// (else `app_setting`, else
+    /// [`DEFAULT_MAX_CONCURRENT_ITEMS`](crate::model::DEFAULT_MAX_CONCURRENT_ITEMS)), refuse any
+    /// overlap between `run.repo_scope` and a live run's scope on the same box, then move the run
+    /// `queued -> running` with `executing_box_id = box_id`, `started_at = at`,
+    /// `lease_box_id = box_id`, `lease_owner = owner`, `lease_expires_at = lease_until`, and the
+    /// item `queued -> in_progress`.
+    ///
+    /// `Ok(false)` when the slot or the overlap check refuses, when the run is not `queued`, or
+    /// when its `target_box_id` is not `box_id`; nothing is written in any of those cases.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown run (`"run"`)
+    /// or box (`"box"`), the run looked up first.
+    async fn claim_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        at: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+    ) -> Result<bool>;
+
+    /// ANA-2 §4.9's heartbeat: `UPDATE run SET lease_expires_at = until WHERE id = run AND
+    /// lease_owner = owner`. `Ok(false)` = zero rows = abandon; the run exists but is not ours.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`.
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool>;
+
+    /// ANA-2 §4.9's sweep: every `running` run whose `executing_box_id` is `box_id` and whose
+    /// lease is `NULL` or expired at `now` becomes ours (`lease_owner = owner`,
+    /// `lease_expires_at = lease_until`). Returns the adopted rows in `queued_at` order; empty
+    /// when nothing was abandoned. A box that does not exist adopts nothing (`Ok(vec![])`).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn adopt_runs(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+    ) -> Result<Vec<Run>>;
+
+    /// Inserts a step at `pending`. `fanout_index = -1` is the judge and is accepted.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on an unknown run or agent
+    /// (foreign key, like [`append_events`](WriteStore::append_events)), on a duplicate id, or on
+    /// a repeat of `(run_id, position, attempt, fanout_index)`.
+    async fn create_step(&self, new: NewRunStep) -> Result<RunStep>;
+
+    /// §4.3 compare-and-set on `run.status`; `started_at = COALESCE(started_at, at)` when `to` is
+    /// `running`, `finished_at = COALESCE(finished_at, at)` when `to` is terminal. Same contract
+    /// as [`transition`](WriteStore::transition): `Ok(false)` on a stale `from`, `Constraint` on
+    /// an illegal pair without an update, `NotFound` first (plan D14).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a pair outside
+    /// [`RunStatus::can_move_to`].
+    async fn transition_run(
+        &self,
+        run: RunId,
+        from: RunStatus,
+        to: RunStatus,
+        at: DateTime<Utc>,
+    ) -> Result<bool>;
+
+    /// The `run_step` twin of [`transition_run`](WriteStore::transition_run).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a pair outside
+    /// [`StepStatus::can_move_to`].
+    async fn transition_step(
+        &self,
+        step: StepId,
+        from: StepStatus,
+        to: StepStatus,
+        at: DateTime<Utc>,
+    ) -> Result<bool>;
+
+    /// Writes the settle columns of [`StepOutcome`]; never `status`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`.
+    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()>;
+
+    /// The four `R-ORCH-2` answers, a compare-and-set on `awaiting_approval`:
+    /// `Approved | Skipped -> done`, `Rejected -> failed`, `Retried -> superseded`, with
+    /// `gate_outcome`, `gate_note` and `finished_at = COALESCE(finished_at, at)`. `Ok(false)` when
+    /// the step is not awaiting.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`.
+    async fn answer_gate(
+        &self,
+        step: StepId,
+        outcome: GateOutcome,
+        note: Option<String>,
+        at: DateTime<Utc>,
+    ) -> Result<bool>;
+
+    /// ANA-2 §4.5's bookkeeping, one transaction (plan D6): among the steps of
+    /// `(run, position, attempt)` with `fanout_index >= 0`, the winner becomes
+    /// `selected = true, status = done`; every other candidate becomes `selected = false` and,
+    /// when its status is `pending`, `awaiting_approval` or `done`, `superseded` (a `failed` or
+    /// `cancelled` loser keeps its status); the judge row (`fanout_index = -1`), when there is
+    /// one, becomes `done` with `gate_note = reason`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }` for
+    /// `winner`; [`StoreError::Constraint`](crate::store::StoreError::Constraint) when `winner` is
+    /// not a candidate of that `(run, position, attempt)` or is not `awaiting_approval | done`.
+    /// Either refusal leaves every row untouched.
+    async fn select_fanout(
+        &self,
+        run: RunId,
+        position: i32,
+        attempt: i32,
+        winner: StepId,
+        reason: Option<String>,
+    ) -> Result<()>;
+
+    /// §4.4's loop half: `pending | awaiting_approval | done -> superseded`, no other status.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) from any other status (the
+    /// law's table, not a stale compare-and-set).
+    async fn supersede_step(&self, step: StepId) -> Result<()>;
+
+    /// Upserts `run_step_tree` rows on the table's `(run_step_id, repo_id)` key; an empty slice
+    /// checks the step and writes nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a row's
+    /// `run_step_id` is not `step` or names an unknown repo.
+    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()>;
+
+    /// `R-ORCH-11`'s two hashes, upserted on `(run_step_id, repo_id)`; same refusals as
+    /// [`upsert_step_tree`](WriteStore::upsert_step_tree).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a row's
+    /// `run_step_id` is not `step` or names an unknown repo.
+    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()>;
+
+    /// Inserts the document at `max(version) + 1` for `(item, kind)` under the item's row lock
+    /// (plan D6), so two writers cannot allocate the same version.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "item" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on a duplicate id or an
+    /// unknown `produced_by_step_id` / `created_by`.
+    async fn write_document(&self, new: NewDocument) -> Result<Document>;
+
+    /// §4.8's promotion, one transaction: the step
+    /// `failed | awaiting_approval -> awaiting_approval` with `promoted_at = at`; its run
+    /// `running -> awaiting_approval` (already `awaiting_approval` is fine); its item
+    /// `in_progress -> awaiting_approval` (already `awaiting_approval` is fine).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the step's status is
+    /// any other, or its run is terminal.
+    async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()>;
+
+    /// `status = failed, failure = failure, finished_at = COALESCE(finished_at, at)` from any
+    /// non-terminal status (the law allows `queued | running | awaiting_approval -> failed`).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the run is already
+    /// terminal.
+    async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> Result<()>;
+
+    /// `R-TUI-9`'s three effects, one transaction (plan D6): the summary document at its next
+    /// version, the commits upserted, the item moved to `closed` under the law with `closed_at`
+    /// set. Refused while any run of the item is active.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "item" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a run of the item is
+    /// `queued | running | awaiting_approval`, when `summary.kind != "summary"`, when
+    /// `summary.item_id != item`, or when the item's status cannot move to `closed` (only
+    /// `blocked`, `failed` and `done` can). Any refusal writes nothing.
+    async fn close_out(
+        &self,
+        item: ItemId,
+        summary: NewDocument,
+        commits: &[RunStepCommit],
+    ) -> Result<Document>;
+
+    /// Inserts an `item_note`; the refusal notes of ANA-2 invariant 7.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on an unknown item,
+    /// author, box or step (foreign keys) or a duplicate id.
+    async fn add_note(&self, note: NewNote) -> Result<Note>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the
@@ -619,8 +897,7 @@ pub trait WriteStore: ReadStore {
 /// Shared by every [`WriteStore`] implementation so the two backends cannot disagree about which
 /// three values are terminal; the text is the same in both tables' `CHECK` lists.
 #[must_use]
-pub fn chat_step_status(status: RunStatus) -> Option<crate::model::StepStatus> {
-    use crate::model::StepStatus;
+pub fn chat_step_status(status: RunStatus) -> Option<StepStatus> {
     match status {
         RunStatus::Done => Some(StepStatus::Done),
         RunStatus::Failed => Some(StepStatus::Failed),
@@ -655,7 +932,7 @@ impl TransitionLaw for RunStatus {
     }
 }
 
-impl TransitionLaw for crate::model::StepStatus {
+impl TransitionLaw for StepStatus {
     const ENTITY: &'static str = "run_step";
 
     fn is_legal_move(self, to: Self) -> bool {
@@ -739,6 +1016,80 @@ pub fn reserved_phase_name(name: &str) -> String {
 #[must_use]
 pub fn item_kind_is_held(prefix: &str, items: u64) -> String {
     format!("item_kind {prefix} is held by {items} items")
+}
+
+// ---- MOD-4: the refusals of ANA-2 §8's writers ------------------------------------------------
+//
+// Same reason as the five above: a rule the schema cannot express is spelled once here, so
+// `MemStore` and `PgStore` refuse the same input with the same sentence. The FK refusals reuse
+// `references_no_row`, which is the sentence `MemStore` already gave `run.project_id` and
+// `session_event.run_step_id` before this milestone gave it a name.
+
+/// A foreign key that names no row, in the sentence both stores give it.
+#[must_use]
+pub fn references_no_row(column: &str, id: impl std::fmt::Display, table: &str) -> String {
+    format!("{column} `{id}` references no {table}")
+}
+
+/// A client-minted id that is already stored: Postgres's duplicate key, in words.
+#[must_use]
+pub fn already_exists(entity: &str, id: impl std::fmt::Display) -> String {
+    format!("{entity} `{id}` already exists")
+}
+
+/// `UNIQUE (run_id, position, attempt, fanout_index)` (§5.8), in words.
+#[must_use]
+pub fn step_slot_is_taken(run: RunId, position: i32, attempt: i32, fanout_index: i32) -> String {
+    format!("run {run} already has a step at ({position}, {attempt}, {fanout_index})")
+}
+
+/// `R-TUI-9`: close-out is refused while any run of the item is still active, and the refusal
+/// names the run that is in the way rather than saying only that one is.
+#[must_use]
+pub fn item_has_a_live_run(item: ItemId, run: RunId, status: RunStatus) -> String {
+    format!("item {item} has a live run {run} (`{status}`)")
+}
+
+/// `R-TUI-9`: the document close-out writes is the item's summary, not any other kind.
+#[must_use]
+pub fn close_out_needs_a_summary(kind: &str) -> String {
+    format!("close_out writes a `summary` document, not a `{kind}`")
+}
+
+/// `R-TUI-9`: the summary must name the item being closed.
+#[must_use]
+pub fn summary_names_another_item(item: ItemId, named: ItemId) -> String {
+    format!("the summary of {item} cannot name item {named}")
+}
+
+/// §4.5: `select_fanout` takes a winner from the candidates of one `(run, position, attempt)`.
+#[must_use]
+pub fn not_a_fanout_candidate(winner: StepId, run: RunId, position: i32, attempt: i32) -> String {
+    format!("run_step {winner} is not a candidate of run {run} at ({position}, {attempt})")
+}
+
+/// §4.5: only a settled candidate can win — one the gate has answered or that finished on its own.
+#[must_use]
+pub fn winner_is_not_settled(winner: StepId, status: StepStatus) -> String {
+    format!("run_step {winner} is `{status}`; a fan-out winner is `awaiting_approval` or `done`")
+}
+
+/// §4.6 / `R-ORCH-11`: a batch of tree or commit rows belongs to the step it is written for.
+#[must_use]
+pub fn row_names_another_step(table: &str, row: StepId, step: StepId) -> String {
+    format!("{table}.run_step_id `{row}` is not the step being written (`{step}`)")
+}
+
+/// §4.8: promotion takes a step the run stopped on, not one that is still moving or already done.
+#[must_use]
+pub fn step_is_not_promotable(step: StepId, status: StepStatus) -> String {
+    format!("run_step {step} is `{status}`; only `failed` and `awaiting_approval` are promotable")
+}
+
+/// §4.8: a terminal run has nothing left to stop on, so nothing below it can be promoted.
+#[must_use]
+pub fn run_is_terminal(run: RunId, status: RunStatus) -> String {
+    format!("run {run} is terminal (`{status}`)")
 }
 
 /// D8: the CAS token a rung whose row always exists must be given.
