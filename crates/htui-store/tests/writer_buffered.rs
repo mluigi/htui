@@ -12,10 +12,12 @@ use std::path::{Path, PathBuf};
 
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
-    AgentBox, ChatRunSpec, EventKind, EventRole, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
-    NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph, NewWorkspace, PhaseId, PhasePatch,
-    ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch, RunId, RunStatus, SessionEvent,
-    Status, StepGraphId, StepGraphPatch, StepId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    AgentBox, ChatRunSpec, DocumentId, EventKind, EventRole, GateOutcome, GraphSnapshot, Isolation,
+    ItemId, ItemKindId, ItemKindPatch, ItemPatch, NewDocument, NewItem, NewItemKind, NewNote,
+    NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, NoteId, PhaseId,
+    PhasePatch, ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch, RunId, RunMode, RunStatus,
+    RunStepCommit, RunStepTree, SessionEvent, SnapshotGraph, SnapshotSettings, Status, StepGraphId,
+    StepGraphPatch, StepId, StepOutcome, StepStatus, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
     WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
@@ -23,6 +25,7 @@ use htui_core::store::{DeleteTarget, ReadStore as _, SettingRung, StoreError, Wr
 use htui_store::cache::pending::OPEN_SUFFIX;
 use htui_store::{Backend, BufferedWriter, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use serde_json::json;
+use uuid::Uuid;
 
 /// A mirror in a throwaway directory: no server, no `%APPDATA%`.
 async fn cache(root: &Path) -> CacheStore {
@@ -625,6 +628,313 @@ async fn every_hierarchy_method_is_unreachable_offline() {
         pending_files(writer.dir()),
         0,
         "31 refusals write nothing to the buffer either"
+    );
+    cache.close().await;
+}
+
+/// The smallest `R-ORCH-11` snapshot [`NewRun`] takes: enough to type-check, never decoded here.
+///
+/// Offline the refusal comes before anything looks at it, which is the point — a snapshot the
+/// seam would reject on the server must still be refused with the *offline* sentence.
+fn offline_snapshot() -> GraphSnapshot {
+    GraphSnapshot {
+        v: GraphSnapshot::V,
+        graph: SnapshotGraph {
+            id: ids::GRAPH_HTUI_FEAT,
+            name: "feature".to_owned(),
+            is_override: false,
+        },
+        topology: "sha256:offline".to_owned(),
+        mode: RunMode::Manual,
+        phases: Vec::new(),
+        settings: SnapshotSettings {
+            default_isolation: Isolation::Worktree,
+            per_token_cap_run: None,
+            per_token_cap_batch: None,
+            max_fan_out: 4,
+            max_agents_per_run: 6,
+        },
+    }
+}
+
+/// MOD-4 milestone 1, plan D5: ANA-2 §8's run seam is written - and read - on the server only.
+///
+/// All **23** new methods are listed here, the five [`htui_core::store::ReadStore`] reads
+/// included, and every one answers [`DATABASE_UNREACHABLE`]. The sibling case above says why that
+/// is the right sentence rather than a new constant, and it is the same reason twice over here:
+/// `htui` has been online-only since MOD-25, so queueing a run off the server is exactly the event
+/// `R-STO-4` words as "no item creation, no runs"; and a buffered `claim_run` would be a lease
+/// taken against a database nobody can reach, which is not a sink, it is a lie.
+///
+/// The assertion is on the sentence, not just the variant, because the refusal being *one*
+/// sentence is the thing that could silently regress: a second constant for the same fact is what
+/// this case exists to fail on.
+#[tokio::test]
+async fn every_run_seam_method_is_unreachable_offline() {
+    let root = tempfile::tempdir().expect("temp root");
+    let cache = cache(root.path()).await;
+    let writer = BufferedWriter::new(cache.clone());
+
+    let refused = |what: &str, err: StoreError| match err {
+        StoreError::Unreachable(sentence) => assert_eq!(
+            sentence, DATABASE_UNREACHABLE,
+            "{what} answers MOD-25's one offline sentence, not a second one"
+        ),
+        other => panic!("{what} must refuse as Unreachable, got {other:?}"),
+    };
+
+    let at = fixtures::demo_at(3, 0);
+    let later = fixtures::demo_at(3, 1);
+    let run = RunId::new();
+    let step = StepId::new();
+    let repo = RepoId::new();
+    let owner = Uuid::now_v7();
+
+    // ---- the five reads (plan D1) ----
+    refused(
+        "run",
+        writer.run(run).await.expect_err("run has no mirror reader"),
+    );
+    refused(
+        "run_steps",
+        writer
+            .run_steps(run)
+            .await
+            .expect_err("run_step has no mirror reader"),
+    );
+    refused(
+        "step_trees",
+        writer
+            .step_trees(step)
+            .await
+            .expect_err("run_step_tree has no mirror reader"),
+    );
+    refused(
+        "step_commits",
+        writer
+            .step_commits(step)
+            .await
+            .expect_err("run_step_commit has no mirror reader"),
+    );
+    refused(
+        "resolve_inputs",
+        writer
+            .resolve_inputs(ids::HTUI_FEAT_1, run, &["plan".to_owned()])
+            .await
+            .expect_err("inputs are resolved on the server"),
+    );
+
+    // ---- run creation, admission and lease ----
+    refused(
+        "create_run",
+        writer
+            .create_run(NewRun {
+                id: run,
+                project_id: ids::PROJECT_HTUI,
+                item_id: ids::HTUI_FEAT_1,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                started_by: ids::USER,
+                graph_snapshot: offline_snapshot(),
+                repo_scope: vec![repo],
+                queued_at: at,
+            })
+            .await
+            .expect_err("no run is queued offline"),
+    );
+    refused(
+        "claim_run",
+        writer
+            .claim_run(run, ids::BOX, owner, at, later)
+            .await
+            .expect_err("no run is claimed offline"),
+    );
+    refused(
+        "refresh_lease",
+        writer
+            .refresh_lease(run, owner, later)
+            .await
+            .expect_err("no lease is refreshed offline"),
+    );
+    refused(
+        "adopt_runs",
+        writer
+            .adopt_runs(ids::BOX, owner, at, later)
+            .await
+            .expect_err("no run is adopted offline"),
+    );
+
+    // ---- steps and the §4.3 law ----
+    refused(
+        "create_step",
+        writer
+            .create_step(NewRunStep {
+                id: step,
+                run_id: run,
+                position: 0,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "plan".to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: None,
+            })
+            .await
+            .expect_err("no step is created offline"),
+    );
+    refused(
+        "transition_run",
+        writer
+            .transition_run(run, RunStatus::Queued, RunStatus::Running, at)
+            .await
+            .expect_err("no run moves offline"),
+    );
+    refused(
+        "transition_step",
+        writer
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect_err("no step moves offline"),
+    );
+    refused(
+        "finish_step",
+        writer
+            .finish_step(
+                step,
+                StepOutcome {
+                    finished_at: at,
+                    ..StepOutcome::default()
+                },
+            )
+            .await
+            .expect_err("no step settles offline"),
+    );
+    refused(
+        "answer_gate",
+        writer
+            .answer_gate(step, GateOutcome::Approved, None, at)
+            .await
+            .expect_err("no gate is answered offline"),
+    );
+    refused(
+        "select_fanout",
+        writer
+            .select_fanout(run, 0, 1, step, None)
+            .await
+            .expect_err("no winner is picked offline"),
+    );
+    refused(
+        "supersede_step",
+        writer
+            .supersede_step(step)
+            .await
+            .expect_err("no step is superseded offline"),
+    );
+
+    // ---- trees and commits (ANA-2 §4.6) ----
+    refused(
+        "upsert_step_tree",
+        writer
+            .upsert_step_tree(
+                step,
+                &[RunStepTree {
+                    run_step_id: step,
+                    repo_id: repo,
+                    mode: Isolation::Worktree,
+                    path: "/tmp/offline/tree".to_owned(),
+                    base_ref: "main".to_owned(),
+                    dirty: false,
+                }],
+            )
+            .await
+            .expect_err("no tree is recorded offline"),
+    );
+    refused(
+        "record_commits",
+        writer
+            .record_commits(
+                step,
+                &[RunStepCommit {
+                    run_step_id: step,
+                    repo_id: repo,
+                    before_hash: "0".repeat(40),
+                    after_hash: None,
+                }],
+            )
+            .await
+            .expect_err("no commit is recorded offline"),
+    );
+
+    // ---- documents, promotion, failure and close-out ----
+    refused(
+        "write_document",
+        writer
+            .write_document(NewDocument {
+                id: DocumentId::new(),
+                item_id: ids::HTUI_FEAT_1,
+                kind: "plan".to_owned(),
+                title: "Offline".to_owned(),
+                body: "nothing".to_owned(),
+                produced_by_step_id: Some(step),
+                created_by: ids::USER,
+                created_at: at,
+            })
+            .await
+            .expect_err("no document is written offline"),
+    );
+    refused(
+        "promote_step",
+        writer
+            .promote_step(step, at)
+            .await
+            .expect_err("no step is promoted offline"),
+    );
+    refused(
+        "fail_run",
+        writer
+            .fail_run(run, "offline", at)
+            .await
+            .expect_err("no run is failed offline"),
+    );
+    refused(
+        "close_out",
+        writer
+            .close_out(
+                ids::HTUI_FEAT_1,
+                NewDocument {
+                    id: DocumentId::new(),
+                    item_id: ids::HTUI_FEAT_1,
+                    kind: "summary".to_owned(),
+                    title: "Offline".to_owned(),
+                    body: "nothing".to_owned(),
+                    produced_by_step_id: Some(step),
+                    created_by: ids::USER,
+                    created_at: at,
+                },
+                &[],
+            )
+            .await
+            .expect_err("no item is closed out offline"),
+    );
+    refused(
+        "add_note",
+        writer
+            .add_note(NewNote {
+                id: NoteId::new(),
+                item_id: ids::HTUI_FEAT_1,
+                body: "offline".to_owned(),
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+                via_step_id: Some(step),
+                created_at: at,
+            })
+            .await
+            .expect_err("no note is added offline"),
+    );
+
+    assert_eq!(
+        pending_files(writer.dir()),
+        0,
+        "23 refusals write nothing to the buffer either"
     );
     cache.close().await;
 }

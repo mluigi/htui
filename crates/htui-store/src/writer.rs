@@ -233,25 +233,29 @@ impl ReadStore for BufferedWriter {
 
     // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
     //
-    // Unwritten here on purpose: blueprint §4.1 is what gives `Writer` and `BufferedWriter` their
-    // bodies (D5 — the five refuse offline with `DATABASE_UNREACHABLE` exactly as the hierarchy
-    // reads do). They are declared now only because the trait has no defaults and the crate has
-    // to compile from T2's second commit on (blueprint H-8). Nothing calls them before T3.
+    // Refused, not delegated to the mirror (plan D5), and that is the one place this impl parts
+    // company with the reads above it. All five tables *are* mirrored, and
+    // [`Backend::Offline`](crate::Backend::Offline) answers all five from the mirror — that is the
+    // arm an offline reader actually travels. `BufferedWriter` is the **write** sink, kept
+    // compiling for one release and constructed by no backend since MOD-25, and a half-alive run
+    // seam here — reads that answer, writes that cannot — is the shape that invites a caller to
+    // orchestrate against a database it cannot reach. The sentence is
+    // `hierarchy_needs_the_server()`'s; see its doc for why it is not a new one.
 
     async fn run(&self, _id: RunId) -> Result<Option<Run>> {
-        todo!("MOD-4 T2 commit 3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
-        todo!("MOD-4 T2 commit 3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
-        todo!("MOD-4 T2 commit 3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
-        todo!("MOD-4 T2 commit 3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn resolve_inputs(
@@ -260,7 +264,7 @@ impl ReadStore for BufferedWriter {
         _run: RunId,
         _kinds: &[String],
     ) -> Result<Vec<ResolvedInput>> {
-        todo!("MOD-4 T2 commit 3")
+        Err(hierarchy_needs_the_server())
     }
 }
 
@@ -622,10 +626,14 @@ impl WriteStore for BufferedWriter {
 
     // ---- ANA-2 §8's eighteen run writers (MOD-4 milestone 1, plan D1) -------------------------
     //
-    // Unwritten here on purpose, for the reason above: blueprint §4.1 owns these bodies.
+    // Refused, for the reason above and one of their own (plan D5): a buffered `claim_run` would
+    // take a lease against a database nobody can reach, and nothing at `upload_pending` could
+    // settle it afterwards. No new constant and no buffered implementation — `set_step_prompt`'s
+    // note above reserved this exact moment, and the refusal is the signal that an offline graph
+    // step needs a design.
 
     async fn create_run(&self, _new: NewRun) -> Result<Run> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn claim_run(
@@ -636,7 +644,7 @@ impl WriteStore for BufferedWriter {
         _at: DateTime<Utc>,
         _lease_until: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn refresh_lease(
@@ -645,7 +653,7 @@ impl WriteStore for BufferedWriter {
         _owner: Uuid,
         _until: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn adopt_runs(
@@ -655,11 +663,11 @@ impl WriteStore for BufferedWriter {
         _now: DateTime<Utc>,
         _lease_until: DateTime<Utc>,
     ) -> Result<Vec<Run>> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn create_step(&self, _new: NewRunStep) -> Result<RunStep> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn transition_run(
@@ -669,7 +677,7 @@ impl WriteStore for BufferedWriter {
         _to: RunStatus,
         _at: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn transition_step(
@@ -679,11 +687,11 @@ impl WriteStore for BufferedWriter {
         _to: StepStatus,
         _at: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn finish_step(&self, _step: StepId, _outcome: StepOutcome) -> Result<()> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn answer_gate(
@@ -693,7 +701,7 @@ impl WriteStore for BufferedWriter {
         _note: Option<String>,
         _at: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn select_fanout(
@@ -704,31 +712,31 @@ impl WriteStore for BufferedWriter {
         _winner: StepId,
         _reason: Option<String>,
     ) -> Result<()> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn supersede_step(&self, _step: StepId) -> Result<()> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn upsert_step_tree(&self, _step: StepId, _trees: &[RunStepTree]) -> Result<()> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn record_commits(&self, _step: StepId, _commits: &[RunStepCommit]) -> Result<()> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn write_document(&self, _new: NewDocument) -> Result<Document> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn promote_step(&self, _step: StepId, _at: DateTime<Utc>) -> Result<()> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn fail_run(&self, _run: RunId, _failure: &str, _at: DateTime<Utc>) -> Result<()> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn close_out(
@@ -737,11 +745,11 @@ impl WriteStore for BufferedWriter {
         _summary: NewDocument,
         _commits: &[RunStepCommit],
     ) -> Result<Document> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 
     async fn add_note(&self, _note: NewNote) -> Result<Note> {
-        todo!("MOD-4 T3")
+        Err(hierarchy_needs_the_server())
     }
 }
 
@@ -807,6 +815,14 @@ pub const DATABASE_UNREACHABLE: &str = "this box browses its read-only cache and
 /// [`REGISTRY_ON_SERVER_ONLY`] and [`PROMPT_ON_SERVER_ONLY`] were the other candidates and both
 /// name a different subsystem; a maintainer who met "the agent registry is written on the server
 /// only" after renaming a project would go looking in the wrong place.
+///
+/// **Since MOD-4 milestone 1 (plan D5) it serves a second family**: ANA-2 §8's run seam, eighteen
+/// [`WriteStore`] writers and five [`ReadStore`] reads, refused here with the same one sentence and
+/// no other. A third constant was not coined for the reason a thirty-second one was not: queueing
+/// a run off the server is the event `R-STO-4` already words as "no item creation, no runs", and a
+/// user who meets the refusal from a rename and from a run must not have to decide whether they are
+/// two problems. The fn keeps its MOD-15 name because the sentence is the shared thing, not the
+/// subsystem — renaming it would only move the question.
 fn hierarchy_needs_the_server() -> StoreError {
     StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned())
 }
@@ -908,34 +924,52 @@ impl ReadStore for Writer {
 
     // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
     //
-    // Unwritten here on purpose: blueprint §4.1 is what gives `Writer` and `BufferedWriter` their
-    // bodies (D5 — the five refuse offline with `DATABASE_UNREACHABLE` exactly as the hierarchy
-    // reads do). They are declared now only because the trait has no defaults and the crate has
-    // to compile from T2's second commit on (blueprint H-8). Nothing calls them before T3.
+    // Delegation, like every read above: a `Writer` decides *which* store, never *what* a read
+    // means. The `Buffered` arm is where the refusal lives.
 
-    async fn run(&self, _id: RunId) -> Result<Option<Run>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn run(&self, id: RunId) -> Result<Option<Run>> {
+        match self {
+            Self::Memory(store) => store.run(id).await,
+            Self::Online(pg) => pg.run(id).await,
+            Self::Buffered(buffer) => buffer.run(id).await,
+        }
     }
 
-    async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn run_steps(&self, run: RunId) -> Result<Vec<RunStep>> {
+        match self {
+            Self::Memory(store) => store.run_steps(run).await,
+            Self::Online(pg) => pg.run_steps(run).await,
+            Self::Buffered(buffer) => buffer.run_steps(run).await,
+        }
     }
 
-    async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn step_trees(&self, step: StepId) -> Result<Vec<RunStepTree>> {
+        match self {
+            Self::Memory(store) => store.step_trees(step).await,
+            Self::Online(pg) => pg.step_trees(step).await,
+            Self::Buffered(buffer) => buffer.step_trees(step).await,
+        }
     }
 
-    async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn step_commits(&self, step: StepId) -> Result<Vec<RunStepCommit>> {
+        match self {
+            Self::Memory(store) => store.step_commits(step).await,
+            Self::Online(pg) => pg.step_commits(step).await,
+            Self::Buffered(buffer) => buffer.step_commits(step).await,
+        }
     }
 
     async fn resolve_inputs(
         &self,
-        _item: ItemId,
-        _run: RunId,
-        _kinds: &[String],
+        item: ItemId,
+        run: RunId,
+        kinds: &[String],
     ) -> Result<Vec<ResolvedInput>> {
-        todo!("MOD-4 T2 commit 3")
+        match self {
+            Self::Memory(store) => store.resolve_inputs(item, run, kinds).await,
+            Self::Online(pg) => pg.resolve_inputs(item, run, kinds).await,
+            Self::Buffered(buffer) => buffer.resolve_inputs(item, run, kinds).await,
+        }
     }
 }
 
@@ -1362,126 +1396,204 @@ impl WriteStore for Writer {
 
     // ---- ANA-2 §8's eighteen run writers (MOD-4 milestone 1, plan D1) -------------------------
     //
-    // Unwritten here on purpose, for the reason above: blueprint §4.1 owns these bodies.
+    // Delegation, for the reason above.
 
-    async fn create_run(&self, _new: NewRun) -> Result<Run> {
-        todo!("MOD-4 T3")
+    async fn create_run(&self, new: NewRun) -> Result<Run> {
+        match self {
+            Self::Memory(store) => store.create_run(new).await,
+            Self::Online(pg) => pg.create_run(new).await,
+            Self::Buffered(buffer) => buffer.create_run(new).await,
+        }
     }
 
     async fn claim_run(
         &self,
-        _run: RunId,
-        _box_id: BoxId,
-        _owner: Uuid,
-        _at: DateTime<Utc>,
-        _lease_until: DateTime<Utc>,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        at: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T3")
+        match self {
+            Self::Memory(store) => store.claim_run(run, box_id, owner, at, lease_until).await,
+            Self::Online(pg) => pg.claim_run(run, box_id, owner, at, lease_until).await,
+            Self::Buffered(buffer) => buffer.claim_run(run, box_id, owner, at, lease_until).await,
+        }
     }
 
-    async fn refresh_lease(
-        &self,
-        _run: RunId,
-        _owner: Uuid,
-        _until: DateTime<Utc>,
-    ) -> Result<bool> {
-        todo!("MOD-4 T3")
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.refresh_lease(run, owner, until).await,
+            Self::Online(pg) => pg.refresh_lease(run, owner, until).await,
+            Self::Buffered(buffer) => buffer.refresh_lease(run, owner, until).await,
+        }
     }
 
     async fn adopt_runs(
         &self,
-        _box_id: BoxId,
-        _owner: Uuid,
-        _now: DateTime<Utc>,
-        _lease_until: DateTime<Utc>,
+        box_id: BoxId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
     ) -> Result<Vec<Run>> {
-        todo!("MOD-4 T3")
+        match self {
+            Self::Memory(store) => store.adopt_runs(box_id, owner, now, lease_until).await,
+            Self::Online(pg) => pg.adopt_runs(box_id, owner, now, lease_until).await,
+            Self::Buffered(buffer) => buffer.adopt_runs(box_id, owner, now, lease_until).await,
+        }
     }
 
-    async fn create_step(&self, _new: NewRunStep) -> Result<RunStep> {
-        todo!("MOD-4 T3")
+    async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
+        match self {
+            Self::Memory(store) => store.create_step(new).await,
+            Self::Online(pg) => pg.create_step(new).await,
+            Self::Buffered(buffer) => buffer.create_step(new).await,
+        }
     }
 
     async fn transition_run(
         &self,
-        _run: RunId,
-        _from: RunStatus,
-        _to: RunStatus,
-        _at: DateTime<Utc>,
+        run: RunId,
+        from: RunStatus,
+        to: RunStatus,
+        at: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T3")
+        match self {
+            Self::Memory(store) => store.transition_run(run, from, to, at).await,
+            Self::Online(pg) => pg.transition_run(run, from, to, at).await,
+            Self::Buffered(buffer) => buffer.transition_run(run, from, to, at).await,
+        }
     }
 
     async fn transition_step(
         &self,
-        _step: StepId,
-        _from: StepStatus,
-        _to: StepStatus,
-        _at: DateTime<Utc>,
+        step: StepId,
+        from: StepStatus,
+        to: StepStatus,
+        at: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T3")
+        match self {
+            Self::Memory(store) => store.transition_step(step, from, to, at).await,
+            Self::Online(pg) => pg.transition_step(step, from, to, at).await,
+            Self::Buffered(buffer) => buffer.transition_step(step, from, to, at).await,
+        }
     }
 
-    async fn finish_step(&self, _step: StepId, _outcome: StepOutcome) -> Result<()> {
-        todo!("MOD-4 T3")
+    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.finish_step(step, outcome).await,
+            Self::Online(pg) => pg.finish_step(step, outcome).await,
+            Self::Buffered(buffer) => buffer.finish_step(step, outcome).await,
+        }
     }
 
     async fn answer_gate(
         &self,
-        _step: StepId,
-        _outcome: GateOutcome,
-        _note: Option<String>,
-        _at: DateTime<Utc>,
+        step: StepId,
+        outcome: GateOutcome,
+        note: Option<String>,
+        at: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T3")
+        match self {
+            Self::Memory(store) => store.answer_gate(step, outcome, note, at).await,
+            Self::Online(pg) => pg.answer_gate(step, outcome, note, at).await,
+            Self::Buffered(buffer) => buffer.answer_gate(step, outcome, note, at).await,
+        }
     }
 
     async fn select_fanout(
         &self,
-        _run: RunId,
-        _position: i32,
-        _attempt: i32,
-        _winner: StepId,
-        _reason: Option<String>,
+        run: RunId,
+        position: i32,
+        attempt: i32,
+        winner: StepId,
+        reason: Option<String>,
     ) -> Result<()> {
-        todo!("MOD-4 T3")
+        match self {
+            Self::Memory(store) => {
+                store
+                    .select_fanout(run, position, attempt, winner, reason)
+                    .await
+            }
+            Self::Online(pg) => {
+                pg.select_fanout(run, position, attempt, winner, reason)
+                    .await
+            }
+            Self::Buffered(buffer) => {
+                buffer
+                    .select_fanout(run, position, attempt, winner, reason)
+                    .await
+            }
+        }
     }
 
-    async fn supersede_step(&self, _step: StepId) -> Result<()> {
-        todo!("MOD-4 T3")
+    async fn supersede_step(&self, step: StepId) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.supersede_step(step).await,
+            Self::Online(pg) => pg.supersede_step(step).await,
+            Self::Buffered(buffer) => buffer.supersede_step(step).await,
+        }
     }
 
-    async fn upsert_step_tree(&self, _step: StepId, _trees: &[RunStepTree]) -> Result<()> {
-        todo!("MOD-4 T3")
+    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.upsert_step_tree(step, trees).await,
+            Self::Online(pg) => pg.upsert_step_tree(step, trees).await,
+            Self::Buffered(buffer) => buffer.upsert_step_tree(step, trees).await,
+        }
     }
 
-    async fn record_commits(&self, _step: StepId, _commits: &[RunStepCommit]) -> Result<()> {
-        todo!("MOD-4 T3")
+    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.record_commits(step, commits).await,
+            Self::Online(pg) => pg.record_commits(step, commits).await,
+            Self::Buffered(buffer) => buffer.record_commits(step, commits).await,
+        }
     }
 
-    async fn write_document(&self, _new: NewDocument) -> Result<Document> {
-        todo!("MOD-4 T3")
+    async fn write_document(&self, new: NewDocument) -> Result<Document> {
+        match self {
+            Self::Memory(store) => store.write_document(new).await,
+            Self::Online(pg) => pg.write_document(new).await,
+            Self::Buffered(buffer) => buffer.write_document(new).await,
+        }
     }
 
-    async fn promote_step(&self, _step: StepId, _at: DateTime<Utc>) -> Result<()> {
-        todo!("MOD-4 T3")
+    async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.promote_step(step, at).await,
+            Self::Online(pg) => pg.promote_step(step, at).await,
+            Self::Buffered(buffer) => buffer.promote_step(step, at).await,
+        }
     }
 
-    async fn fail_run(&self, _run: RunId, _failure: &str, _at: DateTime<Utc>) -> Result<()> {
-        todo!("MOD-4 T3")
+    async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.fail_run(run, failure, at).await,
+            Self::Online(pg) => pg.fail_run(run, failure, at).await,
+            Self::Buffered(buffer) => buffer.fail_run(run, failure, at).await,
+        }
     }
 
     async fn close_out(
         &self,
-        _item: ItemId,
-        _summary: NewDocument,
-        _commits: &[RunStepCommit],
+        item: ItemId,
+        summary: NewDocument,
+        commits: &[RunStepCommit],
     ) -> Result<Document> {
-        todo!("MOD-4 T3")
+        match self {
+            Self::Memory(store) => store.close_out(item, summary, commits).await,
+            Self::Online(pg) => pg.close_out(item, summary, commits).await,
+            Self::Buffered(buffer) => buffer.close_out(item, summary, commits).await,
+        }
     }
 
-    async fn add_note(&self, _note: NewNote) -> Result<Note> {
-        todo!("MOD-4 T3")
+    async fn add_note(&self, note: NewNote) -> Result<Note> {
+        match self {
+            Self::Memory(store) => store.add_note(note).await,
+            Self::Online(pg) => pg.add_note(note).await,
+            Self::Buffered(buffer) => buffer.add_note(note).await,
+        }
     }
 }
 
