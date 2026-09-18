@@ -26,11 +26,19 @@ pub mod status;
 pub use graph::{
     GraphSource, ResolveError, Resolved, override_graph, resolve, resolve_scope, topology,
 };
+pub use isolate::{
+    Clock, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree, SystemClock,
+};
 pub use status::{Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt};
 
 // The crate's public face is re-exported from here, and the list grows with the modules that
-// define it: `command::{Command, CommandOutcome, GateAnswer}` and `isolate::{Isolator,
-// IsolatorFuture, IsolateError, Prepared, PreparedTree}` with T3, and `engine::{AgentSelector,
-// Clock, Engine, EngineError, FirstCandidate, NoSink, Rest, SessionSink, SystemClock}` and
-// `gate::{Settle, Verdict, parse_verdict}` with T4. Re-exporting a name before its module defines
-// it does not compile, so the list arrives in pieces rather than whole.
+// define it: `command::{Command, CommandOutcome, GateAnswer}` arrives with T3's second half, and
+// `engine::{AgentSelector, Engine, FirstCandidate, NoSink, SessionSink}` and `gate::{Settle,
+// Verdict, parse_verdict}` with T4. Re-exporting a name before its module defines it does not
+// compile, so the list arrives in pieces rather than whole.
+//
+// Two of the blueprint's `engine::` names are exported from elsewhere, because T3 needs them and
+// `engine.rs` is still a stub: `Clock` and `SystemClock` are `isolate`'s (their only implementor
+// this milestone is `fake::TestClock`), and `EngineError` and `Rest` are `command`'s (the enabling
+// guards return the first and `CommandOutcome` carries the second). The crate-root paths are the
+// ones T4 and milestone 6 use either way.
