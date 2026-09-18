@@ -35,8 +35,7 @@ use htui_core::store::{
     close_out_needs_a_summary, expected_on_row, graph_not_in_project, illegal_move, invalid_prefix,
     item_has_a_live_run, item_kind_is_held, legal_move, not_a_fanout_candidate,
     not_a_terminal_status, references_no_row, reserved_phase_name, row_names_another_step,
-    run_is_terminal,
-    step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
+    run_is_terminal, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
 };
 use serde_json::Value;
 use sqlx::PgConnection;

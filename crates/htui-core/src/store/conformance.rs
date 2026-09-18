@@ -3971,10 +3971,7 @@ async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
         .create_run(new_run(ProjectId::new(), ItemId::new(), Vec::new()))
         .await;
     assert!(
-        matches!(
-            both_wrong,
-            Err(StoreError::NotFound { entity: "item", .. })
-        ),
+        matches!(both_wrong, Err(StoreError::NotFound { entity: "item", .. })),
         "{CASE}: D14 — an unknown item outranks an unknown project, got {both_wrong:?}"
     );
 

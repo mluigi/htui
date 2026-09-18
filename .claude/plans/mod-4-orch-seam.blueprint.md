@@ -57,6 +57,26 @@ one it was rejected (see the T1 close-out note).
 | A-6 | `tests/cache.rs`'s tree/commit case is the only pin that the mirror carries the two new tables — `trees_and_commits_read_back` is a totality case on an empty fixture and both its row-content twins are `WriteStore` cases | §3.9's `tests/cache.rs` row, now marked a gate; the case's own doc in `conformance.rs` says it too | F-P set up the empty fixture deliberately and did not name the consequence for the mirror |
 | A-7 | The four Postgres-only twin names are listed in `PENDING` in `conformance.rs`'s `every_cross_referenced_test_name_exists`; deleting an entry is part of writing its test, and the test fails by name if the entry outlives the fn | §3.9's `tests/pg_criteria.rs` row, part (c) | T1 shipped them as `pg_criteria::<name>`, a spelling the scanner skipped in silence; fixed in T1, commit `958a987` |
 
+### 0.2 Amendments from the T2 adversarial audit (2026-09-18, after T2's close-out)
+
+Four verifiers audited T2 at `ea48712`. Everything actionable inside `htui-store` (and the two
+`htui-core` halves a store-side divergence implicated) was fixed in T2's repair commits `e51c824`,
+`06131b7` and `78326dd`; the one T3 finding is §4.5. D0–D16 are untouched.
+
+| # | What the audit found | Disposition |
+|---|---|---|
+| B-2 | `PgStore::create_run` accepted a `repo_scope` naming a repo that does not exist, where `MemStore` refuses. `run.repo_scope` is a `UUID[]` and an array element cannot carry a `REFERENCES` clause, so the schema cannot refuse it and the writer must — and `claim_run`'s `repo_scope && $2::uuid[]` would otherwise compare against a phantom id for the run's life. The only unenforced reference among the eighteen writers | **Fixed** (`e51c824`): an `unnest` / `LEFT JOIN repo` probe inside the transaction, before the first write, returning `references_no_row("run.repo_scope", …)`. `run_create_moves_the_item` gained the leg |
+| B-3 | `upsert_step_tree` and `record_commits` judged the batch before probing the step, so an unknown step carrying a stray row was `Constraint` where `MemStore`'s `check_step_batch` answers `NotFound` — plan D14 inverted on the Postgres side | **Fixed** (`e51c824`): the probe moved above the loop on both writers; `trees_and_commits_round_trip` gained a leg for each |
+| B-4 | `MemStore::create_run` checked the duplicate id and four foreign keys **before** it looked the item up, so an unknown item plus an unknown project was `Constraint` where `PgStore` answers `NotFound`. `PgStore` is D14-compliant here and `MemStore` was the deviant one | **Fixed** (`e51c824`): `require_item` + `legal_move` moved to the top of `MemStore::create_run`; one conformance leg gets both wrong at once |
+| B-5 | The mirror's three-armed `CASE` rank in `resolve_inputs` had no test behind it — §0.1's A-6 hole in its second form. Deleting the whole `CASE` left `the_mirror_passes_the_read_cases` green | **Fixed** (`06131b7`): `tests/cache.rs::the_mirror_ranks_resolve_inputs_the_way_postgres_does`, checked by deleting the `CASE` and watching it turn red while the read-case harness stayed green |
+| B-1 | `cargo check -p htui --all-targets` does not pass at HEAD; five hand-written `htui` files have never been compiled | **Deferred to T3**, §4.5. Verified correct behind a throwaway stub, not committed |
+| B-6 | `run.repo_scope` / `lease_*` had no test that gave `repos_col` and `opt_ts_col` a value to decode, and `tests/cache.rs`'s "have no reader yet" comment was stale from `9da9565` | **Fixed** (`06131b7`) |
+| B-7 | `resolve_inputs` on the mirror can answer a fan-out **loser's** document mid-pass: `document` is refreshed and committed before `run_step`, so between the two commits the row joins to no step and passes eligibility | **Documented, no code change** (`06131b7`). Design-inherent to the per-table cursor pass; ANA-9 §6.2 promises whole-table, not cross-table, consistency |
+| B-8 | ANA-2 §5.4's twelve seeded `app_setting` defaults were pinned by count only; ANA-5's ten are value-pinned twice over | **Fixed** (`78326dd`): `ANA2_DEFAULTS` and `the_twelve_ana2_defaults_land_with_their_values`, as JSON text because three are `null` and one is an object |
+| B-9 | `adopt_runs` broke a `queued_at` tie by nothing, where `MemStore` sorts `(queued_at, RunId)`; `close_out`'s live-run probe already spells the tiebreak | **Fixed** (`78326dd`): `ORDER BY queued_at, id`, and the trait doc now says the order is total |
+| B-10 | `the_six_ana_comments_are_present_and_verbatim` guards twenty-five entries | **Fixed** (`78326dd`): renamed count-free |
+| B-11 | The T2 gate line names no `DATABASE_URL`; run with the bare `…/postgres` one it emits 212 errors and exits 1 | **Fixed**: §1's T2 row and §3.10 |
+
 ---
 
 ## 1. Build order and validation, at a glance
@@ -66,7 +86,7 @@ Serial: **T1 → T2 → T3**. `cargo test --workspace` is red from T1's first co
 | Task | Crate(s) | Commits (minimum) | Validation (copied from the plan `:175-183`) |
 |---|---|---|---|
 | T1 | `htui-core` (+ one `htui` test helper) | 6 | `cargo test -p htui-core --all-features` then `cargo clippy -p htui-core --all-targets --all-features -- -D warnings` |
-| T2 | `htui-store`, `htui` strings | 6 | `USERNAME=htui-ci HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres cargo test -p htui-store --all-features` then, from `crates/htui-store`, `cargo sqlx prepare --check -- --all-targets --all-features` |
+| T2 | `htui-store`, `htui` strings | 6 | `USERNAME=htui-ci HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres cargo test -p htui-store --all-features` then, from `crates/htui-store`, `DATABASE_URL=postgres://postgres:htui@localhost:5439/htui_sqlx cargo sqlx prepare --check -- --all-targets --all-features` (the URL must name a **migrated** database, not the bare `…/postgres` one — see §3.10) |
 | T3 | `htui-store` writer, `htui-agent` spies | 3 | `cargo test --workspace --all-features` |
 
 Memory note that applies: run each gate yourself with `--test-threads=1` before declaring green (the keyring fake is process-wide); check `df -h /` before blaming Postgres.
@@ -1262,7 +1282,13 @@ Delete CTE (`:166-169` region): add `t AS (SELECT run_step_id FROM run_step_tree
 
 ### 3.10 `.sqlx`
 
-From `crates/htui-store`: `cargo sqlx prepare -- --all-targets --all-features` against the migrated dev database after every commit that adds or changes a `query!`; commit the new `query-*.json` files with the code that uses them; the T2 gate ends with `cargo sqlx prepare --check -- --all-targets --all-features`.
+From `crates/htui-store`: `DATABASE_URL=postgres://postgres:htui@localhost:5439/htui_sqlx cargo sqlx prepare -- --all-targets --all-features` against the migrated dev database after every commit that adds or changes a `query!`; commit the new `query-*.json` files with the code that uses them.
+
+**Both forms of the check need a `DATABASE_URL`, and it must name a *migrated* database** (T2 audit). The URL the milestone hands around for `HTUI_TEST_DATABASE_URL` is `…/postgres`, which is **bare** — the harness mints and drops its own schemas — so `cargo sqlx prepare --check` run with that one exported emits 212 compile errors and exits 1. That is a false red: the `.sqlx` data is current and the checker simply cannot see a `run` table. Use `…/htui_sqlx`, or run the CI-equivalent, which needs no database at all and is the stronger check of the two:
+
+```
+SQLX_OFFLINE=true cargo check -p htui-store --all-targets --all-features
+```
 
 ### 3.11 T2 commit sequence
 
@@ -1297,6 +1323,21 @@ From `crates/htui-store`: `cargo sqlx prepare -- --all-targets --all-features` a
 2. `test(htui-agent): the spies pass the run seam through` (§4.3) — `cargo test -p htui-agent --all-features`.
 3. `docs(htui-store): the one sentence serves twenty-three more methods` — doc-only, then the full gate `cargo test --workspace --all-features` (with `--test-threads=1` once, per memory).
 
+#### 4.5 Amendments from the T2 adversarial audit (2026-09-18, after T2's close-out) — **T3's gate**
+
+Everything actionable inside `htui-store` was fixed in T2's repair commits. One finding is T3's, and it
+corrects a claim T1 and T2 both carried forward:
+
+| # | What the audit found | What T3 must do |
+|---|---|---|
+| B-1 | **`cargo check -p htui --all-targets` does not pass at HEAD and has not since T1.** `htui-agent`'s `UsageSpy` was never widened, `htui` depends on `htui-agent`, so `htui`'s own code is never type-checked. T1's commit `13f3020` says "the `htui` crate does not compile until T2 lands anyway (plan D0)", which implies it becomes gatable once T2 lands. **It does not** — §4.3's spies are what unblock it, and they are T3's. Five hand-written `htui` files therefore ship through the end of T2 with no compiler behind them: `src/hierarchy.rs` (T1's 22-field `DeleteReach` destructure), `tests/kinds.rs` (T1's `StepGraph` literal), `src/ui/tabs/settings/connection.rs`, `tests/connection.rs` and `tests/snapshots/connection__confirm.snap` (T2's seventeen-strings, the last of them a **hand-edited insta snapshot that could not have been re-recorded**). | Add two lines to §4.4 commit 2's gate, run **after** the spy arms land and before commit 3: `cargo check -p htui --all-targets` and `cargo test -p htui --all-features`. Do not trust `connection__confirm.snap`: run the suite and, if insta reports a mismatch, re-record it rather than hand-editing again. |
+
+T2's repair verified all five by building them behind a **throwaway** stub — the twenty-three `todo!()`
+arms the compiler itself suggests, pasted into `UsageSpy`'s two impls and reverted immediately after.
+With that stub in place `cargo check -p htui --all-targets` exits 0 and `cargo test -p htui
+--all-features` is green, snapshot suite included. That is evidence the five files are correct as
+written; it is **not** a substitute for T3 running the real gate, and nothing about it was committed.
+
 ---
 
 ## 5. Hazards
@@ -1304,7 +1345,7 @@ From `crates/htui-store`: `cargo sqlx prepare -- --all-targets --all-features` a
 | # | Hazard | Guard |
 |---|---|---|
 | H-1 | `query_as!(BoxInfo, …)` at `pg/read.rs:700-714` and `StepRow` (`rows.rs:114-117`) bind **positionally**: a field appended to the struct but not to the select, or in a different order, compiles and mis-assigns | Append in both at the same time; `run_and_steps_round_trip` (g) and the existing `box_info` tests catch a swap |
-| H-2 | `the_six_ana_comments_are_present_and_verbatim` (`migrations.rs:206-264`) asserts "and no others": adding comments without extending the pin fails; trimming the pin to pass loses the guarantee | Extend to 24; never delete an entry |
+| H-2 | `the_ana_column_comments_are_present_and_verbatim` (`migrations.rs:206-264`; renamed count-free by the T2 repair, it was `the_six_…`) asserts "and no others": adding comments without extending the pin fails; trimming the pin to pass loses the guarantee | Extend to 24; never delete an entry |
 | H-3 | `refresh.rs:281`'s `_ =>` fallback would route `run_step_tree` to the commit refresher — compiles, refreshes nothing, no test fails until the mirror is read | Explicit arms (F-F) and the `tests/cache.rs` tree test |
 | H-4 | Someone "fixes" the judge with `CHECK (fanout_index >= 0)` | §3.2's section-4 comment; case 40 (d) inserts `-1` on both backends |
 | H-5 | `mem.rs:2575-2576`'s hard-coded zeros | Case 44 (m) |
