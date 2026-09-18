@@ -16,9 +16,9 @@ use htui_core::model::{
     ItemId, ItemKindId, ItemKindPatch, ItemPatch, NewDocument, NewItem, NewItemKind, NewNote,
     NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, NoteId, PhaseId,
     PhasePatch, ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch, RunId, RunMode, RunStatus,
-    RunStepCommit, RunStepTree, SessionEvent, SnapshotGraph, SnapshotSettings, Status, StepGraphId,
-    StepGraphPatch, StepId, StepOutcome, StepStatus, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph, SnapshotSettings, Status,
+    StepGraphId, StepGraphPatch, StepId, StepOutcome, StepStatus, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{DeleteTarget, ReadStore as _, SettingRung, StoreError, WriteStore as _};
@@ -936,6 +936,132 @@ async fn every_run_seam_method_is_unreachable_offline() {
         0,
         "23 refusals write nothing to the buffer either"
     );
+    cache.close().await;
+}
+
+/// MOD-4 milestone 1, plan D5, on the **other** half of the seam: [`Backend`]'s eleven inherent
+/// orchestration reads.
+///
+/// The two cases above pin [`BufferedWriter`]'s twenty-three. They cannot reach these eleven:
+/// `step_graph`, `phase_agents`, `prompt_template`, `resolve_graph`, `agent_boxes`, `box_row`,
+/// `repo_paths`, `ready_items`, `missing_tags`, `active_runs_on_box` and `overlapping_runs` are
+/// inherent to [`Backend`], on no trait, so no writer and no store impl carries them. Offline they
+/// answer through `backend.rs`'s `orchestration_offline()`, which is a *second* helper beside the
+/// prompt reads' `prompt_offline()` - and `prompt_offline()` answers `PROMPT_ON_SERVER_ONLY`, a
+/// different sentence, from an adjacent block of arms of an identical shape. One arm wired to the
+/// wrong neighbour would compile, and until this case existed nothing anywhere in the workspace
+/// constructed a [`Backend::Offline`] and asked any of the eleven anything.
+///
+/// The assertion is on the sentence for the sibling cases' reason: MOD-25's one sentence serves
+/// reads and writes both, and a second constant minted for the same fact is what this case exists
+/// to fail on.
+///
+/// The five new [`htui_core::store::ReadStore`] reads are deliberately **not** here. `run`,
+/// `run_steps`, `step_trees`, `step_commits` and `resolve_inputs` all read a table in
+/// `MIRRORED_TABLES`, so plan D12's read-dispatch rule has [`Backend::Offline`] answer them off
+/// the mirror rather than refuse (`backend.rs`'s run-read block says so); they refuse only on
+/// [`BufferedWriter`], where the case above pins them. The milestone's invariant is therefore
+/// "every new offline **refusal** answers the one sentence", not "every new offline path".
+#[tokio::test]
+async fn every_inherent_orchestration_read_is_unreachable_offline() {
+    let root = tempfile::tempdir().expect("temp root");
+    let cache = cache(root.path()).await;
+    let backend = Backend::Offline {
+        cache: cache.clone(),
+        since: None,
+    };
+
+    let refused = |what: &str, err: StoreError| match err {
+        StoreError::Unreachable(sentence) => assert_eq!(
+            sentence, DATABASE_UNREACHABLE,
+            "{what} answers MOD-25's one offline sentence, not a second one"
+        ),
+        other => panic!("{what} must refuse as Unreachable, got {other:?}"),
+    };
+
+    let scope = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI],
+    };
+
+    refused(
+        "step_graph",
+        backend
+            .step_graph(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect_err("step_graph is not mirrored"),
+    );
+    refused(
+        "phase_agents",
+        backend
+            .phase_agents(PhaseId::new())
+            .await
+            .expect_err("phase_agent is not mirrored"),
+    );
+    refused(
+        "prompt_template",
+        backend
+            .prompt_template(ids::PROJECT_HTUI, "implement", None)
+            .await
+            .expect_err("prompts are read on the server"),
+    );
+    refused(
+        "resolve_graph",
+        backend
+            .resolve_graph(ids::HTUI_FEAT_1)
+            .await
+            .expect_err("a graph is resolved on the server"),
+    );
+    refused(
+        "agent_boxes",
+        backend
+            .agent_boxes(ids::BOX)
+            .await
+            .expect_err("agent_box is not mirrored"),
+    );
+    refused(
+        "box_row",
+        backend
+            .box_row(ids::BOX)
+            .await
+            .expect_err("the whole box row is not mirrored"),
+    );
+    refused(
+        "repo_paths",
+        backend
+            .repo_paths(ids::BOX)
+            .await
+            .expect_err("repo_box_path is not mirrored"),
+    );
+    refused(
+        "ready_items",
+        backend
+            .ready_items(&scope, ids::BOX)
+            .await
+            .expect_err("readiness is decided on the server"),
+    );
+    refused(
+        "missing_tags",
+        backend
+            .missing_tags(ids::HTUI_FEAT_1, ids::BOX)
+            .await
+            .expect_err("capability is decided on the server"),
+    );
+    refused(
+        "active_runs_on_box",
+        backend
+            .active_runs_on_box(ids::BOX)
+            .await
+            .expect_err("no slot is counted offline"),
+    );
+    refused(
+        "overlapping_runs",
+        backend
+            .overlapping_runs(&[RepoId::new()])
+            .await
+            .expect_err("no scope is intersected offline"),
+    );
+
     cache.close().await;
 }
 
