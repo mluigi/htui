@@ -34,7 +34,8 @@ use htui_core::store::{
     StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, chat_step_status,
     close_out_needs_a_summary, expected_on_row, graph_not_in_project, illegal_move, invalid_prefix,
     item_has_a_live_run, item_kind_is_held, legal_move, not_a_fanout_candidate,
-    not_a_terminal_status, reserved_phase_name, row_names_another_step, run_is_terminal,
+    not_a_terminal_status, references_no_row, reserved_phase_name, row_names_another_step,
+    run_is_terminal,
     step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
 };
 use serde_json::Value;
@@ -2326,6 +2327,31 @@ impl WriteStore for PgStore {
         })?;
         legal_move(status, Status::Queued)?;
 
+        // `run.repo_scope` is a `UUID[]`, and an array element cannot carry a `REFERENCES` clause,
+        // so the schema cannot refuse a scope naming a repo that does not exist - this writer has
+        // to, because `MemStore` does (`references_no_row("run.repo_scope", ...)`) and because
+        // `claim_run`'s overlap test `repo_scope && $2::uuid[]` would otherwise compare against a
+        // phantom id for the rest of the run's life. Inside the transaction and before the first
+        // write, so a refusal leaves nothing behind.
+        let phantom = sqlx::query_scalar!(
+            r#"SELECT scoped.id AS "id!: RepoId"
+                 FROM unnest($1::uuid[]) AS scoped(id)
+                 LEFT JOIN repo ON repo.id = scoped.id
+                WHERE repo.id IS NULL
+                LIMIT 1"#,
+            &scope,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(missing) = phantom {
+            return Err(StoreError::Constraint(references_no_row(
+                "run.repo_scope",
+                missing,
+                "repo",
+            )));
+        }
+
         let run = sqlx::query_as!(
             Run,
             r#"
@@ -3100,8 +3126,13 @@ impl WriteStore for PgStore {
     /// `run_step_tree` upserted on the table's own `(run_step_id, repo_id)` key (ANA-2 §4.6): a
     /// step re-preparing a tree it already has replaces the row rather than raising `23505`.
     ///
-    /// The batch is checked whole before the first insert, [`WriteStore::append_events`]-style: a
-    /// row naming another step is refused in Rust, because `run_step_tree.run_step_id` is bound
+    /// The step is looked up **before** the batch is judged (plan D14: `NotFound` beats
+    /// `Constraint`, the row first and legality second), which is the order
+    /// [`MemStore`](htui_core::store::MemStore)'s `check_step_batch` uses: an unknown step carrying
+    /// a stray row is `NotFound`, not the `Constraint` the row alone would earn.
+    ///
+    /// The batch is then checked whole before the first insert, [`WriteStore::append_events`]-style:
+    /// a row naming another step is refused in Rust, because `run_step_tree.run_step_id` is bound
     /// from `step` and a stray row would otherwise be written *under the argument's key*, silently
     /// re-homing it. An unknown `repo_id` is the foreign key's `23503`, which [`map_sqlx`] turns
     /// into the same [`StoreError::Constraint`]; the transaction is what makes it write nothing.
@@ -3118,6 +3149,9 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
     /// `run_step_id` is not `step` or names an unknown repo.
     async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        step_exists(&mut tx, step).await?;
+
         for row in trees {
             if row.run_step_id != step {
                 return Err(StoreError::Constraint(row_names_another_step(
@@ -3127,9 +3161,6 @@ impl WriteStore for PgStore {
                 )));
             }
         }
-
-        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        step_exists(&mut tx, step).await?;
 
         for row in trees {
             sqlx::query!(
@@ -3168,6 +3199,9 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
     /// `run_step_id` is not `step` or names an unknown repo.
     async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        step_exists(&mut tx, step).await?;
+
         for row in commits {
             if row.run_step_id != step {
                 return Err(StoreError::Constraint(row_names_another_step(
@@ -3177,9 +3211,6 @@ impl WriteStore for PgStore {
                 )));
             }
         }
-
-        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        step_exists(&mut tx, step).await?;
 
         for row in commits {
             sqlx::query!(

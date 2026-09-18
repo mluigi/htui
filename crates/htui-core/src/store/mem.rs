@@ -3099,6 +3099,12 @@ impl State {
 
     /// The `run` row and the item's move to `queued`, together or not at all (plan D6).
     fn create_run(&mut self, new: NewRun, now: DateTime<Utc>) -> Result<Run> {
+        // Plan D14, before anything else: the row is looked up first and legality second, so a
+        // request that gets the item wrong *and* something else wrong answers `NotFound` for the
+        // item. `PgStore` cannot order this any other way — its `SELECT ... FOR UPDATE` on `item`
+        // is the transaction's first statement — so the emulation follows it.
+        let status = self.require_item(new.item_id)?.status;
+        legal_move(status, Status::Queued)?;
         if self.runs.contains_key(&new.id) {
             return Err(StoreError::Constraint(already_exists("run", new.id)));
         }
@@ -3126,8 +3132,6 @@ impl State {
                 )));
             }
         }
-        let status = self.require_item(new.item_id)?.status;
-        legal_move(status, Status::Queued)?;
         let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
             StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
         })?;

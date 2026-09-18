@@ -3964,6 +3964,39 @@ async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
         "{CASE}: an unknown item is NotFound, got {unknown:?}"
     );
 
+    // Plan D14 on a request with two faults at once: the item is looked up first, so the missing
+    // row is what the refusal names even though the project is a foreign key that would also
+    // refuse. Without this leg each store may order its own checks and still pass.
+    let both_wrong = store
+        .create_run(new_run(ProjectId::new(), ItemId::new(), Vec::new()))
+        .await;
+    assert!(
+        matches!(
+            both_wrong,
+            Err(StoreError::NotFound { entity: "item", .. })
+        ),
+        "{CASE}: D14 — an unknown item outranks an unknown project, got {both_wrong:?}"
+    );
+
+    // `run.repo_scope` is a `UUID[]`, and an array element cannot carry a `REFERENCES` clause, so
+    // Postgres cannot refuse this one for us: the writer has to. A run scoped to a repo that does
+    // not exist would make `claim_run`'s `repo_scope && $2::uuid[]` overlap test compare against a
+    // phantom id for the rest of the run's life.
+    let phantom = RepoId::new();
+    let unscoped = store
+        .create_run(new_run(ids::PROJECT_AGY, ids::AGY_FEAT_1, vec![phantom]))
+        .await;
+    assert!(
+        matches!(unscoped, Err(StoreError::Constraint(ref message))
+            if message.contains("run.repo_scope")),
+        "{CASE}: a scope naming an unknown repo is refused by name, got {unscoped:?}"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::AGY_FEAT_1).await.status,
+        Status::Open,
+        "{CASE}: and the refusal left the item where it was"
+    );
+
     let live = new_run(ids::PROJECT_HTUI, ids::HTUI_FEAT_1, Vec::new());
     let live_id = live.id;
     let refused = store.create_run(live).await;
@@ -4985,6 +5018,28 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
         ),
         "{CASE}: an empty slice still checks the step, got {no_step:?}"
     );
+    // Plan D14 once more, on the combination the two legs above never reach together: the step is
+    // looked up before the batch is judged, so an unknown step carrying a stray row is `NotFound`
+    // and not the `Constraint` the row alone would earn.
+    let stray_on_no_step = store
+        .upsert_step_tree(
+            StepId::new(),
+            &[RunStepTree {
+                run_step_id: ids::STEP_PLAN,
+                ..tree(first, false)
+            }],
+        )
+        .await;
+    assert!(
+        matches!(
+            stray_on_no_step,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: D14 — the step is looked up before the batch is judged, got {stray_on_no_step:?}"
+    );
     store
         .upsert_step_tree(ids::STEP_R2_PRD, &[])
         .await
@@ -5046,6 +5101,25 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
             })
         ),
         "{CASE}: an empty slice still checks the step, got {no_commit_step:?}"
+    );
+    let stray_commit_on_no_step = store
+        .record_commits(
+            StepId::new(),
+            &[RunStepCommit {
+                run_step_id: ids::STEP_PLAN,
+                ..commit(first, None)
+            }],
+        )
+        .await;
+    assert!(
+        matches!(
+            stray_commit_on_no_step,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: D14 holds for commits too, got {stray_commit_on_no_step:?}"
     );
     store
         .record_commits(ids::STEP_R2_PRD, &[])

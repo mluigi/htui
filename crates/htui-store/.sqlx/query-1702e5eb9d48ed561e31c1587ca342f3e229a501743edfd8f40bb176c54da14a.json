@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT scoped.id AS \"id!: RepoId\"\n                 FROM unnest($1::uuid[]) AS scoped(id)\n                 LEFT JOIN repo ON repo.id = scoped.id\n                WHERE repo.id IS NULL\n                LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: RepoId",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1702e5eb9d48ed561e31c1587ca342f3e229a501743edfd8f40bb176c54da14a"
+}
