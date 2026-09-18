@@ -38,7 +38,7 @@ use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
     WriteStore, chat_step_status, expected_on_row, graph_not_in_project, invalid_prefix,
-    item_kind_is_held, not_a_terminal_status, reserved_phase_name,
+    item_kind_is_held, legal_move, not_a_terminal_status, reserved_phase_name,
 };
 
 /// The store the TUI runs against in MOD-1: every row in process memory, cloned out under a lock
@@ -1043,6 +1043,11 @@ impl State {
     ///
     /// `closed_at` tracks the current status, not the history: it is set on a move to a terminal
     /// status and cleared on a move back to a live one (blueprint Errata).
+    ///
+    /// The order of MOD-4 plan D14 / D15: the row is looked up first, so a missing row is
+    /// `NotFound` even when the pair is also illegal; then the ANA-2 §4.3 table refuses an illegal
+    /// pair with `Constraint` **before** any write; only then does a stale `from` answer
+    /// `Ok(false)`.
     fn transition(
         &mut self,
         id: ItemId,
@@ -1057,6 +1062,7 @@ impl State {
                 entity: "item",
                 id: id.to_string(),
             })?;
+        legal_move(from, to)?;
         if item.status != from {
             return Ok(false);
         }

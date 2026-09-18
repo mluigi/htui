@@ -147,6 +147,11 @@ pub trait WriteStore: ReadStore {
         patch: ItemPatch,
     ) -> Result<UpdateOutcome>;
     /// Compare-and-set status move; never bumps `version`, never writes a revision (§4.2).
+    ///
+    /// An illegal `(from, to)` is [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// without an update ([`legal_move`], ANA-2 §4.3); a missing row is
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) first (plan D14). A stale
+    /// `from` on a legal pair is still `Ok(false)`.
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool>;
 
     /// Appends session events, skipping any `(run_step_id, seq)` already stored, and answers how
@@ -622,6 +627,77 @@ pub fn chat_step_status(status: RunStatus) -> Option<crate::model::StepStatus> {
         RunStatus::Cancelled => Some(StepStatus::Cancelled),
         RunStatus::Queued | RunStatus::Running | RunStatus::AwaitingApproval => None,
     }
+}
+
+/// The three ANA-2 §4.3 tables behind one name, so `MemStore` and `PgStore` call the same rule
+/// (plan D15; the precedent is [`chat_step_status`]).
+pub trait TransitionLaw: Copy + std::fmt::Display {
+    /// `"item"`, `"run"` or `"run_step"`: the `entity` a refusal names.
+    const ENTITY: &'static str;
+
+    /// The table: whether `self -> to` is a sanctioned move.
+    fn is_legal_move(self, to: Self) -> bool;
+}
+
+impl TransitionLaw for Status {
+    const ENTITY: &'static str = "item";
+
+    fn is_legal_move(self, to: Self) -> bool {
+        self.can_move_to(to)
+    }
+}
+
+impl TransitionLaw for RunStatus {
+    const ENTITY: &'static str = "run";
+
+    fn is_legal_move(self, to: Self) -> bool {
+        self.can_move_to(to)
+    }
+}
+
+impl TransitionLaw for crate::model::StepStatus {
+    const ENTITY: &'static str = "run_step";
+
+    fn is_legal_move(self, to: Self) -> bool {
+        self.can_move_to(to)
+    }
+}
+
+/// `Ok(())` when `from -> to` is in the table, else the
+/// [`StoreError::Constraint`](crate::store::StoreError::Constraint) every compare-and-set returns
+/// **before** touching the row.
+///
+/// Precedence (plan D14): the caller looks the row up first, so a missing row is
+/// [`StoreError::NotFound`](crate::store::StoreError::NotFound) even when the pair is also
+/// illegal — telling a caller its pair is wrong when the real problem is that its id is would be
+/// the wrong sentence, and `pg_criteria` already pins the other order.
+///
+/// The order every compare-and-set honours, on both stores: row lookup → `NotFound`; this call →
+/// `Constraint` with no write; `from` mismatch → `Ok(false)` with no write; update → `Ok(true)`.
+///
+/// # Errors
+/// [`StoreError::Constraint`](crate::store::StoreError::Constraint) with [`illegal_move`]'s
+/// sentence when the pair is outside the table.
+pub fn legal_move<T: TransitionLaw>(from: T, to: T) -> Result<()> {
+    if from.is_legal_move(to) {
+        Ok(())
+    } else {
+        Err(crate::store::StoreError::Constraint(illegal_move(
+            T::ENTITY,
+            from,
+            to,
+        )))
+    }
+}
+
+/// The refusal text of an illegal move, one sentence for the three tables.
+#[must_use]
+pub fn illegal_move(
+    entity: &'static str,
+    from: impl std::fmt::Display,
+    to: impl std::fmt::Display,
+) -> String {
+    format!("{entity}.status `{from}` cannot move to `{to}` (ANA-2 §4.3)")
 }
 
 /// The refusal text a non-terminal [`finish_chat_run`](WriteStore::finish_chat_run) status gets.

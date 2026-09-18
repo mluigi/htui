@@ -554,13 +554,23 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
         "status_cas_keeps_version: version unchanged"
     );
 
+    // Move the row on, so the next call's `from` is stale while its `(from, to)` pair is still a
+    // sanctioned one (ANA-2 §4.3). The staleness is what this leg tests, so the pair must be
+    // legal or the §4.3 guard would pre-empt the compare-and-set with `Constraint` (plan D4).
+    assert!(
+        store
+            .transition(before.id, Status::Queued, Status::InProgress)
+            .await
+            .expect("status_cas_keeps_version: transition must not fail"),
+        "status_cas_keeps_version: queued -> in_progress matches"
+    );
     let stale = store
-        .transition(before.id, Status::Open, Status::Done)
+        .transition(before.id, Status::Queued, Status::InProgress)
         .await
         .expect("status_cas_keeps_version: transition must not fail");
     assert!(
         !stale,
-        "status_cas_keeps_version: a stale `from` is refused"
+        "status_cas_keeps_version: a stale `from` is refused even on a legal pair"
     );
     let unmoved = store
         .item(before.id)
@@ -569,7 +579,7 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
         .expect("status_cas_keeps_version: the item still exists");
     assert_eq!(
         unmoved.status,
-        Status::Queued,
+        Status::InProgress,
         "status_cas_keeps_version: a refused move is a no-op"
     );
 
@@ -577,10 +587,10 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
     // it, a move back to a live one clears it (§4.2; blueprint Errata).
     assert!(
         store
-            .transition(before.id, Status::Queued, Status::Done)
+            .transition(before.id, Status::InProgress, Status::Done)
             .await
             .expect("status_cas_keeps_version: transition must not fail"),
-        "status_cas_keeps_version: queued -> done matches"
+        "status_cas_keeps_version: in_progress -> done matches"
     );
     let done = store
         .item(before.id)
@@ -609,7 +619,7 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
     );
     assert_eq!(
         reopened.version, before.version,
-        "status_cas_keeps_version: neither move bumped the version"
+        "status_cas_keeps_version: no move bumped the version"
     );
 
     // No revision was written: the edit at the pre-transition version still lands, and the
@@ -645,11 +655,18 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
 
 /// Items are never deleted; closing is a status (§4.1).
 async fn no_delete_path<S: WriteStore>(store: &S) {
-    let closed = store
-        .transition(ids::HTUI_ANA_2, Status::Open, Status::Closed)
+    // `open` does not reach `closed` in ANA-2 §4.3's item table: only `blocked`, `failed` and
+    // `done` do, so the close-out path takes two sanctioned moves (plan D4).
+    let blocked = store
+        .transition(ids::HTUI_ANA_2, Status::Open, Status::Blocked)
         .await
         .expect("no_delete_path: transition must not fail");
-    assert!(closed, "no_delete_path: open -> closed matches");
+    assert!(blocked, "no_delete_path: open -> blocked matches");
+    let closed = store
+        .transition(ids::HTUI_ANA_2, Status::Blocked, Status::Closed)
+        .await
+        .expect("no_delete_path: transition must not fail");
+    assert!(closed, "no_delete_path: blocked -> closed matches");
 
     let still_there = store
         .item(ids::HTUI_ANA_2)

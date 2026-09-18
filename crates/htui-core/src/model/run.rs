@@ -50,6 +50,28 @@ impl RunStatus {
     pub const fn is_active(self) -> bool {
         matches!(self, Self::Queued | Self::Running | Self::AwaitingApproval)
     }
+
+    /// ANA-2 §4.3's `run` table (`docs/ANA-2.md:600-616`): whether `self -> to` is a sanctioned
+    /// move. Every terminal status answers `false` for every `to`.
+    #[must_use]
+    pub const fn can_move_to(self, to: Self) -> bool {
+        match self {
+            Self::Queued => matches!(to, Self::Running | Self::Cancelled | Self::Failed),
+            Self::Running => matches!(
+                to,
+                Self::AwaitingApproval | Self::Done | Self::Failed | Self::Cancelled
+            ),
+            Self::AwaitingApproval => matches!(to, Self::Running | Self::Failed | Self::Cancelled),
+            Self::Done | Self::Failed | Self::Cancelled => false,
+        }
+    }
+
+    /// `done | failed | cancelled` — the complement of [`RunStatus::is_active`], and the set that
+    /// reaches nothing in [`RunStatus::can_move_to`].
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        !self.is_active()
+    }
 }
 
 str_enum!(
@@ -71,6 +93,46 @@ str_enum!(
         Superseded => "superseded",
     }
 );
+
+impl StepStatus {
+    /// ANA-2 §4.3's `run_step` table (`docs/ANA-2.md:630-654`). `failed` is **not** terminal for
+    /// a step: it can be promoted to `awaiting_approval` (§4.8) while its run is live, and, like
+    /// every non-terminal status, can be cancelled with its run. The "while the run is
+    /// non-terminal" condition on promotion belongs to
+    /// [`WriteStore::promote_step`](crate::store::WriteStore::promote_step), not to this table.
+    ///
+    /// `awaiting_approval -> awaiting_approval` is §4.3's promotion row and the one self-move any
+    /// of the three tables sanctions: a gated step promoted to chat keeps its status and gains
+    /// `promoted_at`.
+    #[must_use]
+    pub const fn can_move_to(self, to: Self) -> bool {
+        match self {
+            Self::Pending => matches!(to, Self::Running | Self::Superseded | Self::Cancelled),
+            Self::Running => matches!(
+                to,
+                Self::AwaitingApproval | Self::Done | Self::Failed | Self::Cancelled
+            ),
+            Self::AwaitingApproval => matches!(
+                to,
+                Self::Done
+                    | Self::Failed
+                    | Self::Superseded
+                    | Self::AwaitingApproval
+                    | Self::Cancelled
+            ),
+            Self::Failed => matches!(to, Self::AwaitingApproval | Self::Cancelled),
+            Self::Done => matches!(to, Self::Superseded),
+            Self::Cancelled | Self::Superseded => false,
+        }
+    }
+
+    /// `done | cancelled | superseded` (ANA-2 §4.3). `failed` is deliberately absent, and `done`
+    /// is present even though it still reaches `superseded`.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Cancelled | Self::Superseded)
+    }
+}
 
 str_enum!(
     /// `run_step.gate_outcome` (§5.8): how the human answered the gate.
@@ -362,8 +424,125 @@ pub struct RunSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::prompt_summary;
+    use super::{RunStatus, StepStatus, prompt_summary};
     use serde_json::json;
+
+    /// Every row of ANA-2 §4.3's `run` transition table (`docs/ANA-2.md:600-616`), transcribed
+    /// from the document rather than from [`RunStatus::can_move_to`].
+    const RUN_SANCTIONED: &[(RunStatus, RunStatus)] = &[
+        // `queued`
+        (RunStatus::Queued, RunStatus::Running),
+        (RunStatus::Queued, RunStatus::Cancelled),
+        (RunStatus::Queued, RunStatus::Failed),
+        // `running`
+        (RunStatus::Running, RunStatus::AwaitingApproval),
+        (RunStatus::Running, RunStatus::Done),
+        (RunStatus::Running, RunStatus::Failed),
+        (RunStatus::Running, RunStatus::Cancelled),
+        // `awaiting_approval`
+        (RunStatus::AwaitingApproval, RunStatus::Running),
+        (RunStatus::AwaitingApproval, RunStatus::Failed),
+        (RunStatus::AwaitingApproval, RunStatus::Cancelled),
+        // `done`, `failed`, `cancelled` are terminal.
+    ];
+
+    /// Every row of ANA-2 §4.3's `run_step` transition table (`docs/ANA-2.md:630-654`),
+    /// transcribed from the document rather than from [`StepStatus::can_move_to`]. The
+    /// `awaiting_approval -> awaiting_approval` self-move is §4.8's promotion row, and
+    /// `failed -> awaiting_approval` is the same row from the escalation side.
+    const STEP_SANCTIONED: &[(StepStatus, StepStatus)] = &[
+        // `pending`
+        (StepStatus::Pending, StepStatus::Running),
+        (StepStatus::Pending, StepStatus::Superseded),
+        (StepStatus::Pending, StepStatus::Cancelled),
+        // `running`
+        (StepStatus::Running, StepStatus::AwaitingApproval),
+        (StepStatus::Running, StepStatus::Done),
+        (StepStatus::Running, StepStatus::Failed),
+        (StepStatus::Running, StepStatus::Cancelled),
+        // `awaiting_approval`
+        (StepStatus::AwaitingApproval, StepStatus::Done),
+        (StepStatus::AwaitingApproval, StepStatus::Failed),
+        (StepStatus::AwaitingApproval, StepStatus::Superseded),
+        (StepStatus::AwaitingApproval, StepStatus::AwaitingApproval),
+        (StepStatus::AwaitingApproval, StepStatus::Cancelled),
+        // `failed` — terminal except for the promotion row, and cancellable with its run
+        (StepStatus::Failed, StepStatus::AwaitingApproval),
+        (StepStatus::Failed, StepStatus::Cancelled),
+        // `done`
+        (StepStatus::Done, StepStatus::Superseded),
+        // `cancelled` and `superseded` are terminal.
+    ];
+
+    #[test]
+    fn the_run_status_table_sanctions_exactly_the_ana_2_pairs() {
+        for &from in RunStatus::ALL {
+            for &to in RunStatus::ALL {
+                let sanctioned = RUN_SANCTIONED.contains(&(from, to));
+                assert_eq!(
+                    from.can_move_to(to),
+                    sanctioned,
+                    "run.status `{from}` -> `{to}`: the table says {sanctioned}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_step_status_table_sanctions_exactly_the_ana_2_pairs() {
+        for &from in StepStatus::ALL {
+            for &to in StepStatus::ALL {
+                let sanctioned = STEP_SANCTIONED.contains(&(from, to));
+                assert_eq!(
+                    from.can_move_to(to),
+                    sanctioned,
+                    "run_step.status `{from}` -> `{to}`: the table says {sanctioned}"
+                );
+            }
+        }
+    }
+
+    /// A terminal run reaches nothing, which is the same set [`RunStatus::is_active`] excludes.
+    #[test]
+    fn a_terminal_run_status_is_one_that_reaches_nothing() {
+        for &from in RunStatus::ALL {
+            let reaches_nothing = RunStatus::ALL.iter().all(|&to| !from.can_move_to(to));
+            assert_eq!(
+                from.is_terminal(),
+                reaches_nothing,
+                "run.status `{from}`: is_terminal and reaching nothing are the same set"
+            );
+            assert_eq!(
+                from.is_terminal(),
+                !from.is_active(),
+                "run.status `{from}`: is_terminal is the complement of is_active"
+            );
+        }
+    }
+
+    /// `failed` is the one step status the two notions disagree about: it is not terminal,
+    /// because §4.8 promotes it, and `done` is terminal even though it can be superseded.
+    #[test]
+    fn a_terminal_step_status_is_done_cancelled_or_superseded() {
+        let terminal: Vec<StepStatus> = StepStatus::ALL
+            .iter()
+            .copied()
+            .filter(|status| status.is_terminal())
+            .collect();
+        assert_eq!(
+            terminal,
+            vec![
+                StepStatus::Done,
+                StepStatus::Cancelled,
+                StepStatus::Superseded
+            ],
+            "run_step.status: the terminal set of ANA-2 §4.3, `failed` deliberately absent"
+        );
+        assert!(
+            !StepStatus::Failed.is_terminal(),
+            "run_step.status `failed` is promotable, so it is not terminal"
+        );
+    }
 
     /// Plan D106's two figures, and the four ways a record can decline to supply them.
     #[test]

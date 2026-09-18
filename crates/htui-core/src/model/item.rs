@@ -34,6 +34,30 @@ impl Status {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Closed)
     }
+
+    /// ANA-2 §4.3's `item` table (`docs/ANA-2.md:565-589`): whether the orchestrator or close-out
+    /// may move an item from `self` to `to`. `closed` reaches nothing.
+    ///
+    /// Every legal pair is a row of that table; a pair outside it is a bug, not a race, and
+    /// [`WriteStore::transition`](crate::store::WriteStore::transition) refuses it before it
+    /// reaches the row. Note that `is_terminal` and "reaches nothing" are **not** the same set
+    /// here: `done` is terminal for the readiness rule and still reaches `closed` and `open`.
+    #[must_use]
+    pub const fn can_move_to(self, to: Self) -> bool {
+        match self {
+            Self::Open => matches!(to, Self::Queued | Self::Blocked),
+            Self::Queued => matches!(to, Self::InProgress | Self::Open | Self::Blocked),
+            Self::InProgress => matches!(
+                to,
+                Self::AwaitingApproval | Self::Done | Self::Failed | Self::Blocked | Self::Open
+            ),
+            Self::AwaitingApproval => matches!(to, Self::InProgress | Self::Failed | Self::Open),
+            Self::Blocked => matches!(to, Self::Open | Self::Closed),
+            Self::Failed => matches!(to, Self::Queued | Self::Closed),
+            Self::Done => matches!(to, Self::Closed | Self::Open),
+            Self::Closed => false,
+        }
+    }
 }
 
 /// A row of `item` (§5.5).
@@ -221,4 +245,66 @@ pub struct ItemRevision {
     pub reason: String,
     /// `item_revision.created_at`.
     pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Status;
+
+    /// Every row of ANA-2 §4.3's item transition table (`docs/ANA-2.md:565-589`), transcribed
+    /// from the document rather than from [`Status::can_move_to`], so a pair added to or dropped
+    /// from the `match` fails here.
+    const SANCTIONED: &[(Status, Status)] = &[
+        // `open`
+        (Status::Open, Status::Queued),
+        (Status::Open, Status::Blocked),
+        // `queued`
+        (Status::Queued, Status::InProgress),
+        (Status::Queued, Status::Open),
+        (Status::Queued, Status::Blocked),
+        // `in_progress`
+        (Status::InProgress, Status::AwaitingApproval),
+        (Status::InProgress, Status::Done),
+        (Status::InProgress, Status::Failed),
+        (Status::InProgress, Status::Blocked),
+        (Status::InProgress, Status::Open),
+        // `awaiting_approval`
+        (Status::AwaitingApproval, Status::InProgress),
+        (Status::AwaitingApproval, Status::Failed),
+        (Status::AwaitingApproval, Status::Open),
+        // `blocked`
+        (Status::Blocked, Status::Open),
+        (Status::Blocked, Status::Closed),
+        // `failed`
+        (Status::Failed, Status::Queued),
+        (Status::Failed, Status::Closed),
+        // `done`
+        (Status::Done, Status::Closed),
+        (Status::Done, Status::Open),
+        // `closed` reaches nothing.
+    ];
+
+    #[test]
+    fn the_item_status_table_sanctions_exactly_the_ana_2_pairs() {
+        for &from in Status::ALL {
+            for &to in Status::ALL {
+                let sanctioned = SANCTIONED.contains(&(from, to));
+                assert_eq!(
+                    from.can_move_to(to),
+                    sanctioned,
+                    "item.status `{from}` -> `{to}`: the table says {sanctioned}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_closed_item_reaches_no_other_status() {
+        for &to in Status::ALL {
+            assert!(
+                !Status::Closed.can_move_to(to),
+                "item.status `closed` is terminal, so it cannot reach `{to}`"
+            );
+        }
+    }
 }
