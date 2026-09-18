@@ -6261,10 +6261,7 @@ mod tests {
         /// `.rs` instead - which is how these four shipped - is no longer possible: a span that
         /// joins two snake_case halves with `::` and whose right half reads like a test name is a
         /// failure below, because that shape reaches neither arm and was silently skipped.
-        const PENDING: &[&str] = &[
-            "ck_run_graph_snapshot_is_not_valid_for_old_rows_and_checked_for_new",
-            "document_versions_do_not_collide_under_contention",
-        ];
+        const PENDING: &[&str] = &[];
 
         // Another crate's integration test binary, so it is read at run time rather than through
         // `include_str!`: `htui-core` must not take a compile-time dependency on `htui-store`.

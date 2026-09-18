@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, graph_snapshot, started_by, queued_at) VALUES ($1, $2, NULL, 'chat', 'manual', 'queued', $3, NULL, $4, now())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "59bf12724342ab583ac9f51d8096c9bfefb731e904e67cab17296fb025dfd145"
+}

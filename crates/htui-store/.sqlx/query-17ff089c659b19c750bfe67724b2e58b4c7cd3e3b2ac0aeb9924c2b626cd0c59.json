@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT convalidated FROM pg_constraint WHERE conname = 'ck_run_graph_snapshot'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "convalidated",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "pg_constraint",
+            "name": "convalidated"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "17ff089c659b19c750bfe67724b2e58b4c7cd3e3b2ac0aeb9924c2b626cd0c59"
+}

@@ -3784,3 +3784,144 @@ async fn inherent_orchestration_reads_answer_the_fixture() {
 
     db.drop_db().await;
 }
+
+/// `0003`'s `ck_run_graph_snapshot` is `NOT VALID`: it is checked for every new row and for no
+/// row that was already there (ANA-2 §5.1, plan D7).
+///
+/// `run_create_moves_the_item` in the conformance suite delegates the column's own guard here,
+/// because `MemStore` has no `CHECK` to show. Two halves: the constraint is still unvalidated in
+/// the catalogue — which is what lets a database with pre-MOD-4 `graph` runs take the migration at
+/// all — and a fresh `kind = 'graph'` row with no snapshot is refused by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn ck_run_graph_snapshot_is_not_valid_for_old_rows_and_checked_for_new() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    let validated = sqlx::query_scalar!(
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'ck_run_graph_snapshot'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the constraint exists");
+    assert!(
+        !validated,
+        "`NOT VALID` is the whole point: a validated constraint would have had to scan `run` on \
+         upgrade and would have refused a database holding pre-MOD-4 `graph` runs"
+    );
+
+    // The fixture's own rows loaded under it, which is the "new row" path already exercised.
+    let graph_runs = sqlx::query_scalar!(
+        "SELECT COUNT(*) AS \"count!\" FROM run WHERE kind = 'graph' AND graph_snapshot IS NOT NULL",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("count the fixture's graph runs");
+    assert!(
+        graph_runs > 0,
+        "the fixture carries graph runs and every one of them has a snapshot (D13)"
+    );
+
+    let refused = sqlx::query!(
+        "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
+                          graph_snapshot, started_by, queued_at) \
+         VALUES ($1, $2, NULL, 'graph', 'manual', 'queued', $3, NULL, $4, now())",
+        RunId::new().as_uuid(),
+        ids::PROJECT_HTUI.as_uuid(),
+        ids::BOX.as_uuid(),
+        ids::USER.as_uuid(),
+    )
+    .execute(&db.pool)
+    .await
+    .expect_err("a graph run with no snapshot is refused");
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514"),
+        "and refused by the `CHECK`, not by anything else: {refused}"
+    );
+
+    // The same insert as a `chat` run is accepted: the constraint is implication, not NOT NULL.
+    sqlx::query!(
+        "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
+                          graph_snapshot, started_by, queued_at) \
+         VALUES ($1, $2, NULL, 'chat', 'manual', 'queued', $3, NULL, $4, now())",
+        RunId::new().as_uuid(),
+        ids::PROJECT_HTUI.as_uuid(),
+        ids::BOX.as_uuid(),
+        ids::USER.as_uuid(),
+    )
+    .execute(&db.pool)
+    .await
+    .expect("a chat run needs no snapshot");
+
+    db.drop_db().await;
+}
+
+/// Plan D6: two writers arriving together at one `(item, kind)` get consecutive versions, never
+/// the same one.
+///
+/// The conformance case `write_document_allocates_its_version` delegates this here: `MemStore`
+/// holds a `RwLock` and cannot show it. What makes it hold on Postgres is the
+/// `SELECT 1 FROM item ... FOR UPDATE` `write_document` takes before its
+/// `COALESCE(MAX(version), 0) + 1` — the row the second writer would otherwise have to wait for
+/// does not exist in `document` yet, so the parent is the only row both contend on. Without that
+/// lock both statements read `MAX(version) = 2` and both write `3`.
+#[tokio::test(flavor = "multi_thread")]
+async fn document_versions_do_not_collide_under_contention() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let left = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let right = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("third pool")
+        .store;
+
+    let plan = |title: &str| htui_core::model::NewDocument {
+        id: htui_core::model::DocumentId::new(),
+        item_id: ids::HTUI_FEAT_1,
+        kind: "plan".to_owned(),
+        title: title.to_owned(),
+        body: String::new(),
+        produced_by_step_id: None,
+        created_by: ids::USER,
+        created_at: Utc::now(),
+    };
+
+    let (one, two) = tokio::join!(
+        left.write_document(plan("Left")),
+        right.write_document(plan("Right")),
+    );
+    let mut versions = [
+        one.expect("the first write must not fail").version,
+        two.expect("the second write must not fail").version,
+    ];
+    versions.sort_unstable();
+    assert_eq!(
+        versions,
+        [3, 4],
+        "the fixture holds plan v1 and v2, so the two concurrent writers take 3 and 4 - never 3 \
+         twice (plan D6)"
+    );
+
+    let stored = sqlx::query_scalar!(
+        "SELECT version FROM document WHERE item_id = $1 AND kind = 'plan' ORDER BY version",
+        ids::HTUI_FEAT_1.as_uuid(),
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("read the versions back");
+    assert_eq!(
+        stored,
+        vec![1, 2, 3, 4],
+        "and the table agrees: no gap, no repeat"
+    );
+
+    db.drop_db().await;
+}
