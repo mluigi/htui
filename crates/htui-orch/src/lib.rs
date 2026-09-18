@@ -23,12 +23,14 @@ pub mod graph;
 pub mod isolate;
 pub mod status;
 
+pub use graph::{
+    GraphSource, ResolveError, Resolved, override_graph, resolve, resolve_scope, topology,
+};
 pub use status::{Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt};
 
 // The crate's public face is re-exported from here, and the list grows with the modules that
-// define it: `graph::{GraphSource, Resolved, ResolveError, resolve, resolve_scope, override_graph,
-// topology}` with T2's next commit, `command::{Command, CommandOutcome, GateAnswer}` and `isolate::{Isolator, IsolatorFuture,
-// IsolateError, Prepared, PreparedTree}` with T3, and `engine::{AgentSelector, Clock, Engine,
-// EngineError, FirstCandidate, NoSink, Rest, SessionSink, SystemClock}` and `gate::{Settle,
-// Verdict, parse_verdict}` with T4. Re-exporting a name before its module defines it does not
-// compile, so the list arrives in pieces rather than whole.
+// define it: `command::{Command, CommandOutcome, GateAnswer}` and `isolate::{Isolator,
+// IsolatorFuture, IsolateError, Prepared, PreparedTree}` with T3, and `engine::{AgentSelector,
+// Clock, Engine, EngineError, FirstCandidate, NoSink, Rest, SessionSink, SystemClock}` and
+// `gate::{Settle, Verdict, parse_verdict}` with T4. Re-exporting a name before its module defines
+// it does not compile, so the list arrives in pieces rather than whole.
