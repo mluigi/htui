@@ -324,12 +324,28 @@ impl<S: WriteStore, C: Clock + ?Sized> GateContext<'_, S, C> {
     }
 }
 
-/// ANA-2 §4.2's gate table (`docs/ANA-2.md:446-452`), and the only half of the gate that writes.
+/// Where the gate left the walk.
 ///
-/// Returns `None` when the walk may continue to the next position, and `Some(rest)` when it may
-/// not. **The blueprint's §5.5 signature returns a bare `Rest`**, which cannot express "the step
-/// is done, keep going" — the `never`/`on_failure` pass and the `never` retry both leave the run
-/// `running` with more to do — so the option is the shape and the deviation is deliberate.
+/// **The blueprint's §5.5 signature returns a bare `Rest`**, which cannot express either of the
+/// two outcomes that are not rests: a `never`/`on_failure` pass leaves the run `running` with more
+/// positions to walk, and a `never` failure inside budget owes a *new attempt* that only stage 1
+/// may create — the capability interlock has to run again, and `gate.rs` holds no selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landing {
+    /// The step is `done`; the walk moves on.
+    Advance,
+    /// The step is `failed` and the budget holds: stage 1 admits `(position, attempt)`.
+    Retry {
+        /// The step's own position.
+        position: i32,
+        /// The attempt to create.
+        attempt: i32,
+    },
+    /// The walk stops here.
+    Rest(Rest),
+}
+
+/// ANA-2 §4.2's gate table (`docs/ANA-2.md:446-452`), and the only half of the gate that writes.
 ///
 /// Three rows of the table and their writes:
 ///
@@ -351,7 +367,7 @@ pub async fn apply<S: WriteStore, C: Clock + ?Sized>(
     step: &RunStep,
     phase: &SnapshotPhase,
     settle: Settle,
-) -> Result<Option<Rest>, EngineError> {
+) -> Result<Landing, EngineError> {
     let now = ctx.clock.now();
     match (phase.gate_effective, settle) {
         // `always` parks on every outcome; `on_failure` and `never` park on none of the three
@@ -365,7 +381,7 @@ pub async fn apply<S: WriteStore, C: Clock + ?Sized>(
             ctx.store
                 .transition_step(step.id, StepStatus::Running, StepStatus::Done, now)
                 .await?;
-            Ok(None)
+            Ok(Landing::Advance)
         }
         (Gate::OnFailure, outcome @ (Settle::Failed(_) | Settle::Rejected { .. })) => {
             note_step(ctx, step, gate_note(&outcome).as_deref(), now).await?;
@@ -398,13 +414,13 @@ pub async fn apply<S: WriteStore, C: Clock + ?Sized>(
                 .await?;
             let step = reread(ctx, step).await?;
             match review_loop(ctx, &step, &verdict_line).await? {
-                LoopOutcome::Resumed { .. } => Ok(None),
-                LoopOutcome::Escalated { attempts, .. } => Ok(Some(Rest {
+                LoopOutcome::Resumed { .. } => Ok(Landing::Advance),
+                LoopOutcome::Escalated { attempts, .. } => Ok(Landing::Rest(Rest {
                     run: RunStatus::AwaitingApproval,
                     position: Some(step.position),
                     failure: Some(RunFailure::ReviewLoopExhausted(attempts)),
                 })),
-                LoopOutcome::NoTarget => Ok(Some(Rest {
+                LoopOutcome::NoTarget => Ok(Landing::Rest(Rest {
                     run: RunStatus::Failed,
                     position: Some(step.position),
                     failure: Some(RunFailure::NoLoopTarget),
@@ -467,7 +483,7 @@ async fn park<S: WriteStore, C: Clock + ?Sized>(
     step: &RunStep,
     phase: &SnapshotPhase,
     now: DateTime<Utc>,
-) -> Result<Option<Rest>, EngineError> {
+) -> Result<Landing, EngineError> {
     ctx.store
         .transition_step(
             step.id,
@@ -486,7 +502,7 @@ async fn park<S: WriteStore, C: Clock + ?Sized>(
         .await?;
     ctx.move_item(Status::InProgress, Status::AwaitingApproval)
         .await?;
-    Ok(Some(Rest {
+    Ok(Landing::Rest(Rest {
         run: RunStatus::AwaitingApproval,
         position: Some(phase.position),
         failure: None,
@@ -505,12 +521,18 @@ async fn retry_or_fail<S: WriteStore, C: Clock + ?Sized>(
     phase: &SnapshotPhase,
     failure: &StepFailure,
     now: DateTime<Utc>,
-) -> Result<Option<Rest>, EngineError> {
+) -> Result<Landing, EngineError> {
     ctx.store
         .transition_step(step.id, StepStatus::Running, StepStatus::Failed, now)
         .await?;
+    // The successor is named rather than created: `cursor` reads a `failed` latest attempt as a
+    // rest (`crate::status::cursor`), so the walk would stop here — and only stage 1 may create a
+    // step, because the capability interlock has to run for every attempt (plan D6).
     if may_attempt(step.attempt + 1, phase.retry_limit) {
-        return Ok(None);
+        return Ok(Landing::Retry {
+            position: phase.position,
+            attempt: step.attempt + 1,
+        });
     }
     ctx.store
         .finish_run(
@@ -520,7 +542,7 @@ async fn retry_or_fail<S: WriteStore, C: Clock + ?Sized>(
             now,
         )
         .await?;
-    Ok(Some(Rest {
+    Ok(Landing::Rest(Rest {
         run: RunStatus::Failed,
         position: Some(phase.position),
         failure: failure.run_failure(),
@@ -814,17 +836,24 @@ async fn retire<S: WriteStore, C: Clock + ?Sized>(
             StepStatus::Pending | StepStatus::AwaitingApproval | StepStatus::Done => {
                 ctx.store.supersede_step(step.id).await?;
             }
-            StepStatus::Running => {
-                // `running -> superseded` is illegal (`model/run.rs:114-117`); `select_fanout`
-                // already encodes the same rule for a live loser, so this inherits a precedent
-                // rather than inventing one (`store/traits.rs:813-816`).
+            // `running -> superseded` and `failed -> superseded` are both illegal
+            // (`crates/htui-core/src/model/run.rs:111-130`), and `cancelled` is the one legal
+            // retirement either of them has. `transition_step` moves `status` and nothing else, so
+            // the rejecting review keeps its `gate_outcome = 'rejected'` and its `gate_note` —
+            // which is the half of ANA-2 §4.4 step 3 that matters (`:719`).
+            //
+            // **Plan D5 says a `failed` step is "left alone", and that reading cannot work**:
+            // `cursor` reads a `failed` latest attempt as a rest, so the rejecting review at
+            // `p_review` would stop the walk forever and the blueprint's own §7 rejection branch —
+            // which creates `(3,2)` after `(2,2)` is approved — would be unreachable. D5's reason
+            // for the exclusion was that `superseded` is illegal from `failed`, and it is; the
+            // conclusion it drew from that is the part this corrects.
+            StepStatus::Running | StepStatus::Failed => {
                 ctx.store
-                    .transition_step(step.id, StepStatus::Running, StepStatus::Cancelled, now)
+                    .transition_step(step.id, step.status, StepStatus::Cancelled, now)
                     .await?;
             }
-            // `failed` reaches only `awaiting_approval` and `cancelled`, so the rejecting review is
-            // left where it is — which is also what keeps its `gate_outcome` and `gate_note`.
-            StepStatus::Failed | StepStatus::Superseded | StepStatus::Cancelled => {}
+            StepStatus::Superseded | StepStatus::Cancelled => {}
         }
     }
     Ok(())
