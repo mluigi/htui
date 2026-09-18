@@ -31,12 +31,14 @@ use htui_agent::record::{
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId,
-    EventKind, EventRole, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemSummary, LinkGraph, NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph, NewWorkspace,
-    Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Quota, QuotaSource,
-    Repo, RepoBoxPath, RepoId, RepoPatch, RunId, RunStatus, RunSummary, Scope, SessionEvent,
-    Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, UpstreamEntry,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
+    EventKind, EventRole, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewDocument, NewItem, NewItemKind, NewNote,
+    NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
+    Project, ProjectId, ProjectPatch, PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId,
+    RepoPatch, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
@@ -46,6 +48,7 @@ use htui_core::store::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures
@@ -318,6 +321,33 @@ impl ReadStore for SpyStore {
     async fn project(&self, id: ProjectId) -> StoreResult<Option<Project>> {
         self.inner.project(id).await
     }
+
+    // ---- MOD-4 milestone 1: ANA-2 §8's five run reads ---------------------------------------
+    //
+    // Delegated, none of them logged: this spy watches `set_step_usage`, `set_step_prompt` and
+    // the quota latch, and the recorder reads no orchestrated run. They are here because
+    // `ReadStore` has no default bodies - a decorator owes every method.
+
+    async fn run(&self, id: RunId) -> StoreResult<Option<Run>> {
+        self.inner.run(id).await
+    }
+    async fn run_steps(&self, run: RunId) -> StoreResult<Vec<RunStep>> {
+        self.inner.run_steps(run).await
+    }
+    async fn step_trees(&self, step: StepId) -> StoreResult<Vec<RunStepTree>> {
+        self.inner.step_trees(step).await
+    }
+    async fn step_commits(&self, step: StepId) -> StoreResult<Vec<RunStepCommit>> {
+        self.inner.step_commits(step).await
+    }
+    async fn resolve_inputs(
+        &self,
+        item: ItemId,
+        run: RunId,
+        kinds: &[String],
+    ) -> StoreResult<Vec<ResolvedInput>> {
+        self.inner.resolve_inputs(item, run, kinds).await
+    }
 }
 
 impl WriteStore for SpyStore {
@@ -577,6 +607,119 @@ impl WriteStore for SpyStore {
     }
     async fn delete_project(&self, id: ProjectId) -> StoreResult<DeleteReach> {
         self.inner.delete_project(id).await
+    }
+
+    // ---- MOD-4 milestone 1: ANA-2 §8's eighteen run writers ---------------------------------
+    //
+    // Delegated, none of them logged. The recorder mints nothing: it is handed a `step_id` and
+    // writes events, usage and the prompt digest against it. Nothing in MOD-4 changes what this
+    // spy counts, so nothing here records.
+
+    async fn create_run(&self, new: NewRun) -> StoreResult<Run> {
+        self.inner.create_run(new).await
+    }
+    async fn claim_run(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        at: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.inner
+            .claim_run(run, box_id, owner, at, lease_until)
+            .await
+    }
+    async fn refresh_lease(
+        &self,
+        run: RunId,
+        owner: Uuid,
+        until: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.inner.refresh_lease(run, owner, until).await
+    }
+    async fn adopt_runs(
+        &self,
+        box_id: BoxId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+    ) -> StoreResult<Vec<Run>> {
+        self.inner.adopt_runs(box_id, owner, now, lease_until).await
+    }
+    async fn create_step(&self, new: NewRunStep) -> StoreResult<RunStep> {
+        self.inner.create_step(new).await
+    }
+    async fn transition_run(
+        &self,
+        run: RunId,
+        from: RunStatus,
+        to: RunStatus,
+        at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.inner.transition_run(run, from, to, at).await
+    }
+    async fn transition_step(
+        &self,
+        step: StepId,
+        from: StepStatus,
+        to: StepStatus,
+        at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.inner.transition_step(step, from, to, at).await
+    }
+    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> StoreResult<()> {
+        self.inner.finish_step(step, outcome).await
+    }
+    async fn answer_gate(
+        &self,
+        step: StepId,
+        outcome: GateOutcome,
+        note: Option<String>,
+        at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.inner.answer_gate(step, outcome, note, at).await
+    }
+    async fn select_fanout(
+        &self,
+        run: RunId,
+        position: i32,
+        attempt: i32,
+        winner: StepId,
+        reason: Option<String>,
+    ) -> StoreResult<()> {
+        self.inner
+            .select_fanout(run, position, attempt, winner, reason)
+            .await
+    }
+    async fn supersede_step(&self, step: StepId) -> StoreResult<()> {
+        self.inner.supersede_step(step).await
+    }
+    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> StoreResult<()> {
+        self.inner.upsert_step_tree(step, trees).await
+    }
+    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> StoreResult<()> {
+        self.inner.record_commits(step, commits).await
+    }
+    async fn write_document(&self, new: NewDocument) -> StoreResult<Document> {
+        self.inner.write_document(new).await
+    }
+    async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> StoreResult<()> {
+        self.inner.promote_step(step, at).await
+    }
+    async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> StoreResult<()> {
+        self.inner.fail_run(run, failure, at).await
+    }
+    async fn close_out(
+        &self,
+        item: ItemId,
+        summary: NewDocument,
+        commits: &[RunStepCommit],
+    ) -> StoreResult<Document> {
+        self.inner.close_out(item, summary, commits).await
+    }
+    async fn add_note(&self, note: NewNote) -> StoreResult<Note> {
+        self.inner.add_note(note).await
     }
 }
 
