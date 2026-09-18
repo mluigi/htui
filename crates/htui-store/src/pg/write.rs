@@ -33,7 +33,8 @@ use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung, StoreError,
     StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, chat_step_status,
     close_out_needs_a_summary, expected_on_row, graph_not_in_project, illegal_move, invalid_prefix,
-    item_has_a_live_run, item_kind_is_held, legal_move, not_a_fanout_candidate,
+    item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
+    not_a_fanout_candidate,
     not_a_terminal_status, references_no_row, reserved_phase_name, row_names_another_step,
     run_is_terminal, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
 };
@@ -2298,8 +2299,9 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
-    /// [`StoreError::Constraint`] when the item cannot reach `queued`, when the id is taken, or on
-    /// any of the keys above. Nothing is written on any of them.
+    /// [`StoreError::Constraint`] when the item cannot reach `queued`, when the item is not in
+    /// `new.project_id`, when the id is taken, or on any of the keys above. Nothing is written on
+    /// any of them.
     async fn create_run(&self, new: NewRun) -> Result<Run> {
         let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
             StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
@@ -2313,8 +2315,10 @@ impl WriteStore for PgStore {
 
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
-        let status = sqlx::query_scalar!(
-            r#"SELECT status AS "status: Status" FROM item WHERE id = $1 FOR UPDATE"#,
+        let item = sqlx::query!(
+            r#"SELECT status     AS "status: Status",
+                      project_id AS "project_id: ProjectId"
+                 FROM item WHERE id = $1 FOR UPDATE"#,
             new.item_id.as_uuid(),
         )
         .fetch_optional(&mut *tx)
@@ -2324,7 +2328,18 @@ impl WriteStore for PgStore {
             entity: "item",
             id: new.item_id.to_string(),
         })?;
+        let status = item.status;
         legal_move(status, Status::Queued)?;
+        // `run.project_id` and `item.project_id` are independent foreign keys, so the schema
+        // cannot refuse a run filed under project A for project B's item - and `delete_project`,
+        // which counts by `run.project_id`, would then take it with the wrong project. The row is
+        // already locked and read, so the comparison costs nothing.
+        if item.project_id != new.project_id {
+            return Err(StoreError::Constraint(item_not_in_project(
+                new.item_id,
+                new.project_id,
+            )));
+        }
 
         // `run.repo_scope` is a `UUID[]`, and an array element cannot carry a `REFERENCES` clause,
         // so the schema cannot refuse a scope naming a repo that does not exist - this writer has

@@ -41,7 +41,8 @@ use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
     WriteStore, already_exists, chat_step_status, close_out_needs_a_summary, expected_on_row,
-    graph_not_in_project, invalid_prefix, item_has_a_live_run, item_kind_is_held, legal_move,
+    graph_not_in_project, invalid_prefix, item_has_a_live_run, item_kind_is_held,
+    item_not_in_project, legal_move,
     not_a_fanout_candidate, not_a_terminal_status, references_no_row, reserved_phase_name,
     row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
     summary_names_another_item, winner_is_not_settled,
@@ -3103,8 +3104,18 @@ impl State {
         // request that gets the item wrong *and* something else wrong answers `NotFound` for the
         // item. `PgStore` cannot order this any other way — its `SELECT ... FOR UPDATE` on `item`
         // is the transaction's first statement — so the emulation follows it.
-        let status = self.require_item(new.item_id)?.status;
+        let item = self.require_item(new.item_id)?;
+        let (status, holder) = (item.status, item.project_id);
         legal_move(status, Status::Queued)?;
+        // Nothing in the schema ties `run.project_id` to `item.project_id`, so without this a run
+        // lands under project A for project B's item — where `delete_project`, which counts by
+        // `run.project_id`, would take it with the wrong project.
+        if holder != new.project_id {
+            return Err(StoreError::Constraint(item_not_in_project(
+                new.item_id,
+                new.project_id,
+            )));
+        }
         if self.runs.contains_key(&new.id) {
             return Err(StoreError::Constraint(already_exists("run", new.id)));
         }

@@ -680,8 +680,10 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "item" }`;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the item's status
-    /// cannot move to `queued` (only `open` and `failed` can), when `id` already exists, or on any
-    /// foreign key.
+    /// cannot move to `queued` (only `open` and `failed` can), when the item is not in
+    /// `new.project_id` ([`item_not_in_project`] — the run is filed under that id and
+    /// [`delete_project`](WriteStore::delete_project) counts by it), when `id` already exists, or
+    /// on any foreign key.
     async fn create_run(&self, new: NewRun) -> Result<Run>;
 
     /// ANA-2 §4.7's admission, one transaction: lock the box row, count its **`running`** runs
@@ -1021,6 +1023,14 @@ pub fn invalid_prefix(prefix: &str) -> String {
 #[must_use]
 pub fn graph_not_in_project(graph: StepGraphId, project: ProjectId) -> String {
     format!("step_graph {graph} is not in project {project}")
+}
+
+/// §5.1: a run is filed under `run.project_id`, which `delete_project` counts by — so the item it
+/// runs must live in that same project. The schema cannot say it: the two columns are independent
+/// foreign keys.
+#[must_use]
+pub fn item_not_in_project(item: ItemId, project: ProjectId) -> String {
+    format!("item {item} is not in project {project}")
 }
 
 /// D11: `judge` and `handoff` are template roles (ANA-5 §4.6), not phase names — a project cannot

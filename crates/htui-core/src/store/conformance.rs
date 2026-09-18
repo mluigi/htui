@@ -3994,6 +3994,25 @@ async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
         "{CASE}: and the refusal left the item where it was"
     );
 
+    // `run.project_id` and `item.project_id` are two columns, and nothing in the schema ties them:
+    // a run can be filed under project A while its item lives in project B, where `runs(item)`
+    // would list it and `delete_project`'s count — which counts by `run.project_id` — would take
+    // it with the wrong project. Both stores already hold the item row under lock here, so both
+    // can compare.
+    let elsewhere = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::AGY_FEAT_1, Vec::new()))
+        .await;
+    assert!(
+        matches!(elsewhere, Err(StoreError::Constraint(ref message))
+            if message.contains("is not in project")),
+        "{CASE}: a run cannot be filed under a project its item is not in, got {elsewhere:?}"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::AGY_FEAT_1).await.status,
+        Status::Open,
+        "{CASE}: and that refusal left the item where it was too"
+    );
+
     let live = new_run(ids::PROJECT_HTUI, ids::HTUI_FEAT_1, Vec::new());
     let live_id = live.id;
     let refused = store.create_run(live).await;
