@@ -17,12 +17,14 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Isolation, Item, ItemId, ItemKind, ItemKindId,
-    ItemKindPatch, ItemPatch, ItemRevision, NewItem, NewItemKind, NewProject, NewRepo,
-    NewStepGraph, NewWorkspace, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, RunId, RunStatus, SessionEvent, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, GateOutcome, Isolation, Item, ItemId,
+    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
+    Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptTemplateId, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepStatus, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -35,6 +37,7 @@ use htui_core::store::{
 };
 use serde_json::Value;
 use sqlx::PgConnection;
+use uuid::Uuid;
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
@@ -147,7 +150,7 @@ async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Opt
 /// What a project delete reaches, in one statement of scalar subqueries over `0001_init.sql`'s
 /// `ON DELETE CASCADE` chain (PRD D13, plan V11). `None` when no row has that id.
 ///
-/// The six CTEs are the id sets the cascade walks, named as
+/// The seven CTEs are the id sets the cascade walks, named as
 /// [`MemStore`](htui_core::store::MemStore)'s `ProjectReach` names them, so the two backends count
 /// the same rows: `run` is reached by `project_id` **or** by an `item_id` of the project
 /// (`0001_init.sql:450` cascades from the item), and `item_link` by **either** end, tombstones
@@ -166,7 +169,9 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
              s  AS (SELECT id FROM run_step         WHERE run_id   IN (SELECT id FROM r)),
              g  AS (SELECT id FROM step_graph       WHERE project_id = $1),
              ph AS (SELECT id FROM step_graph_phase WHERE graph_id IN (SELECT id FROM g)),
-             rp AS (SELECT id FROM repo             WHERE project_id = $1)
+             rp AS (SELECT id FROM repo             WHERE project_id = $1),
+             t  AS (SELECT run_step_id FROM run_step_tree
+                     WHERE run_step_id IN (SELECT id FROM s))
         SELECT (SELECT count(*) FROM workspace_project WHERE project_id = $1) AS "workspace_links!",
                (SELECT count(*) FROM i)                                       AS "items!",
                (SELECT count(*) FROM item_key_counter WHERE project_id = $1)  AS "item_key_counters!",
@@ -186,6 +191,7 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
                  WHERE run_step_id IN (SELECT id FROM s))                     AS "session_events!",
                (SELECT count(*) FROM run_step_commit
                  WHERE run_step_id IN (SELECT id FROM s))                     AS "run_step_commits!",
+               (SELECT count(*) FROM t)                                       AS "run_step_trees!",
                (SELECT count(*) FROM command_run
                  WHERE run_step_id IN (SELECT id FROM s))                     AS "command_runs!",
                (SELECT count(*) FROM item_note
@@ -222,6 +228,7 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
         run_steps: rows(row.run_steps),
         session_events: rows(row.session_events),
         run_step_commits: rows(row.run_step_commits),
+        run_step_trees: rows(row.run_step_trees),
         command_runs: rows(row.command_runs),
         notes: rows(row.notes),
         revisions: rows(row.revisions),
@@ -1573,6 +1580,8 @@ impl WriteStore for PgStore {
                       project_id AS "project_id: ProjectId",
                       name,
                       description,
+                      -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.
+                      is_override,
                       created_at,
                       updated_at
             "#,
@@ -1609,6 +1618,8 @@ impl WriteStore for PgStore {
                       project_id AS "project_id: ProjectId",
                       name,
                       description,
+                      -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.
+                      is_override,
                       created_at,
                       updated_at
             "#,
@@ -2110,6 +2121,137 @@ impl WriteStore for PgStore {
             id,
             "rows the cascade would take",
         )))
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // ANA-2 §8's eighteen run writers (MOD-4 milestone 1, plan D1).
+    //
+    // Declared here, unwritten, from the commit that makes the crate compile again (blueprint
+    // H-8): the trait has no default bodies, so `PgStore` cannot satisfy `WriteStore` without
+    // them, and the SQL of each lands in the blueprint §3.11 commit that owns it — creation,
+    // admission, lease and CAS in 4; settle, gates, fan-out, trees and commits in 5; documents,
+    // close-out and failure in 6. The conformance cases that call them (37-47) are red until
+    // then, which is exactly what `EXPECTED_CASES` still saying 36 records.
+    // -------------------------------------------------------------------------------------------
+
+    async fn create_run(&self, _new: NewRun) -> Result<Run> {
+        todo!("MOD-4 T2 commit 4")
+    }
+
+    async fn claim_run(
+        &self,
+        _run: RunId,
+        _box_id: BoxId,
+        _owner: Uuid,
+        _at: DateTime<Utc>,
+        _lease_until: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T2 commit 4")
+    }
+
+    async fn refresh_lease(
+        &self,
+        _run: RunId,
+        _owner: Uuid,
+        _until: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T2 commit 4")
+    }
+
+    async fn adopt_runs(
+        &self,
+        _box_id: BoxId,
+        _owner: Uuid,
+        _now: DateTime<Utc>,
+        _lease_until: DateTime<Utc>,
+    ) -> Result<Vec<Run>> {
+        todo!("MOD-4 T2 commit 4")
+    }
+
+    async fn create_step(&self, _new: NewRunStep) -> Result<RunStep> {
+        todo!("MOD-4 T2 commit 4")
+    }
+
+    async fn transition_run(
+        &self,
+        _run: RunId,
+        _from: RunStatus,
+        _to: RunStatus,
+        _at: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T2 commit 4")
+    }
+
+    async fn transition_step(
+        &self,
+        _step: StepId,
+        _from: StepStatus,
+        _to: StepStatus,
+        _at: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T2 commit 4")
+    }
+
+    async fn finish_step(&self, _step: StepId, _outcome: StepOutcome) -> Result<()> {
+        todo!("MOD-4 T2 commit 5")
+    }
+
+    async fn answer_gate(
+        &self,
+        _step: StepId,
+        _outcome: GateOutcome,
+        _note: Option<String>,
+        _at: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T2 commit 5")
+    }
+
+    async fn select_fanout(
+        &self,
+        _run: RunId,
+        _position: i32,
+        _attempt: i32,
+        _winner: StepId,
+        _reason: Option<String>,
+    ) -> Result<()> {
+        todo!("MOD-4 T2 commit 5")
+    }
+
+    async fn supersede_step(&self, _step: StepId) -> Result<()> {
+        todo!("MOD-4 T2 commit 4")
+    }
+
+    async fn upsert_step_tree(&self, _step: StepId, _trees: &[RunStepTree]) -> Result<()> {
+        todo!("MOD-4 T2 commit 5")
+    }
+
+    async fn record_commits(&self, _step: StepId, _commits: &[RunStepCommit]) -> Result<()> {
+        todo!("MOD-4 T2 commit 5")
+    }
+
+    async fn write_document(&self, _new: NewDocument) -> Result<Document> {
+        todo!("MOD-4 T2 commit 6")
+    }
+
+    async fn promote_step(&self, _step: StepId, _at: DateTime<Utc>) -> Result<()> {
+        todo!("MOD-4 T2 commit 5")
+    }
+
+    async fn fail_run(&self, _run: RunId, _failure: &str, _at: DateTime<Utc>) -> Result<()> {
+        todo!("MOD-4 T2 commit 6")
+    }
+
+    async fn close_out(
+        &self,
+        _item: ItemId,
+        _summary: NewDocument,
+        _commits: &[RunStepCommit],
+    ) -> Result<Document> {
+        todo!("MOD-4 T2 commit 6")
+    }
+
+    async fn add_note(&self, _note: NewNote) -> Result<Note> {
+        todo!("MOD-4 T2 commit 5")
     }
 }
 

@@ -17,10 +17,10 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     BoxTool, CommandQueue, Document, DocumentHead, DocumentId, Gate, Isolation, Item, ItemFilter,
     ItemId, ItemKind, ItemKindId, LinkEdge, LinkGraph, LinkKind, Note, PhaseId, Project, ProjectId,
-    ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RunId, RunStepSummary,
-    RunSummary, Scope, SessionEvent, SkillId, SkillVersion, StepGraph, StepGraphId, StepGraphPhase,
-    StepId, UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject,
-    WorkspaceSummary,
+    ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, ResolvedInput, Run, RunId,
+    RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SkillId,
+    SkillVersion, StepGraph, StepGraphId, StepGraphPhase, StepId, UpstreamEntry, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -91,7 +91,8 @@ impl ReadStore for PgStore {
                    i.status        AS "status: htui_core::model::Status",
                    i.priority,
                    i.required_tags,
-                   i.updated_at
+                   i.updated_at,
+                   i.touched_paths
               FROM item i
              WHERE i.project_id = ANY($1)
                AND ($2::uuid[] IS NULL OR i.project_id = ANY($2))
@@ -383,8 +384,19 @@ impl ReadStore for PgStore {
                                        FROM jsonb_array_elements(s.trim_record->'sections') e
                                       WHERE e->'trimmed' = 'true'::jsonb)
                         ELSE false
-                   END                                              AS "trimmed!"
+                   END                                              AS "trimmed!",
+                   -- MOD-4 milestone 1: the six `RunStepSummary` fields ANA-2 added, appended in
+                   -- the struct's order because `query_as!` binds positionally. `agent_name` is
+                   -- what `MemStore::run_steps` reads out of its agent map, so the projection
+                   -- joins the registry rather than leaving the Runs pane an id.
+                   s.usage,
+                   s.selected,
+                   s.exit_code,
+                   s.verify_outcome AS "verify_outcome: htui_core::model::VerifyOutcome",
+                   s.promoted_at,
+                   a.name                                           AS "agent_name?"
               FROM run_step s
+              LEFT JOIN agent a ON a.id = s.agent_id
              WHERE s.run_id = ANY($1)
              ORDER BY s.run_id, s.position, s.attempt, s.fanout_index
             "#,
@@ -616,6 +628,37 @@ impl ReadStore for PgStore {
         .await
         .map_err(map_sqlx)
     }
+
+    // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
+    //
+    // Declared unwritten so the crate compiles from this commit on (blueprint H-8); the SQL lands
+    // in blueprint §3.11's third commit, together with `run_step_tree` as the seventeenth
+    // mirrored table.
+
+    async fn run(&self, _id: RunId) -> Result<Option<Run>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn resolve_inputs(
+        &self,
+        _item: ItemId,
+        _run: RunId,
+        _kinds: &[String],
+    ) -> Result<Vec<ResolvedInput>> {
+        todo!("MOD-4 T2 commit 3")
+    }
 }
 
 /// The reads `Backend` dispatches over that are not [`ReadStore`] methods.
@@ -701,9 +744,16 @@ impl PgStore {
         sqlx::query_as!(
             BoxInfo,
             r#"
-            SELECT id        AS "box_id: htui_core::model::BoxId",
+            -- Positional binding, so the order here is `BoxInfo`'s, not the table's. The two tag
+            -- arrays are both `Vec<String>` and adjacent: transposing them type-checks and binds
+            -- silently, which is why `pg_criteria.rs::the_0003_columns_reach_the_projections`
+            -- seeds two *different* sets and names which is which (blueprint §3.5, T1 audit A-5).
+            SELECT id            AS "box_id: htui_core::model::BoxId",
                    hostname,
-                   os_family AS "os_family: htui_core::model::OsFamily"
+                   os_family     AS "os_family: htui_core::model::OsFamily",
+                   probed_tags,
+                   declared_tags,
+                   settings
               FROM box WHERE id = $1
             "#,
             self.this_box.as_uuid(),
@@ -1246,6 +1296,10 @@ impl PgStore {
                    project_id AS "project_id: ProjectId",
                    name,
                    description,
+                   -- Inserted between `description` and `created_at`, never appended:
+                   -- `is_override` sits mid-struct and `query_as!` binds positionally, so an
+                   -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
+                   is_override,
                    created_at,
                    updated_at
               FROM step_graph WHERE id = $1
@@ -1385,6 +1439,10 @@ impl PgStore {
                    project_id AS "project_id: ProjectId",
                    name,
                    description,
+                   -- Inserted between `description` and `created_at`, never appended:
+                   -- `is_override` sits mid-struct and `query_as!` binds positionally, so an
+                   -- appended column would map `created_at` onto it and type-check (T1 audit A-4).
+                   is_override,
                    created_at,
                    updated_at
               FROM step_graph

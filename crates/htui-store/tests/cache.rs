@@ -17,7 +17,7 @@ use htui_store::testkit as common;
 
 use std::path::Path;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{SubsecRound as _, TimeDelta, Utc};
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
     EventKind, EventRole, ItemFilter, LinkGraph, ProjectId, PromptScope, RunId, Scope,
@@ -548,6 +548,140 @@ async fn the_mirror_projects_a_malformed_trim_record_like_postgres() {
     teardown(db, &[&cache]).await;
 }
 
+/// Every column `0003_orchestration.sql` adds reaches the mirror, and the ones a projection
+/// carries read back through it (MOD-4 milestone 1, blueprint §3.8).
+///
+/// The fixture leaves all of them at their defaults — `touched_paths` empty on every item, the
+/// verify and promotion columns NULL on every step, no scope and no lease on any run — so an
+/// equality against `MemStore` proves nothing about them. This writes a distinct value into each
+/// one on Postgres, refreshes, and reads it back: the projected ones (`ItemSummary.touched_paths`
+/// and the six `RunStepSummary` fields) through the mirror's own reads, and the three `run`
+/// columns no read reaches until the five `ReadStore` run reads land, straight off the table.
+#[tokio::test]
+async fn the_0003_columns_reach_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let scope = platform_scope().await;
+    let lease_at = Utc::now().trunc_subsecs(6);
+    let repo_scope = uuid::Uuid::from_u128(0x0003_0003_0003_0003_0003_0003_0003_0003);
+
+    sqlx::query("UPDATE item SET touched_paths = $2 WHERE id = $1")
+        .bind(ids::HTUI_FEAT_1.as_uuid())
+        .bind(vec!["core:src/**".to_owned(), "docs:*.md".to_owned()])
+        .execute(&db.pool)
+        .await
+        .expect("declare an overlap set");
+    sqlx::query(
+        "UPDATE run_step SET verify_outcome = 'fail', verify_exit_code = 7, promoted_at = $2, \
+                             exit_code = 3, selected = true, usage = '{\"in\":1}'::jsonb \
+          WHERE id = $1",
+    )
+    .bind(ids::STEP_IMPL.as_uuid())
+    .bind(lease_at)
+    .execute(&db.pool)
+    .await
+    .expect("record a verification and a promotion");
+    sqlx::query(
+        "UPDATE run SET repo_scope = $2::uuid[], lease_box_id = $3, lease_owner = gen_random_uuid(), \
+                        lease_expires_at = $4 \
+          WHERE id = $1",
+    )
+    .bind(ids::RUN_1.as_uuid())
+    .bind(vec![repo_scope])
+    .bind(db.store.this_box().as_uuid())
+    .bind(lease_at)
+    .execute(&db.pool)
+    .await
+    .expect("scope the run and take a lease on it");
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let filter = ItemFilter::default();
+    let mirrored_items = cache.items(&scope, &filter).await.expect("cache items");
+    assert_eq!(
+        mirrored_items
+            .iter()
+            .find(|row| row.id == ids::HTUI_FEAT_1)
+            .map(|row| row.touched_paths.clone()),
+        Some(vec!["core:src/**".to_owned(), "docs:*.md".to_owned()]),
+        "item.touched_paths is mirrored and projected, in order"
+    );
+    assert_eq!(
+        mirrored_items,
+        db.store.items(&scope, &filter).await.expect("pg items"),
+        "and the two backends project the whole list alike"
+    );
+
+    let mirrored_runs = cache.runs(ids::HTUI_FEAT_1).await.expect("cache runs");
+    let step = mirrored_runs
+        .iter()
+        .flat_map(|run| run.steps.iter())
+        .find(|step| step.id == ids::STEP_IMPL)
+        .expect("the implement step is mirrored");
+    assert_eq!(
+        (
+            step.verify_outcome,
+            step.promoted_at,
+            step.exit_code,
+            step.selected,
+            step.usage.clone(),
+            step.agent_name.as_deref(),
+        ),
+        (
+            Some(htui_core::model::VerifyOutcome::Fail),
+            Some(lease_at),
+            Some(3),
+            Some(true),
+            Some(serde_json::json!({ "in": 1 })),
+            Some("claude"),
+        ),
+        "the six RunStepSummary fields ANA-2 added come off the mirror, `agent_name` through the \
+         `LEFT JOIN agent` that stands in for `MemStore`'s agent map"
+    );
+    assert_eq!(
+        mirrored_runs,
+        db.store.runs(ids::HTUI_FEAT_1).await.expect("pg runs"),
+        "and the two backends project the whole list alike"
+    );
+
+    // `run.repo_scope`, `lease_box_id` and `lease_expires_at` have no reader yet, so they are
+    // asserted off the mirror table itself; `lease_owner` is deliberately not mirrored (plan D7).
+    let row =
+        sqlx::query("SELECT repo_scope, lease_box_id, lease_expires_at FROM run WHERE id = ?")
+            .bind(ids::RUN_1.to_string())
+            .fetch_one(cache.pool())
+            .await
+            .expect("the mirrored run row");
+    assert_eq!(
+        (
+            row.try_get::<String, _>("repo_scope").expect("repo_scope"),
+            row.try_get::<Option<String>, _>("lease_box_id")
+                .expect("lease_box_id"),
+            row.try_get::<Option<i64>, _>("lease_expires_at")
+                .expect("lease_expires_at"),
+        ),
+        (
+            format!("[\"{repo_scope}\"]"),
+            Some(db.store.this_box().to_string()),
+            Some(lease_at.timestamp_micros()),
+        ),
+        "the scope arrives as a JSON array of uuids and the lease as epoch microseconds"
+    );
+    assert!(
+        sqlx::query("SELECT lease_owner FROM run LIMIT 1")
+            .fetch_optional(cache.pool())
+            .await
+            .is_err(),
+        "`lease_owner` is not a mirror column: a liveness token for a process that is not running"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// The §7.3 walk never renders the root as its own upstream entry, even when the graph loops back
 /// to it (T68, F-52 review, H3).
 ///
@@ -982,7 +1116,13 @@ async fn steps_beyond_n_lose_their_events() {
 
     // The fixture only gives `STEP_PLAN` events; the newest finished step needs some too, or
     // "the newest keeps its events" has nothing to assert on.
-    let newest = ids::STEP_REVIEW;
+    //
+    // `refresh_transcripts` orders by `finished_at DESC` **within one project**, and MOD-4's
+    // fixture growth (blueprint F-P) put `RUN_3` on `HTUI_ANA_1`, which is `PROJECT_HTUI` too:
+    // its two candidates finish at hours 15 and 16 of day 1, after `STEP_REVIEW`'s 12. So the
+    // project's newest finished step is now the fan-out loser, and naming `STEP_REVIEW` here
+    // would assert that a step outside the window keeps its events.
+    let newest = ids::STEP_R3_RESEARCH_B;
     for seq in 0..3 {
         let event = pending_event(newest, seq);
         sqlx::query(

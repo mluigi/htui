@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO step_graph (id, project_id, name, description)\n            VALUES ($1, $2, $3, $4)\n            RETURNING id         AS \"id: StepGraphId\",\n                      project_id AS \"project_id: ProjectId\",\n                      name,\n                      description,\n                      created_at,\n                      updated_at\n            ",
+  "query": "\n            INSERT INTO step_graph (id, project_id, name, description)\n            VALUES ($1, $2, $3, $4)\n            RETURNING id         AS \"id: StepGraphId\",\n                      project_id AS \"project_id: ProjectId\",\n                      name,\n                      description,\n                      -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.\n                      is_override,\n                      created_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -49,6 +49,17 @@
       },
       {
         "ordinal": 4,
+        "name": "is_override",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "is_override"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -84,8 +95,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "b8f25025a8e77c7b7af8373c63d12984f3f4f4995a2a7d9acadd967baa695986"
+  "hash": "dc01b3461798639f3c363c858a2f09dbd9824e38315716320958c28e34bc3e8e"
 }

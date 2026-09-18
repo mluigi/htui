@@ -28,8 +28,9 @@ use chrono::{DateTime, Utc};
 use htui_core::model::{
     AgentId, BoundSkill, BoxId, GateOutcome, ItemId, LinkNode, PhaseId, ProjectId, RunId, RunKind,
     RunMode, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId,
-    SkillVersion, Status, StepId, StepStatus, UpstreamEntry,
+    SkillVersion, Status, StepId, StepStatus, UpstreamEntry, VerifyOutcome,
 };
+use serde_json::Value;
 
 /// One `run` row with the joined `box.hostname`: every [`RunSummary`] field except `steps`.
 #[derive(Debug, Clone)]
@@ -118,6 +119,24 @@ pub(crate) struct StepRow {
     pub(crate) prompt_tokens: Option<i32>,
     /// Whether any `run_step.trim_record->'sections'` entry has `trimmed: true` (plan D106).
     pub(crate) trimmed: bool,
+    /// `run_step.usage` (ANA-2 §6.2), whole.
+    ///
+    /// This and the five below are [`RunStepSummary`]'s MOD-4 fields, appended in the summary's
+    /// own order for the positional reason two fields up. `run_step.verify_exit_code` is
+    /// deliberately **absent**: it is a `RunStep` column and not a [`RunStepSummary`] one, so a
+    /// field here would be bound by the statement and read by nothing.
+    pub(crate) usage: Option<Value>,
+    /// `run_step.selected`.
+    pub(crate) selected: Option<bool>,
+    /// `run_step.exit_code`.
+    pub(crate) exit_code: Option<i32>,
+    /// `run_step.verify_outcome` (ANA-2 §4.2).
+    pub(crate) verify_outcome: Option<VerifyOutcome>,
+    /// `run_step.promoted_at` (ANA-2 §4.8).
+    pub(crate) promoted_at: Option<DateTime<Utc>>,
+    /// `agent.name` of `agent_id`, joined: `MemStore` denormalises it out of its agent map, so the
+    /// statement `LEFT JOIN`s `agent` to answer the same thing (MOD-4 milestone 1).
+    pub(crate) agent_name: Option<String>,
 }
 
 impl StepRow {
@@ -137,6 +156,12 @@ impl StepRow {
             finished_at: self.finished_at,
             prompt_tokens: self.prompt_tokens,
             trimmed: self.trimmed,
+            usage: self.usage,
+            selected: self.selected,
+            exit_code: self.exit_code,
+            verify_outcome: self.verify_outcome,
+            promoted_at: self.promoted_at,
+            agent_name: self.agent_name,
         }
     }
 }

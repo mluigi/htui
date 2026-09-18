@@ -29,10 +29,10 @@ use chrono::{DateTime, Utc};
 use htui_core::model::{
     Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, Document, DocumentHead, DocumentId,
     EventKind, EventRole, GateOutcome, Item, ItemFilter, ItemId, ItemSummary, LinkEdge, LinkGraph,
-    LinkKind, LinkNode, Note, NoteId, OsFamily, Project, ProjectId, ProjectRef, PromptScope, RunId,
-    RunKind, RunMode, RunStatus, RunStepSummary, RunSummary, Scope, SessionEvent, Status,
-    StepGraphId, StepId, StepStatus, Transport, UpstreamEntry, UserId, WorkspaceId,
-    WorkspaceSummary,
+    LinkKind, LinkNode, Note, NoteId, OsFamily, Project, ProjectId, ProjectRef, PromptScope,
+    ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraphId, StepId, StepStatus,
+    Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -179,6 +179,7 @@ fn item_summary_of(row: &SqliteRow) -> Result<ItemSummary> {
         priority: get(row, "priority")?,
         required_tags: strings_col("item.required_tags", &text(row, "required_tags")?)?,
         updated_at: ts_col("item.updated_at", get(row, "updated_at")?)?,
+        touched_paths: strings_col("item.touched_paths", &text(row, "touched_paths")?)?,
     })
 }
 
@@ -231,7 +232,8 @@ impl ReadStore for CacheStore {
 
         let mut sql = String::from(
             "SELECT i.id, i.project_id, i.kind_id, i.key, i.key_prefix, i.key_number, i.title, \
-             i.status, i.priority, i.required_tags, i.updated_at FROM item i WHERE i.project_id IN (",
+             i.status, i.priority, i.required_tags, i.updated_at, i.touched_paths \
+             FROM item i WHERE i.project_id IN (",
         );
         sql.push_str(&placeholders(scope.project_ids.len()));
         sql.push(')');
@@ -510,18 +512,22 @@ impl ReadStore for CacheStore {
             // whole Runs read over a single bad row. `prompt_summary` answers `(None, false)` to
             // every one of them, and `'true'` rather than a truthy `json_extract` is its
             // `Value::as_bool`: the integer `1` is not the JSON `true`.
-            "SELECT run_id, id, position, attempt, fanout_index, phase_name, agent_id, model, \
-                    status, gate_outcome, started_at, finished_at, \
-                    CASE WHEN json_type(trim_record, '$.estimated_after') = 'integer' \
-                         THEN json_extract(trim_record, '$.estimated_after') END AS prompt_tokens, \
-                    CASE WHEN json_type(trim_record, '$.sections') = 'array' \
+            "SELECT s.run_id, s.id, s.position, s.attempt, s.fanout_index, s.phase_name, \
+                    s.agent_id, s.model, s.status, s.gate_outcome, s.started_at, s.finished_at, \
+                    CASE WHEN json_type(s.trim_record, '$.estimated_after') = 'integer' \
+                         THEN json_extract(s.trim_record, '$.estimated_after') END AS prompt_tokens, \
+                    CASE WHEN json_type(s.trim_record, '$.sections') = 'array' \
                          THEN COALESCE((SELECT max(CASE WHEN e.type = 'object' \
                                                      AND json_type(e.value, '$.trimmed') = 'true' \
                                                     THEN 1 ELSE 0 END) \
-                                          FROM json_each(run_step.trim_record, '$.sections') e), 0) \
-                         ELSE 0 END AS trimmed \
-               FROM run_step WHERE run_id IN ({}) \
-              ORDER BY run_id, position, attempt, fanout_index",
+                                          FROM json_each(s.trim_record, '$.sections') e), 0) \
+                         ELSE 0 END AS trimmed, \
+                    s.usage, s.selected, s.exit_code, s.verify_outcome, s.promoted_at, \
+                    a.name AS agent_name \
+               FROM run_step s \
+               LEFT JOIN agent a ON a.id = s.agent_id \
+              WHERE s.run_id IN ({}) \
+              ORDER BY s.run_id, s.position, s.attempt, s.fanout_index",
             placeholders(ids.len()),
         );
         let mut query = sqlx::query(AssertSqlSafe(sql));
@@ -554,6 +560,14 @@ impl ReadStore for CacheStore {
                     prompt_tokens: get::<Option<i64>>(row, "prompt_tokens")?
                         .and_then(|tokens| i32::try_from(tokens).ok()),
                     trimmed: bool_col(get::<i64>(row, "trimmed")?),
+                    // MOD-4 milestone 1: the six ANA-2 fields. `agent_name` is the `LEFT JOIN`
+                    // above, which is what `MemStore::run_steps` reads out of its agent map.
+                    usage: opt_json_col("run_step.usage", opt_text(row, "usage")?.as_deref())?,
+                    selected: get::<Option<i64>>(row, "selected")?.map(bool_col),
+                    exit_code: get(row, "exit_code")?,
+                    verify_outcome: get::<Option<VerifyOutcome>>(row, "verify_outcome")?,
+                    promoted_at: opt_ts_col("run_step.promoted_at", get(row, "promoted_at")?)?,
+                    agent_name: opt_text(row, "agent_name")?,
                 },
             ));
         }
@@ -768,6 +782,37 @@ impl ReadStore for CacheStore {
             updated_at: ts_col("project.updated_at", get(&row, "updated_at")?)?,
         }))
     }
+
+    // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
+    //
+    // Declared unwritten so the crate compiles from this commit on (blueprint H-8); the SQL lands
+    // in blueprint §3.11's third commit, together with `run_step_tree` as the seventeenth
+    // mirrored table.
+
+    async fn run(&self, _id: RunId) -> Result<Option<Run>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn resolve_inputs(
+        &self,
+        _item: ItemId,
+        _run: RunId,
+        _kinds: &[String],
+    ) -> Result<Vec<ResolvedInput>> {
+        todo!("MOD-4 T2 commit 3")
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -837,15 +882,24 @@ impl CacheStore {
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub async fn box_info(&self) -> Result<Option<BoxInfo>> {
-        let row = sqlx::query("SELECT id, hostname, os_family FROM box ORDER BY id LIMIT 1")
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        let row = sqlx::query(
+            "SELECT id, hostname, os_family, probed_tags, declared_tags, settings \
+               FROM box ORDER BY id LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         let Some(row) = row else { return Ok(None) };
         Ok(Some(BoxInfo {
             box_id: uuid_col::<BoxId>("box.id", &text(&row, "id")?)?,
             hostname: text(&row, "hostname")?,
             os_family: get::<OsFamily>(&row, "os_family")?,
+            // Named columns here, unlike the positional `query_as!` on Postgres, so the two tag
+            // arrays cannot transpose (T1 audit A-5) — but the fixture's sets differ anyway and
+            // `cache.rs`'s `box_info` equality against `MemStore` is what proves it.
+            probed_tags: strings_col("box.probed_tags", &text(&row, "probed_tags")?)?,
+            declared_tags: strings_col("box.declared_tags", &text(&row, "declared_tags")?)?,
+            settings: json_col("box.settings", &text(&row, "settings")?)?,
         }))
     }
 

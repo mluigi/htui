@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id         AS \"id: StepGraphId\",\n                   project_id AS \"project_id: ProjectId\",\n                   name,\n                   description,\n                   created_at,\n                   updated_at\n              FROM step_graph\n             WHERE project_id = $1\n             ORDER BY name COLLATE \"C\"\n            ",
+  "query": "\n            SELECT id         AS \"id: StepGraphId\",\n                   project_id AS \"project_id: ProjectId\",\n                   name,\n                   description,\n                   -- Inserted between `description` and `created_at`, never appended:\n                   -- `is_override` sits mid-struct and `query_as!` binds positionally, so an\n                   -- appended column would map `created_at` onto it and type-check (T1 audit A-4).\n                   is_override,\n                   created_at,\n                   updated_at\n              FROM step_graph\n             WHERE project_id = $1\n             ORDER BY name COLLATE \"C\"\n            ",
   "describe": {
     "columns": [
       {
@@ -49,6 +49,17 @@
       },
       {
         "ordinal": 4,
+        "name": "is_override",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "is_override"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,8 +92,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "92b94f5e92e08532b9d84703caa4fe529bb100de2b47375f3d5bf4e7919f03f1"
+  "hash": "b4a0cdcbbfd612c5eb959d6826628e589ada7d976456efc3c587b521fed90604"
 }

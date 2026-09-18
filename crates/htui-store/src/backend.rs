@@ -27,8 +27,9 @@ use chrono::{DateTime, Utc};
 use htui_core::model::{
     AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, Document, DocumentHead, DocumentId, Item,
     ItemFilter, ItemId, ItemKind, ItemKindId, ItemSummary, LinkGraph, Note, PhaseId, Project,
-    ProjectId, ProjectRef, PromptScope, PromptTemplate, RunSummary, Scope, SessionEvent, StepId,
-    UpstreamEntry, UserId, WorkspaceSummary,
+    ProjectId, ProjectRef, PromptScope, PromptTemplate, ResolvedInput, Run, RunId, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, StepId, UpstreamEntry, UserId,
+    WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -519,6 +520,37 @@ impl ReadStore for Backend {
             Self::Online { pg, .. } => pg.project(id).await,
             Self::Offline { cache, .. } => cache.project(id).await,
         }
+    }
+
+    // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
+    //
+    // Declared unwritten so the crate compiles from this commit on (blueprint H-8); the SQL lands
+    // in blueprint §3.11's third commit, together with `run_step_tree` as the seventeenth
+    // mirrored table.
+
+    async fn run(&self, _id: RunId) -> Result<Option<Run>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn resolve_inputs(
+        &self,
+        _item: ItemId,
+        _run: RunId,
+        _kinds: &[String],
+    ) -> Result<Vec<ResolvedInput>> {
+        todo!("MOD-4 T2 commit 3")
     }
 }
 

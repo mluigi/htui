@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, status, gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, usage, isolation_path, started_at, finished_at, updated_at FROM run_step WHERE run_id IN (SELECT id FROM run WHERE project_id = $1) AND updated_at > $2 ORDER BY updated_at",
+  "query": "SELECT id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, status, gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, usage, isolation_path, started_at, finished_at, verify_outcome, verify_exit_code, promoted_at, updated_at FROM run_step WHERE run_id IN (SELECT id FROM run WHERE project_id = $1) AND updated_at > $2 ORDER BY updated_at",
   "describe": {
     "columns": [
       {
@@ -214,6 +214,39 @@
       },
       {
         "ordinal": 19,
+        "name": "verify_outcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "verify_outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "verify_exit_code",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "verify_exit_code"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "promoted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "promoted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -250,8 +283,11 @@
       true,
       true,
       true,
+      true,
+      true,
+      true,
       false
     ]
   },
-  "hash": "ec121f796c46c1afde5472e057cdadc9a8f28219c7ccb23127a0819c79647930"
+  "hash": "6fed5ee2771cbda772030a478ad5c250b3046de4c7187a0a799db24280237fd4"
 }

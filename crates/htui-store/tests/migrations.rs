@@ -665,8 +665,10 @@ async fn seed_is_idempotent() {
     );
     assert_eq!(
         common::count(&db.pool, "app_setting").await,
-        12,
-        "cache_refresh_seconds, cache_overlap_seconds and ANA-5's ten"
+        24,
+        "cache_refresh_seconds, cache_overlap_seconds and ANA-5's ten, plus the twelve ANA-2 §5.4 \
+         defaults `0003_orchestration.sql` seeds — none of which collides with the twelve before \
+         it, and all of which survive the second and third seed pass unchanged"
     );
     // MOD-6 left this at zero because `agent.launch`'s shape was still ANA-4's to settle. It is
     // settled (§5.1, §5.3), so MOD-2 seeds the rows and this asserts they arrive exactly once.

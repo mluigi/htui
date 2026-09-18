@@ -37,13 +37,14 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, Item,
-    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkGraph,
-    NewItem, NewItemKind, NewProject, NewRepo, NewStepGraph, NewWorkspace, Note, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId,
-    RepoPatch, RunId, RunStatus, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, UpstreamEntry, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, GateOutcome,
+    Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary,
+    LinkGraph, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep,
+    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -51,6 +52,7 @@ use htui_core::store::{
     StoredSetting, UpdateOutcome, WriteStore,
 };
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::cache::CacheStore;
 use crate::cache::pending::{append_pending, seal_pending};
@@ -227,6 +229,38 @@ impl ReadStore for BufferedWriter {
 
     async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
         self.cache.project(id).await
+    }
+
+    // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
+    //
+    // Unwritten here on purpose: blueprint §4.1 is what gives `Writer` and `BufferedWriter` their
+    // bodies (D5 — the five refuse offline with `DATABASE_UNREACHABLE` exactly as the hierarchy
+    // reads do). They are declared now only because the trait has no defaults and the crate has
+    // to compile from T2's second commit on (blueprint H-8). Nothing calls them before T3.
+
+    async fn run(&self, _id: RunId) -> Result<Option<Run>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn resolve_inputs(
+        &self,
+        _item: ItemId,
+        _run: RunId,
+        _kinds: &[String],
+    ) -> Result<Vec<ResolvedInput>> {
+        todo!("MOD-4 T2 commit 3")
     }
 }
 
@@ -585,6 +619,130 @@ impl WriteStore for BufferedWriter {
     async fn delete_project(&self, _id: ProjectId) -> Result<DeleteReach> {
         Err(hierarchy_needs_the_server())
     }
+
+    // ---- ANA-2 §8's eighteen run writers (MOD-4 milestone 1, plan D1) -------------------------
+    //
+    // Unwritten here on purpose, for the reason above: blueprint §4.1 owns these bodies.
+
+    async fn create_run(&self, _new: NewRun) -> Result<Run> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn claim_run(
+        &self,
+        _run: RunId,
+        _box_id: BoxId,
+        _owner: Uuid,
+        _at: DateTime<Utc>,
+        _lease_until: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn refresh_lease(
+        &self,
+        _run: RunId,
+        _owner: Uuid,
+        _until: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn adopt_runs(
+        &self,
+        _box_id: BoxId,
+        _owner: Uuid,
+        _now: DateTime<Utc>,
+        _lease_until: DateTime<Utc>,
+    ) -> Result<Vec<Run>> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn create_step(&self, _new: NewRunStep) -> Result<RunStep> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn transition_run(
+        &self,
+        _run: RunId,
+        _from: RunStatus,
+        _to: RunStatus,
+        _at: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn transition_step(
+        &self,
+        _step: StepId,
+        _from: StepStatus,
+        _to: StepStatus,
+        _at: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn finish_step(&self, _step: StepId, _outcome: StepOutcome) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn answer_gate(
+        &self,
+        _step: StepId,
+        _outcome: GateOutcome,
+        _note: Option<String>,
+        _at: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn select_fanout(
+        &self,
+        _run: RunId,
+        _position: i32,
+        _attempt: i32,
+        _winner: StepId,
+        _reason: Option<String>,
+    ) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn supersede_step(&self, _step: StepId) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn upsert_step_tree(&self, _step: StepId, _trees: &[RunStepTree]) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn record_commits(&self, _step: StepId, _commits: &[RunStepCommit]) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn write_document(&self, _new: NewDocument) -> Result<Document> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn promote_step(&self, _step: StepId, _at: DateTime<Utc>) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn fail_run(&self, _run: RunId, _failure: &str, _at: DateTime<Utc>) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn close_out(
+        &self,
+        _item: ItemId,
+        _summary: NewDocument,
+        _commits: &[RunStepCommit],
+    ) -> Result<Document> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn add_note(&self, _note: NewNote) -> Result<Note> {
+        todo!("MOD-4 T3")
+    }
 }
 
 /// D35's refusal for the three item writes: offline item editing is MOD-13's question.
@@ -746,6 +904,38 @@ impl ReadStore for Writer {
             Self::Online(pg) => pg.project(id).await,
             Self::Buffered(buffer) => buffer.project(id).await,
         }
+    }
+
+    // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
+    //
+    // Unwritten here on purpose: blueprint §4.1 is what gives `Writer` and `BufferedWriter` their
+    // bodies (D5 — the five refuse offline with `DATABASE_UNREACHABLE` exactly as the hierarchy
+    // reads do). They are declared now only because the trait has no defaults and the crate has
+    // to compile from T2's second commit on (blueprint H-8). Nothing calls them before T3.
+
+    async fn run(&self, _id: RunId) -> Result<Option<Run>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
+        todo!("MOD-4 T2 commit 3")
+    }
+
+    async fn resolve_inputs(
+        &self,
+        _item: ItemId,
+        _run: RunId,
+        _kinds: &[String],
+    ) -> Result<Vec<ResolvedInput>> {
+        todo!("MOD-4 T2 commit 3")
     }
 }
 
@@ -1168,6 +1358,130 @@ impl WriteStore for Writer {
             Self::Online(pg) => pg.delete_project(id).await,
             Self::Buffered(buffer) => buffer.delete_project(id).await,
         }
+    }
+
+    // ---- ANA-2 §8's eighteen run writers (MOD-4 milestone 1, plan D1) -------------------------
+    //
+    // Unwritten here on purpose, for the reason above: blueprint §4.1 owns these bodies.
+
+    async fn create_run(&self, _new: NewRun) -> Result<Run> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn claim_run(
+        &self,
+        _run: RunId,
+        _box_id: BoxId,
+        _owner: Uuid,
+        _at: DateTime<Utc>,
+        _lease_until: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn refresh_lease(
+        &self,
+        _run: RunId,
+        _owner: Uuid,
+        _until: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn adopt_runs(
+        &self,
+        _box_id: BoxId,
+        _owner: Uuid,
+        _now: DateTime<Utc>,
+        _lease_until: DateTime<Utc>,
+    ) -> Result<Vec<Run>> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn create_step(&self, _new: NewRunStep) -> Result<RunStep> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn transition_run(
+        &self,
+        _run: RunId,
+        _from: RunStatus,
+        _to: RunStatus,
+        _at: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn transition_step(
+        &self,
+        _step: StepId,
+        _from: StepStatus,
+        _to: StepStatus,
+        _at: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn finish_step(&self, _step: StepId, _outcome: StepOutcome) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn answer_gate(
+        &self,
+        _step: StepId,
+        _outcome: GateOutcome,
+        _note: Option<String>,
+        _at: DateTime<Utc>,
+    ) -> Result<bool> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn select_fanout(
+        &self,
+        _run: RunId,
+        _position: i32,
+        _attempt: i32,
+        _winner: StepId,
+        _reason: Option<String>,
+    ) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn supersede_step(&self, _step: StepId) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn upsert_step_tree(&self, _step: StepId, _trees: &[RunStepTree]) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn record_commits(&self, _step: StepId, _commits: &[RunStepCommit]) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn write_document(&self, _new: NewDocument) -> Result<Document> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn promote_step(&self, _step: StepId, _at: DateTime<Utc>) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn fail_run(&self, _run: RunId, _failure: &str, _at: DateTime<Utc>) -> Result<()> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn close_out(
+        &self,
+        _item: ItemId,
+        _summary: NewDocument,
+        _commits: &[RunStepCommit],
+    ) -> Result<Document> {
+        todo!("MOD-4 T3")
+    }
+
+    async fn add_note(&self, _note: NewNote) -> Result<Note> {
+        todo!("MOD-4 T3")
     }
 }
 

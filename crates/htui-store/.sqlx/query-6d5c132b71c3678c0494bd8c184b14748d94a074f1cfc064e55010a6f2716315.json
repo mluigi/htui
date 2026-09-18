@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, graph_snapshot, started_by, queued_at, started_at, finished_at, failure, updated_at FROM run WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
+  "query": "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, graph_snapshot, started_by, queued_at, started_at, finished_at, failure, repo_scope, lease_box_id, lease_expires_at, updated_at FROM run WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
   "describe": {
     "columns": [
       {
@@ -159,6 +159,39 @@
       },
       {
         "ordinal": 14,
+        "name": "repo_scope",
+        "type_info": "UuidArray",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "repo_scope"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "lease_box_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "lease_box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "lease_expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -190,8 +223,11 @@
       true,
       true,
       true,
+      false,
+      true,
+      true,
       false
     ]
   },
-  "hash": "cf5ddfe715c86393bc83a7705655faa8865d7edcdc823ed5ecc7161a45c3c403"
+  "hash": "6d5c132b71c3678c0494bd8c184b14748d94a074f1cfc064e55010a6f2716315"
 }

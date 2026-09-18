@@ -386,6 +386,11 @@ fn opt_json_text(value: Option<&Value>) -> Result<Option<String>> {
     value.map(json_text).transpose()
 }
 
+/// A `UUID[]` value as the mirror's JSON array of hyphenated strings (`run.repo_scope`).
+fn uuids_text(values: &[Uuid]) -> Result<String> {
+    strings_text(&values.iter().map(ToString::to_string).collect::<Vec<_>>())
+}
+
 /// A `TEXT[]` value as the mirror's JSON array.
 fn strings_text(values: &[String]) -> Result<String> {
     serde_json::to_string(values)
@@ -1078,6 +1083,9 @@ const RUN_COLUMNS: &[&str] = &[
     "started_at",
     "finished_at",
     "failure",
+    "repo_scope",
+    "lease_box_id",
+    "lease_expires_at",
     "updated_at",
 ];
 
@@ -1089,9 +1097,11 @@ async fn refresh_run(
     hw: i64,
 ) -> Result<Batch> {
     let rows = sqlx::query!(
+        // `lease_owner` is deliberately absent (plan D7): a liveness token for a process that is
+        // by definition not running while the mirror is read.
         "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, \
                 graph_snapshot, started_by, queued_at, started_at, finished_at, failure, \
-                updated_at \
+                repo_scope, lease_box_id, lease_expires_at, updated_at \
            FROM run WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
         project.as_uuid(),
         since,
@@ -1118,6 +1128,9 @@ async fn refresh_run(
             .bind(row.started_at.map(ts_bind))
             .bind(row.finished_at.map(ts_bind))
             .bind(row.failure.as_deref())
+            .bind(uuids_text(&row.repo_scope)?)
+            .bind(row.lease_box_id.map(|id| id.to_string()))
+            .bind(row.lease_expires_at.map(ts_bind))
             .bind(ts_bind(row.updated_at))
             .execute(&mut *tx)
             .await
@@ -1151,6 +1164,9 @@ const RUN_STEP_COLUMNS: &[&str] = &[
     "isolation_path",
     "started_at",
     "finished_at",
+    "verify_outcome",
+    "verify_exit_code",
+    "promoted_at",
     "updated_at",
 ];
 
@@ -1164,7 +1180,8 @@ async fn refresh_run_step(
     let rows = sqlx::query!(
         "SELECT id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, status, \
                 gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, usage, \
-                isolation_path, started_at, finished_at, updated_at \
+                isolation_path, started_at, finished_at, verify_outcome, verify_exit_code, \
+                promoted_at, updated_at \
            FROM run_step \
           WHERE run_id IN (SELECT id FROM run WHERE project_id = $1) AND updated_at > $2 \
           ORDER BY updated_at",
@@ -1198,6 +1215,9 @@ async fn refresh_run_step(
             .bind(row.isolation_path.as_deref())
             .bind(row.started_at.map(ts_bind))
             .bind(row.finished_at.map(ts_bind))
+            .bind(row.verify_outcome.as_deref())
+            .bind(row.verify_exit_code.map(i64::from))
+            .bind(row.promoted_at.map(ts_bind))
             .bind(ts_bind(row.updated_at))
             .execute(&mut *tx)
             .await

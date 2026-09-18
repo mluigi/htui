@@ -1575,6 +1575,23 @@ async fn inherent_reads_answer_the_fixture() {
         db.store.this_box(),
         "box_info answers for this box"
     );
+    // MOD-4 milestone 1, T1 audit A-5: `probed_tags` and `declared_tags` are adjacent
+    // `Vec<String>` fields of `BoxInfo` and `query_as!` binds **positionally**, so transposing
+    // them in the select list type-checks and binds silently. The fixture seeds two deliberately
+    // different sets, and this names which is which.
+    assert_eq!(
+        (info.probed_tags.as_slice(), info.declared_tags.as_slice()),
+        (
+            ["rust".to_owned(), "msvc".to_owned(), "cmake".to_owned()].as_slice(),
+            ["gpu".to_owned()].as_slice()
+        ),
+        "the probe wrote the toolchain tags and the human declared `gpu`; the two are not swapped"
+    );
+    assert_eq!(
+        info.settings,
+        serde_json::json!({ "max_concurrent_items": 2 }),
+        "box.settings comes back whole (ANA-2 §4.7)"
+    );
 
     // MOD-2 plan D3: the registry read is inherent too, because `agent` / `agent_box` are not
     // mirrored. The demo loader inserts the seed's `agent` rows and no `agent_box` row at all, so
@@ -2722,6 +2739,18 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
     .execute(&db.pool)
     .await
     .expect("seed a run_step_commit");
+    // `run_step_tree.repo_id` has no cascade either (`0003_orchestration.sql:94`), so it takes the
+    // sibling project's repo for the reason spelled out above. Seeded rather than left at zero so
+    // the `run_step_trees` entry below cannot pass on `0 == 0` (blueprint §3.9(b)).
+    sqlx::query(
+        "INSERT INTO run_step_tree (run_step_id, repo_id, mode, path, base_ref, dirty) \
+         VALUES ($1, $2, 'worktree', '/trees/abc', 'main', true)",
+    )
+    .bind(step)
+    .bind(sibling_repo)
+    .execute(&db.pool)
+    .await
+    .expect("seed a run_step_tree");
     sqlx::query(
         "INSERT INTO command_run (run_step_id, box_id, class, command, cwd) \
          VALUES ($1, $2, 'test', 'cargo test', '/src')",
@@ -2734,9 +2763,14 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
 
     /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
     ///
-    /// Twenty-one entries for twenty-one fields: a field added without an entry leaves the struct
+    /// Twenty-two entries for twenty-two fields: a field added without an entry leaves the struct
     /// literal below incomplete and the crate does not compile.
-    const TABLES: [&str; 21] = [
+    ///
+    /// `TABLES` and `claimed` are zipped **positionally**, so a new name goes where its field sits
+    /// in `DeleteReach` and never simply at the end: `run_step_trees` is struct index 16, between
+    /// `run_step_commits` and `command_runs`, and appending it to both arrays would compile while
+    /// comparing every later field against the wrong table (T1 audit A-3).
+    const TABLES: [&str; 22] = [
         "workspace_project",
         "workspace_box_path",
         "item",
@@ -2753,6 +2787,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "run_step",
         "session_event",
         "run_step_commit",
+        "run_step_tree",
         "command_run",
         "item_note",
         "item_revision",
@@ -2791,13 +2826,14 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         run_steps,
         session_events,
         run_step_commits,
+        run_step_trees,
         command_runs,
         notes,
         revisions,
         links,
         documents,
     } = report;
-    let claimed: [u64; 21] = [
+    let claimed: [u64; 22] = [
         workspace_links,
         workspace_box_paths,
         items,
@@ -2814,6 +2850,7 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         run_steps,
         session_events,
         run_step_commits,
+        run_step_trees,
         command_runs,
         notes,
         revisions,
@@ -2835,8 +2872,14 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "a project is not a workspace, so no box path of one moves"
     );
     assert!(
-        (phase_agents, run_step_commits, command_runs, repo_box_paths) == (1, 1, 1, 1),
-        "the five seeded tables are non-zero, so none of them passed on `0 == 0`"
+        (
+            phase_agents,
+            run_step_commits,
+            run_step_trees,
+            command_runs,
+            repo_box_paths
+        ) == (1, 1, 1, 1, 1),
+        "the six seeded tables are non-zero, so none of them passed on `0 == 0`"
     );
 
     db.drop_db().await;

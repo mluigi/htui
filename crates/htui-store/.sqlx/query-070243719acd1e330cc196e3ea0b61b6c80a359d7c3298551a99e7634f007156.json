@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id         AS \"id: StepGraphId\",\n                   project_id AS \"project_id: ProjectId\",\n                   name,\n                   description,\n                   created_at,\n                   updated_at\n              FROM step_graph WHERE id = $1\n            ",
+  "query": "\n            UPDATE step_graph SET\n                name        = COALESCE($3, name),\n                description = COALESCE($4, description)\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id         AS \"id: StepGraphId\",\n                      project_id AS \"project_id: ProjectId\",\n                      name,\n                      description,\n                      -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.\n                      is_override,\n                      created_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -49,6 +49,17 @@
       },
       {
         "ordinal": 4,
+        "name": "is_override",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "is_override"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -72,7 +83,10 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Timestamptz",
+        "Text",
+        "Text"
       ]
     },
     "nullable": [
@@ -81,8 +95,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "26320a7ae893198fbb15f22f47e510822f02efdea97e5c070fc9c76e549601db"
+  "hash": "070243719acd1e330cc196e3ea0b61b6c80a359d7c3298551a99e7634f007156"
 }
