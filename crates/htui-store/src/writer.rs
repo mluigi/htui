@@ -739,6 +739,16 @@ impl WriteStore for BufferedWriter {
         Err(hierarchy_needs_the_server())
     }
 
+    async fn finish_run(
+        &self,
+        _run: RunId,
+        _to: RunStatus,
+        _failure: Option<&str>,
+        _at: DateTime<Utc>,
+    ) -> Result<()> {
+        Err(hierarchy_needs_the_server())
+    }
+
     async fn close_out(
         &self,
         _item: ItemId,
@@ -1572,6 +1582,20 @@ impl WriteStore for Writer {
             Self::Memory(store) => store.fail_run(run, failure, at).await,
             Self::Online(pg) => pg.fail_run(run, failure, at).await,
             Self::Buffered(buffer) => buffer.fail_run(run, failure, at).await,
+        }
+    }
+
+    async fn finish_run(
+        &self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.finish_run(run, to, failure, at).await,
+            Self::Online(pg) => pg.finish_run(run, to, failure, at).await,
+            Self::Buffered(buffer) => buffer.finish_run(run, to, failure, at).await,
         }
     }
 

@@ -1160,6 +1160,29 @@ pub fn run_is_terminal(run: RunId, status: RunStatus) -> String {
     format!("run {run} is terminal (`{status}`)")
 }
 
+/// M2 D7: where [`finish_run`](WriteStore::finish_run) takes the item, or `None` to leave it.
+///
+/// ANA-2 §4.3's verdict table, as one function rather than one per backend: `MemStore` matches on
+/// it and `PgStore` binds its answer, so the mapping cannot be spelled two ways the way the refusal
+/// sentences could before they were named. `to` is the run's terminal status and `item` the item's
+/// *current* one; the caller has already established that no other run of the item is active.
+///
+/// `None` is "leave it alone", which is plan D17 rather than an omission: MOD-2's chat path and the
+/// offline upload path insert `run` and `item` rows outside §4.3, so an item at a status this table
+/// does not list has not necessarily passed through [`Status::can_move_to`] and must not be forced
+/// through the law on its way out.
+#[must_use]
+pub const fn finish_run_item_mirror(to: RunStatus, item: Status) -> Option<Status> {
+    match (to, item) {
+        (RunStatus::Done, Status::InProgress) => Some(Status::Done),
+        (RunStatus::Failed, Status::InProgress | Status::AwaitingApproval) => Some(Status::Failed),
+        (RunStatus::Cancelled, Status::Queued | Status::InProgress | Status::AwaitingApproval) => {
+            Some(Status::Open)
+        }
+        _ => None,
+    }
+}
+
 /// M2 D7: [`finish_run`](WriteStore::finish_run) was asked to leave a run non-terminal.
 ///
 /// It is a separate sentence from [`illegal_move`] on purpose: `running -> awaiting_approval` is a

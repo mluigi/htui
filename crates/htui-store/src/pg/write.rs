@@ -32,8 +32,9 @@ use htui_core::seed;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung, StoreError,
     StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, chat_step_status,
-    close_out_needs_a_summary, expected_on_row, graph_not_in_project, illegal_move, invalid_prefix,
-    item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
+    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
+    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move,
+    invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
     not_a_fanout_candidate, not_a_terminal_status, references_no_row, reserved_phase_name,
     row_names_another_step, run_is_terminal, step_is_not_promotable, summary_names_another_item,
     winner_is_not_settled,
@@ -3445,6 +3446,139 @@ impl WriteStore for PgStore {
                 id: run.to_string(),
             }),
         }
+    }
+
+    /// Plan M2 D7: the run's terminal move and the item's mirror, one transaction.
+    ///
+    /// [`promote_step`](WriteStore::promote_step) is the template — the rows are taken
+    /// `FOR UPDATE` and every refusal is decided under the locks and before the first `UPDATE` —
+    /// with one addition that is the whole point of the writer. The item's row is locked
+    /// **before** its sibling runs are counted, so two runs of one item finishing at the same
+    /// instant serialise on it: without that lock each would see the other still live in its own
+    /// snapshot, both would decline to move the item, and the item would be stranded
+    /// `in_progress` with no live run left to move it.
+    ///
+    /// The lock order is `run` then `item`, which is `promote_step`'s, so the two cannot deadlock
+    /// against each other.
+    ///
+    /// The item's target is derived in Rust rather than in SQL, from the same `match` `MemStore`
+    /// runs, so ANA-2 §4.3's mapping is written once per rule and not once per backend; and
+    /// `closed_at` is `to.is_terminal()` in SQL exactly as
+    /// [`transition`](WriteStore::transition) writes it (`:603-611`). Zero rows affected by the
+    /// final `UPDATE` is not an error: the item moved under us, which plan D17 says to leave alone.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run" }`; [`StoreError::Constraint`] with
+    /// [`finish_run_needs_a_terminal_status`] for a non-terminal `to`, with
+    /// [`failure_disagrees_with_status`] when `failure` and `to` disagree, and with
+    /// [`illegal_move`]'s sentence when the run is already terminal.
+    async fn finish_run(
+        &self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let Some(row) = sqlx::query!(
+            r#"
+            SELECT status  AS "status: RunStatus",
+                   item_id AS "item_id: ItemId"
+              FROM run
+             WHERE id = $1
+               FOR UPDATE
+            "#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        else {
+            return Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            });
+        };
+
+        if !to.is_terminal() {
+            return Err(StoreError::Constraint(finish_run_needs_a_terminal_status(
+                run, to,
+            )));
+        }
+        if failure.is_some() != (to == RunStatus::Failed) {
+            return Err(StoreError::Constraint(failure_disagrees_with_status(
+                run,
+                to,
+                failure.is_some(),
+            )));
+        }
+        // A terminal row reaches nothing, so `legal_move` is the whole refusal: `run_is_terminal`
+        // would only say the same thing in a second sentence.
+        legal_move(row.status, to)?;
+
+        sqlx::query!(
+            "UPDATE run \
+                SET status      = $2, \
+                    failure     = COALESCE($3, failure), \
+                    finished_at = COALESCE(finished_at, $4) \
+              WHERE id = $1",
+            run.as_uuid(),
+            to as RunStatus,
+            failure,
+            at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        if let Some(item) = row.item_id {
+            let Some(current) = sqlx::query_scalar!(
+                r#"SELECT status AS "status: Status" FROM item WHERE id = $1 FOR UPDATE"#,
+                item.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            else {
+                // The foreign key makes this unreachable; it is an early return rather than a
+                // panic because a missing parent is the database's fault, not the caller's.
+                return tx.commit().await.map_err(map_sqlx);
+            };
+
+            let live = sqlx::query_scalar!(
+                "SELECT count(*) FROM run \
+                  WHERE item_id = $1 AND id <> $2 \
+                    AND status IN ('queued','running','awaiting_approval')",
+                item.as_uuid(),
+                run.as_uuid(),
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .unwrap_or_default();
+
+            if live == 0
+                && let Some(target) = finish_run_item_mirror(to, current)
+            {
+                sqlx::query!(
+                    "UPDATE item \
+                        SET status    = $3, \
+                            closed_at = CASE WHEN $4 THEN clock_timestamp() ELSE NULL END \
+                      WHERE id = $1 AND status = $2",
+                    item.as_uuid(),
+                    current.as_str(),
+                    target.as_str(),
+                    target.is_terminal(),
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            }
+        }
+
+        tx.commit().await.map_err(map_sqlx)
     }
 
     /// `R-TUI-9`'s close-out: the summary, the commits and the item's move to `closed`, one

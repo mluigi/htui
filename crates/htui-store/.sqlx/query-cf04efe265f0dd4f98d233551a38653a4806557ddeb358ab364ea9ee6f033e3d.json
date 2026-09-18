@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run SET status      = $2, failure     = COALESCE($3, failure), finished_at = COALESCE(finished_at, $4) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cf04efe265f0dd4f98d233551a38653a4806557ddeb358ab364ea9ee6f033e3d"
+}

@@ -41,11 +41,11 @@ use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
     WriteStore, already_exists, chat_step_status, close_out_needs_a_summary, expected_on_row,
-    failure_disagrees_with_status, finish_run_needs_a_terminal_status, graph_not_in_project,
-    invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
-    not_a_fanout_candidate, not_a_terminal_status, references_no_row, reserved_phase_name,
-    row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
-    summary_names_another_item, winner_is_not_settled,
+    failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
+    graph_not_in_project, invalid_prefix, item_has_a_live_run, item_kind_is_held,
+    item_not_in_project, legal_move, not_a_fanout_candidate, not_a_terminal_status,
+    references_no_row, reserved_phase_name, row_names_another_step, run_is_terminal,
+    step_is_not_promotable, step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
 };
 use uuid::Uuid;
 
@@ -3800,16 +3800,10 @@ impl State {
         let Some(status) = self.items.get(&item).map(|row| row.status) else {
             return Ok(());
         };
-        let target = match (to, status) {
-            (RunStatus::Done, Status::InProgress) => Status::Done,
-            (RunStatus::Failed, Status::InProgress | Status::AwaitingApproval) => Status::Failed,
-            (
-                RunStatus::Cancelled,
-                Status::Queued | Status::InProgress | Status::AwaitingApproval,
-            ) => Status::Open,
-            // Plan D17: MOD-2's chat path and the offline upload path insert rows outside §4.3, so
-            // an item at an unexpected status is left alone rather than forced through the law.
-            _ => return Ok(()),
+        // §4.3's verdict table lives in `traits.rs` so `PgStore` binds the same answer this
+        // matches on; `None` is plan D17's "leave an unexpected item alone".
+        let Some(target) = finish_run_item_mirror(to, status) else {
+            return Ok(());
         };
         self.transition(item, status, target, now)?;
         Ok(())
