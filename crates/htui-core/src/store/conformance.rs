@@ -8,17 +8,22 @@
 
 use core::future::Future;
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::fixtures::ids;
 use crate::model::{
-    Agent, AgentBox, AgentId, Billing, ChatRunSpec, CommandQueue, DocumentId, EventKind, EventRole,
-    Gate, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewItem,
-    NewItemKind, NewProject, NewRepo, NewStepGraph, NewWorkspace, PhaseId, PhasePatch, ProjectId,
-    ProjectPatch, PromptScope, RepoBoxPath, RepoId, RepoPatch, RunId, RunStatus, Scope,
-    SessionEvent, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, Transport,
-    UpstreamEntry, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, CommandQueue,
+    DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Gate, GateOutcome,
+    GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemSummary, LinkKind, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun,
+    NewRunStep, NewStepGraph, NewWorkspace, NoteId, PhaseId, PhasePatch, ProjectId, ProjectPatch,
+    PromptScope, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph, SnapshotSettings, Status,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, Transport,
+    UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -65,6 +70,17 @@ pub const CASES: &[&str] = &[
     "settings_project_rung_merges_keys",
     "settings_phase_rung_writes_token_budget_only",
     "project_create_seeds_the_catalogue",
+    "run_create_moves_the_item",
+    "claim_run_admits_one_and_refuses_the_second",
+    "lease_refresh_is_a_cas_on_owner",
+    "step_create_and_transition_law",
+    "finish_step_records_the_settle",
+    "gate_answers_write_their_outcome",
+    "select_fanout_is_one_transaction",
+    "trees_and_commits_round_trip",
+    "write_document_allocates_its_version",
+    "close_out_refuses_a_live_run",
+    "illegal_transitions_are_constraint",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -130,6 +146,19 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             settings_phase_rung_writes_token_budget_only(store).await;
         }
         "project_create_seeds_the_catalogue" => project_create_seeds_the_catalogue(store).await,
+        "run_create_moves_the_item" => run_create_moves_the_item(store).await,
+        "claim_run_admits_one_and_refuses_the_second" => {
+            claim_run_admits_one_and_refuses_the_second(store).await;
+        }
+        "lease_refresh_is_a_cas_on_owner" => lease_refresh_is_a_cas_on_owner(store).await,
+        "step_create_and_transition_law" => step_create_and_transition_law(store).await,
+        "finish_step_records_the_settle" => finish_step_records_the_settle(store).await,
+        "gate_answers_write_their_outcome" => gate_answers_write_their_outcome(store).await,
+        "select_fanout_is_one_transaction" => select_fanout_is_one_transaction(store).await,
+        "trees_and_commits_round_trip" => trees_and_commits_round_trip(store).await,
+        "write_document_allocates_its_version" => write_document_allocates_its_version(store).await,
+        "close_out_refuses_a_live_run" => close_out_refuses_a_live_run(store).await,
+        "illegal_transitions_are_constraint" => illegal_transitions_are_constraint(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -3686,6 +3715,1763 @@ async fn settings_phase_rung_writes_token_budget_only<S: WriteStore>(store: &S) 
             })
         ),
         "{CASE}: an unknown phase is NotFound, got {unknown_write:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// ANA-2 §8: the run seam (MOD-4 milestone 1, plan D12)
+// ------------------------------------------------------------------------------------------------
+
+/// The smallest `R-ORCH-11` snapshot [`WriteStore::create_run`] accepts: the `htui` FEAT graph,
+/// no phases, and the settings the seed rungs resolve to.
+///
+/// Deliberately not the fixture's own `demo_graph_snapshot`: a case that asserts the column
+/// round-trips must pass a value it can recognise afterwards, and a snapshot with no phase is the
+/// shortest one that still decodes as §5.1's type.
+fn run_snapshot() -> GraphSnapshot {
+    GraphSnapshot {
+        v: GraphSnapshot::V,
+        graph: SnapshotGraph {
+            id: ids::GRAPH_HTUI_FEAT,
+            name: "feature".to_owned(),
+            is_override: false,
+        },
+        topology: "sha256:conformance".to_owned(),
+        mode: RunMode::Manual,
+        phases: Vec::new(),
+        settings: SnapshotSettings {
+            default_isolation: Isolation::Worktree,
+            per_token_cap_run: None,
+            per_token_cap_batch: None,
+            max_fan_out: 4,
+            max_agents_per_run: 6,
+        },
+    }
+}
+
+/// A graph-run request with a fresh id, targeting the fixture box and started by the fixture user.
+fn new_run(project: ProjectId, item: ItemId, scope: Vec<RepoId>) -> NewRun {
+    NewRun {
+        id: RunId::new(),
+        project_id: project,
+        item_id: item,
+        mode: RunMode::Manual,
+        target_box_id: ids::BOX,
+        started_by: ids::USER,
+        graph_snapshot: run_snapshot(),
+        repo_scope: scope,
+        queued_at: Utc::now(),
+    }
+}
+
+/// A step request with a fresh id at one `(position, attempt, fanout_index)` slot of `run`.
+fn new_run_step(run: RunId, position: i32, attempt: i32, fanout_index: i32) -> NewRunStep {
+    NewRunStep {
+        id: StepId::new(),
+        run_id: run,
+        position,
+        attempt,
+        fanout_index,
+        phase_name: "implement".to_owned(),
+        agent_id: Some(ids::AGENT_CLAUDE),
+        model: Some("opus".to_owned()),
+    }
+}
+
+/// A document request with a fresh id; the version is the store's to allocate, never the caller's.
+fn new_document(item: ItemId, kind: &str, step: Option<StepId>) -> NewDocument {
+    NewDocument {
+        id: DocumentId::new(),
+        item_id: item,
+        kind: kind.to_owned(),
+        title: format!("{kind} of {item}"),
+        body: String::new(),
+        produced_by_step_id: step,
+        created_by: ids::USER,
+        created_at: Utc::now(),
+    }
+}
+
+/// A note request with a fresh id, on the fixture box and by the fixture user.
+fn new_note(item: ItemId, author: UserId, step: Option<StepId>) -> NewNote {
+    NewNote {
+        id: NoteId::new(),
+        item_id: item,
+        body: "Refused: the tree was dirty.".to_owned(),
+        created_by: author,
+        box_id: Some(ids::BOX),
+        via_step_id: step,
+        created_at: Utc::now(),
+    }
+}
+
+/// Creates `spec` and drives it `pending -> running -> awaiting_approval`, the two legal moves a
+/// gate answer needs to have something to answer.
+async fn gated_step<S: WriteStore>(case: &str, store: &S, spec: NewRunStep) -> StepId {
+    let id = spec.id;
+    let at = Utc::now();
+    store.create_step(spec).await.expect(case);
+    for (from, to) in [
+        (StepStatus::Pending, StepStatus::Running),
+        (StepStatus::Running, StepStatus::AwaitingApproval),
+    ] {
+        assert!(
+            store.transition_step(id, from, to, at).await.expect(case),
+            "{case}: {from} -> {to} is a sanctioned move"
+        );
+    }
+    id
+}
+
+/// The one step of `run` with that id, or a panic naming the case: the cases read steps back
+/// through [`ReadStore::run_steps`], never through a store-specific accessor.
+async fn step_row<S: ReadStore>(case: &str, store: &S, run: RunId, step: StepId) -> RunStep {
+    store
+        .run_steps(run)
+        .await
+        .expect(case)
+        .into_iter()
+        .find(|row| row.id == step)
+        .unwrap_or_else(|| panic!("{case}: run {run} holds step {step}"))
+}
+
+/// The run row, or a panic naming the case.
+async fn run_row<S: ReadStore>(case: &str, store: &S, run: RunId) -> Run {
+    store
+        .run(run)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: run {run} exists"))
+}
+
+/// The item row, or a panic naming the case.
+async fn item_row<S: ReadStore>(case: &str, store: &S, item: ItemId) -> Item {
+    store
+        .item(item)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: item {item} exists"))
+}
+
+/// Plan D6: the `run` row and the item's move to `queued` land together or not at all (ANA-2 §4.3,
+/// §5.1). The `MemStore` twin is
+/// `mem.rs::create_run_moves_the_item_and_writes_nothing_when_the_law_refuses`; on Postgres the
+/// snapshot column's own guard is `pg_criteria::ck_run_graph_snapshot_is_not_valid_for_old_rows_and_checked_for_new`.
+async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
+    const CASE: &str = "run_create_moves_the_item";
+    let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
+    assert_eq!(before.status, Status::Open, "{CASE}: fixture precondition");
+
+    let request = new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new());
+    let id = request.id;
+    let scope = request.repo_scope.clone();
+    let created = store.create_run(request).await.expect(CASE);
+    assert_eq!(
+        created.status,
+        RunStatus::Queued,
+        "{CASE}: a run starts queued"
+    );
+    assert_eq!(
+        created.kind,
+        RunKind::Graph,
+        "{CASE}: create_run mints graph runs"
+    );
+    assert_eq!(
+        created.item_id,
+        Some(ids::HTUI_ANA_2),
+        "{CASE}: the item is carried"
+    );
+    assert_eq!(
+        created.executing_box_id, None,
+        "{CASE}: nothing has claimed it"
+    );
+    assert_eq!(
+        created.repo_scope, scope,
+        "{CASE}: the request's scope is stored"
+    );
+    assert_eq!(
+        (created.lease_box_id, created.lease_expires_at),
+        (None, None),
+        "{CASE}: an unclaimed run holds no lease"
+    );
+    let snapshot: GraphSnapshot = serde_json::from_value(
+        created
+            .graph_snapshot
+            .clone()
+            .unwrap_or_else(|| panic!("{CASE}: a graph run carries its snapshot")),
+    )
+    .unwrap_or_else(|error| panic!("{CASE}: the snapshot decodes as §5.1's type, got {error}"));
+    assert_eq!(
+        snapshot,
+        run_snapshot(),
+        "{CASE}: the snapshot round-trips whole"
+    );
+
+    let after = item_row(CASE, store, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        after.status,
+        Status::Queued,
+        "{CASE}: the item moved with the run"
+    );
+    assert_eq!(
+        after.version, before.version,
+        "{CASE}: a transition writes no revision, so the version stands"
+    );
+    assert_eq!(
+        run_row(CASE, store, id).await,
+        created,
+        "{CASE}: `run` answers the row `create_run` returned"
+    );
+
+    let duplicate = NewRun {
+        id,
+        ..new_run(ids::PROJECT_AGY, ids::AGY_FEAT_1, Vec::new())
+    };
+    let repeated = store.create_run(duplicate).await;
+    assert!(
+        matches!(repeated, Err(StoreError::Constraint(_))),
+        "{CASE}: a run id that exists is Constraint, got {repeated:?}"
+    );
+
+    let unknown = store
+        .create_run(new_run(ids::PROJECT_HTUI, ItemId::new(), Vec::new()))
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "item", .. })),
+        "{CASE}: an unknown item is NotFound, got {unknown:?}"
+    );
+
+    let live = new_run(ids::PROJECT_HTUI, ids::HTUI_FEAT_1, Vec::new());
+    let live_id = live.id;
+    let refused = store.create_run(live).await;
+    assert!(
+        matches!(refused, Err(StoreError::Constraint(_))),
+        "{CASE}: in_progress does not reach queued (ANA-2 §4.3), got {refused:?}"
+    );
+    assert_eq!(
+        store.run(live_id).await.expect(CASE),
+        None,
+        "{CASE}: the refusal wrote no run row — create_run is one transaction"
+    );
+
+    let retry = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        retry.status,
+        RunStatus::Queued,
+        "{CASE}: a failed item may be re-run"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_CLEAN_1).await.status,
+        Status::Queued,
+        "{CASE}: failed -> queued is the retry row of §4.3"
+    );
+}
+
+/// ANA-2 §4.7's admission: the repo-scope overlap refuses before the slot count does, and the slot
+/// count is the box rung of [`DEFAULT_MAX_CONCURRENT_ITEMS`].
+///
+/// The `MemStore` twin is `mem.rs::claim_run_refuses_an_overlapping_scope_and_a_full_box`; the
+/// thing only Postgres can show — that two concurrent claims on the last slot cannot both win — is
+/// `pg_criteria::admission_is_serialised_by_the_box_row_lock`.
+async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_admits_one_and_refuses_the_second";
+    let repo = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    let third_item = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "Third"))
+        .await
+        .expect(CASE)
+        .id;
+    let fourth_item = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "Fourth"))
+        .await
+        .expect(CASE)
+        .id;
+
+    let mut queued = Vec::new();
+    for (item, scope) in [
+        (ids::HTUI_ANA_2, vec![repo]),
+        (ids::HTUI_CLEAN_1, vec![repo]),
+        (third_item, Vec::new()),
+        (fourth_item, Vec::new()),
+    ] {
+        queued.push((
+            item,
+            store
+                .create_run(new_run(ids::PROJECT_HTUI, item, scope))
+                .await
+                .expect(CASE)
+                .id,
+        ));
+    }
+    let [(_, first), (second_item, second), (_, third), (_, fourth)] = queued[..] else {
+        panic!("{CASE}: four runs were queued")
+    };
+
+    let owner = Uuid::now_v7();
+    let at = Utc::now();
+    let until = at + TimeDelta::minutes(5);
+
+    assert!(
+        store
+            .claim_run(first, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        "{CASE}: the first run is admitted"
+    );
+    let claimed = run_row(CASE, store, first).await;
+    assert_eq!(
+        claimed.status,
+        RunStatus::Running,
+        "{CASE}: the run started"
+    );
+    assert_eq!(
+        claimed.executing_box_id,
+        Some(ids::BOX),
+        "{CASE}: the claiming box is recorded"
+    );
+    assert_eq!(
+        claimed.started_at,
+        Some(at),
+        "{CASE}: `at` is the caller's clock"
+    );
+    assert_eq!(
+        claimed.lease_box_id,
+        Some(ids::BOX),
+        "{CASE}: the lease names the box"
+    );
+    assert_eq!(
+        claimed.lease_expires_at,
+        Some(until),
+        "{CASE}: the lease expires when the caller said"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_ANA_2).await.status,
+        Status::InProgress,
+        "{CASE}: the item moved queued -> in_progress with the claim"
+    );
+
+    assert!(
+        !store
+            .claim_run(second, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        "{CASE}: an overlapping repo_scope is refused while a slot is still free"
+    );
+    assert_eq!(
+        run_row(CASE, store, second).await.status,
+        RunStatus::Queued,
+        "{CASE}: a refused claim writes nothing to the run"
+    );
+    assert_eq!(
+        item_row(CASE, store, second_item).await.status,
+        Status::Queued,
+        "{CASE}: nor to its item"
+    );
+
+    assert!(
+        store
+            .claim_run(third, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        "{CASE}: an empty scope overlaps nothing (hazard H-10)"
+    );
+    assert_eq!(
+        DEFAULT_MAX_CONCURRENT_ITEMS, 2,
+        "{CASE}: the next leg reads as it does because the default is two"
+    );
+    assert!(
+        !store
+            .claim_run(fourth, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        "{CASE}: the box is full at DEFAULT_MAX_CONCURRENT_ITEMS running runs"
+    );
+    assert!(
+        !store
+            .claim_run(first, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        "{CASE}: a run that is no longer queued is not claimable"
+    );
+
+    let no_box = store
+        .claim_run(second, BoxId::new(), owner, at, until)
+        .await;
+    assert!(
+        matches!(no_box, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box is NotFound, got {no_box:?}"
+    );
+    let no_run = store
+        .claim_run(RunId::new(), BoxId::new(), owner, at, until)
+        .await;
+    assert!(
+        matches!(no_run, Err(StoreError::NotFound { entity: "run", .. })),
+        "{CASE}: the run is looked up before the box, got {no_run:?}"
+    );
+}
+
+/// ANA-2 §4.9: the heartbeat is a compare-and-set on `lease_owner` and the sweep takes an expired
+/// lease from whoever held it. The `MemStore` twin is
+/// `mem.rs::a_lease_refresh_is_a_cas_on_its_owner_and_the_sweep_adopts_it`.
+///
+/// `lease_owner` is deliberately not a [`Run`] field, so ownership is asserted only through what
+/// `refresh_lease` answers (blueprint F-S).
+async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
+    const CASE: &str = "lease_refresh_is_a_cas_on_owner";
+    let first_owner = Uuid::now_v7();
+    let second_owner = Uuid::now_v7();
+    let at = Utc::now();
+    let until = at + TimeDelta::minutes(5);
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert!(
+        store
+            .claim_run(run, ids::BOX, first_owner, at, until)
+            .await
+            .expect(CASE),
+        "{CASE}: the run is admitted"
+    );
+
+    let extended = until + TimeDelta::minutes(5);
+    assert!(
+        store
+            .refresh_lease(run, first_owner, extended)
+            .await
+            .expect(CASE),
+        "{CASE}: the owner extends its own lease"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await.lease_expires_at,
+        Some(extended),
+        "{CASE}: the new expiry is stored"
+    );
+    let stranger = extended + TimeDelta::minutes(5);
+    assert!(
+        !store
+            .refresh_lease(run, second_owner, stranger)
+            .await
+            .expect(CASE),
+        "{CASE}: a stranger's heartbeat is zero rows, which means abandon"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await.lease_expires_at,
+        Some(extended),
+        "{CASE}: a refused heartbeat writes nothing"
+    );
+    let unknown = store
+        .refresh_lease(RunId::new(), first_owner, extended)
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
+        "{CASE}: an unknown run is NotFound, got {unknown:?}"
+    );
+
+    let swept = extended + TimeDelta::minutes(10);
+    assert!(
+        store
+            .adopt_runs(
+                ids::BOX,
+                second_owner,
+                extended - TimeDelta::seconds(1),
+                swept,
+            )
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: a live lease is not abandoned"
+    );
+    let adopted = store
+        .adopt_runs(
+            ids::BOX,
+            second_owner,
+            extended + TimeDelta::seconds(1),
+            swept,
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        adopted.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![run],
+        "{CASE}: the expired lease is adopted"
+    );
+    assert_eq!(
+        adopted.first().and_then(|row| row.lease_expires_at),
+        Some(swept),
+        "{CASE}: the adopted row carries the sweeper's expiry"
+    );
+    assert!(
+        !store
+            .refresh_lease(run, first_owner, swept)
+            .await
+            .expect(CASE),
+        "{CASE}: the old owner has lost it"
+    );
+    assert!(
+        store
+            .refresh_lease(run, second_owner, swept)
+            .await
+            .expect(CASE),
+        "{CASE}: and the sweeper holds it"
+    );
+    assert!(
+        store
+            .adopt_runs(BoxId::new(), second_owner, swept, swept)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: a box that does not exist adopts nothing rather than refusing"
+    );
+}
+
+/// `create_step`, the two compare-and-sets and `supersede_step`, with the order `run_steps`
+/// answers in: the judge sorts before its candidates. The `MemStore` twin is
+/// `mem.rs::step_creation_and_the_two_compare_and_sets_follow_the_law`.
+async fn step_create_and_transition_law<S: WriteStore>(store: &S) {
+    const CASE: &str = "step_create_and_transition_law";
+    let request = new_run_step(ids::RUN_2, 1, 1, 0);
+    let step = request.id;
+    let created = store.create_step(request).await.expect(CASE);
+    assert_eq!(
+        created.status,
+        StepStatus::Pending,
+        "{CASE}: a step starts pending"
+    );
+    assert_eq!(
+        (
+            created.started_at,
+            created.finished_at,
+            created.selected,
+            created.gate_outcome,
+            created.exit_code,
+            created.verify_outcome,
+            created.promoted_at,
+        ),
+        (None, None, None, None, None, None, None),
+        "{CASE}: every settle column is NULL on a fresh step"
+    );
+    assert_eq!(
+        step_row(CASE, store, ids::RUN_2, step).await,
+        created,
+        "{CASE}: the row reads back as `create_step` returned it"
+    );
+
+    let repeat = store.create_step(new_run_step(ids::RUN_2, 0, 1, 0)).await;
+    assert!(
+        matches!(repeat, Err(StoreError::Constraint(_))),
+        "{CASE}: (run_id, position, attempt, fanout_index) is unique, got {repeat:?}"
+    );
+    let orphan = store.create_step(new_run_step(RunId::new(), 9, 1, 0)).await;
+    assert!(
+        matches!(orphan, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown run is a foreign key refusal, got {orphan:?}"
+    );
+
+    let judge = new_run_step(ids::RUN_2, 1, 1, -1);
+    let judge_id = judge.id;
+    store.create_step(judge).await.expect(CASE);
+    assert_eq!(
+        store
+            .run_steps(ids::RUN_2)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        vec![ids::STEP_R2_PRD, judge_id, step],
+        "{CASE}: (position, attempt, fanout_index) order puts the judge first"
+    );
+
+    let started = Utc::now();
+    let finished = started + TimeDelta::minutes(1);
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, started)
+            .await
+            .expect(CASE),
+        "{CASE}: pending -> running matches"
+    );
+    assert_eq!(
+        step_row(CASE, store, ids::RUN_2, step).await.started_at,
+        Some(started),
+        "{CASE}: the move to running stamps started_at"
+    );
+    assert!(
+        store
+            .transition_step(step, StepStatus::Running, StepStatus::Done, finished)
+            .await
+            .expect(CASE),
+        "{CASE}: running -> done matches"
+    );
+    assert_eq!(
+        step_row(CASE, store, ids::RUN_2, step).await.finished_at,
+        Some(finished),
+        "{CASE}: a terminal move stamps finished_at"
+    );
+
+    let settled = step_row(CASE, store, ids::RUN_2, step).await;
+    let illegal = store
+        .transition_step(step, StepStatus::Done, StepStatus::Running, finished)
+        .await;
+    assert!(
+        matches!(illegal, Err(StoreError::Constraint(_))),
+        "{CASE}: done reaches only superseded, got {illegal:?}"
+    );
+    assert_eq!(
+        step_row(CASE, store, ids::RUN_2, step).await,
+        settled,
+        "{CASE}: a refused pair leaves the row byte-identical"
+    );
+    assert!(
+        !store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, finished)
+            .await
+            .expect(CASE),
+        "{CASE}: a stale `from` on a legal pair is Ok(false)"
+    );
+
+    assert!(
+        store
+            .transition_run(ids::RUN_2, RunStatus::Queued, RunStatus::Running, started)
+            .await
+            .expect(CASE),
+        "{CASE}: queued -> running matches"
+    );
+    assert_eq!(
+        run_row(CASE, store, ids::RUN_2).await.started_at,
+        Some(started),
+        "{CASE}: the run's move to running stamps started_at"
+    );
+    assert!(
+        store
+            .transition_run(ids::RUN_2, RunStatus::Running, RunStatus::Done, finished)
+            .await
+            .expect(CASE),
+        "{CASE}: running -> done matches"
+    );
+    assert_eq!(
+        run_row(CASE, store, ids::RUN_2).await.finished_at,
+        Some(finished),
+        "{CASE}: a terminal run move stamps finished_at"
+    );
+    let terminal = store
+        .transition_run(ids::RUN_2, RunStatus::Done, RunStatus::Queued, finished)
+        .await;
+    assert!(
+        matches!(terminal, Err(StoreError::Constraint(_))),
+        "{CASE}: a terminal run reaches nothing, got {terminal:?}"
+    );
+
+    let fresh = new_run_step(ids::RUN_2, 2, 1, 0);
+    let fresh_id = fresh.id;
+    store.create_step(fresh).await.expect(CASE);
+    store.supersede_step(fresh_id).await.expect(CASE);
+    assert_eq!(
+        step_row(CASE, store, ids::RUN_2, fresh_id).await.status,
+        StepStatus::Superseded,
+        "{CASE}: pending -> superseded is §4.4's loop half"
+    );
+    store.supersede_step(step).await.expect(CASE);
+    let running = new_run_step(ids::RUN_2, 3, 1, 0);
+    let running_id = running.id;
+    store.create_step(running).await.expect(CASE);
+    assert!(
+        store
+            .transition_step(
+                running_id,
+                StepStatus::Pending,
+                StepStatus::Running,
+                started
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the fourth step starts"
+    );
+    let live = store.supersede_step(running_id).await;
+    assert!(
+        matches!(live, Err(StoreError::Constraint(_))),
+        "{CASE}: running does not reach superseded, got {live:?}"
+    );
+    let gone = store.supersede_step(StepId::new()).await;
+    assert!(
+        matches!(
+            gone,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {gone:?}"
+    );
+
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
+        Status::Queued,
+        "{CASE}: no run or step move touches the item — only claim_run, promote_step, create_run \
+         and close_out do"
+    );
+}
+
+/// `finish_step` writes the settle columns and never `status`; `usage` and `trim_record` `None`
+/// leave the column, every other field overwrites. The `MemStore` twin is
+/// `mem.rs::finish_step_settles_the_columns_and_leaves_usage_when_it_is_none`.
+///
+/// Leg (d) is the writer-side half of the three-builder pin: what `finish_step` stores has to come
+/// back through the `RunStepSummary` the Runs sub-tab reads, on every backend.
+async fn finish_step_records_the_settle<S: WriteStore>(store: &S) {
+    const CASE: &str = "finish_step_records_the_settle";
+    let finished = Utc::now();
+    store
+        .finish_step(
+            ids::STEP_R2_PRD,
+            StepOutcome {
+                exit_code: Some(0),
+                usage: Some(json!({ "input_tokens": 3 })),
+                trim_record: Some(json!({ "estimated_after": 11, "sections": [] })),
+                verify_outcome: Some(VerifyOutcome::Pass),
+                verify_exit_code: Some(0),
+                finished_at: finished,
+            },
+        )
+        .await
+        .expect(CASE);
+    let settled = step_row(CASE, store, ids::RUN_2, ids::STEP_R2_PRD).await;
+    assert_eq!(
+        settled.status,
+        StepStatus::Pending,
+        "{CASE}: finish_step never moves status"
+    );
+    assert_eq!(settled.exit_code, Some(0), "{CASE}: exit_code is written");
+    assert_eq!(
+        settled.verify_outcome,
+        Some(VerifyOutcome::Pass),
+        "{CASE}: verify_outcome is written"
+    );
+    assert_eq!(
+        settled.verify_exit_code,
+        Some(0),
+        "{CASE}: so is its exit code"
+    );
+    assert_eq!(
+        settled.finished_at,
+        Some(finished),
+        "{CASE}: and the caller's clock"
+    );
+
+    store
+        .finish_step(
+            ids::STEP_R2_PRD,
+            StepOutcome {
+                exit_code: Some(1),
+                finished_at: finished,
+                ..StepOutcome::default()
+            },
+        )
+        .await
+        .expect(CASE);
+    let second = step_row(CASE, store, ids::RUN_2, ids::STEP_R2_PRD).await;
+    assert_eq!(second.exit_code, Some(1), "{CASE}: exit_code overwrites");
+    assert_eq!(
+        second.usage,
+        Some(json!({ "input_tokens": 3 })),
+        "{CASE}: a None usage leaves the column the summer wrote"
+    );
+    assert_eq!(
+        second.trim_record,
+        Some(json!({ "estimated_after": 11, "sections": [] })),
+        "{CASE}: a None trim_record leaves the column the assembler wrote"
+    );
+    assert_eq!(
+        second.verify_outcome, None,
+        "{CASE}: verify_outcome is not one of the two that leave"
+    );
+
+    let unknown = store
+        .finish_step(StepId::new(), StepOutcome::default())
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {unknown:?}"
+    );
+
+    let summary = store
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.id == ids::RUN_2)
+        .unwrap_or_else(|| panic!("{CASE}: FEAT-3 owns RUN_2"));
+    let listed = summary
+        .steps
+        .iter()
+        .find(|row| row.id == ids::STEP_R2_PRD)
+        .unwrap_or_else(|| panic!("{CASE}: RUN_2's summary lists its step"));
+    assert_eq!(
+        (
+            listed.usage.clone(),
+            listed.exit_code,
+            listed.verify_outcome,
+            listed.selected,
+            listed.promoted_at,
+        ),
+        (
+            second.usage.clone(),
+            second.exit_code,
+            second.verify_outcome,
+            second.selected,
+            second.promoted_at,
+        ),
+        "{CASE}: the summary projection and the row agree column for column"
+    );
+    assert_eq!(
+        listed.agent_name.as_deref(),
+        Some("claude"),
+        "{CASE}: agent_name is denormalised from agent_id on every backend"
+    );
+}
+
+/// `R-ORCH-2`'s four answers, §4.8's promotion — which lifts the step, its run and its item in one
+/// transaction — and the refusal note of ANA-2 invariant 7. The `MemStore` twins are
+/// `mem.rs::gate_answers_write_their_outcome_and_promotion_lifts_the_run_and_the_item` and
+/// `mem.rs::add_note_writes_the_row_and_refuses_every_dangling_reference`.
+async fn gate_answers_write_their_outcome<S: WriteStore>(store: &S) {
+    const CASE: &str = "gate_answers_write_their_outcome";
+    let at = Utc::now();
+    let approved = gated_step(CASE, store, new_run_step(ids::RUN_2, 1, 1, 0)).await;
+    let rejected = gated_step(CASE, store, new_run_step(ids::RUN_2, 2, 1, 0)).await;
+    let retried = gated_step(CASE, store, new_run_step(ids::RUN_2, 3, 1, 0)).await;
+    let skipped = gated_step(CASE, store, new_run_step(ids::RUN_2, 4, 1, 0)).await;
+
+    assert!(
+        store
+            .answer_gate(
+                approved,
+                GateOutcome::Approved,
+                Some("looks right".to_owned()),
+                at
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: an awaiting step takes its answer"
+    );
+    let row = step_row(CASE, store, ids::RUN_2, approved).await;
+    assert_eq!(row.status, StepStatus::Done, "{CASE}: approved -> done");
+    assert_eq!(
+        row.gate_outcome,
+        Some(GateOutcome::Approved),
+        "{CASE}: the answer is recorded"
+    );
+    assert_eq!(
+        row.gate_note.as_deref(),
+        Some("looks right"),
+        "{CASE}: so is the note"
+    );
+    assert_eq!(row.finished_at, Some(at), "{CASE}: and the caller's clock");
+    assert!(
+        !store
+            .answer_gate(approved, GateOutcome::Approved, None, at)
+            .await
+            .expect(CASE),
+        "{CASE}: a step that is no longer awaiting cannot be answered twice"
+    );
+
+    for (step, outcome, expected) in [
+        (rejected, GateOutcome::Rejected, StepStatus::Failed),
+        (retried, GateOutcome::Retried, StepStatus::Superseded),
+        (skipped, GateOutcome::Skipped, StepStatus::Done),
+    ] {
+        assert!(
+            store
+                .answer_gate(step, outcome, None, at)
+                .await
+                .expect(CASE),
+            "{CASE}: {outcome} is answerable"
+        );
+        assert_eq!(
+            step_row(CASE, store, ids::RUN_2, step).await.status,
+            expected,
+            "{CASE}: {outcome} settles the step at {expected}"
+        );
+    }
+    let unknown = store
+        .answer_gate(StepId::new(), GateOutcome::Approved, None, at)
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {unknown:?}"
+    );
+
+    assert!(
+        store
+            .transition_run(ids::RUN_2, RunStatus::Queued, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the run starts"
+    );
+    assert!(
+        store
+            .transition(ids::HTUI_FEAT_3, Status::Queued, Status::InProgress)
+            .await
+            .expect(CASE),
+        "{CASE}: and so does its item"
+    );
+    store.promote_step(rejected, at).await.expect(CASE);
+    let promoted = step_row(CASE, store, ids::RUN_2, rejected).await;
+    assert_eq!(
+        promoted.status,
+        StepStatus::AwaitingApproval,
+        "{CASE}: a failed step under a live run is promotable (§4.8)"
+    );
+    assert_eq!(
+        promoted.promoted_at,
+        Some(at),
+        "{CASE}: promoted_at is stamped"
+    );
+    assert_eq!(
+        run_row(CASE, store, ids::RUN_2).await.status,
+        RunStatus::AwaitingApproval,
+        "{CASE}: the run is lifted with the step"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval,
+        "{CASE}: and so is the item, in the same transaction"
+    );
+    let settled = store.promote_step(approved, at).await;
+    assert!(
+        matches!(settled, Err(StoreError::Constraint(_))),
+        "{CASE}: a done step is not promotable, got {settled:?}"
+    );
+
+    let written = store
+        .add_note(new_note(ids::HTUI_FEAT_3, ids::USER, Some(rejected)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.notes(ids::HTUI_FEAT_3).await.expect(CASE).last(),
+        Some(&written),
+        "{CASE}: the returned note is the stored note"
+    );
+    let no_author = store
+        .add_note(new_note(ids::HTUI_FEAT_3, UserId::new(), None))
+        .await;
+    assert!(
+        matches!(no_author, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown author is a foreign key refusal, got {no_author:?}"
+    );
+    let no_item = store
+        .add_note(new_note(ItemId::new(), ids::USER, None))
+        .await;
+    assert!(
+        matches!(no_item, Err(StoreError::Constraint(_))),
+        "{CASE}: so is an unknown item, got {no_item:?}"
+    );
+}
+
+/// ANA-2 §4.5's bookkeeping is one transaction (plan D6): a refused winner leaves every candidate
+/// exactly as it was, and the selection is what `resolve_inputs` reads afterwards.
+///
+/// The `MemStore` twins are `mem.rs::select_fanout_settles_every_candidate_or_none` and
+/// `mem.rs::resolve_inputs_prefers_this_run_and_skips_a_loser`.
+async fn select_fanout_is_one_transaction<S: WriteStore>(store: &S) {
+    const CASE: &str = "select_fanout_is_one_transaction";
+    let at = Utc::now();
+    let winner = gated_step(CASE, store, new_run_step(ids::RUN_2, 1, 1, 0)).await;
+    let loser = gated_step(CASE, store, new_run_step(ids::RUN_2, 1, 1, 1)).await;
+    let failed = gated_step(CASE, store, new_run_step(ids::RUN_2, 1, 1, 2)).await;
+    let elsewhere = gated_step(CASE, store, new_run_step(ids::RUN_2, 2, 1, 0)).await;
+    let judge = new_run_step(ids::RUN_2, 1, 1, -1);
+    let judge_id = judge.id;
+    store.create_step(judge).await.expect(CASE);
+    assert!(
+        store
+            .transition_step(judge_id, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the judge runs"
+    );
+    assert!(
+        store
+            .answer_gate(failed, GateOutcome::Rejected, None, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the third candidate fails"
+    );
+
+    let before = step_row(CASE, store, ids::RUN_2, loser).await;
+    let wrong_slot = store.select_fanout(ids::RUN_2, 1, 1, elsewhere, None).await;
+    assert!(
+        matches!(wrong_slot, Err(StoreError::Constraint(_))),
+        "{CASE}: a winner from another position is refused, got {wrong_slot:?}"
+    );
+    let absent = store
+        .select_fanout(ids::RUN_2, 1, 1, StepId::new(), None)
+        .await;
+    assert!(
+        matches!(
+            absent,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown winner is NotFound, got {absent:?}"
+    );
+    assert_eq!(
+        step_row(CASE, store, ids::RUN_2, loser).await,
+        before,
+        "{CASE}: a refused selection writes nothing at all"
+    );
+
+    let by_winner = store
+        .write_document(new_document(
+            ids::HTUI_FEAT_3,
+            "implementation",
+            Some(winner),
+        ))
+        .await
+        .expect(CASE);
+    let by_loser = store
+        .write_document(new_document(
+            ids::HTUI_FEAT_3,
+            "implementation",
+            Some(loser),
+        ))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (by_winner.version, by_loser.version),
+        (1, 2),
+        "{CASE}: the loser holds the higher version, which is what makes (b) a real contrast"
+    );
+
+    store
+        .select_fanout(ids::RUN_2, 1, 1, winner, Some("shorter diff".to_owned()))
+        .await
+        .expect(CASE);
+    let settled = |id| step_row(CASE, store, ids::RUN_2, id);
+    let won = settled(winner).await;
+    assert_eq!(
+        (won.selected, won.status),
+        (Some(true), StepStatus::Done),
+        "{CASE}: the winner is selected and done"
+    );
+    let lost = settled(loser).await;
+    assert_eq!(
+        (lost.selected, lost.status),
+        (Some(false), StepStatus::Superseded),
+        "{CASE}: an awaiting loser is superseded"
+    );
+    let rejected = settled(failed).await;
+    assert_eq!(
+        (rejected.selected, rejected.status),
+        (Some(false), StepStatus::Failed),
+        "{CASE}: a failed loser is marked but keeps its status"
+    );
+    let arbiter = settled(judge_id).await;
+    assert_eq!(
+        (arbiter.status, arbiter.gate_note.as_deref()),
+        (StepStatus::Done, Some("shorter diff")),
+        "{CASE}: the judge is settled with the reason"
+    );
+    assert_eq!(
+        settled(elsewhere).await.selected,
+        None,
+        "{CASE}: another position is not part of this fan-out"
+    );
+
+    let resolved = store
+        .resolve_inputs(ids::HTUI_FEAT_3, ids::RUN_2, &["implementation".to_owned()])
+        .await
+        .expect(CASE);
+    assert_eq!(
+        resolved
+            .first()
+            .and_then(|row| row.document.as_ref())
+            .map(|row| row.id),
+        Some(by_winner.id),
+        "{CASE}: `selected IS NOT FALSE` skips the loser's higher version"
+    );
+    assert_eq!(
+        store
+            .documents_of_kinds(ids::HTUI_FEAT_3, &["implementation".to_owned()])
+            .await
+            .expect(CASE)
+            .first()
+            .map(|row| row.id),
+        Some(by_loser.id),
+        "{CASE}: documents_of_kinds excludes no loser — plan D2's contrast"
+    );
+
+    let listed = store
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.id == ids::RUN_2)
+        .unwrap_or_else(|| panic!("{CASE}: FEAT-3 owns RUN_2"));
+    assert_eq!(
+        listed
+            .steps
+            .iter()
+            .find(|row| row.id == winner)
+            .and_then(|row| row.selected),
+        Some(true),
+        "{CASE}: the Runs sub-tab's projection carries the verdict"
+    );
+}
+
+/// `run_step_tree` and `run_step_commit` upsert on `(run_step_id, repo_id)`, read back in
+/// `repo_id` order, and are counted by a project delete — two tables `MemStore` never held before
+/// MOD-4 (plan D12). The `MemStore` twin is
+/// `mem.rs::trees_and_commits_upsert_on_their_repo_key_and_the_delete_counts_them`; the cascade
+/// itself is `pg_criteria::step_tree_rows_cascade_with_their_step` on Postgres.
+async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
+    const CASE: &str = "trees_and_commits_round_trip";
+    let core = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    let docs = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "docs", false))
+        .await
+        .expect(CASE)
+        .id;
+    let (first, second) = if core < docs {
+        (core, docs)
+    } else {
+        (docs, core)
+    };
+
+    let tree = |repo: RepoId, dirty: bool| RunStepTree {
+        run_step_id: ids::STEP_R2_PRD,
+        repo_id: repo,
+        mode: Isolation::Worktree,
+        path: "/srv/trees/prd".to_owned(),
+        base_ref: "main".to_owned(),
+        dirty,
+    };
+    store
+        .upsert_step_tree(ids::STEP_R2_PRD, &[tree(second, false), tree(first, false)])
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store
+            .step_trees(ids::STEP_R2_PRD)
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|row| row.repo_id)
+            .collect::<Vec<_>>(),
+        vec![first, second],
+        "{CASE}: repo_id order regardless of input order"
+    );
+    store
+        .upsert_step_tree(ids::STEP_R2_PRD, &[tree(first, true)])
+        .await
+        .expect(CASE);
+    let trees = store.step_trees(ids::STEP_R2_PRD).await.expect(CASE);
+    assert_eq!(
+        trees.len(),
+        2,
+        "{CASE}: the upsert replaced rather than inserted"
+    );
+    assert!(
+        trees.first().is_some_and(|row| row.dirty),
+        "{CASE}: and it replaced on the key"
+    );
+
+    let stray = RunStepTree {
+        run_step_id: ids::STEP_PLAN,
+        ..tree(first, false)
+    };
+    let foreign = store.upsert_step_tree(ids::STEP_R2_PRD, &[stray]).await;
+    assert!(
+        matches!(foreign, Err(StoreError::Constraint(_))),
+        "{CASE}: a row naming another step is refused, got {foreign:?}"
+    );
+    let no_repo = store
+        .upsert_step_tree(ids::STEP_R2_PRD, &[tree(RepoId::new(), false)])
+        .await;
+    assert!(
+        matches!(no_repo, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown repo is a foreign key refusal, got {no_repo:?}"
+    );
+    assert_eq!(
+        store.step_trees(ids::STEP_R2_PRD).await.expect(CASE).len(),
+        2,
+        "{CASE}: neither refusal wrote a row"
+    );
+    let no_step = store.upsert_step_tree(StepId::new(), &[]).await;
+    assert!(
+        matches!(
+            no_step,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an empty slice still checks the step, got {no_step:?}"
+    );
+    store
+        .upsert_step_tree(ids::STEP_R2_PRD, &[])
+        .await
+        .expect(CASE);
+
+    let commit = |repo: RepoId, after: Option<&str>| RunStepCommit {
+        run_step_id: ids::STEP_R2_PRD,
+        repo_id: repo,
+        before_hash: "0000000000000000000000000000000000000000".to_owned(),
+        after_hash: after.map(ToOwned::to_owned),
+    };
+    store
+        .record_commits(
+            ids::STEP_R2_PRD,
+            &[commit(second, None), commit(first, None)],
+        )
+        .await
+        .expect(CASE);
+    store
+        .record_commits(ids::STEP_R2_PRD, &[commit(first, Some("deadbeef"))])
+        .await
+        .expect(CASE);
+    let commits = store.step_commits(ids::STEP_R2_PRD).await.expect(CASE);
+    assert_eq!(
+        commits.iter().map(|row| row.repo_id).collect::<Vec<_>>(),
+        vec![first, second],
+        "{CASE}: repo_id order, and still two rows"
+    );
+    assert_eq!(
+        commits.first().and_then(|row| row.after_hash.as_deref()),
+        Some("deadbeef"),
+        "{CASE}: after_hash None then Some is an update, not a second row"
+    );
+    let stray_commit = RunStepCommit {
+        run_step_id: ids::STEP_PLAN,
+        ..commit(first, None)
+    };
+    let foreign_commit = store
+        .record_commits(ids::STEP_R2_PRD, &[stray_commit])
+        .await;
+    assert!(
+        matches!(foreign_commit, Err(StoreError::Constraint(_))),
+        "{CASE}: a commit row naming another step is refused, got {foreign_commit:?}"
+    );
+    let no_commit_repo = store
+        .record_commits(ids::STEP_R2_PRD, &[commit(RepoId::new(), None)])
+        .await;
+    assert!(
+        matches!(no_commit_repo, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown repo is a foreign key refusal, got {no_commit_repo:?}"
+    );
+    let no_commit_step = store.record_commits(StepId::new(), &[]).await;
+    assert!(
+        matches!(
+            no_commit_step,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an empty slice still checks the step, got {no_commit_step:?}"
+    );
+    store
+        .record_commits(ids::STEP_R2_PRD, &[])
+        .await
+        .expect(CASE);
+
+    let reach = store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture project exists"));
+    assert_eq!(
+        (reach.run_step_trees, reach.run_step_commits),
+        (2, 2),
+        "{CASE}: the delete counts both tables (plan D12)"
+    );
+    let taken = store.delete_project(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(taken, reach, "{CASE}: the report equals the act");
+    assert!(
+        store
+            .step_trees(ids::STEP_R2_PRD)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: the tree rows went with their step"
+    );
+    assert!(
+        store
+            .step_commits(ids::STEP_R2_PRD)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: and so did the commit rows"
+    );
+}
+
+/// The version is allocated per `(item, kind)` inside the transaction (plan D6), and ANA-2 §4.2's
+/// resolver ranks this run's output above another run's above a hand-written document.
+///
+/// The `MemStore` twin is `mem.rs::write_document_allocates_the_next_version_of_its_kind`; the
+/// thing only Postgres can show — that two concurrent writers cannot allocate the same version —
+/// is `pg_criteria::document_versions_do_not_collide_under_contention`.
+async fn write_document_allocates_its_version<S: WriteStore>(store: &S) {
+    const CASE: &str = "write_document_allocates_its_version";
+    let third = store
+        .write_document(new_document(ids::HTUI_FEAT_1, "plan", Some(ids::STEP_PLAN)))
+        .await
+        .expect(CASE);
+    assert_eq!(third.version, 3, "{CASE}: the fixture holds plan v1 and v2");
+    let fourth = store
+        .write_document(new_document(ids::HTUI_FEAT_1, "plan", None))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        fourth.version, 4,
+        "{CASE}: the next call takes the next number"
+    );
+    let fresh = store
+        .write_document(new_document(ids::HTUI_FEAT_1, "review", None))
+        .await
+        .expect(CASE);
+    assert_eq!(fresh.version, 1, "{CASE}: a kind with no rows starts at 1");
+    let heads = store.documents(ids::HTUI_FEAT_1).await.expect(CASE);
+    for id in [third.id, fourth.id, fresh.id] {
+        assert!(
+            heads.iter().any(|head| head.id == id),
+            "{CASE}: {id} is listed among the item's documents"
+        );
+    }
+
+    let no_item = store
+        .write_document(new_document(ItemId::new(), "plan", None))
+        .await;
+    assert!(
+        matches!(no_item, Err(StoreError::NotFound { entity: "item", .. })),
+        "{CASE}: an unknown item is NotFound, got {no_item:?}"
+    );
+    let no_step = store
+        .write_document(new_document(ids::HTUI_FEAT_1, "plan", Some(StepId::new())))
+        .await;
+    assert!(
+        matches!(no_step, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown producing step is a foreign key refusal, got {no_step:?}"
+    );
+    let duplicate = store
+        .write_document(NewDocument {
+            id: third.id,
+            ..new_document(ids::HTUI_FEAT_1, "plan", None)
+        })
+        .await;
+    assert!(
+        matches!(duplicate, Err(StoreError::Constraint(_))),
+        "{CASE}: a duplicate id is Constraint, got {duplicate:?}"
+    );
+
+    // The preference leg: two runs of one item, each with a step, and a hand-written version on
+    // top. Nothing here is a fan-out loser, so `selected IS NOT FALSE` admits every row and the
+    // ranking is what decides.
+    let second_run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert!(
+        store
+            .transition(ids::HTUI_ANA_2, Status::Queued, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: queued -> open frees the item for a second run"
+    );
+    let third_run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let step_of_second = new_run_step(second_run, 0, 1, 0);
+    let second_step = step_of_second.id;
+    store.create_step(step_of_second).await.expect(CASE);
+    let step_of_third = new_run_step(third_run, 0, 1, 0);
+    let third_step = step_of_third.id;
+    store.create_step(step_of_third).await.expect(CASE);
+
+    let by_second = store
+        .write_document(new_document(ids::HTUI_ANA_2, "research", Some(second_step)))
+        .await
+        .expect(CASE);
+    let by_third = store
+        .write_document(new_document(ids::HTUI_ANA_2, "research", Some(third_step)))
+        .await
+        .expect(CASE);
+    let by_hand = store
+        .write_document(new_document(ids::HTUI_ANA_2, "research", None))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (by_second.version, by_third.version, by_hand.version),
+        (1, 2, 3),
+        "{CASE}: the hand-written version is the highest, so the ranking has to bite"
+    );
+
+    let picked = |run| async move {
+        store
+            .resolve_inputs(ids::HTUI_ANA_2, run, &["research".to_owned()])
+            .await
+            .expect(CASE)
+            .first()
+            .and_then(|row| row.document.as_ref())
+            .map(|row| row.id)
+    };
+    assert_eq!(
+        picked(second_run).await,
+        Some(by_second.id),
+        "{CASE}: this run's own output wins"
+    );
+    assert_eq!(
+        picked(third_run).await,
+        Some(by_third.id),
+        "{CASE}: and so does the other run's, for the other run"
+    );
+    assert_eq!(
+        picked(ids::RUN_1).await,
+        Some(by_third.id),
+        "{CASE}: for a third run, any run's output outranks hand-written and the highest \
+         version wins among equals"
+    );
+    assert_eq!(
+        store
+            .documents_of_kinds(ids::HTUI_ANA_2, &["research".to_owned()])
+            .await
+            .expect(CASE)
+            .first()
+            .map(|row| row.id),
+        Some(by_hand.id),
+        "{CASE}: documents_of_kinds ranks by version alone — plan D2's contrast"
+    );
+    let with_gap = store
+        .resolve_inputs(
+            ids::HTUI_ANA_2,
+            second_run,
+            &["research".to_owned(), "nope".to_owned()],
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        with_gap
+            .iter()
+            .map(|row| row.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["research", "nope"],
+        "{CASE}: one entry per requested kind, in request order"
+    );
+    assert!(
+        with_gap.get(1).is_some_and(|row| row.document.is_none()),
+        "{CASE}: a kind the item has no eligible row for is carried as None (blueprint F-O)"
+    );
+}
+
+/// `R-TUI-9`'s close-out is one transaction, refused while any run of the item is active. The
+/// `MemStore` twin is `mem.rs::close_out_refuses_a_live_run_and_otherwise_writes_all_three_effects`.
+async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "close_out_refuses_a_live_run";
+    let repo = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    let commits = [RunStepCommit {
+        run_step_id: ids::STEP_IMPL,
+        repo_id: repo,
+        before_hash: "0000000000000000000000000000000000000000".to_owned(),
+        after_hash: Some("deadbeef".to_owned()),
+    }];
+
+    let live = store
+        .close_out(
+            ids::HTUI_FEAT_3,
+            new_document(ids::HTUI_FEAT_3, "summary", None),
+            &[],
+        )
+        .await;
+    let StoreError::Constraint(sentence) = live.expect_err(&format!(
+        "{CASE}: FEAT-3 still owns the queued RUN_2, so it cannot be closed out"
+    )) else {
+        panic!("{CASE}: a live run is Constraint, not NotFound")
+    };
+    assert!(
+        sentence.contains(&ids::RUN_2.to_string()),
+        "{CASE}: the refusal names the run that is in the way, got `{sentence}`"
+    );
+    assert!(
+        store
+            .documents(ids::HTUI_FEAT_3)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: the refusal wrote no summary"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
+        Status::Queued,
+        "{CASE}: nor moved the item"
+    );
+
+    for (item, summary, why) in [
+        (
+            ids::HTUI_ANA_2,
+            new_document(ids::HTUI_ANA_2, "summary", None),
+            "open does not reach closed (ANA-2 §4.3)",
+        ),
+        (
+            ids::HTUI_FEAT_1,
+            new_document(ids::HTUI_FEAT_1, "plan", None),
+            "the document must be a summary",
+        ),
+        (
+            ids::HTUI_FEAT_1,
+            new_document(ids::HTUI_ANA_2, "summary", None),
+            "the summary must name the item being closed",
+        ),
+    ] {
+        let refused = store.close_out(item, summary, &[]).await;
+        assert!(
+            matches!(refused, Err(StoreError::Constraint(_))),
+            "{CASE}: {why}, got {refused:?}"
+        );
+    }
+    let unknown = store
+        .close_out(
+            ItemId::new(),
+            new_document(ItemId::new(), "summary", None),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "item", .. })),
+        "{CASE}: an unknown item is NotFound, got {unknown:?}"
+    );
+    assert_eq!(
+        store.documents(ids::HTUI_FEAT_1).await.expect(CASE).len(),
+        3,
+        "{CASE}: no refusal wrote a document"
+    );
+
+    assert!(
+        store
+            .transition(ids::HTUI_FEAT_1, Status::InProgress, Status::Done)
+            .await
+            .expect(CASE),
+        "{CASE}: the item finishes before it is closed"
+    );
+    let written = store
+        .close_out(
+            ids::HTUI_FEAT_1,
+            new_document(ids::HTUI_FEAT_1, "summary", None),
+            &commits,
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(written.version, 1, "{CASE}: the first summary of the item");
+    let closed = item_row(CASE, store, ids::HTUI_FEAT_1).await;
+    assert_eq!(closed.status, Status::Closed, "{CASE}: the item is closed");
+    assert!(
+        closed.closed_at.is_some(),
+        "{CASE}: closed_at tracks the current status"
+    );
+    assert_eq!(
+        store
+            .step_commits(ids::STEP_IMPL)
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|row| row.repo_id)
+            .collect::<Vec<_>>(),
+        vec![repo],
+        "{CASE}: the close-out's commits landed on their own step"
+    );
+}
+
+/// Every pair ANA-2 §4.3 leaves out is [`StoreError::Constraint`] with no write, on all three
+/// tables — and plan D14's precedence holds: an unknown id is `NotFound` even when the pair is
+/// also illegal. `mem.rs::supersede_and_fail_run_refuse_what_the_law_forbids` covers the same
+/// ground for `fail_run` on `MemStore`.
+async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
+    const CASE: &str = "illegal_transitions_are_constraint";
+
+    for (from, to) in [
+        (Status::Open, Status::Queued),
+        (Status::Queued, Status::InProgress),
+        (Status::InProgress, Status::Done),
+    ] {
+        let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
+        assert_eq!(before.status, from, "{CASE}: the item is driven to {from}");
+        for target in Status::ALL.iter().copied() {
+            if from.can_move_to(target) {
+                continue;
+            }
+            let refused = store.transition(ids::HTUI_ANA_2, from, target).await;
+            assert!(
+                matches!(refused, Err(StoreError::Constraint(_))),
+                "{CASE}: item {from} -> {target} is outside §4.3, got {refused:?}"
+            );
+        }
+        assert_eq!(
+            item_row(CASE, store, ids::HTUI_ANA_2).await,
+            before,
+            "{CASE}: every refused item pair left the row byte-identical"
+        );
+        assert!(
+            store
+                .transition(ids::HTUI_ANA_2, from, to)
+                .await
+                .expect(CASE),
+            "{CASE}: {from} -> {to} is the sanctioned step on"
+        );
+    }
+
+    let at = Utc::now();
+    for (from, to) in [
+        (RunStatus::Queued, RunStatus::Running),
+        (RunStatus::Running, RunStatus::AwaitingApproval),
+    ] {
+        let before = run_row(CASE, store, ids::RUN_2).await;
+        assert_eq!(before.status, from, "{CASE}: the run is driven to {from}");
+        for target in RunStatus::ALL.iter().copied() {
+            if from.can_move_to(target) {
+                continue;
+            }
+            let refused = store.transition_run(ids::RUN_2, from, target, at).await;
+            assert!(
+                matches!(refused, Err(StoreError::Constraint(_))),
+                "{CASE}: run {from} -> {target} is outside §4.3, got {refused:?}"
+            );
+        }
+        assert_eq!(
+            run_row(CASE, store, ids::RUN_2).await,
+            before,
+            "{CASE}: every refused run pair left the row byte-identical"
+        );
+        assert!(
+            store
+                .transition_run(ids::RUN_2, from, to, at)
+                .await
+                .expect(CASE),
+            "{CASE}: {from} -> {to} is the sanctioned step on"
+        );
+    }
+
+    for (from, to) in [
+        (StepStatus::Pending, StepStatus::Running),
+        (StepStatus::Running, StepStatus::Done),
+        (StepStatus::Done, StepStatus::Superseded),
+    ] {
+        let before = step_row(CASE, store, ids::RUN_2, ids::STEP_R2_PRD).await;
+        assert_eq!(before.status, from, "{CASE}: the step is driven to {from}");
+        for target in StepStatus::ALL.iter().copied() {
+            if from.can_move_to(target) {
+                continue;
+            }
+            let refused = store
+                .transition_step(ids::STEP_R2_PRD, from, target, at)
+                .await;
+            assert!(
+                matches!(refused, Err(StoreError::Constraint(_))),
+                "{CASE}: run_step {from} -> {target} is outside §4.3, got {refused:?}"
+            );
+        }
+        assert_eq!(
+            step_row(CASE, store, ids::RUN_2, ids::STEP_R2_PRD).await,
+            before,
+            "{CASE}: every refused step pair left the row byte-identical"
+        );
+        assert!(
+            store
+                .transition_step(ids::STEP_R2_PRD, from, to, at)
+                .await
+                .expect(CASE),
+            "{CASE}: {from} -> {to} is the sanctioned step on"
+        );
+    }
+
+    let item = store
+        .transition(ItemId::new(), Status::Queued, Status::Done)
+        .await;
+    assert!(
+        matches!(item, Err(StoreError::NotFound { entity: "item", .. })),
+        "{CASE}: plan D14 — an unknown item is NotFound even though the pair is illegal, got \
+         {item:?}"
+    );
+    let run = store
+        .transition_run(RunId::new(), RunStatus::Done, RunStatus::Queued, at)
+        .await;
+    assert!(
+        matches!(run, Err(StoreError::NotFound { entity: "run", .. })),
+        "{CASE}: and so is an unknown run, got {run:?}"
+    );
+    let step = store
+        .transition_step(StepId::new(), StepStatus::Done, StepStatus::Pending, at)
+        .await;
+    assert!(
+        matches!(
+            step,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: and an unknown step, got {step:?}"
+    );
+
+    store.fail_run(ids::RUN_2, "boom", at).await.expect(CASE);
+    let failed = run_row(CASE, store, ids::RUN_2).await;
+    assert_eq!(failed.status, RunStatus::Failed, "{CASE}: the run failed");
+    assert_eq!(
+        failed.failure.as_deref(),
+        Some("boom"),
+        "{CASE}: the reason is stored"
+    );
+    assert_eq!(
+        failed.finished_at,
+        Some(at),
+        "{CASE}: fail_run stamps finished_at from the caller's clock"
+    );
+    let again = store.fail_run(ids::RUN_2, "again", at).await;
+    let StoreError::Constraint(sentence) =
+        again.expect_err(&format!("{CASE}: a terminal run cannot fail twice"))
+    else {
+        panic!("{CASE}: a terminal run is Constraint, not NotFound")
+    };
+    assert!(
+        sentence.contains(RunStatus::Failed.as_str()) && sentence.contains("§4.3"),
+        "{CASE}: the refusal is `illegal_move`'s sentence, naming both statuses, got `{sentence}`"
+    );
+    let missing = store.fail_run(RunId::new(), "boom", at).await;
+    assert!(
+        matches!(missing, Err(StoreError::NotFound { entity: "run", .. })),
+        "{CASE}: an unknown run is NotFound, got {missing:?}"
     );
 }
 
