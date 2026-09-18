@@ -1331,6 +1331,101 @@ pub fn truncated(now: DateTime<Utc>) -> DateTime<Utc> {
     now.trunc_subsecs(TIMESTAMPTZ_DIGITS)
 }
 
+/// Builds an [`Engine`] over a `FakeOrchestrator`'s parts and dispatches one command.
+///
+/// **This is the wiring T3's `FakeOrchestrator::dispatch` left as a `todo!()`**, and it lives here
+/// rather than in `fake.rs` for the reason the file itself gives: every part is already public on
+/// the orchestrator, and what was missing was `engine.rs`. Putting it beside the `Engine` keeps
+/// `fake.rs` exactly as T3 shipped it, and lets `conformance.rs`'s `impl Orchestrate for
+/// FakeOrchestrator` call one function instead of re-deciding thirteen fields per case.
+///
+/// A fresh `Engine` per command is not a concession to the test: the engine holds nothing across a
+/// call (plan D16), so this is the shape milestone 6's Runs tab has too.
+///
+/// # Errors
+/// Every [`EngineError`] the walk raises.
+#[cfg(feature = "test-support")]
+pub async fn dispatch_fake(
+    orch: &crate::fake::FakeOrchestrator,
+    command: Command,
+) -> Result<CommandOutcome, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, phase: &str, attempt: i32| {
+        Box::new(orch.driver_for(phase, attempt)) as Box<dyn AgentDriver>
+    };
+    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    engine.dispatch(command).await
+}
+
+/// [`Engine::resume`] over the same parts (ANA-2 §12 criterion 3).
+///
+/// # Errors
+/// Every [`EngineError`] the walk raises.
+#[cfg(feature = "test-support")]
+pub async fn resume_fake(
+    orch: &crate::fake::FakeOrchestrator,
+    run: RunId,
+) -> Result<Resume, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, phase: &str, attempt: i32| {
+        Box::new(orch.driver_for(phase, attempt)) as Box<dyn AgentDriver>
+    };
+    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    engine.resume(run).await
+}
+
+/// The thirteen fields, filled from the harness.
+///
+/// `app` is read here rather than cached because `MemStore::set_app_setting` (`mem.rs:430`) is the
+/// only writer a case can reach for `step_deadline_seconds` — `SettingKey` is a closed enum of ten
+/// that does not carry it, and `ProjectPatch` has no `settings` field — so a map captured at
+/// construction would silently ignore the one knob the deadline case has.
+#[cfg(feature = "test-support")]
+async fn fake_parts<'a>(
+    orch: &'a crate::fake::FakeOrchestrator,
+    graphs: &'a crate::fake::FakeGraphSource<'a>,
+    driver: DriverFor<'a>,
+    scrubber: &'a dyn Scrubber,
+) -> Result<
+    EngineParts<
+        'a,
+        htui_core::store::MemStore,
+        crate::fake::FakeGraphSource<'a>,
+        crate::fake::FakeIsolator,
+        crate::fake::TestClock,
+        FirstCandidate,
+        crate::fake::FakeOrchestrator,
+    >,
+    EngineError,
+> {
+    let app = orch.store.app_settings().await?;
+    let box_profile = orch
+        .store
+        .box_profile(orch.box_id())
+        .await?
+        .ok_or(EngineError::Store(StoreError::NotFound {
+            entity: "box",
+            id: orch.box_id().to_string(),
+        }))?;
+    Ok(EngineParts {
+        store: &orch.store,
+        graphs,
+        isolator: &orch.isolator,
+        clock: &orch.clock,
+        selector: &FirstCandidate,
+        sink: orch,
+        driver,
+        scrubber,
+        app,
+        box_profile,
+        box_id: orch.box_id(),
+        owner: orch.owner(),
+        user: orch.user(),
+    })
+}
+
 /// Plan D13's harness-side document producer, wired to the seam the engine calls.
 ///
 /// It lives here rather than in `fake.rs` because [`SessionSink`] is `engine.rs`'s trait and T3
@@ -1359,16 +1454,13 @@ mod tests {
     use htui_agent::event::StopReason;
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        BoxProfile, Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewStepGraph, PhaseId,
-        PhasePatch, RepoId, RunMode, RunStatus, SnapshotCandidate, SnapshotPhase, Status,
-        StepGraphId, StepGraphPhase, StepStatus,
+        Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch,
+        RepoId, RunMode, RunStatus, SnapshotCandidate, SnapshotPhase, Status, StepGraphId,
+        StepGraphPhase, StepStatus,
     };
-    use htui_core::scrub::MinimalScrubber;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
-    use super::{
-        AgentSelector, Engine, EngineParts, FirstCandidate, NoSink, Resume, required_inputs,
-    };
+    use super::{AgentSelector, FirstCandidate, NoSink, Resume, required_inputs};
     use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
     use crate::fake::{FakeOrchestrator, ScriptedStep};
     use crate::isolate::Clock as _;
@@ -1378,41 +1470,28 @@ mod tests {
     ///
     /// The driver factory is a closure over the orchestrator, which is what `FakeDriver`'s
     /// "one script, once" rule needs (blueprint H-12): a fresh driver per `(phase, attempt)`.
+    /// The `FakeOrchestrator` plus the two edits a case has to make through real writers.
+    ///
+    /// `dispatch` and `resume` forward to [`super::dispatch_fake`] and [`super::resume_fake`],
+    /// which is exactly what T5's conformance binding calls — so these tests exercise the wiring
+    /// and not a second copy of it.
     struct Harness {
         orch: FakeOrchestrator,
-        scrubber: MinimalScrubber,
-        profile: BoxProfile,
     }
 
     impl Harness {
         async fn new() -> Self {
-            let orch = FakeOrchestrator::demo();
-            let profile = orch
-                .store
-                .box_profile(orch.box_id())
-                .await
-                .expect("MemStore never fails a read")
-                .expect("the demo fixture registers this box");
             Self {
-                orch,
-                scrubber: MinimalScrubber::new([]),
-                profile,
+                orch: FakeOrchestrator::demo(),
             }
         }
 
-        /// The `app_setting` map, read per dispatch rather than once.
-        ///
-        /// It is read late because `MemStore::set_app_setting` (`mem.rs:430`) is the **only**
-        /// writer a test can reach for `step_deadline_seconds`: `SettingKey` is a closed enum of
-        /// ten and does not carry it (`prompt/settings.rs:151-172`), and `ProjectPatch` has no
-        /// `settings` field at all (`model/hierarchy.rs:102-109`), so neither `set_setting` nor
-        /// `update_project` can plant one.
-        async fn app(&self) -> BTreeMap<String, serde_json::Value> {
-            self.orch
-                .store
-                .app_settings()
-                .await
-                .expect("MemStore never fails a read")
+        async fn dispatch(&self, command: Command) -> Result<CommandOutcome, EngineError> {
+            super::dispatch_fake(&self.orch, command).await
+        }
+
+        async fn resume(&self, run: htui_core::model::RunId) -> Result<Resume, EngineError> {
+            super::resume_fake(&self.orch, run).await
         }
 
         /// Repoints the item at a clone of its graph whose phases `mutate` has edited.
@@ -1479,57 +1558,6 @@ mod tests {
                 )
                 .await
                 .expect("the item's version is current");
-        }
-
-        /// One dispatch through a freshly built engine. The engine holds nothing between calls
-        /// (plan D16), so building one per command is the shape production has too.
-        async fn dispatch(&self, command: Command) -> Result<CommandOutcome, EngineError> {
-            let graphs = self.orch.graphs();
-            let driver = |candidate: &SnapshotCandidate, phase: &str, attempt: i32| {
-                let _ = candidate;
-                Box::new(self.orch.driver_for(phase, attempt)) as Box<dyn AgentDriver>
-            };
-            let engine = Engine::new(EngineParts {
-                store: &self.orch.store,
-                graphs: &graphs,
-                isolator: &self.orch.isolator,
-                clock: &self.orch.clock,
-                selector: &FirstCandidate,
-                sink: &self.orch,
-                driver: &driver,
-                scrubber: &self.scrubber,
-                app: self.app().await,
-                box_profile: self.profile.clone(),
-                box_id: self.orch.box_id(),
-                owner: self.orch.owner(),
-                user: self.orch.user(),
-            });
-            engine.dispatch(command).await
-        }
-
-        /// `Engine::resume`, over the same parts.
-        async fn resume(&self, run: htui_core::model::RunId) -> Result<Resume, EngineError> {
-            let graphs = self.orch.graphs();
-            let driver = |candidate: &SnapshotCandidate, phase: &str, attempt: i32| {
-                let _ = candidate;
-                Box::new(self.orch.driver_for(phase, attempt)) as Box<dyn AgentDriver>
-            };
-            let engine = Engine::new(EngineParts {
-                store: &self.orch.store,
-                graphs: &graphs,
-                isolator: &self.orch.isolator,
-                clock: &self.orch.clock,
-                selector: &FirstCandidate,
-                sink: &self.orch,
-                driver: &driver,
-                scrubber: &self.scrubber,
-                app: self.app().await,
-                box_profile: self.profile.clone(),
-                box_id: self.orch.box_id(),
-                owner: self.orch.owner(),
-                user: self.orch.user(),
-            });
-            engine.resume(run).await
         }
 
         /// `ids::HTUI_FEAT_3` is seeded **`queued`** with a live `RUN_2` on it

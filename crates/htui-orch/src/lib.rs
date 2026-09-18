@@ -27,8 +27,10 @@ pub mod status;
 pub use command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 pub use engine::{
     AgentSelector, DriverFor, Engine, EngineParts, FirstCandidate, NoSink, Resume, SessionSink,
-    required_inputs,
+    live_step_at, required_inputs,
 };
+#[cfg(feature = "test-support")]
+pub use engine::{dispatch_fake, resume_fake};
 pub use gate::{
     Landing, LoopOutcome, LoopStop, Settle, SettleInput, StepFailure, Verdict, parse_verdict,
 };
