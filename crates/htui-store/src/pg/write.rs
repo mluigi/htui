@@ -2421,10 +2421,16 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)?
         .rows_affected();
         if moved != 1 {
-            return Err(StoreError::Constraint(concurrent_write(
-                "item",
+            // The item has been locked `FOR UPDATE` since before the law was consulted, so the
+            // status this `UPDATE` matches on is the status the refusal above was decided against
+            // and no other transaction can have moved it. Reported as a backend fault rather than
+            // dressed up as a caller's constraint, which is `update_item`'s precedent: the
+            // alternative sentence - a lost race between attempts - is one this writer has no
+            // attempts to lose.
+            return Err(StoreError::Backend(format!(
+                "item `{}` did not move `{status}` -> `queued` under the row lock this \
+                 transaction holds: no rule of ANA-2 §4.3 can produce this",
                 new.item_id,
-                "the status the run was queued against",
             )));
         }
 
@@ -3570,10 +3576,12 @@ impl WriteStore for PgStore {
         .rows_affected();
 
         if closed != 1 {
-            return Err(StoreError::Constraint(concurrent_write(
-                "item",
-                item,
-                "the status the close-out was decided against",
+            // Impossible for `create_run`'s reason: the item has been locked `FOR UPDATE` since
+            // this transaction's first statement, so the status the close-out was decided against
+            // is still the row's.
+            return Err(StoreError::Backend(format!(
+                "item `{item}` did not move `{status}` -> `closed` under the row lock this \
+                 transaction holds: no rule of ANA-2 §4.3 can produce this"
             )));
         }
 
