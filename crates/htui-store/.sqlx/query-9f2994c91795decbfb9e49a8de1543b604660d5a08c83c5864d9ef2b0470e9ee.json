@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE item SET status = 'awaiting_approval', closed_at = NULL WHERE id = $1 AND status = 'in_progress'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9f2994c91795decbfb9e49a8de1543b604660d5a08c83c5864d9ef2b0470e9ee"
+}

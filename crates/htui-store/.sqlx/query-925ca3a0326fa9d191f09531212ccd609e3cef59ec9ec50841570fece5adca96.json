@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run SET status = 'awaiting_approval' WHERE id = $1 AND status = 'running'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "925ca3a0326fa9d191f09531212ccd609e3cef59ec9ec50841570fece5adca96"
+}

@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET exit_code        = $2, usage            = COALESCE($3, usage), trim_record      = COALESCE($4, trim_record), verify_outcome   = $5, verify_exit_code = $6, finished_at      = $7 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Jsonb",
+        "Jsonb",
+        "Text",
+        "Int4",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "de3b25580be5a32901faf85741ffb633e91930de1b6f8498ef1348a29e79bbe0"
+}

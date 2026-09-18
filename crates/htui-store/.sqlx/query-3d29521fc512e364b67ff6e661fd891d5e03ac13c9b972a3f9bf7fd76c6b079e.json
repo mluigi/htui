@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT s.status  AS \"step_status: StepStatus\",\n                   r.id      AS \"run_id: RunId\",\n                   r.status  AS \"run_status: RunStatus\",\n                   r.item_id AS \"item_id: ItemId\"\n              FROM run_step s JOIN run r ON r.id = s.run_id\n             WHERE s.id = $1\n               FOR UPDATE OF s, r\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "step_status: StepStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "run_status: RunStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "item_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "3d29521fc512e364b67ff6e661fd891d5e03ac13c9b972a3f9bf7fd76c6b079e"
+}

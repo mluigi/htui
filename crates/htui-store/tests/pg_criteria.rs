@@ -19,9 +19,9 @@ use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, BoxId, GraphSnapshot, Isolation, ItemFilter, ItemId,
-    ItemKindId, ItemKindPatch, ItemPatch, NewItem, NewProject, NewRun, NewWorkspace, ProjectId,
-    RunId, RunMode, RunStatus, SnapshotGraph, SnapshotSettings, Status, StepId, Transport,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    ItemKindId, ItemKindPatch, ItemPatch, NewItem, NewProject, NewRepo, NewRun, NewWorkspace,
+    ProjectId, RepoId, RunId, RunMode, RunStatus, RunStepTree, SnapshotGraph, SnapshotSettings,
+    Status, StepId, Transport, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -3291,6 +3291,102 @@ async fn renamed_prefix_leaves_the_old_counter_row() {
     assert_eq!(minted.key, "ANL-1");
     assert_eq!(counter(&db.pool, project, "ANL").await, Some(1));
     assert_eq!(counter(&db.pool, project, "ANA").await, Some(2), "still");
+
+    db.drop_db().await;
+}
+
+/// `run_step_tree` rows go with their step when the run above them is deleted (ANA-2 §4.6).
+///
+/// The Postgres-only twin the `store::conformance` case
+/// `trees_and_commits_round_trip` names: `MemStore` keeps its trees in a map it clears by hand, so
+/// nothing in `htui-core` can show that `0003_orchestration.sql:93`'s
+/// `REFERENCES run_step(id) ON DELETE CASCADE` is what actually takes them here. The delete is the
+/// **run**, not the step, so both links of the chain - `run_step.run_id` from `0001_init.sql` and
+/// `run_step_tree.run_step_id` from `0003` - are exercised at once.
+///
+/// `run_step_tree.repo_id` deliberately has **no** cascade (a tree outlives a repo rename, never a
+/// step), so the repo is expected to stand afterwards; the case asserts that too, because a
+/// cascade that reached it would be a silent data loss the conformance suite cannot see.
+#[tokio::test(flavor = "multi_thread")]
+async fn step_tree_rows_cascade_with_their_step() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    let repo = db
+        .store
+        .create_repo(NewRepo {
+            id: RepoId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: "cascade".to_owned(),
+            default_branch: "main".to_owned(),
+            is_primary: false,
+            remote_url: None,
+        })
+        .await
+        .expect("the repo lands")
+        .id;
+    db.store
+        .upsert_step_tree(
+            ids::STEP_R2_PRD,
+            &[RunStepTree {
+                run_step_id: ids::STEP_R2_PRD,
+                repo_id: repo,
+                mode: Isolation::Worktree,
+                path: "/srv/trees/prd".to_owned(),
+                base_ref: "main".to_owned(),
+                dirty: false,
+            }],
+        )
+        .await
+        .expect("the tree row lands");
+
+    /// How many `run_step_tree` rows hang off the fixture's `RUN_2`.
+    async fn trees_of(pool: &PgPool, run: RunId) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM run_step_tree t \
+               JOIN run_step s ON s.id = t.run_step_id WHERE s.run_id = $1",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("count run_step_tree")
+    }
+
+    assert_eq!(
+        trees_of(&db.pool, ids::RUN_2).await,
+        1,
+        "the writer wrote the row this case is about to lose"
+    );
+
+    sqlx::query("DELETE FROM run WHERE id = $1")
+        .bind(ids::RUN_2.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("the run is deleted");
+
+    assert_eq!(
+        trees_of(&db.pool, ids::RUN_2).await,
+        0,
+        "the tree rows went with the run's steps (0003_orchestration.sql:93)"
+    );
+    assert_eq!(
+        db.store
+            .step_trees(ids::STEP_R2_PRD)
+            .await
+            .expect("the read stands"),
+        Vec::new(),
+        "and the reader agrees"
+    );
+    assert!(
+        db.store
+            .repos(ids::PROJECT_HTUI)
+            .await
+            .expect("the repo read")
+            .iter()
+            .any(|row| row.id == repo),
+        "run_step_tree.repo_id has no cascade: the repo outlives the tree"
+    );
 
     db.drop_db().await;
 }

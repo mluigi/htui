@@ -33,7 +33,8 @@ use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung, StoreError,
     StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, chat_step_status, expected_on_row,
     graph_not_in_project, illegal_move, invalid_prefix, item_kind_is_held, legal_move,
-    not_a_terminal_status, reserved_phase_name,
+    not_a_fanout_candidate, not_a_terminal_status, reserved_phase_name, row_names_another_step,
+    run_is_terminal, step_is_not_promotable, winner_is_not_settled,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -97,6 +98,25 @@ fn refuse_illegal_move<T: TransitionLaw, R>(
             id: id.to_string(),
         })
     }
+}
+
+/// The existence check the two batch upserts share, on **their own transaction** (MOD-4 T2).
+///
+/// `run_step_tree` and `run_step_commit` both hang off `run_step` by a foreign key, so an unknown
+/// step would already be a `23503` - but that is [`StoreError::Constraint`] where the contract says
+/// [`StoreError::NotFound`], and an **empty** batch inserts nothing and so would raise nothing at
+/// all. One `SELECT 1` inside the transaction answers both, and answers them the same way for a
+/// batch of zero rows as for a batch of ten.
+async fn step_exists(conn: &mut PgConnection, step: StepId) -> Result<()> {
+    sqlx::query_scalar!("SELECT 1 FROM run_step WHERE id = $1", step.as_uuid())
+        .fetch_optional(conn)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run_step",
+            id: step.to_string(),
+        })?;
+    Ok(())
 }
 
 /// A `count(*)` as the `u64` [`DeleteReach`] holds. Postgres counts as `bigint` and never
@@ -2711,29 +2731,235 @@ impl WriteStore for PgStore {
         }
     }
 
-    async fn finish_step(&self, _step: StepId, _outcome: StepOutcome) -> Result<()> {
-        todo!("MOD-4 T2 commit 5")
+    /// The settle columns of [`StepOutcome`], and **never** `status`: a step's status is moved by
+    /// [`transition_step`](WriteStore::transition_step), by the gate or by the fan-out, and a
+    /// process that merely finished has not decided which of those it was.
+    ///
+    /// `usage` and `trim_record` are the two columns this writer does not own. The usage summer
+    /// ([`set_step_usage`](PgStore::set_step_usage)) and the prompt assembler
+    /// ([`set_step_prompt`](PgStore::set_step_prompt)) write them earlier in the step's life, so a
+    /// `None` here means "leave what they wrote" - `COALESCE($3, usage)`, the same idiom
+    /// `set_step_usage` uses for its digest. Every other field overwrites, `None` included:
+    /// `verify_outcome` of a re-run that did not verify is genuinely absent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }` - zero rows updated is the only thing this
+    /// statement can mean.
+    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()> {
+        let updated = sqlx::query!(
+            "UPDATE run_step \
+                SET exit_code        = $2, \
+                    usage            = COALESCE($3, usage), \
+                    trim_record      = COALESCE($4, trim_record), \
+                    verify_outcome   = $5, \
+                    verify_exit_code = $6, \
+                    finished_at      = $7 \
+              WHERE id = $1",
+            step.as_uuid(),
+            outcome.exit_code,
+            outcome.usage,
+            outcome.trim_record,
+            outcome.verify_outcome.map(VerifyOutcome::as_str),
+            outcome.verify_exit_code,
+            outcome.finished_at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            });
+        }
+        Ok(())
     }
 
+    /// `R-ORCH-2`'s four answers, a compare-and-set on `awaiting_approval` rather than on the
+    /// caller's idea of the status: the gate is answered from a pane that may have been open a
+    /// while, and a step that moved on in the meantime must say `Ok(false)`, not overwrite.
+    ///
+    /// The status each answer settles the step at is decided in Rust, so §4.3's table and this
+    /// mapping stay one sentence each: `Approved | Skipped -> done`, `Rejected -> failed`,
+    /// `Retried -> superseded`. `gate_note` is assigned rather than `COALESCE`d - a second answer
+    /// carrying no note clears the first one's - while `finished_at` is `COALESCE`d, because a step
+    /// that already finished keeps the instant it finished at.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }` when no row has that id; the "not
+    /// awaiting" answer is `Ok(false)`, which is why the miss needs the follow-up read.
     async fn answer_gate(
         &self,
-        _step: StepId,
-        _outcome: GateOutcome,
-        _note: Option<String>,
-        _at: DateTime<Utc>,
+        step: StepId,
+        outcome: GateOutcome,
+        note: Option<String>,
+        at: DateTime<Utc>,
     ) -> Result<bool> {
-        todo!("MOD-4 T2 commit 5")
+        let settled = match outcome {
+            GateOutcome::Approved | GateOutcome::Skipped => StepStatus::Done,
+            GateOutcome::Rejected => StepStatus::Failed,
+            GateOutcome::Retried => StepStatus::Superseded,
+        };
+
+        let answered = sqlx::query!(
+            "UPDATE run_step \
+                SET status       = $2, \
+                    gate_outcome = $3, \
+                    gate_note    = $4, \
+                    finished_at  = COALESCE(finished_at, $5) \
+              WHERE id = $1 AND status = 'awaiting_approval'",
+            step.as_uuid(),
+            settled.as_str(),
+            outcome.as_str(),
+            note.as_deref(),
+            at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if answered == 1 {
+            return Ok(true);
+        }
+
+        let exists = sqlx::query_scalar!("SELECT 1 FROM run_step WHERE id = $1", step.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .is_some();
+
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })
+        }
     }
 
+    /// ANA-2 §4.5's bookkeeping, one transaction (plan D6): the whole slot is locked and validated
+    /// before the first candidate is touched, so a refused selection writes nothing at all.
+    ///
+    /// The lock is taken over the **slot** in `id` order rather than over the winner first: two
+    /// selections racing on one `(run, position, attempt)` with different winners would otherwise
+    /// each hold the other's row and deadlock. A winner that is not in the slot at all is therefore
+    /// looked up by a second, unlocked probe, which is the only way to tell plan D14's two answers
+    /// apart - an id that names nothing is [`StoreError::NotFound`], an id that names a step of
+    /// another position is [`StoreError::Constraint`].
+    ///
+    /// The losers' `CASE` is blueprint hazard H-13: `selected = false` is recorded for every
+    /// candidate, but only `pending`, `awaiting_approval` and `done` move to `superseded` - a
+    /// `failed` or `cancelled` loser keeps the status that says *why* it lost. The judge row
+    /// (`fanout_index = -1`) is settled directly rather than through [`legal_move`]: §4.5 makes its
+    /// `done` part of the winner's outcome, so a judge still at `pending` - a human who answered
+    /// the fan-out themselves - must not turn the selection into a refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }` for an unknown `winner`;
+    /// [`StoreError::Constraint`] when `winner` is not a candidate of that `(run, position,
+    /// attempt)` - the judge row included, `fanout_index >= 0` being what a candidate is - or is
+    /// not yet `awaiting_approval | done`.
     async fn select_fanout(
         &self,
-        _run: RunId,
-        _position: i32,
-        _attempt: i32,
-        _winner: StepId,
-        _reason: Option<String>,
+        run: RunId,
+        position: i32,
+        attempt: i32,
+        winner: StepId,
+        reason: Option<String>,
     ) -> Result<()> {
-        todo!("MOD-4 T2 commit 5")
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let slot = sqlx::query!(
+            r#"
+            SELECT id     AS "id: StepId",
+                   status AS "status: StepStatus",
+                   fanout_index
+              FROM run_step
+             WHERE run_id = $1 AND position = $2 AND attempt = $3
+             ORDER BY id
+               FOR UPDATE
+            "#,
+            run.as_uuid(),
+            position,
+            attempt,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        let Some(row) = slot.iter().find(|row| row.id == winner) else {
+            let exists =
+                sqlx::query_scalar!("SELECT 1 FROM run_step WHERE id = $1", winner.as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?
+                    .is_some();
+            return if exists {
+                Err(StoreError::Constraint(not_a_fanout_candidate(
+                    winner, run, position, attempt,
+                )))
+            } else {
+                Err(StoreError::NotFound {
+                    entity: "run_step",
+                    id: winner.to_string(),
+                })
+            };
+        };
+        if row.fanout_index < 0 {
+            return Err(StoreError::Constraint(not_a_fanout_candidate(
+                winner, run, position, attempt,
+            )));
+        }
+        if !matches!(row.status, StepStatus::AwaitingApproval | StepStatus::Done) {
+            return Err(StoreError::Constraint(winner_is_not_settled(
+                winner, row.status,
+            )));
+        }
+
+        sqlx::query!(
+            "UPDATE run_step SET selected = true, status = 'done' WHERE id = $1",
+            winner.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        sqlx::query!(
+            "UPDATE run_step \
+                SET selected = false, \
+                    status   = CASE WHEN status IN ('pending','awaiting_approval','done') \
+                                    THEN 'superseded' ELSE status END \
+              WHERE run_id = $1 AND position = $2 AND attempt = $3 \
+                AND fanout_index >= 0 AND id <> $4",
+            run.as_uuid(),
+            position,
+            attempt,
+            winner.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        sqlx::query!(
+            "UPDATE run_step SET status = 'done', gate_note = $4 \
+              WHERE run_id = $1 AND position = $2 AND attempt = $3 AND fanout_index < 0",
+            run.as_uuid(),
+            position,
+            attempt,
+            reason.as_deref(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)
     }
 
     /// §4.4's loop half: `pending | awaiting_approval | done -> superseded`, and nothing else.
@@ -2782,20 +3008,204 @@ impl WriteStore for PgStore {
         }
     }
 
-    async fn upsert_step_tree(&self, _step: StepId, _trees: &[RunStepTree]) -> Result<()> {
-        todo!("MOD-4 T2 commit 5")
+    /// `run_step_tree` upserted on the table's own `(run_step_id, repo_id)` key (ANA-2 §4.6): a
+    /// step re-preparing a tree it already has replaces the row rather than raising `23505`.
+    ///
+    /// The batch is checked whole before the first insert, [`WriteStore::append_events`]-style: a
+    /// row naming another step is refused in Rust, because `run_step_tree.run_step_id` is bound
+    /// from `step` and a stray row would otherwise be written *under the argument's key*, silently
+    /// re-homing it. An unknown `repo_id` is the foreign key's `23503`, which [`map_sqlx`] turns
+    /// into the same [`StoreError::Constraint`]; the transaction is what makes it write nothing.
+    ///
+    /// One statement per row rather than one `UNNEST`: a batch naming the same repo twice would be
+    /// `ON CONFLICT DO UPDATE`'s "cannot affect row a second time", where
+    /// [`MemStore`](htui_core::store::MemStore)'s map simply keeps the last. Batches are one row
+    /// per repo in scope.
+    ///
+    /// An empty slice still runs the existence check and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
+    /// `run_step_id` is not `step` or names an unknown repo.
+    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+        for row in trees {
+            if row.run_step_id != step {
+                return Err(StoreError::Constraint(row_names_another_step(
+                    "run_step_tree",
+                    row.run_step_id,
+                    step,
+                )));
+            }
+        }
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        step_exists(&mut tx, step).await?;
+
+        for row in trees {
+            sqlx::query!(
+                "INSERT INTO run_step_tree (run_step_id, repo_id, mode, path, base_ref, dirty) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (run_step_id, repo_id) DO UPDATE \
+                    SET mode     = EXCLUDED.mode, \
+                        path     = EXCLUDED.path, \
+                        base_ref = EXCLUDED.base_ref, \
+                        dirty    = EXCLUDED.dirty",
+                step.as_uuid(),
+                row.repo_id.as_uuid(),
+                row.mode.as_str(),
+                row.path,
+                row.base_ref,
+                row.dirty,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        tx.commit().await.map_err(map_sqlx)
     }
 
-    async fn record_commits(&self, _step: StepId, _commits: &[RunStepCommit]) -> Result<()> {
-        todo!("MOD-4 T2 commit 5")
+    /// `R-ORCH-11`'s two hashes, on the same key and with the same refusals as
+    /// [`upsert_step_tree`](WriteStore::upsert_step_tree) - see its doc for why the batch is
+    /// checked whole and written row by row.
+    ///
+    /// `after_hash` is nullable and is assigned rather than `COALESCE`d: the git driver records the
+    /// `before` hash when it takes the tree and the `after` hash when it commits, and a second call
+    /// carrying `None` means the step produced no commit after all.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
+    /// `run_step_id` is not `step` or names an unknown repo.
+    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
+        for row in commits {
+            if row.run_step_id != step {
+                return Err(StoreError::Constraint(row_names_another_step(
+                    "run_step_commit",
+                    row.run_step_id,
+                    step,
+                )));
+            }
+        }
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        step_exists(&mut tx, step).await?;
+
+        for row in commits {
+            sqlx::query!(
+                "INSERT INTO run_step_commit (run_step_id, repo_id, before_hash, after_hash) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (run_step_id, repo_id) DO UPDATE \
+                    SET before_hash = EXCLUDED.before_hash, \
+                        after_hash  = EXCLUDED.after_hash",
+                step.as_uuid(),
+                row.repo_id.as_uuid(),
+                row.before_hash,
+                row.after_hash,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        tx.commit().await.map_err(map_sqlx)
     }
 
     async fn write_document(&self, _new: NewDocument) -> Result<Document> {
         todo!("MOD-4 T2 commit 6")
     }
 
-    async fn promote_step(&self, _step: StepId, _at: DateTime<Utc>) -> Result<()> {
-        todo!("MOD-4 T2 commit 5")
+    /// §4.8's promotion, one transaction (plan D6): the step, its run and its item are lifted to
+    /// `awaiting_approval` together, so no reader sees a gated step under a running item.
+    ///
+    /// The refusal is **this writer's own rule, not §4.3's table**: `running -> awaiting_approval`
+    /// is a legal step move, but a step still running has produced nothing to promote. Only `failed`
+    /// and `awaiting_approval` promote - the first is `R-ORCH-5`'s "take this one over by hand", the
+    /// second is idempotence for a second click. [`step_is_not_promotable`] is the sentence, which
+    /// is why [`legal_move`] is not called here.
+    ///
+    /// The run and the item are moved by compare-and-set rather than unconditionally: a run already
+    /// at `awaiting_approval` (a second promotion in the same gate) matches nothing and is left
+    /// alone, which is the same zero-rows-tolerated shape [`claim_run`](WriteStore::claim_run) uses
+    /// for its item. The item's `closed_at` is cleared alongside, because
+    /// [`transition`](WriteStore::transition) - the statement `MemStore` routes this through - does.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when the step
+    /// is at any other status, or its run is terminal. Both are decided under the two row locks and
+    /// before the first write.
+    async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let Some(row) = sqlx::query!(
+            r#"
+            SELECT s.status  AS "step_status: StepStatus",
+                   r.id      AS "run_id: RunId",
+                   r.status  AS "run_status: RunStatus",
+                   r.item_id AS "item_id: ItemId"
+              FROM run_step s JOIN run r ON r.id = s.run_id
+             WHERE s.id = $1
+               FOR UPDATE OF s, r
+            "#,
+            step.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        else {
+            return Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            });
+        };
+
+        if !matches!(
+            row.step_status,
+            StepStatus::Failed | StepStatus::AwaitingApproval
+        ) {
+            return Err(StoreError::Constraint(step_is_not_promotable(
+                step,
+                row.step_status,
+            )));
+        }
+        if row.run_status.is_terminal() {
+            return Err(StoreError::Constraint(run_is_terminal(
+                row.run_id,
+                row.run_status,
+            )));
+        }
+
+        sqlx::query!(
+            "UPDATE run_step SET status = 'awaiting_approval', promoted_at = $2 WHERE id = $1",
+            step.as_uuid(),
+            at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        sqlx::query!(
+            "UPDATE run SET status = 'awaiting_approval' WHERE id = $1 AND status = 'running'",
+            row.run_id.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        if let Some(item) = row.item_id {
+            sqlx::query!(
+                "UPDATE item SET status = 'awaiting_approval', closed_at = NULL \
+                  WHERE id = $1 AND status = 'in_progress'",
+                item.as_uuid(),
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        tx.commit().await.map_err(map_sqlx)
     }
 
     async fn fail_run(&self, _run: RunId, _failure: &str, _at: DateTime<Utc>) -> Result<()> {
@@ -2811,8 +3221,46 @@ impl WriteStore for PgStore {
         todo!("MOD-4 T2 commit 6")
     }
 
-    async fn add_note(&self, _note: NewNote) -> Result<Note> {
-        todo!("MOD-4 T2 commit 5")
+    /// One `item_note`: ANA-2 invariant 7's refusal note, and the one thing a refusing gate always
+    /// leaves behind.
+    ///
+    /// No guard of its own. Every refusal [`MemStore`](htui_core::store::MemStore) spells out is a
+    /// key of the table - `item_note_pkey` on a repeated id, and the three foreign keys on
+    /// `item_id`, `created_by` and `via_step_id` (the last added at `0001_init.sql:591`, which is
+    /// what makes a dangling step a `23503` here rather than a silently stored orphan). [`map_sqlx`]
+    /// turns all four into [`StoreError::Constraint`].
+    ///
+    /// `created_at` is the caller's (F-S), so the note a chat writes and the note the pane shows
+    /// carry the instant the author wrote at rather than the instant the row landed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] on an unknown item, author, box or step, or a duplicate id.
+    async fn add_note(&self, note: NewNote) -> Result<Note> {
+        sqlx::query_as!(
+            Note,
+            r#"
+            INSERT INTO item_note (id, item_id, body, created_by, box_id, via_step_id, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id          AS "id: htui_core::model::NoteId",
+                      item_id     AS "item_id: ItemId",
+                      body,
+                      created_by  AS "created_by: UserId",
+                      box_id      AS "box_id: BoxId",
+                      via_step_id AS "via_step_id: StepId",
+                      created_at
+            "#,
+            note.id.as_uuid(),
+            note.item_id.as_uuid(),
+            note.body,
+            note.created_by.as_uuid(),
+            note.box_id.map(BoxId::as_uuid),
+            note.via_step_id.map(StepId::as_uuid),
+            note.created_at,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 }
 

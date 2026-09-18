@@ -6264,7 +6264,6 @@ mod tests {
         const PENDING: &[&str] = &[
             "ck_run_graph_snapshot_is_not_valid_for_old_rows_and_checked_for_new",
             "document_versions_do_not_collide_under_contention",
-            "step_tree_rows_cascade_with_their_step",
         ];
 
         // Another crate's integration test binary, so it is read at run time rather than through

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET status = 'done', gate_note = $4 WHERE run_id = $1 AND position = $2 AND attempt = $3 AND fanout_index < 0",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e989b28c09b20b1b2eebe36de71ccc23f9fb7e9f402a8449005ecf729e030b1c"
+}

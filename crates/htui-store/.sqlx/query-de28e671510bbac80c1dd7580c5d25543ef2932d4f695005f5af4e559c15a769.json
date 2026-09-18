@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO run_step_tree (run_step_id, repo_id, mode, path, base_ref, dirty) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (run_step_id, repo_id) DO UPDATE SET mode     = EXCLUDED.mode, path     = EXCLUDED.path, base_ref = EXCLUDED.base_ref, dirty    = EXCLUDED.dirty",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "de28e671510bbac80c1dd7580c5d25543ef2932d4f695005f5af4e559c15a769"
+}

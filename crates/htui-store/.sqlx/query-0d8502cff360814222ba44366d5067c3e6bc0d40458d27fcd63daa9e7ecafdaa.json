@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET selected = true, status = 'done' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0d8502cff360814222ba44366d5067c3e6bc0d40458d27fcd63daa9e7ecafdaa"
+}

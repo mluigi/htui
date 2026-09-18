@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO run_step_commit (run_step_id, repo_id, before_hash, after_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (run_step_id, repo_id) DO UPDATE SET before_hash = EXCLUDED.before_hash, after_hash  = EXCLUDED.after_hash",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f00a379efefb2cd20c448dce54b4ed05f4d6bb49962494ce29bb3dd08ce93a42"
+}

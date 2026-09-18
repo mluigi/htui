@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET selected = false, status   = CASE WHEN status IN ('pending','awaiting_approval','done') THEN 'superseded' ELSE status END WHERE run_id = $1 AND position = $2 AND attempt = $3 AND fanout_index >= 0 AND id <> $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "de3d863a10937e2092a3143469eef7056ec6798ab6a4c5c54019985bd3e01401"
+}
