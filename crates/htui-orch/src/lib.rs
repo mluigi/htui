@@ -5,9 +5,11 @@
 //! of its own, which is what keeps it headless (`R-ORCH-12`) and what keeps `htui-store` from
 //! ever learning that an orchestrator exists.
 //!
-//! Milestone 2 lands [`graph`] and [`status`]. [`command`], [`isolate`], [`engine`], [`gate`],
-//! [`fake`] and [`conformance`] are declared here with their contracts and are filled by
-//! milestone 2's later tasks. `fanout.rs`, `select.rs`, `verify.rs`, `overlap.rs`, `recover.rs`
+//! Milestone 2 lands [`graph`] and [`status`]. [`command`], [`isolate`], [`engine`] and [`gate`]
+//! are declared here with their contracts and are filled by milestone 2's later tasks, as are
+//! `fake` and `conformance` — those two are named in plain text, not linked, because they are
+//! `#[cfg(feature = "test-support")]` and a doc link to them is a `broken_intra_doc_links` error
+//! in any build without the feature. `fanout.rs`, `select.rs`, `verify.rs`, `overlap.rs`, `recover.rs`
 //! and `queue.rs` are named by ANA-2 §8 and belong to later milestones; they are deliberately not
 //! created, not even empty (plan D1).
 #![warn(missing_docs)]
