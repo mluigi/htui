@@ -3864,7 +3864,7 @@ async fn item_row<S: ReadStore>(case: &str, store: &S, item: ItemId) -> Item {
 /// Plan D6: the `run` row and the item's move to `queued` land together or not at all (ANA-2 §4.3,
 /// §5.1). The `MemStore` twin is
 /// `mem.rs::create_run_moves_the_item_and_writes_nothing_when_the_law_refuses`; on Postgres the
-/// snapshot column's own guard is `pg_criteria::ck_run_graph_snapshot_is_not_valid_for_old_rows_and_checked_for_new`.
+/// snapshot column's own guard is `pg_criteria.rs::ck_run_graph_snapshot_is_not_valid_for_old_rows_and_checked_for_new`.
 async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
     const CASE: &str = "run_create_moves_the_item";
     let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
@@ -3983,7 +3983,7 @@ async fn run_create_moves_the_item<S: WriteStore>(store: &S) {
 ///
 /// The `MemStore` twin is `mem.rs::claim_run_refuses_an_overlapping_scope_and_a_full_box`; the
 /// thing only Postgres can show — that two concurrent claims on the last slot cannot both win — is
-/// `pg_criteria::admission_is_serialised_by_the_box_row_lock`.
+/// `pg_criteria.rs::admission_is_serialised_by_the_box_row_lock`.
 async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     const CASE: &str = "claim_run_admits_one_and_refuses_the_second";
     let repo = store
@@ -4881,7 +4881,7 @@ async fn select_fanout_is_one_transaction<S: WriteStore>(store: &S) {
 /// `repo_id` order, and are counted by a project delete — two tables `MemStore` never held before
 /// MOD-4 (plan D12). The `MemStore` twin is
 /// `mem.rs::trees_and_commits_upsert_on_their_repo_key_and_the_delete_counts_them`; the cascade
-/// itself is `pg_criteria::step_tree_rows_cascade_with_their_step` on Postgres.
+/// itself is `pg_criteria.rs::step_tree_rows_cascade_with_their_step` on Postgres.
 async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
     const CASE: &str = "trees_and_commits_round_trip";
     let core = store
@@ -5072,7 +5072,7 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
 ///
 /// The `MemStore` twin is `mem.rs::write_document_allocates_the_next_version_of_its_kind`; the
 /// thing only Postgres can show — that two concurrent writers cannot allocate the same version —
-/// is `pg_criteria::document_versions_do_not_collide_under_contention`.
+/// is `pg_criteria.rs::document_versions_do_not_collide_under_contention`.
 async fn write_document_allocates_its_version<S: WriteStore>(store: &S) {
     const CASE: &str = "write_document_allocates_its_version";
     let third = store
@@ -6053,7 +6053,7 @@ async fn run_and_steps_round_trip<S: ReadStore>(store: &S) {
 ///
 /// The fixture seeds no `repo`, so no tree or commit row can exist here (blueprint F-P); row
 /// content is `trees_and_commits_round_trip` on both writers and
-/// `pg_criteria::step_tree_rows_cascade_with_their_step` on Postgres.
+/// `pg_criteria.rs::step_tree_rows_cascade_with_their_step` on Postgres.
 async fn trees_and_commits_read_back<S: ReadStore>(store: &S) {
     const CASE: &str = "trees_and_commits_read_back";
     for step in [
@@ -6215,12 +6215,37 @@ mod tests {
     /// an unchecked reference is exactly the hole this test exists to close. Spans that are not
     /// plain snake_case are skipped, which is what keeps this test's own message templates -
     /// compiled into the source it scans - from being read as references.
+    ///
+    /// A third shape is a failure rather than either: `<file>::<name>`, two snake_case halves
+    /// joined by `::` where the right one reads like a test name. It is the near-miss of the
+    /// second shape - MOD-4 shipped four of them - and it reaches neither arm, so it was skipped
+    /// in silence while reading exactly like a checked delegation. Module and lint paths
+    /// (`store::mem`, `clippy::type_complexity`) are not test names and stay skipped. `PENDING`
+    /// below is the one sanctioned exemption, for a delegation whose target another task writes.
     #[test]
     fn every_cross_referenced_test_name_exists() {
         /// This module's own source: the text that was compiled, doc comments included.
         const SELF: &str = include_str!("conformance.rs");
         /// The sibling `MemStore` unit tests.
         const MEM: &str = include_str!("mem.rs");
+
+        /// Names the doc comments above delegate to that the tree does not carry **yet**: each is
+        /// a `pg_criteria.rs` test T2 of MOD-4 writes, against a column or a concurrency the
+        /// `MemStore` half cannot show.
+        ///
+        /// An entry is an exemption from the assertion below and nothing else: the reference is
+        /// still spelled `pg_criteria.rs::<name>`, so the moment T2 defines the fn the exemption
+        /// goes stale and this test says so by name. Deleting the entry is then the whole of the
+        /// work, and the delegation becomes checked for real. Writing the reference *without* the
+        /// `.rs` instead - which is how these four shipped - is no longer possible: a span that
+        /// joins two snake_case halves with `::` and whose right half reads like a test name is a
+        /// failure below, because that shape reaches neither arm and was silently skipped.
+        const PENDING: &[&str] = &[
+            "admission_is_serialised_by_the_box_row_lock",
+            "ck_run_graph_snapshot_is_not_valid_for_old_rows_and_checked_for_new",
+            "document_versions_do_not_collide_under_contention",
+            "step_tree_rows_cascade_with_their_step",
+        ];
 
         // Another crate's integration test binary, so it is read at run time rather than through
         // `include_str!`: `htui-core` must not take a compile-time dependency on `htui-store`.
@@ -6262,11 +6287,32 @@ mod tests {
                          the table in `every_cross_referenced_test_name_exists`"
                     ),
                 };
+                if PENDING.contains(&name) {
+                    assert!(
+                        !defines(source, name),
+                        "`{file}.rs` now defines `{name}`: delete its PENDING entry, which is \
+                         what turns the reference into a checked one"
+                    );
+                    continue;
+                }
                 assert!(
                     defines(source, name),
                     "a doc comment names `{file}.rs::{name}`, but `{file}.rs` defines no such fn"
                 );
                 checked += 1;
+            } else if let Some((left, right)) = token.split_once("::")
+                && snake_case(left)
+                && snake_case(right)
+                && right.matches('_').count() >= 4
+            {
+                // `store::mem` and `clippy::type_complexity` are module and lint paths and stay
+                // skipped; a right half shaped like a test name is a delegation that meant to be
+                // checked and reached neither arm above.
+                panic!(
+                    "a doc comment names the test `{token}`, which this scanner cannot check: \
+                     spell a test in another file with its file name and extension, as the doc \
+                     comment on this fn describes"
+                );
             } else if snake_case(token) && token.matches('_').count() >= 4 {
                 assert!(
                     defines(SELF, token) || defines(MEM, token),
