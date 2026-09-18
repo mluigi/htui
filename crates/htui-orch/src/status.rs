@@ -102,7 +102,8 @@ pub enum Cursor {
 
 /// The latest-attempt step at `position`, or `None` when the walk has not reached it.
 ///
-/// Only [`WALKED_FANOUT_INDEX`] is considered.
+/// Only `fanout_index = 0` is considered; fan-out's other indices and its `-1` judge step are
+/// milestone 4's.
 #[must_use]
 pub fn latest_at(steps: &[RunStep], position: i32) -> Option<&RunStep> {
     steps
