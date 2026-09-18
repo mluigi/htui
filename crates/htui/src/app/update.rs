@@ -425,6 +425,7 @@ mod tests {
             priority: 0,
             required_tags: Vec::new(),
             updated_at: htui_core::fixtures::demo_at(0, 0),
+            touched_paths: Vec::new(),
         };
         ReplyEnvelope {
             seq,

@@ -117,6 +117,7 @@ impl Item {
             priority: self.priority,
             required_tags: self.required_tags.clone(),
             updated_at: self.updated_at,
+            touched_paths: self.touched_paths.clone(),
         }
     }
 }
@@ -146,6 +147,10 @@ pub struct ItemSummary {
     pub required_tags: Vec<String>,
     /// `item.updated_at`.
     pub updated_at: DateTime<Utc>,
+    /// `item.touched_paths` (ANA-2 §4.7): the declared overlap set the admission resolves to a
+    /// `run.repo_scope`. Appended, never inserted (plan D10): the SQL projections bind
+    /// positionally.
+    pub touched_paths: Vec<String>,
 }
 
 /// Filter passed to [`crate::store::ReadStore::items`]. Every field is a conjunct; `None` means

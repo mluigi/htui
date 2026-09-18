@@ -2247,9 +2247,9 @@ async fn project_create_update_cas<S: WriteStore>(store: &S) {
 /// The exact numbers are the fixture's per-project seed (5 kinds, 5 graphs, 15 phases, 10
 /// templates); the rest are asserted non-zero, because a project delete that reported zero runs
 /// while taking two would be the drift this case exists to catch. `phase_agents`,
-/// `run_step_commits` and `command_runs` are `0` on both stores: `MemStore` holds none of the three
-/// tables and the demo database seeds none of them. Only `pg_criteria.rs` can tell that apart from
-/// not counting them at all, and its two cases do.
+/// `run_step_commits`, `run_step_trees` and `command_runs` are `0` on both stores here: the demo
+/// database seeds none of the four tables. Only `pg_criteria.rs` can tell that apart from not
+/// counting them at all, and its two cases do.
 async fn project_delete_takes_everything_and_says_so<S: WriteStore>(store: &S) {
     const CASE: &str = "project_delete_takes_everything_and_says_so";
     let agy_scope = Scope {
@@ -2291,10 +2291,11 @@ async fn project_delete_takes_everything_and_says_so<S: WriteStore>(store: &S) {
             report.repo_box_paths,
             report.phase_agents,
             report.run_step_commits,
+            report.run_step_trees,
             report.command_runs,
             report.workspace_box_paths
         ),
-        (0, 0, 0, 0, 0, 0),
+        (0, 0, 0, 0, 0, 0, 0),
         "{CASE}: tables neither store seeds for this project count zero, not one"
     );
     for (label, count) in [

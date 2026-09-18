@@ -95,8 +95,10 @@ pub mod usage;
 pub mod user;
 
 pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
-pub use box_::{BoxInfo, BoxProfile, BoxRow, BoxTool, OsFamily};
-pub use document::{Document, DocumentHead};
+pub use box_::{
+    BoxInfo, BoxProfile, BoxRow, BoxSettings, BoxTool, DEFAULT_MAX_CONCURRENT_ITEMS, OsFamily,
+};
+pub use document::{Document, DocumentHead, NewDocument, ResolvedInput};
 pub use event::{EventKind, EventRole, SessionEvent};
 pub use hierarchy::{
     NewProject, NewRepo, NewWorkspace, Project, ProjectPatch, ProjectRef, Repo, RepoBoxPath,
@@ -110,17 +112,20 @@ pub use ids::{
 pub use item::{Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Status};
 pub use kind::{
     CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewStepGraph, PhaseAgent,
-    PhasePatch, PromptTemplate, StepGraph, StepGraphPatch, StepGraphPhase,
+    PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph, ResolvedPhase, StepGraph,
+    StepGraphPatch, StepGraphPhase,
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
-pub use note::Note;
+pub use note::{NewNote, Note};
 pub use quota::{
     Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
     QuotaSource, QuotaWindow, SkipReason, Spend, available, normalize,
 };
 pub use run::{
-    ChatRunSpec, GateOutcome, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepSummary, RunSummary, StepStatus, prompt_summary,
+    ChatRunSpec, GateOutcome, GraphSnapshot, NewRun, NewRunStep, Run, RunKind, RunMode, RunStatus,
+    RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, SnapshotCandidate,
+    SnapshotGraph, SnapshotJudge, SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepOutcome,
+    StepStatus, VerifyOutcome, prompt_summary,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{BoundSkill, Skill, SkillBinding, SkillVersion};

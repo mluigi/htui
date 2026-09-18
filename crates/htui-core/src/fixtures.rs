@@ -1237,6 +1237,9 @@ fn runs() -> Vec<Run> {
             started_at: Some(demo_at(1, 8)),
             finished_at: Some(demo_at(1, 12)),
             failure: None,
+            repo_scope: Vec::new(),
+            lease_box_id: None,
+            lease_expires_at: None,
             updated_at: demo_at(1, 12),
         },
         Run {
@@ -1254,6 +1257,9 @@ fn runs() -> Vec<Run> {
             started_at: None,
             finished_at: None,
             failure: None,
+            repo_scope: Vec::new(),
+            lease_box_id: None,
+            lease_expires_at: None,
             updated_at: demo_at(2, 8),
         },
     ]
@@ -1309,6 +1315,9 @@ fn steps() -> Vec<RunStep> {
         isolation_path: None,
         started_at: None,
         finished_at: None,
+        verify_outcome: None,
+        verify_exit_code: None,
+        promoted_at: None,
         updated_at: demo_at(2, 8),
     });
     steps
@@ -1343,6 +1352,9 @@ fn done_step(
         isolation_path: None,
         started_at: Some(demo_at(1, hour)),
         finished_at: Some(demo_at(1, hour + 1)),
+        verify_outcome: None,
+        verify_exit_code: None,
+        promoted_at: None,
         updated_at: demo_at(1, hour + 1),
     }
 }

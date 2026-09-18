@@ -226,6 +226,9 @@ impl MemStore {
                 box_id: row.id,
                 hostname: row.hostname.clone(),
                 os_family: row.os_family,
+                probed_tags: row.probed_tags.clone(),
+                declared_tags: row.declared_tags.clone(),
+                settings: row.settings.clone(),
             })
         }))
     }
@@ -839,6 +842,15 @@ impl State {
                     finished_at: step.finished_at,
                     prompt_tokens,
                     trimmed,
+                    usage: step.usage.clone(),
+                    selected: step.selected,
+                    exit_code: step.exit_code,
+                    verify_outcome: step.verify_outcome,
+                    promoted_at: step.promoted_at,
+                    agent_name: step
+                        .agent_id
+                        .and_then(|id| self.agents.get(&id))
+                        .map(|agent| agent.name.clone()),
                 }
             })
             .collect()
@@ -1304,6 +1316,9 @@ impl State {
             started_at: Some(chat.started_at),
             finished_at: None,
             failure: None,
+            repo_scope: Vec::new(),
+            lease_box_id: None,
+            lease_expires_at: None,
             updated_at: chat.started_at,
         });
         self.steps.entry(chat.step_id).or_insert_with(|| RunStep {
@@ -1326,6 +1341,9 @@ impl State {
             isolation_path: None,
             started_at: Some(chat.started_at),
             finished_at: None,
+            verify_outcome: None,
+            verify_exit_code: None,
+            promoted_at: None,
             updated_at: chat.started_at,
         });
         Ok(())
@@ -2038,6 +2056,7 @@ impl State {
             project_id: new.project_id,
             name: new.name,
             description: new.description,
+            is_override: false,
             created_at: now,
             updated_at: now,
         };
@@ -2579,6 +2598,7 @@ impl State {
                     .count(),
             ),
             run_step_commits: 0,
+            run_step_trees: 0,
             command_runs: 0,
             notes: rows(
                 self.notes

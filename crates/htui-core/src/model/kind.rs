@@ -138,6 +138,8 @@ pub struct StepGraph {
     pub name: String,
     /// `step_graph.description`.
     pub description: String,
+    /// `step_graph.is_override` (ANA-2 §4.1): a per-item clone, hidden from the graph list.
+    pub is_override: bool,
     /// `step_graph.created_at`.
     pub created_at: DateTime<Utc>,
     /// `step_graph.updated_at`.
@@ -240,6 +242,75 @@ pub struct PhaseAgent {
     pub agent_id: AgentId,
     /// `phase_agent.model`.
     pub model: String,
+}
+
+/// `project.settings` as ANA-2 §4.7 reads it.
+///
+/// Read-only (plan D11) and every field defaults, so `'{}'` decodes. Nothing re-serialises the
+/// struct onto the row, which is what keeps unknown keys alive: MOD-15's key-level `set_setting`
+/// is the column's only writer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectSettings {
+    /// The isolation a phase that names none resolves to.
+    pub default_isolation: Isolation,
+    /// Per-step token budget.
+    pub token_budget: Option<i32>,
+    /// How long finished runs are kept.
+    pub retention_days: Option<i32>,
+    /// How many earlier steps' transcripts a prompt may carry.
+    pub cached_transcript_steps: Option<i32>,
+    /// Whether raw `session_event` rows survive retention.
+    pub keep_raw_events: bool,
+    /// `R-ORCH-8`'s per-run cap, micros.
+    pub per_token_cap_run: Option<i64>,
+    /// `R-ORCH-8`'s per-batch cap, micros.
+    pub per_token_cap_batch: Option<i64>,
+    /// The deadline a phase that names none resolves to.
+    pub step_deadline_seconds: Option<u32>,
+    /// The agent a phase with no candidate resolves to.
+    pub default_agent_id: Option<AgentId>,
+    /// The fan-out judge a phase with none resolves to (ANA-2 §4.5).
+    pub judge_agent_id: Option<AgentId>,
+    /// Globs excluded from a `copy` isolation tree (ANA-2 §4.6).
+    pub copy_exclude: Vec<String>,
+}
+
+impl Default for ProjectSettings {
+    fn default() -> Self {
+        Self {
+            default_isolation: Isolation::Worktree,
+            token_budget: None,
+            retention_days: None,
+            cached_transcript_steps: None,
+            keep_raw_events: false,
+            per_token_cap_run: None,
+            per_token_cap_batch: None,
+            step_deadline_seconds: None,
+            default_agent_id: None,
+            judge_agent_id: None,
+            copy_exclude: Vec::new(),
+        }
+    }
+}
+
+/// What `Backend::resolve_graph` answers in one round trip (ANA-2 §8): the graph an item runs
+/// under and its phases with their candidate agents.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedGraph {
+    /// The `step_graph` row: the item's override, else its kind's default.
+    pub graph: StepGraph,
+    /// In `position` order.
+    pub phases: Vec<ResolvedPhase>,
+}
+
+/// One phase of a [`ResolvedGraph`] with the candidates the snapshot builder picks from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedPhase {
+    /// The `step_graph_phase` row.
+    pub phase: StepGraphPhase,
+    /// `phase_agent` rows in `position` order; empty on `MemStore`, which holds no such table.
+    pub agents: Vec<PhaseAgent>,
 }
 
 /// A row of `prompt_template` (§5.4).

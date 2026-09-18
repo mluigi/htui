@@ -814,9 +814,9 @@ pub enum DeleteTarget {
 ///
 /// One struct rather than a method per table, so a table `0003` adds is a field here and the two
 /// callers of the counting code cannot disagree about it. A workspace delete fills
-/// `workspace_links` and `workspace_box_paths` only. `phase_agents`, `run_step_commits` and
-/// `command_runs` are `0` on `MemStore`, which holds none of the three tables, and `0` on the demo
-/// database, which seeds none of them.
+/// `workspace_links` and `workspace_box_paths` only. `phase_agents` and `command_runs` are `0` on
+/// `MemStore`, which holds neither table, and `0` on the demo database, which seeds neither;
+/// `run_step_commits` and `run_step_trees` are counted on both since MOD-4.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeleteReach {
     /// `workspace_project` rows.
@@ -851,6 +851,8 @@ pub struct DeleteReach {
     pub session_events: u64,
     /// `run_step_commit` rows.
     pub run_step_commits: u64,
+    /// `run_step_tree` rows, the table `0003_orchestration.sql` adds (ANA-2 §4.6).
+    pub run_step_trees: u64,
     /// `command_run` rows, which cascade from `run_step` (`0001_init.sql:539`).
     ///
     /// Nothing in this tree writes the table yet — MOD-16's queue is its first writer — so every

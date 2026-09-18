@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::model::ids::{BoxId, UserId};
 
@@ -89,7 +90,35 @@ pub struct BoxInfo {
     pub hostname: String,
     /// `box.os_family` of this box.
     pub os_family: OsFamily,
+    /// `box.probed_tags` (`R-ORCH-10`).
+    pub probed_tags: Vec<String>,
+    /// `box.declared_tags`.
+    pub declared_tags: Vec<String>,
+    /// `box.settings`, whole; decode with [`BoxSettings`].
+    pub settings: Value,
 }
+
+/// `box.settings` as ANA-2 §4.7 reads it.
+///
+/// Read-only this milestone (plan D11): MOD-15's key-level `set_setting` is the only writer, so
+/// unknown keys survive because nothing here is ever re-serialised onto the row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BoxSettings {
+    /// `R-ORCH-9`; `None` = fall through to the `app_setting` rung, else
+    /// [`DEFAULT_MAX_CONCURRENT_ITEMS`].
+    ///
+    /// `Option<u32>` rather than `u32` because `#[serde(default)]` on a `u32` is `0`, which
+    /// admits nothing at all — a box whose settings blob does not name the key would stop
+    /// accepting runs (blueprint F-T).
+    pub max_concurrent_items: Option<u32>,
+    /// `R-MCP-3`'s `{class: n}`; empty = the `app_setting` rung.
+    pub command_limits: BTreeMap<String, u32>,
+}
+
+/// The value `0003_orchestration.sql` seeds under `app_setting.max_concurrent_items`, and what a
+/// store answers when neither the box nor that table names one (`R-ORCH-9`).
+pub const DEFAULT_MAX_CONCURRENT_ITEMS: u32 = 2;
 
 /// The prompt's `box` section, projected from `box` and its `box_tool` rows
 /// (`docs/ANA-5.md` §4.2). Not a table.

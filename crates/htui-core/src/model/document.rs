@@ -66,3 +66,37 @@ impl Document {
         }
     }
 }
+
+/// Arguments of [`crate::store::WriteStore::write_document`]: everything but `version`, which the
+/// store allocates under the item's row lock (ANA-2 §4.2, plan D6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewDocument {
+    /// `document.id`.
+    pub id: DocumentId,
+    /// `document.item_id`.
+    pub item_id: ItemId,
+    /// `document.kind`.
+    pub kind: String,
+    /// `document.title`.
+    pub title: String,
+    /// `document.body`.
+    pub body: String,
+    /// `document.produced_by_step_id`; `None` means written by hand.
+    pub produced_by_step_id: Option<StepId>,
+    /// `document.created_by`.
+    pub created_by: UserId,
+    /// `document.created_at`.
+    pub created_at: DateTime<Utc>,
+}
+
+/// One requested kind of [`crate::store::ReadStore::resolve_inputs`], present or missing.
+///
+/// A `Vec<Document>` could not report a kind the item has no eligible row for, and ANA-2 §4.2
+/// needs that fact: a missing input kind fails the step (blueprint F-O).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedInput {
+    /// The requested `document.kind`.
+    pub kind: String,
+    /// `None` = the item has no eligible document of this kind.
+    pub document: Option<Document>,
+}

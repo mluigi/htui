@@ -4,7 +4,10 @@ use chrono::{DateTime, SubsecRound as _, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::model::ids::{AgentId, BoxId, ItemId, ProjectId, RepoId, RunId, StepId, UserId};
+use crate::model::ids::{
+    AgentId, BoxId, ItemId, ProjectId, RepoId, RunId, StepGraphId, StepId, UserId,
+};
+use crate::model::kind::{CommandQueue, Gate, Isolation};
 
 str_enum!(
     /// `run.kind` (§5.8).
@@ -148,6 +151,18 @@ str_enum!(
     }
 );
 
+str_enum!(
+    /// `run_step.verify_outcome` (ANA-2 §4.2): `unavailable` never fails a step.
+    VerifyOutcome {
+        /// The verify command exited 0.
+        Pass => "pass",
+        /// The verify command exited non-zero.
+        Fail => "fail",
+        /// No verify command, or it could not be run.
+        Unavailable => "unavailable",
+    }
+);
+
 /// A row of `run` (§5.8).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Run {
@@ -180,6 +195,15 @@ pub struct Run {
     pub finished_at: Option<DateTime<Utc>>,
     /// `run.failure`.
     pub failure: Option<String>,
+    /// `run.repo_scope`: the repos this run may touch (ANA-2 §4.7); empty on every row older than
+    /// `0003_orchestration.sql` and on a chat run.
+    pub repo_scope: Vec<RepoId>,
+    /// `run.lease_box_id` (ANA-2 §4.9).
+    pub lease_box_id: Option<BoxId>,
+    /// `run.lease_expires_at`; `None` = never claimed. `run.lease_owner` is deliberately **not**
+    /// on this row: the mirror does not carry it and a reader has no use for another process's
+    /// liveness token.
+    pub lease_expires_at: Option<DateTime<Utc>>,
     /// `run.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
@@ -195,7 +219,8 @@ pub struct RunStep {
     pub position: i32,
     /// `run_step.attempt`: retry / review loop counter.
     pub attempt: i32,
-    /// `run_step.fanout_index`: `0..fan_out`.
+    /// `run_step.fanout_index`: `0..fan_out`; `-1` is the judge step of this position and attempt
+    /// (ANA-2 §4.5).
     pub fanout_index: i32,
     /// `run_step.phase_name`; `chat` for a chat run.
     pub phase_name: String,
@@ -226,6 +251,13 @@ pub struct RunStep {
     pub started_at: Option<DateTime<Utc>>,
     /// `run_step.finished_at`.
     pub finished_at: Option<DateTime<Utc>>,
+    /// `run_step.verify_outcome` (ANA-2 §4.2).
+    pub verify_outcome: Option<VerifyOutcome>,
+    /// `run_step.verify_exit_code`: the verify command's own exit code, distinct from
+    /// [`RunStep::exit_code`].
+    pub verify_exit_code: Option<i32>,
+    /// `run_step.promoted_at` (ANA-2 §4.8).
+    pub promoted_at: Option<DateTime<Utc>>,
     /// `run_step.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
@@ -309,6 +341,228 @@ impl ChatRunSpec {
     }
 }
 
+/// Arguments of [`crate::store::WriteStore::create_run`]: a `kind = 'graph'` run inserted at
+/// `queued`, with the item moved to `queued` in the same transaction (ANA-2 §4.3, §5.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewRun {
+    /// `run.id`, minted by the caller so a retry is idempotent.
+    pub id: RunId,
+    /// `run.project_id`.
+    pub project_id: ProjectId,
+    /// `run.item_id`: a graph run always has one.
+    pub item_id: ItemId,
+    /// `run.mode`.
+    pub mode: RunMode,
+    /// `run.target_box_id`.
+    pub target_box_id: BoxId,
+    /// `run.started_by`.
+    pub started_by: UserId,
+    /// `run.graph_snapshot`, serialised by the store (`R-ORCH-11`).
+    pub graph_snapshot: GraphSnapshot,
+    /// `run.repo_scope` (ANA-2 §4.7).
+    ///
+    /// An empty scope overlaps nothing, so the admission of
+    /// [`claim_run`](crate::store::WriteStore::claim_run) never refuses it: a caller that resolves
+    /// an item's `touched_paths` to repos must never queue an empty scope for an item that has a
+    /// primary repo (§4.7's "an empty `touched_paths` overlaps the whole primary repo" is the
+    /// resolver's rule, not the seam's).
+    pub repo_scope: Vec<RepoId>,
+    /// `run.queued_at`; the caller's clock, microsecond-truncated like [`ChatRunSpec::started_at`].
+    pub queued_at: DateTime<Utc>,
+}
+
+/// Arguments of [`crate::store::WriteStore::create_step`]: a `run_step` inserted at `pending`
+/// with every settle column `NULL`. `UNIQUE (run_id, position, attempt, fanout_index)` is the
+/// database's; a repeat is `Constraint`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewRunStep {
+    /// `run_step.id`.
+    pub id: StepId,
+    /// `run_step.run_id`.
+    pub run_id: RunId,
+    /// `run_step.position`.
+    pub position: i32,
+    /// `run_step.attempt`, 1-based.
+    pub attempt: i32,
+    /// `run_step.fanout_index`; `-1` for the judge.
+    pub fanout_index: i32,
+    /// `run_step.phase_name`.
+    pub phase_name: String,
+    /// `run_step.agent_id`.
+    pub agent_id: Option<AgentId>,
+    /// `run_step.model`.
+    pub model: Option<String>,
+}
+
+/// What [`crate::store::WriteStore::finish_step`] writes: the settle columns and nothing about
+/// `status`, which only the §4.3 law moves.
+///
+/// `usage` and `trim_record` `None` **leave** the column — the assembler and the usage summer
+/// write them earlier — while every other field overwrites.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StepOutcome {
+    /// `run_step.exit_code`.
+    pub exit_code: Option<i32>,
+    /// `run_step.usage`; `None` leaves the column.
+    pub usage: Option<Value>,
+    /// `run_step.trim_record`; `None` leaves the column.
+    pub trim_record: Option<Value>,
+    /// `run_step.verify_outcome`.
+    pub verify_outcome: Option<VerifyOutcome>,
+    /// `run_step.verify_exit_code`.
+    pub verify_exit_code: Option<i32>,
+    /// `run_step.finished_at`.
+    pub finished_at: DateTime<Utc>,
+}
+
+/// A row of `run_step_tree` (ANA-2 §4.6): the isolation tree of one repo for one step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunStepTree {
+    /// `run_step_tree.run_step_id`.
+    pub run_step_id: StepId,
+    /// `run_step_tree.repo_id`.
+    pub repo_id: RepoId,
+    /// `run_step_tree.mode`; the same `CHECK` list as `step_graph_phase.isolation`.
+    pub mode: Isolation,
+    /// `run_step_tree.path`: absolute, on the executing box.
+    pub path: String,
+    /// `run_step_tree.base_ref`.
+    pub base_ref: String,
+    /// `run_step_tree.dirty`.
+    pub dirty: bool,
+}
+
+/// `run.graph_snapshot` (`R-ORCH-11`, ANA-2 §5.1): the graph as it was at queue time.
+///
+/// The only route to a graph while offline, since `step_graph` is not mirrored. Every optional
+/// field carries `#[serde(default)]` so a snapshot written by a later builder still decodes here;
+/// [`Run::graph_snapshot`] stays an untyped `Value`, because a reader that only lists runs never
+/// decodes it, while [`NewRun`] carries the typed form and the store serialises it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphSnapshot {
+    /// Schema version; a reader that meets an unknown `v` refuses rather than guesses.
+    pub v: u32,
+    /// The graph row this snapshot was taken from.
+    pub graph: SnapshotGraph,
+    /// `sha256:…` over the canonical `phases[]`; milestone 2 computes it, milestone 1 stores it.
+    pub topology: String,
+    /// `run.mode`, repeated so the snapshot is self-contained.
+    pub mode: RunMode,
+    /// The phases in `position` order.
+    pub phases: Vec<SnapshotPhase>,
+    /// The project settings the resolution used.
+    pub settings: SnapshotSettings,
+}
+
+impl GraphSnapshot {
+    /// The `v` this crate writes and the only one it reads.
+    pub const V: u32 = 1;
+}
+
+/// The `step_graph` half of a [`GraphSnapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotGraph {
+    /// `step_graph.id`.
+    pub id: StepGraphId,
+    /// `step_graph.name`.
+    pub name: String,
+    /// `step_graph.is_override` (ANA-2 §4.1).
+    #[serde(default)]
+    pub is_override: bool,
+}
+
+/// One resolved phase of a [`GraphSnapshot`] (ANA-2 §5.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotPhase {
+    /// `step_graph_phase.position`.
+    pub position: i32,
+    /// `step_graph_phase.name`.
+    pub name: String,
+    /// `step_graph_phase.fan_out`.
+    pub fan_out: i32,
+    /// `step_graph_phase.gate`, as configured.
+    pub gate: Gate,
+    /// `gate` after the `R-ORCH-6` downgrade; equal to `gate` when nothing downgraded it.
+    pub gate_effective: Gate,
+    /// `step_graph_phase.gate_hard`.
+    pub gate_hard: bool,
+    /// `step_graph_phase.retry_limit`.
+    pub retry_limit: i32,
+    /// `step_graph_phase.input_kinds`.
+    pub input_kinds: Vec<String>,
+    /// `step_graph_phase.output_kind`.
+    pub output_kind: String,
+    /// Resolved: the phase's own, else [`SnapshotSettings::default_isolation`].
+    pub isolation: Isolation,
+    /// `step_graph_phase.command_queue`.
+    pub command_queue: CommandQueue,
+    /// `step_graph_phase.verify_command`.
+    #[serde(default)]
+    pub verify_command: Option<String>,
+    /// `step_graph_phase.deadline_seconds`, resolved against the project rung.
+    #[serde(default)]
+    pub deadline_seconds: Option<u32>,
+    /// The prompt template, resolved to a concrete version.
+    pub template: SnapshotTemplate,
+    /// `step_graph_phase.token_budget`.
+    #[serde(default)]
+    pub token_budget: Option<i32>,
+    /// The `phase_agent` rows, in `position` order.
+    pub candidates: Vec<SnapshotCandidate>,
+    /// The fan-out judge, when the phase has one.
+    #[serde(default)]
+    pub judge: Option<SnapshotJudge>,
+}
+
+/// The prompt template of a [`SnapshotPhase`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotTemplate {
+    /// `prompt_template.name`.
+    pub name: String,
+    /// Resolved: never `None` in a snapshot, unlike `step_graph_phase.template_version`.
+    pub version: i32,
+}
+
+/// One candidate agent of a [`SnapshotPhase`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotCandidate {
+    /// `phase_agent.agent_id`.
+    pub agent_id: AgentId,
+    /// `agent.name`, denormalised so an offline reader needs no registry.
+    pub agent_name: String,
+    /// `phase_agent.model`.
+    pub model: String,
+}
+
+/// The fan-out judge of a [`SnapshotPhase`] (ANA-2 §4.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotJudge {
+    /// `step_graph_phase.judge_agent_id`.
+    pub agent_id: AgentId,
+    /// `agent.name`.
+    pub agent_name: String,
+    /// `step_graph_phase.judge_model`.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// The `project.settings` a [`GraphSnapshot`] resolved against (ANA-2 §5.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotSettings {
+    /// `project.settings.default_isolation`.
+    pub default_isolation: Isolation,
+    /// `project.settings.per_token_cap_run`, micros.
+    #[serde(default)]
+    pub per_token_cap_run: Option<i64>,
+    /// `project.settings.per_token_cap_batch`, micros.
+    #[serde(default)]
+    pub per_token_cap_batch: Option<i64>,
+    /// `app_setting.max_fan_out`.
+    pub max_fan_out: u32,
+    /// `app_setting.max_agents_per_run`.
+    pub max_agents_per_run: u32,
+}
+
 /// A row of `run_step_commit` (§5.8): the before/after commit of one repository for one step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunStepCommit {
@@ -357,6 +611,19 @@ pub struct RunStepSummary {
     /// Whether any `trim_record.sections[].trimmed` is `true`: the `!` the Runs pane renders
     /// beside the token figure (plan D106).
     pub trimmed: bool,
+    /// `run_step.usage`, whole (ANA-2 §6.2).
+    pub usage: Option<Value>,
+    /// `run_step.selected`.
+    pub selected: Option<bool>,
+    /// `run_step.exit_code`.
+    pub exit_code: Option<i32>,
+    /// `run_step.verify_outcome`.
+    pub verify_outcome: Option<VerifyOutcome>,
+    /// `run_step.promoted_at`.
+    pub promoted_at: Option<DateTime<Utc>>,
+    /// `agent.name` of `agent_id`, denormalised for the Runs pane; `None` when `agent_id` is
+    /// `None` or names no row.
+    pub agent_name: Option<String>,
 }
 
 /// Plan D106's derivation of [`RunStepSummary::prompt_tokens`] and [`RunStepSummary::trimmed`]

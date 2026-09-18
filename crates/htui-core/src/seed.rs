@@ -195,6 +195,7 @@ pub fn graph_row(
         project_id,
         name: kind.name.to_owned(),
         description: graph_description(kind.name),
+        is_override: false,
         created_at: now,
         updated_at: now,
     }
