@@ -4101,6 +4101,33 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
             .expect(CASE),
         "{CASE}: the box is full at DEFAULT_MAX_CONCURRENT_ITEMS running runs"
     );
+    // §4.7 draws the two predicates over two different sets, and `awaiting_approval` is where they
+    // part: the slot count is `status = 'running'` alone, because "an `awaiting_approval` run
+    // consumes no compute and must not hold a slot", while the overlap predicate "ranges over
+    // non-terminal runs, including `awaiting_approval` ones, because a parked run still owns its
+    // trees and its unmerged branch" (`docs/ANA-2.md` §4.7, invariant 6).
+    assert!(
+        store
+            .transition_run(first, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the first run parks at a gate"
+    );
+    assert!(
+        !store
+            .claim_run(second, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        "{CASE}: a parked run still holds the trees of its repo_scope"
+    );
+    assert!(
+        store
+            .claim_run(fourth, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        "{CASE}: but it holds no slot, so the box that was full has one free"
+    );
+
     assert!(
         !store
             .claim_run(first, ids::BOX, owner, at, until)

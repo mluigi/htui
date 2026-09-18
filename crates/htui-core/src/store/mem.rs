@@ -3178,6 +3178,12 @@ impl State {
             return Ok(false);
         }
 
+        // Two predicates over two sets, which §4.7 draws apart on purpose. The slot count is
+        // `status = 'running'` alone — "an `awaiting_approval` run consumes no compute and must
+        // not hold a slot" — while the overlap predicate "ranges over non-terminal runs, including
+        // `awaiting_approval` ones, because a parked run still owns its trees and its unmerged
+        // branch" (invariant 6). A `queued` run is in neither: it has no `executing_box_id` and no
+        // tree.
         let live: Vec<&Run> = self
             .runs
             .values()
@@ -3186,7 +3192,11 @@ impl State {
                     && matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
             })
             .collect();
-        if rows(live.len()) >= u64::from(self.max_concurrent_items(box_id)) {
+        let running = live
+            .iter()
+            .filter(|row| row.status == RunStatus::Running)
+            .count();
+        if rows(running) >= u64::from(self.max_concurrent_items(box_id)) {
             return Ok(false);
         }
         // An empty `repo_scope` intersects nothing, so a run that declared none is never refused

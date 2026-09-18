@@ -684,14 +684,19 @@ pub trait WriteStore: ReadStore {
     /// foreign key.
     async fn create_run(&self, new: NewRun) -> Result<Run>;
 
-    /// ANA-2 §4.7's admission, one transaction: lock the box row, count its live runs against
+    /// ANA-2 §4.7's admission, one transaction: lock the box row, count its **`running`** runs
+    /// against
     /// [`BoxSettings::max_concurrent_items`](crate::model::BoxSettings::max_concurrent_items)
     /// (else `app_setting`, else
     /// [`DEFAULT_MAX_CONCURRENT_ITEMS`](crate::model::DEFAULT_MAX_CONCURRENT_ITEMS)), refuse any
-    /// overlap between `run.repo_scope` and a live run's scope on the same box, then move the run
-    /// `queued -> running` with `executing_box_id = box_id`, `started_at = at`,
+    /// overlap between `run.repo_scope` and a **non-terminal** run's scope on the same box, then
+    /// move the run `queued -> running` with `executing_box_id = box_id`, `started_at = at`,
     /// `lease_box_id = box_id`, `lease_owner = owner`, `lease_expires_at = lease_until`, and the
     /// item `queued -> in_progress`.
+    ///
+    /// The two predicates range over two different sets, and `awaiting_approval` is where they
+    /// part: a parked run consumes no compute and so holds no slot, but it still owns its trees
+    /// and its unmerged branch and so still refuses an overlapping scope (§4.7, invariant 6).
     ///
     /// `Ok(false)` when the slot or the overlap check refuses, when the run is not `queued`, or
     /// when its `target_box_id` is not `box_id`; nothing is written in any of those cases.
