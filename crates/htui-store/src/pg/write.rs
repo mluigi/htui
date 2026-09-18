@@ -31,10 +31,11 @@ use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung, StoreError,
-    StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, chat_step_status, expected_on_row,
-    graph_not_in_project, illegal_move, invalid_prefix, item_kind_is_held, legal_move,
-    not_a_fanout_candidate, not_a_terminal_status, reserved_phase_name, row_names_another_step,
-    run_is_terminal, step_is_not_promotable, winner_is_not_settled,
+    StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, chat_step_status,
+    close_out_needs_a_summary, expected_on_row, graph_not_in_project, illegal_move, invalid_prefix,
+    item_has_a_live_run, item_kind_is_held, legal_move, not_a_fanout_candidate,
+    not_a_terminal_status, reserved_phase_name, row_names_another_step, run_is_terminal,
+    step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -155,6 +156,56 @@ async fn step_exists(conn: &mut PgConnection, step: StepId) -> Result<()> {
             id: step.to_string(),
         })?;
     Ok(())
+}
+
+/// The `document` insert [`WriteStore::write_document`] and [`WriteStore::close_out`] share, on
+/// **their own transaction** and under a lock the caller has already taken on the item (MOD-4 T2).
+///
+/// The version is allocated by the statement itself - `COALESCE(MAX(version), 0) + 1` over the
+/// `(item, kind)` the row is about to join - so the read and the write are one snapshot. What makes
+/// that safe against a second writer is the caller's `SELECT ... FOR UPDATE` on the **item**: the
+/// row the second writer would have to wait for does not exist in `document` yet, so the parent is
+/// the only row both are guaranteed to contend on.
+///
+/// `close_out` cannot call [`WriteStore::write_document`] for this, because that method opens a
+/// transaction of its own and close-out's three effects are one (the same reason `seed_project`
+/// does not reuse `create_step_graph`).
+///
+/// # Errors
+///
+/// [`StoreError::Constraint`] on a duplicate id (`23505`) or a `created_by` /
+/// `produced_by_step_id` that names no row (`23503`); the item's own key cannot fail here, because
+/// the caller has just read the row.
+async fn insert_document(conn: &mut PgConnection, new: NewDocument) -> Result<Document> {
+    sqlx::query_as!(
+        Document,
+        r#"
+        INSERT INTO document (id, item_id, kind, version, title, body, produced_by_step_id,
+                              created_by, created_at)
+        SELECT $1, $2, $3, COALESCE(MAX(version), 0) + 1, $4, $5, $6, $7, $8
+          FROM document WHERE item_id = $2 AND kind = $3
+        RETURNING id                  AS "id: htui_core::model::DocumentId",
+                  item_id             AS "item_id: ItemId",
+                  kind,
+                  version,
+                  title,
+                  body,
+                  produced_by_step_id AS "produced_by_step_id: StepId",
+                  created_by          AS "created_by: UserId",
+                  created_at
+        "#,
+        new.id.as_uuid(),
+        new.item_id.as_uuid(),
+        new.kind,
+        new.title,
+        new.body,
+        new.produced_by_step_id.map(StepId::as_uuid),
+        new.created_by.as_uuid(),
+        new.created_at,
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(map_sqlx)
 }
 
 /// A `count(*)` as the `u64` [`DeleteReach`] holds. Postgres counts as `bigint` and never
@@ -3177,35 +3228,7 @@ impl WriteStore for PgStore {
             id: new.item_id.to_string(),
         })?;
 
-        let written = sqlx::query_as!(
-            Document,
-            r#"
-            INSERT INTO document (id, item_id, kind, version, title, body, produced_by_step_id,
-                                  created_by, created_at)
-            SELECT $1, $2, $3, COALESCE(MAX(version), 0) + 1, $4, $5, $6, $7, $8
-              FROM document WHERE item_id = $2 AND kind = $3
-            RETURNING id                  AS "id: htui_core::model::DocumentId",
-                      item_id             AS "item_id: ItemId",
-                      kind,
-                      version,
-                      title,
-                      body,
-                      produced_by_step_id AS "produced_by_step_id: StepId",
-                      created_by          AS "created_by: UserId",
-                      created_at
-            "#,
-            new.id.as_uuid(),
-            new.item_id.as_uuid(),
-            new.kind,
-            new.title,
-            new.body,
-            new.produced_by_step_id.map(StepId::as_uuid),
-            new.created_by.as_uuid(),
-            new.created_at,
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_sqlx)?;
+        let written = insert_document(&mut tx, new).await?;
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(written)
@@ -3303,17 +3326,199 @@ impl WriteStore for PgStore {
         tx.commit().await.map_err(map_sqlx)
     }
 
-    async fn fail_run(&self, _run: RunId, _failure: &str, _at: DateTime<Utc>) -> Result<()> {
-        todo!("MOD-4 T2 commit 6")
+    /// §4.3's failure row: `queued | running | awaiting_approval -> failed`, with the reason and
+    /// the caller's instant.
+    ///
+    /// `finished_at` is `COALESCE`d rather than assigned, so a run that already stamped a finish
+    /// (a `cancelled` racing a `failed` is not possible under the law, but a re-`finish` is) keeps
+    /// the first instant. `failure` is assigned: the newest reason is the one the pane shows.
+    ///
+    /// The three statuses in the `WHERE` are exactly [`RunStatus::can_move_to`]'s `-> Failed`
+    /// column, so the compare-and-set *is* the law, and like
+    /// [`supersede_step`](WriteStore::supersede_step) the follow-up read fetches the **status**
+    /// rather than a bare `SELECT 1`: it is what [`illegal_move`] names in the sentence.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run" }`; [`StoreError::Constraint`] when the run is
+    /// already terminal.
+    async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> Result<()> {
+        let moved = sqlx::query!(
+            "UPDATE run SET status = 'failed', failure = $2, \
+                            finished_at = COALESCE(finished_at, $3) \
+              WHERE id = $1 AND status IN ('queued','running','awaiting_approval')",
+            run.as_uuid(),
+            failure,
+            at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if moved == 1 {
+            return Ok(());
+        }
+
+        let current = sqlx::query_scalar!(
+            r#"SELECT status AS "status: RunStatus" FROM run WHERE id = $1"#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        match current {
+            Some(status) => Err(StoreError::Constraint(illegal_move(
+                "run",
+                status,
+                RunStatus::Failed,
+            ))),
+            None => Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            }),
+        }
     }
 
+    /// `R-TUI-9`'s close-out: the summary, the commits and the item's move to `closed`, one
+    /// transaction (plan D6), refused while any run of the item is still active.
+    ///
+    /// The item's row is taken `FOR UPDATE` first and held to the commit, which is what makes the
+    /// three effects one act rather than three: it is the lock
+    /// [`write_document`](WriteStore::write_document) needs to allocate the summary's version, and
+    /// it is also what stops a [`claim_run`](WriteStore::claim_run) from admitting a run of this
+    /// item between the live-run probe and the `UPDATE` - `claim_run` moves the item to
+    /// `in_progress` and so contends on the same row.
+    ///
+    /// The live-run probe orders by `(queued_at, id)` rather than taking any row, so the run the
+    /// sentence names is the same one [`MemStore`](htui_core::store::MemStore) names: with two
+    /// live runs the backends would otherwise disagree about which is "in the way".
+    ///
+    /// Every commit row's step is probed by [`step_exists`], because the foreign key would make an
+    /// unknown step [`StoreError::Constraint`] where the contract says [`StoreError::NotFound`].
+    /// An unknown **repo** is left to the key (`23503`), which [`map_sqlx`] turns into
+    /// `Constraint`; it is raised at the insert rather than before it, and the transaction is what
+    /// makes the difference unobservable - nothing has been committed when it fires.
+    ///
+    /// The insert is [`insert_document`] and not the trait method, which would open a transaction
+    /// of its own; the closing `UPDATE` is [`transition`](WriteStore::transition)'s statement with
+    /// `closed_at` fixed, since `closed` is terminal by construction here. Its `AND status = $2`
+    /// cannot miss under the row lock, and is kept as the assertion that it cannot.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "item" }`, or `{ entity: "run_step" }` for a commit row
+    /// naming a step that does not exist; [`StoreError::Constraint`] when a run of the item is
+    /// `queued | running | awaiting_approval`, when `summary.kind` is not `summary`, when
+    /// `summary.item_id` is not `item`, when the item cannot reach `closed` under §4.3, when a
+    /// commit row names an unknown repo, or when the summary duplicates a document id or names an
+    /// unknown `created_by` / `produced_by_step_id`. No refusal writes anything.
     async fn close_out(
         &self,
-        _item: ItemId,
-        _summary: NewDocument,
-        _commits: &[RunStepCommit],
+        item: ItemId,
+        summary: NewDocument,
+        commits: &[RunStepCommit],
     ) -> Result<Document> {
-        todo!("MOD-4 T2 commit 6")
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let Some(status) = sqlx::query_scalar!(
+            r#"SELECT status AS "status: Status" FROM item WHERE id = $1 FOR UPDATE"#,
+            item.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        else {
+            return Err(StoreError::NotFound {
+                entity: "item",
+                id: item.to_string(),
+            });
+        };
+
+        if let Some(live) = sqlx::query!(
+            r#"
+            SELECT id     AS "id: RunId",
+                   status AS "status: RunStatus"
+              FROM run
+             WHERE item_id = $1 AND status IN ('queued','running','awaiting_approval')
+             ORDER BY queued_at, id
+             LIMIT 1
+            "#,
+            item.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        {
+            return Err(StoreError::Constraint(item_has_a_live_run(
+                item,
+                live.id,
+                live.status,
+            )));
+        }
+
+        if summary.kind != "summary" {
+            return Err(StoreError::Constraint(close_out_needs_a_summary(
+                &summary.kind,
+            )));
+        }
+        if summary.item_id != item {
+            return Err(StoreError::Constraint(summary_names_another_item(
+                item,
+                summary.item_id,
+            )));
+        }
+        legal_move(status, Status::Closed)?;
+
+        let mut probed: Vec<StepId> = Vec::new();
+        for row in commits {
+            if !probed.contains(&row.run_step_id) {
+                step_exists(&mut tx, row.run_step_id).await?;
+                probed.push(row.run_step_id);
+            }
+        }
+
+        let written = insert_document(&mut tx, summary).await?;
+
+        for row in commits {
+            sqlx::query!(
+                "INSERT INTO run_step_commit (run_step_id, repo_id, before_hash, after_hash) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (run_step_id, repo_id) DO UPDATE \
+                    SET before_hash = EXCLUDED.before_hash, \
+                        after_hash  = EXCLUDED.after_hash",
+                row.run_step_id.as_uuid(),
+                row.repo_id.as_uuid(),
+                row.before_hash,
+                row.after_hash,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        let closed = sqlx::query!(
+            "UPDATE item SET status = 'closed', closed_at = clock_timestamp() \
+              WHERE id = $1 AND status = $2",
+            item.as_uuid(),
+            status.as_str(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if closed != 1 {
+            return Err(StoreError::Constraint(concurrent_write(
+                "item",
+                item,
+                "the status the close-out was decided against",
+            )));
+        }
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(written)
     }
 
     /// One `item_note`: ANA-2 invariant 7's refusal note, and the one thing a refusing gate always
