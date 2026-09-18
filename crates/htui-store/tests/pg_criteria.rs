@@ -3390,3 +3390,397 @@ async fn step_tree_rows_cascade_with_their_step() {
 
     db.drop_db().await;
 }
+
+/// MOD-4 milestone 1's eleven inherent orchestration reads (blueprint §3.5, F-N), against the
+/// fixture.
+///
+/// `phase_agent`, `agent_box`, `repo_box_path` and the whole `box` row are outside the mirrored
+/// table list of `docs/ANA-9.md` §4.4, so these eleven never became `ReadStore` methods and
+/// `Backend`'s offline arm refuses them (plan D1). The conformance suite reaches only the traits,
+/// so this is the **only** thing in the tree that pins Postgres's answers against the `MemStore`
+/// the suite pins — which is what makes them one seam rather than two implementations.
+///
+/// Three reads are compared against seeded rows rather than against `MemStore`, because the
+/// fixture has no `phase_agent`, `agent_box` or `repo_box_path` row and equality on two empty
+/// vectors pins nothing. `phase_agents` stays deliberately divergent: `MemStore` holds no such
+/// table and answers empty whatever the phase, which is the blueprint's F-N note and the reason
+/// the snapshot builder falls back to `project.settings.default_agent_id`.
+#[tokio::test(flavor = "multi_thread")]
+async fn inherent_orchestration_reads_answer_the_fixture() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mem = htui_core::store::MemStore::demo();
+    let scope = htui_core::model::Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+    };
+
+    // ---- step_graph, prompt_template, resolve_graph: the fixture's own rows -------------------
+    assert_eq!(
+        db.store
+            .step_graph(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("step_graph must not fail"),
+        mem.step_graph(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore::step_graph"),
+        "one step_graph row, byte for byte"
+    );
+    assert_eq!(
+        db.store
+            .step_graph(htui_core::model::StepGraphId::new())
+            .await
+            .expect("an unknown graph is None, not an error"),
+        None
+    );
+
+    let highest = db
+        .store
+        .prompt_template(ids::PROJECT_HTUI, "implement", None)
+        .await
+        .expect("prompt_template must not fail");
+    assert_eq!(
+        highest,
+        mem.prompt_template(ids::PROJECT_HTUI, "implement", None)
+            .await
+            .expect("MemStore::prompt_template"),
+        "the highest version of a name, on both backends"
+    );
+    let version = highest
+        .as_ref()
+        .expect("the fixture seeds `implement`")
+        .version;
+    assert_eq!(
+        db.store
+            .prompt_template(ids::PROJECT_HTUI, "implement", Some(version))
+            .await
+            .expect("the pin resolves"),
+        highest,
+        "a pin that names the highest version is the same row"
+    );
+    assert_eq!(
+        db.store
+            .prompt_template(ids::PROJECT_HTUI, "implement", Some(version + 99))
+            .await
+            .expect("an unhonourable pin is None, not an error"),
+        None,
+        "a pin that names no row does not fall back to the highest"
+    );
+
+    let resolved = db
+        .store
+        .resolve_graph(ids::HTUI_FEAT_1)
+        .await
+        .expect("resolve_graph must not fail")
+        .expect("FEAT-1's kind has a default graph");
+    assert_eq!(
+        Some(&resolved),
+        mem.resolve_graph(ids::HTUI_FEAT_1)
+            .await
+            .expect("MemStore::resolve_graph")
+            .as_ref(),
+        "the graph and its phases, in position order, on both backends"
+    );
+    assert!(
+        resolved
+            .phases
+            .windows(2)
+            .all(|pair| pair[0].phase.position < pair[1].phase.position),
+        "phases are in `position` order"
+    );
+    assert_eq!(
+        db.store
+            .resolve_graph(ItemId::new())
+            .await
+            .expect("an unknown item is None, not an error"),
+        None
+    );
+
+    // ---- box_row, active_runs_on_box, overlapping_runs, ready_items, missing_tags -------------
+    assert_eq!(
+        db.store
+            .box_row(ids::BOX)
+            .await
+            .expect("box_row must not fail"),
+        mem.box_row(ids::BOX).await.expect("MemStore::box_row"),
+        "the whole box row, both tag lists and `settings` included"
+    );
+    let this_box = db
+        .store
+        .box_row(ids::BOX)
+        .await
+        .expect("box_row")
+        .expect("the fixture's one box");
+    assert_eq!(
+        (
+            this_box.probed_tags.as_slice(),
+            this_box.declared_tags.as_slice()
+        ),
+        (
+            ["rust", "msvc", "cmake"].map(str::to_owned).as_slice(),
+            ["gpu"].map(str::to_owned).as_slice()
+        ),
+        "the two `Vec<String>` columns are adjacent in the struct and a transposed select list \
+         would type-check (T1 audit A-5)"
+    );
+
+    assert_eq!(
+        db.store
+            .active_runs_on_box(ids::BOX)
+            .await
+            .expect("active_runs_on_box must not fail"),
+        mem.active_runs_on_box(ids::BOX)
+            .await
+            .expect("MemStore::active_runs_on_box"),
+        "§4.7's slot count: `running` and `awaiting_approval`, never `queued`"
+    );
+
+    // Every fixture run has an empty `repo_scope` — the fixture has no `repo` row — so the
+    // overlap read is given one by hand rather than asserted vacuously. `RUN_2` is `queued`,
+    // which is active.
+    let scoped = RepoId::new();
+    let elsewhere = RepoId::new();
+    assert_eq!(
+        db.store
+            .overlapping_runs(&[scoped])
+            .await
+            .expect("overlapping_runs must not fail"),
+        mem.overlapping_runs(&[scoped])
+            .await
+            .expect("MemStore::overlapping_runs"),
+        "with no run in the scope both backends answer the same nothing"
+    );
+    sqlx::query!(
+        "UPDATE run SET repo_scope = $2::uuid[] WHERE id = $1",
+        ids::RUN_2.as_uuid(),
+        &[scoped.as_uuid()][..],
+    )
+    .execute(&db.pool)
+    .await
+    .expect("give the queued run a scope");
+    assert_eq!(
+        db.store
+            .overlapping_runs(&[scoped])
+            .await
+            .expect("overlapping_runs")
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        vec![ids::RUN_2],
+        "an active run whose scope intersects is named"
+    );
+    assert!(
+        db.store
+            .overlapping_runs(&[elsewhere])
+            .await
+            .expect("overlapping_runs")
+            .is_empty(),
+        "a disjoint scope names nothing"
+    );
+    assert!(
+        db.store
+            .overlapping_runs(&[])
+            .await
+            .expect("an empty scope is not an error")
+            .is_empty(),
+        "an empty scope intersects nothing (hazard H-10)"
+    );
+    db.store
+        .fail_run(ids::RUN_2, "no longer wanted", Utc::now())
+        .await
+        .expect("terminate the run");
+    assert!(
+        db.store
+            .overlapping_runs(&[scoped])
+            .await
+            .expect("overlapping_runs")
+            .is_empty(),
+        "and a terminal run holds no scope at all"
+    );
+
+    let ready = db
+        .store
+        .ready_items(&scope, ids::BOX)
+        .await
+        .expect("ready_items must not fail");
+    assert_eq!(
+        ready,
+        mem.ready_items(&scope, ids::BOX)
+            .await
+            .expect("MemStore::ready_items"),
+        "§7.4's readiness and `R-ORCH-10`'s capability half agree on both backends"
+    );
+    assert!(
+        ready.iter().all(|row| row
+            .required_tags
+            .iter()
+            .all(|tag| this_box.probed_tags.contains(tag) || this_box.declared_tags.contains(tag))),
+        "nothing this box cannot run is offered"
+    );
+    assert!(
+        db.store
+            .ready_items(&scope, BoxId::new())
+            .await
+            .expect("an unknown box is not an error")
+            .iter()
+            .all(|row| row.required_tags.is_empty()),
+        "a box with no row has no capabilities, so only untagged items are ready"
+    );
+
+    // `docker` is neither probed nor declared; `cmake` is probed and `gpu` declared.
+    assert_eq!(
+        db.store
+            .missing_tags(ids::HTUI_TOOL_1, ids::BOX)
+            .await
+            .expect("missing_tags must not fail"),
+        mem.missing_tags(ids::HTUI_TOOL_1, ids::BOX)
+            .await
+            .expect("MemStore::missing_tags"),
+        "the tags this box cannot cover, in byte order"
+    );
+    assert_eq!(
+        db.store
+            .missing_tags(ids::HTUI_TOOL_1, ids::BOX)
+            .await
+            .expect("missing_tags"),
+        vec!["docker".to_owned()],
+        "and they are the right ones"
+    );
+    assert!(
+        db.store
+            .missing_tags(ids::HTUI_FEAT_1, ids::BOX)
+            .await
+            .expect("missing_tags")
+            .is_empty(),
+        "an item this box can take is missing nothing"
+    );
+    assert!(
+        matches!(
+            db.store.missing_tags(ItemId::new(), ids::BOX).await,
+            Err(htui_core::store::StoreError::NotFound { entity: "item", .. })
+        ),
+        "an empty answer means `this box can take it`, so an unknown item cannot be spelled alike"
+    );
+    assert!(
+        matches!(
+            db.store.missing_tags(ids::HTUI_FEAT_1, BoxId::new()).await,
+            Err(htui_core::store::StoreError::NotFound { entity: "box", .. })
+        ),
+        "nor an unknown box"
+    );
+
+    // ---- phase_agents, agent_boxes, repo_paths: seeded, because the fixture has no such row ---
+    sqlx::query!(
+        "INSERT INTO phase_agent (phase_id, position, agent_id, model) \
+         VALUES ($1, 1, $2, 'opus'), ($1, 0, $3, 'sonnet')",
+        ids::PHASE_HTUI_IMPLEMENT.as_uuid(),
+        ids::AGENT_AGY.as_uuid(),
+        ids::AGENT_CLAUDE.as_uuid(),
+    )
+    .execute(&db.pool)
+    .await
+    .expect("seed two phase_agent rows out of position order");
+
+    let candidates = db
+        .store
+        .phase_agents(ids::PHASE_HTUI_IMPLEMENT)
+        .await
+        .expect("phase_agents must not fail");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|row| (row.position, row.agent_id, row.model.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, ids::AGENT_CLAUDE, "sonnet"),
+            (1, ids::AGENT_AGY, "opus")
+        ],
+        "candidates come back in `position` order, not insertion order"
+    );
+    assert!(
+        mem.phase_agents(ids::PHASE_HTUI_IMPLEMENT)
+            .await
+            .expect("MemStore::phase_agents")
+            .is_empty(),
+        "`MemStore` holds no `phase_agent` table and says so (blueprint F-N)"
+    );
+    assert_eq!(
+        db.store
+            .resolve_graph(ids::HTUI_FEAT_1)
+            .await
+            .expect("resolve_graph")
+            .expect("the graph")
+            .phases
+            .iter()
+            .find(|row| row.phase.id == ids::PHASE_HTUI_IMPLEMENT)
+            .map(|row| row.agents.len()),
+        Some(2),
+        "and `resolve_graph` carries the candidates it now has"
+    );
+
+    sqlx::query!(
+        "INSERT INTO agent_box (agent_id, box_id, enabled, version, path) \
+         VALUES ($1, $2, true, '1.2.3', '/usr/bin/claude')",
+        ids::AGENT_CLAUDE.as_uuid(),
+        ids::BOX.as_uuid(),
+    )
+    .execute(&db.pool)
+    .await
+    .expect("seed one agent_box row");
+    let installed = db
+        .store
+        .agent_boxes(ids::BOX)
+        .await
+        .expect("agent_boxes must not fail");
+    assert_eq!(
+        installed
+            .iter()
+            .map(|row| (row.agent_id, row.enabled, row.version.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![(ids::AGENT_CLAUDE, true, Some("1.2.3"))],
+        "the box's own agent rows, and no other box's"
+    );
+    assert!(
+        db.store
+            .agent_boxes(BoxId::new())
+            .await
+            .expect("an unknown box is not an error")
+            .is_empty()
+    );
+
+    let repo = db
+        .store
+        .create_repo(NewRepo {
+            id: RepoId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: "core".to_owned(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            is_primary: true,
+        })
+        .await
+        .expect("create the repo the path hangs off")
+        .id;
+    sqlx::query!(
+        "INSERT INTO repo_box_path (repo_id, box_id, local_path) VALUES ($1, $2, 'C:/src/core')",
+        repo.as_uuid(),
+        ids::BOX.as_uuid(),
+    )
+    .execute(&db.pool)
+    .await
+    .expect("seed one repo_box_path row");
+    assert_eq!(
+        db.store
+            .repo_paths(ids::BOX)
+            .await
+            .expect("repo_paths must not fail")
+            .iter()
+            .map(|row| (row.repo_id, row.local_path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(repo, "C:/src/core")],
+        "every checkout path on one box (`R-BOX-4`), the mirror image of `repo_box_path_rows`"
+    );
+
+    db.drop_db().await;
+}

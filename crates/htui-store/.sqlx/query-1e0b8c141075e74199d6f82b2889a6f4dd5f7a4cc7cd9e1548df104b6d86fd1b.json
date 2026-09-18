@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run SET repo_scope = $2::uuid[] WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1e0b8c141075e74199d6f82b2889a6f4dd5f7a4cc7cd9e1548df104b6d86fd1b"
+}

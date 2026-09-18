@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COALESCE(i.step_graph_id, k.default_graph_id)\n                       AS \"graph_id?: htui_core::model::StepGraphId\"\n              FROM item i JOIN item_kind k ON k.id = i.kind_id\n             WHERE i.id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "graph_id?: htui_core::model::StepGraphId",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "d518bf0855125156c4efad856e455e65d82db8fc0b57fb8cab1bfa65547a987f"
+}

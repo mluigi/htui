@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT t COLLATE \"C\" AS \"tag!\"\n              FROM item i CROSS JOIN box b, UNNEST(i.required_tags) t\n             WHERE i.id = $1 AND b.id = $2\n               AND t <> ALL (b.probed_tags || b.declared_tags)\n             ORDER BY 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tag!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8a46c75b8cf51582d48ea27a63dce8ad9eb5abdef0a796162c83bc0366e53c6a"
+}

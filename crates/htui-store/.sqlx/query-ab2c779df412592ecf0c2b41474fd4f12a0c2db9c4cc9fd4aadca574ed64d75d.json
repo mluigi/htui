@@ -1,0 +1,136 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT agent_id AS \"agent_id: htui_core::model::AgentId\",\n                   box_id   AS \"box_id: BoxId\",\n                   enabled,\n                   version,\n                   path,\n                   probed_at,\n                   quota,\n                   quota_at,\n                   updated_at,\n                   probe\n              FROM agent_box\n             WHERE box_id = $1\n             ORDER BY agent_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "agent_id: htui_core::model::AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "agent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "box_id: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "version",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "path"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "probed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "probed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "quota",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "quota"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "quota_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "quota_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "probe",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_box",
+            "name": "probe"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "ab2c779df412592ecf0c2b41474fd4f12a0c2db9c4cc9fd4aadca574ed64d75d"
+}

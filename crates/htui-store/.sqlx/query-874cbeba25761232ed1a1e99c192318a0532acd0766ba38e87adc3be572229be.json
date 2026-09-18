@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO phase_agent (phase_id, position, agent_id, model) VALUES ($1, 1, $2, 'opus'), ($1, 0, $3, 'sonnet')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "874cbeba25761232ed1a1e99c192318a0532acd0766ba38e87adc3be572229be"
+}

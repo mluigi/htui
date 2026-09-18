@@ -1,0 +1,161 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT i.id            AS \"id: ItemId\",\n                   i.project_id    AS \"project_id: ProjectId\",\n                   i.kind_id       AS \"kind_id: htui_core::model::ItemKindId\",\n                   i.key           AS \"key!\",\n                   i.key_prefix,\n                   i.key_number,\n                   i.title,\n                   i.status        AS \"status: htui_core::model::Status\",\n                   i.priority,\n                   i.required_tags,\n                   i.updated_at,\n                   i.touched_paths\n              FROM item i LEFT JOIN box b ON b.id = $2\n             WHERE i.project_id = ANY($1)\n               AND i.status = 'open'\n               AND NOT EXISTS (\n                        SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id\n                         WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'\n                           AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed'))\n               AND NOT EXISTS (\n                        SELECT 1 FROM UNNEST(i.required_tags) t\n                         WHERE t <> ALL (COALESCE(b.probed_tags, '{}')\n                                      || COALESCE(b.declared_tags, '{}')))\n             ORDER BY array_position($1, i.project_id), i.key_prefix, i.key_number\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind_id: htui_core::model::ItemKindId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "kind_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "key_prefix",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key_prefix"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "key_number",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key_number"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "title",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "status: htui_core::model::Status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "priority",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "priority"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "required_tags",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "required_tags"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "touched_paths",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "touched_paths"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a22310d83599424233ef569d5d082dde7e1db6b07ee7f8220bb1962e87fb6c31"
+}

@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT repo_id AS \"repo_id: RepoId\",\n                   box_id  AS \"box_id: BoxId\",\n                   local_path,\n                   updated_at\n              FROM repo_box_path\n             WHERE box_id = $1\n             ORDER BY repo_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repo_id: RepoId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "repo_box_path",
+            "name": "repo_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "box_id: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "repo_box_path",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "local_path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repo_box_path",
+            "name": "local_path"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repo_box_path",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "634a10f06a5d6bc4faf133d623fb89117aa3b6833400a069fe1e2eceeae0bb59"
+}

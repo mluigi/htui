@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_box (agent_id, box_id, enabled, version, path) VALUES ($1, $2, true, '1.2.3', '/usr/bin/claude')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "370e538be8c8cd89f429f736fed0346dc2a537d0e8a329b77ac23fe729c7b62f"
+}

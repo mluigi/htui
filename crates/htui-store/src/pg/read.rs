@@ -16,12 +16,13 @@ use std::collections::BTreeMap;
 use htui_core::model::{
     Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     BoxTool, CommandQueue, Document, DocumentHead, DocumentId, Gate, GateOutcome, Isolation, Item,
-    ItemFilter, ItemId, ItemKind, ItemKindId, LinkEdge, LinkGraph, LinkKind, Note, PhaseId,
-    Project, ProjectId, ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId,
-    ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunStepTree, RunSummary, Scope, SessionEvent, SkillId, SkillVersion, StepGraph, StepGraphId,
-    StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, VerifyOutcome, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
+    ItemFilter, ItemId, ItemKind, ItemKindId, LinkEdge, LinkGraph, LinkKind, Note, PhaseAgent,
+    PhaseId, Project, ProjectId, ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath,
+    RepoId, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus,
+    RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SkillId,
+    SkillVersion, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, UpstreamEntry,
+    UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject,
+    WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -1324,6 +1325,438 @@ impl PgStore {
             id.as_uuid(),
         )
         .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // MOD-4 milestone 1: the eleven orchestration reads of plan D1 (blueprint F-N).
+    //
+    // Inherent and not [`ReadStore`] methods for the same reason MOD-2's five prompt reads are:
+    // each one's table - `phase_agent`, `agent_box`, `repo_box_path`, `box` whole rather than
+    // projected - is absent from the mirrored list of `docs/ANA-9.md` §4.4, so `CacheStore` has
+    // nothing to answer from and [`Backend::Offline`] refuses them. `MemStore` carries a
+    // like-named inherent for each so that `Backend`'s `match self` has three arms to dispatch
+    // over, and `pg_criteria::inherent_orchestration_reads_answer_the_fixture` is what pins the
+    // two answers together - there is no conformance case, because the suite reaches only the
+    // traits.
+    //
+    // ANA-2 §8 names sixteen reads; five of them (`agents`, `app_settings`, `item_kind`,
+    // `phases`, `repos`) already existed when MOD-4 began and two of those the shipped tree keeps
+    // elsewhere. The shipped placement wins (plan D1), which is why this block is eleven long.
+    // -------------------------------------------------------------------------------------------
+
+    /// One `step_graph` row, or `None`.
+    ///
+    /// The statement is [`step_graph_row`](PgStore::step_graph_row)'s - MOD-15 already needed a
+    /// graph by id for its compare-and-set follow-ups. This is the public name `Backend` dispatches
+    /// to, so the two crates do not each grow a copy of the select list.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn step_graph(&self, id: StepGraphId) -> Result<Option<StepGraph>> {
+        self.step_graph_row(id).await
+    }
+
+    /// A phase's candidate agents in `position` order (`R-ORCH-1`, `R-AGT-8`).
+    ///
+    /// `(phase_id, position)` is the table's primary key, so the order is total without a
+    /// tie-break. `MemStore` answers empty here whatever the phase: it holds no `phase_agent`
+    /// table, and the snapshot builder falls back to `project.settings.default_agent_id`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
+        sqlx::query_as!(
+            PhaseAgent,
+            r#"
+            SELECT phase_id AS "phase_id: PhaseId",
+                   position,
+                   agent_id AS "agent_id: htui_core::model::AgentId",
+                   model
+              FROM phase_agent
+             WHERE phase_id = $1
+             ORDER BY position
+            "#,
+            phase.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// One `prompt_template` by `(project, name)`: the pinned `version` when `version` is `Some`,
+    /// else the highest (`docs/ANA-5.md` §4.6).
+    ///
+    /// A pin that names no row is `None` rather than the highest version - the same rule
+    /// [`SkillBinding::version_in_force`](htui_core::model::SkillBinding::version_in_force) applies
+    /// to the same shape of question - which is why the pin is a `WHERE` conjunct and not an
+    /// `ORDER BY` preference.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn prompt_template(
+        &self,
+        project: ProjectId,
+        name: &str,
+        version: Option<i32>,
+    ) -> Result<Option<PromptTemplate>> {
+        sqlx::query_as!(
+            PromptTemplate,
+            r#"
+            SELECT id         AS "id: htui_core::model::PromptTemplateId",
+                   project_id AS "project_id: ProjectId",
+                   name,
+                   version,
+                   body,
+                   created_by AS "created_by: htui_core::model::UserId",
+                   created_at,
+                   updated_at
+              FROM prompt_template
+             WHERE project_id = $1 AND name = $2 AND ($3::int IS NULL OR version = $3)
+             ORDER BY version DESC
+             LIMIT 1
+            "#,
+            project.as_uuid(),
+            name,
+            version,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// The graph an item runs under - its own `step_graph_id`, else its kind's default - with the
+    /// phases in `position` order and each phase's candidate agents (ANA-2 §8).
+    ///
+    /// Three round trips plus one per phase rather than one join, because [`ResolvedGraph`] is a
+    /// tree and `query_as!` builds rows: the alternative is a `jsonb_agg` the two backends would
+    /// then have to decode alike. `None` when the item, its kind or the graph is gone, which is
+    /// `MemStore`'s `?`-chain in SQL - the `COALESCE` resolves the graph id and the row read after
+    /// it decides whether such a graph exists.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
+        let Some(graph_id) = sqlx::query_scalar!(
+            r#"
+            SELECT COALESCE(i.step_graph_id, k.default_graph_id)
+                       AS "graph_id?: htui_core::model::StepGraphId"
+              FROM item i JOIN item_kind k ON k.id = i.kind_id
+             WHERE i.id = $1
+            "#,
+            item.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .flatten() else {
+            return Ok(None);
+        };
+
+        let Some(graph) = self.step_graph_row(graph_id).await? else {
+            return Ok(None);
+        };
+
+        let mut phases = Vec::new();
+        for phase in self.phase_rows(graph_id).await? {
+            let agents = self.phase_agents(phase.id).await?;
+            phases.push(ResolvedPhase { phase, agents });
+        }
+        Ok(Some(ResolvedGraph { graph, phases }))
+    }
+
+    /// Every `agent_box` row of one box, in `agent_id` byte order.
+    ///
+    /// Postgres compares `uuid` as its sixteen bytes, which is `Uuid`'s own `Ord`, so the bare
+    /// `ORDER BY` is `MemStore`'s `sort_by_key` and needs no collation.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
+        sqlx::query_as!(
+            AgentBox,
+            r#"
+            SELECT agent_id AS "agent_id: htui_core::model::AgentId",
+                   box_id   AS "box_id: BoxId",
+                   enabled,
+                   version,
+                   path,
+                   probed_at,
+                   quota,
+                   quota_at,
+                   updated_at,
+                   probe
+              FROM agent_box
+             WHERE box_id = $1
+             ORDER BY agent_id
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// One whole `box` row, unlike [`box_info`](PgStore::box_info)'s three-column top-bar
+    /// projection: §4.7's admission reads `settings` and `R-ORCH-10`'s matching reads both tag
+    /// lists.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn box_row(&self, id: BoxId) -> Result<Option<BoxRow>> {
+        sqlx::query_as!(
+            BoxRow,
+            r#"
+            SELECT id             AS "id: BoxId",
+                   user_id        AS "user_id: htui_core::model::UserId",
+                   hostname,
+                   os_family      AS "os_family: htui_core::model::OsFamily",
+                   os_version,
+                   arch,
+                   cpu,
+                   ram_mb,
+                   gpu_present,
+                   gpu_vendor,
+                   htui_version,
+                   probed_tags,
+                   declared_tags,
+                   quirks,
+                   settings,
+                   registered_at,
+                   last_seen_at,
+                   last_probed_at,
+                   updated_at
+              FROM box WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// Every repo checkout path on one box, in `repo_id` byte order (`R-BOX-4`).
+    ///
+    /// The other half of [`repo_box_path_rows`](PgStore::repo_box_path_rows), which reads the same
+    /// table by `repo_id` for the repo editor; the orchestrator asks the opposite question.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn repo_paths(&self, box_id: BoxId) -> Result<Vec<RepoBoxPath>> {
+        sqlx::query_as!(
+            RepoBoxPath,
+            r#"
+            SELECT repo_id AS "repo_id: RepoId",
+                   box_id  AS "box_id: BoxId",
+                   local_path,
+                   updated_at
+              FROM repo_box_path
+             WHERE box_id = $1
+             ORDER BY repo_id
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// The scope's ready items this box can actually take: §7.4's readiness, then `R-ORCH-10`'s
+    /// capability half - `required_tags` a subset of the box's `probed_tags ∪ declared_tags`.
+    ///
+    /// The readiness conjunct and the ordering are [`items`](ReadStore::items)' own, copied rather
+    /// than shared because `ItemFilter` has no field for a box and this predicate is the machine's
+    /// vocabulary, not the caller's. The capability half is `NOT EXISTS (... t <> ALL (...))`,
+    /// which is `<@` spelled so that the tag list drives it.
+    ///
+    /// The two `COALESCE`s are the unknown-box case and are **not** decoration: the `LEFT JOIN`
+    /// leaves both arrays `NULL` when $2 names no box, `t <> ALL (NULL)` is `NULL` rather than
+    /// true, the `WHERE` inside `EXISTS` does not hold, and every item - tagged or not - would come
+    /// back ready. With `'{}'` in their place `t <> ALL ('{}')` is true, so a tagged item is
+    /// excluded and an untagged one has nothing to unnest. That is `MemStore`'s empty
+    /// `box_capabilities` for an unknown box, in SQL, and it is what the parity case caught.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn ready_items(
+        &self,
+        scope: &Scope,
+        box_id: BoxId,
+    ) -> Result<Vec<htui_core::model::ItemSummary>> {
+        if scope.is_empty() {
+            return Ok(Vec::new()); // `= ANY('{}')` is false for every row; skip the round trip.
+        }
+        let projects = project_uuids(scope);
+
+        sqlx::query_as!(
+            htui_core::model::ItemSummary,
+            r#"
+            SELECT i.id            AS "id: ItemId",
+                   i.project_id    AS "project_id: ProjectId",
+                   i.kind_id       AS "kind_id: htui_core::model::ItemKindId",
+                   i.key           AS "key!",
+                   i.key_prefix,
+                   i.key_number,
+                   i.title,
+                   i.status        AS "status: htui_core::model::Status",
+                   i.priority,
+                   i.required_tags,
+                   i.updated_at,
+                   i.touched_paths
+              FROM item i LEFT JOIN box b ON b.id = $2
+             WHERE i.project_id = ANY($1)
+               AND i.status = 'open'
+               AND NOT EXISTS (
+                        SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id
+                         WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'
+                           AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed'))
+               AND NOT EXISTS (
+                        SELECT 1 FROM UNNEST(i.required_tags) t
+                         WHERE t <> ALL (COALESCE(b.probed_tags, '{}')
+                                      || COALESCE(b.declared_tags, '{}')))
+             ORDER BY array_position($1, i.project_id), i.key_prefix, i.key_number
+            "#,
+            &projects[..],
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// The `required_tags` of one item the box has neither probed nor declared, in byte order:
+    /// what the Backlog renders beside an item it cannot start here (`R-ORCH-10`).
+    ///
+    /// Unlike [`ready_items`](PgStore::ready_items) this one **refuses** an unknown id, and the
+    /// item is looked up first: an empty answer has to mean "this box can take it", so "no such
+    /// box" cannot be spelled the same way. The two `SELECT 1` probes run only when the main
+    /// statement returns nothing, which is also the answer when every tag is covered - so the cost
+    /// falls on the boring path, and `CROSS JOIN` needs no outer-join semantics.
+    ///
+    /// `COLLATE "C"` because the documented order is bytes: `MemStore` sorts `as_bytes()`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown item (`"item"`) or box (`"box"`), the item first.
+    pub async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
+        let missing = sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT t COLLATE "C" AS "tag!"
+              FROM item i CROSS JOIN box b, UNNEST(i.required_tags) t
+             WHERE i.id = $1 AND b.id = $2
+               AND t <> ALL (b.probed_tags || b.declared_tags)
+             ORDER BY 1
+            "#,
+            item.as_uuid(),
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        if !missing.is_empty() {
+            return Ok(missing);
+        }
+
+        if sqlx::query_scalar!("SELECT 1 FROM item WHERE id = $1", item.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .is_none()
+        {
+            return Err(StoreError::NotFound {
+                entity: "item",
+                id: item.to_string(),
+            });
+        }
+        if sqlx::query_scalar!("SELECT 1 FROM box WHERE id = $1", box_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .is_none()
+        {
+            return Err(StoreError::NotFound {
+                entity: "box",
+                id: box_id.to_string(),
+            });
+        }
+        Ok(missing)
+    }
+
+    /// How many runs hold a slot on one box: §4.7's admission count, which is `running` **and**
+    /// `awaiting_approval` and not `queued` - a queued run occupies nothing yet.
+    ///
+    /// Distinct from [`active_runs`](PgStore::active_runs), which counts a scope's live runs for
+    /// the top bar and does count `queued`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn active_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+        let count = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) AS "count!"
+              FROM run
+             WHERE executing_box_id = $1 AND status IN ('running','awaiting_approval')
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// Every active run whose `repo_scope` intersects `scope`, in `(queued_at, id)` order: what
+    /// §4.7's overlap refusal names.
+    ///
+    /// An empty `scope` intersects nothing (hazard H-10): `'{}' && anything` is false, which is
+    /// `MemStore`'s `any(|repo| scope.contains(repo))` over an empty haystack, so the caller that
+    /// queues a scopeless run gets no refusal from here.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn overlapping_runs(&self, scope: &[RepoId]) -> Result<Vec<Run>> {
+        let repos: Vec<Uuid> = scope.iter().map(|id| id.as_uuid()).collect();
+        sqlx::query_as!(
+            Run,
+            r#"
+            SELECT id               AS "id: RunId",
+                   project_id       AS "project_id: ProjectId",
+                   item_id          AS "item_id: ItemId",
+                   kind             AS "kind: RunKind",
+                   mode             AS "mode: RunMode",
+                   status           AS "status: RunStatus",
+                   target_box_id    AS "target_box_id: BoxId",
+                   executing_box_id AS "executing_box_id: BoxId",
+                   graph_snapshot,
+                   started_by       AS "started_by: UserId",
+                   queued_at,
+                   started_at,
+                   finished_at,
+                   failure,
+                   repo_scope       AS "repo_scope: Vec<RepoId>",
+                   lease_box_id     AS "lease_box_id: BoxId",
+                   lease_expires_at,
+                   updated_at
+              FROM run
+             WHERE status IN ('queued','running','awaiting_approval')
+               AND repo_scope && $1::uuid[]
+             ORDER BY queued_at, id
+            "#,
+            &repos[..],
+        )
+        .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)
     }
