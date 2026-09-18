@@ -6622,7 +6622,7 @@ mod tests {
         /// `.rs` instead - which is how these four shipped - is no longer possible: a span that
         /// joins two snake_case halves with `::` and whose right half reads like a test name is a
         /// failure below, because that shape reaches neither arm and was silently skipped.
-        const PENDING: &[&str] = &["finish_run_holds_the_item_while_another_run_is_live"];
+        const PENDING: &[&str] = &[];
 
         // Another crate's integration test binary, so it is read at run time rather than through
         // `include_str!`: `htui-core` must not take a compile-time dependency on `htui-store`.

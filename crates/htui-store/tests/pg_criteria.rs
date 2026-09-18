@@ -3925,3 +3925,138 @@ async fn document_versions_do_not_collide_under_contention() {
 
     db.drop_db().await;
 }
+
+/// Plan M2 D7: `finish_run` derives the item from the item's *remaining* live runs, and on
+/// Postgres it does so under the item's row lock.
+///
+/// The conformance case `finish_run_moves_run_and_item_together` delegates the column half here:
+/// `item.closed_at` is not on [`htui_core::model::Item`]'s critical path for the `MemStore`
+/// assertions, and this is where the SQL that writes it can be read back directly. The two-run leg
+/// is repeated rather than referenced because it is the one the plan's Risks row names, and a
+/// `PgStore` that counted the item's runs *without* the `FOR UPDATE` would still pass it
+/// sequentially while stranding the item under concurrency.
+///
+/// Getting two live graph runs onto one item takes the same detour as the conformance case:
+/// `create_run` admits only `open | failed` items and leaves the item at `queued`, so the item is
+/// walked back `queued -> open` between the two creates.
+#[tokio::test(flavor = "multi_thread")]
+async fn finish_run_holds_the_item_while_another_run_is_live() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let owner = uuid::Uuid::now_v7();
+    let at = Utc::now();
+    let until = at + TimeDelta::minutes(5);
+
+    let closed_at = async |item: ItemId| {
+        sqlx::query_scalar!(
+            r#"SELECT closed_at FROM item WHERE id = $1"#,
+            item.as_uuid(),
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the item's closed_at back")
+    };
+
+    let left = db
+        .store
+        .create_run(race_run(ids::HTUI_ANA_2))
+        .await
+        .expect("the first run is queued")
+        .id;
+    assert!(
+        db.store
+            .transition(ids::HTUI_ANA_2, Status::Queued, Status::Open)
+            .await
+            .expect("the walk back must not fail"),
+        "queued -> open is sanctioned, and is the only way to queue a second run on one item"
+    );
+    let right = db
+        .store
+        .create_run(race_run(ids::HTUI_ANA_2))
+        .await
+        .expect("the second run is queued")
+        .id;
+    for run in [left, right] {
+        assert!(
+            db.store
+                .claim_run(run, ids::BOX, owner, at, until)
+                .await
+                .expect("the claim must not fail"),
+            "both runs fit the fixture box's two slots"
+        );
+    }
+
+    db.store
+        .finish_run(left, RunStatus::Done, None, at)
+        .await
+        .expect("the first finish must not fail");
+    let held = db
+        .store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .expect("read must not fail")
+        .expect("the fixture item exists");
+    assert_eq!(
+        held.status,
+        Status::InProgress,
+        "the item is held while its other run is still live"
+    );
+    assert_eq!(
+        closed_at(ids::HTUI_ANA_2).await,
+        None,
+        "and nothing was closed off"
+    );
+
+    db.store
+        .finish_run(right, RunStatus::Done, None, at)
+        .await
+        .expect("the second finish must not fail");
+    let moved = db
+        .store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .expect("read must not fail")
+        .expect("the fixture item exists");
+    assert_eq!(
+        moved.status,
+        Status::Done,
+        "the last run out moves the item"
+    );
+    assert!(
+        closed_at(ids::HTUI_ANA_2).await.is_some(),
+        "`done` is terminal for an item, so the mirror sets `closed_at` - the same rule \
+         `transition` writes, not a second one"
+    );
+
+    // The other direction of that rule, on its own item: a `cancelled` run hands the item back to
+    // the backlog, and `open` is not terminal, so `closed_at` stays clear.
+    let cancelled = db
+        .store
+        .create_run(race_run(ids::HTUI_CLEAN_1))
+        .await
+        .expect("a failed item can be re-queued")
+        .id;
+    db.store
+        .finish_run(cancelled, RunStatus::Cancelled, None, at)
+        .await
+        .expect("the cancel must not fail");
+    let released = db
+        .store
+        .item(ids::HTUI_CLEAN_1)
+        .await
+        .expect("read must not fail")
+        .expect("the fixture item exists");
+    assert_eq!(
+        released.status,
+        Status::Open,
+        "queued -> open is the only row of the table whose `from` is `queued`"
+    );
+    assert_eq!(
+        closed_at(ids::HTUI_CLEAN_1).await,
+        None,
+        "and `open` is not terminal, so `closed_at` is cleared rather than stamped"
+    );
+
+    db.drop_db().await;
+}
