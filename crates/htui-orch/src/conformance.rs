@@ -12,10 +12,13 @@
 use chrono::TimeDelta;
 use htui_agent::conformance::epoch;
 use htui_core::fixtures::ids;
-use htui_core::model::AgentId;
-use htui_core::store::MemStore;
+use htui_core::model::{
+    AgentId, GateOutcome, Item, ItemId, Run, RunId, RunMode, RunStatus, RunStep, Status, StepStatus,
+};
+use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
-use crate::command::{Command, CommandOutcome, EngineError};
+use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
+use crate::engine::Resume;
 use crate::fake::{FakeIsolator, FakeOrchestrator, ScriptedStep, TestClock};
 use crate::isolate::Clock as _;
 
@@ -49,6 +52,16 @@ pub trait Orchestrate {
     /// Whatever the engine refuses with.
     async fn dispatch(&self, command: Command) -> Result<CommandOutcome, EngineError>;
 
+    /// Re-resolve a run's graph and walk it on, or report that the topology moved under it.
+    ///
+    /// Not in the blueprint's §4.5 list either, and needed for the same reason the other two
+    /// out-of-list methods are: `topology_mismatch_parks_on_resume` is ANA-2 §12 criterion 3 and
+    /// criterion 3 *is* the resume path. Milestone 5's sweep drives the same entry point.
+    ///
+    /// # Errors
+    /// Whatever the engine refuses with.
+    async fn resume(&self, run: RunId) -> Result<Resume, EngineError>;
+
     /// The store every assertion reads.
     fn store(&self) -> &MemStore;
 
@@ -75,6 +88,10 @@ pub trait Orchestrate {
 impl Orchestrate for FakeOrchestrator {
     async fn dispatch(&self, command: Command) -> Result<CommandOutcome, EngineError> {
         Self::dispatch(self, command).await
+    }
+
+    async fn resume(&self, run: RunId) -> Result<Resume, EngineError> {
+        Self::resume(self, run).await
     }
 
     fn store(&self) -> &MemStore {
@@ -203,9 +220,244 @@ async fn fresh_harness_is_usable<H: CaseHarness>(harness: &H, case: &str) {
     );
 }
 
-/// ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`). **Stub**: T5 lands the body (blueprint §6.3).
+// -- what every case needs, written once ---------------------------------------------------------
+
+/// The run's steps in `(position, attempt, fanout_index)` order.
+///
+/// A free function over [`Orchestrate`] rather than a method on it: `store()` is the whole seam a
+/// case reads through, and a trait that also carried the three obvious projections of it would be
+/// a trait milestone 3's real-isolator harness has to implement four more times for nothing.
+///
+/// # Panics
+/// Never: `MemStore` fails no read.
+async fn steps_of<O: Orchestrate>(orch: &O, run: RunId) -> Vec<RunStep> {
+    orch.store()
+        .run_steps(run)
+        .await
+        .expect("MemStore never fails a read")
+}
+
+/// One item row.
+///
+/// # Panics
+/// When the item is not there, which in a case means the fixture moved.
+async fn item_of<O: Orchestrate>(orch: &O, id: ItemId) -> Item {
+    orch.store()
+        .item(id)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the case names an item the fixture holds")
+}
+
+/// One run row.
+///
+/// # Panics
+/// When the run is not there, which in a case means the walk never created it.
+async fn run_of<O: Orchestrate>(orch: &O, id: RunId) -> Run {
+    orch.store()
+        .run(id)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the case names a run the walk created")
+}
+
+/// `ids::HTUI_FEAT_3` is seeded **`queued`** with a live `RUN_2` on it
+/// (`crates/htui-core/src/fixtures.rs:899`, `:1374-1380`), and `create_run` moves an item
+/// `open | failed -> queued` only — so `StartRun` on it is a `Constraint` until the seeded run is
+/// ended. Cancelling `RUN_2` moves the item `queued -> open` inside `finish_run`'s own transaction,
+/// which is the one-line prologue every case that walks `FEAT-3` needs.
+///
+/// # Panics
+/// When `RUN_2` is not cancellable, which means the fixture moved.
+async fn free_feat_3<O: Orchestrate>(orch: &O) {
+    orch.store()
+        .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock().now())
+        .await
+        .expect("the seeded run is queued and cancellable");
+}
+
+/// `StartRun` on `item` in manual mode with no requested scope, unwrapped to its run id and rest.
+///
+/// # Panics
+/// When the command is refused, which every caller of this helper expects not to be.
+async fn start<O: Orchestrate>(orch: &O, item: ItemId) -> (RunId, crate::command::Rest) {
+    let outcome = orch
+        .dispatch(Command::StartRun {
+            item,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        })
+        .await
+        .expect("the graph resolves and the box has a slot");
+    let CommandOutcome::Started { run, rest } = outcome else {
+        panic!("`StartRun` answers `Started`, not {outcome:?}");
+    };
+    (run, rest)
+}
+
+/// Answer the run's one parked step, and give back the step that was answered.
+///
+/// Every case that drives more than one gate goes through here rather than re-finding the parked
+/// step by hand: "the step that is `awaiting_approval`" is the walk's own invariant — at most one
+/// per run this milestone — and a case that looked it up by position would be asserting the
+/// walk's ordering twice.
+///
+/// # Panics
+/// When no step is parked, or when the answer is refused.
+async fn answer<O: Orchestrate>(orch: &O, run: RunId, answer: GateAnswer) -> RunStep {
+    let steps = steps_of(orch, run).await;
+    let parked = steps
+        .iter()
+        .find(|step| step.status == StepStatus::AwaitingApproval)
+        .expect("the walk parked exactly one step")
+        .clone();
+    orch.dispatch(Command::AnswerGate {
+        run,
+        step: parked.id,
+        answer,
+    })
+    .await
+    .expect("the parked gate is answerable");
+    parked
+}
+
+// -- the eleven cases ----------------------------------------------------------------------------
+
+/// ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
+///
+/// The shape asserted is blueprint §7's data-flow table read from the store: one step per position
+/// in `prd, plan, implement, review` order, every one `done`, one document per position carrying
+/// `produced_by_step_id` of the step that earned it, and the item mirroring the run at row 35.
+///
+/// `prompt_digest` is asserted `Some` rather than re-hashed: stage 3's `set_step_prompt` and the
+/// recorder's `record_prompt` write the same digest by construction (blueprint H-13), and a case
+/// that re-hashed a scrubbed variant would be pinning the scrubber, not the walk.
 async fn feat_walks_end_to_end<H: CaseHarness>(harness: &H) {
-    fresh_harness_is_usable(harness, "feat_walks_end_to_end").await;
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    assert_eq!(rest.position, Some(0), "every seeded phase gates `always`");
+    assert_eq!(rest.failure, None);
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(steps.len(), 1, "the walk stopped at the first gate");
+    assert_eq!(
+        (
+            steps[0].position,
+            steps[0].attempt,
+            steps[0].fanout_index,
+            steps[0].phase_name.as_str(),
+            steps[0].status
+        ),
+        (0, 1, 0, "prd", StepStatus::AwaitingApproval)
+    );
+    assert!(
+        steps[0].prompt_digest.is_some(),
+        "stage 3 wrote the digest and the recorder rewrote the same one (blueprint H-13)"
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval,
+        "the three-write park moves step, run and item (blueprint H-10)"
+    );
+
+    // Four approvals: positions 0, 1 and 2 each park the next, and the fourth finishes the run.
+    for position in 0..4 {
+        let parked = answer(&orch, run, GateAnswer::Approved).await;
+        assert_eq!(
+            parked.position, position,
+            "the walk parks positions in order"
+        );
+    }
+
+    let row = run_of(&orch, run).await;
+    assert_eq!(row.status, RunStatus::Done);
+    assert_eq!(row.finished_at, Some(orch.clock().now()));
+    assert_eq!(row.failure, None);
+
+    let item = item_of(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        item.status,
+        Status::Done,
+        "plan D7: `finish_run` mirrors it"
+    );
+    assert!(
+        item.closed_at.is_some(),
+        "a `done` item carries the instant it closed"
+    );
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(steps.len(), 4, "one step per position, no retry");
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (
+                step.position,
+                step.attempt,
+                step.fanout_index,
+                step.phase_name.as_str(),
+                step.status,
+                step.gate_outcome
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                0,
+                1,
+                0,
+                "prd",
+                StepStatus::Done,
+                Some(GateOutcome::Approved)
+            ),
+            (
+                1,
+                1,
+                0,
+                "plan",
+                StepStatus::Done,
+                Some(GateOutcome::Approved)
+            ),
+            (
+                2,
+                1,
+                0,
+                "implement",
+                StepStatus::Done,
+                Some(GateOutcome::Approved)
+            ),
+            (
+                3,
+                1,
+                0,
+                "review",
+                StepStatus::Done,
+                Some(GateOutcome::Approved)
+            ),
+        ],
+        "blueprint §7's data-flow table, read back from the store"
+    );
+
+    let documents = orch
+        .store()
+        .documents(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read");
+    for step in &steps {
+        let head = documents
+            .iter()
+            .find(|head| head.kind == step.phase_name)
+            .unwrap_or_else(|| {
+                panic!("the sink wrote a `{}` document (plan D13)", step.phase_name)
+            });
+        assert_eq!(
+            head.produced_by_step_id,
+            Some(step.id),
+            "the `{}` document names the step that produced it",
+            step.phase_name
+        );
+    }
 }
 
 /// Criterion 2 (`:2088`). **Stub**: T5 lands the body.

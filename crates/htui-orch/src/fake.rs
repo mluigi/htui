@@ -693,28 +693,37 @@ impl FakeOrchestrator {
 
     /// Build an `Engine` over this harness's parts and dispatch one command (blueprint §4.4).
     ///
-    /// **T4 fills this in.** Every part it needs is already public on this type and none of them
-    /// is a decision left open: the store is [`store`](Self::store), the graph source is
-    /// [`graphs`](Self::graphs), the isolator and clock are the two public fields, the driver
-    /// factory is [`driver_for`](Self::driver_for), the session sink is
-    /// [`after_done`](Self::after_done), and the three identities are
-    /// [`box_id`](Self::box_id) / [`user`](Self::user) / [`owner`](Self::owner). What is missing is
-    /// `engine.rs` itself.
+    /// One line, because every part it borrows is already public on this type and
+    /// `crate::engine::dispatch_fake` is the single place that assembles them: the store is
+    /// [`store`](Self::store), the graph source is [`graphs`](Self::graphs), the isolator and clock
+    /// are the two public fields, the driver factory is [`driver_for`](Self::driver_for), the
+    /// session sink is [`after_done`](Self::after_done), and the three identities are
+    /// [`box_id`](Self::box_id) / [`user`](Self::user) / [`owner`](Self::owner). Forwarding rather
+    /// than re-assembling is what keeps `engine.rs`'s own tests and the conformance binding on one
+    /// wiring instead of two.
     ///
     /// # Errors
-    /// Every [`EngineError`], once there is an engine to raise one.
-    ///
-    /// # Panics
-    /// Until T4 lands, always.
+    /// Every [`EngineError`] the walk raises.
     pub async fn dispatch(
         &self,
         command: Command,
     ) -> std::result::Result<CommandOutcome, EngineError> {
-        let _ = command;
-        todo!(
-            "T4 wires `Engine::dispatch` here; every part it borrows is already public on \
-             `FakeOrchestrator`"
-        )
+        crate::engine::dispatch_fake(self, command).await
+    }
+
+    /// `Engine::resume` over the same parts (ANA-2 §12 criterion 3).
+    ///
+    /// The twin of [`dispatch`](Self::dispatch), and the one the conformance suite's
+    /// `topology_mismatch_parks_on_resume` drives: a resumed run re-resolves the live graph and
+    /// compares its `topology` with the snapshot it was created with.
+    ///
+    /// # Errors
+    /// Every [`EngineError`] the walk raises.
+    pub async fn resume(
+        &self,
+        run: RunId,
+    ) -> std::result::Result<crate::engine::Resume, EngineError> {
+        crate::engine::resume_fake(self, run).await
     }
 
     /// The run's steps in `(position, attempt, fanout_index)` order.
