@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH s AS (SELECT id FROM run_step\n                    WHERE run_id IN (SELECT id FROM run\n                                      WHERE project_id = $1\n                                         OR item_id IN (SELECT id FROM item WHERE project_id = $1))),\n             c AS (DELETE FROM run_step_commit WHERE run_step_id IN (SELECT id FROM s))\n        DELETE FROM run_step_tree WHERE run_step_id IN (SELECT id FROM s)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d97c770f202d869a62d0a1a7ceb00f287740189297962ba6c2c94c4da3ec57e0"
+}

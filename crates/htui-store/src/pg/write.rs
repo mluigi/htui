@@ -100,6 +100,44 @@ fn refuse_illegal_move<T: TransitionLaw, R>(
     }
 }
 
+/// Takes the project's `run_step_commit` and `run_step_tree` rows out of the way before its
+/// `DELETE FROM project`, on the delete's own transaction (MOD-4 T2).
+///
+/// Both tables reference `repo(id)` **without** `ON DELETE CASCADE` (`0001_init.sql:503`,
+/// `0003_orchestration.sql:94`) - deliberately: a tree outlives its repo's rename, never its step.
+/// A project delete cascades to `repo` *and* to `run_step` in one statement, and Postgres checks
+/// each foreign key as the row it guards is reached rather than at the end of the statement. So a
+/// project holding a tree or a commit against one of its **own** repos raised a bare `23503` and
+/// could not be deleted at all, where PRD D13 promises a report. `pg_criteria.rs`'s
+/// `project_delete_takes_everything_and_says_so` named the hazard and routed around it while
+/// nothing in the tree wrote either table; MOD-4's
+/// [`upsert_step_tree`](WriteStore::upsert_step_tree) and
+/// [`record_commits`](WriteStore::record_commits) are what made it reachable, and this is the fix.
+///
+/// The predicate is [`project_reach`]'s own, the rows of the project's steps and so the rows it
+/// counted, which is why "the counts shown are the counts the act took" still holds: these rows
+/// would have been cascaded away by `run_step` anyway, and are merely taken a statement earlier. A
+/// row belonging to
+/// *another* project's step but pointing at this project's repo is not touched and still refuses
+/// the delete, which is the honest answer: nothing counted it.
+async fn release_repo_references(conn: &mut PgConnection, id: ProjectId) -> Result<()> {
+    sqlx::query!(
+        r#"
+        WITH s AS (SELECT id FROM run_step
+                    WHERE run_id IN (SELECT id FROM run
+                                      WHERE project_id = $1
+                                         OR item_id IN (SELECT id FROM item WHERE project_id = $1))),
+             c AS (DELETE FROM run_step_commit WHERE run_step_id IN (SELECT id FROM s))
+        DELETE FROM run_step_tree WHERE run_step_id IN (SELECT id FROM s)
+        "#,
+        id.as_uuid(),
+    )
+    .execute(conn)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(())
+}
+
 /// The existence check the two batch upserts share, on **their own transaction** (MOD-4 T2).
 ///
 /// `run_step_tree` and `run_step_commit` both hang off `run_step` by a foreign key, so an unknown
@@ -3112,8 +3150,65 @@ impl WriteStore for PgStore {
         tx.commit().await.map_err(map_sqlx)
     }
 
-    async fn write_document(&self, _new: NewDocument) -> Result<Document> {
-        todo!("MOD-4 T2 commit 6")
+    /// The document at `max(version) + 1` for its `(item, kind)`, allocated **under the item's row
+    /// lock** (plan D6): two writers arriving together serialise on that lock, so the second one's
+    /// `MAX(version)` already sees the first one's row and no version is ever handed out twice.
+    ///
+    /// The lock is on `item` rather than on `document`, because the row the second writer must wait
+    /// for does not exist yet - there is nothing in `document` to lock. `SELECT ... FOR UPDATE` on
+    /// the parent is the only row both writers are guaranteed to contend on.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "item" }`; [`StoreError::Constraint`] on a duplicate id
+    /// or a `created_by` / `produced_by_step_id` that names no row (`23503`).
+    async fn write_document(&self, new: NewDocument) -> Result<Document> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        sqlx::query_scalar!(
+            "SELECT 1 FROM item WHERE id = $1 FOR UPDATE",
+            new.item_id.as_uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "item",
+            id: new.item_id.to_string(),
+        })?;
+
+        let written = sqlx::query_as!(
+            Document,
+            r#"
+            INSERT INTO document (id, item_id, kind, version, title, body, produced_by_step_id,
+                                  created_by, created_at)
+            SELECT $1, $2, $3, COALESCE(MAX(version), 0) + 1, $4, $5, $6, $7, $8
+              FROM document WHERE item_id = $2 AND kind = $3
+            RETURNING id                  AS "id: htui_core::model::DocumentId",
+                      item_id             AS "item_id: ItemId",
+                      kind,
+                      version,
+                      title,
+                      body,
+                      produced_by_step_id AS "produced_by_step_id: StepId",
+                      created_by          AS "created_by: UserId",
+                      created_at
+            "#,
+            new.id.as_uuid(),
+            new.item_id.as_uuid(),
+            new.kind,
+            new.title,
+            new.body,
+            new.produced_by_step_id.map(StepId::as_uuid),
+            new.created_by.as_uuid(),
+            new.created_at,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(written)
     }
 
     /// §4.8's promotion, one transaction (plan D6): the step, its run and its item are lifted to
@@ -3434,6 +3529,7 @@ impl PgStore {
                 id: id.to_string(),
             });
         };
+        release_repo_references(&mut tx, id).await?;
         match sqlx::query!("DELETE FROM project WHERE id = $1", id.as_uuid())
             .execute(&mut *tx)
             .await
