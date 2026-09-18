@@ -5360,6 +5360,10 @@ async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
         (Status::Open, Status::Queued),
         (Status::Queued, Status::InProgress),
         (Status::InProgress, Status::Done),
+        // The fourth pair is what makes `done` a `from` rather than only the row the loop stops
+        // on: `done` reaches `closed` and `open` and nothing else, so six of its eight targets are
+        // refusals this leg would otherwise never ask for.
+        (Status::Done, Status::Closed),
     ] {
         let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
         assert_eq!(before.status, from, "{CASE}: the item is driven to {from}");
