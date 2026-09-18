@@ -16,11 +16,12 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AppUser, BoxRow, BoxTool, Document, EventKind, EventRole, GateOutcome, Item, ItemKind,
-    ItemKindId, ItemLink, ItemRevision, LinkKind, Note, NoteId, OsFamily, PhaseId, Project,
-    ProjectId, PromptTemplate, PromptTemplateId, Run, RunKind, RunMode, RunStatus, RunStep,
-    SessionEvent, Skill, SkillBinding, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
+    Agent, AppUser, BoxRow, BoxTool, Document, EventKind, EventRole, GateOutcome, GraphSnapshot,
+    Isolation, Item, ItemKind, ItemKindId, ItemLink, ItemRevision, LinkKind, Note, NoteId,
+    OsFamily, PhaseId, Project, ProjectId, PromptTemplate, PromptTemplateId, Run, RunKind, RunMode,
+    RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion, SnapshotCandidate,
+    SnapshotGraph, SnapshotPhase, SnapshotSettings, SnapshotTemplate, Status, StepGraph,
+    StepGraphId, StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::seed;
@@ -254,6 +255,12 @@ pub mod ids {
         DOC_FEAT_1_PLAN_V1: DocumentId = (class::DOCUMENT, 4),
         /// `plan` v2 of `htui` `FEAT-1`, produced by [`STEP_PLAN`].
         DOC_FEAT_1_PLAN_V2: DocumentId = (class::DOCUMENT, 5),
+        /// `research` v2 of `htui` `ANA-1`, produced by the fan-out winner
+        /// [`STEP_R3_RESEARCH_A`].
+        DOC_ANA_1_RESEARCH_V2: DocumentId = (class::DOCUMENT, 6),
+        /// `research` v3 of `htui` `ANA-1`, produced by the fan-out loser [`STEP_R3_RESEARCH_B`]:
+        /// the highest version of its kind and the one ANA-2 §4.2's resolver must skip.
+        DOC_ANA_1_RESEARCH_V3: DocumentId = (class::DOCUMENT, 7),
     );
 
     demo_ids!(
@@ -271,6 +278,14 @@ pub mod ids {
         STEP_REVIEW: StepId = (class::RUN_STEP, 3),
         /// The pending `prd` step of [`RUN_2`].
         STEP_R2_PRD: StepId = (class::RUN_STEP, 4),
+        /// The finished fan-out run of `htui` `ANA-1`: one `research` phase, two candidates, a
+        /// winner and a loser (blueprint F-P).
+        RUN_3: RunId = (class::RUN, 2),
+        /// The winning `research` candidate of [`RUN_3`] (`fanout_index` 0).
+        STEP_R3_RESEARCH_A: StepId = (class::RUN_STEP, 5),
+        /// The losing `research` candidate of [`RUN_3`] (`fanout_index` 1): the fixture's only
+        /// `selected = false` row.
+        STEP_R3_RESEARCH_B: StepId = (class::RUN_STEP, 6),
     );
 
     demo_ids!(
@@ -1135,8 +1150,12 @@ fn notes() -> Vec<Note> {
         .collect()
 }
 
-/// `document` (§5.5): three hand-written documents on `ANA-1`, and a hand-written `prd` plus two
-/// step-produced `plan` versions on `FEAT-1`, so the Documents sub-tab can show both origins.
+/// `document` (§5.5): three hand-written documents on `ANA-1` plus the two `research` versions its
+/// fan-out produced, and a hand-written `prd` plus two step-produced `plan` versions on `FEAT-1`,
+/// so the Documents sub-tab can show both origins.
+///
+/// `ANA-1`'s `research` line is what ANA-2 §4.2's resolver is asserted against: v1 hand-written,
+/// v2 by the fan-out winner, v3 by the loser (blueprint F-P).
 fn documents() -> Vec<Document> {
     vec![
         document(
@@ -1147,6 +1166,24 @@ fn documents() -> Vec<Document> {
             "Research: store topology",
             None,
             12,
+        ),
+        document(
+            ids::DOC_ANA_1_RESEARCH_V2,
+            ids::HTUI_ANA_1,
+            "research",
+            2,
+            "Research: store topology (claude)",
+            Some(ids::STEP_R3_RESEARCH_A),
+            15,
+        ),
+        document(
+            ids::DOC_ANA_1_RESEARCH_V3,
+            ids::HTUI_ANA_1,
+            "research",
+            3,
+            "Research: store topology (agy)",
+            Some(ids::STEP_R3_RESEARCH_B),
+            16,
         ),
         document(
             ids::DOC_ANA_1_VERDICT,
@@ -1219,7 +1256,99 @@ fn document(
     }
 }
 
-/// `run` (§5.8): one finished graph run and one still-queued run, the fixture's only active one.
+/// The §5.1 snapshot every fixture `graph` run carries: the `htui` `feature` graph's phases as
+/// [`catalogue`] seeds them, one candidate per phase (the agent that phase's [`ids::RUN_1`] step
+/// ran on), no judge, and the default project settings.
+///
+/// `topology` is a fixed literal rather than a digest of the phases because MOD-4 milestone 1 has
+/// no builder to compute one; milestone 2's builder replaces the literal, not the shape. Built
+/// from the **typed** [`GraphSnapshot`] and serialised here, which is what keeps the fixture and
+/// `NewRun::graph_snapshot` from drifting apart (plan D13).
+///
+/// # Panics
+///
+/// Never for the fixture: the assertions name rows [`catalogue`] and [`steps`] always seed.
+fn demo_graph_snapshot() -> Value {
+    let (_, graphs, phases, _) = catalogue();
+    let graph = graphs
+        .into_iter()
+        .find(|row| row.id == ids::GRAPH_HTUI_FEAT)
+        .expect("the catalogue seeds `htui`'s default FEAT graph");
+    let registry = agents();
+    let run_1 = steps();
+
+    let phases = phases
+        .into_iter()
+        .filter(|phase| phase.graph_id == graph.id)
+        .map(|phase| {
+            let step = run_1
+                .iter()
+                .find(|step| step.run_id == ids::RUN_1 && step.phase_name == phase.name)
+                .expect("every phase of the FEAT graph has a `RUN_1` step");
+            let agent_id = step.agent_id.expect("every `RUN_1` step names an agent");
+            let agent_name = registry
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .map(|agent| agent.name.clone())
+                .expect("every fixture agent id is in the registry");
+            SnapshotPhase {
+                position: phase.position,
+                name: phase.name.clone(),
+                fan_out: phase.fan_out,
+                gate: phase.gate,
+                // Nothing downgrades a gate in the fixture (`R-ORCH-6`), so the two agree.
+                gate_effective: phase.gate,
+                gate_hard: phase.gate_hard,
+                retry_limit: phase.retry_limit,
+                input_kinds: phase.input_kinds.clone(),
+                output_kind: phase.output_kind.clone(),
+                // Resolved against the project rung, which the seed leaves at `worktree`.
+                isolation: phase.isolation.unwrap_or(Isolation::Worktree),
+                command_queue: phase.command_queue,
+                verify_command: phase.verify_command.clone(),
+                deadline_seconds: Some(7200),
+                template: SnapshotTemplate {
+                    name: phase.template_name.clone(),
+                    version: phase.template_version.unwrap_or(1),
+                },
+                token_budget: phase.token_budget,
+                candidates: vec![SnapshotCandidate {
+                    agent_id,
+                    agent_name,
+                    model: step
+                        .model
+                        .clone()
+                        .expect("every `RUN_1` step names a model"),
+                }],
+                judge: None,
+            }
+        })
+        .collect();
+
+    serde_json::to_value(GraphSnapshot {
+        v: GraphSnapshot::V,
+        graph: SnapshotGraph {
+            id: graph.id,
+            name: graph.name,
+            is_override: graph.is_override,
+        },
+        topology: "sha256:demo".to_owned(),
+        mode: RunMode::Manual,
+        phases,
+        settings: SnapshotSettings {
+            default_isolation: Isolation::Worktree,
+            per_token_cap_run: None,
+            per_token_cap_batch: None,
+            max_fan_out: 4,
+            max_agents_per_run: 6,
+        },
+    })
+    .expect("a literal this module owns serialises")
+}
+
+/// `run` (§5.8): one finished graph run on `FEAT-1`, one still-queued run on `FEAT-3` — the
+/// fixture's only active one — and one finished fan-out run on `ANA-1` (blueprint F-P). Every one
+/// carries the `R-ORCH-11` snapshot [`demo_graph_snapshot`] builds.
 fn runs() -> Vec<Run> {
     vec![
         Run {
@@ -1231,7 +1360,7 @@ fn runs() -> Vec<Run> {
             status: RunStatus::Done,
             target_box_id: ids::BOX,
             executing_box_id: Some(ids::BOX),
-            graph_snapshot: None,
+            graph_snapshot: Some(demo_graph_snapshot()),
             started_by: ids::USER,
             queued_at: demo_at(1, 8),
             started_at: Some(demo_at(1, 8)),
@@ -1251,7 +1380,7 @@ fn runs() -> Vec<Run> {
             status: RunStatus::Queued,
             target_box_id: ids::BOX,
             executing_box_id: None,
-            graph_snapshot: None,
+            graph_snapshot: Some(demo_graph_snapshot()),
             started_by: ids::USER,
             queued_at: demo_at(2, 8),
             started_at: None,
@@ -1262,10 +1391,32 @@ fn runs() -> Vec<Run> {
             lease_expires_at: None,
             updated_at: demo_at(2, 8),
         },
+        Run {
+            id: ids::RUN_3,
+            project_id: ids::PROJECT_HTUI,
+            item_id: Some(ids::HTUI_ANA_1),
+            kind: RunKind::Graph,
+            mode: RunMode::Manual,
+            status: RunStatus::Done,
+            target_box_id: ids::BOX,
+            executing_box_id: Some(ids::BOX),
+            graph_snapshot: Some(demo_graph_snapshot()),
+            started_by: ids::USER,
+            queued_at: demo_at(1, 14),
+            started_at: Some(demo_at(1, 14)),
+            finished_at: Some(demo_at(1, 17)),
+            failure: None,
+            repo_scope: Vec::new(),
+            lease_box_id: None,
+            lease_expires_at: None,
+            updated_at: demo_at(1, 17),
+        },
     ]
 }
 
-/// `run_step` (§5.8): the four approved steps of `RUN_1` and the pending step of `RUN_2`.
+/// `run_step` (§5.8): the four approved steps of `RUN_1`, the pending step of `RUN_2` and the two
+/// `research` candidates of `RUN_3`. Every `attempt` is `1`: ANA-2 §4.4 counts retries from one,
+/// so a first attempt is `1` and never `0` (plan D13).
 fn steps() -> Vec<RunStep> {
     let mut steps = vec![
         done_step(ids::STEP_PRD, 0, "prd", ids::AGENT_CLAUDE, "sonnet", 8),
@@ -1299,7 +1450,7 @@ fn steps() -> Vec<RunStep> {
         id: ids::STEP_R2_PRD,
         run_id: ids::RUN_2,
         position: 0,
-        attempt: 0,
+        attempt: 1,
         fanout_index: 0,
         phase_name: "prd".to_owned(),
         agent_id: Some(ids::AGENT_CLAUDE),
@@ -1320,7 +1471,65 @@ fn steps() -> Vec<RunStep> {
         promoted_at: None,
         updated_at: demo_at(2, 8),
     });
+    steps.push(fanout_candidate(
+        ids::STEP_R3_RESEARCH_A,
+        0,
+        ids::AGENT_CLAUDE,
+        "opus",
+        true,
+        15,
+    ));
+    steps.push(fanout_candidate(
+        ids::STEP_R3_RESEARCH_B,
+        1,
+        ids::AGENT_AGY,
+        "default",
+        false,
+        16,
+    ));
     steps
+}
+
+/// One `research` candidate of `RUN_3`, settled: the winner is `done` and gate-approved, the loser
+/// `superseded` with no gate answer of its own (ANA-2 §4.5). Both start at hour 14 and finish at
+/// `hour`; the run's own `updated_at` is when the selection landed.
+fn fanout_candidate(
+    id: StepId,
+    fanout_index: i32,
+    agent_id: crate::model::AgentId,
+    model: &str,
+    won: bool,
+    hour: i64,
+) -> RunStep {
+    RunStep {
+        id,
+        run_id: ids::RUN_3,
+        position: 0,
+        attempt: 1,
+        fanout_index,
+        phase_name: "research".to_owned(),
+        agent_id: Some(agent_id),
+        model: Some(model.to_owned()),
+        status: if won {
+            StepStatus::Done
+        } else {
+            StepStatus::Superseded
+        },
+        gate_outcome: won.then_some(GateOutcome::Approved),
+        gate_note: None,
+        selected: Some(won),
+        exit_code: Some(0),
+        prompt_digest: None,
+        trim_record: None,
+        usage: None,
+        isolation_path: None,
+        started_at: Some(demo_at(1, 14)),
+        finished_at: Some(demo_at(1, hour)),
+        verify_outcome: None,
+        verify_exit_code: None,
+        promoted_at: None,
+        updated_at: demo_at(1, 17),
+    }
 }
 
 /// One finished, gate-approved step of `RUN_1`, running for an hour from `hour`.
@@ -1336,7 +1545,7 @@ fn done_step(
         id,
         run_id: ids::RUN_1,
         position,
-        attempt: 0,
+        attempt: 1,
         fanout_index: 0,
         phase_name: phase_name.to_owned(),
         agent_id: Some(agent_id),
@@ -1790,6 +1999,112 @@ mod tests {
             crate::model::prompt_summary(step.trim_record.as_ref()),
             (Some(35_988), true),
             "D106's projection of the golden record: `~36k` and the `!`"
+        );
+    }
+
+    /// Plan D13's two corrections: `run_step.attempt` is 1-based everywhere, and every `graph`
+    /// run carries a §5.1 snapshot rather than the `NULL` the pre-`0003` rows had.
+    #[test]
+    fn every_graph_run_carries_a_snapshot_and_counts_its_attempts_from_one() {
+        let data = demo_data();
+        let attempts: Vec<i32> = data.steps.iter().map(|step| step.attempt).collect();
+        assert!(
+            attempts.iter().all(|attempt| *attempt == 1),
+            "ANA-2 §4.4 counts attempts from one, got {attempts:?}"
+        );
+        for run in &data.runs {
+            assert_eq!(
+                run.kind,
+                crate::model::RunKind::Graph,
+                "the fixture holds graph runs only"
+            );
+            let snapshot: crate::model::GraphSnapshot = serde_json::from_value(
+                run.graph_snapshot
+                    .clone()
+                    .unwrap_or_else(|| panic!("run {} carries a snapshot", run.id)),
+            )
+            .expect("the fixture snapshot decodes as §5.1's type");
+            assert_eq!(
+                snapshot.v,
+                crate::model::GraphSnapshot::V,
+                "run {}: the snapshot is at the version this crate writes",
+                run.id
+            );
+            assert_eq!(
+                snapshot.phases.len(),
+                4,
+                "run {}: the `feature` graph's four phases",
+                run.id
+            );
+            assert!(
+                snapshot
+                    .phases
+                    .iter()
+                    .all(|phase| phase.candidates.len() == 1),
+                "run {}: one candidate per phase",
+                run.id
+            );
+        }
+    }
+
+    /// Blueprint F-P: `ANA-1` owns a finished fan-out run, the only fixture rows that carry a
+    /// `selected` verdict and the only step-produced documents outside `FEAT-1`.
+    #[test]
+    fn ana_1_owns_a_finished_fan_out_run_with_a_winner_and_a_loser() {
+        let data = demo_data();
+        let run = data
+            .runs
+            .iter()
+            .find(|run| run.id == ids::RUN_3)
+            .expect("the fixture holds the ANA-1 fan-out run");
+        assert_eq!(
+            (run.item_id, run.status),
+            (Some(ids::HTUI_ANA_1), crate::model::RunStatus::Done),
+            "RUN_3 is a finished run of ANA-1"
+        );
+
+        let steps: Vec<_> = data
+            .steps
+            .iter()
+            .filter(|step| step.run_id == ids::RUN_3)
+            .collect();
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step.id, step.fanout_index, step.selected, step.status))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ids::STEP_R3_RESEARCH_A,
+                    0,
+                    Some(true),
+                    crate::model::StepStatus::Done
+                ),
+                (
+                    ids::STEP_R3_RESEARCH_B,
+                    1,
+                    Some(false),
+                    crate::model::StepStatus::Superseded
+                ),
+            ],
+            "the winner sorts before the loser and only the winner is `selected`"
+        );
+
+        let research: Vec<_> = data
+            .documents
+            .iter()
+            .filter(|row| row.item_id == ids::HTUI_ANA_1 && row.kind == "research")
+            .map(|row| (row.id, row.version, row.produced_by_step_id))
+            .collect();
+        assert_eq!(
+            research,
+            vec![
+                (ids::DOC_ANA_1_RESEARCH, 1, None),
+                (ids::DOC_ANA_1_RESEARCH_V2, 2, Some(ids::STEP_R3_RESEARCH_A)),
+                (ids::DOC_ANA_1_RESEARCH_V3, 3, Some(ids::STEP_R3_RESEARCH_B)),
+            ],
+            "hand-written v1, the winner's v2 and the loser's v3: what `resolve_inputs` has to \
+             rank and `documents_of_kinds` has to ignore"
         );
     }
 
