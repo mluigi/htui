@@ -648,8 +648,33 @@ async fn the_0003_columns_reach_the_mirror() {
         "and the two backends project the whole list alike"
     );
 
-    // `run.repo_scope`, `lease_box_id` and `lease_expires_at` have no reader yet, so they are
-    // asserted off the mirror table itself; `lease_owner` is deliberately not mirrored (plan D7).
+    // `CacheStore::run` decodes all three: `repos_col` on the JSON array and `opt_ts_col` on the
+    // lease stamp. The conformance read case reaches them only with an empty scope and a NULL
+    // lease - "a run seeded before 0003 declares no scope" - which every decoder answers alike, so
+    // this is the one place the two projections are compared with values in them.
+    let mirrored_run = cache.run(ids::RUN_1).await.expect("cache run");
+    assert_eq!(
+        mirrored_run,
+        db.store.run(ids::RUN_1).await.expect("pg run"),
+        "the mirror's run row equals Postgres's, scope and lease included"
+    );
+    let mirrored_run = mirrored_run.expect("RUN_1 is mirrored");
+    assert_eq!(
+        (
+            mirrored_run.repo_scope,
+            mirrored_run.lease_box_id,
+            mirrored_run.lease_expires_at,
+        ),
+        (
+            vec![htui_core::model::RepoId::from(repo_scope)],
+            Some(db.store.this_box()),
+            Some(lease_at),
+        ),
+        "and it decodes to the values written, not to the empty defaults an unscoped run has"
+    );
+
+    // The storage shape underneath that read, which no projection can show: `lease_owner` is
+    // deliberately not mirrored at all (plan D7).
     let row =
         sqlx::query("SELECT repo_scope, lease_box_id, lease_expires_at FROM run WHERE id = ?")
             .bind(ids::RUN_1.to_string())
@@ -824,6 +849,104 @@ async fn run_step_tree_refreshes_off_its_parent_step() {
             .map(|tree| (tree.base_ref.clone(), tree.dirty)),
         Some(("999999".to_owned(), true)),
         "once the step moves, the tree is re-upserted whole"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// `resolve_inputs`' three-armed `CASE` rank is the mirror's, not just Postgres's (T2 audit).
+///
+/// Blueprint §0.1's A-6 hole, in its second form. `the_mirror_passes_the_read_cases` is the only
+/// harness a read-only `CacheStore` can run, and in every `resolve_inputs` leg of
+/// `resolve_inputs_prefers_this_run_and_skips_losers` the expected document is *simultaneously* the
+/// top-ranked row and the highest-version eligible one, so `ORDER BY d.version DESC` alone answers
+/// each of them: deleting the whole `CASE WHEN s.id IS NULL THEN 2 WHEN s.run_id = ? THEN 0 ELSE 1
+/// END` from `cache/read.rs` leaves that case green. The one test that does make the rank bite -
+/// `write_document_allocates_its_version` - is a `WriteStore` case, and a `CacheStore` is read-only.
+///
+/// So the fixture's `research` ladder is extended here, in Postgres, with two rows that make each
+/// arm decide something:
+///
+/// - **v4, hand-written** (`produced_by_step_id IS NULL`, rank 2). It is a higher version than the
+///   winner, so rank 2 must lose to rank 0 and to rank 1.
+/// - **v5, produced by `STEP_PLAN`** (rank 1 from `RUN_3`'s seat, rank 0 from `RUN_1`'s). `RUN_1` is
+///   the run `STEP_PLAN` belongs to and its `selected` is `NULL`, so the row is eligible from both
+///   seats and only the rank tells them apart.
+///
+/// From `RUN_3` the answer is still the fixture's v2 - rank 0 beats a higher-versioned rank 1 and
+/// two rank 2s - and from `RUN_1` it is v5, rank 0 there. Both are asserted equal to Postgres's own
+/// answer as well as by id, so a mirror that ranks differently *or* a Postgres that does fails.
+#[tokio::test]
+async fn the_mirror_ranks_resolve_inputs_the_way_postgres_does() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let insert = |version: i32, step: Option<StepId>| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO document (item_id, kind, version, title, body, \
+                                       produced_by_step_id, created_by) \
+                 VALUES ($1, 'research', $2, $3, 'body', $4, $5) RETURNING id",
+            )
+            .bind(ids::HTUI_ANA_1.as_uuid())
+            .bind(version)
+            .bind(format!("research v{version}"))
+            .bind(step.map(StepId::as_uuid))
+            .bind(ids::USER.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .map(|row| row.get::<uuid::Uuid, _>("id"))
+            .expect("a research row the rank has to judge")
+        }
+    };
+    let hand_written_v4 = insert(4, None).await;
+    let other_runs_v5 = insert(5, Some(ids::STEP_PLAN)).await;
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the pass that carries the two new documents");
+
+    let asked = ["research".to_owned()];
+    let winner = |seat: RunId| {
+        let (cache, db_store, asked) = (&cache, &db.store, &asked);
+        async move {
+            let mirrored = cache
+                .resolve_inputs(ids::HTUI_ANA_1, seat, asked)
+                .await
+                .expect("the mirror resolves");
+            assert_eq!(
+                mirrored,
+                db_store
+                    .resolve_inputs(ids::HTUI_ANA_1, seat, asked)
+                    .await
+                    .expect("Postgres resolves"),
+                "the two engines rank the same ladder the same way from {seat}"
+            );
+            mirrored
+                .first()
+                .and_then(|row| row.document.as_ref())
+                .map(|document| document.id.as_uuid())
+        }
+    };
+
+    assert_eq!(
+        winner(ids::RUN_3).await,
+        Some(ids::DOC_ANA_1_RESEARCH_V2.as_uuid()),
+        "from RUN_3's seat its own selected output outranks v5's other run and v4's hand, \
+         both of which are the higher version"
+    );
+    assert_ne!(
+        winner(ids::RUN_3).await,
+        Some(hand_written_v4),
+        "and rank 2 never wins on version alone"
+    );
+    assert_eq!(
+        winner(ids::RUN_1).await,
+        Some(other_runs_v5),
+        "from RUN_1's seat v5 is the rank-0 row, so the arms are told apart and not merely ordered"
     );
 
     teardown(db, &[&cache]).await;

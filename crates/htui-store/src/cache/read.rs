@@ -959,6 +959,15 @@ impl ReadStore for CacheStore {
     /// `s.selected IS NOT FALSE` is the one deliberate divergence in text: the mirror stores the
     /// column as `0`/`1`/`NULL`, so the eligibility test is written over integers here. The two
     /// predicates admit exactly the same rows.
+    ///
+    /// **Mid-pass the two engines can still disagree, and that is the refresher's shape, not this
+    /// statement's.** [`run_pass`](crate::cache::refresh::run_pass) walks one table at a time and
+    /// commits each batch on its own, with `document` seventh and `run_step` ninth, so a reader
+    /// between those two commits sees a document whose producing step has not arrived: the
+    /// `LEFT JOIN` yields `s.id IS NULL`, which both ranks it 2 and — the consequence that matters
+    /// — passes the eligibility test, so a fan-out **loser's** document can be answered here where
+    /// Postgres excludes it. ANA-9 §6.2 promises whole-table consistency, not cross-table, so this
+    /// is by design; a caller that cannot tolerate a loser's output must read Postgres.
     async fn resolve_inputs(
         &self,
         item: ItemId,
