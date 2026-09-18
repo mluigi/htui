@@ -6054,6 +6054,12 @@ async fn run_and_steps_round_trip<S: ReadStore>(store: &S) {
 /// The fixture seeds no `repo`, so no tree or commit row can exist here (blueprint F-P); row
 /// content is `trees_and_commits_round_trip` on both writers and
 /// `pg_criteria.rs::step_tree_rows_cascade_with_their_step` on Postgres.
+///
+/// That is the whole of what this case can claim, and it is less than its name suggests: both
+/// writer twins are [`WriteStore`] cases, which a `CacheStore` cannot run, so a mirror that
+/// answers `Ok(vec![])` unconditionally - one carrying neither table - passes this byte for byte.
+/// The compensating control is T2's `crates/htui-store/tests/cache.rs` tree case, which is the
+/// only thing pinning that the mirror carries `run_step_tree` and `run_step_commit` at all.
 async fn trees_and_commits_read_back<S: ReadStore>(store: &S) {
     const CASE: &str = "trees_and_commits_read_back";
     for step in [
