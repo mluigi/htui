@@ -710,6 +710,15 @@ impl WriteStore for SpyStore {
     async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> StoreResult<()> {
         self.inner.fail_run(run, failure, at).await
     }
+    async fn finish_run(
+        &self,
+        run: RunId,
+        to: RunStatus,
+        failure: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        self.inner.finish_run(run, to, failure, at).await
+    }
     async fn close_out(
         &self,
         item: ItemId,

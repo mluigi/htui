@@ -659,7 +659,7 @@ fn offline_snapshot() -> GraphSnapshot {
 
 /// MOD-4 milestone 1, plan D5: ANA-2 §8's run seam is written - and read - on the server only.
 ///
-/// All **23** new methods are listed here, the five [`htui_core::store::ReadStore`] reads
+/// All **24** new methods are listed here, the five [`htui_core::store::ReadStore`] reads
 /// included, and every one answers [`DATABASE_UNREACHABLE`]. The sibling case above says why that
 /// is the right sentence rather than a new constant, and it is the same reason twice over here:
 /// `htui` has been online-only since MOD-25, so queueing a run off the server is exactly the event
@@ -894,6 +894,13 @@ async fn every_run_seam_method_is_unreachable_offline() {
             .fail_run(run, "offline", at)
             .await
             .expect_err("no run is failed offline"),
+    );
+    refused(
+        "finish_run",
+        writer
+            .finish_run(run, RunStatus::Done, None, at)
+            .await
+            .expect_err("no run is finished offline"),
     );
     refused(
         "close_out",
