@@ -1608,6 +1608,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "htui-orch"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "htui-agent",
+ "htui-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "htui-store"
 version = "0.1.0"
 dependencies = [

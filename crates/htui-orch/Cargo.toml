@@ -1,0 +1,37 @@
+[package]
+name        = "htui-orch"
+version     = "0.1.0"
+description = "The step-graph orchestrator: ANA-2 §4.2's six-stage walk, headless (R-ORCH-12)"
+
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[features]
+default = []
+# Fakes and the walk's conformance suite (plan D1, D18); forwards to both dependency crates so a
+# case can build its assertions over `MemStore::demo()` and drive `FakeDriver`.
+test-support = ["htui-core/test-support", "htui-agent/test-support"]
+
+[dependencies]
+# ANA-2 invariant 10 (`docs/ANA-2.md:143-146`): **never** `htui-store`. The engine stays generic
+# over `S: WriteStore` so it is headless (`R-ORCH-12`) and so `htui-store` never learns about it.
+# No `sha2` either: the workspace's one hasher is `htui_core::prompt::digest::sha256_hex`.
+htui-core  = { workspace = true }
+htui-agent = { workspace = true }
+chrono     = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tokio      = { workspace = true, features = ["sync"] }
+tracing    = { workspace = true }
+uuid       = { workspace = true }
+
+[dev-dependencies]
+htui-core  = { workspace = true, features = ["test-support"] }
+htui-agent = { workspace = true, features = ["test-support"] }
+tokio      = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true
