@@ -876,11 +876,17 @@ pub trait WriteStore: ReadStore {
     /// set. Refused while any run of the item is active.
     ///
     /// # Errors
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "item" }`;
+    /// Its own refusals, plus - because it performs their work - every refusal of
+    /// [`record_commits`](WriteStore::record_commits) and
+    /// [`write_document`](WriteStore::write_document). In full:
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "item" }`, or
+    /// `{ entity: "run_step" }` for a commit row naming a step that does not exist;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a run of the item is
     /// `queued | running | awaiting_approval`, when `summary.kind != "summary"`, when
-    /// `summary.item_id != item`, or when the item's status cannot move to `closed` (only
-    /// `blocked`, `failed` and `done` can). Any refusal writes nothing.
+    /// `summary.item_id != item`, when the item's status cannot move to `closed` (only `blocked`,
+    /// `failed` and `done` can), when a commit row names an unknown repo, or when the summary
+    /// duplicates a document id or names an unknown `created_by` / `produced_by_step_id`. Any
+    /// refusal writes nothing: every one of these is decided before the first write.
     async fn close_out(
         &self,
         item: ItemId,
