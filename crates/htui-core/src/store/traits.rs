@@ -722,8 +722,9 @@ pub trait WriteStore: ReadStore {
 
     /// ANA-2 §4.9's sweep: every `running` run whose `executing_box_id` is `box_id` and whose
     /// lease is `NULL` or expired at `now` becomes ours (`lease_owner = owner`,
-    /// `lease_expires_at = lease_until`). Returns the adopted rows in `queued_at` order; empty
-    /// when nothing was abandoned. A box that does not exist adopts nothing (`Ok(vec![])`).
+    /// `lease_expires_at = lease_until`). Returns the adopted rows in `queued_at` order, ties
+    /// broken by `id` so the order is total and the same on every backend; empty when nothing was
+    /// abandoned. A box that does not exist adopts nothing (`Ok(vec![])`).
     ///
     /// # Errors
     /// The backend's own failures only.

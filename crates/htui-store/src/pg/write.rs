@@ -2653,7 +2653,7 @@ impl WriteStore for PgStore {
                    lease_expires_at,
                    updated_at
               FROM swept
-             ORDER BY queued_at
+             ORDER BY queued_at, id
             "#,
             box_id.as_uuid(),
             owner,

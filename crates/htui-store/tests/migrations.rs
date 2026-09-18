@@ -334,7 +334,7 @@ const ANA_TABLE_COMMENT: (&str, &str) = (
 );
 
 #[tokio::test]
-async fn the_six_ana_comments_are_present_and_verbatim() {
+async fn the_ana_column_comments_are_present_and_verbatim() {
     let Some(db) = common::fresh_db().await else {
         return;
     };
@@ -474,6 +474,69 @@ async fn the_ten_ana5_defaults_land_with_their_values() {
         Some(0.10),
         "the one fractional default decodes as a JSON number"
     );
+
+    db.drop_db().await;
+}
+
+/// ANA-2 §5.4's twelve defaults, seeded by `0003_orchestration.sql` section 8.
+///
+/// Written as JSON **text** rather than as `i64`, because three of the twelve are `null` and one is
+/// an object: `as_i64()` would answer `None` for all four and a value pin that cannot fail on those
+/// keys is not one. Each right-hand side is the literal of the migration, parsed here and compared
+/// as `serde_json::Value` so key order inside `command_limits` is not part of the assertion.
+const ANA2_DEFAULTS: &[(&str, &str)] = &[
+    ("command_limits", r#"{"build":1,"test":4,"verify":1}"#),
+    ("copy_max_total_bytes", "21474836480"),
+    ("default_isolation", r#""worktree""#),
+    ("lease_refresh_seconds", "60"),
+    ("lease_ttl_seconds", "120"),
+    ("max_agents_per_run", "6"),
+    ("max_concurrent_items", "2"),
+    ("max_fan_out", "4"),
+    ("per_token_cap_batch", "null"),
+    ("per_token_cap_run", "null"),
+    ("scheduler_window", "null"),
+    ("step_deadline_seconds", "7200"),
+];
+
+/// The twelve are pinned by value, not only by the row count `0003_orchestration.sql` moved to 24.
+///
+/// A migration is forward-only and can never be edited, so a transcription slip is permanent:
+/// `step_deadline_seconds` 7200 -> 720, `copy_max_total_bytes` losing a digit, or
+/// `lease_ttl_seconds` and `lease_refresh_seconds` transposed would each keep the count at 24 and
+/// pass every other test in the workspace. ANA-5's ten are pinned this way twice over
+/// ([`ANA5_INTEGER_DEFAULTS`] and `pg_criteria.rs`); ANA-2's twelve were not (T2 audit).
+#[tokio::test]
+async fn the_twelve_ana2_defaults_land_with_their_values() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    let keys: Vec<String> = ANA2_DEFAULTS
+        .iter()
+        .map(|(key, _)| (*key).to_owned())
+        .collect();
+    let rows: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT key, value FROM app_setting WHERE key = ANY($1) ORDER BY key")
+            .bind(&keys)
+            .fetch_all(&db.pool)
+            .await
+            .expect("read ANA-2 defaults");
+
+    assert_eq!(
+        rows.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+        keys.iter().map(String::as_str).collect::<Vec<_>>(),
+        "all twelve ANA-2 §5.4 keys landed, and the const is in the key order the query returns"
+    );
+
+    for ((key, expected), (_, actual)) in ANA2_DEFAULTS.iter().zip(&rows) {
+        let expected: serde_json::Value =
+            serde_json::from_str(expected).expect("the const carries JSON the migration wrote");
+        assert_eq!(
+            *actual, expected,
+            "app_setting.{key} carries ANA-2 §5.4's value"
+        );
+    }
 
     db.drop_db().await;
 }
