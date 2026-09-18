@@ -13,7 +13,7 @@
 //! reaching a file under `<cache_dir>/pending/` rather than the server. **Since MOD-25 `htui` is
 //! online-only** and they agree again: `writer()` answers `None` off the server, so a chat on a
 //! box whose Postgres is unreachable is refused with
-//! [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE) instead of buffered. The invariant is
+//! [`DATABASE_UNREACHABLE`] instead of buffered. The invariant is
 //! back to its widest form: nothing is written anywhere unless the backend is
 //! [`Backend::Online`] (or [`Backend::Memory`]), which is what `writable()` already answered for.
 //! What has not changed at any point is [`Backend::is_writable`]: it is still `false` offline,
@@ -140,7 +140,7 @@ impl Backend {
     /// it answered `Some(Writer::Buffered(..))`: a chat that could not reach Postgres recorded
     /// into `<cache_dir>/pending/` and the refresher uploaded it on the next connection. MOD-25
     /// made `htui` online-only, so that chat is now refused with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE) instead. This one arm is the whole
+    /// [`DATABASE_UNREACHABLE`] instead. This one arm is the whole
     /// disable: [`Writer::Buffered`] and [`crate::BufferedWriter`] stay in the tree and keep
     /// compiling for one release so the reversal is restoring this arm and nothing else, and the
     /// upload side stays live — `upload_pending` still runs on every refresh pass, so a buffer an
@@ -426,7 +426,7 @@ impl Backend {
     // Three arms each, and the offline one refuses for the prompt reads' reason rather than a new
     // one: `phase_agent`, `agent_box`, `repo_box_path` and the whole `box` row are outside the
     // mirrored table list of `docs/ANA-9.md` §4.4, so `CacheStore` has nothing to answer from.
-    // The sentence is [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE) - the one `htui`
+    // The sentence is [`DATABASE_UNREACHABLE`] - the one `htui`
     // already says when the server is what is missing - and **not** a new constant (plan D5,
     // blueprint F-I).
     // -------------------------------------------------------------------------------------------
@@ -436,7 +436,7 @@ impl Backend {
     /// # Errors
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn step_graph(&self, id: StepGraphId) -> Result<Option<StepGraph>> {
         match self {
             Self::Memory(store) => store.step_graph(id).await,
@@ -450,7 +450,7 @@ impl Backend {
     /// # Errors
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
         match self {
             Self::Memory(store) => store.phase_agents(phase).await,
@@ -464,7 +464,7 @@ impl Backend {
     /// # Errors
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn prompt_template(
         &self,
         project: ProjectId,
@@ -483,7 +483,7 @@ impl Backend {
     /// # Errors
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
         match self {
             Self::Memory(store) => store.resolve_graph(item).await,
@@ -497,7 +497,7 @@ impl Backend {
     /// # Errors
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
         match self {
             Self::Memory(store) => store.agent_boxes(box_id).await,
@@ -511,7 +511,7 @@ impl Backend {
     /// # Errors
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn box_row(&self, id: BoxId) -> Result<Option<BoxRow>> {
         match self {
             Self::Memory(store) => store.box_row(id).await,
@@ -525,7 +525,7 @@ impl Backend {
     /// # Errors
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn repo_paths(&self, box_id: BoxId) -> Result<Vec<RepoBoxPath>> {
         match self {
             Self::Memory(store) => store.repo_paths(box_id).await,
@@ -539,7 +539,7 @@ impl Backend {
     /// # Errors
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn ready_items(&self, scope: &Scope, box_id: BoxId) -> Result<Vec<ItemSummary>> {
         match self {
             Self::Memory(store) => store.ready_items(scope, box_id).await,
@@ -554,7 +554,7 @@ impl Backend {
     ///
     /// Whatever the arm's store reports, [`StoreError::NotFound`] for an unknown item or box
     /// included; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         match self {
             Self::Memory(store) => store.missing_tags(item, box_id).await,
@@ -568,7 +568,7 @@ impl Backend {
     /// # Errors
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn active_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
         match self {
             Self::Memory(store) => store.active_runs_on_box(box_id).await,
@@ -582,7 +582,7 @@ impl Backend {
     /// # Errors
     ///
     /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
-    /// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE).
+    /// [`DATABASE_UNREACHABLE`].
     pub async fn overlapping_runs(&self, scope: &[RepoId]) -> Result<Vec<Run>> {
         match self {
             Self::Memory(store) => store.overlapping_runs(scope).await,
@@ -600,7 +600,7 @@ fn prompt_offline() -> StoreError {
 /// The one sentence every offline orchestration read answers with (plan D5, blueprint F-I).
 ///
 /// Beside [`prompt_offline`] and shaped like it, but reusing
-/// [`DATABASE_UNREACHABLE`](crate::DATABASE_UNREACHABLE) rather than minting a constant: that
+/// [`DATABASE_UNREACHABLE`] rather than minting a constant: that
 /// sentence already covers reads - "this box browses its read-only cache and starts no run" is
 /// exactly what a box that cannot resolve a graph or count a slot has to be told, and it is the
 /// same sentence [`BufferedWriter`](crate::BufferedWriter) gives for the writers these reads feed.

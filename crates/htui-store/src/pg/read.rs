@@ -1348,7 +1348,7 @@ impl PgStore {
 
     /// One `step_graph` row, or `None`.
     ///
-    /// The statement is [`step_graph_row`](PgStore::step_graph_row)'s - MOD-15 already needed a
+    /// The statement is `step_graph_row`'s - MOD-15 already needed a
     /// graph by id for its compare-and-set follow-ups. This is the public name `Backend` dispatches
     /// to, so the two crates do not each grow a copy of the select list.
     ///
@@ -1544,7 +1544,7 @@ impl PgStore {
 
     /// Every repo checkout path on one box, in `repo_id` byte order (`R-BOX-4`).
     ///
-    /// The other half of [`repo_box_path_rows`](PgStore::repo_box_path_rows), which reads the same
+    /// The other half of `repo_box_path_rows`, which reads the same
     /// table by `repo_id` for the repo editor; the orchestrator asks the opposite question.
     ///
     /// # Errors

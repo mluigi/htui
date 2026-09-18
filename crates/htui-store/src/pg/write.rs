@@ -3425,13 +3425,13 @@ impl WriteStore for PgStore {
     /// sentence names is the same one [`MemStore`](htui_core::store::MemStore) names: with two
     /// live runs the backends would otherwise disagree about which is "in the way".
     ///
-    /// Every commit row's step is probed by [`step_exists`], because the foreign key would make an
+    /// Every commit row's step is probed by `step_exists`, because the foreign key would make an
     /// unknown step [`StoreError::Constraint`] where the contract says [`StoreError::NotFound`].
     /// An unknown **repo** is left to the key (`23503`), which [`map_sqlx`] turns into
     /// `Constraint`; it is raised at the insert rather than before it, and the transaction is what
     /// makes the difference unobservable - nothing has been committed when it fires.
     ///
-    /// The insert is [`insert_document`] and not the trait method, which would open a transaction
+    /// The insert is `insert_document` and not the trait method, which would open a transaction
     /// of its own; the closing `UPDATE` is [`transition`](WriteStore::transition)'s statement with
     /// `closed_at` fixed, since `closed` is terminal by construction here. Its `AND status = $2`
     /// cannot miss under the row lock, and is kept as the assertion that it cannot.
