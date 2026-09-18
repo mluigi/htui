@@ -23,10 +23,11 @@ pub mod graph;
 pub mod isolate;
 pub mod status;
 
+pub use status::{Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt};
+
 // The crate's public face is re-exported from here, and the list grows with the modules that
-// define it: `status::{Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt}` and
-// `graph::{GraphSource, Resolved, ResolveError, resolve, topology}` with T2's next two commits,
-// `command::{Command, CommandOutcome, GateAnswer}` and `isolate::{Isolator, IsolatorFuture,
+// define it: `graph::{GraphSource, Resolved, ResolveError, resolve, resolve_scope, override_graph,
+// topology}` with T2's next commit, `command::{Command, CommandOutcome, GateAnswer}` and `isolate::{Isolator, IsolatorFuture,
 // IsolateError, Prepared, PreparedTree}` with T3, and `engine::{AgentSelector, Clock, Engine,
 // EngineError, FirstCandidate, NoSink, Rest, SessionSink, SystemClock}` and `gate::{Settle,
 // Verdict, parse_verdict}` with T4. Re-exporting a name before its module defines it does not
