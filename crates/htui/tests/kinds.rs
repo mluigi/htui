@@ -977,6 +977,7 @@ async fn an_unreferenced_graph_is_listed_after_the_kinds() {
             project_id: ids::PROJECT_VULKAN,
             name: "orphan".to_owned(),
             description: String::new(),
+            is_override: false,
             created_at: now,
             updated_at: now,
         },
