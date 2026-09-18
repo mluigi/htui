@@ -86,14 +86,18 @@ fn cas_miss<T>(
 ///
 /// The cost is one extra round trip on a path that is already an error: every legal `(from, to)`
 /// goes straight to its compare-and-set and never reaches here (blueprint §3.6).
+///
+/// `refusal` is [`legal_move`]'s own error, never a second copy of the rule: plan D15 gives the
+/// §4.3 tables one home that both stores call, so a change there reaches `PgStore` without anyone
+/// remembering to make it twice. All this function decides is D14's precedence — which of the two
+/// answers the caller gets.
 fn refuse_illegal_move<T: TransitionLaw, R>(
     exists: bool,
     id: impl core::fmt::Display,
-    from: T,
-    to: T,
+    refusal: StoreError,
 ) -> Result<R> {
     if exists {
-        Err(StoreError::Constraint(illegal_move(T::ENTITY, from, to)))
+        Err(refusal)
     } else {
         Err(StoreError::NotFound {
             entity: T::ENTITY,
@@ -587,13 +591,13 @@ impl WriteStore for PgStore {
     /// byte-identical (plan D15). The `NotFound` above still wins on an unknown id (plan D14),
     /// which is what the existence probe in that branch is for.
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
-        if !from.can_move_to(to) {
+        if let Err(refusal) = legal_move(from, to) {
             let exists = sqlx::query_scalar!("SELECT 1 FROM item WHERE id = $1", id.as_uuid())
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(map_sqlx)?
                 .is_some();
-            return refuse_illegal_move(exists, id, from, to);
+            return refuse_illegal_move::<Status, _>(exists, id, refusal);
         }
 
         let moved = sqlx::query!(
@@ -2747,13 +2751,13 @@ impl WriteStore for PgStore {
         to: RunStatus,
         at: DateTime<Utc>,
     ) -> Result<bool> {
-        if !from.can_move_to(to) {
+        if let Err(refusal) = legal_move(from, to) {
             let exists = sqlx::query_scalar!("SELECT 1 FROM run WHERE id = $1", run.as_uuid())
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(map_sqlx)?
                 .is_some();
-            return refuse_illegal_move(exists, run, from, to);
+            return refuse_illegal_move::<RunStatus, _>(exists, run, refusal);
         }
 
         let moved = sqlx::query!(
@@ -2812,14 +2816,14 @@ impl WriteStore for PgStore {
         to: StepStatus,
         at: DateTime<Utc>,
     ) -> Result<bool> {
-        if !from.can_move_to(to) {
+        if let Err(refusal) = legal_move(from, to) {
             let exists =
                 sqlx::query_scalar!("SELECT 1 FROM run_step WHERE id = $1", step.as_uuid())
                     .fetch_optional(&self.pool)
                     .await
                     .map_err(map_sqlx)?
                     .is_some();
-            return refuse_illegal_move(exists, step, from, to);
+            return refuse_illegal_move::<StepStatus, _>(exists, step, refusal);
         }
 
         let moved = sqlx::query!(

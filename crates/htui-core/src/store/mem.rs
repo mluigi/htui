@@ -3556,15 +3556,15 @@ impl State {
             }
         }
         for id in judges {
-            if let Some(row) = self.steps.get_mut(&id) {
-                if matches!(
+            if let Some(row) = self.steps.get_mut(&id)
+                && matches!(
                     row.status,
                     StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
-                ) {
-                    row.status = StepStatus::Done;
-                    row.gate_note.clone_from(&reason);
-                    row.updated_at = now;
-                }
+                )
+            {
+                row.status = StepStatus::Done;
+                row.gate_note.clone_from(&reason);
+                row.updated_at = now;
             }
         }
         Ok(())
