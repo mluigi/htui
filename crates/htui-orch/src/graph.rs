@@ -31,7 +31,7 @@ const DEFAULT_MAX_AGENTS_PER_RUN: u32 = 6;
 /// method answers (plan D19).
 ///
 /// The eleven orchestration reads milestone 1 shipped are **inherent** on `MemStore`
-/// (`crates/htui-core/src/store/mem.rs:445-644`) and on `htui-store`'s `Backend`, on no trait,
+/// (`crates/htui-core/src/store/mem.rs:447-662`) and on `htui-store`'s `Backend`, on no trait,
 /// because the tables behind them are not mirrored. A crate generic over `S: ReadStore +
 /// WriteStore` therefore cannot reach `resolve_graph`, `phase_agents`, `prompt_template` or the
 /// agent registry at all, and three `GraphSnapshot` fields — `SnapshotPhase::candidates`,
@@ -383,7 +383,7 @@ fn project_settings(project: &Project) -> ProjectSettings {
 /// One `app_setting` value as a positive `i64`.
 ///
 /// "Positive or it did not answer" is `htui_core::prompt::settings`'s rule for the same table
-/// (`crates/htui-core/src/prompt/settings.rs:617-623`): absent, `null`, a string, a bool, zero and
+/// (`crates/htui-core/src/prompt/settings.rs:621-625`): absent, `null`, a string, a bool, zero and
 /// negative all mean the rung is silent, so a planted `0` falls through to the next rung rather
 /// than pinning a budget of nothing.
 fn app_positive(app: &BTreeMap<String, Value>, key: &str) -> Option<i64> {
@@ -593,7 +593,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
     ///
     /// T3's `FakeGraphSource` is the real one; this is the smallest thing that makes `graph.rs`
     /// testable on its own, and it exists for the reason plan D20 gives: `MemStore::phase_agents`
-    /// answers empty unconditionally (`crates/htui-core/src/store/mem.rs:469-472`) and every demo
+    /// answers empty unconditionally (`crates/htui-core/src/store/mem.rs:470-473`) and every demo
     /// agent is `enabled`, so rungs 1 and 3 of §4.1's chain are both empty here and a resolution
     /// with no stand-in would refuse every phase for a reason that is about the fixture rather
     /// than about the walk.
