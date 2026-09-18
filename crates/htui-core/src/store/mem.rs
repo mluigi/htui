@@ -3477,9 +3477,16 @@ impl State {
     /// ANA-2 §4.5's bookkeeping: everything is validated before the first candidate is touched,
     /// which is what makes the whole selection one transaction (plan D6).
     ///
-    /// The judge row is settled directly rather than through [`legal_move`]: §4.5 makes the
-    /// judge's `done` part of the winner's outcome, so a judge that never left `pending` — a
-    /// human answering the fan-out itself — must not turn the selection into a refusal.
+    /// The judge row is settled directly rather than through [`legal_move`], but only from
+    /// `pending | running | awaiting_approval`: §4.5 makes the judge's `done` part of the winner's
+    /// outcome, so a judge that never left `pending` — a human answering the fan-out itself — must
+    /// not turn the selection into a refusal, while a judge that already reached an outcome keeps
+    /// it. §4.5's judge-failure path (`docs/ANA-2.md:858-862`) is the case that forces the guard:
+    /// the judge parks the run at `awaiting_approval` with its reason in `gate_note` and *this
+    /// method is the human's pick*, so settling it would be the `failed -> done` the §4.3 table
+    /// rejects, over the top of the reason the human chose from. "Nothing is lost" is that
+    /// sentence. It is the treatment the losers get for the same reason (hazard H-13), and a
+    /// judge left alone is left alone whole: no `status`, no `gate_note`, no `updated_at`.
     fn select_fanout(
         &mut self,
         run: RunId,
@@ -3539,9 +3546,14 @@ impl State {
         }
         for id in judges {
             if let Some(row) = self.steps.get_mut(&id) {
-                row.status = StepStatus::Done;
-                row.gate_note.clone_from(&reason);
-                row.updated_at = now;
+                if matches!(
+                    row.status,
+                    StepStatus::Pending | StepStatus::Running | StepStatus::AwaitingApproval
+                ) {
+                    row.status = StepStatus::Done;
+                    row.gate_note.clone_from(&reason);
+                    row.updated_at = now;
+                }
             }
         }
         Ok(())

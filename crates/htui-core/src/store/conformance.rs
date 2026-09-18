@@ -4904,6 +4904,51 @@ async fn select_fanout_is_one_transaction<S: WriteStore>(store: &S) {
         "{CASE}: documents_of_kinds excludes no loser — plan D2's contrast"
     );
 
+    // §4.5's judge-failure path (`docs/ANA-2.md:858-862`): the judge failed, its `gate_note` names
+    // why, the run parked at `awaiting_approval` and a human picks. That pick is this method, so
+    // the selection may not move the judge `failed -> done` — a pair `StepStatus::can_move_to`
+    // rejects — nor replace the reason with its own, which on the human path is `None`. "Nothing
+    // is lost" is the sentence being asserted. A second slot because a slot holds one judge.
+    let picked = gated_step(CASE, store, new_run_step(ids::RUN_2, 3, 1, 0)).await;
+    let beaten = gated_step(CASE, store, new_run_step(ids::RUN_2, 3, 1, 1)).await;
+    let broken = gated_step(CASE, store, new_run_step(ids::RUN_2, 3, 1, -1)).await;
+    assert!(
+        store
+            .answer_gate(
+                broken,
+                GateOutcome::Rejected,
+                Some("the verdict block did not parse".to_owned()),
+                at,
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the judge fails with the reason in its `gate_note`"
+    );
+
+    store
+        .select_fanout(ids::RUN_2, 3, 1, picked, None)
+        .await
+        .expect(CASE);
+    let arbiter = settled(broken).await;
+    assert_eq!(
+        (arbiter.status, arbiter.gate_note.as_deref()),
+        (
+            StepStatus::Failed,
+            Some("the verdict block did not parse")
+        ),
+        "{CASE}: a judge that failed keeps the status and the reason the human picked from"
+    );
+    assert_eq!(
+        (settled(picked).await.selected, settled(picked).await.status),
+        (Some(true), StepStatus::Done),
+        "{CASE}: the human's winner is settled all the same"
+    );
+    assert_eq!(
+        settled(beaten).await.status,
+        StepStatus::Superseded,
+        "{CASE}: and so is its loser"
+    );
+
     let listed = store
         .runs(ids::HTUI_FEAT_3)
         .await

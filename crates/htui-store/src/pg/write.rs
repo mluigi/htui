@@ -2970,9 +2970,19 @@ impl WriteStore for PgStore {
     /// The losers' `CASE` is blueprint hazard H-13: `selected = false` is recorded for every
     /// candidate, but only `pending`, `awaiting_approval` and `done` move to `superseded` - a
     /// `failed` or `cancelled` loser keeps the status that says *why* it lost. The judge row
-    /// (`fanout_index = -1`) is settled directly rather than through [`legal_move`]: §4.5 makes its
-    /// `done` part of the winner's outcome, so a judge still at `pending` - a human who answered
-    /// the fan-out themselves - must not turn the selection into a refusal.
+    /// (`fanout_index = -1`) gets the same treatment for the same reason: it is settled directly
+    /// rather than through [`legal_move`], because §4.5 makes its `done` part of the winner's
+    /// outcome and a judge still at `pending` - a human who answered the fan-out themselves - must
+    /// not turn the selection into a refusal; but only `pending`, `running` and
+    /// `awaiting_approval` are settled. §4.5's judge-failure path (`docs/ANA-2.md:858-862`) is why:
+    /// a failed judge parks the run at `awaiting_approval` with the reason in `gate_note`, and
+    /// *this method is the human's pick*, so settling it would be the `failed -> done` §4.3 rejects
+    /// over the top of the reason that pick was made from. "Nothing is lost" is that sentence.
+    ///
+    /// The status set is in the `WHERE` rather than a `CASE` over both columns so an unsettleable
+    /// judge is not written at all: `run_step` carries the `set_updated_at` trigger
+    /// (`0001_init.sql:564-580`), a no-op `UPDATE` would still bump the column the §4.4 cache
+    /// cursor rides on, and `MemStore`'s guard leaves the row whole.
     ///
     /// # Errors
     ///
@@ -3063,7 +3073,8 @@ impl WriteStore for PgStore {
 
         sqlx::query!(
             "UPDATE run_step SET status = 'done', gate_note = $4 \
-              WHERE run_id = $1 AND position = $2 AND attempt = $3 AND fanout_index < 0",
+              WHERE run_id = $1 AND position = $2 AND attempt = $3 AND fanout_index < 0 \
+                AND status IN ('pending','running','awaiting_approval')",
             run.as_uuid(),
             position,
             attempt,

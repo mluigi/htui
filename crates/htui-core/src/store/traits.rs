@@ -801,7 +801,17 @@ pub trait WriteStore: ReadStore {
     /// `selected = true, status = done`; every other candidate becomes `selected = false` and,
     /// when its status is `pending`, `awaiting_approval` or `done`, `superseded` (a `failed` or
     /// `cancelled` loser keeps its status); the judge row (`fanout_index = -1`), when there is
-    /// one, becomes `done` with `gate_note = reason`.
+    /// one, becomes `done` with `gate_note = reason` — but only from `pending`, `running` or
+    /// `awaiting_approval`. A judge that already reached an outcome is left alone entirely, status
+    /// and `gate_note` both: §4.5's judge-failure path (`docs/ANA-2.md:858-862`) parks the run at
+    /// `awaiting_approval` with the failure reason in the judge's `gate_note` and has *a human*
+    /// pick through this method, so settling it here would be the `failed -> done` §4.3 rejects,
+    /// written over the reason the pick was made from. "Nothing is lost" is that sentence.
+    ///
+    /// §4.5 selects among *settled* candidates, so a candidate still `running` is not a case the
+    /// slot is expected to hold; one that is gets `selected = false` and keeps `running`, exactly
+    /// as a `failed` loser keeps `failed`. Nothing here refuses it — a live loser is the
+    /// orchestrator's to cancel (§4.4), not this write's.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }` for
