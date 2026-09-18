@@ -485,7 +485,7 @@ pub enum StoreRequest {
     /// Remove the keyring entry and stop dialling. The live connection, if any, is kept until
     /// quit (D13).
     ClearDsn,
-    /// `CacheStore::rebuild()` on the current mirror: the sixteen mirrored tables and the cursor
+    /// `CacheStore::rebuild()` on the current mirror: the seventeen mirrored tables and the cursor
     /// go, the file and its `cache_meta` stay (D14).
     RebuildCache,
 }

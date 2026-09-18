@@ -133,7 +133,7 @@ const CONFIRM_CLEAR: &str = "Remove the DSN from the keyring? This session keeps
 /// Both lists, always. The action is never extended to clear anything else — if it were, one of
 /// these two halves would quietly stop being true, and a confirmation that is wrong about what it
 /// destroys is worse than no confirmation at all.
-const CONFIRM_REBUILD: &str = "Rebuild the mirror? Survives: the file, schema_version, db_fingerprint, built_at, the pending/ buffer. Goes: the 16 mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass refills it. y / n";
+const CONFIRM_REBUILD: &str = "Rebuild the mirror? Survives: the file, schema_version, db_fingerprint, built_at, the pending/ buffer. Goes: the 17 mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass refills it. y / n";
 
 /// What the pane says while a rebuild is out. A rebuild can take seconds; a screen that still
 /// showed the question would be inviting a second `y` at nothing.
@@ -986,7 +986,7 @@ mod tests {
             "db_fingerprint",
             "built_at",
             "pending/",
-            "16 mirrored tables",
+            "17 mirrored tables",
             "cache_cursor",
             "last_full_refresh_at",
         ] {

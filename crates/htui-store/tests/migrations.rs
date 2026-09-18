@@ -14,7 +14,8 @@ use htui_core::store::StoreError;
 use htui_store::{MIGRATOR, MigrationState, PgStore, identity};
 use sqlx::Row as _;
 
-/// The 32 tables of blueprint B.1, in creation order.
+/// The 33 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// adds (`run_step_tree`, ANA-2 §9).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -48,6 +49,8 @@ const TABLES: &[&str] = &[
     "session_event",
     "command_run",
     "app_setting",
+    // 0003_orchestration.sql (ANA-2 §9), and therefore last.
+    "run_step_tree",
 ];
 
 #[tokio::test]
@@ -68,8 +71,9 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2],
-        "0001_init.sql and MOD-2 milestone 5's 0002_agent_probe.sql, in ordinal order"
+        vec![1, 2, 3],
+        "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql and MOD-4 milestone 1's \
+         0003_orchestration.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -87,14 +91,16 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        32,
-        "blueprint B.1 lists 32 tables; ANA-9 §3's prose count of 30 is wrong (H.1)"
+        33,
+        "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1) and \
+         0003_orchestration.sql adds run_step_tree"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migration creates the 32 tables of B.1 and nothing else, got {present:?}"
+        "the migrations create the 33 tables of B.1 as amended by ANA-2 §9 and nothing else, \
+         got {present:?}"
     );
 
     db.drop_db().await;
@@ -150,12 +156,14 @@ async fn agent_box_gains_a_jsonb_probe_column() {
     db.drop_db().await;
 }
 
-/// The six `COMMENT ON COLUMN` texts of `0002_agent_probe.sql`, verbatim.
+/// The twenty-five `COMMENT ON COLUMN` texts of `0002_agent_probe.sql` and
+/// `0003_orchestration.sql`, verbatim.
 ///
 /// `agent.name` is ANA-4 §9 as amended by plan D43 (its `COMMENT ... IS NULL` would have cleared a
-/// comment `0001_init.sql` never wrote); the other five are ANA-5 §9 copied from
-/// `docs/ANA-5.md:2153-2181`. They live here as literals on purpose: this test is the guard
-/// against a paraphrase drifting into a forward-only migration that cannot be edited afterwards.
+/// comment `0001_init.sql` never wrote); the next five are ANA-5 §9 copied from
+/// `docs/ANA-5.md:2153-2181`; the last nineteen are ANA-2 §9 (`docs/ANA-2.md:1862-1999`). They
+/// live here as literals on purpose: this test is the guard against a paraphrase drifting into a
+/// forward-only migration that cannot be edited afterwards.
 const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
         "agent",
@@ -200,7 +208,130 @@ const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
         "ANA-5 4.4: phase, then project.settings.token_budget, then app_setting.token_budget; the \
          assembler targets budget * (1 - app_setting.prompt_reserve_fraction)",
     ),
+    // ---------------------------------------------------------------------------------------
+    // 0003_orchestration.sql (ANA-2 §9), section by section.
+    // ---------------------------------------------------------------------------------------
+    (
+        "step_graph",
+        "is_override",
+        "true = an <item.key>-override clone (R-ORCH-1, ANA-2 §4.1); hidden from the R-TUI-8 \
+         graph list",
+    ),
+    (
+        "step_graph_phase",
+        "judge_agent_id",
+        "R-ORCH-7 judge; NULL = human selection is required whenever fan_out > 1 (ANA-2 §4.5)",
+    ),
+    (
+        "step_graph_phase",
+        "judge_model",
+        "model for the judge; overrides agent.default_model (ANA-2 §7)",
+    ),
+    (
+        "step_graph_phase",
+        "deadline_seconds",
+        "wall clock for one step attempt; NULL = project.settings.step_deadline_seconds \
+         (ANA-2 §4.1)",
+    ),
+    (
+        "step_graph_phase",
+        "verify_command",
+        "ANA-2 §4.2: runs after the session and before the gate, in the primary repo tree, \
+         through command_run when the phase advertises it; outcome lands in \
+         run_step.verify_outcome",
+    ),
+    (
+        "step_graph_phase",
+        "input_kinds",
+        "ANA-2 §4.2: each kind resolves to the latest document version on this item whose \
+         producing step is not a fan-out loser, preferring this run's own output; a missing kind \
+         fails the step",
+    ),
+    (
+        "run",
+        "repo_scope",
+        "repos this run may touch, resolved at queue time from item.touched_paths (ANA-2 §4.7)",
+    ),
+    (
+        "run",
+        "lease_owner",
+        "per-process id of the orchestrator holding this run; a zero-row lease refresh means \
+         abandon (ANA-2 §4.9)",
+    ),
+    (
+        "run",
+        "graph_snapshot",
+        "ANA-2 §5.1: {v, graph, topology, mode, phases[], settings}; carries both gate and \
+         gate_effective so the R-ORCH-6 downgrade is auditable",
+    ),
+    (
+        "run_step",
+        "verify_outcome",
+        "ANA-2 §4.2: pass | fail | unavailable; unavailable never fails a step",
+    ),
+    (
+        "run_step",
+        "exit_code",
+        "the agent process exit code (R-ORCH-11); verification has its own verify_exit_code",
+    ),
+    (
+        "run_step",
+        "fanout_index",
+        "0..fan_out-1; -1 = the R-ORCH-7 judge step for this position and attempt (ANA-2 §4.5)",
+    ),
+    (
+        "run_step",
+        "selected",
+        "fan-out winner; NULL when fan_out = 1; false on a loser, which is also superseded \
+         (ANA-2 §4.5)",
+    ),
+    (
+        "run_step",
+        "attempt",
+        "1-based; retry_limit is the number of additional attempts, so attempt <= retry_limit + 1 \
+         (ANA-2 §4.2)",
+    ),
+    (
+        "run_step",
+        "isolation_path",
+        "the primary repo tree; every repo in scope has a run_step_tree row (ANA-2 §4.6)",
+    ),
+    (
+        "run_step",
+        "promoted_at",
+        "set when the step was promoted to an interactive chat (R-ORCH-5, ANA-2 §4.8)",
+    ),
+    (
+        "item",
+        "touched_paths",
+        "R-ORCH-9 declared overlap set: \"<repo_name>:<glob>\" entries, or a bare glob meaning \
+         the primary repo. Empty means unknown, which overlaps the whole primary repo \
+         (ANA-2 §4.7).",
+    ),
+    (
+        "box",
+        "settings",
+        "ANA-2 §4.7 BoxSettings: max_concurrent_items (R-ORCH-9), command_limits {class: n} \
+         (R-MCP-3). Every field optional; defaults come from app_setting.",
+    ),
+    (
+        "project",
+        "settings",
+        "ANA-2 §4.7 ProjectSettings: token_budget, retention_days, cached_transcript_steps, \
+         keep_raw_events, default_isolation, per_token_cap_run, per_token_cap_batch, \
+         step_deadline_seconds, default_agent_id, judge_agent_id, copy_exclude. Every field \
+         optional.",
+    ),
 ];
+
+/// The one `COMMENT ON TABLE` of `0003_orchestration.sql` (ANA-2 §9), verbatim. Kept beside
+/// [`ANA_COLUMN_COMMENTS`] rather than in it: `col_description` cannot read it, because a table
+/// comment is `objsubid = 0`.
+const ANA_TABLE_COMMENT: (&str, &str) = (
+    "run_step_tree",
+    "R-ORCH-8 isolation, per repo; ANA-2 §4.6. A dirty local or shared_serialized tree is never \
+     reset by the recovery sweep (ANA-2 §4.9).",
+);
 
 #[tokio::test]
 async fn the_six_ana_comments_are_present_and_verbatim() {
@@ -228,8 +359,25 @@ async fn the_six_ana_comments_are_present_and_verbatim() {
         );
     }
 
-    // And nothing else in those four tables carries one, so a reader of `\d+` sees exactly the
-    // six contracts the two ANAs wrote and no half-finished seventh.
+    // The one table comment, which `col_description` above cannot see: a table's own comment is
+    // `objsubid = 0` on the class, not on any attribute.
+    let (table, expected) = ANA_TABLE_COMMENT;
+    let actual: Option<String> = sqlx::query_scalar(
+        "SELECT pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_class c \
+         WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' AND c.relname = $1",
+    )
+    .bind(table)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap_or_else(|err| panic!("read obj_description for {table}: {err}"));
+    assert_eq!(
+        actual.as_deref(),
+        Some(expected),
+        "{table}'s table comment is the ANA-2 §9 text byte for byte"
+    );
+
+    // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
+    // twenty-five contracts the three ANAs wrote and no half-finished twenty-sixth.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -248,7 +396,7 @@ async fn the_six_ana_comments_are_present_and_verbatim() {
     )
     .fetch_all(&db.pool)
     .await
-    .expect("list the commented columns of the four tables");
+    .expect("list the commented columns of the named tables");
 
     let mut expected: Vec<(String, String)> = ANA_COLUMN_COMMENTS
         .iter()
@@ -257,7 +405,7 @@ async fn the_six_ana_comments_are_present_and_verbatim() {
     expected.sort();
     assert_eq!(
         commented, expected,
-        "exactly the six commented columns, and no others"
+        "exactly the twenty-five commented columns, and no others"
     );
 
     db.drop_db().await;
@@ -352,8 +500,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(2),
-        "two embedded migrations, none applied"
+        MigrationState::Pending(3),
+        "three embedded migrations, none applied"
     );
 
     db.drop_db().await;

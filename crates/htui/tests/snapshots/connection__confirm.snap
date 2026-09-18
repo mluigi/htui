@@ -29,6 +29,6 @@ expression: "frame_of(&bench, &section)"
 
 
 Rebuild the mirror? Survives: the file, schema_version, db_fingerprint, built_at, the pending/
-buffer. Goes: the 16 mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass
+buffer. Goes: the 17 mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass
 refills it. y / n
 y confirm · n / Esc cancel
