@@ -1,0 +1,101 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT t.run_step_id, t.repo_id, t.mode, t.path, t.base_ref, t.dirty,\n                  s.updated_at as \"ts!\"\n             FROM run_step_tree t\n             JOIN run_step s ON s.id = t.run_step_id\n             JOIN run r      ON r.id = s.run_id\n            WHERE r.project_id = $1 AND s.updated_at > $2\n            ORDER BY s.updated_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_step_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step_tree",
+            "name": "run_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repo_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_step_tree",
+            "name": "repo_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "mode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step_tree",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step_tree",
+            "name": "path"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "base_ref",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step_tree",
+            "name": "base_ref"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "dirty",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "run_step_tree",
+            "name": "dirty"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "ts!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "61773c8960be9e6ab88d730265f0f5d1aed69ae6347fe445a0717331ce394a4f"
+}

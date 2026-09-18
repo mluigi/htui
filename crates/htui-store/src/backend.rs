@@ -524,33 +524,54 @@ impl ReadStore for Backend {
 
     // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
     //
-    // Declared unwritten so the crate compiles from this commit on (blueprint H-8); the SQL lands
-    // in blueprint §3.11's third commit, together with `run_step_tree` as the seventeenth
-    // mirrored table.
+    // Three arms each, in the shape above and under the same rule: all five read a mirrored table,
+    // so `Offline` answers off the mirror rather than refusing. The eleven **inherent** run reads
+    // are the ones that refuse there, because `step_graph`, `phase_agent` and `agent_box` are not
+    // mirrored at all.
 
-    async fn run(&self, _id: RunId) -> Result<Option<Run>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn run(&self, id: RunId) -> Result<Option<Run>> {
+        match self {
+            Self::Memory(store) => store.run(id).await,
+            Self::Online { pg, .. } => pg.run(id).await,
+            Self::Offline { cache, .. } => cache.run(id).await,
+        }
     }
 
-    async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn run_steps(&self, run: RunId) -> Result<Vec<RunStep>> {
+        match self {
+            Self::Memory(store) => store.run_steps(run).await,
+            Self::Online { pg, .. } => pg.run_steps(run).await,
+            Self::Offline { cache, .. } => cache.run_steps(run).await,
+        }
     }
 
-    async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn step_trees(&self, step: StepId) -> Result<Vec<RunStepTree>> {
+        match self {
+            Self::Memory(store) => store.step_trees(step).await,
+            Self::Online { pg, .. } => pg.step_trees(step).await,
+            Self::Offline { cache, .. } => cache.step_trees(step).await,
+        }
     }
 
-    async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn step_commits(&self, step: StepId) -> Result<Vec<RunStepCommit>> {
+        match self {
+            Self::Memory(store) => store.step_commits(step).await,
+            Self::Online { pg, .. } => pg.step_commits(step).await,
+            Self::Offline { cache, .. } => cache.step_commits(step).await,
+        }
     }
 
     async fn resolve_inputs(
         &self,
-        _item: ItemId,
-        _run: RunId,
-        _kinds: &[String],
+        item: ItemId,
+        run: RunId,
+        kinds: &[String],
     ) -> Result<Vec<ResolvedInput>> {
-        todo!("MOD-4 T2 commit 3")
+        match self {
+            Self::Memory(store) => store.resolve_inputs(item, run, kinds).await,
+            Self::Online { pg, .. } => pg.resolve_inputs(item, run, kinds).await,
+            Self::Offline { cache, .. } => cache.resolve_inputs(item, run, kinds).await,
+        }
     }
 }
 

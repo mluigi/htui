@@ -15,11 +15,12 @@ use std::collections::BTreeMap;
 
 use htui_core::model::{
     Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
-    BoxTool, CommandQueue, Document, DocumentHead, DocumentId, Gate, Isolation, Item, ItemFilter,
-    ItemId, ItemKind, ItemKindId, LinkEdge, LinkGraph, LinkKind, Note, PhaseId, Project, ProjectId,
-    ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, ResolvedInput, Run, RunId,
-    RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SkillId,
-    SkillVersion, StepGraph, StepGraphId, StepGraphPhase, StepId, UpstreamEntry, Workspace,
+    BoxTool, CommandQueue, Document, DocumentHead, DocumentId, Gate, GateOutcome, Isolation, Item,
+    ItemFilter, ItemId, ItemKind, ItemKindId, LinkEdge, LinkGraph, LinkKind, Note, PhaseId,
+    Project, ProjectId, ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId,
+    ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, Scope, SessionEvent, SkillId, SkillVersion, StepGraph, StepGraphId,
+    StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, VerifyOutcome, Workspace,
     WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
@@ -630,34 +631,202 @@ impl ReadStore for PgStore {
     }
 
     // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
-    //
-    // Declared unwritten so the crate compiles from this commit on (blueprint H-8); the SQL lands
-    // in blueprint §3.11's third commit, together with `run_step_tree` as the seventeenth
-    // mirrored table.
 
-    async fn run(&self, _id: RunId) -> Result<Option<Run>> {
-        todo!("MOD-4 T2 commit 3")
+    /// The whole `run` row, lease columns and all — not [`RunSummary`], which the Runs pane reads
+    /// and which carries no lease (blueprint F-S).
+    async fn run(&self, id: RunId) -> Result<Option<Run>> {
+        sqlx::query_as!(
+            Run,
+            r#"
+            SELECT id               AS "id: RunId",
+                   project_id       AS "project_id: ProjectId",
+                   item_id          AS "item_id: ItemId",
+                   kind             AS "kind: RunKind",
+                   mode             AS "mode: RunMode",
+                   status           AS "status: RunStatus",
+                   target_box_id    AS "target_box_id: BoxId",
+                   executing_box_id AS "executing_box_id: BoxId",
+                   graph_snapshot,
+                   started_by       AS "started_by: UserId",
+                   queued_at,
+                   started_at,
+                   finished_at,
+                   failure,
+                   repo_scope       AS "repo_scope: Vec<RepoId>",
+                   lease_box_id     AS "lease_box_id: BoxId",
+                   lease_expires_at,
+                   updated_at
+              FROM run WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
-    async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
-        todo!("MOD-4 T2 commit 3")
+    /// Every step of the run, judge first within its position and attempt: `fanout_index` ascending
+    /// puts `-1` before `0` without a special case (ANA-2 §4.5).
+    async fn run_steps(&self, run: RunId) -> Result<Vec<RunStep>> {
+        sqlx::query_as!(
+            RunStep,
+            r#"
+            SELECT id                  AS "id: StepId",
+                   run_id              AS "run_id: RunId",
+                   position,
+                   attempt,
+                   fanout_index,
+                   phase_name,
+                   agent_id            AS "agent_id: AgentId",
+                   model,
+                   status              AS "status: StepStatus",
+                   gate_outcome        AS "gate_outcome: GateOutcome",
+                   gate_note,
+                   selected,
+                   exit_code,
+                   prompt_digest,
+                   trim_record,
+                   usage,
+                   isolation_path,
+                   started_at,
+                   finished_at,
+                   verify_outcome      AS "verify_outcome: VerifyOutcome",
+                   verify_exit_code,
+                   promoted_at,
+                   updated_at
+              FROM run_step
+             WHERE run_id = $1
+             ORDER BY position, attempt, fanout_index
+            "#,
+            run.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
-    async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn step_trees(&self, step: StepId) -> Result<Vec<RunStepTree>> {
+        sqlx::query_as!(
+            RunStepTree,
+            r#"
+            SELECT run_step_id AS "run_step_id: StepId",
+                   repo_id     AS "repo_id: RepoId",
+                   mode        AS "mode: Isolation",
+                   path,
+                   base_ref,
+                   dirty
+              FROM run_step_tree WHERE run_step_id = $1 ORDER BY repo_id
+            "#,
+            step.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
-    async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn step_commits(&self, step: StepId) -> Result<Vec<RunStepCommit>> {
+        sqlx::query_as!(
+            RunStepCommit,
+            r#"
+            SELECT run_step_id AS "run_step_id: StepId",
+                   repo_id     AS "repo_id: RepoId",
+                   before_hash,
+                   after_hash
+              FROM run_step_commit WHERE run_step_id = $1 ORDER BY repo_id
+            "#,
+            step.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
+    /// ANA-2 §4.2's input resolver: latest eligible document per kind, this run's own output
+    /// preferred, fan-out losers excluded, one entry per requested kind in request order.
+    ///
+    /// The rank is written as an explicit `CASE` rather than the `(s.run_id = $2) DESC NULLS LAST`
+    /// of §4.2's sketch, and the mirror's statement carries the same three arms: `DESC NULLS LAST`
+    /// over a boolean is not spelled or sorted alike on SQLite, and the two backends have to agree
+    /// (blueprint H-14). `ROW_NUMBER() OVER (PARTITION BY kind ...)` rather than `DISTINCT ON` for
+    /// the same reason — it is one statement both engines run.
+    ///
+    /// The caller's order is applied in Rust, exactly as
+    /// [`documents_of_kinds`](ReadStore::documents_of_kinds) applies it and for the same two
+    /// reasons: it is an arbitrary permutation no `ORDER BY` expresses, and the empty-`kinds` case
+    /// must be byte order rather than the database collation.
     async fn resolve_inputs(
         &self,
-        _item: ItemId,
-        _run: RunId,
-        _kinds: &[String],
+        item: ItemId,
+        run: RunId,
+        kinds: &[String],
     ) -> Result<Vec<ResolvedInput>> {
-        todo!("MOD-4 T2 commit 3")
+        let wanted: Vec<String> = if kinds.is_empty() {
+            let mut all = sqlx::query_scalar!(
+                "SELECT DISTINCT kind FROM document WHERE item_id = $1",
+                item.as_uuid(),
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+            all.sort_unstable();
+            all
+        } else {
+            kinds.to_vec()
+        };
+
+        let eligible = sqlx::query_as!(
+            Document,
+            r#"
+            SELECT id                  AS "id!: DocumentId",
+                   item_id             AS "item_id!: ItemId",
+                   kind                AS "kind!",
+                   version             AS "version!",
+                   title               AS "title!",
+                   body                AS "body!",
+                   produced_by_step_id AS "produced_by_step_id: StepId",
+                   created_by          AS "created_by!: UserId",
+                   created_at          AS "created_at!"
+              FROM (SELECT d.id,
+                           d.item_id,
+                           d.kind,
+                           d.version,
+                           d.title,
+                           d.body,
+                           d.produced_by_step_id,
+                           d.created_by,
+                           d.created_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY d.kind
+                               ORDER BY CASE WHEN s.id IS NULL      THEN 2
+                                             WHEN s.run_id = $2     THEN 0
+                                             ELSE 1 END,
+                                        d.version DESC) AS rank_in_kind
+                      FROM document d
+                      LEFT JOIN run_step s ON s.id = d.produced_by_step_id
+                     WHERE d.item_id = $1
+                       AND d.kind = ANY($3::text[])
+                       AND (s.id IS NULL OR s.selected IS NOT FALSE)) ranked
+             WHERE rank_in_kind = 1
+            "#,
+            item.as_uuid(),
+            run.as_uuid(),
+            &wanted[..],
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let by_kind: BTreeMap<&str, &Document> = eligible
+            .iter()
+            .map(|document| (document.kind.as_str(), document))
+            .collect();
+        Ok(wanted
+            .iter()
+            .map(|kind| ResolvedInput {
+                kind: kind.clone(),
+                document: by_kind.get(kind.as_str()).map(|&found| found.clone()),
+            })
+            .collect())
     }
 }
 

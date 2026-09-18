@@ -197,7 +197,7 @@ impl Refresher {
     }
 }
 
-/// The ten cursor-driven tables of §6.2, in foreign-key order.
+/// The eleven cursor-driven tables of §6.2, in foreign-key order.
 const PROJECT: &str = "project";
 const REPO: &str = "repo";
 const ITEM_KIND: &str = "item_kind";
@@ -208,6 +208,7 @@ const DOCUMENT: &str = "document";
 const RUN: &str = "run";
 const RUN_STEP: &str = "run_step";
 const RUN_STEP_COMMIT: &str = "run_step_commit";
+const RUN_STEP_TREE: &str = "run_step_tree";
 
 /// One pass, as a free function so `tests/cache.rs` can run it without a task.
 ///
@@ -262,6 +263,7 @@ pub async fn run_pass(
             RUN,
             RUN_STEP,
             RUN_STEP_COMMIT,
+            RUN_STEP_TREE,
         ] {
             let hw = cursor(sqlite, project, table).await?;
             if hw != 0 {
@@ -278,7 +280,16 @@ pub async fn run_pass(
                 DOCUMENT => refresh_document(pool, sqlite, project, since, hw).await?,
                 RUN => refresh_run(pool, sqlite, project, since, hw).await?,
                 RUN_STEP => refresh_run_step(pool, sqlite, project, since, hw).await?,
-                _ => refresh_run_step_commit(pool, sqlite, project, since, hw).await?,
+                // Explicit arms, and no `_` fallback: until MOD-4 milestone 1 this match ended
+                // `_ => refresh_run_step_commit`, so adding a table to the list above and
+                // nothing else would have handed it to the commit refresher — which compiles,
+                // refreshes nothing, and leaves every read of the new table empty with no test
+                // failing (blueprint F-F, hazard H-3).
+                RUN_STEP_COMMIT => {
+                    refresh_run_step_commit(pool, sqlite, project, since, hw).await?
+                }
+                RUN_STEP_TREE => refresh_run_step_tree(pool, sqlite, project, since, hw).await?,
+                other => unreachable!("every table of the cursor list has an arm, not `{other}`"),
             };
             tracing::debug!(
                 project = %project,
@@ -1270,6 +1281,65 @@ async fn refresh_run_step_commit(
     }
     let high_water = rows.last().map_or(hw, |row| ts_bind(row.ts));
     finish(tx, project, RUN_STEP_COMMIT, high_water).await?;
+    Ok(Batch {
+        rows: rows.len() as u64,
+        tombstones: 0,
+    })
+}
+
+const RUN_STEP_TREE_COLUMNS: &[&str] = &[
+    "run_step_id",
+    "repo_id",
+    "mode",
+    "path",
+    "base_ref",
+    "dirty",
+];
+
+/// ANA-2 §4.6's isolation trees, the seventeenth mirrored table (plan D9).
+///
+/// A twin of [`refresh_run_step_commit`] in every respect, and for the same reason: the table has
+/// no `updated_at` of its own, so it rides its parent step's. A tree that changes without its step
+/// changing is therefore invisible to the pass — which is correct, because nothing writes one
+/// except `upsert_step_tree`, and that runs while the step it belongs to is being settled.
+async fn refresh_run_step_tree(
+    pool: &PgPool,
+    sqlite: &SqlitePool,
+    project: ProjectId,
+    since: DateTime<Utc>,
+    hw: i64,
+) -> Result<Batch> {
+    let rows = sqlx::query!(
+        r#"SELECT t.run_step_id, t.repo_id, t.mode, t.path, t.base_ref, t.dirty,
+                  s.updated_at as "ts!"
+             FROM run_step_tree t
+             JOIN run_step s ON s.id = t.run_step_id
+             JOIN run r      ON r.id = s.run_id
+            WHERE r.project_id = $1 AND s.updated_at > $2
+            ORDER BY s.updated_at"#,
+        project.as_uuid(),
+        since,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let sql = upsert_sql(RUN_STEP_TREE, RUN_STEP_TREE_COLUMNS, 2);
+    let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
+    for row in &rows {
+        sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
+            .bind(row.run_step_id.to_string())
+            .bind(row.repo_id.to_string())
+            .bind(&row.mode)
+            .bind(&row.path)
+            .bind(&row.base_ref)
+            .bind(i64::from(row.dirty))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+    }
+    let high_water = rows.last().map_or(hw, |row| ts_bind(row.ts));
+    finish(tx, project, RUN_STEP_TREE, high_water).await?;
     Ok(Batch {
         rows: rows.len() as u64,
         tombstones: 0,

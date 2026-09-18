@@ -25,14 +25,17 @@
 //! silently wrong; none of them is optional (blueprint H.9, H.10). Enums need no helper: the
 //! `str_enum!` derive emits a SQLite `Type`/`Decode` over `str`.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use htui_core::model::{
     Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, Document, DocumentHead, DocumentId,
-    EventKind, EventRole, GateOutcome, Item, ItemFilter, ItemId, ItemSummary, LinkEdge, LinkGraph,
-    LinkKind, LinkNode, Note, NoteId, OsFamily, Project, ProjectId, ProjectRef, PromptScope,
-    ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraphId, StepId, StepStatus,
-    Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceId, WorkspaceSummary,
+    EventKind, EventRole, GateOutcome, Isolation, Item, ItemFilter, ItemId, ItemSummary, LinkEdge,
+    LinkGraph, LinkKind, LinkNode, Note, NoteId, OsFamily, Project, ProjectId, ProjectRef,
+    PromptScope, RepoId, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
+    StepGraphId, StepId, StepStatus, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceId,
+    WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -89,6 +92,17 @@ pub(crate) fn ts_bind(at: DateTime<Utc>) -> i64 {
 /// TEXT holding a JSON array -> `Vec<String>` (`required_tags`, `touched_paths`, `probed_tags`).
 pub(crate) fn strings_col(column: &str, text: &str) -> Result<Vec<String>> {
     serde_json::from_str(text).map_err(|_| bad(column, "a JSON array of strings"))
+}
+
+/// TEXT holding a JSON array of hyphenated uuids -> `Vec<RepoId>` (`run.repo_scope`).
+///
+/// The mirror has no array type, so `refresh_run` writes the `UUID[]` column as JSON; this is the
+/// other half of that (plan D7).
+pub(crate) fn repos_col(column: &str, text: &str) -> Result<Vec<RepoId>> {
+    strings_col(column, text)?
+        .iter()
+        .map(|id| uuid_col::<RepoId>(column, id))
+        .collect()
 }
 
 /// TEXT holding JSON -> `serde_json::Value` (`payload`, `raw`, `settings`, `graph_snapshot`,
@@ -785,33 +799,228 @@ impl ReadStore for CacheStore {
 
     // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
     //
-    // Declared unwritten so the crate compiles from this commit on (blueprint H-8); the SQL lands
-    // in blueprint §3.11's third commit, together with `run_step_tree` as the seventeenth
-    // mirrored table.
+    // Every one of them reads a table the mirror carries, which is what makes it a trait method
+    // rather than an inherent one: `run`, `run_step` and `run_step_commit` since `0001_mirror.sql`,
+    // `run_step_tree` since this milestone's companion migration.
 
-    async fn run(&self, _id: RunId) -> Result<Option<Run>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn run(&self, id: RunId) -> Result<Option<Run>> {
+        // `lease_owner` is absent from the mirror by design (plan D7) and absent from `Run` for
+        // the same reason: another process's liveness token is no use to a reader.
+        let row = sqlx::query(
+            "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, \
+                    graph_snapshot, started_by, queued_at, started_at, finished_at, failure, \
+                    repo_scope, lease_box_id, lease_expires_at, updated_at \
+               FROM run WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let Some(row) = row else { return Ok(None) };
+        Ok(Some(Run {
+            id: uuid_col::<RunId>("run.id", &text(&row, "id")?)?,
+            project_id: uuid_col("run.project_id", &text(&row, "project_id")?)?,
+            item_id: opt_uuid_col::<ItemId>("run.item_id", opt_text(&row, "item_id")?.as_deref())?,
+            kind: get::<RunKind>(&row, "kind")?,
+            mode: get::<RunMode>(&row, "mode")?,
+            status: get::<RunStatus>(&row, "status")?,
+            target_box_id: uuid_col("run.target_box_id", &text(&row, "target_box_id")?)?,
+            executing_box_id: opt_uuid_col::<BoxId>(
+                "run.executing_box_id",
+                opt_text(&row, "executing_box_id")?.as_deref(),
+            )?,
+            graph_snapshot: opt_json_col(
+                "run.graph_snapshot",
+                opt_text(&row, "graph_snapshot")?.as_deref(),
+            )?,
+            started_by: uuid_col::<UserId>("run.started_by", &text(&row, "started_by")?)?,
+            queued_at: ts_col("run.queued_at", get(&row, "queued_at")?)?,
+            started_at: opt_ts_col("run.started_at", get(&row, "started_at")?)?,
+            finished_at: opt_ts_col("run.finished_at", get(&row, "finished_at")?)?,
+            failure: opt_text(&row, "failure")?,
+            repo_scope: repos_col("run.repo_scope", &text(&row, "repo_scope")?)?,
+            lease_box_id: opt_uuid_col::<BoxId>(
+                "run.lease_box_id",
+                opt_text(&row, "lease_box_id")?.as_deref(),
+            )?,
+            lease_expires_at: opt_ts_col("run.lease_expires_at", get(&row, "lease_expires_at")?)?,
+            updated_at: ts_col("run.updated_at", get(&row, "updated_at")?)?,
+        }))
     }
 
-    async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn run_steps(&self, run: RunId) -> Result<Vec<RunStep>> {
+        let rows = sqlx::query(
+            "SELECT id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, \
+                    status, gate_outcome, gate_note, selected, exit_code, prompt_digest, \
+                    trim_record, usage, isolation_path, started_at, finished_at, verify_outcome, \
+                    verify_exit_code, promoted_at, updated_at \
+               FROM run_step WHERE run_id = ? \
+              ORDER BY position, attempt, fanout_index",
+        )
+        .bind(run.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| {
+                Ok(RunStep {
+                    id: uuid_col::<StepId>("run_step.id", &text(row, "id")?)?,
+                    run_id: uuid_col("run_step.run_id", &text(row, "run_id")?)?,
+                    position: get(row, "position")?,
+                    attempt: get(row, "attempt")?,
+                    fanout_index: get(row, "fanout_index")?,
+                    phase_name: text(row, "phase_name")?,
+                    agent_id: opt_uuid_col::<AgentId>(
+                        "run_step.agent_id",
+                        opt_text(row, "agent_id")?.as_deref(),
+                    )?,
+                    model: opt_text(row, "model")?,
+                    status: get::<StepStatus>(row, "status")?,
+                    gate_outcome: get::<Option<GateOutcome>>(row, "gate_outcome")?,
+                    gate_note: opt_text(row, "gate_note")?,
+                    selected: get::<Option<i64>>(row, "selected")?.map(bool_col),
+                    exit_code: get(row, "exit_code")?,
+                    prompt_digest: opt_text(row, "prompt_digest")?,
+                    trim_record: opt_json_col(
+                        "run_step.trim_record",
+                        opt_text(row, "trim_record")?.as_deref(),
+                    )?,
+                    usage: opt_json_col("run_step.usage", opt_text(row, "usage")?.as_deref())?,
+                    isolation_path: opt_text(row, "isolation_path")?,
+                    started_at: opt_ts_col("run_step.started_at", get(row, "started_at")?)?,
+                    finished_at: opt_ts_col("run_step.finished_at", get(row, "finished_at")?)?,
+                    verify_outcome: get::<Option<VerifyOutcome>>(row, "verify_outcome")?,
+                    verify_exit_code: get(row, "verify_exit_code")?,
+                    promoted_at: opt_ts_col("run_step.promoted_at", get(row, "promoted_at")?)?,
+                    updated_at: ts_col("run_step.updated_at", get(row, "updated_at")?)?,
+                })
+            })
+            .collect()
     }
 
-    async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn step_trees(&self, step: StepId) -> Result<Vec<RunStepTree>> {
+        let rows = sqlx::query(
+            "SELECT run_step_id, repo_id, mode, path, base_ref, dirty \
+               FROM run_step_tree WHERE run_step_id = ? ORDER BY repo_id",
+        )
+        .bind(step.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| {
+                Ok(RunStepTree {
+                    run_step_id: uuid_col::<StepId>(
+                        "run_step_tree.run_step_id",
+                        &text(row, "run_step_id")?,
+                    )?,
+                    repo_id: uuid_col("run_step_tree.repo_id", &text(row, "repo_id")?)?,
+                    mode: get::<Isolation>(row, "mode")?,
+                    path: text(row, "path")?,
+                    base_ref: text(row, "base_ref")?,
+                    dirty: bool_col(get::<i64>(row, "dirty")?),
+                })
+            })
+            .collect()
     }
 
-    async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
-        todo!("MOD-4 T2 commit 3")
+    async fn step_commits(&self, step: StepId) -> Result<Vec<RunStepCommit>> {
+        let rows = sqlx::query(
+            "SELECT run_step_id, repo_id, before_hash, after_hash \
+               FROM run_step_commit WHERE run_step_id = ? ORDER BY repo_id",
+        )
+        .bind(step.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| {
+                Ok(RunStepCommit {
+                    run_step_id: uuid_col::<StepId>(
+                        "run_step_commit.run_step_id",
+                        &text(row, "run_step_id")?,
+                    )?,
+                    repo_id: uuid_col("run_step_commit.repo_id", &text(row, "repo_id")?)?,
+                    before_hash: text(row, "before_hash")?,
+                    after_hash: opt_text(row, "after_hash")?,
+                })
+            })
+            .collect()
     }
 
+    /// The Postgres statement's twin, down to the three-armed `CASE`.
+    ///
+    /// Blueprint H-14: `(s.run_id = ?) DESC NULLS LAST` is not a spelling both engines sort the
+    /// same way, so the rank is written out — this run's own output 0, another run's 1, a
+    /// hand-written document 2 — and the pick is `ROW_NUMBER() OVER (PARTITION BY kind ...)`,
+    /// which is one statement Postgres and SQLite both run, rather than `DISTINCT ON`. The
+    /// conformance read case is what proves the two agree.
+    ///
+    /// `s.selected IS NOT FALSE` is the one deliberate divergence in text: the mirror stores the
+    /// column as `0`/`1`/`NULL`, so the eligibility test is written over integers here. The two
+    /// predicates admit exactly the same rows.
     async fn resolve_inputs(
         &self,
-        _item: ItemId,
-        _run: RunId,
-        _kinds: &[String],
+        item: ItemId,
+        run: RunId,
+        kinds: &[String],
     ) -> Result<Vec<ResolvedInput>> {
-        todo!("MOD-4 T2 commit 3")
+        let wanted: Vec<String> = if kinds.is_empty() {
+            let rows = sqlx::query("SELECT DISTINCT kind FROM document WHERE item_id = ?")
+                .bind(item.to_string())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+            let mut all = rows
+                .iter()
+                .map(|row| text(row, "kind"))
+                .collect::<Result<Vec<_>>>()?;
+            all.sort_unstable();
+            all
+        } else {
+            kinds.to_vec()
+        };
+
+        let rows = sqlx::query(
+            "SELECT id, item_id, kind, version, title, body, produced_by_step_id, created_by, \
+                    created_at \
+               FROM (SELECT d.id, d.item_id, d.kind, d.version, d.title, d.body, \
+                            d.produced_by_step_id, d.created_by, d.created_at, \
+                            ROW_NUMBER() OVER ( \
+                                PARTITION BY d.kind \
+                                ORDER BY CASE WHEN s.id IS NULL      THEN 2 \
+                                              WHEN s.run_id = ?      THEN 0 \
+                                              ELSE 1 END, \
+                                         d.version DESC) AS rank_in_kind \
+                       FROM document d \
+                       LEFT JOIN run_step s ON s.id = d.produced_by_step_id \
+                      WHERE d.item_id = ? \
+                        AND d.kind IN (SELECT k.value FROM json_each(?) k) \
+                        AND (s.id IS NULL OR COALESCE(s.selected, 1) <> 0)) \
+              WHERE rank_in_kind = 1",
+        )
+        .bind(run.to_string())
+        .bind(item.to_string())
+        .bind(serde_json::to_string(&wanted).unwrap_or_else(|_| "[]".to_owned()))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let eligible = rows
+            .iter()
+            .map(document_of)
+            .collect::<Result<Vec<Document>>>()?;
+        let by_kind: BTreeMap<&str, &Document> = eligible
+            .iter()
+            .map(|document| (document.kind.as_str(), document))
+            .collect();
+        Ok(wanted
+            .iter()
+            .map(|kind| ResolvedInput {
+                kind: kind.clone(),
+                document: by_kind.get(kind.as_str()).map(|&found| found.clone()),
+            })
+            .collect())
     }
 }
 

@@ -682,6 +682,153 @@ async fn the_0003_columns_reach_the_mirror() {
     teardown(db, &[&cache]).await;
 }
 
+/// `run_step_tree` is the seventeenth mirrored table, and — having no `updated_at` of its own —
+/// it rides its parent step's, exactly as `run_step_commit` does (ANA-2 §4.6, plan D9).
+///
+/// **This is the milestone's gate on the mirror carrying the two step-child tables at all** (T1
+/// audit A-6): `trees_and_commits_read_back` is a totality case over a fixture with no
+/// `run_step_tree` and no `run_step_commit` row, and both of its row-content twins are
+/// `WriteStore` cases a read-only `CacheStore` cannot run. So this test asserts rows, not
+/// emptiness — a mirror that refreshes nothing must fail it.
+///
+/// Blueprint F-F is the trap it exists for: `run_pass`'s table match used to end in a `_ =>`
+/// arm, so a `run_step_tree` added to the cursor list alone would have been handed to
+/// `refresh_run_step_commit`, which compiles, refreshes nothing, and leaves every read empty.
+///
+/// The passes run with **zero overlap** so the middle leg is deterministic: the §4.4 visibility
+/// window would otherwise re-fetch a step whose `updated_at` is merely close to the high-water
+/// mark, and "the tree moved but its step did not" would prove nothing.
+#[tokio::test]
+async fn run_step_tree_refreshes_off_its_parent_step() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let sharp = RefreshSettings {
+        overlap: std::time::Duration::ZERO,
+        ..settings(&db, 20)
+    };
+
+    // The fixture has no `repo` row (blueprint F-P), and both tables key on one.
+    let repo: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO repo (project_id, name, is_primary) VALUES ($1, 'core', true) RETURNING id",
+    )
+    .bind(ids::PROJECT_HTUI.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("a repo for the trees to key on");
+    sqlx::query(
+        "INSERT INTO run_step_tree (run_step_id, repo_id, mode, path, base_ref, dirty) \
+         VALUES ($1, $2, 'worktree', '/w/htui-feat-1', 'a1b2c3', false)",
+    )
+    .bind(ids::STEP_IMPL.as_uuid())
+    .bind(repo)
+    .execute(&db.pool)
+    .await
+    .expect("isolate the implement step");
+    sqlx::query(
+        "INSERT INTO run_step_commit (run_step_id, repo_id, before_hash, after_hash) \
+         VALUES ($1, $2, 'a1b2c3', 'd4e5f6')",
+    )
+    .bind(ids::STEP_IMPL.as_uuid())
+    .bind(repo)
+    .execute(&db.pool)
+    .await
+    .expect("record what the step committed");
+
+    run_pass(&db.pool, &cache, &all_projects(), &sharp)
+        .await
+        .expect("the first pass");
+
+    let mirrored = cache.step_trees(ids::STEP_IMPL).await.expect("cache trees");
+    assert_eq!(
+        mirrored,
+        db.store.step_trees(ids::STEP_IMPL).await.expect("pg trees"),
+        "the tree reaches the mirror and reads back as Postgres reads it"
+    );
+    assert_eq!(
+        mirrored
+            .iter()
+            .map(|tree| (
+                tree.mode,
+                tree.path.as_str(),
+                tree.base_ref.as_str(),
+                tree.dirty
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            htui_core::model::Isolation::Worktree,
+            "/w/htui-feat-1",
+            "a1b2c3",
+            false
+        )],
+        "and it is a row, not an empty answer that would pass against a mirror of nothing"
+    );
+    assert_eq!(
+        cache
+            .step_commits(ids::STEP_IMPL)
+            .await
+            .expect("cache commits"),
+        db.store
+            .step_commits(ids::STEP_IMPL)
+            .await
+            .expect("pg commits"),
+        "`run_step_commit` is mirrored on the same terms and has never had a row to prove it"
+    );
+    assert!(
+        cache
+            .step_trees(ids::STEP_PLAN)
+            .await
+            .expect("cache trees")
+            .is_empty(),
+        "a step with no tree is empty, not the previous step's answer"
+    );
+
+    // The tree alone moves: its parent step's `updated_at` does not, so the pass does not see it.
+    sqlx::query(
+        "UPDATE run_step_tree SET dirty = true, base_ref = '999999' WHERE run_step_id = $1",
+    )
+    .bind(ids::STEP_IMPL.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("dirty the tree behind the cursor's back");
+    run_pass(&db.pool, &cache, &all_projects(), &sharp)
+        .await
+        .expect("the blind pass");
+    assert_eq!(
+        cache
+            .step_trees(ids::STEP_IMPL)
+            .await
+            .expect("cache trees")
+            .first()
+            .map(|tree| (tree.base_ref.clone(), tree.dirty)),
+        Some(("a1b2c3".to_owned(), false)),
+        "a tree has no timestamp of its own, so nothing about it alone advances a cursor"
+    );
+
+    // Touch the step: the `BEFORE UPDATE` trigger moves `updated_at`, and the tree rides it.
+    sqlx::query("UPDATE run_step SET model = 'opus-2' WHERE id = $1")
+        .bind(ids::STEP_IMPL.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("touch the parent step");
+    run_pass(&db.pool, &cache, &all_projects(), &sharp)
+        .await
+        .expect("the riding pass");
+    assert_eq!(
+        cache
+            .step_trees(ids::STEP_IMPL)
+            .await
+            .expect("cache trees")
+            .first()
+            .map(|tree| (tree.base_ref.clone(), tree.dirty)),
+        Some(("999999".to_owned(), true)),
+        "once the step moves, the tree is re-upserted whole"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// The §7.3 walk never renders the root as its own upstream entry, even when the graph loops back
 /// to it (T68, F-52 review, H3).
 ///
