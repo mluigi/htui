@@ -741,11 +741,6 @@ impl AgentRuntime {
         // `Writer::Buffered` refuses `upsert_agent_box` with this same sentence (plan D52). It is
         // checked here rather than discovered on the write, because by then the spawns have
         // happened.
-        if matches!(writer, Writer::Buffered(_)) {
-            return Err(StoreError::Unreachable(
-                htui_store::REGISTRY_ON_SERVER_ONLY.to_owned(),
-            ));
-        }
         let box_id = backend
             .box_info()
             .await?
@@ -1290,9 +1285,7 @@ impl AgentRuntime {
         // The first two are properties of the *row and the writer* and hold for D60's trigger
         // too, so they are what builds the arguments; staleness is the third trigger's own
         // condition and is applied to the spawn alone.
-        let reprobe = (summary.agent.transport == Transport::Acp
-            && !matches!(writer, Writer::Buffered(_)))
-        .then(|| ReprobeArgs {
+        let reprobe = (summary.agent.transport == Transport::Acp).then(|| ReprobeArgs {
             writer: writer.clone(),
             box_id,
             agent: summary.agent.clone(),
@@ -1404,20 +1397,13 @@ impl core::fmt::Debug for ChatArgs {
 /// A document that does not parse refuses either way — that is `start_chat`'s own comment, and
 /// this function is where the two answers are told apart rather than folded into one `ok_or`.
 fn project_caps_for(
-    writer: &Writer,
+    _writer: &Writer,
     project_id: ProjectId,
     settings: Option<Value>,
 ) -> Result<ProjectCaps, StoreError> {
-    let settings = match (settings, writer) {
-        (Some(settings), _) => settings,
-        (None, Writer::Buffered(_)) => {
-            tracing::info!(
-                project = %project_id,
-                "unmirrored project: no cap is enforced offline (plan D70)"
-            );
-            json!({})
-        }
-        (None, _) => {
+    let settings = match settings {
+        Some(settings) => settings,
+        None => {
             return Err(StoreError::NotFound {
                 entity: "project",
                 id: project_id.to_string(),
@@ -1444,24 +1430,16 @@ fn project_caps_for(
 /// row. Nothing here looks at `agent.name` (`R-AGT-5`) — the name is logged, and a log line is not
 /// a dispatch.
 fn quota_latch_for(
-    writer: &Writer,
+    _writer: &Writer,
     agent: &Agent,
     box_id: BoxId,
     source: QuotaSource,
 ) -> Option<QuotaLatch> {
-    if matches!(writer, Writer::Buffered(_)) {
-        tracing::info!(
-            agent = %agent.name,
-            reason = htui_store::REGISTRY_ON_SERVER_ONLY,
-            "offline: quota is not latched, and the usage rows are (plan D68)"
-        );
-        return None;
-    }
     Some(QuotaLatch {
         agent_id: agent.id,
         box_id,
         source,
-        billing: agent.billing,
+        billing: agent.billing.clone(),
     })
 }
 
@@ -1748,11 +1726,6 @@ fn recording_writer(backend: &Backend) -> Result<Writer, StoreError> {
     let writer = backend
         .writer()
         .ok_or_else(|| StoreError::Unreachable(htui_store::REGISTRY_ON_SERVER_ONLY.to_owned()))?;
-    if matches!(writer, Writer::Buffered(_)) {
-        return Err(StoreError::Unreachable(
-            htui_store::REGISTRY_ON_SERVER_ONLY.to_owned(),
-        ));
-    }
     Ok(writer)
 }
 
@@ -3705,110 +3678,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// Review M-3: an offline chat whose project is **not in the mirror** still starts, unbounded;
-    /// the same absent row online refuses the chat.
-    ///
-    /// `project_caps_for` is called directly for `a_buffered_writer_gets_no_latch`'s reason — the
-    /// thing under test is a decision, not a turn. The offline half cannot be driven through the
-    /// shell at all: an offline chat takes its project from `projects(scope)`, which joins the
-    /// mirrored `project` row it is about to be missing, so the situation this guards against
-    /// arrives from a caller that names a project id some other way (MOD-4's orchestrator is the
-    /// next one) rather than from the Chat tab's own composer.
-    ///
-    /// The third assertion is the one that keeps the degradation honest: a cap the mirror *does*
-    /// hold is enforced offline exactly as online, which is why plan D70 put the cap in a mirrored
-    /// column instead of an env knob.
-    #[tokio::test]
-    async fn an_unmirrored_project_is_unbounded_offline_and_refused_online() {
-        let root = tempfile::tempdir().expect("temp root");
-        let cache = htui_store::CacheStore::open(root.path(), "caps-test", 1)
-            .await
-            .expect("mirror");
-        let buffered = Writer::Buffered(htui_store::BufferedWriter::new(cache.clone()));
-
-        assert_eq!(
-            project_caps_for(&buffered, ids::PROJECT_HTUI, None)
-                .expect("an unmirrored project does not refuse an offline chat"),
-            ProjectCaps::default(),
-            "no row, no cap: `{{}}` is unbounded, and the chat records to the buffer as it always \
-             did"
-        );
-        let refused = project_caps_for(&Writer::Memory(MemStore::demo()), ids::PROJECT_HTUI, None);
-        match refused {
-            Err(StoreError::NotFound { entity, id }) => {
-                assert_eq!(entity, "project");
-                assert_eq!(
-                    id,
-                    ids::PROJECT_HTUI.to_string(),
-                    "the refusal names the row"
-                );
-            }
-            other => panic!("online, a project the store does not hold refuses: {other:?}"),
-        }
-        assert_eq!(
-            project_caps_for(
-                &buffered,
-                ids::PROJECT_HTUI,
-                Some(json!({ "per_token_cap_run": 300 })),
-            )
-            .expect("a mirrored document parses offline")
-            .run_micros,
-            Some(300),
-            "a cap the mirror holds is enforced offline, which is why D70 chose this column"
-        );
-        assert!(
-            project_caps_for(
-                &buffered,
-                ids::PROJECT_HTUI,
-                Some(json!({ "per_token_cap_run": -1 }))
-            )
-            .is_err(),
-            "and a document that does not parse still refuses, offline included"
-        );
-        cache.close().await;
-    }
-
     /// Plan D66-D68: an offline chat latches no allowance and says why, decided at chat start
     /// rather than discovered on the first `usage` row.
     ///
-    /// `quota_latch_for` is called directly because the thing under test is a decision, not a
-    /// turn: a `Writer::Buffered` refuses every registry write, so the latch has nowhere to go and
-    /// the *usage rows* are what carry the figure until they are uploaded.
-    #[tokio::test]
-    async fn a_buffered_writer_gets_no_latch() {
-        let root = tempfile::tempdir().expect("temp root");
-        let cache = htui_store::CacheStore::open(root.path(), "latch-test", 1)
-            .await
-            .expect("mirror");
-        let agent = fake_row(AgentId::new());
-
-        assert_eq!(
-            quota_latch_for(
-                &Writer::Buffered(htui_store::BufferedWriter::new(cache.clone())),
-                &agent,
-                ids::BOX,
-                QuotaSource::AcpMetaRateLimit,
-            ),
-            None,
-            "the offline mirror has no `agent_box` table at all, deliberately (plan D68)"
-        );
-        let online = quota_latch_for(
-            &Writer::Memory(MemStore::demo()),
-            &agent,
-            ids::BOX,
-            QuotaSource::AcpMetaRateLimit,
-        )
-        .expect("a writer that can reach the registry latches");
-        assert_eq!(online.agent_id, agent.id, "the row the chat runs on");
-        assert_eq!(online.box_id, ids::BOX);
-        assert_eq!(
-            online.source,
-            QuotaSource::AcpMetaRateLimit,
-            "the source is the row's declaration, passed through (`R-AGT-5`)"
-        );
-        assert_eq!(online.billing, agent.billing);
-        cache.close().await;
-    }
 
     /// The latch, wired: a chat that reports a cost leaves `agent_box.quota` on the row it ran on.
     ///
@@ -3897,8 +3769,7 @@ pub(crate) mod tests {
 
     /// Since MOD-25 an offline backend is refused for *being* offline, and the refusal is one
     /// fixed sentence: `htui` is online-only, so a box whose Postgres is unreachable browses its
-    /// read-only cache and starts no run (`R-STO-4`). The old milestone-4 behaviour — hand out
-    /// `Writer::Buffered` and record into `<cache_dir>/pending/` — is withdrawn.
+    /// read-only cache and starts no run (`R-STO-4`).
     ///
     /// Three facts, and the sentence is asserted by **equality**, not `contains`: it is the
     /// contract the status line and the Chat body both render, so a reword is a deliberate change
@@ -4325,52 +4196,6 @@ pub(crate) mod tests {
 
     /// Plan D52 for the chat path: a `Writer::Buffered` refuses `upsert_agent_box`, so a re-probe
     /// against one would spawn an adapter to throw its answer away.
-    #[tokio::test]
-    #[ignore = "MOD-25: no backend hands out Writer::Buffered; kept for the reversal, removed by the CLEAN item"]
-    async fn a_buffered_writer_never_re_probes() {
-        let root = tempfile::tempdir().expect("a throwaway config root");
-        let cache = htui_store::CacheStore::open(root.path(), "reprobe-test", 1)
-            .await
-            .expect("a fresh mirror");
-        let agent_id = AgentId::new();
-        let mut demo = htui_core::fixtures::demo_data();
-        for user in &mut demo.users {
-            user.name = htui_store::identity::os_user_name();
-        }
-        demo.agents = vec![acp_fake_row(agent_id)];
-        htui_store::testkit::seed_mirror(&cache, &demo)
-            .await
-            .expect("the mirror is seeded");
-
-        let backend = Backend::Offline {
-            cache: cache.clone(),
-            since: None,
-        };
-        let mut runtime =
-            AgentRuntime::new(acp_factory(Script::one_turn(vec![ScriptEvent::Emit(
-                DriverEvent::Done(DoneEvent {
-                    stop_reason: StopReason::EndTurn,
-                }),
-            )])))
-            .with_grace(Duration::from_millis(0));
-        let (tx, _rx) = mpsc::unbounded_channel();
-
-        let served = runtime
-            .serve(&backend, &tx, &envelope(1, start(agent_id, "hello")))
-            .await;
-        assert!(
-            matches!(served, Served::Start { .. }),
-            "an offline chat still starts: {served:?}"
-        );
-        assert_eq!(
-            runtime.background_len(),
-            0,
-            "probing costs process spawns; a writer that refuses the row is refused first"
-        );
-        drop(served);
-        runtime.shutdown(Duration::ZERO).await;
-        cache.close().await;
-    }
 
     /// An `acp` registry row whose command exists nowhere.
     ///

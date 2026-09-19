@@ -413,7 +413,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 ### Deferred backlog
 
-- [ ] **CLEAN-2 - Delete the disabled offline buffered-write path** (from MOD-25). `R-STO-1`,
+- [x] **CLEAN-2 - Delete the disabled offline buffered-write path** (from MOD-25). `R-STO-1`,
   `R-STO-4`. MOD-25 disabled the offline buffer and **deliberately kept the machinery in the tree,
   compiling, for one release** so a reversal would cost one arm in `backend.rs`
   (`docs/decisions/mod/mod-25.md`). This item deletes it once the decision has sat. **Do not start

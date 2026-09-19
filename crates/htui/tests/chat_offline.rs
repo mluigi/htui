@@ -289,77 +289,10 @@ async fn an_offline_chat_is_refused_with_the_unreachable_warning() {
 /// The photograph is of an *ended* chat rather than a live one because that is the only state a
 /// buffered chat can be photographed in without a race (`Harness::drive_to_end`); the header line
 /// the case is about is the same either way, and the transcript above it is the live renderer's.
-#[tokio::test]
-#[ignore = "MOD-25: the offline buffer is disabled (Backend::writer answers None offline); kept for the reversal, removed by the CLEAN item"]
-async fn an_offline_chat_is_accepted_and_its_header_says_it_is_buffered() {
-    let agent_id = AgentId::new();
-    let (_root, cache) = offline_mirror(agent_id).await;
-    let (_keyring, mut harness) = offline_harness(&cache, one_turn()).await;
-    harness.drive().await;
-
-    compose(&mut harness, "what is in main.rs");
-    harness.drive().await;
-    // `Esc` arms, the second `Esc` ends the chat; `drive_to_end` waits for the file writes the
-    // buffered writer does off-task, which a poll-once pump cannot do without racing.
-    harness.key("esc");
-    harness.key("esc");
-    harness.drive_to_end().await;
-
-    let rendered = harness.render();
-    assert!(
-        rendered.contains("buffered · uploads when the store returns"),
-        "the header states the buffer: {rendered}"
-    );
-    stable().bind(|| insta::assert_snapshot!("chat_buffered", rendered));
-    cache.close().await;
-}
 
 /// `R-HIS-1` for the offline case, and the first half of §11 criterion 12: the rows a live chat
 /// would have sent to Postgres are on disk instead, in `seq` order, under the step the runtime
 /// minted — and the buffer is sealed once the chat ends, so the uploader may take it (`[H-1]`).
-#[tokio::test]
-#[ignore = "MOD-25: the offline buffer is disabled (Backend::writer answers None offline); kept for the reversal, removed by the CLEAN item"]
-async fn an_offline_chat_writes_its_rows_to_the_pending_buffer_in_seq_order() {
-    let agent_id = AgentId::new();
-    let (_root, cache) = offline_mirror(agent_id).await;
-    let (_keyring, mut harness) = offline_harness(&cache, one_turn()).await;
-    harness.drive().await;
-
-    compose(&mut harness, "what is in main.rs");
-    harness.drive().await;
-    // `Esc` arms, the second `Esc` ends the chat: that is what seals the buffer.
-    harness.key("esc");
-    harness.key("esc");
-    harness.drive_to_end().await;
-
-    let step = harness.chat_steps()[0];
-    let (_project, rows) = sealed_buffer(&cache);
-
-    assert!(
-        rows.iter().all(|row| row.run_step_id == step),
-        "every line belongs to the step the runtime minted"
-    );
-    assert_eq!(
-        rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
-        (0..rows.len() as i32).collect::<Vec<_>>(),
-        "gapless and ascending, which is the order the uploader replays them in"
-    );
-    assert_eq!(
-        rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
-        vec![
-            EventKind::Prompt,
-            EventKind::Other,
-            EventKind::AssistantText,
-            EventKind::ToolCall,
-            EventKind::ToolResult,
-            EventKind::AssistantText,
-            EventKind::Usage,
-            EventKind::Done,
-        ],
-        "the same log an online chat writes: the prompt, the banner, and then what the agent did"
-    );
-    cache.close().await;
-}
 
 /// §11 criterion 12, end to end: the buffer a driver wrote with the store unreachable is landed by
 /// `upload_pending` on the next connection, row for row, and a second pass changes nothing.
@@ -367,121 +300,10 @@ async fn an_offline_chat_writes_its_rows_to_the_pending_buffer_in_seq_order() {
 /// This is the half no other suite can prove. `htui-store`'s own upload cases write their buffers
 /// by hand, so they cannot notice the recorder and the uploader drifting apart; here the rows come
 /// out of the production recorder and go into the production uploader.
-#[tokio::test]
-#[ignore = "MOD-25: the offline buffer is disabled (Backend::writer answers None offline); kept for the reversal, removed by the CLEAN item"]
-async fn a_buffered_chat_lands_in_postgres_on_the_next_connection() {
-    let agent_id = AgentId::new();
-    let (_root, cache) = offline_mirror(agent_id).await;
-    let (_keyring, mut harness) = offline_harness(&cache, one_turn()).await;
-    harness.drive().await;
-    compose(&mut harness, "what is in main.rs");
-    harness.drive().await;
-    harness.key("esc");
-    harness.key("esc");
-    harness.drive_to_end().await;
-
-    let step = harness.chat_steps()[0];
-    let (_project, buffered) = sealed_buffer(&cache);
-
-    let Some(db) = testkit::demo_db().await else {
-        cache.close().await;
-        return;
-    };
-    assert_eq!(
-        db.store
-            .step_events(step)
-            .await
-            .expect("the log reads")
-            .map(|rows| rows.len()),
-        None,
-        "the server has never heard of this step before the upload"
-    );
-
-    let uploaded = upload_pending(
-        &db.pool,
-        cache.dir(),
-        db.store.this_box(),
-        db.store.this_user(),
-    )
-    .await
-    .expect("the upload lands");
-    assert_eq!(uploaded, 1, "one buffer, one file uploaded");
-
-    let landed = db
-        .store
-        .step_events(step)
-        .await
-        .expect("the log reads")
-        .expect("the uploaded step has a log");
-    assert_eq!(
-        landed, buffered,
-        "the rows the driver wrote to the buffer are the rows Postgres now holds"
-    );
-
-    // §11.7's idempotency, over rows this test produced rather than hand-written ones.
-    assert_eq!(
-        upload_pending(
-            &db.pool,
-            cache.dir(),
-            db.store.this_box(),
-            db.store.this_user(),
-        )
-        .await
-        .expect("a second pass is a no-op"),
-        0,
-        "the file is gone, so the second pass has nothing to upload"
-    );
-    assert_eq!(
-        db.store
-            .step_events(step)
-            .await
-            .expect("the log reads")
-            .expect("still there"),
-        landed,
-        "and nothing about the step changed"
-    );
-
-    cache.close().await;
-    db.drop_db().await;
-}
 
 /// D33's refusal, from the shell: a mirror this box has synced *without* an `app_user` row for this
 /// OS user cannot name `run.started_by`, and inventing one would make the uploader insert a
 /// stranger as the chat's author. The refusal says which row is missing.
-#[tokio::test]
-#[ignore = "MOD-25: unreachable from the shell — start() refuses at the writer before it reaches this_user(); kept for the reversal, removed by the CLEAN item"]
-async fn an_offline_box_that_never_synced_this_user_refuses_and_says_so() {
-    let agent_id = AgentId::new();
-    let root = tempfile::tempdir().expect("a throwaway config root");
-    let cache = CacheStore::open(root.path(), "offline-chat", PgStore::schema_version())
-        .await
-        .expect("a fresh mirror");
-    // Everything an offline chat needs except a user this box knows by this OS name.
-    let mut demo = htui_core::fixtures::demo_data();
-    for user in &mut demo.users {
-        user.name = format!("not-{}", htui_store::identity::os_user_name());
-    }
-    demo.agents = vec![scripted_row(agent_id)];
-    testkit::seed_mirror(&cache, &demo)
-        .await
-        .expect("the mirror is seeded");
-
-    let (_keyring, mut harness) = offline_harness(&cache, one_turn()).await;
-    harness.drive().await;
-    compose(&mut harness, "what is in main.rs");
-    harness.drive().await;
-
-    let rendered = harness.render();
-    assert!(
-        rendered.contains("app_user"),
-        "the refusal names the row this box has never synced: {rendered}"
-    );
-    assert!(
-        harness.chat_steps().is_empty(),
-        "and no chat was started: {rendered}"
-    );
-    cache.close().await;
-}
 
 /// The negative of the header case: a chat that records into a store the maintainer can read back
 /// says nothing about a buffer, so none of the eight `chat__*` snapshots moves.

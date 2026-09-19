@@ -148,11 +148,11 @@ fn init_tracing(path: Option<&Path>) -> anyhow::Result<()> {
         .open(path)?;
     let filter = tracing_subscriber::EnvFilter::try_from_env("HTUI_LOG_FILTER")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    
+
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(file)
         .with_ansi(false);
-    
+
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)

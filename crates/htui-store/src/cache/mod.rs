@@ -2,12 +2,10 @@
 //!
 //! [`CacheStore`] is `ReadStore` only: an offline write is a compile error rather than a runtime
 //! flag (§6.1). [`refresh`] owns the only writer (§6.3); [`read`] is the reader every offline view
-//! goes through; [`pending`] is the offline chat buffer of §4.3, which lives next to the file
-//! rather than inside it.
+//! goes through.
 //!
 //! Nothing in this module may run on the UI task (`R-NF-3`).
 
-pub mod pending;
 pub mod read;
 pub mod refresh;
 
@@ -24,9 +22,6 @@ use crate::error::{map_migrate, map_sqlx};
 
 /// The mirror file inside [`CacheStore::dir`].
 pub const CACHE_FILE: &str = "cache.sqlite";
-
-/// The offline chat buffer directory inside [`CacheStore::dir`] (§4.3).
-pub const PENDING_DIR: &str = "pending";
 
 /// The seventeen mirrored tables of §4.4, in foreign-key order.
 ///
@@ -131,10 +126,7 @@ impl CacheStore {
     /// carries on, because an unreadable best-effort buffer must not cost the user `start()`.
     pub async fn open(root: &Path, fingerprint: &str, schema_version: i64) -> Result<Self> {
         let dir = root.join("cache").join(fingerprint);
-        create_dir(&dir.join(PENDING_DIR))?;
-        // `[H-1]` No chat of this process can be live yet, so a buffer still carrying the open
-        // suffix belongs to a run that crashed: seal it, and the next pass uploads it whole.
-        pending::seal_orphaned(&dir)?;
+        create_dir(&dir)?;
         let path = dir.join(CACHE_FILE);
         let existed = path.exists();
 
@@ -211,7 +203,7 @@ impl CacheStore {
         })
     }
 
-    /// `<root>/cache/<fingerprint>`; `dir().join("pending")` is the offline chat buffer (§4.3).
+    /// `<root>/cache/<fingerprint>`.
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir

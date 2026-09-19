@@ -31,10 +31,6 @@
 //! chat-tab snapshot run against it, and a seam only the production backend can exercise is a seam
 //! no test covers.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-
 use chrono::{DateTime, Utc};
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, GateOutcome,
@@ -48,14 +44,12 @@ use htui_core::model::{
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, MemStore, ReadStore, Result, SettingRung, StoreError,
-    StoredSetting, UpdateOutcome, WriteStore,
+    CasOutcome, DeleteReach, DeleteTarget, MemStore, ReadStore, Result, SettingRung, StoredSetting,
+    UpdateOutcome, WriteStore,
 };
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::cache::CacheStore;
-use crate::cache::pending::{append_pending, seal_pending};
 use crate::pg::PgStore;
 
 /// A writable store a caller can hold.
@@ -65,12 +59,6 @@ pub enum Writer {
     Memory(MemStore),
     /// Postgres.
     Online(PgStore),
-    /// The offline sink (MOD-2 plan D34): reads from the mirror, writes to `<cache_dir>/pending/`.
-    ///
-    /// **Kept, but not constructed by any backend since MOD-25** — `htui` is online-only and a
-    /// chat off the server is refused with [`DATABASE_UNREACHABLE`]. The arm stays for one
-    /// release so the reversal is a one-arm change in `backend.rs`; the CLEAN item removes it.
-    Buffered(BufferedWriter),
 }
 
 impl Writer {
@@ -81,7 +69,6 @@ impl Writer {
         match self {
             Self::Memory(_) => "memory",
             Self::Online(_) => "online",
-            Self::Buffered(_) => "buffered",
         }
     }
 }
@@ -114,661 +101,11 @@ impl Writer {
 /// `append_events` shared one map. Since MOD-25 no [`Backend::writer`](crate::Backend::writer)
 /// call constructs it at all: the type is kept for one release for the reversal, and the upload
 /// side still lands whatever an earlier build buffered.
-#[derive(Debug, Clone)]
-pub struct BufferedWriter {
-    /// Reads, and the directory the buffer lives under.
-    cache: CacheStore,
-    /// `cache.dir()`, copied once: the argument every `cache::pending` call takes.
-    dir: PathBuf,
-    /// Filled by `start_chat_run`, read by `append_events` and `finish_chat_run`. `Arc` because
-    /// the recorder borrows a clone of the writer the session task owns, and the two must see one
-    /// map.
-    runs: Arc<Mutex<HashMap<StepId, (ProjectId, RunId)>>>,
-}
-
-impl BufferedWriter {
-    /// A writer over this mirror's directory, with nothing registered yet.
-    #[must_use]
-    pub fn new(cache: CacheStore) -> Self {
-        let dir = cache.dir().to_path_buf();
-        Self {
-            cache,
-            dir,
-            runs: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// `<root>/cache/<fingerprint>`; the buffer files live in `dir().join("pending")`.
-    #[must_use]
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// The `(project, run)` a step was registered under, or `None` — for tests and logs.
-    #[must_use]
-    pub fn run_of(&self, step: StepId) -> Option<(ProjectId, RunId)> {
-        self.registrations().get(&step).copied()
-    }
-
-    /// A copy of the registration map.
-    ///
-    /// The lock is taken and released inside this call, so no caller can hold it across an
-    /// `.await` — the crate rule — and the map holds a handful of id pairs per chat. A poisoned
-    /// lock is read through rather than propagated: the only writer is `start_chat_run`, and a
-    /// panic there costs the chat its registrations, which surfaces as the `NotFound` above
-    /// instead of as a second panic inside a session task.
-    fn registrations(&self) -> HashMap<StepId, (ProjectId, RunId)> {
-        self.runs.lock().map_or_else(
-            |poisoned| poisoned.into_inner().clone(),
-            |runs| runs.clone(),
-        )
-    }
-
-    /// The `(project, run)` of `step`, or the [`StoreError::NotFound`] an unregistered step gets.
-    fn resolve(
-        registrations: &HashMap<StepId, (ProjectId, RunId)>,
-        step: StepId,
-    ) -> Result<(ProjectId, RunId)> {
-        registrations
-            .get(&step)
-            .copied()
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "run_step",
-                id: step.to_string(),
-            })
-    }
-}
 
 /// Plain delegation to the mirror: the recorder never reads, and the `WriteStore: ReadStore` bound
 /// wants these seven anyway.
-impl ReadStore for BufferedWriter {
-    async fn items(&self, scope: &Scope, filter: &ItemFilter) -> Result<Vec<ItemSummary>> {
-        self.cache.items(scope, filter).await
-    }
-
-    async fn item(&self, id: ItemId) -> Result<Option<Item>> {
-        self.cache.item(id).await
-    }
-
-    async fn links(&self, id: ItemId, hops: u8) -> Result<LinkGraph> {
-        self.cache.links(id, hops).await
-    }
-
-    async fn documents(&self, id: ItemId) -> Result<Vec<DocumentHead>> {
-        self.cache.documents(id).await
-    }
-
-    async fn notes(&self, id: ItemId) -> Result<Vec<Note>> {
-        self.cache.notes(id).await
-    }
-
-    async fn runs(&self, id: ItemId) -> Result<Vec<RunSummary>> {
-        self.cache.runs(id).await
-    }
-
-    async fn step_events(&self, step: StepId) -> Result<Option<Vec<SessionEvent>>> {
-        self.cache.step_events(step).await
-    }
-
-    async fn document(&self, id: DocumentId) -> Result<Option<Document>> {
-        self.cache.document(id).await
-    }
-
-    async fn documents_of_kinds(&self, item: ItemId, kinds: &[String]) -> Result<Vec<Document>> {
-        self.cache.documents_of_kinds(item, kinds).await
-    }
-
-    async fn upstream_summaries(
-        &self,
-        id: ItemId,
-        hops: u8,
-        scope: &PromptScope,
-    ) -> Result<Vec<UpstreamEntry>> {
-        self.cache.upstream_summaries(id, hops, scope).await
-    }
-
-    async fn project(&self, id: ProjectId) -> Result<Option<Project>> {
-        self.cache.project(id).await
-    }
-
-    // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
-    //
-    // Refused, not delegated to the mirror (plan D5), and that is the one place this impl parts
-    // company with the reads above it. All five tables *are* mirrored, and
-    // [`Backend::Offline`](crate::Backend::Offline) answers all five from the mirror — that is the
-    // arm an offline reader actually travels. `BufferedWriter` is the **write** sink, kept
-    // compiling for one release and constructed by no backend since MOD-25, and a half-alive run
-    // seam here — reads that answer, writes that cannot — is the shape that invites a caller to
-    // orchestrate against a database it cannot reach. The sentence is
-    // `hierarchy_needs_the_server()`'s; see its doc for why it is not a new one.
-
-    async fn run(&self, _id: RunId) -> Result<Option<Run>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn run_steps(&self, _run: RunId) -> Result<Vec<RunStep>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn step_trees(&self, _step: StepId) -> Result<Vec<RunStepTree>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn step_commits(&self, _step: StepId) -> Result<Vec<RunStepCommit>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn resolve_inputs(
-        &self,
-        _item: ItemId,
-        _run: RunId,
-        _kinds: &[String],
-    ) -> Result<Vec<ResolvedInput>> {
-        Err(hierarchy_needs_the_server())
-    }
-}
-
-impl WriteStore for BufferedWriter {
-    async fn mint_item(&self, _new: NewItem) -> Result<Item> {
-        Err(item_writes_need_the_server())
-    }
-
-    async fn update_item(
-        &self,
-        _id: ItemId,
-        _expected_version: i32,
-        _patch: ItemPatch,
-    ) -> Result<UpdateOutcome> {
-        Err(item_writes_need_the_server())
-    }
-
-    async fn transition(&self, _id: ItemId, _from: Status, _to: Status) -> Result<bool> {
-        Err(item_writes_need_the_server())
-    }
-
-    /// Groups `events` by `run_step_id` and appends each group to that run's buffer file, in the
-    /// order the caller gave them, answering how many lines were written across every file.
-    ///
-    /// **Every** group is resolved against the registration map *before* the first byte is
-    /// written, so a batch naming one unregistered step writes nothing at all — the trait's
-    /// "either every new row lands or none does", kept at the granularity the file can offer.
-    ///
-    /// The events are appended verbatim: scrubbing is the recorder's job and has already happened,
-    /// and this crate does not look inside a payload.
-    async fn append_events(&self, events: &[SessionEvent]) -> Result<usize> {
-        let Some(first) = events.first() else {
-            return Ok(0);
-        };
-        let registrations = self.registrations();
-
-        // The common case by far: the recorder flushes one step's rows at a time, and this path
-        // hands the caller's own slice to the appender rather than copying every payload.
-        if events
-            .iter()
-            .all(|event| event.run_step_id == first.run_step_id)
-        {
-            let (project, run) = Self::resolve(&registrations, first.run_step_id)?;
-            return append_pending(&self.dir, project, run, events).await;
-        }
-
-        // Groups in first-seen order, so two runs interleaved in one batch keep each file's rows
-        // in the order they were recorded.
-        let mut groups: Vec<(StepId, Vec<SessionEvent>)> = Vec::new();
-        for event in events {
-            match groups
-                .iter_mut()
-                .find(|(step, _)| *step == event.run_step_id)
-            {
-                Some((_, rows)) => rows.push(event.clone()),
-                None => groups.push((event.run_step_id, vec![event.clone()])),
-            }
-        }
-        let resolved = groups
-            .into_iter()
-            .map(|(step, rows)| Self::resolve(&registrations, step).map(|pair| (pair, rows)))
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut written = 0usize;
-        for ((project, run), rows) in resolved {
-            written += append_pending(&self.dir, project, run, &rows).await?;
-        }
-        Ok(written)
-    }
-
-    /// A no-op (plan D35): the buffer's line format holds `session_event` columns only, so there
-    /// is nowhere to put a `run_step` column.
-    ///
-    /// The number is not lost — `upload_pending` recomputes it from the uploaded rows with the
-    /// same summing rule the recorder used (plan D36), which is what keeps criterion 7 true for a
-    /// chat that happened to be offline.
-    async fn set_step_usage(
-        &self,
-        step: StepId,
-        _usage: Value,
-        _prompt_digest: Option<String>,
-    ) -> Result<()> {
-        tracing::debug!(%step, "buffered: run_step.usage is recomputed at upload (D36)");
-        Ok(())
-    }
-
-    /// Refused, not a no-op — which is the whole difference from
-    /// [`set_step_usage`](BufferedWriter::set_step_usage) directly above (blueprint E-8).
-    ///
-    /// That one may be silent because `upload_pending` recomputes `run_step.usage` from the
-    /// uploaded `session_event` rows (plan D36), so the figure is deferred rather than lost.
-    /// Nothing can recompute a **trim record**: the buffer's line format holds `session_event`
-    /// columns only, and the `prompt` event's payload carries an abridged `sections[]` that is a
-    /// lossy projection of the record, not the record. A silent no-op would therefore leave a step
-    /// with a `prompt` event and no audit row, which is exactly what `R-PRM-3`'s "recorded on the
-    /// step" forbids.
-    ///
-    /// `R-STO-4` starts no graph run offline, so nothing in this milestone reaches this arm. When
-    /// MOD-4 first does, the refusal is the signal that an offline graph step needs a design — not
-    /// a stub that already silently discarded its audit.
-    ///
-    /// # Errors
-    ///
-    /// Always [`StoreError::Unreachable`] with [`PROMPT_ON_SERVER_ONLY`].
-    async fn set_step_prompt(&self, step: StepId, _digest: &str, _trim: &Value) -> Result<()> {
-        tracing::debug!(%step, "buffered: run_step.trim_record cannot be buffered (E-8)");
-        Err(StoreError::Unreachable(PROMPT_ON_SERVER_ONLY.to_owned()))
-    }
-
-    async fn upsert_agent(&self, _agent: &Agent) -> Result<()> {
-        Err(registry_writes_need_the_server())
-    }
-
-    async fn upsert_agent_box(&self, _row: &AgentBox) -> Result<()> {
-        Err(registry_writes_need_the_server())
-    }
-
-    /// Refused with the other registry writes (MOD-2 plan D68): the cache mirror holds no
-    /// `agent_box` table at all (`cache_migrations/0002_agent_mirror.sql:9-11`), so there is
-    /// nowhere to put a latch offline.
-    ///
-    /// The refusal is not a lost figure. An offline chat leaves the last server-side quota
-    /// standing and buffers its `usage` rows, from which `upload_pending` re-derives the spend -
-    /// the same trade `set_step_usage` makes above. The chat asks **before** the first `usage`
-    /// row rather than discovering this on it (`agent_worker::quota_latch_for`).
-    async fn set_agent_box_quota(
-        &self,
-        _agent_id: AgentId,
-        _box_id: BoxId,
-        _quota: Value,
-        _quota_at: DateTime<Utc>,
-    ) -> Result<()> {
-        Err(registry_writes_need_the_server())
-    }
-
-    /// Registers the chat's step under its `(project, run)` pair and writes no row.
-    ///
-    /// The pair is what the buffer's file name carries, and `append_events` is the only thing that
-    /// needs it; the `run` / `run_step` rows themselves are synthesised by `upload_pending` from
-    /// that name and the events, which is what makes an uploaded chat converge with an online one.
-    async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
-        let pair = (chat.project_id, chat.run_id);
-        match self.runs.lock() {
-            Ok(mut runs) => {
-                runs.insert(chat.step_id, pair);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().insert(chat.step_id, pair);
-            }
-        }
-        Ok(())
-    }
-
-    /// `[H-1]` Seals this chat's buffer so `upload_pending` can take it, and writes no row.
-    ///
-    /// This is the **deviation from D35**, which asked for a no-op: a buffer only becomes
-    /// uploadable when its chat ends, otherwise the refresher's next pass takes a live chat's
-    /// partial file, closes the `run` as `done` and freezes `run_step.usage` at a partial sum.
-    /// `status` and `finished_at` are not used — the uploader derives both from the events, and
-    /// the line format carries neither.
-    ///
-    /// The registration is deliberately **kept**: a flush that arrives after the seal appends to a
-    /// fresh open buffer rather than losing its rows, and that one is sealed by the next
-    /// `CacheStore::open` or by a later seal - under a sealed name of its own, never appended to
-    /// the file the first seal produced.
-    async fn finish_chat_run(
-        &self,
-        _run: RunId,
-        step: StepId,
-        _status: RunStatus,
-        _finished_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let (project, run) = Self::resolve(&self.registrations(), step)?;
-        let sealed = seal_pending(&self.dir, project, run).await?;
-        tracing::debug!(%step, sealed, "buffered: the chat buffer is closed");
-        Ok(())
-    }
-
-    // ---- MOD-15 milestone 1: the hierarchy (plan D2) ---------------------------------------
-    //
-    // Thirty-one refusals through one helper, readers included. `htui` is online-only since
-    // MOD-25, so a hierarchy write off the server is refused rather than buffered; and none of
-    // these six tables is mirrored (`cache::MIRRORED_TABLES`), so offline a *read* of them is
-    // unreachable in the literal sense too. One sentence covers both directions, which is why
-    // this needs no constant of its own — see [`hierarchy_needs_the_server`].
-    //
-    // They are one-liners on purpose. A real buffered implementation would be a second
-    // hierarchy with a second set of rules to keep in step, written to be deleted: CLEAN-2
-    // removes `BufferedWriter` whole once MOD-25's decision has settled.
-
-    async fn create_workspace(&self, _new: NewWorkspace) -> Result<Workspace> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn update_workspace(
-        &self,
-        _id: WorkspaceId,
-        _expected: DateTime<Utc>,
-        _patch: WorkspacePatch,
-    ) -> Result<CasOutcome<Workspace>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn workspace(&self, _id: WorkspaceId) -> Result<Option<Workspace>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn upsert_workspace_project(&self, _link: &WorkspaceProject) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn remove_workspace_project(
-        &self,
-        _workspace: WorkspaceId,
-        _project: ProjectId,
-    ) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn workspace_projects(&self, _workspace: WorkspaceId) -> Result<Vec<WorkspaceProject>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn upsert_workspace_box_path(&self, _path: &WorkspaceBoxPath) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn workspace_box_paths(&self, _workspace: WorkspaceId) -> Result<Vec<WorkspaceBoxPath>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn create_project(&self, _new: NewProject) -> Result<Project> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn update_project(
-        &self,
-        _id: ProjectId,
-        _expected: DateTime<Utc>,
-        _patch: ProjectPatch,
-    ) -> Result<CasOutcome<Project>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn create_repo(&self, _new: NewRepo) -> Result<Repo> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn update_repo(
-        &self,
-        _id: RepoId,
-        _expected: DateTime<Utc>,
-        _patch: RepoPatch,
-    ) -> Result<CasOutcome<Repo>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn repos(&self, _project: ProjectId) -> Result<Vec<Repo>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn upsert_repo_box_path(&self, _path: &RepoBoxPath) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn repo_box_paths(&self, _repo: RepoId) -> Result<Vec<RepoBoxPath>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn create_item_kind(&self, _new: NewItemKind) -> Result<ItemKind> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn update_item_kind(
-        &self,
-        _id: ItemKindId,
-        _expected: DateTime<Utc>,
-        _patch: ItemKindPatch,
-    ) -> Result<CasOutcome<ItemKind>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn item_kinds(&self, _project: ProjectId) -> Result<Vec<ItemKind>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn delete_item_kind(&self, _id: ItemKindId) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn create_step_graph(&self, _new: NewStepGraph) -> Result<StepGraph> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn update_step_graph(
-        &self,
-        _id: StepGraphId,
-        _expected: DateTime<Utc>,
-        _patch: StepGraphPatch,
-    ) -> Result<CasOutcome<StepGraph>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn step_graphs(&self, _project: ProjectId) -> Result<Vec<StepGraph>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn create_phase(&self, _phase: &StepGraphPhase) -> Result<StepGraphPhase> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn update_phase(
-        &self,
-        _id: PhaseId,
-        _expected: DateTime<Utc>,
-        _patch: PhasePatch,
-    ) -> Result<CasOutcome<StepGraphPhase>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn phases(&self, _graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn set_setting(
-        &self,
-        _rung: SettingRung,
-        _key: SettingKey,
-        _value: Value,
-        _expected: Option<DateTime<Utc>>,
-    ) -> Result<CasOutcome<StoredSetting>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn clear_setting(
-        &self,
-        _rung: SettingRung,
-        _key: SettingKey,
-        _expected: DateTime<Utc>,
-    ) -> Result<CasOutcome<StoredSetting>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn setting(&self, _rung: SettingRung, _key: SettingKey) -> Result<Option<StoredSetting>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn delete_reach(&self, _target: DeleteTarget) -> Result<Option<DeleteReach>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn delete_workspace(&self, _id: WorkspaceId) -> Result<DeleteReach> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn delete_project(&self, _id: ProjectId) -> Result<DeleteReach> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    // ---- ANA-2 §8's eighteen run writers (MOD-4 milestone 1, plan D1) -------------------------
-    //
-    // Refused, for the reason above and one of their own (plan D5): a buffered `claim_run` would
-    // take a lease against a database nobody can reach, and nothing at `upload_pending` could
-    // settle it afterwards. No new constant and no buffered implementation — `set_step_prompt`'s
-    // note above reserved this exact moment, and the refusal is the signal that an offline graph
-    // step needs a design.
-
-    async fn create_run(&self, _new: NewRun) -> Result<Run> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn claim_run(
-        &self,
-        _run: RunId,
-        _box_id: BoxId,
-        _owner: Uuid,
-        _at: DateTime<Utc>,
-        _lease_until: DateTime<Utc>,
-    ) -> Result<bool> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn refresh_lease(
-        &self,
-        _run: RunId,
-        _owner: Uuid,
-        _until: DateTime<Utc>,
-    ) -> Result<bool> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn adopt_runs(
-        &self,
-        _box_id: BoxId,
-        _owner: Uuid,
-        _now: DateTime<Utc>,
-        _lease_until: DateTime<Utc>,
-    ) -> Result<Vec<Run>> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn create_step(&self, _new: NewRunStep) -> Result<RunStep> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn transition_run(
-        &self,
-        _run: RunId,
-        _from: RunStatus,
-        _to: RunStatus,
-        _at: DateTime<Utc>,
-    ) -> Result<bool> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn transition_step(
-        &self,
-        _step: StepId,
-        _from: StepStatus,
-        _to: StepStatus,
-        _at: DateTime<Utc>,
-    ) -> Result<bool> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn finish_step(&self, _step: StepId, _outcome: StepOutcome) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn answer_gate(
-        &self,
-        _step: StepId,
-        _outcome: GateOutcome,
-        _note: Option<String>,
-        _at: DateTime<Utc>,
-    ) -> Result<bool> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn select_fanout(
-        &self,
-        _run: RunId,
-        _position: i32,
-        _attempt: i32,
-        _winner: StepId,
-        _reason: Option<String>,
-    ) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn supersede_step(&self, _step: StepId) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn upsert_step_tree(&self, _step: StepId, _trees: &[RunStepTree]) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn record_commits(&self, _step: StepId, _commits: &[RunStepCommit]) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn write_document(&self, _new: NewDocument) -> Result<Document> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn promote_step(&self, _step: StepId, _at: DateTime<Utc>) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn fail_run(&self, _run: RunId, _failure: &str, _at: DateTime<Utc>) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn finish_run(
-        &self,
-        _run: RunId,
-        _to: RunStatus,
-        _failure: Option<&str>,
-        _at: DateTime<Utc>,
-    ) -> Result<()> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn close_out(
-        &self,
-        _item: ItemId,
-        _summary: NewDocument,
-        _commits: &[RunStepCommit],
-    ) -> Result<Document> {
-        Err(hierarchy_needs_the_server())
-    }
-
-    async fn add_note(&self, _note: NewNote) -> Result<Note> {
-        Err(hierarchy_needs_the_server())
-    }
-}
 
 /// D35's refusal for the three item writes: offline item editing is MOD-13's question.
-fn item_writes_need_the_server() -> StoreError {
-    StoreError::Unreachable(
-        "item writes need the server; offline item editing is MOD-13's".to_owned(),
-    )
-}
 
 /// D35's refusal for the registry writes, and MOD-2 D52's for a probe that has no server to
 /// write its snapshot to: the same sentence in both places, on purpose. It is also what an
@@ -780,9 +117,6 @@ fn item_writes_need_the_server() -> StoreError {
 pub const REGISTRY_ON_SERVER_ONLY: &str = "the agent registry is written on the server only";
 
 /// D35's refusal for the two registry writes.
-fn registry_writes_need_the_server() -> StoreError {
-    StoreError::Unreachable(REGISTRY_ON_SERVER_ONLY.to_owned())
-}
 
 /// The one sentence the whole prompt path answers with off the server (MOD-2 plan D109,
 /// blueprint E-8).
@@ -832,18 +166,12 @@ pub const DATABASE_UNREACHABLE: &str = "this box browses its read-only cache and
 /// a run off the server is the event `R-STO-4` already words as "no item creation, no runs", and a
 /// user who meets the refusal from a rename and from a run must not have to decide whether they are
 /// two problems. The fn keeps its MOD-15 name because the sentence is the shared thing, not the
-/// subsystem — renaming it would only move the question.
-fn hierarchy_needs_the_server() -> StoreError {
-    StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned())
-}
-
 /// Plain delegation: a `Writer` decides *which* store, never *what* a read means.
 impl ReadStore for Writer {
     async fn items(&self, scope: &Scope, filter: &ItemFilter) -> Result<Vec<ItemSummary>> {
         match self {
             Self::Memory(store) => store.items(scope, filter).await,
             Self::Online(pg) => pg.items(scope, filter).await,
-            Self::Buffered(buffer) => buffer.items(scope, filter).await,
         }
     }
 
@@ -851,7 +179,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.item(id).await,
             Self::Online(pg) => pg.item(id).await,
-            Self::Buffered(buffer) => buffer.item(id).await,
         }
     }
 
@@ -859,7 +186,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.links(id, hops).await,
             Self::Online(pg) => pg.links(id, hops).await,
-            Self::Buffered(buffer) => buffer.links(id, hops).await,
         }
     }
 
@@ -867,7 +193,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.documents(id).await,
             Self::Online(pg) => pg.documents(id).await,
-            Self::Buffered(buffer) => buffer.documents(id).await,
         }
     }
 
@@ -875,7 +200,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.notes(id).await,
             Self::Online(pg) => pg.notes(id).await,
-            Self::Buffered(buffer) => buffer.notes(id).await,
         }
     }
 
@@ -883,7 +207,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.runs(id).await,
             Self::Online(pg) => pg.runs(id).await,
-            Self::Buffered(buffer) => buffer.runs(id).await,
         }
     }
 
@@ -891,7 +214,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.step_events(step).await,
             Self::Online(pg) => pg.step_events(step).await,
-            Self::Buffered(buffer) => buffer.step_events(step).await,
         }
     }
 
@@ -899,7 +221,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.document(id).await,
             Self::Online(pg) => pg.document(id).await,
-            Self::Buffered(buffer) => buffer.document(id).await,
         }
     }
 
@@ -907,7 +228,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.documents_of_kinds(item, kinds).await,
             Self::Online(pg) => pg.documents_of_kinds(item, kinds).await,
-            Self::Buffered(buffer) => buffer.documents_of_kinds(item, kinds).await,
         }
     }
 
@@ -920,7 +240,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.upstream_summaries(id, hops, scope).await,
             Self::Online(pg) => pg.upstream_summaries(id, hops, scope).await,
-            Self::Buffered(buffer) => buffer.upstream_summaries(id, hops, scope).await,
         }
     }
 
@@ -928,7 +247,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.project(id).await,
             Self::Online(pg) => pg.project(id).await,
-            Self::Buffered(buffer) => buffer.project(id).await,
         }
     }
 
@@ -941,7 +259,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.run(id).await,
             Self::Online(pg) => pg.run(id).await,
-            Self::Buffered(buffer) => buffer.run(id).await,
         }
     }
 
@@ -949,7 +266,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.run_steps(run).await,
             Self::Online(pg) => pg.run_steps(run).await,
-            Self::Buffered(buffer) => buffer.run_steps(run).await,
         }
     }
 
@@ -957,7 +273,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.step_trees(step).await,
             Self::Online(pg) => pg.step_trees(step).await,
-            Self::Buffered(buffer) => buffer.step_trees(step).await,
         }
     }
 
@@ -965,7 +280,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.step_commits(step).await,
             Self::Online(pg) => pg.step_commits(step).await,
-            Self::Buffered(buffer) => buffer.step_commits(step).await,
         }
     }
 
@@ -978,7 +292,6 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.resolve_inputs(item, run, kinds).await,
             Self::Online(pg) => pg.resolve_inputs(item, run, kinds).await,
-            Self::Buffered(buffer) => buffer.resolve_inputs(item, run, kinds).await,
         }
     }
 }
@@ -988,7 +301,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.mint_item(new).await,
             Self::Online(pg) => pg.mint_item(new).await,
-            Self::Buffered(buffer) => buffer.mint_item(new).await,
         }
     }
 
@@ -1001,7 +313,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.update_item(id, expected_version, patch).await,
             Self::Online(pg) => pg.update_item(id, expected_version, patch).await,
-            Self::Buffered(buffer) => buffer.update_item(id, expected_version, patch).await,
         }
     }
 
@@ -1009,7 +320,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.transition(id, from, to).await,
             Self::Online(pg) => pg.transition(id, from, to).await,
-            Self::Buffered(buffer) => buffer.transition(id, from, to).await,
         }
     }
 
@@ -1017,7 +327,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.append_events(events).await,
             Self::Online(pg) => pg.append_events(events).await,
-            Self::Buffered(buffer) => buffer.append_events(events).await,
         }
     }
 
@@ -1030,7 +339,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.set_step_usage(step, usage, prompt_digest).await,
             Self::Online(pg) => pg.set_step_usage(step, usage, prompt_digest).await,
-            Self::Buffered(buffer) => buffer.set_step_usage(step, usage, prompt_digest).await,
         }
     }
 
@@ -1038,7 +346,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.upsert_agent(agent).await,
             Self::Online(pg) => pg.upsert_agent(agent).await,
-            Self::Buffered(buffer) => buffer.upsert_agent(agent).await,
         }
     }
 
@@ -1046,7 +353,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.upsert_agent_box(row).await,
             Self::Online(pg) => pg.upsert_agent_box(row).await,
-            Self::Buffered(buffer) => buffer.upsert_agent_box(row).await,
         }
     }
 
@@ -1067,11 +373,6 @@ impl WriteStore for Writer {
                 pg.set_agent_box_quota(agent_id, box_id, quota, quota_at)
                     .await
             }
-            Self::Buffered(buffer) => {
-                buffer
-                    .set_agent_box_quota(agent_id, box_id, quota, quota_at)
-                    .await
-            }
         }
     }
 
@@ -1079,7 +380,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.start_chat_run(chat).await,
             Self::Online(pg) => pg.start_chat_run(chat).await,
-            Self::Buffered(buffer) => buffer.start_chat_run(chat).await,
         }
     }
 
@@ -1093,7 +393,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.finish_chat_run(run, step, status, finished_at).await,
             Self::Online(pg) => pg.finish_chat_run(run, step, status, finished_at).await,
-            Self::Buffered(buffer) => buffer.finish_chat_run(run, step, status, finished_at).await,
         }
     }
 
@@ -1101,7 +400,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.set_step_prompt(step, digest, trim).await,
             Self::Online(pg) => pg.set_step_prompt(step, digest, trim).await,
-            Self::Buffered(buffer) => buffer.set_step_prompt(step, digest, trim).await,
         }
     }
 
@@ -1115,7 +413,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.create_workspace(new).await,
             Self::Online(pg) => pg.create_workspace(new).await,
-            Self::Buffered(buffer) => buffer.create_workspace(new).await,
         }
     }
 
@@ -1128,7 +425,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.update_workspace(id, expected, patch).await,
             Self::Online(pg) => pg.update_workspace(id, expected, patch).await,
-            Self::Buffered(buffer) => buffer.update_workspace(id, expected, patch).await,
         }
     }
 
@@ -1136,7 +432,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.workspace(id).await,
             Self::Online(pg) => pg.workspace(id).await,
-            Self::Buffered(buffer) => buffer.workspace(id).await,
         }
     }
 
@@ -1144,7 +439,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.upsert_workspace_project(link).await,
             Self::Online(pg) => pg.upsert_workspace_project(link).await,
-            Self::Buffered(buffer) => buffer.upsert_workspace_project(link).await,
         }
     }
 
@@ -1156,7 +450,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.remove_workspace_project(workspace, project).await,
             Self::Online(pg) => pg.remove_workspace_project(workspace, project).await,
-            Self::Buffered(buffer) => buffer.remove_workspace_project(workspace, project).await,
         }
     }
 
@@ -1164,7 +457,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.workspace_projects(workspace).await,
             Self::Online(pg) => pg.workspace_projects(workspace).await,
-            Self::Buffered(buffer) => buffer.workspace_projects(workspace).await,
         }
     }
 
@@ -1172,7 +464,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.upsert_workspace_box_path(path).await,
             Self::Online(pg) => pg.upsert_workspace_box_path(path).await,
-            Self::Buffered(buffer) => buffer.upsert_workspace_box_path(path).await,
         }
     }
 
@@ -1180,7 +471,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.workspace_box_paths(workspace).await,
             Self::Online(pg) => pg.workspace_box_paths(workspace).await,
-            Self::Buffered(buffer) => buffer.workspace_box_paths(workspace).await,
         }
     }
 
@@ -1188,7 +478,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.create_project(new).await,
             Self::Online(pg) => pg.create_project(new).await,
-            Self::Buffered(buffer) => buffer.create_project(new).await,
         }
     }
 
@@ -1201,7 +490,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.update_project(id, expected, patch).await,
             Self::Online(pg) => pg.update_project(id, expected, patch).await,
-            Self::Buffered(buffer) => buffer.update_project(id, expected, patch).await,
         }
     }
 
@@ -1209,7 +497,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.create_repo(new).await,
             Self::Online(pg) => pg.create_repo(new).await,
-            Self::Buffered(buffer) => buffer.create_repo(new).await,
         }
     }
 
@@ -1222,7 +509,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.update_repo(id, expected, patch).await,
             Self::Online(pg) => pg.update_repo(id, expected, patch).await,
-            Self::Buffered(buffer) => buffer.update_repo(id, expected, patch).await,
         }
     }
 
@@ -1230,7 +516,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.repos(project).await,
             Self::Online(pg) => pg.repos(project).await,
-            Self::Buffered(buffer) => buffer.repos(project).await,
         }
     }
 
@@ -1238,7 +523,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.upsert_repo_box_path(path).await,
             Self::Online(pg) => pg.upsert_repo_box_path(path).await,
-            Self::Buffered(buffer) => buffer.upsert_repo_box_path(path).await,
         }
     }
 
@@ -1246,7 +530,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.repo_box_paths(repo).await,
             Self::Online(pg) => pg.repo_box_paths(repo).await,
-            Self::Buffered(buffer) => buffer.repo_box_paths(repo).await,
         }
     }
 
@@ -1254,7 +537,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.create_item_kind(new).await,
             Self::Online(pg) => pg.create_item_kind(new).await,
-            Self::Buffered(buffer) => buffer.create_item_kind(new).await,
         }
     }
 
@@ -1267,7 +549,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.update_item_kind(id, expected, patch).await,
             Self::Online(pg) => pg.update_item_kind(id, expected, patch).await,
-            Self::Buffered(buffer) => buffer.update_item_kind(id, expected, patch).await,
         }
     }
 
@@ -1275,7 +556,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.item_kinds(project).await,
             Self::Online(pg) => pg.item_kinds(project).await,
-            Self::Buffered(buffer) => buffer.item_kinds(project).await,
         }
     }
 
@@ -1283,7 +563,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.delete_item_kind(id).await,
             Self::Online(pg) => pg.delete_item_kind(id).await,
-            Self::Buffered(buffer) => buffer.delete_item_kind(id).await,
         }
     }
 
@@ -1291,7 +570,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.create_step_graph(new).await,
             Self::Online(pg) => pg.create_step_graph(new).await,
-            Self::Buffered(buffer) => buffer.create_step_graph(new).await,
         }
     }
 
@@ -1304,7 +582,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.update_step_graph(id, expected, patch).await,
             Self::Online(pg) => pg.update_step_graph(id, expected, patch).await,
-            Self::Buffered(buffer) => buffer.update_step_graph(id, expected, patch).await,
         }
     }
 
@@ -1312,7 +589,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.step_graphs(project).await,
             Self::Online(pg) => pg.step_graphs(project).await,
-            Self::Buffered(buffer) => buffer.step_graphs(project).await,
         }
     }
 
@@ -1320,7 +596,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.create_phase(phase).await,
             Self::Online(pg) => pg.create_phase(phase).await,
-            Self::Buffered(buffer) => buffer.create_phase(phase).await,
         }
     }
 
@@ -1333,7 +608,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.update_phase(id, expected, patch).await,
             Self::Online(pg) => pg.update_phase(id, expected, patch).await,
-            Self::Buffered(buffer) => buffer.update_phase(id, expected, patch).await,
         }
     }
 
@@ -1341,7 +615,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.phases(graph).await,
             Self::Online(pg) => pg.phases(graph).await,
-            Self::Buffered(buffer) => buffer.phases(graph).await,
         }
     }
 
@@ -1355,7 +628,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.set_setting(rung, key, value, expected).await,
             Self::Online(pg) => pg.set_setting(rung, key, value, expected).await,
-            Self::Buffered(buffer) => buffer.set_setting(rung, key, value, expected).await,
         }
     }
 
@@ -1368,7 +640,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.clear_setting(rung, key, expected).await,
             Self::Online(pg) => pg.clear_setting(rung, key, expected).await,
-            Self::Buffered(buffer) => buffer.clear_setting(rung, key, expected).await,
         }
     }
 
@@ -1376,7 +647,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.setting(rung, key).await,
             Self::Online(pg) => pg.setting(rung, key).await,
-            Self::Buffered(buffer) => buffer.setting(rung, key).await,
         }
     }
 
@@ -1384,7 +654,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.delete_reach(target).await,
             Self::Online(pg) => pg.delete_reach(target).await,
-            Self::Buffered(buffer) => buffer.delete_reach(target).await,
         }
     }
 
@@ -1392,7 +661,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.delete_workspace(id).await,
             Self::Online(pg) => pg.delete_workspace(id).await,
-            Self::Buffered(buffer) => buffer.delete_workspace(id).await,
         }
     }
 
@@ -1400,7 +668,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.delete_project(id).await,
             Self::Online(pg) => pg.delete_project(id).await,
-            Self::Buffered(buffer) => buffer.delete_project(id).await,
         }
     }
 
@@ -1412,7 +679,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.create_run(new).await,
             Self::Online(pg) => pg.create_run(new).await,
-            Self::Buffered(buffer) => buffer.create_run(new).await,
         }
     }
 
@@ -1427,7 +693,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.claim_run(run, box_id, owner, at, lease_until).await,
             Self::Online(pg) => pg.claim_run(run, box_id, owner, at, lease_until).await,
-            Self::Buffered(buffer) => buffer.claim_run(run, box_id, owner, at, lease_until).await,
         }
     }
 
@@ -1435,7 +700,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.refresh_lease(run, owner, until).await,
             Self::Online(pg) => pg.refresh_lease(run, owner, until).await,
-            Self::Buffered(buffer) => buffer.refresh_lease(run, owner, until).await,
         }
     }
 
@@ -1449,7 +713,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.adopt_runs(box_id, owner, now, lease_until).await,
             Self::Online(pg) => pg.adopt_runs(box_id, owner, now, lease_until).await,
-            Self::Buffered(buffer) => buffer.adopt_runs(box_id, owner, now, lease_until).await,
         }
     }
 
@@ -1457,7 +720,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.create_step(new).await,
             Self::Online(pg) => pg.create_step(new).await,
-            Self::Buffered(buffer) => buffer.create_step(new).await,
         }
     }
 
@@ -1471,7 +733,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.transition_run(run, from, to, at).await,
             Self::Online(pg) => pg.transition_run(run, from, to, at).await,
-            Self::Buffered(buffer) => buffer.transition_run(run, from, to, at).await,
         }
     }
 
@@ -1485,7 +746,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.transition_step(step, from, to, at).await,
             Self::Online(pg) => pg.transition_step(step, from, to, at).await,
-            Self::Buffered(buffer) => buffer.transition_step(step, from, to, at).await,
         }
     }
 
@@ -1493,7 +753,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.finish_step(step, outcome).await,
             Self::Online(pg) => pg.finish_step(step, outcome).await,
-            Self::Buffered(buffer) => buffer.finish_step(step, outcome).await,
         }
     }
 
@@ -1507,7 +766,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.answer_gate(step, outcome, note, at).await,
             Self::Online(pg) => pg.answer_gate(step, outcome, note, at).await,
-            Self::Buffered(buffer) => buffer.answer_gate(step, outcome, note, at).await,
         }
     }
 
@@ -1529,11 +787,6 @@ impl WriteStore for Writer {
                 pg.select_fanout(run, position, attempt, winner, reason)
                     .await
             }
-            Self::Buffered(buffer) => {
-                buffer
-                    .select_fanout(run, position, attempt, winner, reason)
-                    .await
-            }
         }
     }
 
@@ -1541,7 +794,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.supersede_step(step).await,
             Self::Online(pg) => pg.supersede_step(step).await,
-            Self::Buffered(buffer) => buffer.supersede_step(step).await,
         }
     }
 
@@ -1549,7 +801,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.upsert_step_tree(step, trees).await,
             Self::Online(pg) => pg.upsert_step_tree(step, trees).await,
-            Self::Buffered(buffer) => buffer.upsert_step_tree(step, trees).await,
         }
     }
 
@@ -1557,7 +808,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.record_commits(step, commits).await,
             Self::Online(pg) => pg.record_commits(step, commits).await,
-            Self::Buffered(buffer) => buffer.record_commits(step, commits).await,
         }
     }
 
@@ -1565,7 +815,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.write_document(new).await,
             Self::Online(pg) => pg.write_document(new).await,
-            Self::Buffered(buffer) => buffer.write_document(new).await,
         }
     }
 
@@ -1573,7 +822,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.promote_step(step, at).await,
             Self::Online(pg) => pg.promote_step(step, at).await,
-            Self::Buffered(buffer) => buffer.promote_step(step, at).await,
         }
     }
 
@@ -1581,7 +829,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.fail_run(run, failure, at).await,
             Self::Online(pg) => pg.fail_run(run, failure, at).await,
-            Self::Buffered(buffer) => buffer.fail_run(run, failure, at).await,
         }
     }
 
@@ -1595,7 +842,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.finish_run(run, to, failure, at).await,
             Self::Online(pg) => pg.finish_run(run, to, failure, at).await,
-            Self::Buffered(buffer) => buffer.finish_run(run, to, failure, at).await,
         }
     }
 
@@ -1608,7 +854,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.close_out(item, summary, commits).await,
             Self::Online(pg) => pg.close_out(item, summary, commits).await,
-            Self::Buffered(buffer) => buffer.close_out(item, summary, commits).await,
         }
     }
 
@@ -1616,7 +861,6 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.add_note(note).await,
             Self::Online(pg) => pg.add_note(note).await,
-            Self::Buffered(buffer) => buffer.add_note(note).await,
         }
     }
 }
@@ -1625,6 +869,8 @@ impl WriteStore for Writer {
 mod tests {
     use super::*;
     use crate::Backend;
+    use crate::CacheStore;
+    use htui_core::store::StoreError;
     use htui_core::fixtures::ids;
 
     #[tokio::test]

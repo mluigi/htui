@@ -17,7 +17,6 @@
 //! offline buffer instead of to Postgres. The header said so (D42), from the `writer_label` the
 //! acceptance carried — never from a guess about which backend the worker is holding, which is a
 //! thing this tab is not allowed to know (`R-NF-3`). Since MOD-25 no backend hands out the
-//! buffered writer at all — an offline chat is refused rather than buffered — so that D42 branch
 //! (`BUFFERED_LABEL` / `BUFFERED_NOTE`, and the comparison that uses them) is kept compiling
 //! for the reversal and is never taken; a later CLEAN item removes it.
 
@@ -61,14 +60,12 @@ const REPLAY_HINT: &str = "Esc leave replay · t thoughts · j/k scroll";
 ///
 /// Compared rather than matched on a backend: the tab is told where its rows went and does not
 /// deduce it (`R-NF-3`).
-const BUFFERED_LABEL: &str = "buffered";
 
 /// What the header adds when the conversation is only on this disk (D42).
 ///
 /// An offline chat is in no `run` table until it is uploaded, so `active_runs` does not count it
 /// and the Runs pane cannot list it: this line is the only place it is visible, and the maintainer
 /// has to be able to tell it apart from a conversation the server already holds.
-const BUFFERED_NOTE: &str = " · buffered · uploads when the store returns";
 
 /// The live chat, once one has been accepted.
 #[derive(Debug, Clone)]
@@ -80,7 +77,6 @@ pub struct ChatSessionState {
     /// What this transport can do.
     pub caps: DriverCaps,
     /// The chat records into the offline buffer, not into a store anyone else can read (D42).
-    pub buffered: bool,
     /// How the session ended, once it has.
     pub ended: Option<htui_agent::event::StopReason>,
 }
@@ -304,15 +300,10 @@ impl ChatTab {
             .as_ref()
             .and_then(|state| state.session_ref.as_ref())
             .map_or(NONE.to_owned(), |reference| reference.as_str().to_owned());
-        let buffered = if self.session.as_ref().is_some_and(|state| state.buffered) {
-            BUFFERED_NOTE
-        } else {
-            ""
-        };
         Line::from(vec![
             Span::styled(agent, ctx.theme.accent),
             Span::styled(
-                format!(" · {model} · {project} · session {session}{buffered}"),
+                format!(" · {model} · {project} · session {session}"),
                 ctx.theme.dim,
             ),
         ])
@@ -478,7 +469,6 @@ impl Tab for ChatTab {
                     step_id: *step_id,
                     session_ref: session_ref.clone(),
                     caps: *caps,
-                    buffered: *writer_label == BUFFERED_LABEL,
                     ended: None,
                 });
             }

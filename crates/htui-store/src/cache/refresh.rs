@@ -23,7 +23,6 @@ use uuid::Uuid;
 
 use super::CacheStore;
 use super::read::ts_bind;
-use crate::cache::pending::upload_pending;
 use crate::error::map_sqlx;
 
 /// `app_setting.cache_refresh_seconds`, seeded by [`crate::PgStore::seed_if_empty`].
@@ -78,8 +77,6 @@ pub struct PassReport {
     pub events: u64,
     /// `session_event` rows trimmed for steps outside the last N.
     pub trimmed: u64,
-    /// `pending/*.jsonl` files uploaded.
-    pub uploaded: usize,
 }
 
 impl PassReport {
@@ -225,8 +222,7 @@ const RUN_STEP_TREE: &str = "run_step_tree";
 ///    mirror instead of upserted and still advances the cursor (§4.4);
 /// 4. the last-N **finished** transcripts per project, copied for steps not already mirrored, then
 ///    trimmed scoped to that project so another project's cached steps survive;
-/// 5. the `pending/*.jsonl` upload, once, after the tables (§6.2's last line, §4.3);
-/// 6. `cache_meta.last_full_refresh_at`, set only when every cursor was `0` at the top of the pass.
+/// 5. `cache_meta.last_full_refresh_at`, set only when every cursor was `0` at the top of the pass.
 ///
 /// # Errors
 ///
@@ -306,9 +302,6 @@ pub async fn run_pass(
         report.events += transcripts.copied;
         report.trimmed += transcripts.trimmed;
     }
-
-    report.uploaded =
-        upload_pending(pool, cache.dir(), settings.this_box, settings.this_user).await?;
 
     if full {
         cache.note_full_refresh(Utc::now()).await?;
