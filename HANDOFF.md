@@ -14,37 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-19):** **MOD-29 was done**
+**Current status (2026-09-19):** **CLEAN-2 was done**
+(`docs/decisions/clean/clean-2.md`, `92f3c48`): The offline buffered-write path was fully deleted.
+Before it, **MOD-29 was done**
 (`docs/decisions/mod/mod-29.md`): Bugsink integration via Sentry crate was added and initialized with the provided DSN.
 Before it, **ANA-14 is rejected and concluded**
 (`docs/decisions/ana/ana-14.md`): Redis will not be introduced into `htui`. The capabilities it offers are either already solvable via Postgres (`LISTEN`/`NOTIFY`, `SKIP LOCKED`) or explicitly disallowed by architectural invariants (no external daemons).
-Before it, **MOD-15 was done, all six milestones**
-(`docs/decisions/mod/mod-15.md`, `0d48a71`..`d3ec338`): `htui` now owns the hierarchy it used to
-only read. The store seam writes workspaces, projects, repos, kinds, graphs and the three settings
-rungs under compare-and-set; a created project is born with its 35 seeded rows; and the Settings tab
-grew four sections — **Hierarchy**, **Kinds**, **Prompt** and **Connection**. The last one closes
-`R-STO-1`'s in-app half: a DSN typed into the running program reaches the OS keyring, re-opens the
-mirror under the new database's fingerprint and reaches `online` **without a restart**, behind a
-masked field that never draws what was typed and a `Dsn` newtype that cannot print itself. A box
-whose keyring is empty opens **on that field** instead of parking offline — and a box whose keyring
-cannot be read now launches at all, which before this item it did not (`connect::start` propagated
-`NoStorageAccess` and the binary exited). **1271 passed, 0 failed, 30 ignored** workspace-wide with
-Postgres live and at `--test-threads=1`. No migration: `0003_orchestration.sql` is still MOD-4's and
-still next, and `CASES` ends at 36.
-Before it, **MOD-25 was done** (`docs/decisions/mod/mod-25.md`,
-`9dcf4b2`..`ba4b82c`): `htui` is **online-only**. A box that cannot reach its Postgres shows
-`offline · <age>`, browses its read-only cache, and **refuses** a chat with one sentence instead of
-buffering it — `Backend::writer()` answers `None` on `Offline`, one arm, at the seam whose own doc
-reserved the change. The buffered machinery stays in the tree, compiling, for one release so the
-reversal costs one arm; **`CLEAN-2`** deletes it once the decision has sat, and the **upload side is
-still live** so a buffer written by an earlier build still lands. **MOD-17, MOD-18 and MOD-19 are
-withdrawn, not done** — ANA-10's verdict is superseded, and `docs/ANA-10.md` stays as the analysis
-not taken. This **unblocks MOD-4 by removal** and **strikes MOD-4's M8** (no `LocalStore`, no
-`local_migrations/`). `R-STO-6` lost its dangling `R-STO-7` citation, the only `docs/REQUIREMENTS.md`
-edit. The masked DSN field it owed to MOD-15 **shipped there**, as `TextField::masked()` inside
-`SectionId("connection")`. **1013 passed,
-0 failed, 30 ignored** workspace-wide with Postgres live (5 of those ignores are MOD-25's parked
-reversal evidence).
 **Live coordinates.** Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql`
 is no longer held (`docs/ANA-2.md` §9) and is **still the next migration** — MOD-2 milestone 9 and
 MOD-20 both deliberately added none. Adapters install under `HTUI_AGENTS_ROOT`, default
@@ -413,26 +388,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 ### Deferred backlog
 
-- [x] **CLEAN-2 - Delete the disabled offline buffered-write path** (from MOD-25). `R-STO-1`,
-  `R-STO-4`. MOD-25 disabled the offline buffer and **deliberately kept the machinery in the tree,
-  compiling, for one release** so a reversal would cost one arm in `backend.rs`
-  (`docs/decisions/mod/mod-25.md`). This item deletes it once the decision has sat. **Do not start
-  it before the maintainer says the decision has settled** — that wait is the item's whole point.
-  The list, from MOD-25's close-out: the `Writer::Buffered` arm and `BufferedWriter` in
-  `crates/htui-store/src/writer.rs` (with `Writer::label`'s `"buffered"`); `cache::pending`'s
-  **append and seal side only** — `append_pending`, `seal_pending`, `seal_orphaned`'s call in
-  `CacheStore::open`; the `matches!(Writer::Buffered(_))` guards and the `project_caps_for` /
-  `quota_latch_for` arms in `crates/htui/src/agent_worker.rs`; `BUFFERED_LABEL` / `BUFFERED_NOTE` /
-  `ChatSessionState::buffered` and the D42 header branch in `ui/tabs/chat/mod.rs`; the four ignored
-  cases in `crates/htui/tests/chat_offline.rs` plus
-  `tests/snapshots/chat_offline__chat_buffered.snap`; the ignored `a_buffered_writer_never_re_probes`;
-  `crates/htui-store/tests/writer_buffered.rs`; the pending cases in `tests/cache.rs` and
-  `tests/pg_criteria.rs`; and the doc comments MOD-25 rewrote to say "kept for the reversal".
-  **`upload_pending` is the decision, not a detail**: MOD-25 left the upload side live so a box that
-  buffered under an earlier build still lands its rows. Deleting it strands any such buffer, so this
-  item must either keep the upload path or state that enough releases have passed that no unuploaded
-  buffer can exist. `MIRRORED_TABLES` keeps `agent` either way — the Backlog and the agents section
-  read that row off the mirror too.
 - [ ] **CLEAN-3 - `cargo doc --workspace --no-deps` has never been green** (found at MOD-4 milestone
   1 close-out, 2026-09-18). The plan's own validation block runs `cargo doc --workspace --no-deps`,
   and it exits 101 — at MOD-4's HEAD **and at `0cf232d` before it**, verified in a worktree. Six
@@ -482,5 +437,5 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing)                                 |
 | MOD-N   | 22 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 2 (CLEAN-2 delete the disabled offline buffer, CLEAN-3 the workspace doc gate)             |
+| CLEAN-N | 1 (CLEAN-3 the workspace doc gate)             |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[CLEAN-2](docs/decisions/clean/clean-2.md)** - Delete the disabled offline buffered-write path (done, 2026-09-19)
 - **[MOD-29](docs/decisions/mod/mod-29.md)** - Bugsink integration via Sentry crate (done, 2026-09-19)
 
 - **[ANA-14](docs/decisions/ana/ana-14.md)** - Research whether using Redis could be beneficial (rejected, 2026-09-19)
