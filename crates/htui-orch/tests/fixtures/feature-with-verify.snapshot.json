@@ -1,0 +1,169 @@
+{
+  "v": 1,
+  "graph": {
+    "id": "01a0b8da-ffc9-72d3-b6a0-f9658ec5d903",
+    "name": "feature-with-verify",
+    "is_override": false
+  },
+  "topology": "sha256:d6508f2886c017e60e0bd342f2334697e93c4d35926bbd999420a06f33ffb038",
+  "mode": "manual",
+  "phases": [
+    {
+      "position": 0,
+      "name": "prd",
+      "fan_out": 1,
+      "gate": "always",
+      "gate_effective": "always",
+      "gate_hard": true,
+      "retry_limit": 1,
+      "input_kinds": [],
+      "output_kind": "prd",
+      "isolation": "worktree",
+      "command_queue": "fan_out_only",
+      "verify_command": null,
+      "deadline_seconds": 7200,
+      "template": {
+        "name": "prd",
+        "version": 1
+      },
+      "token_budget": 120000,
+      "candidates": [
+        {
+          "agent_id": "01a06490-eab0-7000-8000-000000000e00",
+          "agent_name": "claude",
+          "model": "sonnet"
+        }
+      ],
+      "judge": null
+    },
+    {
+      "position": 1,
+      "name": "plan",
+      "fan_out": 1,
+      "gate": "always",
+      "gate_effective": "always",
+      "gate_hard": true,
+      "retry_limit": 1,
+      "input_kinds": [
+        "prd"
+      ],
+      "output_kind": "plan",
+      "isolation": "worktree",
+      "command_queue": "fan_out_only",
+      "verify_command": null,
+      "deadline_seconds": 7200,
+      "template": {
+        "name": "plan",
+        "version": 1
+      },
+      "token_budget": 120000,
+      "candidates": [
+        {
+          "agent_id": "01a06490-eab0-7000-8000-000000000e00",
+          "agent_name": "claude",
+          "model": "sonnet"
+        }
+      ],
+      "judge": null
+    },
+    {
+      "position": 2,
+      "name": "implement",
+      "fan_out": 1,
+      "gate": "always",
+      "gate_effective": "always",
+      "gate_hard": false,
+      "retry_limit": 1,
+      "input_kinds": [
+        "plan",
+        "review"
+      ],
+      "output_kind": "implement",
+      "isolation": "worktree",
+      "command_queue": "fan_out_only",
+      "verify_command": null,
+      "deadline_seconds": 7200,
+      "template": {
+        "name": "implement",
+        "version": 1
+      },
+      "token_budget": 120000,
+      "candidates": [
+        {
+          "agent_id": "01a06490-eab0-7000-8000-000000000e00",
+          "agent_name": "claude",
+          "model": "sonnet"
+        }
+      ],
+      "judge": null
+    },
+    {
+      "position": 3,
+      "name": "verify",
+      "fan_out": 1,
+      "gate": "always",
+      "gate_effective": "always",
+      "gate_hard": false,
+      "retry_limit": 1,
+      "input_kinds": [
+        "implement"
+      ],
+      "output_kind": "implement",
+      "isolation": "worktree",
+      "command_queue": "fan_out_only",
+      "verify_command": null,
+      "deadline_seconds": 7200,
+      "template": {
+        "name": "review",
+        "version": 1
+      },
+      "token_budget": 120000,
+      "candidates": [
+        {
+          "agent_id": "01a06490-eab0-7000-8000-000000000e00",
+          "agent_name": "claude",
+          "model": "sonnet"
+        }
+      ],
+      "judge": null
+    },
+    {
+      "position": 4,
+      "name": "review",
+      "fan_out": 1,
+      "gate": "always",
+      "gate_effective": "always",
+      "gate_hard": false,
+      "retry_limit": 1,
+      "input_kinds": [
+        "plan",
+        "verify"
+      ],
+      "output_kind": "review",
+      "isolation": "worktree",
+      "command_queue": "fan_out_only",
+      "verify_command": null,
+      "deadline_seconds": 7200,
+      "template": {
+        "name": "review",
+        "version": 1
+      },
+      "token_budget": 120000,
+      "candidates": [
+        {
+          "agent_id": "01a06490-eab0-7000-8000-000000000e00",
+          "agent_name": "claude",
+          "model": "sonnet"
+        }
+      ],
+      "judge": null
+    }
+  ],
+  "settings": {
+    "default_isolation": "worktree",
+    "per_token_cap_run": null,
+    "per_token_cap_batch": null,
+    "max_fan_out": 4,
+    "max_agents_per_run": 6
+  }
+}
