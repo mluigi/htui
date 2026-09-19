@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[ANA-18](docs/decisions/ana/ana-18.md)** - Research JEV model implementability (done, 2026-09-19)
 - **[CLEAN-3](docs/decisions/clean/clean-3.md)** - `cargo doc --workspace --no-deps` has never been green (done, 2026-09-19)
 
 - **[CLEAN-2](docs/decisions/clean/clean-2.md)** - Delete the disabled offline buffered-write path (done, 2026-09-19)

@@ -14,7 +14,9 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-19):** **CLEAN-3 was done**
+**Current status (2026-09-19):** **ANA-18 was done**
+(`docs/decisions/ana/ana-18.md`): Concluded JEV model is not implementable.
+Before it, **CLEAN-3 was done**
 (`docs/decisions/clean/clean-3.md`, `06442b7`): Fixed broken intra-doc links across the workspace.
 Before it, **CLEAN-2 was done**
 (`docs/decisions/clean/clean-2.md`, `92f3c48`): The offline buffered-write path was fully deleted.
