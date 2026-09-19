@@ -14,12 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-19):** **CLEAN-2 was done**
+**Current status (2026-09-19):** **CLEAN-3 was done**
+(`docs/decisions/clean/clean-3.md`, `06442b7`): Fixed broken intra-doc links across the workspace.
+Before it, **CLEAN-2 was done**
 (`docs/decisions/clean/clean-2.md`, `92f3c48`): The offline buffered-write path was fully deleted.
 Before it, **MOD-29 was done**
 (`docs/decisions/mod/mod-29.md`): Bugsink integration via Sentry crate was added and initialized with the provided DSN.
-Before it, **ANA-14 is rejected and concluded**
-(`docs/decisions/ana/ana-14.md`): Redis will not be introduced into `htui`. The capabilities it offers are either already solvable via Postgres (`LISTEN`/`NOTIFY`, `SKIP LOCKED`) or explicitly disallowed by architectural invariants (no external daemons).
 **Live coordinates.** Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql`
 is no longer held (`docs/ANA-2.md` §9) and is **still the next migration** — MOD-2 milestone 9 and
 MOD-20 both deliberately added none. Adapters install under `HTUI_AGENTS_ROOT`, default
@@ -388,17 +388,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 ### Deferred backlog
 
-- [ ] **CLEAN-3 - `cargo doc --workspace --no-deps` has never been green** (found at MOD-4 milestone
-  1 close-out, 2026-09-18). The plan's own validation block runs `cargo doc --workspace --no-deps`,
-  and it exits 101 — at MOD-4's HEAD **and at `0cf232d` before it**, verified in a worktree. Six
-  pre-existing errors, all intra-doc links in `htui-store`: `reconnect_for` → private
-  `reconnect_over`, `dsn` and `Dsn` → private `Dsn::as_str`, `parse` → private `scan`, unresolved
-  `FAKE`, unresolved `crate::testkit::mock_keyring`. **The scope is not "six links".** The default
-  and `--all-features` runs fail on **disjoint** sets (6 vs 9), so the item must first decide *which
-  feature set the workspace doc gate documents*, then fix that set and keep it green. Files:
-  `crates/htui-store/src/{dsn.rs,secret.rs,connect.rs}`, `crates/htui-core/src/prompt/fixtures.rs`,
-  `crates/htui-agent/src/conformance.rs`. MOD-4 milestone 1 added 17 doc errors of its own and
-  **cleared all 17** (`3f095eb`), so this item inherits only what predates it. Not blocked.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -437,5 +426,5 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing)                                 |
 | MOD-N   | 22 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 1 (CLEAN-3 the workspace doc gate)             |
+| CLEAN-N | 0                                                                                        |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
