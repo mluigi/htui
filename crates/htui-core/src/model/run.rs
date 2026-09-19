@@ -740,6 +740,8 @@ mod tests {
         (StepStatus::AwaitingApproval, StepStatus::AwaitingApproval),
         (StepStatus::AwaitingApproval, StepStatus::Cancelled),
         // `failed` — terminal except for the promotion row, and cancellable with its run
+        // (derived from row 652 + row 654's exception: ANA-2 §4.3's step table sanctions
+        // `failed -> awaiting_approval` only through §4.8's promotion, blueprint C-4).
         (StepStatus::Failed, StepStatus::AwaitingApproval),
         (StepStatus::Failed, StepStatus::Cancelled),
         // `done`
