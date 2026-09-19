@@ -41,6 +41,9 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 # MOD-15 M6 D3: the masked field's buffer and the DSN on its way to the newtype are wiped.
 zeroize            = { workspace = true }
+sentry = { workspace = true }
+sentry-anyhow = { workspace = true }
+sentry-tracing = { workspace = true }
 
 [dev-dependencies]
 # The chat tab's snapshots drive the fake transport through the same registry the ACP one uses.

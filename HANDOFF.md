@@ -14,7 +14,9 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-19):** **ANA-14 is rejected and concluded**
+**Current status (2026-09-19):** **MOD-29 was done**
+(`docs/decisions/mod/mod-29.md`): Bugsink integration via Sentry crate was added and initialized with the provided DSN.
+Before it, **ANA-14 is rejected and concluded**
 (`docs/decisions/ana/ana-14.md`): Redis will not be introduced into `htui`. The capabilities it offers are either already solvable via Postgres (`LISTEN`/`NOTIFY`, `SKIP LOCKED`) or explicitly disallowed by architectural invariants (no external daemons).
 Before it, **MOD-15 was done, all six milestones**
 (`docs/decisions/mod/mod-15.md`, `0d48a71`..`d3ec338`): `htui` now owns the hierarchy it used to
@@ -149,7 +151,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   refusing the write on residue, the way the assembler refuses. **Not MOD-10's**: MOD-10 replaces the
   `Scrubber` implementation behind an unchanged trait; this is a missing call site. Found at MOD-2
   close-out, 2026-09-15.
-- [ ] **MOD-29 - Bugsink integration via Sentry crate (from ANA-15).** Add `sentry` and `sentry-anyhow` dependencies, configure DSN to Bugsink instance, and wire initialization.
 
 - [ ] **MOD-28 - rataflow execution view (from ANA-12).** Add `rataflow` dependency, implement `ExecutionGraph` widget mapping `RunStep` and `SessionEvent` lists to a node graph, add view toggle to Runs tab (`R-TUI-4`), and wire mouse/keyboard events for standard run actions.
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
@@ -480,6 +481,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing)                                 |
-| MOD-N   | 23 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-29 Bugsink integration, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 22 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-2 delete the disabled offline buffer, CLEAN-3 the workspace doc gate)             |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

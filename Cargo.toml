@@ -92,6 +92,9 @@ flate2                = "1.1"
 # MOD-20 (plan D11): free space without `unsafe` — `rustix` on unix, `windows-sys` on Windows,
 # both already in the lock.
 fs4                   = { version = "1.1", default-features = false, features = ["sync"] }
+sentry                = "0.34.0"
+sentry-anyhow         = "0.34.0"
+sentry-tracing        = "0.34.0"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"

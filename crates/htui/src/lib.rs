@@ -138,6 +138,9 @@ fn set_dsn_from_stdin() -> anyhow::Result<()> {
 /// Never to stdout: stdout is the TUI (plan Patterns/Logging). `HTUI_LOG_FILTER` overrides the
 /// default `info` level.
 fn init_tracing(path: Option<&Path>) -> anyhow::Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let Some(path) = path else { return Ok(()) };
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -145,10 +148,15 @@ fn init_tracing(path: Option<&Path>) -> anyhow::Result<()> {
         .open(path)?;
     let filter = tracing_subscriber::EnvFilter::try_from_env("HTUI_LOG_FILTER")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
+    
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(file)
-        .with_ansi(false)
-        .with_env_filter(filter)
+        .with_ansi(false);
+    
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(sentry_tracing::layer())
         .try_init()
         .map_err(|err| anyhow::anyhow!("could not install the log subscriber: {err}"))
 }
