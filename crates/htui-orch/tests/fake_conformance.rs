@@ -18,10 +18,8 @@ fn cases_len_is_eleven() {
 
 #[test]
 fn case_names_are_unique() {
-    let mut sorted: Vec<&&str> = CASES.iter().collect();
-    sorted.sort_unstable();
-    sorted.dedup();
-    assert_eq!(sorted.len(), CASES.len());
+    let unique: std::collections::HashSet<_> = CASES.iter().collect();
+    assert_eq!(unique.len(), CASES.len());
 }
 
 #[tokio::test]

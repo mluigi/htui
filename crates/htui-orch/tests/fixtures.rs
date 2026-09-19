@@ -112,8 +112,7 @@ async fn feature_with_verify_snapshot_matches() {
 
     let expected_str =
         std::fs::read_to_string("tests/fixtures/feature-with-verify.snapshot.json").unwrap();
-    let mut expected: GraphSnapshot = serde_json::from_str(&expected_str).unwrap();
-    expected.graph.id = clone_id; // Normalize IDs if they differ
+    let expected: GraphSnapshot = serde_json::from_str(&expected_str).unwrap();
 
     assert_eq!(resolved_edited.snapshot.topology, expected.topology);
 }
