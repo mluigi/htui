@@ -6,7 +6,7 @@
 //! `S: WriteStore` — it needs something it can own.
 //!
 //! [`Writer`] is that something. Every arm is a cheap handle — `PgStore` is a pool handle,
-//! `MemStore` is an `Arc`, [`BufferedWriter`] is a `CacheStore` handle and a path — so a `Writer`
+//! `MemStore` is an `Arc`, `BufferedWriter` is a `CacheStore` handle and a path — so a `Writer`
 //! is a clone of a handle, never a copy of a store.
 //!
 //! There are **three** arms, but since MOD-25 only two of them are ever constructed. Between
@@ -19,9 +19,9 @@
 //!
 //! **MOD-25 made `htui` online-only**: `Backend::writer()` answers `None` off the server and a
 //! chat there is refused with [`DATABASE_UNREACHABLE`], so no backend hands out
-//! [`Writer::Buffered`] any more. The arm and [`BufferedWriter`] are kept, compiling and `pub`,
+//! `Writer::Buffered` any more. The arm and `BufferedWriter` are kept, compiling and `pub`,
 //! for one release, so reversing MOD-25 is restoring one arm in `backend.rs`; the suites that
-//! prove them construct [`BufferedWriter`] directly, and `upload_pending` still runs on every
+//! prove them construct `BufferedWriter` directly, and `upload_pending` still runs on every
 //! refresh pass so buffers from earlier builds land. A later CLEAN item deletes all of it. What
 //! has **not** changed at any point is the invariant that matters: nothing writes to Postgres
 //! unless the backend is `Online`, and [`Backend::writable`](crate::Backend::writable) still
@@ -77,12 +77,12 @@ impl Writer {
 /// appended to `<cache_dir>/pending/<project>.<run>.jsonl.open` as JSON lines instead.
 ///
 /// It writes what the buffer's line format can hold and refuses the rest. That format is
-/// `session_event` columns only ([`crate::cache::pending`]), so:
+/// `session_event` columns only (`crate::cache::pending`), so:
 ///
 /// - `append_events` is the whole point, and it needs the `(project, run)` pair the file name
 ///   carries. `start_chat_run` is where that pair arrives, so it **registers** the chat's step
 ///   rather than writing a row; a later event for a step nobody registered is a
-///   [`StoreError::NotFound`], never a silent drop.
+///   `StoreError::NotFound`, never a silent drop.
 /// - `set_step_usage` is a no-op: `run_step.usage` has nowhere to go in the buffer, and
 ///   `upload_pending` recomputes it from the uploaded rows (plan D36) rather than losing it.
 /// - `set_step_prompt` is a **refusal**, and the contrast with the line above is the point: no
@@ -91,7 +91,7 @@ impl Writer {
 /// - `finish_chat_run` **seals** the buffer (risk `[H-1]`), which is a deliberate deviation from
 ///   D35's "a no-op that logs at debug": without it, a chat that outlives a reconnect is uploaded
 ///   mid-flight and its `run_step.usage` frozen at a partial sum.
-/// - item and registry writes answer [`StoreError::Unreachable`]: they genuinely need the server.
+/// - item and registry writes answer `StoreError::Unreachable`: they genuinely need the server.
 ///
 /// Two consequences worth stating, both of a buffered chat that a build before MOD-25 started.
 /// Such a chat is **not** in the mirror's `run` table until it is uploaded, so `active_runs` and
@@ -142,7 +142,7 @@ pub const PROMPT_ON_SERVER_ONLY: &str = "the prompt path needs the server: templ
 /// bar reading `offline · <age>`, and starts no run.
 ///
 /// It does **not** name the database itself, because it is carried by
-/// [`StoreError::Unreachable`], whose `Display` already
+/// `StoreError::Unreachable`, whose `Display` already
 /// prefixes `store unreachable: `. Reading the two together is the whole sentence; repeating the
 /// word here made the rendered line say "unreachable" twice.
 pub const DATABASE_UNREACHABLE: &str = "this box browses its read-only cache and starts no run";

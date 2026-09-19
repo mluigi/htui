@@ -276,7 +276,7 @@ static KEYRING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Holds the fake keyring installed and empty until dropped (MOD-15 M6 D18).
 #[derive(Debug)]
 pub struct KeyringGuard {
-    /// [`KEYRING`], held for the length of the test. Underscored because nothing reads it — the
+    /// `KEYRING`, held for the length of the test. Underscored because nothing reads it — the
     /// whole of its job is to be released when this guard drops.
     _lock: tokio::sync::MutexGuard<'static, ()>,
 }
@@ -320,7 +320,7 @@ pub const BROKEN_KEYRING: &str =
 /// [`crate::connect::start`] launches offline anyway, the connection section shows the reason —
 /// is what these tests pin.
 ///
-/// Shares [`KEYRING`] and [`KeyringGuard`] with [`mock_keyring`]: there is one process-wide slot,
+/// Shares `KEYRING` and [`KeyringGuard`] with [`mock_keyring`]: there is one process-wide slot,
 /// so the two must not be installable at the same time.
 pub async fn mock_keyring_broken() -> KeyringGuard {
     let lock = KEYRING.lock().await;

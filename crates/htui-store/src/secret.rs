@@ -9,8 +9,8 @@
 //! TLS is whatever the DSN's `sslmode=` says; `PgConnectOptions::from_str` handles it (`R-STO-2`).
 //!
 //! Under `--cfg feature = "test-support"` — which the binary never enables — the three functions
-//! consult [`FAKE`] first, so a test can round-trip a DSN without touching the developer's OS
-//! store. Nothing installs it but [`crate::testkit::mock_keyring`]; with it uninstalled the
+//! consult `FAKE` first, so a test can round-trip a DSN without touching the developer's OS
+//! store. Nothing installs it but `crate::testkit::mock_keyring`; with it uninstalled the
 //! production path below is what runs, unchanged (blueprint flag L, ruling §0.3).
 
 use htui_core::store::{Result, StoreError};
@@ -44,7 +44,7 @@ pub(crate) enum Fake {
 /// call (see [`Slot`]'s own note), so the crate's mock cannot see a [`set_dsn`] from a later
 /// [`get_dsn`]. Outer `None`: not installed, the real keyring answers — which is the only state a
 /// binary can ever be in, because the binary does not enable `test-support` and nothing but
-/// [`crate::testkit::mock_keyring`] and [`crate::testkit::mock_keyring_broken`] write this.
+/// `crate::testkit::mock_keyring` and `crate::testkit::mock_keyring_broken` write this.
 /// `Some(fake)`: every call is answered by [`Fake`] and no OS store is opened.
 #[cfg(feature = "test-support")]
 pub(crate) static FAKE: std::sync::Mutex<Option<Fake>> = std::sync::Mutex::new(None);

@@ -487,7 +487,7 @@ fn handoff_events() -> Vec<SessionEvent> {
 
 /// Criterion 18's assembler half: a handoff after a step that edited two files and hit one error.
 ///
-/// The summary is [`StepSummary::from_events`]'s own output over [`handoff_events`] rather than a
+/// The summary is [`StepSummary::from_events`]'s own output over `handoff_events` rather than a
 /// literal, so the golden prompt proves the one rewrite §4.2 rule 5 needs from this role: the
 /// step's absolute `edit_proposal` paths reach the prompt as `htui:crates/…` and its tree root, run
 /// id and step id reach it not at all.

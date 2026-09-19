@@ -141,7 +141,7 @@ impl Backend {
     /// into `<cache_dir>/pending/` and the refresher uploaded it on the next connection. MOD-25
     /// made `htui` online-only, so that chat is now refused with
     /// [`DATABASE_UNREACHABLE`] instead. This one arm is the whole
-    /// disable: [`Writer::Buffered`] and [`crate::BufferedWriter`] stay in the tree and keep
+    /// disable: `Writer::Buffered` and `BufferedWriter` stay in the tree and keep
     /// compiling for one release so the reversal is restoring this arm and nothing else, and the
     /// upload side stays live — `upload_pending` still runs on every refresh pass, so a buffer an
     /// earlier build left on disk still lands. A later CLEAN item deletes the machinery.

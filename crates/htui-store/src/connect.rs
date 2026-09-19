@@ -365,7 +365,7 @@ fn reconnect_over(
     })
 }
 
-/// [`reconnect_over`] for a validated DSN (D20): what the worker arms after a `SetDsn`.
+/// `reconnect_over` for a validated DSN (D20): what the worker arms after a `SetDsn`.
 #[must_use]
 pub fn reconnect_for(dsn: &Dsn, root: PathBuf, connect_timeout: Duration) -> Reconnect {
     reconnect_over(

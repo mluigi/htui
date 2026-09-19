@@ -149,7 +149,7 @@ pub trait CaseHarness {
 
     /// What this transport can do, **before** there is a script to put on its wire.
     ///
-    /// [`AgentDriver::caps`] answers the same question and [`open_case`] returns it, which is what
+    /// [`AgentDriver::caps`] answers the same question and `open_case` returns it, which is what
     /// a case gates its *assertions* on. This method exists because three of the six
     /// capability-gated cases (plan D80, D91) gate the **script** as well, and a script is what
     /// [`driver`](Self::driver) takes: `cancel_answers_parked_permissions` cannot script a park a
@@ -160,7 +160,7 @@ pub trait CaseHarness {
     /// answers.
     ///
     /// No default body on purpose: a binding states this from the same place its driver gets it
-    /// (the `agent` row, or the fake's own profile), and [`open_case`] asserts the two agree, so a
+    /// (the `agent` row, or the fake's own profile), and `open_case` asserts the two agree, so a
     /// declaration that drifts from the driver fails the first case rather than silently choosing
     /// the wrong arm for the rest of the suite.
     fn caps(&self) -> DriverCaps;

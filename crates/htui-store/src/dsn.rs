@@ -7,7 +7,7 @@
 //! `_ => tracing::warn!(%key, %value, "ignoring unrecognized connect parameter")`). A DSN typed
 //! into the Settings field would otherwise put its parameter values into the `--log` file.
 //!
-//! The text never leaves this crate: [`Dsn::as_str`] is `pub(crate)` and there is no `Display`.
+//! The text never leaves this crate: `Dsn::as_str` is `pub(crate)` and there is no `Display`.
 //! Everything an outside caller can ask for — the redacted [`Dsn::summary`], the mirror's
 //! [`Dsn::fingerprint`] — is derived here.
 
@@ -27,7 +27,7 @@ const STORED: &str = "stored";
 
 /// A connection string that passed [`Dsn::parse`].
 ///
-/// Prints as `Dsn(<redacted>)`; the text is reachable only through [`Dsn::as_str`], which is
+/// Prints as `Dsn(<redacted>)`; the text is reachable only through `Dsn::as_str`, which is
 /// `pub(crate)`. Cloned into the store worker's request and moved into the keyring write.
 #[derive(Clone)]
 pub struct Dsn(Zeroizing<String>);
@@ -110,7 +110,7 @@ const SCHEMES: [&str; 2] = ["postgres://", "postgresql://"];
 impl Dsn {
     /// Validates `text` and takes a zeroizing copy of it.
     ///
-    /// The [`scan`] runs first and sqlx second: an unrecognised query parameter must be refused
+    /// The `scan` runs first and sqlx second: an unrecognised query parameter must be refused
     /// **before** `PgConnectOptions::from_str` is called, because that call is what logs it.
     ///
     /// # Errors
