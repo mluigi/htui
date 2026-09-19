@@ -14,7 +14,9 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-17):** **MOD-15 is done, all six milestones**
+**Current status (2026-09-19):** **ANA-14 is rejected and concluded**
+(`docs/decisions/ana/ana-14.md`): Redis will not be introduced into `htui`. The capabilities it offers are either already solvable via Postgres (`LISTEN`/`NOTIFY`, `SKIP LOCKED`) or explicitly disallowed by architectural invariants (no external daemons).
+Before it, **MOD-15 was done, all six milestones**
 (`docs/decisions/mod/mod-15.md`, `0d48a71`..`d3ec338`): `htui` now owns the hierarchy it used to
 only read. The store seam writes workspaces, projects, repos, kinds, graphs and the three settings
 rungs under compare-and-set; a created project is born with its 35 seeded rows; and the Settings tab
@@ -41,20 +43,6 @@ edit. The masked DSN field it owed to MOD-15 **shipped there**, as `TextField::m
 `SectionId("connection")`. **1013 passed,
 0 failed, 30 ignored** workspace-wide with Postgres live (5 of those ignores are MOD-25's parked
 reversal evidence).
-Earlier, **MOD-2 was done, all nine milestones**
-(`docs/decisions/mod/mod-2.md`, `5c717d0`..`32e516d`): `htui` starts agent sessions, streams them
-into a chat tab, answers permissions inline, persists and replays every event, tracks quota and
-cancels on a cap — over **three transports** that pass **one** conformance list — and assembles the
-prompt a step will be given, previewed read-only from the running binary. `R-AGT-5` is a passing
-test, not a claim. Milestone 9 added the whole of `htui_core::prompt`, `htui-agent::excerpt`, five
-store-seam methods (`CASES` 22 → **23**, `READ_CASES` 6), the sixth Backlog detail sub-tab
-**Prompt**, and the Runs pane's `~36k`/`!` indicators. ANA-5 §12 criteria 1–20 each carry a named
-test and criterion 21's five items are closed by D95–D99; criterion 18's `follow_up` persistence
-half is **re-deferred to MOD-4 by name** (D107). `docs/ANA-5.md` §4.4/§5.1 are **amended in the
-write-up, not in the file** (D108, maintainer-only per the milestone-5 precedent): the estimator is
-`chars-v2`, Claude prose **2.5** / code **2.4** chars per token, *measured* — ANA-5's 3.5/3.0 was
-28.4% off in the overflow direction and would have shipped silently. **1017 passed, 0 failed, 25
-ignored** workspace-wide with Postgres live.
 **Live coordinates.** Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql`
 is no longer held (`docs/ANA-2.md` §9) and is **still the next migration** — MOD-2 milestone 9 and
 MOD-20 both deliberately added none. Adapters install under `HTUI_AGENTS_ROOT`, default
@@ -93,7 +81,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 
 - [ ] **ANA-11 - Models for requirements and decisions.** Evaluate database schema models to track product requirements (R-IDs) and architectural decisions (MOD/ANA items) inside `htui` itself instead of standalone markdown files.
-- [ ] **ANA-14 - Research whether using Redis could be beneficial.**
 - [ ] **ANA-16 - Research agent execution environments (Docker, remote shell).** Research how to implement ways to run an agent in a Docker container (local and remote) and in a remote shell. Note this would require a central server with htui as just the interface.
 - [ ] **ANA-17 - Per-model calibration of the prompt's section framing** (from MOD-2, finding F-37).
   `R-PRM-1`, `R-PRM-2`. ANA-5 fixes the `<section name="...">` wrapper but never fixes what separates
@@ -492,7 +479,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 4 (ANA-11 requirements/decisions models, ANA-14 Redis research, ANA-16 execution environments, ANA-17 per-model prompt framing)                                 |
+| ANA-N   | 3 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing)                                 |
 | MOD-N   | 23 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-29 Bugsink integration, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-2 delete the disabled offline buffer, CLEAN-3 the workspace doc gate)             |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

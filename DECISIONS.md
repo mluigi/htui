@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 
+- **[ANA-14](docs/decisions/ana/ana-14.md)** - Research whether using Redis could be beneficial (rejected, 2026-09-19)
 - **[MOD-15](docs/decisions/mod/mod-15.md)** - Workspace, project, repo and kind management: the write seam and the per-project seed, then the hierarchy, kinds, prompt-settings and connection sections — a DSN typed into the running app reaches the keyring, re-opens the mirror and connects without a restart (done, 2026-09-17)
 - **[MOD-25](docs/decisions/mod/mod-25.md)** - `htui` is online-only: the offline buffered-write path is disabled behind an unchanged seam, and MOD-17, MOD-18 and MOD-19 are withdrawn with ANA-10's verdict (done, 2026-09-16)
 - **[MOD-2](docs/decisions/mod/mod-2.md)** - Agent driver + chat tab: three transports on one conformance list, durable history and replay, registry and autodiscovery, quota and caps, and the prompt assembler with its read-only preview (done, 2026-09-15)
