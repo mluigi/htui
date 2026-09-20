@@ -24,7 +24,6 @@ split-debuginfo = "unpacked"
 htui-core          = { path = "crates/htui-core" }
 htui-store         = { path = "crates/htui-store" }
 htui-agent         = { path = "crates/htui-agent" }
-htui-orch          = { path = "crates/htui-orch" }
 uuid               = { version = "1.26", features = ["v7", "serde"] }
 chrono             = { version = "0.4", features = ["serde"] }
 serde              = { version = "1", features = ["derive"] }
@@ -92,9 +91,9 @@ flate2                = "1.1"
 # MOD-20 (plan D11): free space without `unsafe` — `rustix` on unix, `windows-sys` on Windows,
 # both already in the lock.
 fs4                   = { version = "1.1", default-features = false, features = ["sync"] }
-sentry                = "0.34.0"
-sentry-anyhow         = "0.34.0"
-sentry-tracing        = "0.34.0"
+sentry                = "0.49.2"
+sentry-anyhow         = "0.49.2"
+sentry-tracing        = "0.49.2"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"
