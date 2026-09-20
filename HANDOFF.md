@@ -59,6 +59,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 ### Analyses
 
 
+- [ ] **ANA-20 - Research Qdrant features.** Research how to implement, if useful, all the features of Qdrant. The findings will be used to update MOD-34, which is blocked on this analysis.
 - [ ] **ANA-11 - Models for requirements and decisions.** Evaluate database schema models to track product requirements (R-IDs) and architectural decisions (MOD/ANA items) inside `htui` itself instead of standalone markdown files.
 - [ ] **ANA-16 - Research agent execution environments (Docker, remote shell).** Research how to implement ways to run an agent in a Docker container (local and remote) and in a remote shell. Note this would require a central server with htui as just the interface.
 - [ ] **ANA-17 - Per-model calibration of the prompt's section framing** (from MOD-2, finding F-37).
@@ -75,7 +76,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   the current blank line in place until this concludes.
 
 ### Next features
-- [ ] **MOD-34 - Qdrant related concepts search** (from ANA-19). Update `compose.yaml` to include the `qdrant/qdrant` image, introduce `VectorStore` trait and `QdrantStore`, implement embedding generation and background sync for `docs/` and items, and wire semantic search to the `search_concepts` MCP tool.
+- [ ] **MOD-34 - Qdrant related concepts search** (from ANA-19, blocked on ANA-20). Update `compose.yaml` to include the `qdrant/qdrant` image, introduce `VectorStore` trait and `QdrantStore`, implement embedding generation and background sync for `docs/` and items, and wire semantic search to the `search_concepts` MCP tool.
 - [ ] **MOD-33 - The box hostname leaves the digest and gains a settings switch** (from MOD-2,
   finding L-5; maintainer-decided 2026-09-16). `R-PRM-1`, `R-PRM-3`, `R-TUI-8`. Two changes to the
   box section (`prompt/render.rs`, the §4.2 projection over `BoxProfile`):
@@ -427,7 +428,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing)                                 |
+| ANA-N   | 4 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing, ANA-20 Qdrant features)                                 |
 | MOD-N   | 23 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                        |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
