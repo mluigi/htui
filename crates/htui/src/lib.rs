@@ -19,6 +19,8 @@ pub mod hierarchy;
 pub mod keymap;
 pub mod preview;
 pub mod prompt_settings;
+/// State and summary of the Qdrant connection string.
+pub mod qdrant_settings_info;
 pub mod store_worker;
 pub mod terminal;
 pub mod ui;

@@ -56,8 +56,17 @@ impl std::fmt::Debug for QdrantStore {
 
 impl QdrantStore {
     /// Creates a new QdrantStore, initializing the collection if necessary.
-    pub async fn new(url: &str, collection_name: &str) -> Result<Self, StoreError> {
-        let client = Qdrant::from_url(url).build().map_err(|e| {
+    pub async fn new(collection_name: &str) -> Result<Self, StoreError> {
+        let url = crate::secret::get_qdrant_url()?
+            .ok_or_else(|| StoreError::Backend("no Qdrant URL stored".into()))?;
+        let api_key = crate::secret::get_qdrant_api_key()?;
+
+        let mut builder = Qdrant::from_url(&url);
+        if let Some(key) = api_key {
+            builder = builder.api_key(key);
+        }
+        
+        let client = builder.build().map_err(|e| {
             StoreError::Backend(format!("Qdrant client error: {}", e))
         })?;
         let embedder = Embedder::new().map_err(|e| {

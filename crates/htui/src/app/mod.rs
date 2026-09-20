@@ -12,7 +12,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crate::keymap::{Binding, KeyChord, KeyScope};
 use crate::ui::overlay::{MigrationPrompt, WorkspaceSwitcher};
 use crate::ui::tabs::settings::{
-    AgentsSection, ConnectionSection, HierarchySection, KindsSection, PromptSection,
+    AgentsSection, ConnectionSection, HierarchySection, KindsSection, PromptSection, QdrantSection,
 };
 use crate::ui::tabs::{BacklogTab, ChatTab, SettingsTab, SkillsTab};
 
@@ -54,6 +54,7 @@ pub fn register_all(app: &mut App) {
         // Last (MOD-15 M6 D19): registration order is strip order, and appending moves no
         // existing section's line.
         Box::new(ConnectionSection::new()),
+        Box::new(QdrantSection::new()),
     ])));
     app.register_tab(Box::new(ChatTab::new()));
 

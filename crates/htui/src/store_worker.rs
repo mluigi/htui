@@ -488,6 +488,12 @@ pub enum StoreRequest {
     /// `CacheStore::rebuild()` on the current mirror: the seventeen mirrored tables and the cursor
     /// go, the file and its `cache_meta` stay (D14).
     RebuildCache,
+    /// Request to fetch Qdrant connection info.
+    QdrantInfo,
+    /// Request to set the Qdrant connection string.
+    SetQdrantSettings(htui_store::qdrant_settings::QdrantSettings),
+    /// Request to clear the Qdrant connection string.
+    ClearQdrantSettings,
 }
 
 impl StoreRequest {
@@ -554,6 +560,9 @@ impl StoreRequest {
             Self::SetDsn(_) => "set_dsn",
             Self::ClearDsn => "clear_dsn",
             Self::RebuildCache => "rebuild_cache",
+            Self::QdrantInfo => "qdrant_info",
+            Self::SetQdrantSettings(_) => "set_qdrant_settings",
+            Self::ClearQdrantSettings => "clear_qdrant_settings",
         }
     }
 }
@@ -704,6 +713,8 @@ pub enum StoreReply {
     /// `ConnectionInfo`, and every connection writer's success (D4): the section re-renders from
     /// it and never patches a field of its own into what it already had.
     Connection(ConnectionSnapshot),
+    /// Reply to QdrantInfo, SetQdrantDsn, ClearQdrantSettings requests.
+    Qdrant(crate::qdrant_settings_info::QdrantSnapshot),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -987,6 +998,12 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             migrations_pending: None,
         },
         StoreRequest::ApplyMigrations => StoreReply::MigrationsApplied { applied: 0 },
+        StoreRequest::QdrantInfo
+        | StoreRequest::SetQdrantSettings(_)
+        | StoreRequest::ClearQdrantSettings => StoreReply::Failed {
+            request: request.name(),
+            message: "handled in worker loop".to_owned(),
+        },
     })
 }
 
@@ -1256,6 +1273,43 @@ pub fn spawn_with(
                                     |err| failed("rebuild_cache", &err),
                                     StoreReply::Connection,
                                 )
+                        }
+                        StoreRequest::QdrantInfo => {
+                            StoreReply::Qdrant(crate::qdrant_settings_info::QdrantSnapshot::fetch().await)
+                        }
+                        StoreRequest::SetQdrantSettings(settings) => {
+                            let url_str = settings.url.clone();
+                            let key_opt = settings.api_key.as_ref().map(|k| k.as_str().to_string());
+                            let res = tokio::task::spawn_blocking(move || {
+                                htui_store::secret::set_qdrant_url(&url_str)?;
+                                if let Some(key) = key_opt {
+                                    htui_store::secret::set_qdrant_api_key(&key)?;
+                                } else {
+                                    htui_store::secret::clear_qdrant_api_key()?;
+                                }
+                                Ok::<(), htui_core::store::StoreError>(())
+                            })
+                            .await
+                            .unwrap();
+                            if let Err(err) = res {
+                                failed("set_qdrant_settings", &err)
+                            } else {
+                                StoreReply::Qdrant(crate::qdrant_settings_info::QdrantSnapshot::fetch().await)
+                            }
+                        }
+                        StoreRequest::ClearQdrantSettings => {
+                            let res = tokio::task::spawn_blocking(|| {
+                                htui_store::secret::clear_qdrant_url()?;
+                                htui_store::secret::clear_qdrant_api_key()?;
+                                Ok::<(), htui_core::store::StoreError>(())
+                            })
+                            .await
+                            .unwrap();
+                            if let Err(err) = res {
+                                failed("clear_qdrant_settings", &err)
+                            } else {
+                                StoreReply::Qdrant(crate::qdrant_settings_info::QdrantSnapshot::fetch().await)
+                            }
                         }
                         // The chat requests need this loop's own state - the live sessions - and
                         // the probe, the installs and the logins need the runtime that owns their

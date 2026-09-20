@@ -22,6 +22,10 @@ pub const SERVICE: &str = "htui";
 /// Keyring user name of the DSN entry.
 pub const USER: &str = "postgres-dsn";
 
+/// Keyring user name of the Qdrant DSN entry.
+pub const QDRANT_URL_USER: &str = "qdrant-url";
+pub const QDRANT_KEY_USER: &str = "qdrant-key";
+
 /// What an installed stand-in answers with (D18, flag L).
 ///
 /// Two shapes because a keyring has two failure modes and they are **not** the same state: an
@@ -29,10 +33,18 @@ pub const USER: &str = "postgres-dsn";
 /// and no unlocked collection — a minimal window manager, a container, most CI images — is the
 /// second, and the whole of this fix is that the two never collapse into each other.
 #[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FakeSlots {
+    pub pg: Option<String>,
+    pub qdrant_url: Option<String>,
+    pub qdrant_key: Option<String>,
+}
+
+#[cfg(feature = "test-support")]
 #[derive(Debug, Clone)]
 pub(crate) enum Fake {
-    /// A readable keyring holding a DSN, or holding nothing.
-    Slot(Option<String>),
+    /// A readable keyring holding DSNs, or holding nothing.
+    Slot(FakeSlots),
     /// A keyring that answers nothing at all: every call fails with this sentence, wrapped in
     /// [`backend`]'s shape so a test sees exactly what the platform path would produce.
     Broken(String),
@@ -59,8 +71,8 @@ pub(crate) fn fake() -> std::sync::MutexGuard<'static, Option<Fake>> {
 
 /// The error an installed [`Fake::Broken`] answers `verb` with.
 #[cfg(feature = "test-support")]
-fn fake_failure(verb: &str, why: &str) -> StoreError {
-    backend(verb, &format!("{SERVICE}/{USER}"), &why)
+fn fake_failure(verb: &str, user: &str, why: &str) -> StoreError {
+    backend(verb, &format!("{}/{}", SERVICE, user), &why)
 }
 
 /// The stored DSN, or `None` when nothing is stored.
@@ -82,8 +94,8 @@ pub fn get_dsn() -> Result<Option<String>> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &*fake() {
         return match fake {
-            Fake::Slot(slot) => Ok(slot.clone().filter(|dsn| !dsn.trim().is_empty())),
-            Fake::Broken(why) => Err(fake_failure("read", why)),
+            Fake::Slot(slots) => Ok(slots.pg.clone().filter(|dsn| !dsn.trim().is_empty())),
+            Fake::Broken(why) => Err(fake_failure("read", USER, &why)),
         };
     }
     Slot::open(SERVICE, USER)?.get()
@@ -98,11 +110,11 @@ pub fn set_dsn(dsn: &str) -> Result<()> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &mut *fake() {
         return match fake {
-            Fake::Slot(slot) => {
-                *slot = Some(dsn.to_owned());
+            Fake::Slot(slots) => {
+                slots.pg = Some(dsn.to_owned());
                 Ok(())
             }
-            Fake::Broken(why) => Err(fake_failure("store", why)),
+            Fake::Broken(why) => Err(fake_failure("store", USER, why)),
         };
     }
     Slot::open(SERVICE, USER)?.set(dsn)
@@ -117,14 +129,92 @@ pub fn clear_dsn() -> Result<()> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &mut *fake() {
         return match fake {
-            Fake::Slot(slot) => {
-                *slot = None;
+            Fake::Slot(slots) => {
+                slots.pg = None;
                 Ok(())
             }
-            Fake::Broken(why) => Err(fake_failure("remove", why)),
+            Fake::Broken(why) => Err(fake_failure("remove", USER, why)),
         };
     }
     Slot::open(SERVICE, USER)?.clear()
+}
+
+pub fn get_qdrant_url() -> Result<Option<String>> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &*fake() {
+        return match fake {
+            Fake::Slot(slots) => Ok(slots.qdrant_url.clone().filter(|u| !u.trim().is_empty())),
+            Fake::Broken(why) => Err(fake_failure("read", QDRANT_URL_USER, &why)),
+        };
+    }
+    Slot::open(SERVICE, QDRANT_URL_USER)?.get()
+}
+
+pub fn set_qdrant_url(url: &str) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &mut *fake() {
+        return match fake {
+            Fake::Slot(slots) => {
+                slots.qdrant_url = Some(url.to_owned());
+                Ok(())
+            }
+            Fake::Broken(why) => Err(fake_failure("store", QDRANT_URL_USER, &why)),
+        };
+    }
+    Slot::open(SERVICE, QDRANT_URL_USER)?.set(url)
+}
+
+pub fn clear_qdrant_url() -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &mut *fake() {
+        return match fake {
+            Fake::Slot(slots) => {
+                slots.qdrant_url = None;
+                Ok(())
+            }
+            Fake::Broken(why) => Err(fake_failure("remove", QDRANT_URL_USER, &why)),
+        };
+    }
+    Slot::open(SERVICE, QDRANT_URL_USER)?.clear()
+}
+
+pub fn get_qdrant_api_key() -> Result<Option<String>> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &*fake() {
+        return match fake {
+            Fake::Slot(slots) => Ok(slots.qdrant_key.clone().filter(|k| !k.trim().is_empty())),
+            Fake::Broken(why) => Err(fake_failure("read", QDRANT_KEY_USER, &why)),
+        };
+    }
+    Slot::open(SERVICE, QDRANT_KEY_USER)?.get()
+}
+
+pub fn set_qdrant_api_key(api_key: &str) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &mut *fake() {
+        return match fake {
+            Fake::Slot(slots) => {
+                slots.qdrant_key = Some(api_key.to_owned());
+                Ok(())
+            }
+            Fake::Broken(why) => Err(fake_failure("store", QDRANT_KEY_USER, &why)),
+        };
+    }
+    Slot::open(SERVICE, QDRANT_KEY_USER)?.set(api_key)
+}
+
+pub fn clear_qdrant_api_key() -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &mut *fake() {
+        return match fake {
+            Fake::Slot(slots) => {
+                slots.qdrant_key = None;
+                Ok(())
+            }
+            Fake::Broken(why) => Err(fake_failure("remove", QDRANT_KEY_USER, &why)),
+        };
+    }
+    Slot::open(SERVICE, QDRANT_KEY_USER)?.clear()
 }
 
 /// One keyring entry, plus the `service/user` pair its error messages quote.

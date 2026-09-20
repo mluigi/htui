@@ -9,7 +9,7 @@ use htui::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{
-    AgentsSection, ConnectionSection, HierarchySection, KindsSection, PromptSection, SectionId,
+    AgentsSection, ConnectionSection, HierarchySection, KindsSection, PromptSection, QdrantSection, SectionId,
     SettingsSection, SettingsTab, message,
 };
 use htui_agent::acp::Handshake;
@@ -952,6 +952,7 @@ fn the_section_strip_fits_the_frame() {
         Box::new(KindsSection::new()),
         Box::new(PromptSection::new()),
         Box::new(ConnectionSection::new()),
+        Box::new(QdrantSection::new()),
     ];
     let width: usize = sections
         .iter()

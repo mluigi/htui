@@ -13,6 +13,8 @@ pub mod connection;
 pub mod hierarchy;
 pub mod kinds;
 pub mod prompt;
+/// The Qdrant DSN settings section.
+pub mod qdrant;
 
 use htui_core::model::Scope;
 use ratatui::Frame;
@@ -32,6 +34,7 @@ pub use connection::ConnectionSection;
 pub use hierarchy::HierarchySection;
 pub use kinds::KindsSection;
 pub use prompt::PromptSection;
+pub use qdrant::QdrantSection;
 
 /// An optional column: an empty field clears it rather than storing `""`.
 ///

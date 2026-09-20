@@ -12,6 +12,8 @@
 
 pub mod backend;
 pub mod cache;
+/// Module defining the QdrantDsn type and logic.
+pub mod qdrant_settings;
 pub mod connect;
 pub mod dsn;
 pub mod error;
