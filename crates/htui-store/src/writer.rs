@@ -90,6 +90,7 @@ impl Writer {
 ///   D35's "a no-op that logs at debug": without it, a chat that outlives a reconnect is uploaded
 ///   mid-flight and its `run_step.usage` frozen at a partial sum.
 /// - item and registry writes answer `StoreError::Unreachable`: they genuinely need the server.
+///
 /// Two consequences worth stating, both of a buffered chat that a build before MOD-25 started.
 /// Such a chat is **not** in the mirror's `run` table until it is uploaded, so `active_runs` and
 /// the top bar do not count it — the D42 header is the one place it shows. And every construction
@@ -98,10 +99,12 @@ impl Writer {
 /// `append_events` shared one map. Since MOD-25 no [`Backend::writer`](crate::Backend::writer)
 /// call constructs it at all: the type is kept for one release for the reversal, and the upload
 /// side still lands whatever an earlier build buffered.
+///
 /// Plain delegation to the mirror: the recorder never reads, and the `WriteStore: ReadStore` bound
 /// wants these seven anyway.
+///
 /// D35's refusal for the three item writes: offline item editing is MOD-13's question.
-
+///
 /// D35's refusal for the registry writes, and MOD-2 D52's for a probe that has no server to
 /// write its snapshot to: the same sentence in both places, on purpose. It is also what an
 /// offline chat logs when it declines to latch a quota (MOD-2 plan D68).
@@ -109,8 +112,6 @@ impl Writer {
 /// than discovering the refusal on the write. Writing a probe result somewhere local is the
 /// local-only store's job (MOD-17), not this seam's.
 pub const REGISTRY_ON_SERVER_ONLY: &str = "the agent registry is written on the server only";
-
-/// D35's refusal for the two registry writes.
 
 /// The one sentence the whole prompt path answers with off the server (MOD-2 plan D109,
 /// blueprint E-8).
