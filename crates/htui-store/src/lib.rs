@@ -16,16 +16,16 @@ pub mod cache;
 pub mod qdrant_settings;
 pub mod connect;
 pub mod dsn;
+pub mod embed;
 pub mod error;
 pub mod identity;
 pub mod pg;
 pub mod secret;
 #[cfg(feature = "test-support")]
 pub mod testkit;
-pub mod writer;
-pub mod embed;
 pub mod vector;
 pub mod vector_sync;
+pub mod writer;
 
 pub use backend::Backend;
 pub use cache::{CacheMeta, CacheStore};

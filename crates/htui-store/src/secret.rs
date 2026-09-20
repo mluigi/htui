@@ -23,7 +23,9 @@ pub const SERVICE: &str = "htui";
 pub const USER: &str = "postgres-dsn";
 
 /// Keyring user name of the Qdrant DSN entry.
+/// The OS keyring username used to store the Qdrant URL.
 pub const QDRANT_URL_USER: &str = "qdrant-url";
+/// The OS keyring username used to store the Qdrant API key.
 pub const QDRANT_KEY_USER: &str = "qdrant-key";
 
 /// What an installed stand-in answers with (D18, flag L).
@@ -95,7 +97,7 @@ pub fn get_dsn() -> Result<Option<String>> {
     if let Some(fake) = &*fake() {
         return match fake {
             Fake::Slot(slots) => Ok(slots.pg.clone().filter(|dsn| !dsn.trim().is_empty())),
-            Fake::Broken(why) => Err(fake_failure("read", USER, &why)),
+            Fake::Broken(why) => Err(fake_failure("read", USER, why)),
         };
     }
     Slot::open(SERVICE, USER)?.get()
@@ -139,17 +141,19 @@ pub fn clear_dsn() -> Result<()> {
     Slot::open(SERVICE, USER)?.clear()
 }
 
+/// Retrieves the stored Qdrant URL, if any.
 pub fn get_qdrant_url() -> Result<Option<String>> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &*fake() {
         return match fake {
             Fake::Slot(slots) => Ok(slots.qdrant_url.clone().filter(|u| !u.trim().is_empty())),
-            Fake::Broken(why) => Err(fake_failure("read", QDRANT_URL_USER, &why)),
+            Fake::Broken(why) => Err(fake_failure("read", QDRANT_URL_USER, why)),
         };
     }
     Slot::open(SERVICE, QDRANT_URL_USER)?.get()
 }
 
+/// Stores the Qdrant URL in the keyring.
 pub fn set_qdrant_url(url: &str) -> Result<()> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &mut *fake() {
@@ -158,12 +162,13 @@ pub fn set_qdrant_url(url: &str) -> Result<()> {
                 slots.qdrant_url = Some(url.to_owned());
                 Ok(())
             }
-            Fake::Broken(why) => Err(fake_failure("store", QDRANT_URL_USER, &why)),
+            Fake::Broken(why) => Err(fake_failure("store", QDRANT_URL_USER, why)),
         };
     }
     Slot::open(SERVICE, QDRANT_URL_USER)?.set(url)
 }
 
+/// Removes the Qdrant URL from the keyring.
 pub fn clear_qdrant_url() -> Result<()> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &mut *fake() {
@@ -172,23 +177,25 @@ pub fn clear_qdrant_url() -> Result<()> {
                 slots.qdrant_url = None;
                 Ok(())
             }
-            Fake::Broken(why) => Err(fake_failure("remove", QDRANT_URL_USER, &why)),
+            Fake::Broken(why) => Err(fake_failure("remove", QDRANT_URL_USER, why)),
         };
     }
     Slot::open(SERVICE, QDRANT_URL_USER)?.clear()
 }
 
+/// Retrieves the stored Qdrant API key, if any.
 pub fn get_qdrant_api_key() -> Result<Option<String>> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &*fake() {
         return match fake {
             Fake::Slot(slots) => Ok(slots.qdrant_key.clone().filter(|k| !k.trim().is_empty())),
-            Fake::Broken(why) => Err(fake_failure("read", QDRANT_KEY_USER, &why)),
+            Fake::Broken(why) => Err(fake_failure("read", QDRANT_KEY_USER, why)),
         };
     }
     Slot::open(SERVICE, QDRANT_KEY_USER)?.get()
 }
 
+/// Stores the Qdrant API key in the keyring.
 pub fn set_qdrant_api_key(api_key: &str) -> Result<()> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &mut *fake() {
@@ -197,12 +204,13 @@ pub fn set_qdrant_api_key(api_key: &str) -> Result<()> {
                 slots.qdrant_key = Some(api_key.to_owned());
                 Ok(())
             }
-            Fake::Broken(why) => Err(fake_failure("store", QDRANT_KEY_USER, &why)),
+            Fake::Broken(why) => Err(fake_failure("store", QDRANT_KEY_USER, why)),
         };
     }
     Slot::open(SERVICE, QDRANT_KEY_USER)?.set(api_key)
 }
 
+/// Removes the Qdrant API key from the keyring.
 pub fn clear_qdrant_api_key() -> Result<()> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &mut *fake() {
@@ -211,7 +219,7 @@ pub fn clear_qdrant_api_key() -> Result<()> {
                 slots.qdrant_key = None;
                 Ok(())
             }
-            Fake::Broken(why) => Err(fake_failure("remove", QDRANT_KEY_USER, &why)),
+            Fake::Broken(why) => Err(fake_failure("remove", QDRANT_KEY_USER, why)),
         };
     }
     Slot::open(SERVICE, QDRANT_KEY_USER)?.clear()

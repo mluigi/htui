@@ -1,5 +1,4 @@
 use htui_core::model::Scope;
-use htui_store::qdrant_settings::QdrantSettings;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -18,16 +17,24 @@ const NO_URL_YET: &str = "no Qdrant URL is stored; type one and press Enter";
 const REPLACES_URL: &str = "Enter replaces the stored Qdrant URL";
 const NOT_STORED: &str = "not stored";
 const UNREADABLE: &str = "the keyring could not be read";
-const UNREADABLE_GUIDE: &str = "the keyring could not be read; Enter tries to store a Qdrant URL in it";
-const EMPTY_URL: &str = "nothing typed; the stored Qdrant settings are unchanged";
+const UNREADABLE_GUIDE: &str =
+    "the keyring could not be read; Enter tries to store a Qdrant URL in it";
 const CONFIRM_CLEAR: &str = "Remove the Qdrant settings from the keyring? y / n";
 
-const HINT_BROWSE: &str = "e edit \u{b7} c clear \u{b7} r reload";
-const HINT_NO_SNAPSHOT: &str = "r reload";
+const HINT_BROWSE: &str = "e edit \u{b7} c clear all \u{b7} r reload · j/k rows";
+const HINT_NO_SNAPSHOT: &str = "r reload · j/k rows";
 const HINT_EDITING: &str = "Enter continue \u{b7} Esc cancel";
 const HINT_EDITING_KEY: &str = "Enter store \u{b7} Esc cancel \u{b7} typed text is never shown";
 const HINT_CONFIRM: &str = "y confirm \u{b7} n / Esc cancel";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    Url,
+    Key,
+}
+impl Row {
+    const ALL: [Self; 2] = [Self::Url, Self::Key];
+}
 struct Editor {
     input: TextField,
 }
@@ -36,9 +43,9 @@ struct Editor {
 enum Mode {
     #[default]
     Browse,
-    EditingUrl(Editor),
-    EditingKey { url: String, editor: Editor },
     ConfirmClear,
+    EditingUrl(Editor),
+    EditingKey(Editor),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -58,6 +65,7 @@ impl Notice {
     }
 }
 
+/// Qdrant section of Settings tab
 pub struct QdrantSection {
     mode: Mode,
     notice: Option<Notice>,
@@ -65,11 +73,26 @@ pub struct QdrantSection {
     unavailable: Option<String>,
     busy: Option<&'static str>,
     opened_for_empty: bool,
+    cursor: usize,
+}
+
+impl std::fmt::Debug for QdrantSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QdrantSection").finish_non_exhaustive()
+    }
+}
+
+impl Default for QdrantSection {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl QdrantSection {
+    /// The ID for the qdrant settings section
     pub const ID: SectionId = SectionId("qdrant");
 
+    /// Create a new QdrantSection
     pub fn new() -> Self {
         Self {
             mode: Mode::default(),
@@ -78,6 +101,7 @@ impl QdrantSection {
             unavailable: None,
             busy: None,
             opened_for_empty: false,
+            cursor: 0,
         }
     }
 
@@ -85,100 +109,87 @@ impl QdrantSection {
         self.snapshot.as_ref().map(|s| &s.url_state)
     }
 
-    fn blocked(&self) -> bool {
-        self.unavailable.is_some() || self.snapshot.is_none() || self.busy.is_some()
+    fn row(&self) -> Row {
+        Row::ALL[self.cursor]
     }
 
-    fn settings_row_refusal(&self) -> String {
-        match self.state() {
-            Some(QdrantState::Stored) => unreachable!("this UI only blocks the missing states"),
-            Some(QdrantState::NotStored) => "there are no Qdrant settings to clear".to_owned(),
-            Some(QdrantState::Unreadable(e)) => format!("keyring unreadable: {}", e),
-            None => NOT_READ.to_owned(),
+    fn move_cursor(&mut self, down: bool) {
+        if self.blocked() {
+            return;
+        }
+        if down {
+            self.cursor = (self.cursor + 1) % Row::ALL.len();
+        } else {
+            self.cursor = (self.cursor + Row::ALL.len() - 1) % Row::ALL.len();
         }
     }
 
-    fn send(&mut self, request: StoreRequest, ctx: &mut Ctx<'_>) {
-        self.busy = Some(request.name());
-        ctx.request(request);
+    fn blocked(&self) -> bool {
+        self.busy.is_some() || self.unavailable.is_some() || self.snapshot.is_none()
     }
 
-    fn open_edit_url(&mut self) {
-        self.notice = None;
-        self.mode = Mode::EditingUrl(Editor {
-            input: TextField::new(),
-        });
-    }
-    
-    fn open_edit_key(&mut self, url: String) {
-        self.notice = None;
-        self.mode = Mode::EditingKey { 
-            url, 
-            editor: Editor { input: TextField::masked() }
-        };
+    fn open_edit(&mut self) {
+        match self.row() {
+            Row::Url => {
+                self.mode = Mode::EditingUrl(Editor {
+                    input: TextField::new(),
+                });
+            }
+            Row::Key => {
+                self.mode = Mode::EditingKey(Editor {
+                    input: TextField::masked(),
+                });
+            }
+        }
     }
 
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.mode = Mode::Browse;
-            return Handled::Consumed;
-        }
-
-        let (mut url_to_transition, mut key_to_submit) = (None, None);
-
-        match &mut self.mode {
+        let (outcome, url_to_submit, key_to_submit) = match &mut self.mode {
             Mode::EditingUrl(editor) => {
-                match editor.input.on_key(key) {
-                    FieldOutcome::Consumed => return Handled::Consumed,
-                    FieldOutcome::Cancel => {
-                        self.mode = Mode::Browse;
-                        return Handled::Consumed;
-                    }
-                    FieldOutcome::Submit => {
-                        let text = editor.input.text().unwrap_or("").trim();
-                        if text.is_empty() {
-                            self.mode = Mode::Browse;
-                            self.say(EMPTY_URL);
-                            return Handled::Consumed;
-                        }
-                        url_to_transition = Some(text.to_owned());
-                    }
-                    _ => return Handled::Pass,
+                let outcome = editor.input.on_key(key);
+                let mut url = None;
+                if let FieldOutcome::Submit = outcome {
+                    url = Some(editor.input.text().unwrap_or("").trim().to_owned());
                 }
+                (outcome, url, None)
             }
-            Mode::EditingKey { url, editor } => {
-                match editor.input.on_key(key) {
-                    FieldOutcome::Consumed => return Handled::Consumed,
-                    FieldOutcome::Cancel => {
-                        self.mode = Mode::Browse;
-                        return Handled::Consumed;
-                    }
-                    FieldOutcome::Submit => {
-                        key_to_submit = Some((url.clone(), editor.input.text().unwrap_or("").to_owned()));
-                    }
-                    _ => return Handled::Pass,
+            Mode::EditingKey(editor) => {
+                let outcome = editor.input.on_key(key);
+                let mut key_text = None;
+                if let FieldOutcome::Submit = outcome {
+                    key_text = Some(editor.input.text().unwrap_or("").trim().to_owned());
                 }
+                (outcome, None, key_text)
             }
             _ => return Handled::Pass,
-        }
+        };
 
-        if let Some(url) = url_to_transition {
-            self.open_edit_key(url);
-            return Handled::Consumed;
-        }
-
-        if let Some((url, key_text)) = key_to_submit {
-            let api_key = if key_text.is_empty() { None } else { Some(key_text) };
-            match QdrantSettings::new(url, api_key) {
-                Ok(settings) => {
-                    self.send(StoreRequest::SetQdrantSettings(settings), ctx);
-                }
-                Err(err) => {
-                    self.refuse(err.to_string());
-                }
+        match outcome {
+            FieldOutcome::Consumed => Handled::Consumed,
+            FieldOutcome::Cancel => {
+                self.mode = Mode::Browse;
+                Handled::Consumed
             }
+            FieldOutcome::Submit => {
+                if let Some(url) = url_to_submit {
+                    if url.is_empty() {
+                        self.mode = Mode::Browse;
+                        self.say("nothing typed; the stored URL is unchanged");
+                        return Handled::Consumed;
+                    }
+                    self.mode = Mode::Browse;
+                    ctx.request(StoreRequest::SetQdrantUrl(url));
+                }
+                if let Some(key_text) = key_to_submit {
+                    self.mode = Mode::Browse;
+                    ctx.request(StoreRequest::SetQdrantApiKey(zeroize::Zeroizing::new(
+                        key_text,
+                    )));
+                }
+                Handled::Consumed
+            }
+            FieldOutcome::Pass => Handled::Pass,
         }
-        Handled::Consumed
     }
 
     fn on_confirm_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
@@ -189,7 +200,7 @@ impl QdrantSection {
             Mode::ConfirmClear => match key.code {
                 KeyCode::Char('y') => {
                     self.mode = Mode::Browse;
-                    self.send(StoreRequest::ClearQdrantSettings, ctx);
+                    ctx.request(StoreRequest::ClearQdrantSettings);
                 }
                 KeyCode::Char('n') | KeyCode::Esc => self.mode = Mode::Browse,
                 _ => {}
@@ -202,7 +213,7 @@ impl QdrantSection {
     fn hint_text(&self) -> String {
         let keys = match self.mode {
             Mode::EditingUrl(_) => HINT_EDITING,
-            Mode::EditingKey { .. } => HINT_EDITING_KEY,
+            Mode::EditingKey(_) => HINT_EDITING_KEY,
             Mode::ConfirmClear => HINT_CONFIRM,
             Mode::Browse => {
                 if self.unavailable.is_some() || self.snapshot.is_none() {
@@ -238,7 +249,7 @@ impl QdrantSection {
         self.snapshot = Some(snapshot.clone());
 
         match write {
-            Some("set_qdrant_settings") => {
+            Some("set_qdrant_url") | Some("set_qdrant_api_key") => {
                 self.mode = Mode::Browse;
                 self.say(STORED);
             }
@@ -255,7 +266,7 @@ impl QdrantSection {
             && matches!(self.mode, Mode::Browse)
         {
             self.opened_for_empty = true;
-            self.open_edit_url();
+            self.open_edit();
             self.say(NO_URL_YET);
         }
     }
@@ -293,26 +304,39 @@ impl SettingsSection for QdrantSection {
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         match self.mode {
-            Mode::EditingUrl(_) | Mode::EditingKey { .. } => return self.on_editor_key(key, ctx),
+            Mode::EditingUrl(_) | Mode::EditingKey(_) => return self.on_editor_key(key, ctx),
             Mode::ConfirmClear => return self.on_confirm_key(key, ctx),
             Mode::Browse => {}
         }
         match key.code {
             KeyCode::Char('e') => {
                 if !self.blocked() {
-                    self.open_edit_url();
+                    self.open_edit();
                 }
                 Handled::Consumed
             }
             KeyCode::Char('c') => {
                 if !self.blocked() {
-                    if matches!(self.state(), Some(QdrantState::Stored)) {
+                    if matches!(self.state(), Some(QdrantState::Stored))
+                        || matches!(
+                            self.snapshot.as_ref().map(|s| &s.key_state),
+                            Some(QdrantState::Stored)
+                        )
+                    {
                         self.notice = None;
                         self.mode = Mode::ConfirmClear;
                     } else {
-                        self.refuse(self.settings_row_refusal());
+                        self.refuse("qdrant settings unavailable".to_owned());
                     }
                 }
+                Handled::Consumed
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.move_cursor(true);
+                Handled::Consumed
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.move_cursor(false);
                 Handled::Consumed
             }
             KeyCode::Char('r') => Handled::Pass,
@@ -336,7 +360,7 @@ impl SettingsSection for QdrantSection {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let room = usize::from(area.width).max(1);
         let mut lines = Vec::new();
-        
+
         let url_val = match self.state() {
             Some(QdrantState::Stored) => {
                 if let Some(summary) = self.snapshot.as_ref().and_then(|s| s.url_summary.as_ref()) {
@@ -357,14 +381,32 @@ impl SettingsSection for QdrantSection {
             None => NOT_READ.to_owned(),
         };
 
-        let style = ctx.theme.base;
-        for (n, chunk) in wrapped(&url_val, room.saturating_sub(10)).into_iter().enumerate() {
-            let l = if n == 0 { "URL" } else { "" };
-            lines.push(Line::styled(format!("  {l:<5}  {chunk}"), style));
-        }
-        for (n, chunk) in wrapped(&key_val, room.saturating_sub(10)).into_iter().enumerate() {
-            let l = if n == 0 { "Key" } else { "" };
-            lines.push(Line::styled(format!("  {l:<5}  {chunk}"), style));
+        for (index, row) in Row::ALL.into_iter().enumerate() {
+            let style = if index == self.cursor {
+                ctx.theme.selected
+            } else {
+                ctx.theme.base
+            };
+
+            let val = match row {
+                Row::Url => &url_val,
+                Row::Key => &key_val,
+            };
+
+            for (n, chunk) in wrapped(val, room.saturating_sub(10))
+                .into_iter()
+                .enumerate()
+            {
+                let l = if n == 0 {
+                    match row {
+                        Row::Url => "URL",
+                        Row::Key => "Key",
+                    }
+                } else {
+                    ""
+                };
+                lines.push(Line::styled(format!("  {l:<5}  {chunk}"), style));
+            }
         }
 
         match &self.mode {
@@ -373,12 +415,7 @@ impl SettingsSection for QdrantSection {
                 let l = "URL: ";
                 let field_room = area.width.saturating_sub(l.chars().count() as u16);
                 let mut spans = vec![Span::styled(l, ctx.theme.accent)];
-                spans.extend(
-                    editor
-                        .input
-                        .line(field_room.max(1), true, ctx.theme)
-                        .spans,
-                );
+                spans.extend(editor.input.line(field_room.max(1), true, ctx.theme).spans);
                 lines.push(Line::from(spans));
                 let guide = match self.state() {
                     Some(QdrantState::Stored) => REPLACES_URL,
@@ -396,16 +433,11 @@ impl SettingsSection for QdrantSection {
                         .map(|line| Line::styled(line, sty)),
                 );
             }
-            Mode::EditingKey { editor, .. } => {
+            Mode::EditingKey(editor) => {
                 let l = "Key: ";
                 let field_room = area.width.saturating_sub(l.chars().count() as u16);
                 let mut spans = vec![Span::styled(l, ctx.theme.accent)];
-                spans.extend(
-                    editor
-                        .input
-                        .line(field_room.max(1), true, ctx.theme)
-                        .spans,
-                );
+                spans.extend(editor.input.line(field_room.max(1), true, ctx.theme).spans);
                 lines.push(Line::from(spans));
                 let guide = "Enter API key, or leave blank if none";
                 let (text, sty) = match &self.notice {
@@ -428,7 +460,11 @@ impl SettingsSection for QdrantSection {
         let hint_line = match (&self.notice, &self.mode) {
             (Some(notice), Mode::Browse) => {
                 let text = notice.text().to_owned();
-                let sty = if notice.is_error() { ctx.theme.error } else { ctx.theme.dim };
+                let sty = if notice.is_error() {
+                    ctx.theme.error
+                } else {
+                    ctx.theme.dim
+                };
                 if keys.chars().count() + text.chars().count() + 3 > room {
                     Line::styled(text, sty)
                 } else {

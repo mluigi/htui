@@ -60,13 +60,13 @@ const REPLAY_HINT: &str = "Esc leave replay · t thoughts · j/k scroll";
 ///
 /// Compared rather than matched on a backend: the tab is told where its rows went and does not
 /// deduce it (`R-NF-3`).
-
+///
 /// What the header adds when the conversation is only on this disk (D42).
 ///
 /// An offline chat is in no `run` table until it is uploaded, so `active_runs` does not count it
 /// and the Runs pane cannot list it: this line is the only place it is visible, and the maintainer
 /// has to be able to tell it apart from a conversation the server already holds.
-
+///
 /// The live chat, once one has been accepted.
 #[derive(Debug, Clone)]
 pub struct ChatSessionState {
@@ -461,7 +461,7 @@ impl Tab for ChatTab {
                 step_id,
                 session_ref,
                 caps,
-                writer_label,
+                writer_label: _,
             } => {
                 self.pending_start = false;
                 self.refusal = None;

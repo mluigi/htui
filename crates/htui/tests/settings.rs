@@ -9,8 +9,8 @@ use htui::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{
-    AgentsSection, ConnectionSection, HierarchySection, KindsSection, PromptSection, QdrantSection, SectionId,
-    SettingsSection, SettingsTab, message,
+    AgentsSection, ConnectionSection, HierarchySection, KindsSection, PromptSection, QdrantSection,
+    SectionId, SettingsSection, SettingsTab, message,
 };
 use htui_agent::acp::Handshake;
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};

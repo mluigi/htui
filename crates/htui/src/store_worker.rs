@@ -491,7 +491,9 @@ pub enum StoreRequest {
     /// Request to fetch Qdrant connection info.
     QdrantInfo,
     /// Request to set the Qdrant connection string.
-    SetQdrantSettings(htui_store::qdrant_settings::QdrantSettings),
+    SetQdrantUrl(String),
+    /// Request to set the Qdrant API key.
+    SetQdrantApiKey(zeroize::Zeroizing<String>),
     /// Request to clear the Qdrant connection string.
     ClearQdrantSettings,
 }
@@ -561,7 +563,8 @@ impl StoreRequest {
             Self::ClearDsn => "clear_dsn",
             Self::RebuildCache => "rebuild_cache",
             Self::QdrantInfo => "qdrant_info",
-            Self::SetQdrantSettings(_) => "set_qdrant_settings",
+            Self::SetQdrantUrl(_) => "set_qdrant_url",
+            Self::SetQdrantApiKey(_) => "set_qdrant_api_key",
             Self::ClearQdrantSettings => "clear_qdrant_settings",
         }
     }
@@ -999,7 +1002,8 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         },
         StoreRequest::ApplyMigrations => StoreReply::MigrationsApplied { applied: 0 },
         StoreRequest::QdrantInfo
-        | StoreRequest::SetQdrantSettings(_)
+        | StoreRequest::SetQdrantUrl(_)
+        | StoreRequest::SetQdrantApiKey(_)
         | StoreRequest::ClearQdrantSettings => StoreReply::Failed {
             request: request.name(),
             message: "handled in worker loop".to_owned(),
@@ -1277,22 +1281,34 @@ pub fn spawn_with(
                         StoreRequest::QdrantInfo => {
                             StoreReply::Qdrant(crate::qdrant_settings_info::QdrantSnapshot::fetch().await)
                         }
-                        StoreRequest::SetQdrantSettings(settings) => {
-                            let url_str = settings.url.clone();
-                            let key_opt = settings.api_key.as_ref().map(|k| k.as_str().to_string());
+                        StoreRequest::SetQdrantUrl(url) => {
+                            let url_str = url.clone();
                             let res = tokio::task::spawn_blocking(move || {
                                 htui_store::secret::set_qdrant_url(&url_str)?;
-                                if let Some(key) = key_opt {
-                                    htui_store::secret::set_qdrant_api_key(&key)?;
-                                } else {
-                                    htui_store::secret::clear_qdrant_api_key()?;
-                                }
-                                Ok::<(), htui_core::store::StoreError>(())
+                                Ok::<(), StoreError>(())
                             })
                             .await
                             .unwrap();
                             if let Err(err) = res {
-                                failed("set_qdrant_settings", &err)
+                                failed("set_qdrant_url", &err)
+                            } else {
+                                StoreReply::Qdrant(crate::qdrant_settings_info::QdrantSnapshot::fetch().await)
+                            }
+                        }
+                        StoreRequest::SetQdrantApiKey(key) => {
+                            let k = key.as_str().to_string();
+                            let res = tokio::task::spawn_blocking(move || {
+                                if k.is_empty() {
+                                    htui_store::secret::clear_qdrant_api_key()?;
+                                } else {
+                                    htui_store::secret::set_qdrant_api_key(&k)?;
+                                }
+                                Ok::<(), StoreError>(())
+                            })
+                            .await
+                            .unwrap();
+                            if let Err(err) = res {
+                                failed("set_qdrant_api_key", &err)
                             } else {
                                 StoreReply::Qdrant(crate::qdrant_settings_info::QdrantSnapshot::fetch().await)
                             }
@@ -1301,7 +1317,7 @@ pub fn spawn_with(
                             let res = tokio::task::spawn_blocking(|| {
                                 htui_store::secret::clear_qdrant_url()?;
                                 htui_store::secret::clear_qdrant_api_key()?;
-                                Ok::<(), htui_core::store::StoreError>(())
+                                Ok::<(), StoreError>(())
                             })
                             .await
                             .unwrap();

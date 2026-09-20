@@ -75,10 +75,8 @@ impl Writer {
 
 /// The offline [`WriteStore`] (MOD-2 plan D34, D35): the rows an online chat sends to Postgres,
 /// appended to `<cache_dir>/pending/<project>.<run>.jsonl.open` as JSON lines instead.
-///
 /// It writes what the buffer's line format can hold and refuses the rest. That format is
 /// `session_event` columns only (`crate::cache::pending`), so:
-///
 /// - `append_events` is the whole point, and it needs the `(project, run)` pair the file name
 ///   carries. `start_chat_run` is where that pair arrives, so it **registers** the chat's step
 ///   rather than writing a row; a later event for a step nobody registered is a
@@ -92,7 +90,6 @@ impl Writer {
 ///   D35's "a no-op that logs at debug": without it, a chat that outlives a reconnect is uploaded
 ///   mid-flight and its `run_step.usage` frozen at a partial sum.
 /// - item and registry writes answer `StoreError::Unreachable`: they genuinely need the server.
-///
 /// Two consequences worth stating, both of a buffered chat that a build before MOD-25 started.
 /// Such a chat is **not** in the mirror's `run` table until it is uploaded, so `active_runs` and
 /// the top bar do not count it — the D42 header is the one place it shows. And every construction
@@ -101,16 +98,13 @@ impl Writer {
 /// `append_events` shared one map. Since MOD-25 no [`Backend::writer`](crate::Backend::writer)
 /// call constructs it at all: the type is kept for one release for the reversal, and the upload
 /// side still lands whatever an earlier build buffered.
-
 /// Plain delegation to the mirror: the recorder never reads, and the `WriteStore: ReadStore` bound
 /// wants these seven anyway.
-
 /// D35's refusal for the three item writes: offline item editing is MOD-13's question.
 
 /// D35's refusal for the registry writes, and MOD-2 D52's for a probe that has no server to
 /// write its snapshot to: the same sentence in both places, on purpose. It is also what an
 /// offline chat logs when it declines to latch a quota (MOD-2 plan D68).
-///
 /// A probe costs process spawns, so the caller checks this **before** it spawns anything rather
 /// than discovering the refusal on the write. Writing a probe result somewhere local is the
 /// local-only store's job (MOD-17), not this seam's.
@@ -120,27 +114,23 @@ pub const REGISTRY_ON_SERVER_ONLY: &str = "the agent registry is written on the 
 
 /// The one sentence the whole prompt path answers with off the server (MOD-2 plan D109,
 /// blueprint E-8).
-///
 /// It names **two** facts because they are the same fact from either end. Reading: four of the
 /// assembler's inputs — `prompt_template`, `skill`, `skill_version`, `skill_binding`, `box_tool` —
 /// have no cache mirror, so a preview cannot be assembled offline at all. Writing:
 /// `run_step.trim_record` has nowhere to go in the pending buffer, whose line format is
 /// `session_event` columns only, and unlike `run_step.usage` nothing can recompute it at upload.
-///
 /// One constant, so a user who meets the refusal from the preview and from a step's audit row
 /// reads the same sentence and does not have to decide whether they are two problems.
 pub const PROMPT_ON_SERVER_ONLY: &str = "the prompt path needs the server: templates, skills and box tools are not mirrored, and a \
      step's trim record has nowhere to go offline";
 
 /// The one sentence a chat is refused with off the server (MOD-25).
-///
 /// `htui` is online-only: since MOD-25 [`Backend::writer`](crate::Backend::writer) answers `None`
 /// on [`Backend::Offline`](crate::Backend::Offline), so a chat started on a box whose Postgres is
 /// unreachable is **refused** rather than recorded into `<cache_dir>/pending/`. This is the
 /// sentence it is refused with, and it echoes `R-STO-4`'s "the TUI opens in offline read-only mode
 /// from the cache ... No item creation, no runs": the shell still browses the mirror, with the top
 /// bar reading `offline · <age>`, and starts no run.
-///
 /// It does **not** name the database itself, because it is carried by
 /// `StoreError::Unreachable`, whose `Display` already
 /// prefixes `store unreachable: `. Reading the two together is the whole sentence; repeating the
@@ -148,18 +138,15 @@ pub const PROMPT_ON_SERVER_ONLY: &str = "the prompt path needs the server: templ
 pub const DATABASE_UNREACHABLE: &str = "this box browses its read-only cache and starts no run";
 
 /// [`DATABASE_UNREACHABLE`] for all 31 hierarchy methods (MOD-15 plan D2), reads included.
-///
 /// Reusing MOD-25's sentence rather than coining a thirty-second one is the decision, not an
 /// economy. Writing: `htui` is online-only, so a workspace rename off the server is the same
 /// event `R-STO-4` already words — "offline read-only mode … no item creation". Reading:
 /// `workspace`, `repo`, `repo_box_path`, `workspace_box_path`, `step_graph` and
 /// `step_graph_phase` have no mirror at all (`cache::MIRRORED_TABLES`), so offline they are
 /// unreachable in the plainest sense of the word.
-///
 /// [`REGISTRY_ON_SERVER_ONLY`] and [`PROMPT_ON_SERVER_ONLY`] were the other candidates and both
 /// name a different subsystem; a maintainer who met "the agent registry is written on the server
 /// only" after renaming a project would go looking in the wrong place.
-///
 /// **Since MOD-4 milestone 1 (plan D5) it serves a second family**: ANA-2 §8's run seam, eighteen
 /// [`WriteStore`] writers and five [`ReadStore`] reads, refused here with the same one sentence and
 /// no other. A third constant was not coined for the reason a thirty-second one was not: queueing
@@ -870,8 +857,8 @@ mod tests {
     use super::*;
     use crate::Backend;
     use crate::CacheStore;
-    use htui_core::store::StoreError;
     use htui_core::fixtures::ids;
+    use htui_core::store::StoreError;
 
     #[tokio::test]
     async fn a_memory_writer_round_trips_a_chat_run() {

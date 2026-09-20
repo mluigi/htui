@@ -1,9 +1,10 @@
+//! Synchronizes document embeddings into Qdrant.
 use crate::vector::VectorStore;
 use htui_core::store::StoreError;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
-use sha2::{Sha256, Digest};
 use tokio::fs;
+use walkdir::WalkDir;
 
 /// A background worker that synchronizes `HANDOFF.md` and `docs/` markdown files to a `VectorStore`.
 #[derive(Debug)]
@@ -40,30 +41,32 @@ impl VectorSync {
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
                 .map(|e| e.path().to_path_buf())
                 .collect::<Vec<_>>()
-        }).await.map_err(|e| StoreError::Backend(e.to_string()))?;
+        })
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
 
         for path in entries {
             let content = fs::read_to_string(&path)
                 .await
                 .map_err(|e| StoreError::Backend(format!("Failed to read {:?}: {}", path, e)))?;
-            
+
             // Generate deterministic ID from relative path
-            let id = path.strip_prefix(&self.repo_root)
+            let id = path
+                .strip_prefix(&self.repo_root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
 
             let mut meta = serde_json::Map::new();
-            meta.insert(
-                "path".to_string(),
-                serde_json::Value::String(id.clone()),
-            );
-            
+            meta.insert("path".to_string(), serde_json::Value::String(id.clone()));
+
             // Upsert documents in 512-token safe chunks (naive character chunking for now)
             let chunks = self.chunk_text(&content, 2000);
             for (i, chunk) in chunks.iter().enumerate() {
                 let chunk_id = format!("{}-{}", id, i);
-                store.upsert_document(&chunk_id, chunk, serde_json::Value::Object(meta.clone())).await?;
+                store
+                    .upsert_document(&chunk_id, chunk, serde_json::Value::Object(meta.clone()))
+                    .await?;
             }
         }
         Ok(())
@@ -78,22 +81,21 @@ impl VectorSync {
         let content = fs::read_to_string(&handoff_path)
             .await
             .map_err(|e| StoreError::Backend(format!("Failed to read HANDOFF.md: {}", e)))?;
-        
+
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         let hash = format!("{:x}", hasher.finalize());
 
         let mut meta = serde_json::Map::new();
-        meta.insert(
-            "hash".to_string(),
-            serde_json::Value::String(hash.clone()),
-        );
+        meta.insert("hash".to_string(), serde_json::Value::String(hash.clone()));
 
         // Splitting HANDOFF into chunks
         let chunks = self.chunk_text(&content, 2000);
         for (i, chunk) in chunks.iter().enumerate() {
             let chunk_id = format!("HANDOFF-{}", i);
-            store.upsert_item(&chunk_id, chunk, serde_json::Value::Object(meta.clone())).await?;
+            store
+                .upsert_item(&chunk_id, chunk, serde_json::Value::Object(meta.clone()))
+                .await?;
         }
         Ok(())
     }

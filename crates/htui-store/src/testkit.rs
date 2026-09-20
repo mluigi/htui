@@ -300,7 +300,9 @@ impl Drop for KeyringGuard {
 /// the slot run one after the other rather than overwriting each other's DSN.
 pub async fn mock_keyring() -> KeyringGuard {
     let lock = KEYRING.lock().await;
-    *crate::secret::fake() = Some(crate::secret::Fake::Slot(crate::secret::FakeSlots::default()));
+    *crate::secret::fake() = Some(crate::secret::Fake::Slot(
+        crate::secret::FakeSlots::default(),
+    ));
     KeyringGuard { _lock: lock }
 }
 
@@ -335,9 +337,6 @@ pub async fn mock_keyring_broken() -> KeyringGuard {
 /// Outside a [`mock_keyring`] guard — reading the real keyring from a test is exactly what this
 /// helper exists to make impossible — and under a [`mock_keyring_broken`] one, which holds no DSN
 /// to report and answers every call with an error instead.
-#[must_use]
-
-#[must_use]
 pub fn fake_qdrant_dsn() -> Option<String> {
     match crate::secret::fake()
         .clone()
@@ -350,6 +349,7 @@ pub fn fake_qdrant_dsn() -> Option<String> {
     }
 }
 
+/// Returns the stored fake Postgres DSN.
 pub fn fake_dsn() -> Option<String> {
     match crate::secret::fake()
         .clone()

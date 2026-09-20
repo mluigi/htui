@@ -1439,7 +1439,7 @@ fn quota_latch_for(
         agent_id: agent.id,
         box_id,
         source,
-        billing: agent.billing.clone(),
+        billing: agent.billing,
     })
 }
 

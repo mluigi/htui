@@ -268,7 +268,6 @@ async fn an_offline_chat_is_refused_with_the_unreachable_warning() {
         "and no chat was started: {rendered}"
     );
 
-
     cache.close().await;
 }
 

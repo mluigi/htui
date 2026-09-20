@@ -10,7 +10,9 @@ use std::process::ExitCode;
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut options = sentry::ClientOptions::default();
-    options.dsn = "https://47539c499d6747008e7561dbbe1129cd@glitchtip.sette.mluigi.it/1".parse().ok();
+    options.dsn = "https://47539c499d6747008e7561dbbe1129cd@glitchtip.sette.mluigi.it/1"
+        .parse()
+        .ok();
     options.release = sentry::release_name!();
     options.attach_stacktrace = true;
     options.in_app_include = vec!["htui", "htui_core", "htui_store", "htui_agent", "htui_orch"];

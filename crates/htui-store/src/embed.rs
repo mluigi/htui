@@ -1,5 +1,6 @@
+//! Provides types for embedding documents.
+use fastembed::{EmbeddingModel, InitOptions, SparseEmbedding, SparseTextEmbedding, TextEmbedding};
 use htui_core::store::StoreError;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding, SparseTextEmbedding, SparseEmbedding};
 use std::sync::Arc;
 
 /// Wrapper for local embedding generation using fastembed-rs.
@@ -21,12 +22,13 @@ impl Embedder {
             model_name: EmbeddingModel::BGESmallENV15,
             show_download_progress: false,
             ..Default::default()
-        }).map_err(|e| StoreError::Backend(format!("Failed to load dense model: {}", e)))?;
-        
+        })
+        .map_err(|e| StoreError::Backend(format!("Failed to load dense model: {}", e)))?;
+
         let sparse_model = SparseTextEmbedding::try_new(Default::default())
             .map_err(|e| StoreError::Backend(format!("Failed to load sparse model: {}", e)))?;
 
-        Ok(Self { 
+        Ok(Self {
             dense_model: Arc::new(dense_model),
             sparse_model: Arc::new(sparse_model),
         })
@@ -36,17 +38,24 @@ impl Embedder {
     pub async fn embed_dense(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, StoreError> {
         let model = self.dense_model.clone();
         tokio::task::spawn_blocking(move || {
-            model.embed(texts, None).map_err(|e| StoreError::Backend(e.to_string()))
+            model
+                .embed(texts, None)
+                .map_err(|e| StoreError::Backend(e.to_string()))
         })
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?
     }
 
     /// Generate sparse (BM25) embeddings for the given texts.
-    pub async fn embed_sparse(&self, texts: Vec<String>) -> Result<Vec<SparseEmbedding>, StoreError> {
+    pub async fn embed_sparse(
+        &self,
+        texts: Vec<String>,
+    ) -> Result<Vec<SparseEmbedding>, StoreError> {
         let model = self.sparse_model.clone();
         tokio::task::spawn_blocking(move || {
-            model.embed(texts, None).map_err(|e| StoreError::Backend(e.to_string()))
+            model
+                .embed(texts, None)
+                .map_err(|e| StoreError::Backend(e.to_string()))
         })
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?
@@ -64,10 +73,13 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let embedder = Embedder::new().expect("Failed to init embedder");
-        
+
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let embeddings = embedder.embed_dense(vec!["hello world".to_string()]).await.expect("Failed to embed");
+            let embeddings = embedder
+                .embed_dense(vec!["hello world".to_string()])
+                .await
+                .expect("Failed to embed");
             assert_eq!(embeddings.len(), 1);
             assert_eq!(embeddings[0].len(), 384); // bge-small is 384 dims
         });
