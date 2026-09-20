@@ -3,3 +3,4 @@
 *.snap.new
 /.idea/
 /*.log
+graphify-out/cache
