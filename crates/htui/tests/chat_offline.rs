@@ -46,7 +46,6 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, EventKind, ProjectId, SessionEvent, Transport,
 };
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
-use htui_store::cache::pending::{OPEN_SUFFIX, upload_pending};
 use htui_store::{Backend, CacheStore, PgStore, testkit};
 use serde_json::json;
 
@@ -212,7 +211,7 @@ fn sealed_buffer(cache: &CacheStore) -> (ProjectId, Vec<SessionEvent>) {
     assert!(
         files
             .iter()
-            .all(|path| path.extension().is_some_and(|ext| ext != OPEN_SUFFIX)),
+            .all(|path| path.extension().is_some_and(|ext| ext != "open")),
         "a chat that has ended leaves no `.open` buffer behind (`[H-1]`): {files:?}"
     );
     assert_eq!(files.len(), 1, "one chat, one buffer: {files:?}");
@@ -269,16 +268,6 @@ async fn an_offline_chat_is_refused_with_the_unreachable_warning() {
         "and no chat was started: {rendered}"
     );
 
-    let pending = cache.dir().join("pending");
-    let buffers: Vec<std::path::PathBuf> = std::fs::read_dir(&pending)
-        .expect("the pending directory exists")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .collect();
-    assert!(
-        buffers.is_empty(),
-        "and nothing was buffered — no `.open` file and no sealed one: {buffers:?}"
-    );
 
     cache.close().await;
 }

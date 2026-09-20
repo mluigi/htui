@@ -33,6 +33,10 @@ serde_json  = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }
+qdrant-client      = { workspace = true }
+fastembed          = { workspace = true }
+ort                = { version = "=2.0.0-rc.4", default-features = false, features = ["download-binaries"] }
+walkdir            = { workspace = true }
 
 [dev-dependencies]
 htui-core = { workspace = true, features = ["test-support"] }
@@ -40,6 +44,7 @@ htui-store = { workspace = true, features = ["test-support"] }
 tokio     = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 tempfile  = "3"
 futures   = { workspace = true }
+rustls    = { workspace = true }
 
 [lints]
 workspace = true

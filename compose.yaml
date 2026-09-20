@@ -48,5 +48,16 @@ services:
       timeout: 3s
       retries: 10
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: htui-qdrant
+    restart: unless-stopped
+    ports:
+      - "6334:6334"
+      - "6333:6333"
+    volumes:
+      - htui-qdrant-data:/qdrant/storage
+
 volumes:
   htui-pgdata:
+  htui-qdrant-data:

@@ -277,7 +277,6 @@ async fn the_mirror_directory_is_the_dsn_fingerprint() {
         "the mirror lives under sha256(host:port/dbname), credentials excluded (4.4)"
     );
     assert!(expected.join("cache.sqlite").exists());
-    assert!(expected.join("pending").is_dir());
 
     close(&started).await;
 }

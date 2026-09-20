@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[ANA-20](docs/decisions/ana/ana-20.md)** - Research Qdrant features (done, 2026-09-20)
 - **[ANA-19](docs/decisions/ana/ana-19.md)** - Vector DB for related concepts search (done, 2026-09-19)
 - **[ANA-18](docs/decisions/ana/ana-18.md)** - Research JEV model implementability (done, 2026-09-19)
 - **[CLEAN-3](docs/decisions/clean/clean-3.md)** - `cargo doc --workspace --no-deps` has never been green (done, 2026-09-19)

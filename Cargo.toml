@@ -94,6 +94,11 @@ fs4                   = { version = "1.1", default-features = false, features = 
 sentry                = "0.49.2"
 sentry-anyhow         = "0.49.2"
 sentry-tracing        = "0.49.2"
+qdrant-client         = "1.19.0"
+fastembed             = "3.14.1"
+ort                   = { version = "=2.0.0-rc.4", default-features = false, features = ["download-binaries"] }
+ureq                  = { version = "2.12.1", features = ["tls"] }
+walkdir               = "2"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"

@@ -21,6 +21,9 @@ pub mod secret;
 #[cfg(feature = "test-support")]
 pub mod testkit;
 pub mod writer;
+pub mod embed;
+pub mod vector;
+pub mod vector_sync;
 
 pub use backend::Backend;
 pub use cache::{CacheMeta, CacheStore};
