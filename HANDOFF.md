@@ -238,6 +238,42 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   the durable record (documented rather than parsed back, so D12's one-way grammar keeps one home).
   Plan: `.claude/plans/mod-4-orch-engine.plan.md`; blueprint:
   `.claude/plans/mod-4-orch-engine.blueprint.md`.
+  **Milestone 3 landed (`6307a3d`..`1b78753`, 2026-09-22): work happens in a real tree.** 22
+  implementation commits plus a seven-commit review round, 39 files; workspace green at
+  `--test-threads=1` (1445 passed), `sqlx prepare --check` clean. `htui-orch` gains
+  `isolate/git.rs`, `isolate/real.rs` (`GixIsolator`, all four `R-ORCH-8` modes), `isolate/copy.rs`
+  and `verify.rs` (`verify_command` through the platform shell, three outcomes, deadline, tail cap,
+  scrubbed output); the engine calls the verify hook between stages 4 and 5, reconciles the winner
+  into the primary tree and cleans up, and `Command` gains `CancelRun`. The seam gains
+  `record_command_run`/`command_runs` and `upsert_step_tree` now also writes
+  `run_step.isolation_path`; `CASES` 48 -> 49. ANA-2 criteria 11, 12 and 13 are proved over a real
+  repository (`tests/gix_isolator.rs`, `pg_criteria.rs`).
+  **OQ-1 was resolved to the `git` CLI, and that has a cost.** `gix` 0.87.1 ships no worktree
+  mutation, so `isolate/git.rs` shells out for exactly five verbs — `worktree add --lock`,
+  `worktree remove`, `merge --no-ff`, `merge --abort` and `reset --hard` (D47) — with a floor of
+  git 2.33.0, checked once when the isolator is built; `gix` keeps every read and every ref write,
+  and its sync calls run on the blocking pool. `docs/ANA-2.md:1777` and `:2055` are amended. **`git`
+  is therefore a runtime dependency of the `worktree` mode and of reconciliation**, and one more
+  fact for MOD-16's Windows verification. **`git worktree prune` is never run** (D46): a pruned
+  admin entry is instead detected when a tree's HEAD cannot be read, and the tree is re-made onto
+  its existing branch.
+  **The review gate found three HIGH, four MEDIUM and five LOW; every finding was verified against
+  the tree and every one was applied** (`892fcf3`, `ff47431`, `085fb79`, `2392031`, `a7e929f`,
+  `70bc276`, `1b78753`). The behaviours a later milestone must know: (1) **a no-commit `worktree`
+  tree is kept, not removed, when it holds untracked work** — `is_dirty` deliberately ignores
+  untracked files (D24, which the dirty-tree refusals rely on), so the step-end removal also asks
+  `has_untracked_files`; (2) **the `shared_serialized` guard lives from `prepare` to that step's
+  capture, and `cleanup(run, _)` drops every guard of the run whether or not it has `step_trees`
+  rows** — a failure between `prepare` and `upsert_step_tree` used to leak the guard until restart;
+  guards are taken in `RepoId` order so milestone 4's siblings cannot deadlock; (3) a failed merge
+  always runs `merge --abort`, even when its conflicted paths cannot be read; (4) a copy never
+  carries a `*.lock` out of the source's `.git`; (5) lock retries fire only on the exact lock
+  wordings, never on a message that merely names `Cargo.lock` or a ref-name conflict.
+  **Still carried**: R-3..R-6 from milestone 2; **R-7** — a run parked by a reconcile refusal
+  (`park_run`) has no resume verb, so milestone 5's sweep or milestone 6's `Unblock`-shaped verb
+  must provide one; **R-8** — `after_hash` becomes the merge commit after reconcile (H-19), so
+  milestone 4's no-progress predicate may need the pre-merge hash. Plan:
+  `.claude/plans/mod-4-orch-tree.plan.md`; blueprint: `.claude/plans/mod-4-orch-tree.blueprint.md`.
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
   per-box paths, agent autodiscovery hook. Not blocked (MOD-6 landed,
