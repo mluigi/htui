@@ -86,10 +86,16 @@ pub enum GateAnswer {
 /// Where a walk stopped, and why.
 ///
 /// `position` is the snapshot position the walk was on when it stopped, and is `None` exactly when
-/// the run finished — there is no position left to name. `failure` is `Some` only for a run that
-/// stopped because of one, and is the same value that was written to `run.failure` (except on the
-/// escalation path, where a parked run's `failure` stays NULL by blueprint A-4 and this is the only
-/// place the caller can read the reason).
+/// the run finished — there is no position left to name.
+///
+/// **`failure` is populated only by the transition that caused the stop**, and is then the same
+/// value that was written to `run.failure` (except on the escalation path, where a parked run's
+/// `failure` stays NULL by blueprint A-4 and this is the only place the caller can read the
+/// reason). It is `None` — even for a run whose `run.failure` is set — whenever the walk merely
+/// *found* the run already terminal or already parked, from an earlier call or another process:
+/// `RunFailure`'s `Display` is one-way by plan D12, so reconstructing the variant from the column
+/// would mean a second copy of that grammar. `run.failure` is the durable record; this field is
+/// what the call that ended the run reports about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rest {
     /// The run's status after the walk stopped.

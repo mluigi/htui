@@ -506,7 +506,10 @@ impl ScriptedStep {
     /// The grammar is fixed by `docs/ANA-5.md:1327-1331` and is exactly three lines — `---`,
     /// `verdict: <approve|request-changes>`, `---` — at the very start of the body, with no other
     /// keys. `verdict` is taken as given rather than typed, so a case can script a malformed one
-    /// and pin ANA-5's "unreadable reads as `request-changes`" rule.
+    /// and pin plan D10's rule, which is that **only an exact `request-changes` rejects**: front
+    /// matter that is absent, unparseable or carries any other value settles `ok` and the value is
+    /// recorded verbatim for the operator. Silence is not a rejection — treating it as one would
+    /// spend `R-ORCH-3`'s retry budget on a parse bug.
     #[must_use]
     pub fn review(verdict: &str, body: &str) -> Self {
         Self {

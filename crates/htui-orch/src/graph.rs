@@ -173,11 +173,22 @@ pub enum ResolveError {
 /// `cargo test -p htui-orch`. A `Value` round trip therefore serialises in declaration order in
 /// one build and alphabetical order in the other, yielding two digests for one graph. Serialising
 /// the struct directly is immune, and this is a measured trap rather than a style preference.
-#[must_use]
-pub fn topology(phases: &[SnapshotPhase]) -> String {
-    let json = serde_json::to_string(phases)
-        .expect("SnapshotPhase serialises: no map keys, no non-finite numbers");
-    format!("sha256:{}", htui_core::prompt::digest::sha256_hex(&json))
+///
+/// # Errors
+/// [`ResolveError::Store`] carrying the serialiser's own sentence. `SnapshotPhase` has no map keys
+/// and no floats, so nothing in the shipped type can trip it — but a `.expect` here would be a
+/// panic on a production path, and a field added to `SnapshotPhase` later is exactly the change
+/// that would reach it.
+pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, ResolveError> {
+    let json = serde_json::to_string(phases).map_err(|err| {
+        ResolveError::Store(StoreError::Constraint(format!(
+            "the graph's phases do not serialise: {err}"
+        )))
+    })?;
+    Ok(format!(
+        "sha256:{}",
+        htui_core::prompt::digest::sha256_hex(&json)
+    ))
 }
 
 /// `run.repo_scope` for an item (ANA-2 §4.7, plan D14).
@@ -275,7 +286,7 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
             name: resolved.graph.name,
             is_override: resolved.graph.is_override,
         },
-        topology: topology(&phases),
+        topology: topology(&phases)?,
         mode,
         phases,
         settings: SnapshotSettings {
@@ -721,7 +732,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
         assert_eq!(
             resolved.snapshot.topology,
-            super::topology(&resolved.snapshot.phases),
+            super::topology(&resolved.snapshot.phases).expect("`SnapshotPhase` serialises"),
             "the snapshot carries the digest of its own phases"
         );
         assert_eq!(resolved.snapshot.v, 1, "{TOPOLOGY_MOVED}");

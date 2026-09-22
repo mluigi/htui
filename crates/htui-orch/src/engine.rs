@@ -509,7 +509,7 @@ where
         let run = self.run(run.id).await?;
         let steps = self.parts.store.run_steps(run.id).await?;
         let attempt = next_attempt(&steps, row.position);
-        if let Some(rest) = self.admit(&run, &snapshot, &phase, attempt).await? {
+        if let Some(rest) = self.admit(&run, &phase, attempt).await? {
             return Ok(CommandOutcome::Retried { step: row.id, rest });
         }
         let rest = self.run_to_rest(run.id).await?;
@@ -565,7 +565,7 @@ where
                 Cursor::Rest { .. } => return self.resting(&row).await,
                 Cursor::Create { position, attempt } => {
                     let phase = Self::phase_at(run, &snapshot, position)?;
-                    if let Some(rest) = self.admit(&row, &snapshot, &phase, attempt).await? {
+                    if let Some(rest) = self.admit(&row, &phase, attempt).await? {
                         return Ok(rest);
                     }
                 }
@@ -651,7 +651,6 @@ where
     async fn admit(
         &self,
         run: &Run,
-        snapshot: &GraphSnapshot,
         phase: &SnapshotPhase,
         attempt: i32,
     ) -> Result<Option<Rest>, EngineError> {
@@ -677,7 +676,6 @@ where
             return self.refuse_capability(run, phase).await.map(Some);
         };
 
-        let _ = snapshot;
         self.parts
             .store
             .create_step(NewRunStep {
@@ -822,13 +820,15 @@ where
             Ok(prompt) => prompt,
             Err(missing) => return self.fail_before_a_token(run, step, phase, missing).await,
         };
+        // `unwrap_or(Value::Null)` here wrote a **null** `trim_record` and said nothing: the row
+        // that records which sections were dropped and why would silently become "there was no
+        // record", which is the one thing `run_step.trim_record` exists to rule out.
+        let trim = serde_json::to_value(&prompt.trim).map_err(|err| {
+            htui_agent::RecordError::Encode(format!("the step's trim record: {err}"))
+        })?;
         self.parts
             .store
-            .set_step_prompt(
-                step.id,
-                &prompt.digest,
-                &serde_json::to_value(&prompt.trim).unwrap_or(Value::Null),
-            )
+            .set_step_prompt(step.id, &prompt.digest, &trim)
             .await?;
 
         // -- stage 4: session -----------------------------------------------------------------
@@ -881,7 +881,7 @@ where
             Landing::Advance => Ok(None),
             Landing::Retry { position, attempt } => {
                 let phase = Self::phase_at(run.id, snapshot, position)?;
-                self.admit(&row, snapshot, &phase, attempt).await
+                self.admit(&row, &phase, attempt).await
             }
             Landing::Rest(rest) => Ok(Some(rest)),
         }
@@ -1184,6 +1184,15 @@ where
     }
 
     /// Where the run is, without moving it.
+    ///
+    /// **`failure` is always `None` here, deliberately.** [`Rest::failure`] is the typed
+    /// [`RunFailure`] of the transition that *caused* the stop, and a rest is by definition not
+    /// that transition: this is the arm a walk takes when it finds a run already terminal or
+    /// already parked, possibly from an earlier call or another process. `run.failure` is a
+    /// `String` and [`RunFailure`]'s `Display` is one-way by plan D12 — one vocabulary, one
+    /// renderer — so parsing it back would mean a second copy of that grammar in a second module,
+    /// which is the drift D12 exists to prevent. A caller that wants the reason of a stop it did
+    /// not witness reads `run.failure`, which is the durable record and the row a human reads.
     async fn resting(&self, run: &Run) -> Result<Rest, EngineError> {
         let snapshot = Self::snapshot_of(run)?;
         let steps = self.parts.store.run_steps(run.id).await?;
@@ -1203,13 +1212,25 @@ where
     }
 
     /// The run's own snapshot, decoded. Invariant 2: the walk reads this and never the live graph.
+    ///
+    /// Only a genuine version mismatch is [`EngineError::SnapshotVersion`]. A row with no snapshot
+    /// at all, or one whose blob does not decode, used to be reported as `v: 0` — a version the
+    /// snapshot never had, with the serde error thrown away, so the operator was told the engine
+    /// was too old to read a run it could in fact read nothing of.
     fn snapshot_of(run: &Run) -> Result<GraphSnapshot, EngineError> {
         let value = run
             .graph_snapshot
             .clone()
-            .ok_or(EngineError::SnapshotVersion { run: run.id, v: 0 })?;
-        let snapshot: GraphSnapshot = serde_json::from_value(value)
-            .map_err(|_| EngineError::SnapshotVersion { run: run.id, v: 0 })?;
+            .ok_or_else(|| EngineError::Snapshot {
+                run: run.id,
+                reason: "the run carries no `graph_snapshot`; a graph run is created with one"
+                    .to_owned(),
+            })?;
+        let snapshot: GraphSnapshot =
+            serde_json::from_value(value).map_err(|err| EngineError::Snapshot {
+                run: run.id,
+                reason: format!("`graph_snapshot` does not decode: {err}"),
+            })?;
         if snapshot.v != GraphSnapshot::V {
             return Err(EngineError::SnapshotVersion {
                 run: run.id,
