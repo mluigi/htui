@@ -13,10 +13,12 @@
 //! command that was asked for and could not be run, and it never fails a step (`:443`).
 //!
 //! The shell is plan D30's: `sh -c` on Unix, `cmd /C` on Windows, with the process environment
-//! unchanged, stdout and stderr merged, masked by the engine's `Scrubber` before it is handed
-//! back, under a semaphore keyed `verify`. The process handling is `isolate/git.rs`'s
+//! unchanged, stdout and stderr merged and tail-capped at 64 KiB, masked by the engine's
+//! `Scrubber` before it is handed back, under a semaphore keyed `verify`, and with the step
+//! deadline's remainder as the timeout. The process handling is `isolate/git.rs`'s
 //! [`Cli`](crate::isolate::git::Cli) contract verb for verb — a supervised child whose whole group
-//! a kill reaches, and both pipes read concurrently so neither can fill and stall it.
+//! a kill reaches, both pipes read concurrently so neither can fill and stall it, and the cap kept
+//! at the **tail**, because the end of a build that failed is the part worth reading.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -33,6 +35,7 @@ use htui_core::scrub::Scrubber;
 use tokio::io::AsyncReadExt as _;
 
 use crate::isolate::Clock;
+use crate::isolate::git::{CAPTURE_TAIL, TailBuffer};
 
 /// `command_run.class` for every row this milestone writes, and the `command_limits` key the
 /// class semaphore is sized from (`docs/ANA-2.md:501-505`, `0003_orchestration.sql:129`).
@@ -59,6 +62,18 @@ const SHELL: (&str, &str) = ("cmd", "/C");
 #[must_use]
 pub fn no_primary_tree() -> String {
     "no primary tree".to_owned()
+}
+
+/// The step deadline's remainder ran out — in the class queue, or during the run itself
+/// (`docs/ANA-2.md:515`).
+///
+/// The step still settles `failed` one stage later, and on the deadline rather than on this: the
+/// remainder this verifier spent is exactly what was left of `deadline_seconds`, so `settle`'s own
+/// elapsed-deadline rule has tripped by the time it reads the outcome. `unavailable` never fails a
+/// step (`:443`) and does not have to here.
+#[must_use]
+pub fn deadline_elapsed() -> String {
+    "deadline elapsed".to_owned()
 }
 
 /// The child died without an exit code, so there is no `verify_exit_code` to record.
@@ -252,17 +267,51 @@ impl ShellVerifier {
         let Some(cwd) = request.cwd else {
             return Some(self.without_running(no_primary_tree()));
         };
+        if request.remaining == Some(Duration::ZERO) {
+            return Some(self.without_running(deadline_elapsed()));
+        }
 
         // One permit of the `verify` class, which is what makes a fan-out of four `cargo test`
         // runs on one box queue rather than thrash it (`docs/ANA-2.md:502-506`). Held until the
         // report is stamped, so two runs of a one-permit class never overlap.
-        let _permit = self.permits.acquire().await.ok();
+        //
+        // The wait counts against the remainder (plan D30): a step whose deadline expires while
+        // it is queued behind three other `cargo test`s never gets to start one of its own.
+        let queued_at = tokio::time::Instant::now();
+        let _permit = match request.remaining {
+            Some(remaining) => {
+                match tokio::time::timeout(remaining, self.permits.acquire()).await {
+                    Ok(permit) => permit.ok(),
+                    Err(_elapsed) => return Some(self.without_running(deadline_elapsed())),
+                }
+            }
+            None => self.permits.acquire().await.ok(),
+        };
+        let budget = match request.remaining {
+            Some(remaining) => {
+                let left = remaining.saturating_sub(queued_at.elapsed());
+                if left.is_zero() {
+                    return Some(self.without_running(deadline_elapsed()));
+                }
+                Some(left)
+            }
+            None => None,
+        };
 
-        Some(self.spawn_and_wait(&command, &cwd, request.step).await)
+        Some(
+            self.spawn_and_wait(&command, &cwd, budget, request.step)
+                .await,
+        )
     }
 
-    /// Steps 3 to 5 of plan D30: the child, its two pipes, and how it ended.
-    async fn spawn_and_wait(&self, command: &str, cwd: &Path, step: StepId) -> VerifyReport {
+    /// Steps 3 to 5 of plan D30: the child, its two pipes, the budget, and how it ended.
+    async fn spawn_and_wait(
+        &self,
+        command: &str,
+        cwd: &Path,
+        budget: Option<Duration>,
+        step: StepId,
+    ) -> VerifyReport {
         let started_at = self.clock.now();
         // The process environment is handed to the child unchanged (plan D30): ANA-2 `:493` asks
         // for "the agent's environment minus the secrets" and the walk's `SessionSpec.env` is
@@ -292,18 +341,23 @@ impl ShellVerifier {
         // One buffer for both pipes: D30 merges them, and merging at the chunk is the only place
         // the interleaving the command produced still exists. Both are drained concurrently so
         // neither can fill and stall the child, exactly as `Cli::run` does.
-        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::new(Mutex::new(TailBuffer::new(CAPTURE_TAIL)));
         let stdout = child.stdout().take();
         let stderr = child.stderr().take();
-        let ended = {
+        let run = async {
             tokio::join!(drain(stdout, &captured), drain(stderr, &captured), async {
                 child.wait().await
             })
             .2
         };
 
+        let ended = match budget {
+            Some(budget) => tokio::time::timeout(budget, run).await,
+            None => Ok(run.await),
+        };
+
         match ended {
-            Ok(status) => {
+            Ok(Ok(status)) => {
                 let output = take_output(&captured);
                 match status.code() {
                     Some(0) => self.finished(VerifyOutcome::Pass, Some(0), output, started_at),
@@ -320,12 +374,24 @@ impl ShellVerifier {
                     ),
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 let output = take_output(&captured);
                 self.finished(
                     VerifyOutcome::Unavailable,
                     None,
                     with_output(cannot_wait(&err), output),
+                    started_at,
+                )
+            }
+            Err(_elapsed) => {
+                // The group on Unix, the job object on Windows: a `cargo test` that spawned test
+                // binaries must not outlive the verify that started it.
+                let _ = Box::into_pin(child.kill()).await;
+                let output = take_output(&captured);
+                self.finished(
+                    VerifyOutcome::Unavailable,
+                    None,
+                    with_output(deadline_elapsed(), output),
                     started_at,
                 )
             }
@@ -353,21 +419,21 @@ fn with_output(reason: String, output: String) -> String {
     }
 }
 
-/// Everything captured so far, leaving the buffer empty.
+/// Everything the cap kept, leaving the buffer empty.
 ///
-/// Lossily decoded: a command's output is bytes and this column is `TEXT`.
-fn take_output(captured: &Mutex<Vec<u8>>) -> String {
+/// Lossily decoded: a command's output is bytes and `command_run.output` is `TEXT`.
+fn take_output(captured: &Mutex<TailBuffer>) -> String {
     let mut guard = captured
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    String::from_utf8_lossy(&std::mem::take(&mut *guard)).into_owned()
+    std::mem::replace(&mut *guard, TailBuffer::new(CAPTURE_TAIL)).into_string()
 }
 
-/// Drains `reader` into the shared buffer, stopping at end of stream or at the first pipe error.
+/// Drains `reader` into the shared tail, stopping at end of stream or at the first pipe error.
 ///
 /// The lock is taken per chunk and never held across an `.await`, so the two drains interleave in
 /// the order the bytes arrived.
-async fn drain(reader: Option<impl tokio::io::AsyncRead + Unpin>, captured: &Mutex<Vec<u8>>) {
+async fn drain(reader: Option<impl tokio::io::AsyncRead + Unpin>, captured: &Mutex<TailBuffer>) {
     let Some(mut reader) = reader else {
         return;
     };
@@ -378,7 +444,7 @@ async fn drain(reader: Option<impl tokio::io::AsyncRead + Unpin>, captured: &Mut
             Ok(read) => captured
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .extend_from_slice(&chunk[..read]),
+                .push(&chunk[..read]),
         }
     }
 }
@@ -430,6 +496,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use htui_core::model::{StepId, VerifyOutcome};
     use htui_core::scrub::MinimalScrubber;
@@ -442,6 +509,17 @@ mod tests {
         ShellVerifier::new(
             &BTreeMap::new(),
             Arc::new(MinimalScrubber::new([])),
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// A verifier that masks `secrets`, `verify = 1` as shipped.
+    fn verifier_masking(secrets: &[&str]) -> ShellVerifier {
+        ShellVerifier::new(
+            &BTreeMap::new(),
+            Arc::new(MinimalScrubber::new(
+                secrets.iter().copied().map(str::to_owned),
+            )),
             Arc::new(SystemClock),
         )
     }
@@ -574,6 +652,174 @@ mod tests {
                 .output
                 .starts_with("cannot spawn /nonexistent/htui-no-shell-here: "),
             "unexpected reason: {}",
+            report.output
+        );
+    }
+
+    /// `docs/ANA-2.md:515` lists an elapsed deadline among `unavailable`'s causes, and a remainder
+    /// of zero has already elapsed: there is nothing left to run the command in, so nothing is
+    /// spawned at all. The step still settles `failed` one stage later, on the deadline itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_zero_remainder_never_spawns() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let marker = dir.path().join("spawned");
+        let report = verifier()
+            .run(VerifyRequest {
+                command: Some(format!("touch {}", marker.display())),
+                cwd: Some(dir.path().to_path_buf()),
+                remaining: Some(Duration::ZERO),
+                step: StepId::new(),
+            })
+            .await
+            .expect("a report");
+        assert_eq!(report.outcome, VerifyOutcome::Unavailable);
+        assert_eq!(report.exit_code, None);
+        assert_eq!(report.output, "deadline elapsed");
+        assert!(!marker.exists(), "an elapsed deadline spawns nothing");
+    }
+
+    /// Plan D30's timeout is the step deadline's remainder, and on expiry the **group** is killed:
+    /// a `cargo test` that spawned test binaries must not outlive the verify that started it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_is_unavailable_and_kills_the_group() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let pidfile = dir.path().join("pid");
+        let report = verifier()
+            .run(VerifyRequest {
+                command: Some(format!("sleep 30 & echo $! > {}; wait", pidfile.display())),
+                cwd: Some(dir.path().to_path_buf()),
+                remaining: Some(Duration::from_millis(500)),
+                step: StepId::new(),
+            })
+            .await
+            .expect("a report");
+        assert_eq!(report.outcome, VerifyOutcome::Unavailable);
+        assert_eq!(report.exit_code, None);
+        assert!(
+            report.output.starts_with("deadline elapsed"),
+            "unexpected reason: {}",
+            report.output
+        );
+
+        // The grandchild is the one the group kill has to reach: the shell would have died with
+        // its own kill either way, and `sleep 30` is what a runaway build looks like.
+        let pid = std::fs::read_to_string(&pidfile).expect("the shell recorded its child's pid");
+        let pid: u32 = pid.trim().parse().expect("a pid");
+        #[cfg(target_os = "linux")]
+        {
+            let alive = PathBuf::from(format!("/proc/{pid}"));
+            for _ in 0..40 {
+                if !alive.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(!alive.exists(), "the group survived the timeout: {pid}");
+        }
+    }
+
+    /// Plan D30 again: the wait for a class permit counts against the remainder, so a step whose
+    /// deadline expires while it is queued behind another `cargo test` never starts one of its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_queue_wait_counts_against_the_remainder() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let verifier = verifier();
+        let marker = dir.path().join("second");
+
+        let holding = verifier.run(request("sleep 2", dir.path().to_path_buf()));
+        let queued = async {
+            // Long enough for the first request to be holding the one permit.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            verifier
+                .run(VerifyRequest {
+                    command: Some(format!("touch {}", marker.display())),
+                    cwd: Some(dir.path().to_path_buf()),
+                    remaining: Some(Duration::from_millis(300)),
+                    step: StepId::new(),
+                })
+                .await
+        };
+        let (_first, second) = tokio::join!(holding, queued);
+
+        let second = second.expect("a report");
+        assert_eq!(second.outcome, VerifyOutcome::Unavailable);
+        assert_eq!(second.output, "deadline elapsed");
+        assert!(!marker.exists(), "the queued command never ran");
+    }
+
+    /// `docs/ANA-2.md:502-506`: the class limit is the whole point of running verify through the
+    /// queue, so two requests of a one-permit class do not overlap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_verify_semaphore_admits_one() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let verifier = verifier();
+        let (first, second) = tokio::join!(
+            verifier.run(request("sleep 0.3", dir.path().to_path_buf())),
+            verifier.run(request("sleep 0.3", dir.path().to_path_buf()))
+        );
+        let first = first.expect("a report");
+        let second = second.expect("a report");
+        assert_eq!(first.outcome, VerifyOutcome::Pass);
+        assert_eq!(second.outcome, VerifyOutcome::Pass);
+        assert!(
+            first.finished_at <= second.started_at || second.finished_at <= first.started_at,
+            "the two runs overlapped: {first:?} and {second:?}"
+        );
+    }
+
+    /// Plan D30's 64 KiB is a **tail** cap — the end of a failing build is the part worth
+    /// keeping — and what survives it is masked before anyone can persist it (`R-SEC-3`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_is_tail_capped_and_masked() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let report = verifier_masking(&["s3cret"])
+            .run(request(
+                "echo START-MARKER; yes filler-line | head -c 100000; echo; echo s3cret",
+                dir.path().to_path_buf(),
+            ))
+            .await
+            .expect("a report");
+
+        assert_eq!(report.outcome, VerifyOutcome::Pass);
+        assert!(
+            !report.output.contains("START-MARKER"),
+            "the head was kept, so the cap is not a tail cap"
+        );
+        assert!(
+            !report.output.contains("s3cret"),
+            "an unmasked secret reached the report"
+        );
+        assert!(
+            report.output.contains("[REDACTED]"),
+            "the secret was not masked, it was lost"
+        );
+    }
+
+    /// `R-SEC-3` is fail-closed: an output the scrubber refuses is not persistable at all, so the
+    /// text is dropped. The outcome and the exit code are facts about the run and survive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_scrub_refusal_withholds_the_output_and_keeps_the_outcome() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let report = verifier()
+            .run(request(
+                "echo token=sk-ant-notarealkey; exit 2",
+                dir.path().to_path_buf(),
+            ))
+            .await
+            .expect("a report");
+
+        assert_eq!(report.outcome, VerifyOutcome::Fail);
+        assert_eq!(report.exit_code, Some(2));
+        assert!(
+            report.output.starts_with("<scrub refused: ")
+                && report.output.ends_with(" bytes withheld>"),
+            "unexpected output: {}",
             report.output
         );
     }
