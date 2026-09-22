@@ -117,6 +117,12 @@ pub struct VerifyRequest {
 }
 
 /// One run of the command, in `command_run`'s shape (plan D31 builds the row from this).
+///
+/// The row's `status` is a function of [`outcome`](VerifyReport::outcome) and the engine is what
+/// applies it: `pass` and `fail` are both `CommandRunStatus::Done`, because the queue's question
+/// is whether the command completed and `run_step.verify_outcome` is where the two are told apart;
+/// `unavailable` is `CommandRunStatus::Failed`, the row behind a command that never ran
+/// (`docs/ANA-2.md:515`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
     /// `run_step.verify_outcome`.
