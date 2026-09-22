@@ -482,13 +482,28 @@ impl Cli {
     /// [`IsolateError::Refused`] with [`merge_conflict`] for a real conflict;
     /// [`IsolateError::Git`] for a held lock (retried) or any other non-zero exit; whichever error
     /// `merge --abort` produced, if the abort is what failed — the primary is then mid-merge and
-    /// the operator has to be told so.
+    /// the operator has to be told so; [`IsolateError::Git`] from the conflicted-paths read when
+    /// that read failed and the abort after it succeeded.
     pub async fn merge_no_ff(
         &self,
         primary: &Path,
         step: StepId,
         before: &str,
         after: &str,
+    ) -> Result<Merged, IsolateError> {
+        self.merge_no_ff_reading(primary, step, before, after, conflicted_paths)
+            .await
+    }
+
+    /// [`merge_no_ff`](Cli::merge_no_ff) with the conflicted-paths read passed in: the only seam
+    /// through which a test can make that read fail while leaving the index `--abort` needs intact.
+    async fn merge_no_ff_reading(
+        &self,
+        primary: &Path,
+        step: StepId,
+        before: &str,
+        after: &str,
+        read_conflicts: fn(&Path) -> Result<Vec<String>, IsolateError>,
     ) -> Result<Merged, IsolateError> {
         let message = format!("htui: reconcile {step}");
         let exited = self
@@ -521,16 +536,27 @@ impl Cli {
         }
 
         // A lock, a conflict or anything else: read the paths first, because `--abort` throws the
-        // stage entries away, then restore the primary, then classify.
+        // stage entries away, then restore the primary, then classify. A read that fails must not
+        // skip the abort — that would leave `MERGE_HEAD` in the user's tree — so it is held until
+        // the primary is restored and surfaced only then.
+        let mut read_failed = None;
         let conflicted = if exited.code == Some(1) && lock_signature(&exited.stderr).is_none() {
             let read = primary.to_path_buf();
-            blocking(move || conflicted_paths(&read)).await?
+            blocking(move || read_conflicts(&read))
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(%err, "the conflicted paths could not be read; aborting anyway");
+                    read_failed = Some(err);
+                    Vec::new()
+                })
         } else {
             Vec::new()
         };
         with_retry("merge --abort", || self.abort_merge(primary)).await?;
 
-        if conflicted.is_empty() {
+        if let Some(err) = read_failed {
+            Err(err)
+        } else if conflicted.is_empty() {
             Err(exited.failure("merge"))
         } else {
             Err(IsolateError::Refused(merge_conflict(&conflicted)))
@@ -2232,6 +2258,42 @@ mod tests {
             !repo.join(".git").join("MERGE_HEAD").exists(),
             "--abort ran before the refusal"
         );
+    }
+
+    /// The doc of `merge_no_ff` promises every failing path aborts the half-merge. A conflicted-
+    /// paths read that fails must not skip the abort and leave `MERGE_HEAD` and the stage entries
+    /// in the user's primary tree; its error surfaces only after the primary is restored.
+    #[tokio::test]
+    async fn a_failed_conflict_read_still_aborts_the_merge() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let base = repo_with_one_commit(&repo);
+        let step = htui_core::model::StepId::new();
+
+        let tree = dir.path().join("tree");
+        git.add_worktree(&repo, &tree, step, htui_core::model::RunId::new(), &base)
+            .await
+            .expect("the worktree is added");
+        let after = commit_file(&tree, "f", "the agent's line\n", "the step's work");
+        let before = commit_file(&repo, "f", "the human's line\n", "meanwhile");
+
+        let err = git
+            .merge_no_ff_reading(&repo, step, &before, &after, |_| {
+                Err(IsolateError::Git("the index could not be read".to_owned()))
+            })
+            .await
+            .expect_err("the read failed");
+        assert_eq!(err.to_string(), "git: the index could not be read");
+        assert!(
+            !repo.join(".git").join("MERGE_HEAD").exists(),
+            "--abort ran although the read failed"
+        );
+        assert_eq!(super::head(&repo).expect("HEAD reads"), before);
+        assert!(!super::is_dirty(&repo).expect("status reads"), "and clean");
     }
 
     /// Blueprint H-8: exit 1 is both "conflict" and "`index.lock` held", and only the second is
