@@ -3678,10 +3678,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Plan D66-D68: an offline chat latches no allowance and says why, decided at chat start
-    /// rather than discovered on the first `usage` row.
-    ///
-
     /// The latch, wired: a chat that reports a cost leaves `agent_box.quota` on the row it ran on.
     ///
     /// T39 proved the recorder latches; this proves the **worker hands it a latch**, which is a
@@ -4193,9 +4189,6 @@ pub(crate) mod tests {
             "a row probed a minute ago is not re-probed"
         );
     }
-
-    /// Plan D52 for the chat path: a `Writer::Buffered` refuses `upsert_agent_box`, so a re-probe
-    /// against one would spawn an adapter to throw its answer away.
 
     /// An `acp` registry row whose command exists nowhere.
     ///

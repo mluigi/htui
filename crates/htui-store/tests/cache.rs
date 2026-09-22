@@ -15,8 +15,6 @@
 
 use htui_store::testkit as common;
 
-use std::path::Path;
-
 use chrono::{SubsecRound as _, TimeDelta, Utc};
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{

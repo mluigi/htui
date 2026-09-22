@@ -42,19 +42,10 @@ use htui_agent::event::{
 };
 use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
-use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, EventKind, ProjectId, SessionEvent, Transport,
-};
-use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use htui_core::model::{Agent, AgentBox, AgentId, Billing, Transport};
+use htui_core::store::{MemStore, WriteStore as _};
 use htui_store::{Backend, CacheStore, PgStore, testkit};
 use serde_json::json;
-
-/// The fake mints a fresh session id per session, so the header's would differ on every run.
-fn stable() -> insta::Settings {
-    let mut settings = insta::Settings::clone_current();
-    settings.add_filter(r"fake-[0-9a-f-]{36}", "fake-<session>");
-    settings
-}
 
 /// A registry row the factory reaches by **row data**: `acp`, so the session is fully capable and
 /// the tab draws no capability banner over the header this test is about (plan D12).
@@ -197,44 +188,6 @@ fn one_turn() -> Script {
     ])
 }
 
-/// The sealed buffer of a run, as `<project>.<run>.jsonl` parsed back into rows.
-///
-/// Panics rather than answering an error: a missing buffer *is* the failure this suite reports.
-fn sealed_buffer(cache: &CacheStore) -> (ProjectId, Vec<SessionEvent>) {
-    let pending = cache.dir().join("pending");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&pending)
-        .expect("the pending directory exists")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .collect();
-    files.sort();
-    assert!(
-        files
-            .iter()
-            .all(|path| path.extension().is_some_and(|ext| ext != "open")),
-        "a chat that has ended leaves no `.open` buffer behind (`[H-1]`): {files:?}"
-    );
-    assert_eq!(files.len(), 1, "one chat, one buffer: {files:?}");
-
-    let stem = files[0]
-        .file_stem()
-        .and_then(std::ffi::OsStr::to_str)
-        .expect("a buffer name");
-    let project: ProjectId = stem
-        .split_once('.')
-        .expect("the name is <project>.<run>.jsonl")
-        .0
-        .parse()
-        .expect("the name's first half is a project id");
-    let rows = std::fs::read_to_string(&files[0])
-        .expect("the buffer reads")
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<SessionEvent>(line).expect("a line is a session_event"))
-        .collect();
-    (project, rows)
-}
-
 /// MOD-25, from the shell: a box whose Postgres is unreachable **refuses** the chat instead of
 /// buffering it. The refusal is the one sentence `htui_store::DATABASE_UNREACHABLE` carries, and
 /// the proof that the buffer is disabled is negative on both sides — no step was minted, and
@@ -270,28 +223,6 @@ async fn an_offline_chat_is_refused_with_the_unreachable_warning() {
 
     cache.close().await;
 }
-
-/// D42: an offline chat says so, in the one place a chat is visible — its header. An offline chat
-/// is in no `run` table until it is uploaded, so nothing else on screen can say it happened.
-///
-/// The photograph is of an *ended* chat rather than a live one because that is the only state a
-/// buffered chat can be photographed in without a race (`Harness::drive_to_end`); the header line
-/// the case is about is the same either way, and the transcript above it is the live renderer's.
-
-/// `R-HIS-1` for the offline case, and the first half of §11 criterion 12: the rows a live chat
-/// would have sent to Postgres are on disk instead, in `seq` order, under the step the runtime
-/// minted — and the buffer is sealed once the chat ends, so the uploader may take it (`[H-1]`).
-
-/// §11 criterion 12, end to end: the buffer a driver wrote with the store unreachable is landed by
-/// `upload_pending` on the next connection, row for row, and a second pass changes nothing.
-///
-/// This is the half no other suite can prove. `htui-store`'s own upload cases write their buffers
-/// by hand, so they cannot notice the recorder and the uploader drifting apart; here the rows come
-/// out of the production recorder and go into the production uploader.
-
-/// D33's refusal, from the shell: a mirror this box has synced *without* an `app_user` row for this
-/// OS user cannot name `run.started_by`, and inventing one would make the uploader insert a
-/// stranger as the chat's author. The refusal says which row is missing.
 
 /// The negative of the header case: a chat that records into a store the maintainer can read back
 /// says nothing about a buffer, so none of the eight `chat__*` snapshots moves.

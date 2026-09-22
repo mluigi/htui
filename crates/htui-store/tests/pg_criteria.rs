@@ -775,33 +775,6 @@ async fn five_thousand_events_replay_in_seq_order() {
     db.drop_db().await;
 }
 
-/// MOD-2 plan D4, **online first**: the two rows `start_chat_run` mints are the two rows the
-/// offline buffer's upload would address for the same chat, so the two paths converge on one pair
-/// instead of colliding.
-///
-/// The chat is started **online**, then the very same events are buffered to a `pending/` file and
-/// uploaded, which is the offline path arriving late. Both `ON CONFLICT (id) DO NOTHING` clauses
-/// must make that upload a no-op on the `run` and `run_step` rows and the
-/// `PRIMARY KEY (run_step_id, seq)` a no-op on every event, so the database still holds exactly one
-/// run, one step and one copy of each event, with the online path's column values untouched.
-///
-/// What converges is the row *count*; the columns belong to whichever path landed first. The
-/// mirror image - upload first, online start second - is
-/// [`an_offline_first_chat_keeps_the_uploaded_columns`].
-///
-/// The column values `store::conformance` cannot see - `run_step.usage`, `run_step.prompt_digest`
-/// and every column of the minted pair - are asserted here in SQL, because §6.1 returns none of
-/// summing rule the recorder ran, which is what makes an uploaded step indistinguishable from one
-/// recorded online rather than one with an empty `usage`.
-
-/// A buffer holding the same `(run_step_id, seq)` line twice loads it **once** (M-1).
-///
-/// `session_event` is protected by `ON CONFLICT (run_step_id, seq) DO NOTHING`, so a duplicated
-/// line never becomes a duplicated row - but `run_step.usage` is summed from the parsed lines
-/// before any of that, and a `usage` row counted twice lands a step whose totals are double the
-/// conversation's (criterion 7). The loader therefore drops a repeat itself, keeping the first
-/// occurrence, so it is robust to a duplicate however it got onto the disk.
-
 /// Plan D15(b) on Postgres: `set_step_usage` overwrites `run_step.usage` on every call, and
 /// `COALESCE($3, prompt_digest)` keeps the stored digest when the caller supplies `None`.
 ///
