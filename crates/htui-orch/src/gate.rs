@@ -417,7 +417,7 @@ pub async fn apply<S: WriteStore, C: Clock + ?Sized>(
                 )
                 .await?;
             let step = reread(ctx, step).await?;
-            match review_loop(ctx, &step, &verdict_line).await? {
+            match review_loop(ctx, &step).await? {
                 LoopOutcome::Resumed { .. } => Ok(Landing::Advance),
                 LoopOutcome::Escalated { attempts, .. } => Ok(Landing::Rest(Rest {
                     run: RunStatus::AwaitingApproval,
@@ -644,7 +644,6 @@ pub enum LoopOutcome {
 pub async fn review_loop<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     review: &RunStep,
-    verdict_line: &str,
 ) -> Result<LoopOutcome, EngineError> {
     let now = ctx.clock.now();
     let Some(target) = loop_target(ctx.snapshot, review.position) else {
@@ -703,7 +702,6 @@ pub async fn review_loop<S: WriteStore, C: Clock + ?Sized>(
         return escalate(ctx, review, impl_phase, attempt, LoopStop::Exhausted, now).await;
     }
 
-    let _ = verdict_line; // already on the step's `gate_note`; kept for the caller's contract.
     retire(ctx, &steps, target, review.position, now).await?;
     Ok(LoopOutcome::Resumed {
         position: target,

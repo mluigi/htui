@@ -143,13 +143,9 @@ async fn a_sparse_snapshot_does_not_index_past_the_phase_array() {
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
     };
-    let outcome = review_loop(
-        &ctx,
-        &row(&store, run.id, review).await,
-        "verdict: request-changes",
-    )
-    .await
-    .expect("the loop reads rows and writes rows; neither refuses here");
+    let outcome = review_loop(&ctx, &row(&store, run.id, review).await)
+        .await
+        .expect("the loop reads rows and writes rows; neither refuses here");
 
     assert_eq!(
         outcome,
@@ -205,13 +201,9 @@ async fn an_unsorted_snapshot_picks_the_phase_whose_position_matches() {
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
     };
-    let outcome = review_loop(
-        &ctx,
-        &row(&store, run.id, review).await,
-        "verdict: request-changes",
-    )
-    .await
-    .expect("the loop reads rows and writes rows; neither refuses here");
+    let outcome = review_loop(&ctx, &row(&store, run.id, review).await)
+        .await
+        .expect("the loop reads rows and writes rows; neither refuses here");
 
     assert_eq!(
         outcome,
@@ -261,13 +253,9 @@ async fn a_sparse_snapshot_with_no_predecessor_refuses_by_name() {
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
     };
-    let outcome = review_loop(
-        &ctx,
-        &row(&store, run.id, step).await,
-        "verdict: request-changes",
-    )
-    .await
-    .expect("a terminal review is a refusal, not an error");
+    let outcome = review_loop(&ctx, &row(&store, run.id, step).await)
+        .await
+        .expect("a terminal review is a refusal, not an error");
 
     assert_eq!(outcome, LoopOutcome::NoTarget);
     assert_eq!(

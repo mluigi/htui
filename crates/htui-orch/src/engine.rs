@@ -388,8 +388,8 @@ where
         // would earn `StoreError::Constraint`.
         self.unpark(&run, now).await?;
 
-        let rest = if let GateAnswer::Rejected { note } = &answer {
-            self.after_rejection(&run, &snapshot, &step, &phase, note, now)
+        let rest = if matches!(answer, GateAnswer::Rejected { .. }) {
+            self.after_rejection(&run, &snapshot, &step, &phase, now)
                 .await?
         } else {
             self.run_to_rest(run.id).await?
@@ -405,7 +405,6 @@ where
         snapshot: &GraphSnapshot,
         step: &RunStep,
         phase: &SnapshotPhase,
-        note: &str,
         now: DateTime<Utc>,
     ) -> Result<Rest, EngineError> {
         let loopable =
@@ -436,7 +435,7 @@ where
 
         let run = self.run(run.id).await?;
         let ctx = self.gate_context(&run, snapshot);
-        match gate::review_loop(&ctx, step, note).await? {
+        match gate::review_loop(&ctx, step).await? {
             LoopOutcome::Resumed { .. } => self.run_to_rest(run.id).await,
             LoopOutcome::Escalated { attempts, .. } => Ok(Rest {
                 run: RunStatus::AwaitingApproval,
