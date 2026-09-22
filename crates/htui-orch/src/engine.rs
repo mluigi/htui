@@ -455,6 +455,20 @@ where
     /// attempt.
     async fn retry_step(&self, run: RunId, step: StepId) -> Result<CommandOutcome, EngineError> {
         let run = self.run(run).await?;
+        // `command::retry_enabled` is a pure function of the step row and says so: the run's own
+        // status is "the engine's, at dispatch" (`command.rs:266-268`). This is that check. On a
+        // terminal run every write below is a no-op that still creates a step — `unpark`'s two
+        // compare-and-sets find a stale `from` and answer `Ok(false)`, while `create_step` refuses
+        // no terminal run on either backend — so the run would gain an orphan `pending` step it can
+        // never walk, and the command would report success (ANA-2 §4.3's run table has no edge out
+        // of `done`, `failed` or `cancelled`, `docs/ANA-2.md:614`).
+        if !matches!(run.status, RunStatus::Running | RunStatus::AwaitingApproval) {
+            return Err(EngineError::RunStatus {
+                run: run.id,
+                status: run.status,
+                expected: "running | awaiting_approval",
+            });
+        }
         let snapshot = Self::snapshot_of(&run)?;
         let row = self.step(run.id, step).await?;
         let phase = Self::phase_at(&snapshot, row.position)?;
@@ -2343,6 +2357,92 @@ mod tests {
             ),
             "{refused}"
         );
+    }
+
+    /// A terminal run has nothing to retry onto: §6.2's `retry` needs a run a human can still
+    /// influence, and `command::retry_enabled` deliberately does not check it (`command.rs:266-268`
+    /// names the check as the engine's, at dispatch). Without it the guard passes on a `failed`
+    /// run, `unpark` writes nothing, stage 1 creates an orphan `pending` step under a run that will
+    /// never walk again, and `CommandOutcome::Retried` reports success.
+    #[tokio::test]
+    async fn retry_on_a_terminal_run_is_refused_and_writes_nothing() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+
+        // A kind nothing in the graph produces: the run fails at stage 3 and the step is `failed`
+        // at attempt 1, which is exactly the pair `retry_enabled` admits.
+        let graph = harness
+            .orch
+            .store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("FEAT-3 resolves to the `feature` graph");
+        let prd = &graph.phases[0].phase;
+        harness
+            .orch
+            .store
+            .update_phase(
+                prd.id,
+                prd.updated_at,
+                PhasePatch {
+                    input_kinds: Some(vec!["spec".to_owned()]),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect("the phase exists");
+
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(rest.run, RunStatus::Failed);
+
+        let before = harness.orch.steps(run).await;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].status, StepStatus::Failed);
+        assert_eq!((before[0].position, before[0].attempt), (0, 1));
+
+        let refused = harness
+            .dispatch(Command::RetryStep {
+                run,
+                step: before[0].id,
+            })
+            .await
+            .expect_err("a terminal run cannot be retried");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::RunStatus {
+                    status: RunStatus::Failed,
+                    expected: "running | awaiting_approval",
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+
+        let after = harness.orch.steps(run).await;
+        assert_eq!(
+            after
+                .iter()
+                .map(|step| (step.position, step.attempt, step.status))
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|step| (step.position, step.attempt, step.status))
+                .collect::<Vec<_>>(),
+            "the refusal writes nothing: no orphan `pending` step at (0,2)"
+        );
+        assert_eq!(harness.orch.run(run).await.status, RunStatus::Failed);
     }
 
     /// ANA-2 §12 criterion 2 (`:2088`): a live run reads its snapshot, never the graph.
