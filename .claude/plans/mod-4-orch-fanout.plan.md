@@ -37,8 +37,8 @@ agents. Reviewer: `rust-reviewer` (`.claude/workflow-config.json:2`).
 **Numbering**: the tree plan's decision table runs to **D47** (`mod-4-orch-tree.plan.md:192`; no
 higher `D` number appears in it or in its blueprint), so this plan starts at **D48**.
 
-**Status**: fact-checked, amended, awaiting CONFIRM. Branch `mod-4-m4`; nothing is committed by
-this plan. The independent fact-check (318 claims) and how every non-confirmed finding was
+**Status**: fact-checked, amended, **CONFIRMED by the maintainer 2026-09-23** (answers under "Open
+questions"; OQ-7 adds D71 and spawns MOD-36/ANA-21). Branch `mod-4-m4`. The independent fact-check (318 claims) and how every non-confirmed finding was
 resolved are in the last section.
 
 **Graphify note**: `graphify-out/GRAPH_REPORT.md` was built from `3e34610` (2026-09-15,
@@ -52,7 +52,16 @@ resolved are in the last section.
 
 Each has a default this plan adopts so implementation is not blocked.
 
-- [ ] **OQ-1 — `max_agents_per_run`'s reading refuses a judged 3-way `implement` in the seeded
+**Answered at CONFIRM (maintainer, 2026-09-23):** OQ-1..OQ-6 and OQ-8 take the adopted default;
+the recorded deviations D48 (no re-attempt of a failed candidate), D63 (retries not counted toward
+`max_agents_per_run`) and OQ-3 (`awaiting_approval`, not `blocked`) are accepted. **OQ-7 is
+overridden in direction, not in this milestone's behaviour**: the maintainer wants candidates spread
+across agents, chosen by per-model weights. That is split out as **MOD-36** (weighted assignment)
+blocked on **ANA-21** (weights derived from public sources); this milestone keeps one agent per
+group but makes the agent choice per candidate (**D71**), so MOD-36 plugs in without re-cutting the
+engine.
+
+- [x] **OQ-1 — `max_agents_per_run`'s reading refuses a judged 3-way `implement` in the seeded
       `feature` graph at the default cap of 6.** ANA-2 counts "every candidate plus every judge
       plus every retry attempt planned so far" and refuses "at admission naming the cap and the
       requested figure" (`docs/ANA-2.md:870-875`). Read literally at `StartRun`, the four-phase
@@ -70,7 +79,7 @@ Each has a default this plan adopts so implementation is not blocked.
       `feature` graph itself at the default (`4 × 2 = 8 > 6`). Criterion 8's case uses the two-phase `analysis` graph (`3 + 1 + 1 = 5`).
       **Alternative:** cap the widest position (`max over phases of fan_out + judge`), which never
       bites at the defaults; or raise the default in `0003`'s seed (a data change, not a migration).
-- [ ] **OQ-2 — A diff renderer is needed now, and `gix` 0.87.1 ships only its primitives.** The
+- [x] **OQ-2 — A diff renderer is needed now, and `gix` 0.87.1 ships only its primitives.** The
       judge's candidate block (`docs/ANA-2.md:828`) and the loop's `previous_diff` (M3 D32 moved it
       here) both need a `--stat` plus a unified diff over `before_hash..after_hash`. `gix` has tree
       diffs (`Repository::diff_tree_to_tree`, `gix-0.87.1/src/repository/diff.rs:50`, gated on
@@ -86,7 +95,7 @@ Each has a default this plan adopts so implementation is not blocked.
       `reset --hard`") is **already one verb behind the shipped code** — `merge --abort` runs today
       (`isolate/git.rs:691-697`, `abort_merge`) — so the main thread's amendment adds two verbs,
       `merge --abort` and `diff`.
-- [ ] **OQ-3 — A judge failure parks the item at `awaiting_approval`, not `blocked`.** ANA-2 says
+- [x] **OQ-3 — A judge failure parks the item at `awaiting_approval`, not `blocked`.** ANA-2 says
       the item "goes to `blocked`" (`:861`; §4.3 `:576`), but `Status::can_move_to` has no road
       from `blocked` back to `in_progress` (`crates/htui-core/src/model/item.rs:55`, carried R-4),
       so the human `SelectFanout` criterion 10 requires (`:2113-2114`) could never resume the item
@@ -94,7 +103,7 @@ Each has a default this plan adopts so implementation is not blocked.
       reason in the judge's `gate_note` and an `item_note`. **Alternative:** `blocked` as written,
       with `SelectFanout` moving the item `blocked → open` and the run finishing — which contradicts
       criterion 10's "completes it".
-- [ ] **OQ-4 — The verdict is read from a `judge` document, so until MOD-11 lands every production
+- [x] **OQ-4 — The verdict is read from a `judge` document, so until MOD-11 lands every production
       judge fails and every fan-out is decided by a human.** ANA-2 has the verdict in "a document of
       kind `judge` … parsed from a fenced JSON block" (`:837-846`), and PRD D8 records that no agent
       writes a document before MOD-11 (`:366-370`). **Default adopted (D52):** the document, as
@@ -102,14 +111,14 @@ Each has a default this plan adopts so implementation is not blocked.
       **Alternative:** parse the last fenced `json` block of the judge session's final
       `assistant_text` event, which works today and needs no document — a second source for one
       fact, and a divergence from ANA-5's "emitted by the agent inside the document" (`:1348`).
-- [ ] **OQ-5 — A `review` phase with `fan_out > 1` is refused at snapshot time.** A review
+- [x] **OQ-5 — A `review` phase with `fan_out > 1` is refused at snapshot time.** A review
       candidate's settle can be `rejected` (`crates/htui-orch/src/gate.rs:240`), and there is no
       reading of "select the winning rejection, then loop" that ANA-2 defines; the loop retires by
       position and a rejected winner cannot reach the automatic loop's `awaiting_approval → failed`
       path from `done` (`model/run.rs:127`). No seeded graph fans out (`seed.rs:221`). **Default
       adopted (D64):** `ResolveError::ReviewFanOut`. **Alternative:** a review group's settle is
       the winner's verdict, applied after selection — a second loop entry point.
-- [ ] **OQ-6 — `min_budget_for_new_attempt` has no key.** ANA-2 names the rule (`:1615`,
+- [x] **OQ-6 — `min_budget_for_new_attempt` has no key.** ANA-2 names the rule (`:1615`,
       `:1421-1424`) and reserves no `app_setting` for it (§5.4 `:1509-1522`); PRD `:272` forbids a
       `0004`. **Default adopted (D60):** read an unseeded `app_setting.min_budget_for_new_attempt`
       (USD micros) when present, default `0`, skipping a candidate when `cap − spent < min` with
@@ -117,12 +126,15 @@ Each has a default this plan adopts so implementation is not blocked.
       already skips at `spent >= cap` (`quota.rs:446-455`), so the default changes no verdict.
       **Alternative:** defer the third skip condition to MOD-12, which owns batch accounting
       (`docs/ANA-2.md:1828-1829`).
-- [ ] **OQ-7 — Every candidate of a group runs on the one agent the walk selects.** ANA-2 says
+- [x] **OQ-7 — Every candidate of a group runs on the one agent the walk selects.** ANA-2 says
       "N candidate sessions … on the same prompt" (`:770-773`) and never says whether they spread
       across `phase_agent` rows. **Default adopted (D60):** same agent, same model, N sessions
       (rival sampling; ANA-5's "identical across siblings: required", `:1870`). **Alternative:**
       round-robin over the eligible list, which makes the comparison partly an agent comparison.
-- [ ] **OQ-8 — Phase-level judge columns stay unread (blueprint H-14, carried).** `0003` added
+      **Answer (2026-09-23):** spread across agents by weight — follow-up **MOD-36**, weights from
+      **ANA-21**. This milestone: same agent for every candidate, chosen per candidate through D71's
+      seam.
+- [x] **OQ-8 — Phase-level judge columns stay unread (blueprint H-14, carried).** `0003` added
       `step_graph_phase.judge_agent_id`/`judge_model` (`0003_orchestration.sql:17-22`) but
       `StepGraphPhase` carries neither (`model/kind.rs:177-211`), so the judge resolves from
       `project.settings.judge_agent_id` only and `judge_model` is always `None`
@@ -186,6 +198,7 @@ Nothing crosses into the seam: `select_fanout`, `answer_gate`, `transition_step`
 | D68 | **`DriverFor` and `SessionSink::after_done` gain a `SessionKey { phase: &str, attempt: i32, fanout_index: i32, call: u32 }`.** `DriverFor` becomes `Fn(&SnapshotCandidate, &SessionKey<'_>)`, `after_done(item, step, phase, key, done)`. `FakeOrchestrator` scripts by `(phase, attempt, fanout_index, call)` with fallback to `(phase, attempt)` (every shipped script keeps working). | Three candidates share `(phase, attempt)` and the judge's two calls share `(phase, attempt, -1)`; criteria 8–10 need each to play a different script and write a different document, and `FakeDriver` refuses a second `start` (`htui-agent/src/fake.rs:178-180`). Today's key is `(phase, attempt)` (`engine.rs:160`, `fake.rs:922-935`). |
 | D69 | **`MemStore::set_project_settings(project, Value)`, a tests-only inherent writer beside `set_app_setting` (`mem.rs:434-443`).** | The judge resolves from `project.settings.judge_agent_id` (`graph.rs:483-490`) and no seam writer reaches that column (`update_project` never touches it, M2 blueprint F-F; `graph.rs:835-837`); the conformance cases build on `FakeOrchestrator::demo()` and cannot rebuild the store. Same precedent, same doc sentence. |
 | D70 | **`git worktree add` is serialised per repository inside `GixIsolator`: a second lock table, `adds: Mutex<BTreeMap<RepoId, Arc<tokio::sync::Mutex<()>>>>`, and every `add_worktree`/`add_worktree_on_branch` call in `worktree_at` (`isolate/real.rs:492-528`) runs under that repository's add lock, held for the one `git` child and nothing else.** No retry classification is added for the race. The lock is keyed by repository, independent of D43's `(box, repo)` step guard (which `worktree` mode never takes), and is never held across another lock or an agent session, so it cannot take part in a deadlock. Candidates still prepare concurrently; only the `add` children queue, each for well under a second on this box. | **The fact-check's probe on git 2.43.0** (`LC_ALL=C`, three backgrounded `git worktree add --lock --reason … -b htui/<x> <path> <base>` per round): 720 adds, 2 failures, both `fatal: failed to read .git/worktrees/<id>/commondir: Success` (exit 128, ≈ 0.4 % per add, ≈ 1 % per 3-way group), **no ref-lock collision at all**. M3's classifier matches only the `.lock': File exists` and `Unable to write index` wordings (`isolate/git.rs:844-851`), so `with_retry` would not retry it; and the failed add had **already created `htui/<step>`** with no worktree, so a blind `-b` retry would fail with "a branch named … already exists" (M3 D23). Two ways out: serialise, or classify the `commondir` wording and retry through `add_worktree_on_branch` (`git.rs:492`) after checking the stranded branch points at the base. Serialising removes the race rather than recovering from it, needs no stderr wording that git may change, and costs sub-second queueing on a path that then runs an agent for minutes. **Residual:** another process's own `git worktree add` on the same repository can still race ours; that is the one case left, and it fails the candidate readably (D48). |
+| D71 | **`AgentSelector::select` gains `fanout_index: i32` and is called once per candidate (`-1` never: the judge's agent is the project judge, D51).** `select(phase, eligible, fanout_index)`; `FirstCandidate` ignores the index, so every candidate of a group still runs on the first eligible agent (OQ-7's default behaviour). Each candidate's `run_step.agent_id`/`model`, driver and session key come from its own selection, never from a group-level variable; D60's substitution note is written per candidate whose choice skipped a higher-priority row. A `fan_out = 1` phase calls it with `0`. | Maintainer's OQ-7 answer (2026-09-23): candidates must eventually spread across agents by per-model weight (MOD-36, weights from ANA-21). Threading the choice per candidate now costs one argument and keeps the engine from baking in "one agent per group"; MOD-36 then adds a weighted selector behind the unchanged seam. The prompt stays assembled once per group (D58); mixed-family budgeting is MOD-36's open point, recorded on its HANDOFF line. |
 
 ## What this milestone touches from the carried list
 
@@ -457,7 +470,7 @@ real tree with `--test-threads=1`.
   `commits_are_identical` doc gains D66's R-8 paragraph.
 - **Validate**: `cargo test -p htui-orch --all-features -- --test-threads=1`; clippy.
 
-### Task 6: stage 1 is `R-AGT-8`'s walk; the fallback; the forwarded set; session keys (D60, D62, D67, D68)
+### Task 6: stage 1 is `R-AGT-8`'s walk; the fallback; the forwarded set; session keys (D60, D62, D67, D68, D71)
 - **Files**: `crates/htui-orch/src/engine.rs`, `crates/htui-orch/src/graph.rs`,
   `crates/htui-orch/src/fake.rs`, `crates/htui-orch/src/lib.rs`,
   `crates/htui-orch/src/conformance.rs`, `crates/htui-orch/tests/fake_conformance.rs`,
@@ -486,7 +499,7 @@ real tree with `--test-threads=1`.
   writes D60's substitution note, generalises `refuse_capability` to D62's two sentences;
   `start_run` (`:315-367`) handles `ResolveError::NoCandidate` per D62; `assemble_prompt`
   (`:1275-1393`) fills D67; `DriverFor`/`SessionSink`/`dispatch_fake`/`resume_fake`/`fake_parts`
-  per D68; `lib.rs` re-exports `SessionKey`, `select::{walk, Walk, SkipCause}`; `fake.rs` scripts
+  per D68; `AgentSelector::select` gains `fanout_index` and `admit` passes `0` (D71; T7 calls it per candidate), with a unit test that a selector returning a different agent per index is honoured for index 0; `lib.rs` re-exports `SessionKey`, `select::{walk, Walk, SkipCause}`; `fake.rs` scripts
   by `SessionKey` with the `(phase, attempt)` fallback; `tests/gix_isolator.rs`'s `dispatch`
   closure (`:143`) and `CommittingSink::after_done` (`:358-362`) take the key. Both count pins move
   in the same commit: `tests/fake_conformance.rs:14-17` (`cases_len_is_eighteen` → renamed
@@ -495,7 +508,7 @@ real tree with `--test-threads=1`.
   eighteen) are both rewritten, not just the number.
 - **Validate**: `cargo test -p htui-orch --all-features -- --test-threads=1`; clippy.
 
-### Task 7: the fan-out drive, the judge, selection, `SelectFanout` (D48–D53, D58, D59, D65)
+### Task 7: the fan-out drive, the judge, selection, `SelectFanout` (D48–D53, D58, D59, D65, D71)
 - **Files**: `crates/htui-orch/src/engine.rs`, `crates/htui-orch/src/status.rs`,
   `crates/htui-orch/src/command.rs`, `crates/htui-orch/src/fake.rs`, `crates/htui-orch/src/lib.rs`,
   `crates/htui-orch/Cargo.toml`, `Cargo.lock`, `crates/htui-orch/src/conformance.rs`,
@@ -525,7 +538,7 @@ real tree with `--test-threads=1`.
   `max_agents_per_run_is_refused_at_start`.
 - **Action**: `Cargo.toml` `futures = { workspace = true }` (and the lock); `status.rs`'s
   `Cursor::{Fan, Select}` and group-aware `cursor` (D59), `engine.rs`'s two matches updated;
-  `engine.rs` — `admit` creates the whole group; `drive_group` (base via rows or
+  `engine.rs` — `admit` creates the whole group, calling `AgentSelector::select` once per `fanout_index` and taking each candidate's agent/model from its own answer (D71; a `fanout_index`-keyed test selector pins that two indices may differ); `drive_group` (base via rows or
   `isolator.base`, one assembly, `join_all` over `run_candidate`); `run_candidate` (stages 2–5 with
   D48's settle, candidate-level failure); `select_stage` (D49's route, auto-win, `run_judge`,
   `park_selection`); `run_judge` (D51–D53: create, walk, `prepare` Local/empty, two calls, verdicts,

@@ -71,8 +71,27 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   digest input, so a per-model frame means `prompt_digest` is only comparable within one model, and
   every golden snapshot in `crates/htui-core/tests/snapshots/` is re-recorded on each change. Leave
   the current blank line in place until this concludes.
+- [ ] **ANA-21 - Per-model weights for agent assignment, derived from public sources** (from MOD-4
+  milestone 4, OQ-7; maintainer-requested 2026-09-23). `R-AGT-8`, `R-ORCH-7`. Blocks MOD-36.
+  Research how to give each configured agent/model a weight (e.g. Gemini Flash 30, Claude Opus 5.5
+  60) that MOD-36 uses to choose which models run a phase's fan-out candidates. Survey public signals
+  (coding and reasoning benchmarks, leaderboards, published pricing and latency), decide whether
+  weights are per task kind (analysis, implement, review, judge) or global, and whether cost enters
+  the weight or stays a separate quota concern (ANA-4). Deliver: the weight table's schema and where
+  it lives (`agent` row, `app_setting`, or a new table), a refresh method (manual, scripted from
+  named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
 
 ### Next features
+- [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
+  OQ-7; blocked on ANA-21). `R-AGT-8`, `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
+  one agent the walk selects (rival sampling). This item spreads candidates across the eligible
+  agents by weight: a weighted `AgentSelector` (the seam milestone 4 leaves per-candidate) picks each
+  `fanout_index`'s agent from the walk's eligible list using ANA-21's weights, so the judge compares
+  different models on the same task. Open points to settle in the plan: the prompt is assembled once
+  per group, but token budgeting uses one agent's estimator (`TokenEstimator::for_agent`), so mixed
+  families need either the tightest budget or per-candidate trimming, which breaks "identical prompt
+  across siblings" (ANA-5 `:1870`); each candidate draws on its own agent's quota; the judge must not
+  learn which model wrote which candidate (position-bias control extends to model-identity bias).
 - [ ] **MOD-34 - Qdrant related concepts search** (from ANA-19). Update `compose.yaml` to include the `qdrant/qdrant` image. Introduce `VectorStore` trait and `QdrantStore`. Implement local embedding generation using `fastembed-rs` (avoiding external APIs per ANA-20). Implement hybrid search (Dense + BM25) and single-collection payload indexing for `docs/` and items, then wire semantic search to the `search_concepts` MCP tool.
 - [ ] **MOD-33 - The box hostname leaves the digest and gains a settings switch** (from MOD-2,
   finding L-5; maintainer-decided 2026-09-16). `R-PRM-1`, `R-PRM-3`, `R-TUI-8`. Two changes to the
@@ -274,6 +293,9 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   must provide one; **R-8** — `after_hash` becomes the merge commit after reconcile (H-19), so
   milestone 4's no-progress predicate may need the pre-merge hash. Plan:
   `.claude/plans/mod-4-orch-tree.plan.md`; blueprint: `.claude/plans/mod-4-orch-tree.blueprint.md`.
+  **Milestone 4 OQ-7 follow-up: MOD-36** — milestone 4 runs every fan-out candidate on one agent;
+  spreading candidates across agents by weight is MOD-36's (weights from ANA-21). Milestone 4 leaves
+  `AgentSelector::select` called once per candidate with its `fanout_index` so MOD-36 plugs in there.
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
   per-box paths, agent autodiscovery hook. Not blocked (MOD-6 landed,
@@ -502,7 +524,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing)                                 |
-| MOD-N   | 23 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 4 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
+| MOD-N   | 24 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                        |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
