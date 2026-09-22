@@ -4,7 +4,7 @@
 //!
 //! - **The `gix` half** — every *read* and every ref *write*. Synchronous functions over `&Path`
 //!   that return owned values, and every async caller — `isolate/real.rs`, and the verbs' own
-//!   post-conditions below — reaches them through [`blocking`], i.e. under
+//!   post-conditions below — reaches them through `blocking`, i.e. under
 //!   [`tokio::task::spawn_blocking`]; no `gix::Repository` ever crosses an `.await`, because it is
 //!   `Send` and *not* `Sync` (`gix-0.87.1/src/types.rs:148`) and `IsolatorFuture` is `Send`, and
 //!   no status walk ever runs on a runtime worker.
@@ -36,6 +36,21 @@ pub const MIN_GIT: (u32, u32, u32) = (2, 33, 0);
 
 /// One verb's wall-clock budget; on expiry the process group is killed and nothing is retried.
 pub const VERB_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The bound on `git --version` inside [`Cli::probe`], which runs synchronously at worker start.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a killed child gets to be reaped before it is abandoned.
+///
+/// `kill()` is `start_kill()` then `wait()`, and a `wait()` on a child stuck in uninterruptible
+/// sleep (a hung NFS mount) does not return; the caller has already decided the child is over.
+pub(crate) const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// How long the pipes are still read after the verb itself exited.
+///
+/// A hook that daemonises inherits both pipes and holds them open long after `git` returned; the
+/// verb's exit is the answer, and whatever the pipes had not delivered by then is not waited for.
+const PIPE_GRACE: Duration = Duration::from_secs(1);
 
 /// Bytes kept of each of stdout and stderr: the **last** 64 KiB (plan D30's figure).
 ///
@@ -104,6 +119,11 @@ fn version_could_not_run(err: &std::io::Error) -> String {
     format!("git --version could not run: {err}")
 }
 
+/// The `--version` probe did not exit within its bound and was killed.
+fn version_timed_out(bound: Duration) -> String {
+    format!("git --version did not answer within {}", budget_text(bound))
+}
+
 /// The `--version` probe ran and printed something [`Cli::parse_version`] does not recognise.
 fn version_not_understood(line: &str) -> String {
     format!("git --version output is not understood: {line}")
@@ -165,17 +185,55 @@ impl Cli {
     /// # Errors
     /// As [`locate`](Cli::locate), minus the `PATH` lookup.
     pub fn probe(binary: PathBuf) -> Result<Self, IsolateError> {
+        Self::probe_within(binary, PROBE_TIMEOUT)
+    }
+
+    /// [`probe`](Cli::probe) under an explicit bound: a `git` that never answers `--version` is
+    /// killed and refused rather than hanging the synchronous `GixIsolator::new` with it.
+    fn probe_within(binary: PathBuf, bound: Duration) -> Result<Self, IsolateError> {
+        use std::io::Read as _;
+
         let mut probe = std::process::Command::new(&binary);
-        probe.arg("--version").stdin(Stdio::null());
+        probe
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         for key in SCRUBBED_ENV {
             probe.env_remove(key);
         }
         probe.env("LC_ALL", "C").env("GIT_TERMINAL_PROMPT", "0");
 
-        let output = probe
-            .output()
+        let mut child = probe
+            .spawn()
             .map_err(|err| IsolateError::Refused(version_could_not_run(&err)))?;
-        let text = String::from_utf8_lossy(&output.stdout);
+        // The pipe is drained on its own thread, so neither a chatty binary nor a grandchild that
+        // holds the pipe open can stall the bounded wait below.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if let Some(mut stdout) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stdout.read_to_end(&mut bytes);
+                let _ = sender.send(bytes);
+            });
+        }
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(IsolateError::Refused(version_timed_out(bound)));
+                }
+                Err(err) => return Err(IsolateError::Refused(version_could_not_run(&err))),
+            }
+        }
+        let stdout = receiver.recv_timeout(PIPE_GRACE).unwrap_or_default();
+        let text = String::from_utf8_lossy(&stdout);
         let line = text.lines().next().unwrap_or_default().trim();
         let version = Self::parse_version(line)
             .ok_or_else(|| IsolateError::Refused(version_not_understood(line)))?;
@@ -257,7 +315,9 @@ impl Cli {
     /// A non-zero exit is **not** an error here: each verb classifies its own before calling
     /// [`Exited::failure`], because exit 1 means two different things to `git merge` (blueprint
     /// H-8). Both pipes are read concurrently into tail buffers so neither can fill and stall the
-    /// child, and the whole of read-both-then-wait runs under the budget.
+    /// child. The budget bounds the verb's own exit; once it has exited, the pipes get
+    /// `PIPE_GRACE` more and are then dropped, so a daemonising hook that inherited them cannot
+    /// turn a verb that exited 0 into a timeout.
     ///
     /// # Errors
     /// [`IsolateError::Git`] when the spawn is refused, when the wait fails, or when the budget
@@ -283,30 +343,40 @@ impl Cli {
         let stdout = child.stdout().take();
         let stderr = child.stderr().take();
 
-        let collected = tokio::time::timeout(self.budget, async {
-            let (out, err) = tokio::join!(
-                read_tail(stdout, CAPTURE_TAIL),
-                read_tail(stderr, CAPTURE_TAIL)
-            );
-            (out, err, child.wait().await)
+        let out = std::sync::Mutex::new(TailBuffer::new(CAPTURE_TAIL));
+        let err = std::sync::Mutex::new(TailBuffer::new(CAPTURE_TAIL));
+        // Boxed rather than pinned on the stack so that dropping it drops the pipes with it.
+        let mut reading = Box::pin(async {
+            tokio::join!(read_tail(stdout, &out), read_tail(stderr, &err));
+        });
+
+        let waited = tokio::time::timeout(self.budget, async {
+            tokio::select! {
+                status = child.wait() => (status, false),
+                () = &mut reading => (child.wait().await, true),
+            }
         })
         .await;
 
-        match collected {
-            Ok((out, err, status)) => {
+        match waited {
+            Ok((status, drained)) => {
+                if !drained {
+                    let _ = tokio::time::timeout(PIPE_GRACE, &mut reading).await;
+                }
+                drop(reading);
                 let status = status.map_err(|err| {
                     IsolateError::Git(format!("git {verb}: waiting failed: {err}"))
                 })?;
                 Ok(Exited {
                     code: status.code(),
-                    stdout: out.into_string(),
-                    stderr: err.into_string(),
+                    stdout: into_string(out),
+                    stderr: into_string(err),
                 })
             }
             Err(_elapsed) => {
                 // The group on Unix, the job object on Windows: a `git` that spawned a hook or a
                 // pager must not outlive the verb that started it.
-                let _ = Box::into_pin(child.kill()).await;
+                kill_within_grace(child.as_mut(), verb).await;
                 Err(IsolateError::Git(timed_out(verb, self.budget)))
             }
         }
@@ -769,20 +839,34 @@ impl Exited {
 /// .lock': File exists.`, exit 255), an `index.lock` on `reset --hard` (`fatal: Unable to create
 /// '<git_dir>/index.lock': File exists.`, exit 128) and one inside `merge` (`error: Unable to
 /// write index.`, exit **1** — the conflict status, blueprint H-8).
+///
+/// The ref lock is recognised by its `Unable to create '….lock': File exists` clause, not by
+/// `cannot lock ref`: git prints that prefix for a directory/file ref conflict too
+/// (`cannot lock ref 'refs/heads/htui/x': 'refs/heads/htui' exists`), which no sleep resolves.
 #[must_use]
 pub fn lock_signature(stderr: &str) -> Option<&str> {
     stderr.lines().map(str::trim_end).find(|line| {
         (line.contains("Unable to create '") && line.contains(".lock': File exists"))
-            || line.contains("cannot lock ref")
             || line.contains("Unable to write index")
     })
 }
 
+/// `gix`'s own lock contention, behind [`create_branch`]'s `cannot create refs/heads/…: ` prefix:
+/// `gix-lock`'s `PermanentlyLocked` (`gix-lock-24.0.0/src/acquire.rs:49-52`) or `gix-ref`'s
+/// `LockAcquire` (`gix-ref-0.67.1/src/store/file/transaction/prepare.rs:487`).
+fn gix_lock_signature(text: &str) -> bool {
+    text.starts_with("cannot create refs/heads/")
+        && ((text.contains("The lock for resource '") && text.contains("could not be obtained"))
+            || text.contains("A lock could not be obtained for reference"))
+}
+
 /// Whether `err` is worth sleeping over (plan D39).
 ///
-/// Two sources, as D39 names them: `gix`'s own lock errors, whose `Display` carries `.lock` or
-/// `cannot lock` (`gix-lock-24.0.0/src/acquire.rs:44-52`; `gix` acquires with `Fail::Immediately`
-/// and never retries for us), and the `git` CLI's, which [`lock_signature`] recognises.
+/// Two sources, as D39 names them: `gix`'s own lock errors, which `gix_lock_signature`
+/// recognises (`gix` acquires with `Fail::Immediately` and never retries for us), and the `git`
+/// CLI's, which [`lock_signature`] recognises. Exact shapes only: a bare `.lock` or `cannot lock`
+/// substring also matches a ref directory/file conflict or any line that names `Cargo.lock`, and
+/// retrying those three times only delays a failure that is permanent.
 ///
 /// A [`IsolateError::Refused`] is **never** one, even though a conflict path list can perfectly
 /// well contain `Cargo.lock`: a refusal is a decision, not a collision. A timed-out verb is never
@@ -793,9 +877,7 @@ pub fn is_lock_error(err: &IsolateError) -> bool {
         IsolateError::Refused(_) => false,
         IsolateError::Git(text) => {
             !text.contains("timed out")
-                && (text.contains(".lock")
-                    || text.contains("cannot lock")
-                    || text.contains("Unable to write index"))
+                && (lock_signature(text).is_some() || gix_lock_signature(text))
         }
         // `gix::lock` surfaces a held lock as `AlreadyExists` when it surfaces it as `io` at all.
         IsolateError::Io(err) => err.kind() == std::io::ErrorKind::AlreadyExists,
@@ -844,20 +926,55 @@ impl TailBuffer {
     }
 }
 
-/// Drains `reader` into a [`TailBuffer`], stopping at end of stream or at the first pipe error.
-async fn read_tail(reader: Option<impl tokio::io::AsyncRead + Unpin>, cap: usize) -> TailBuffer {
-    let mut tail = TailBuffer::new(cap);
+/// Drains `reader` into `tail`, stopping at end of stream or at the first pipe error.
+///
+/// Into a shared buffer rather than a returned one, so that a read abandoned after the verb exited
+/// ([`PIPE_GRACE`]) still leaves behind everything it had read. The `std` lock is held for one
+/// `push` and never across an `.await`.
+async fn read_tail(
+    reader: Option<impl tokio::io::AsyncRead + Unpin>,
+    tail: &std::sync::Mutex<TailBuffer>,
+) {
     let Some(mut reader) = reader else {
-        return tail;
+        return;
     };
     let mut chunk = vec![0_u8; 8 * 1024];
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(read) => tail.push(&chunk[..read]),
+            Ok(read) => tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(&chunk[..read]),
         }
     }
-    tail
+}
+
+/// The text a shared [`TailBuffer`] holds.
+fn into_string(tail: std::sync::Mutex<TailBuffer>) -> String {
+    tail.into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .into_string()
+}
+
+/// Kills a supervised child's whole group and waits for it — for at most [`KILL_GRACE`].
+///
+/// Shared with `verify.rs`. A child that is not reaped in time is abandoned with a warning: the
+/// caller has already decided it is over, and a `wait()` that never returns must not take the
+/// verb, or the run, with it.
+pub(crate) async fn kill_within_grace(
+    child: &mut dyn process_wrap::tokio::ChildWrapper,
+    what: &'static str,
+) {
+    if tokio::time::timeout(KILL_GRACE, Box::into_pin(child.kill()))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            what,
+            "a killed child was not reaped within the grace; abandoning it"
+        );
+    }
 }
 
 /// Builds the wrapped command and spawns it, mirroring `launch.rs:1106-1164` verb for verb.
@@ -1955,6 +2072,131 @@ mod tests {
         assert!(!signalled.ok());
     }
 
+    /// D39 retries a held lock and nothing else. `.lock` or `cannot lock` as bare substrings
+    /// also match a directory/file ref conflict and any message that names `Cargo.lock`, and
+    /// neither goes away by sleeping; only the exact shapes do.
+    #[test]
+    fn only_the_exact_lock_shapes_are_retried() {
+        for (label, text) in [
+            (
+                "git's ref lock",
+                "git worktree add: fatal: cannot lock ref 'refs/heads/htui/x': Unable to create \
+                 '/r/.git/refs/heads/htui/x.lock': File exists.",
+            ),
+            (
+                "git's index lock",
+                "git reset --hard: fatal: Unable to create '/r/.git/index.lock': File exists.",
+            ),
+            (
+                "merge's index lock",
+                "git merge: error: Unable to write index.",
+            ),
+            (
+                "gix's resource lock",
+                "cannot create refs/heads/htui/x: The lock for resource \
+                 '/r/.git/refs/heads/htui/x' could not be obtained immediately after 1 attempt(s).",
+            ),
+            (
+                "gix-ref's reference lock",
+                "cannot create refs/heads/htui/x: A lock could not be obtained for reference \
+                 \"refs/heads/htui/x\"",
+            ),
+        ] {
+            assert!(
+                is_lock_error(&IsolateError::Git(text.to_owned())),
+                "{label} is a lock"
+            );
+        }
+        for (label, text) in [
+            (
+                "a directory/file ref conflict",
+                "git worktree add: fatal: cannot lock ref 'refs/heads/htui/x': 'refs/heads/htui' \
+                 exists; cannot create 'refs/heads/htui/x'",
+            ),
+            (
+                "a message naming Cargo.lock",
+                "git merge: error: Your local changes to the following files would be \
+                 overwritten by merge: Cargo.lock",
+            ),
+            (
+                "a checkout naming a lock file",
+                "git reset --hard: error: unable to unlink old 'Cargo.lock': Permission denied",
+            ),
+            (
+                "gix, but not about a lock",
+                "cannot create refs/heads/htui/x: The reference \"refs/heads/htui/x\" should \
+                 not exist, the lockfile is fine",
+            ),
+        ] {
+            assert!(
+                !is_lock_error(&IsolateError::Git(text.to_owned())),
+                "{label} is not a lock"
+            );
+        }
+    }
+
+    /// A child that daemonises keeps the inherited pipes open after the verb itself exited 0. The
+    /// budget covers the verb, not whatever it left behind: the exit is reported, not a timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_verb_whose_grandchild_holds_the_pipe_still_reports_its_exit() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let sleep = which::which("sleep").expect("a box that can run a test suite has `sleep`");
+        let script = format!(
+            "if [ \"$1\" = \"--version\" ]; then echo 'git version 2.43.0'; exit 0; fi\n\
+             '{}' 6 &\n\
+             echo done\n\
+             exit 0\n",
+            sleep.display()
+        );
+        let binary = fake_git(dir.path(), "daemon-git", &script);
+        let cli = Cli::probe(binary)
+            .expect("the script answers --version")
+            .with_budget(Duration::from_secs(3));
+
+        let started = std::time::Instant::now();
+        let exited = cli
+            .run("worktree add", dir.path(), &[OsStr::new("go")], &[])
+            .await
+            .expect("the verb exited 0 and says so");
+        assert!(exited.ok(), "{exited:?}");
+        assert_eq!(
+            exited.stdout, "done\n",
+            "what it wrote before exiting is kept"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "it did not wait for the grandchild: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `GixIsolator::new` runs the probe synchronously at worker start, so a `git` that hangs on
+    /// `--version` must be refused within a bound rather than hang the worker with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_hangs_is_refused_within_its_bound() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let sleep = which::which("sleep").expect("a box that can run a test suite has `sleep`");
+        let hung = fake_git(
+            dir.path(),
+            "hung-git",
+            &format!("exec '{}' 30", sleep.display()),
+        );
+        let started = std::time::Instant::now();
+        let err = Cli::probe_within(hung, Duration::from_millis(300))
+            .expect_err("the probe outlived its bound");
+        assert_eq!(
+            err.to_string(),
+            "isolation refused: git --version did not answer within 300ms"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     /// D39's schedule, both of its sources, and the two classes it must not touch.
     #[tokio::test(start_paused = true)]
     async fn with_retry_retries_three_times_on_a_lock_error_and_not_on_others() {
@@ -1964,7 +2206,9 @@ mod tests {
         let err = super::with_retry("worktree add", || async {
             attempts.fetch_add(1, Ordering::SeqCst);
             Err::<(), _>(IsolateError::Git(
-                "git worktree add: fatal: cannot lock ref 'refs/heads/htui/x'".to_owned(),
+                "git worktree add: fatal: cannot lock ref 'refs/heads/htui/x': Unable to create \
+                 '/r/.git/refs/heads/htui/x.lock': File exists."
+                    .to_owned(),
             ))
         })
         .await

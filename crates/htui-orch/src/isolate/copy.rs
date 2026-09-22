@@ -9,7 +9,7 @@
 //! The copy carries the source's `.git` (ANA-2 `:915`, the mode table at plan `:204`), which is
 //! what makes it a real checkout the agent can commit in and what `reconcile` later fetches the
 //! range out of. So `.git` is never excluded and [`measure`] counts it — all but its `*.lock`
-//! files, which are another process's claim and not state ([`is_git_lock`]).
+//! files, which are another process's claim and not state (`is_git_lock`).
 //!
 //! Everything here is synchronous; milestone 3's `isolate::real::GixIsolator` calls it under
 //! `tokio::task::spawn_blocking` (it is named in text rather than linked because T5 creates it

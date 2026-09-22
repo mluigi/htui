@@ -392,7 +392,7 @@ impl ShellVerifier {
             Err(_elapsed) => {
                 // The group on Unix, the job object on Windows: a `cargo test` that spawned test
                 // binaries must not outlive the verify that started it.
-                let _ = Box::into_pin(child.kill()).await;
+                crate::isolate::git::kill_within_grace(child.as_mut(), "verify").await;
                 let output = take_output(&captured);
                 self.finished(
                     VerifyOutcome::Unavailable,

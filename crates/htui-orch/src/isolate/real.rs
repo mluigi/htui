@@ -4,7 +4,7 @@
 //! This is the first place ANA-2 §4.6's four isolation modes exist as *behaviour* rather than as
 //! pieces: `isolate/git.rs` knows what a worktree is, `isolate/copy.rs` knows what a copy is, and
 //! neither knows which of them a step wants. Every mode is one private `async fn` per verb, and
-//! every call into the two sync modules runs through [`git::blocking`] (`spawn_blocking`) with
+//! every call into the two sync modules runs through `git::blocking` (`spawn_blocking`) with
 //! owned paths — no `gix::Repository` crosses an `.await` (blueprint H-17), and no `.await` happens
 //! under a `std` lock (`crates/htui-core/src/store/mem.rs:3-7` is the precedent). The `git` verbs
 //! are the one exception by design: they are `async` process supervision, and the `gix`
@@ -292,8 +292,13 @@ impl GixIsolator {
     ///
     /// The `std` lock is released before the `tokio` one is awaited: an `.await` under a `std`
     /// guard is what `mem.rs:3-7` forbids, and here it would also deadlock the next `prepare`.
+    /// The guards are taken in `RepoId` order, never scope order: two steps whose scopes name the
+    /// same repositories in opposite orders would otherwise each hold one and wait on the other.
     async fn acquire(&self, run: RunId, step: StepId, checkouts: &[(RepoId, RepoCheckout)]) {
-        for (repo, _) in checkouts {
+        let mut repos: Vec<RepoId> = checkouts.iter().map(|(repo, _)| *repo).collect();
+        repos.sort_unstable();
+        repos.dedup();
+        for repo in &repos {
             let lock = {
                 let mut locks = self
                     .locks
@@ -392,7 +397,7 @@ impl GixIsolator {
             Some((_, checkout)) => checkout.local_path.clone(),
             None => {
                 let cwd = session_dir(&self.config.scratch_root, run, step);
-                std::fs::create_dir_all(&cwd)?;
+                create_directory(&cwd).await?;
                 cwd
             }
         };
@@ -418,7 +423,7 @@ impl GixIsolator {
     ) -> Result<Prepared, IsolateError> {
         let git = self.cli()?.clone();
         let cwd = session_dir(&self.config.scratch_root, run, step);
-        std::fs::create_dir_all(&cwd)?;
+        create_directory(&cwd).await?;
         let branch = format!("htui/{step}");
 
         let mut trees = Vec::with_capacity(checkouts.len());
@@ -493,7 +498,7 @@ impl GixIsolator {
                     let Ok(head) = blocking(move || git::head(&tree)).await else {
                         git::with_retry("worktree remove", || git.remove_worktree(&local, path))
                             .await?;
-                        remove_directory(path)?;
+                        remove_directory(path).await?;
                         git::with_retry("worktree add", || {
                             git.add_worktree_on_branch(&local, path, step, run, &base)
                         })
@@ -512,7 +517,7 @@ impl GixIsolator {
                 None => {
                     git::with_retry("worktree remove", || git.remove_worktree(&local, path))
                         .await?;
-                    remove_directory(path)?;
+                    remove_directory(path).await?;
                 }
             }
         }
@@ -533,7 +538,7 @@ impl GixIsolator {
     ) -> Result<Prepared, IsolateError> {
         let git = self.cli()?.clone();
         let cwd = session_dir(&self.config.scratch_root, run, step);
-        std::fs::create_dir_all(&cwd)?;
+        create_directory(&cwd).await?;
         let branch = format!("htui/{step}");
         let excludes = copy::excludes(&self.config.copy_exclude);
 
@@ -596,7 +601,7 @@ impl GixIsolator {
             }
             // Anything else standing where the copy goes was not finished by us — the rename is
             // what makes a copy visible, and it runs after the label.
-            remove_directory(path)?;
+            remove_directory(path).await?;
         }
 
         let (source, owned) = (checkout.local_path.clone(), excludes.to_vec());
@@ -869,12 +874,23 @@ pub fn dirty_primary_tree() -> String {
 }
 
 /// `remove_dir_all` where an absent directory is the outcome asked for, not a failure.
-fn remove_directory(path: &Path) -> Result<(), IsolateError> {
-    match std::fs::remove_dir_all(path) {
+///
+/// On the blocking pool, like every other filesystem walk here: a tree under the scratch root can
+/// hold a whole `target/`, and deleting it is not work for a runtime worker.
+async fn remove_directory(path: &Path) -> Result<(), IsolateError> {
+    let path = path.to_path_buf();
+    blocking(move || match std::fs::remove_dir_all(&path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(IsolateError::Io(err)),
-    }
+    })
+    .await
+}
+
+/// `create_dir_all` on the blocking pool, for the same reason as [`remove_directory`].
+async fn create_directory(path: &Path) -> Result<(), IsolateError> {
+    let path = path.to_path_buf();
+    blocking(move || Ok(std::fs::create_dir_all(&path)?)).await
 }
 
 impl Isolator for GixIsolator {
@@ -974,7 +990,7 @@ impl Isolator for GixIsolator {
                     // The copy is a plain directory under the scratch root; `git` knows nothing
                     // about it, so there is nothing to tell it.
                     Isolation::Copy => {
-                        if let Err(err) = remove_directory(Path::new(&tree.path)) {
+                        if let Err(err) = remove_directory(Path::new(&tree.path)).await {
                             failures.push(err);
                         }
                     }
@@ -991,7 +1007,7 @@ impl Isolator for GixIsolator {
 
             // F-Q: `prepare` made `<root>/<run>/<step>/` and no per-tree verb names it.
             let run_dir = self.config.scratch_root.join(run.to_string());
-            if let Err(err) = remove_directory(&run_dir) {
+            if let Err(err) = remove_directory(&run_dir).await {
                 failures.push(err);
             }
 
