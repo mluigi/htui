@@ -376,6 +376,8 @@ fn unreachable_prefix(path: &Path, src: &Path) -> IsolateError {
 mod tests {
     use std::path::Path;
 
+    use super::super::git;
+    use super::super::git::testkit::{commit_file, repo_with_one_commit};
     use super::{
         DEFAULT_COPY_EXCLUDE, Exclude, copy_into_partial, copy_tree, excludes, finish_partial,
         measure, partial_path,
@@ -741,5 +743,87 @@ mod tests {
         finish_partial(&dst).expect("the copy is renamed into place");
         assert!(dst.join(".git").is_dir() && dst.join("f").is_file());
         assert!(!partial.exists(), "and the partial name is gone");
+    }
+
+    /// The whole of plan D35's `copy` branch as blueprint §6.3 orders it, over a real repository:
+    /// measure, copy into the partial, **`git reset --hard`** (plan D47 — the shelled verb, not a
+    /// second reset composed here), the `htui/<step>` label of blueprint A-2 inside the copy, then
+    /// the rename. The source is dirty, and the mode table's claim that "source dirtiness is
+    /// erased by the reset" is only true if every one of those steps lands in that order.
+    ///
+    /// The one fixture subtlety is T2's finding 10: the index `gix` writes from a tree carries no
+    /// stat data, and the copy inherits that index byte for byte. It is the `reset --hard` that
+    /// gives the copy the fully stat-ed index a real checkout has — which is the other reason this
+    /// verb, and not a composition, finishes a copy.
+    #[tokio::test]
+    async fn a_dirty_source_is_reset_and_labelled_in_the_partial_before_it_is_finished() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).expect("the source directory is made");
+        repo_with_one_commit(&src);
+        let before = commit_file(&src, "g", "second\n", "two");
+
+        std::fs::remove_file(src.join("f")).expect("a tracked file is deleted");
+        std::fs::write(src.join("g"), "mangled\n").expect("another is modified");
+        assert!(
+            git::is_dirty(&src).expect("status reads"),
+            "the source this copy starts from is dirty"
+        );
+
+        let list = excludes(&[]);
+        let dst = dir.path().join("trees").join("repo");
+        let step = "htui/0198c0de-0000-7000-8000-00000000000a";
+
+        assert_eq!(
+            super::measure_within_cap(&src, &list, u64::MAX).expect("the source measures"),
+            measure(&src, &list).expect("the source measures"),
+            "the cap guard runs the same walk"
+        );
+        let partial = copy_into_partial(&src, &dst, &list).expect("the tree copies");
+        assert!(
+            git::is_dirty(&partial).expect("status reads"),
+            "the copy carried the source's dirtiness with it: that is what the reset is for"
+        );
+
+        git.reset_hard(&partial, &before)
+            .await
+            .expect("D47's fifth verb cleans the copy");
+        git::create_branch(&partial, step, &before).expect("A-2's label is written in the copy");
+        finish_partial(&dst).expect("the copy is renamed into place");
+
+        assert_eq!(
+            git::head(&dst).expect("HEAD reads"),
+            before,
+            "the copy's before_hash is the source's HEAD"
+        );
+        assert!(
+            !git::is_dirty(&dst).expect("status reads"),
+            "and the row may honestly say dirty = false (the mode table)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("g")).expect("g reads"),
+            "second\n",
+            "the source's modification did not survive into the copy"
+        );
+        assert!(dst.join("f").exists(), "nor its deletion");
+        assert_eq!(
+            git::branch_target(&dst, step).expect("the label reads"),
+            Some(before.clone()),
+            "A-2: the label lives inside the copy, so a reused copy and OQ-5's copy_range both \
+             have a base to read"
+        );
+        assert_eq!(
+            git::branch_target(&src, step).expect("the source's refs read"),
+            None,
+            "and nothing was written into the source (R-ID-4)"
+        );
+        assert!(
+            git::is_dirty(&src).expect("status reads"),
+            "the source is untouched, dirt and all: this mode resets the copy, never the user's \
+             checkout"
+        );
     }
 }
