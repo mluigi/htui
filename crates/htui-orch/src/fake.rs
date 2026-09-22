@@ -58,8 +58,18 @@ pub struct FakeIsolator {
     calls: Mutex<u32>,
     /// Scripted [`prepare`](Isolator::prepare) refusals, FIFO, one consumed per call.
     refusals: Mutex<VecDeque<String>>,
+    /// Scripted [`reconcile`](Isolator::reconcile) refusals, FIFO, one consumed per call.
+    reconcile_refusals: Mutex<VecDeque<String>>,
     /// How many times [`prepare`](Isolator::prepare) has been called, refusals included.
     prepares: Mutex<u32>,
+    /// How many times [`cleanup`](Isolator::cleanup) has been called (plan D36: once per run, at
+    /// the end).
+    cleanups: Mutex<u32>,
+    /// What [`prepare`](Isolator::prepare) reports as `Prepared.extra_dirs` (plan D28).
+    extra_dirs: Mutex<Vec<PathBuf>>,
+    /// What [`capture`](Isolator::capture) last reported per step, which is what the identity
+    /// [`reconcile`](Isolator::reconcile) echoes.
+    captured: Mutex<BTreeMap<StepId, Vec<RunStepCommit>>>,
 }
 
 impl FakeIsolator {
@@ -96,6 +106,30 @@ impl FakeIsolator {
             .push_back(reason.to_owned());
     }
 
+    /// Make the next [`reconcile`](Isolator::reconcile) refuse with `reason`.
+    ///
+    /// `reconcile` lands on a step that is already `done`, which is the one place in the walk
+    /// where `fail_hard` cannot move the row (blueprint H-2) — so what a refusal here does is a
+    /// park, and a test needs to be able to cause one.
+    pub fn refuse_reconcile(&self, reason: &str) {
+        self.reconcile_refusals
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(reason.to_owned());
+    }
+
+    /// Make every [`prepare`](Isolator::prepare) report `dirs` as its `extra_dirs`.
+    ///
+    /// The fake puts all of its trees under one `cwd`, which is the `worktree`/`copy` shape and
+    /// leaves the list empty; plan D28's `local`/`shared_serialized` shape is the one that fills
+    /// it, and this is how a case reaches it without a filesystem.
+    pub fn script_extra_dirs(&self, dirs: Vec<PathBuf>) {
+        *self
+            .extra_dirs
+            .lock()
+            .expect("no panic holds the fake isolator's lock") = dirs;
+    }
+
     /// How many times [`prepare`](Isolator::prepare) has been called on this isolator.
     ///
     /// The trait promises no idempotence (`crate::isolate::Isolator::prepare`) and this fake mints
@@ -105,6 +139,18 @@ impl FakeIsolator {
     pub fn prepares(&self) -> u32 {
         *self
             .prepares
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+    }
+
+    /// How many times [`cleanup`](Isolator::cleanup) has been called.
+    ///
+    /// Plan D36 makes this exactly one per run, after the terminal `finish_run`, and ANA-2
+    /// invariant 6 makes "not once per step" the whole point — so it is a count and not a flag.
+    #[must_use]
+    pub fn cleanups(&self) -> u32 {
+        *self
+            .cleanups
             .lock()
             .expect("no panic holds the fake isolator's lock")
     }
@@ -184,9 +230,13 @@ impl Isolator for FakeIsolator {
                 trees,
                 cwd: PathBuf::from(cwd),
                 // The fake puts every tree under one `cwd`, which is the `worktree`/`copy` shape
-                // (plan D28); nothing is ever outside it, so there is nothing to hand
-                // `SessionSpec.extra_dirs`.
-                extra_dirs: Vec::new(),
+                // (plan D28), so this is empty unless a case scripted it with
+                // [`script_extra_dirs`](FakeIsolator::script_extra_dirs).
+                extra_dirs: self
+                    .extra_dirs
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock")
+                    .clone(),
             })
         })
     }
@@ -196,25 +246,63 @@ impl Isolator for FakeIsolator {
         step: StepId,
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
-        Box::pin(async move { Ok(self.commits(step, trees)) })
+        Box::pin(async move {
+            let commits = self.commits(step, trees);
+            self.captured
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .insert(step, commits.clone());
+            Ok(commits)
+        })
     }
 
-    /// Fan-out is milestone 4's, so the winner is the only candidate and a merge is an identity:
-    /// this echoes [`capture`](Isolator::capture) and consumes a scripted value the same way.
+    /// Fan-out is milestone 4's, so the winner is the only candidate — and for a fake that made no
+    /// tree, a merge is the identity: this reports exactly what
+    /// [`capture`](Isolator::capture) reported for the same step.
+    ///
+    /// **It does not consume a [`script_after`](FakeIsolator::script_after) value**, which is the
+    /// one behavioural change T6 made to this double. Milestone 2 shipped `reconcile` echoing
+    /// `capture`'s own body because nothing called it; now that the engine does, a `reconcile` that
+    /// popped the queue would eat criterion 7's *second* scripted hash on the first step's advance
+    /// and the loop would stop making sense. A step `capture` never ran for reports nothing, and
+    /// `record_commits` over an empty batch writes nothing.
     fn reconcile<'a>(
         &'a self,
         winner: StepId,
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
-        Box::pin(async move { Ok(self.commits(winner, trees)) })
+        Box::pin(async move {
+            let _ = trees;
+            if let Some(reason) = self
+                .reconcile_refusals
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front()
+            {
+                return Err(IsolateError::Refused(reason));
+            }
+            Ok(self
+                .captured
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .get(&winner)
+                .cloned()
+                .unwrap_or_default())
+        })
     }
 
     /// Nothing was created, so nothing is removed — but the call is still made by the engine and is
     /// still counted, so a case can assert that cleanup happened exactly once, at run end.
+    ///
+    /// It no longer ticks the **hash** counter (blueprint F-K): a counter two verbs share cannot
+    /// answer "how many cleanups", and the synthetic hashes are the other one's job.
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
         Box::pin(async move {
             let _ = (run, trees);
-            self.tick();
+            *self
+                .cleanups
+                .lock()
+                .expect("no panic holds the fake isolator's lock") += 1;
             Ok::<(), IsolateError>(())
         })
     }

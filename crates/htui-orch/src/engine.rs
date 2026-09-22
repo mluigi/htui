@@ -402,7 +402,14 @@ where
             self.after_rejection(&run, &snapshot, &step, &phase, now)
                 .await?
         } else {
-            self.run_to_rest(run.id).await?
+            // `answer_gate` moved the step `awaiting_approval -> done`
+            // (`store/traits.rs:788-791`), so this is the human's half of plan D25's "after a step
+            // reaches `done`". A refusal parks the run again, with the reason on the item.
+            let step = self.step(run.id, step.id).await?;
+            match self.reconcile_done_step(&run, &step).await? {
+                Some(rest) => rest,
+                None => self.run_to_rest(run.id).await?,
+            }
         };
         Ok(CommandOutcome::Answered { rest })
     }
@@ -434,6 +441,7 @@ where
                     now,
                 )
                 .await?;
+            self.cleanup_run(run.id).await?;
             return Ok(Rest {
                 run: RunStatus::Failed,
                 position: Some(step.position),
@@ -452,11 +460,17 @@ where
                 position: Some(step.position),
                 failure: Some(RunFailure::ReviewLoopExhausted(attempts)),
             }),
-            LoopOutcome::NoTarget => Ok(Rest {
-                run: RunStatus::Failed,
-                position: Some(step.position),
-                failure: Some(RunFailure::NoLoopTarget),
-            }),
+            LoopOutcome::NoTarget => {
+                // `review_loop` failed the run itself (`gate.rs`'s three `NoTarget` sites), so
+                // this is a terminal `finish_run` the engine did not write and still owes a
+                // cleanup for (plan D36).
+                self.cleanup_run(run.id).await?;
+                Ok(Rest {
+                    run: RunStatus::Failed,
+                    position: Some(step.position),
+                    failure: Some(RunFailure::NoLoopTarget),
+                })
+            }
         }
     }
 
@@ -565,6 +579,7 @@ where
                         .store
                         .finish_run(run, RunStatus::Done, None, now)
                         .await?;
+                    self.cleanup_run(run).await?;
                     return Ok(Rest {
                         run: RunStatus::Done,
                         position: None,
@@ -733,6 +748,7 @@ where
             .store
             .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
+        self.cleanup_run(run.id).await?;
         Ok(Rest {
             run: RunStatus::Failed,
             position: Some(phase.position),
@@ -843,7 +859,7 @@ where
         // -- stage 4: session -----------------------------------------------------------------
         let session_cwd = prepared.cwd.clone();
         let (result, cap_breach) = self
-            .session(run, step, phase, &prompt, prepared.cwd)
+            .session(run, step, phase, &prompt, prepared.cwd, prepared.extra_dirs)
             .await?;
         if let Ok(done) = &result {
             self.parts.sink.after_done(item, step, phase, done).await?;
@@ -901,12 +917,25 @@ where
         let row = self.run(run.id).await?;
         let ctx = self.gate_context(&row, snapshot);
         match gate::apply(&ctx, step, phase, settled).await? {
-            Landing::Advance => Ok(None),
+            // Plan D25: the step is `done`, so the winner's tree is merged into the primary before
+            // the walk advances. A refusal parks the run (blueprint H-2, R-7).
+            Landing::Advance => {
+                let step = self.step(run.id, step.id).await?;
+                Ok(self.reconcile_done_step(&row, &step).await?)
+            }
             Landing::Retry { position, attempt } => {
                 let phase = Self::phase_at(run.id, snapshot, position)?;
                 self.admit(&row, &phase, attempt).await
             }
-            Landing::Rest(rest) => Ok(Some(rest)),
+            Landing::Rest(rest) => {
+                // `gate.rs` writes its own terminal `finish_run` — `retry_or_fail`'s exhausted
+                // budget and `review_loop`'s `NoTarget` — and holds no isolator, so the cleanup
+                // that owes it is here (plan D36). A park is not terminal and is not cleaned up.
+                if rest.run.is_terminal() {
+                    self.cleanup_run(run.id).await?;
+                }
+                Ok(Some(rest))
+            }
         }
     }
 
@@ -1038,7 +1067,131 @@ where
             .store
             .finish_run(run.id, RunStatus::Failed, Some(reason), now)
             .await?;
+        // Plan D36's rule is "after every terminal `finish_run`", and this is the one both of the
+        // walk's hard failures pass through — stage 3's missing input and any error escaping the
+        // region where a step is live. Putting it here rather than at the two call sites is what
+        // makes "every" true.
+        self.cleanup_run(run.id).await?;
         Ok(true)
+    }
+
+    // -- plan D25's reconcile and plan D36's cleanup -------------------------------------------
+
+    /// After a step reached `done` and before the walk advances: the winner into the primary tree
+    /// (plan D25, ANA-2 `:975-988`).
+    ///
+    /// `Ok(None)` — carry on. `Ok(Some(rest))` — the run is parked, with the reason on the item.
+    ///
+    /// **Every error parks, including `Git` and `Io`** (blueprint H-2). The step is already `done`
+    /// and `fail_hard` moves `running -> failed` only — `done -> failed` is illegal
+    /// (`crates/htui-core/src/model/run.rs`) — so an escaped `?` would leave the run `running`
+    /// with every step `done`, which `cursor` reads as `Finished` and the next pass would
+    /// `finish_run(Done)` over an unmerged primary. A run parked with the sentence is also the
+    /// better answer for a transient `index.lock` that outlived its three retries: nothing is
+    /// lost, and the note tells the human what the tree is in.
+    ///
+    /// The trees are read back from rows rather than carried from stage 2 (plan D16): a step whose
+    /// gate a human answered hours later is reconciled by a different call than the one that
+    /// prepared it.
+    ///
+    /// **A parked run has no resume verb this milestone** (blueprint F-G, R-7): `AnswerGate` needs
+    /// a step at `awaiting_approval` and every step here is `done`. Milestone 5's sweep or
+    /// milestone 6's `Unblock`-shaped verb is where a retry of `reconcile` belongs.
+    async fn reconcile_done_step(
+        &self,
+        run: &Run,
+        step: &RunStep,
+    ) -> Result<Option<Rest>, EngineError> {
+        let trees = self.parts.store.step_trees(step.id).await?;
+        match self.parts.isolator.reconcile(step.id, &trees).await {
+            Ok(after) => {
+                // ANA-2 `:987-988`: the winner's `after_hash` becomes the merge commit.
+                self.parts.store.record_commits(step.id, &after).await?;
+                Ok(None)
+            }
+            Err(err) => {
+                let bases = trees
+                    .iter()
+                    .map(|tree| format!("{}@{}", tree.repo_id, tree.base_ref))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let reason = if bases.is_empty() {
+                    err.to_string()
+                } else {
+                    format!("{err} (before_hash: {bases})")
+                };
+                Ok(Some(self.park_run(run, step, &reason).await?))
+            }
+        }
+    }
+
+    /// Parks a run whose step is already `done`: run, item, then the note.
+    ///
+    /// Blueprint H-10's order with the step left alone — `gate::apply`'s park moves the step
+    /// first because it is the thing being waited on, and here there is nothing to move. The item
+    /// goes through `in_progress` on its own because that is where a running run's item is.
+    ///
+    /// `run.failure` is **not** written: `finish_run` is the only writer of that column and the
+    /// run is not finished. The reason is the `item_note`, which is where every other park's is
+    /// (`gate.rs`'s `note_step`, blueprint H-9).
+    async fn park_run(&self, run: &Run, step: &RunStep, reason: &str) -> Result<Rest, EngineError> {
+        let now = self.now();
+        self.parts
+            .store
+            .transition_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
+            .await?;
+        if let Some(item) = run.item_id {
+            self.parts
+                .store
+                .transition(item, Status::InProgress, Status::AwaitingApproval)
+                .await?;
+            self.parts
+                .store
+                .add_note(NewNote {
+                    id: NoteId::new(),
+                    item_id: item,
+                    body: format!(
+                        "reconcile refused for step {} at position {}: {reason}; \
+                         the step stays `done` and the run is parked",
+                        step.id, step.position
+                    ),
+                    created_by: self.parts.user,
+                    box_id: Some(self.parts.box_id),
+                    via_step_id: Some(step.id),
+                    created_at: now,
+                })
+                .await?;
+        }
+        Ok(Rest {
+            run: RunStatus::AwaitingApproval,
+            position: Some(step.position),
+            failure: None,
+        })
+    }
+
+    /// ANA-2 §4.6's cleanup, run-terminal and **never** at step end (invariant 6, `:994-1000`).
+    ///
+    /// Every step of the run, not just the last: a `shared_serialized` guard is released by
+    /// `run_step_tree` row, and a step that never reached `capture` — a `fail_hard` path skips
+    /// stage 5 entirely — is holding one nobody else will give back (T5, blueprint A-1, H-15).
+    ///
+    /// Cleanup failures are `warn`ed and never raised (plan D36): the run is already terminal when
+    /// this runs, a failed `rm` must not un-terminate it, and milestone 5's sweep is the retry.
+    ///
+    /// `pub` because milestone 6's Runs tab calls it directly for a run the worker did not end.
+    ///
+    /// # Errors
+    /// The store's own refusals only. The isolator's are logged.
+    pub async fn cleanup_run(&self, run: RunId) -> Result<(), EngineError> {
+        let steps = self.parts.store.run_steps(run).await?;
+        let mut trees = Vec::new();
+        for step in &steps {
+            trees.extend(self.parts.store.step_trees(step.id).await?);
+        }
+        if let Err(err) = self.parts.isolator.cleanup(run, &trees).await {
+            tracing::warn!(%run, %err, "run-terminal cleanup failed; milestone 5's sweep is the retry");
+        }
+        Ok(())
     }
 
     /// Stage 3's hard failure: a required input resolved to no document, before a token was spent
@@ -1206,6 +1359,7 @@ where
         phase: &SnapshotPhase,
         prompt: &AssembledPrompt,
         cwd: std::path::PathBuf,
+        extra_dirs: Vec<std::path::PathBuf>,
     ) -> Result<
         (
             Result<DoneEvent, htui_agent::error::DriverError>,
@@ -1222,7 +1376,10 @@ where
             agent_id: candidate.agent_id,
             step_id: step.id,
             cwd,
-            extra_dirs: Vec::new(),
+            // Plan D28: every tree that is not under `cwd` — the second repo of a
+            // `shared_serialized` or `local` step, which lives in its own checkout somewhere else
+            // on the box. An agent that cannot read it cannot work in it.
+            extra_dirs,
             // `R-SEC-2`: ANA-7 resolves secrets and milestone 6 wires them; the walk invents none.
             env: BTreeMap::new(),
             model: Some(candidate.model.clone()),
@@ -3142,6 +3299,237 @@ mod tests {
                 .len(),
             before
         );
+    }
+
+    /// Walks `FEAT-3` to `done` by approving every gate it parks at.
+    ///
+    /// # Panics
+    /// When a position never parks, which is what the caller is asserting it did.
+    async fn walk_to_done(harness: &Harness) -> htui_core::model::RunId {
+        harness.free_feat_3().await;
+        let CommandOutcome::Started { run, .. } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        for position in 0..4 {
+            let steps = harness.orch.steps(run).await;
+            let step = steps
+                .iter()
+                .find(|step| {
+                    step.position == position && step.status == StepStatus::AwaitingApproval
+                })
+                .expect("the walk parked at this position");
+            harness
+                .dispatch(Command::AnswerGate {
+                    run,
+                    step: step.id,
+                    answer: GateAnswer::Approved,
+                })
+                .await
+                .expect("the step produced its document");
+        }
+        assert_eq!(harness.orch.run(run).await.status, RunStatus::Done);
+        run
+    }
+
+    /// Plan D36: `Isolator::cleanup` had no caller anywhere until this milestone, and the rule is
+    /// "after every terminal `finish_run`, once".
+    ///
+    /// Once and not four times: ANA-2 invariant 6 (`docs/ANA-2.md:128-131`) forbids cleaning up at
+    /// step end, because the next attempt of a superseded step reads the tree the last one left.
+    #[tokio::test]
+    async fn a_finished_run_is_cleaned_up_once() {
+        let harness = Harness::new().await;
+        let _run = walk_to_done(&harness).await;
+        assert_eq!(
+            harness.orch.isolator.cleanups(),
+            1,
+            "one run, one cleanup, at the end"
+        );
+    }
+
+    /// Blueprint H-2: a `reconcile` error lands on a step that is already `done`, and `fail_hard`
+    /// moves `running -> failed` only — `done -> failed` is illegal (`model/run.rs`).
+    ///
+    /// So every `reconcile` failure parks the run instead: the step stays `done`, the run and the
+    /// item go to `awaiting_approval`, and the reason is an `item_note` a human reads (F-G, R-7).
+    /// The run is **not** terminal, so nothing is cleaned up.
+    #[tokio::test]
+    async fn a_reconcile_refusal_parks_the_run_with_the_step_done() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.gate = Gate::Never;
+                }
+            })
+            .await;
+        harness.orch.isolator.refuse_reconcile("dirty_primary_tree");
+
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+
+        assert_eq!(
+            (rest.run, rest.position, rest.failure),
+            (RunStatus::AwaitingApproval, Some(0), None),
+            "a parked run's `failure` stays NULL; the reason is the note"
+        );
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].status,
+            StepStatus::Done,
+            "the step settled and passed its gate before `reconcile` ran"
+        );
+        assert_eq!(
+            harness.orch.run(run).await.status,
+            RunStatus::AwaitingApproval
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::AwaitingApproval
+        );
+        let notes: Vec<String> = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .map(|note| note.body)
+            .collect();
+        assert!(
+            notes.iter().any(|body| body.contains("dirty_primary_tree")),
+            "ANA-2 invariant 7: the reason is on the item: {notes:?}"
+        );
+        assert_eq!(
+            harness.orch.isolator.cleanups(),
+            0,
+            "a parked run is not terminal, so its trees stay"
+        );
+    }
+
+    /// The other terminal path plan D36 names: a step that never settled at all.
+    ///
+    /// `fail_hard` ends the run, so the trees it made have to go the same way a finished run's do.
+    #[tokio::test]
+    async fn a_hard_failure_still_cleans_up() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .orch
+            .script("prd", 1, ScriptedStep::refusing_to_start("no binary"));
+
+        let refused = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect_err("a driver that cannot start is re-raised after the settle");
+        assert!(matches!(refused, EngineError::Driver(_)), "{refused}");
+        assert_eq!(
+            harness.orch.isolator.cleanups(),
+            1,
+            "plan D36: after every terminal `finish_run`, `fail_hard`'s included"
+        );
+    }
+
+    /// Plan D28 through the seam that carries it: a tree outside the session's `cwd` reaches the
+    /// driver as `SessionSpec.extra_dirs`, which milestone 2 hard-coded empty.
+    ///
+    /// The spy refuses to start *after* recording, which is the cheapest way to read a spec out of
+    /// a walk: the session never opens, so nothing downstream of stage 4 can rewrite what it saw.
+    #[tokio::test]
+    async fn a_tree_outside_the_cwd_reaches_the_session_as_an_extra_dir() {
+        let orch = FakeOrchestrator::demo();
+        orch.store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock.now())
+            .await
+            .expect("the seeded run is queued and cancellable");
+        let elsewhere = std::path::PathBuf::from("/elsewhere/docs");
+        orch.isolator.script_extra_dirs(vec![elsewhere.clone()]);
+
+        let seen: std::sync::Arc<std::sync::Mutex<Option<htui_agent::driver::SessionSpec>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let graphs = orch.graphs();
+        let spy = seen.clone();
+        let driver = move |_candidate: &SnapshotCandidate,
+                           _phase: &str,
+                           _attempt: i32|
+              -> Box<dyn htui_agent::driver::AgentDriver> {
+            Box::new(SpecSpy { seen: spy.clone() })
+        };
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = super::Engine::new(
+            super::fake_parts(&orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the fixture holds a box"),
+        );
+        let refused = engine
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect_err("the spy refuses to start");
+        assert!(matches!(refused, EngineError::Driver(_)), "{refused}");
+
+        let spec = seen
+            .lock()
+            .expect("no panic holds the spy's lock")
+            .clone()
+            .expect("stage 4 built a spec");
+        assert_eq!(spec.extra_dirs, vec![elsewhere]);
+    }
+
+    /// An [`AgentDriver`](htui_agent::driver::AgentDriver) that records its `SessionSpec` and then
+    /// refuses, so a test can read stage 4's argument without opening a session.
+    #[derive(Debug)]
+    struct SpecSpy {
+        seen: std::sync::Arc<std::sync::Mutex<Option<htui_agent::driver::SessionSpec>>>,
+    }
+
+    impl htui_agent::driver::AgentDriver for SpecSpy {
+        fn name(&self) -> &str {
+            "spec-spy"
+        }
+
+        fn caps(&self) -> DriverCaps {
+            htui_agent::fake::FakeDriver::full_caps()
+        }
+
+        fn start<'a>(
+            &'a self,
+            spec: htui_agent::driver::SessionSpec,
+            prompt: String,
+        ) -> htui_agent::driver::DriverFuture<'a, Box<dyn htui_agent::driver::AgentSession>>
+        {
+            Box::pin(async move {
+                drop(prompt);
+                *self.seen.lock().expect("no panic holds the spy's lock") = Some(spec);
+                Err(DriverError::Spawn("the spy never starts".to_owned()))
+            })
+        }
     }
 
     fn harness_steps() -> htui_core::model::RunStep {
