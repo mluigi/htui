@@ -25,6 +25,9 @@ use htui_core::model::{
 
 pub mod copy;
 pub mod git;
+pub mod real;
+
+pub use real::{GixIsolator, IsolatorConfig, RepoCheckout};
 
 /// The boxed future every [`Isolator`] method returns.
 ///
