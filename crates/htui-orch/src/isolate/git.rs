@@ -18,10 +18,12 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use htui_core::model::{RunId, StepId};
 use tokio::io::AsyncReadExt as _;
 
 use crate::isolate::IsolateError;
@@ -305,6 +307,288 @@ impl Cli {
                 let _ = Box::into_pin(child.kill()).await;
                 Err(IsolateError::Git(timed_out(verb, self.budget)))
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The five verbs. Each classifies its own exit before building an error, because exit 1 means two
+// different things to `git merge` (blueprint H-8) and exit 128 two to `worktree remove`.
+// ---------------------------------------------------------------------------------------------
+
+/// What a successful `merge --no-ff` produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merged {
+    /// The merge commit, which becomes the winner's `after_hash` (ANA-2 `:987-988`).
+    pub commit: String,
+}
+
+/// D25's conflict refusal: the sentence ANA-2 `:983` fixes, with the path list.
+///
+/// Named here rather than in `isolate/real.rs` because [`Cli::merge_no_ff`] is what detects the
+/// conflict and reads the paths; `real.rs` passes the sentence straight through.
+pub fn merge_conflict(paths: &[String]) -> String {
+    format!("merge_conflict: {}", paths.join(", "))
+}
+
+/// The post-condition of a verb held, but the tree it made does not answer for it.
+fn broken_post_condition(verb: &str, what: &str) -> IsolateError {
+    IsolateError::Git(format!("git {verb}: {what}"))
+}
+
+impl Cli {
+    /// D23: `git worktree add --lock --reason "htui run <run>" -b htui/<step> <path> <before>`,
+    /// run in the managed checkout.
+    ///
+    /// Nothing is parsed from its output. Success is exit 0 **plus** two `gix` post-conditions:
+    /// the new tree's `HEAD` is `before`, and the main repository lists a locked entry at `path`.
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] with the last classifying stderr line — a branch that already exists
+    /// (exit 255, unreachable after D38's reuse), a path that is already there (exit 128), an
+    /// invalid start point (exit 128), or a held ref lock, which [`with_retry`] sleeps over.
+    pub async fn add_worktree(
+        &self,
+        repo: &Path,
+        path: &Path,
+        step: StepId,
+        run: RunId,
+        before: &str,
+    ) -> Result<(), IsolateError> {
+        let branch = format!("htui/{step}");
+        let reason = format!("htui run {run}");
+        let exited = self
+            .run(
+                "worktree add",
+                repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("--lock"),
+                    OsStr::new("--reason"),
+                    OsStr::new(&reason),
+                    OsStr::new("-b"),
+                    OsStr::new(&branch),
+                    path.as_os_str(),
+                    OsStr::new(before),
+                ],
+                &[],
+            )
+            .await?;
+        if !exited.ok() {
+            return Err(exited.failure("worktree add"));
+        }
+
+        if head(path)? != before {
+            return Err(broken_post_condition(
+                "worktree add",
+                "created a tree that does not check out",
+            ));
+        }
+        if !worktree_by_path(repo, path)?.is_some_and(|entry| entry.locked) {
+            return Err(broken_post_condition(
+                "worktree add",
+                "created a tree that is not listed as locked",
+            ));
+        }
+        Ok(())
+    }
+
+    /// D23 and D46: `git worktree remove --force --force <path>`, run in the managed checkout.
+    ///
+    /// One `--force` for a dirty tree and the second for a locked one — ours are always both. A
+    /// directory that is already gone removes cleanly (the crash-recovery case) and a path `git`
+    /// has never heard of reads as already removed.
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] for any other non-zero exit.
+    pub async fn remove_worktree(&self, repo: &Path, path: &Path) -> Result<(), IsolateError> {
+        let exited = self
+            .run(
+                "worktree remove",
+                repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("remove"),
+                    OsStr::new("--force"),
+                    OsStr::new("--force"),
+                    path.as_os_str(),
+                ],
+                &[],
+            )
+            .await?;
+        if exited.ok()
+            || (exited.code == Some(128) && exited.stderr.contains("is not a working tree"))
+        {
+            return Ok(());
+        }
+        Err(exited.failure("worktree remove"))
+    }
+
+    /// D47: `git reset --hard <target>` in `tree`, the verb that replaced a hand-composed `gix`
+    /// checkout over a populated directory.
+    ///
+    /// Post-condition: the tree's `HEAD` is `target` and [`is_dirty`] is false. Untracked files
+    /// survive, which is exactly why D24 does not count them.
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] for a non-zero exit — a held `index.lock` among them, which
+    /// [`with_retry`] sleeps over — or for a post-condition that does not hold.
+    pub async fn reset_hard(&self, tree: &Path, target: &str) -> Result<(), IsolateError> {
+        let exited = self
+            .run(
+                "reset --hard",
+                tree,
+                &[
+                    OsStr::new("reset"),
+                    OsStr::new("--hard"),
+                    OsStr::new(target),
+                ],
+                &[],
+            )
+            .await?;
+        if !exited.ok() {
+            return Err(exited.failure("reset --hard"));
+        }
+        if head(tree)? != target || is_dirty(tree)? {
+            return Err(broken_post_condition(
+                "reset --hard",
+                "left a tree that is not at the target or not clean",
+            ));
+        }
+        Ok(())
+    }
+
+    /// D25: `git merge --no-ff --no-edit -m "htui: reconcile <step>" <after>` in the primary
+    /// checkout, under the four identity variables.
+    ///
+    /// Exit 0 is checked against `gix`: the new `HEAD`'s parents must be exactly
+    /// `[before, after]`. Exit 1 is where the care goes — it is both "conflict" and "somebody
+    /// holds `index.lock`" (blueprint H-8), and both leave `MERGE_HEAD` behind — so the lock
+    /// signature is consulted *first* and only the remainder is a conflict. Every failing path
+    /// aborts the half-merge before it returns, and the abort is itself retried, so a caller that
+    /// sleeps and tries again does not meet a `MERGE_HEAD` it left there (H-7).
+    ///
+    /// # Errors
+    /// [`IsolateError::Refused`] with [`merge_conflict`] for a real conflict;
+    /// [`IsolateError::Git`] for a held lock (retried) or any other non-zero exit; whichever error
+    /// `merge --abort` produced, if the abort is what failed — the primary is then mid-merge and
+    /// the operator has to be told so.
+    pub async fn merge_no_ff(
+        &self,
+        primary: &Path,
+        step: StepId,
+        before: &str,
+        after: &str,
+    ) -> Result<Merged, IsolateError> {
+        let message = format!("htui: reconcile {step}");
+        let exited = self
+            .run(
+                "merge",
+                primary,
+                &[
+                    OsStr::new("merge"),
+                    OsStr::new("--no-ff"),
+                    OsStr::new("--no-edit"),
+                    OsStr::new("-m"),
+                    OsStr::new(&message),
+                    OsStr::new(after),
+                ],
+                &IDENTITY_ENV,
+            )
+            .await?;
+
+        if exited.ok() {
+            let parents = head_parents(primary)?;
+            if parents != [before, after] {
+                return Err(broken_post_condition(
+                    "merge",
+                    "the merge commit's parents are not [before_hash, after_hash]",
+                ));
+            }
+            return Ok(Merged {
+                commit: head(primary)?,
+            });
+        }
+
+        // A lock, a conflict or anything else: read the paths first, because `--abort` throws the
+        // stage entries away, then restore the primary, then classify.
+        let conflicted = if exited.code == Some(1) && lock_signature(&exited.stderr).is_none() {
+            conflicted_paths(primary)?
+        } else {
+            Vec::new()
+        };
+        with_retry("merge --abort", || self.abort_merge(primary)).await?;
+
+        if conflicted.is_empty() {
+            Err(exited.failure("merge"))
+        } else {
+            Err(IsolateError::Refused(merge_conflict(&conflicted)))
+        }
+    }
+
+    /// `git merge --abort` in `primary`; "There is no merge to abort" is success.
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] for any other non-zero exit, which leaves the primary mid-merge and
+    /// is never swallowed (blueprint H-7).
+    pub async fn abort_merge(&self, primary: &Path) -> Result<(), IsolateError> {
+        let exited = self
+            .run(
+                "merge --abort",
+                primary,
+                &[OsStr::new("merge"), OsStr::new("--abort")],
+                &[],
+            )
+            .await?;
+        if exited.ok()
+            || (exited.code == Some(128) && exited.stderr.contains("There is no merge to abort"))
+        {
+            return Ok(());
+        }
+        Err(exited.failure("merge --abort"))
+    }
+}
+
+/// The sleeps between retries (plan D39): 200, 400 and 800 ms, so four attempts in all.
+///
+/// Entirely ours. `gix::lock` offers `Fail::AfterDurationWithBackoff`, whose backoff is quadratic
+/// rather than this, and `gix` itself acquires with `Fail::Immediately` and never retries for us.
+pub const RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
+
+/// Runs `op`, retrying it on [`RETRY_BACKOFF`]'s schedule while [`is_lock_error`] says the failure
+/// was somebody else holding a `.lock` file (plan D39).
+///
+/// Every git **write** goes through this — the five verbs, [`create_branch`] and [`copy_range`];
+/// reads do not. Each failed attempt is logged at `warn` with its classification, so a `git`
+/// whose wording drifts shows up as a run of warnings rather than as silence.
+///
+/// # Errors
+/// Whatever `op` returned on its last attempt.
+pub async fn with_retry<T, F, Fut>(verb: &'static str, mut op: F) -> Result<T, IsolateError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, IsolateError>>,
+{
+    let mut attempt = 0;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < RETRY_BACKOFF.len() && is_lock_error(&err) => {
+                tracing::warn!(
+                    verb,
+                    attempt,
+                    %err,
+                    "a git lock was held; sleeping before the next attempt"
+                );
+                tokio::time::sleep(RETRY_BACKOFF[attempt]).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
         }
     }
 }
@@ -869,10 +1153,124 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Printed byte for byte by every git-backed test on a box with no `git` on `PATH` (plan D40).
+///
+/// The convention is `htui_store::testkit::SKIP`'s (`crates/htui-store/src/testkit.rs:35`): a
+/// missing external is a skip the suite prints and passes, not a failure.
+pub const SKIP_GIT: &str = "skipped: git not on PATH";
+
 /// Real repositories for tests, built with `gix` alone so they need no `git` on the box (D40).
 #[cfg(any(test, feature = "test-support"))]
 pub mod testkit {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    use super::{Cli, IsolateError, SKIP_GIT, too_old};
+
+    /// The `git` this box can run, or the sentence a test should print and pass on.
+    ///
+    /// Decided once per process, through the very probe `GixIsolator::new` runs, so a test can
+    /// never pass on a box where production would refuse (plan D40). A `git` below the floor
+    /// yields `skipped: git <version> is older than 2.33.0`.
+    pub fn usable_git() -> Result<Cli, String> {
+        static DECIDED: OnceLock<Result<Cli, String>> = OnceLock::new();
+        DECIDED
+            .get_or_init(|| {
+                Cli::locate().map_err(|err| match err {
+                    // The floor sentence is the refusal's own, with the skip prefix in front of
+                    // it, so the two never drift apart.
+                    IsolateError::Refused(reason) if reason == too_old(super::MIN_GIT) => {
+                        format!("skipped: {reason}")
+                    }
+                    IsolateError::Refused(reason) if reason.starts_with("git ") => {
+                        format!("skipped: {reason}")
+                    }
+                    _ => SKIP_GIT.to_owned(),
+                })
+            })
+            .clone()
+    }
+
+    /// `let Some(git) = skip_without_git!() else { return };` — prints the skip sentence and
+    /// yields `None` on a box without a usable `git`.
+    #[macro_export]
+    macro_rules! skip_without_git {
+        () => {
+            match $crate::isolate::git::testkit::usable_git() {
+                Ok(git) => Some(git),
+                Err(reason) => {
+                    println!("{reason}");
+                    None
+                }
+            }
+        };
+    }
+
+    /// One `worktree` block of `git worktree list --porcelain`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PorcelainWorktree {
+        /// The `worktree` line's path.
+        pub path: PathBuf,
+        /// The `HEAD` line's hash, absent for a bare entry.
+        pub head: Option<String>,
+        /// The `branch` line's full reference name, absent when the tree is detached.
+        pub branch: Option<String>,
+        /// The `locked` line's reason, absent when the tree is not locked.
+        pub locked: Option<String>,
+    }
+
+    /// `git worktree list --porcelain` in `repo`, parsed.
+    ///
+    /// Criteria 11 and 13's oracle. It is not a nicety: it runs the *same* binary that wrote the
+    /// administrative entry, so it answers for what `git` believes rather than for what `gix`
+    /// reconstructs.
+    ///
+    /// # Panics
+    /// When the verb cannot run or exits non-zero.
+    pub async fn worktree_list(git: &Cli, repo: &Path) -> Vec<PorcelainWorktree> {
+        use std::ffi::OsStr;
+
+        let exited = git
+            .run(
+                "worktree list",
+                repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("list"),
+                    OsStr::new("--porcelain"),
+                ],
+                &[],
+            )
+            .await
+            .expect("git worktree list runs");
+        assert!(exited.ok(), "git worktree list failed: {}", exited.stderr);
+
+        let mut entries: Vec<PorcelainWorktree> = Vec::new();
+        for line in exited.stdout.lines() {
+            let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+            match key {
+                "worktree" => entries.push(PorcelainWorktree {
+                    path: PathBuf::from(value),
+                    head: None,
+                    branch: None,
+                    locked: None,
+                }),
+                "HEAD" | "branch" | "locked" => {
+                    let Some(entry) = entries.last_mut() else {
+                        continue;
+                    };
+                    let value = (!value.is_empty()).then(|| value.to_owned());
+                    match key {
+                        "HEAD" => entry.head = value,
+                        "branch" => entry.branch = value,
+                        _ => entry.locked = value,
+                    }
+                }
+                _ => {}
+            }
+        }
+        entries
+    }
 
     /// The signature every test commit carries; a fixed timestamp keeps the hashes of a fixture
     /// stable across runs.
@@ -1278,10 +1676,14 @@ mod tests {
     async fn a_verb_that_hangs_times_out() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let marker = dir.path().join("survived");
+        // An absolute `sleep` and a redirection rather than `touch`: this case must not depend on
+        // what is on `PATH`, because the suite is also run with `git` stripped out of it (C-8).
+        let sleep = which::which("sleep").expect("a box that can run a test suite has `sleep`");
         let script = format!(
             "if [ \"$1\" = \"--version\" ]; then echo 'git version 2.43.0'; exit 0; fi\n\
-             sleep 2\n\
-             touch '{}'\n",
+             '{}' 2\n\
+             : > '{}'\n",
+            sleep.display(),
             marker.display()
         );
         let binary = fake_git(dir.path(), "slow-git", &script);
@@ -1377,6 +1779,393 @@ mod tests {
             "git: git worktree add: killed by signal"
         );
         assert!(!signalled.ok());
+    }
+
+    /// D39's schedule, both of its sources, and the two classes it must not touch.
+    #[tokio::test(start_paused = true)]
+    async fn with_retry_retries_three_times_on_a_lock_error_and_not_on_others() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = AtomicU32::new(0);
+        let err = super::with_retry("worktree add", || async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(IsolateError::Git(
+                "git worktree add: fatal: cannot lock ref 'refs/heads/htui/x'".to_owned(),
+            ))
+        })
+        .await
+        .expect_err("every attempt failed");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            4,
+            "the first plus three retries"
+        );
+        assert!(is_lock_error(&err));
+
+        // `gix`'s own wording, D39's first source.
+        let attempts = AtomicU32::new(0);
+        let _ = super::with_retry("create branch", || async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(IsolateError::Git(
+                "cannot create refs/heads/htui/x: The lock for resource \
+                 '.git/refs/heads/htui/x.lock' could not be obtained"
+                    .to_owned(),
+            ))
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+
+        // A lock that clears: the second attempt is the last.
+        let attempts = AtomicU32::new(0);
+        super::with_retry("reset --hard", || async {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(IsolateError::Git(
+                    "git reset --hard: fatal: Unable to create '/r/.git/index.lock': File exists."
+                        .to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .expect("the second attempt succeeded");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        for (label, refused, text) in [
+            ("a timeout", false, "git merge timed out after 120s"),
+            ("a refusal", true, "merge_conflict: Cargo.lock"),
+            (
+                "any other git failure",
+                false,
+                "git merge: fatal: bad object",
+            ),
+        ] {
+            let attempts = AtomicU32::new(0);
+            let _ = super::with_retry("merge", || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Err::<(), _>(if refused {
+                        IsolateError::Refused(text.to_owned())
+                    } else {
+                        IsolateError::Git(text.to_owned())
+                    })
+                }
+            })
+            .await;
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "{label} is never retried"
+            );
+        }
+    }
+
+    /// D23's post-conditions, checked by both oracles: `gix`'s `worktrees()` and the very binary
+    /// that wrote the entry.
+    #[tokio::test]
+    async fn add_worktree_is_listed_by_gix_and_by_git() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let before = repo_with_one_commit(&repo);
+
+        let run = htui_core::model::RunId::new();
+        let step = htui_core::model::StepId::new();
+        let tree = dir.path().join("trees").join("core");
+        git.add_worktree(&repo, &tree, step, run, &before)
+            .await
+            .expect("the worktree is added");
+
+        let entry = super::worktree_by_path(&repo, &tree)
+            .expect("the read succeeds")
+            .expect("gix lists the entry");
+        assert!(entry.locked, "--lock wrote the locked file");
+        assert_eq!(
+            entry.lock_reason.as_deref(),
+            Some(&*format!("htui run {run}"))
+        );
+        assert_eq!(super::head(&tree).expect("the tree has a HEAD"), before);
+        assert_eq!(
+            super::branch_target(&repo, &format!("htui/{step}")).expect("the read succeeds"),
+            Some(before.clone()),
+            "-b created the branch at the start point"
+        );
+
+        let listed = super::testkit::worktree_list(&git, &repo).await;
+        let ours = listed
+            .iter()
+            .find(|entry| entry.path == tree)
+            .expect("git worktree list names the tree it made");
+        assert_eq!(ours.head.as_deref(), Some(&*before));
+        assert_eq!(
+            ours.branch.as_deref(),
+            Some(&*format!("refs/heads/htui/{step}"))
+        );
+        assert_eq!(ours.locked.as_deref(), Some(&*format!("htui run {run}")));
+
+        // D23's own failure mode, unreachable in production because of D38's reuse.
+        let again = dir.path().join("trees").join("core-again");
+        let err = git
+            .add_worktree(&repo, &again, step, run, &before)
+            .await
+            .expect_err("the branch already exists");
+        assert_eq!(
+            err.to_string(),
+            format!("git: git worktree add: fatal: a branch named 'htui/{step}' already exists")
+        );
+    }
+
+    /// D23's remove: two `--force`es clear a locked *and* dirty tree, and a directory that is
+    /// already gone — the crash-recovery case — is not an error either.
+    #[tokio::test]
+    async fn remove_clears_a_locked_dirty_worktree_and_a_vanished_one() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let before = repo_with_one_commit(&repo);
+        let run = htui_core::model::RunId::new();
+
+        let dirty = dir.path().join("dirty");
+        git.add_worktree(&repo, &dirty, htui_core::model::StepId::new(), run, &before)
+            .await
+            .expect("the worktree is added");
+        std::fs::write(dirty.join("f"), "edited by the agent\n").expect("the file is written");
+        git.remove_worktree(&repo, &dirty)
+            .await
+            .expect("locked and dirty is still removable with two forces");
+        assert!(!dirty.exists(), "the directory is gone");
+        assert_eq!(
+            super::worktree_by_path(&repo, &dirty).expect("the read succeeds"),
+            None,
+            "and so is the administrative entry"
+        );
+
+        let vanished = dir.path().join("vanished");
+        git.add_worktree(
+            &repo,
+            &vanished,
+            htui_core::model::StepId::new(),
+            run,
+            &before,
+        )
+        .await
+        .expect("the worktree is added");
+        std::fs::remove_dir_all(&vanished).expect("the directory is deleted behind git's back");
+        git.remove_worktree(&repo, &vanished)
+            .await
+            .expect("a vanished tree removes cleanly");
+
+        git.remove_worktree(&repo, &dir.path().join("never-existed"))
+            .await
+            .expect("`is not a working tree` reads as already removed");
+    }
+
+    /// D46: an entry that outlives its directory is **reported**, never pruned.
+    #[tokio::test]
+    async fn a_stale_entry_that_survives_remove_is_reported_and_never_pruned() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        let root = dir.path().join("trees");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let before = repo_with_one_commit(&repo);
+        let run = htui_core::model::RunId::new();
+
+        let removed = root.join("removed");
+        let stale = root.join("stale");
+        for tree in [&removed, &stale] {
+            git.add_worktree(&repo, tree, htui_core::model::StepId::new(), run, &before)
+                .await
+                .expect("the worktree is added");
+        }
+        git.remove_worktree(&repo, &removed)
+            .await
+            .expect("the first is removed properly");
+        std::fs::remove_dir_all(&stale).expect("the second's directory disappears");
+
+        let surviving = super::worktrees_under(&repo, &root).expect("the read succeeds");
+        assert_eq!(
+            surviving,
+            vec![super::canonical(&stale)],
+            "exactly the entry whose directory went away, which is what cleanup reports"
+        );
+        assert!(
+            super::testkit::worktree_list(&git, &repo)
+                .await
+                .iter()
+                .any(|entry| entry.path == stale),
+            "git itself still lists it: nothing pruned it"
+        );
+    }
+
+    /// D47: the fifth verb, replacing the hand-composed `gix` checkout.
+    #[tokio::test]
+    async fn reset_hard_restores_a_deleted_and_a_modified_tracked_file() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        repo_with_one_commit(&repo);
+        let target = commit_file(&repo, "g", "second\n", "two");
+
+        std::fs::remove_file(repo.join("f")).expect("a tracked file is deleted");
+        std::fs::write(repo.join("g"), "mangled\n").expect("another is modified");
+        std::fs::write(repo.join("untracked"), "kept\n").expect("an untracked file is written");
+        assert!(super::is_dirty(&repo).expect("status reads"));
+
+        git.reset_hard(&repo, &target)
+            .await
+            .expect("the reset succeeds");
+        assert_eq!(super::head(&repo).expect("HEAD reads"), target);
+        assert!(
+            !super::is_dirty(&repo).expect("status reads"),
+            "the tree is clean again"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("g")).expect("g is back"),
+            "second\n"
+        );
+        assert!(repo.join("f").exists(), "the deleted file is restored");
+        assert!(
+            repo.join("untracked").exists(),
+            "reset --hard never removes an untracked file, which is why D24 ignores them"
+        );
+    }
+
+    /// D25's happy path: always `--no-ff`, always two parents, always the `htui` identity.
+    #[tokio::test]
+    async fn merge_no_ff_of_a_descendant_makes_a_two_parent_commit() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let before = repo_with_one_commit(&repo);
+        let step = htui_core::model::StepId::new();
+
+        let tree = dir.path().join("tree");
+        git.add_worktree(&repo, &tree, step, htui_core::model::RunId::new(), &before)
+            .await
+            .expect("the worktree is added");
+        let after = commit_file(&tree, "written", "by the agent\n", "the step's work");
+
+        let merged = git
+            .merge_no_ff(&repo, step, &before, &after)
+            .await
+            .expect("a descendant merges");
+        assert_eq!(super::head(&repo).expect("HEAD reads"), merged.commit);
+        assert_eq!(
+            super::head_parents(&repo).expect("the parents read"),
+            vec![before, after],
+            "--no-ff makes a merge commit even of a descendant (ANA-2 :980)"
+        );
+        assert!(
+            repo.join("written").exists(),
+            "the merge updated the primary working tree"
+        );
+        assert!(
+            !repo.join(".git").join("MERGE_HEAD").exists(),
+            "and concluded it"
+        );
+        assert!(!super::is_dirty(&repo).expect("status reads"));
+    }
+
+    /// D25's conflict branch: the path list, then `--abort`, then the refusal.
+    #[tokio::test]
+    async fn a_conflicting_merge_is_refused_with_the_path_and_aborted() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let base = repo_with_one_commit(&repo);
+        let step = htui_core::model::StepId::new();
+
+        let tree = dir.path().join("tree");
+        git.add_worktree(&repo, &tree, step, htui_core::model::RunId::new(), &base)
+            .await
+            .expect("the worktree is added");
+        let after = commit_file(&tree, "f", "the agent's line\n", "the step's work");
+        let before = commit_file(&repo, "f", "the human's line\n", "meanwhile");
+
+        let err = git
+            .merge_no_ff(&repo, step, &before, &after)
+            .await
+            .expect_err("the two edits of `f` conflict");
+        assert_eq!(err.to_string(), "isolation refused: merge_conflict: f");
+
+        assert_eq!(
+            super::head(&repo).expect("HEAD reads"),
+            before,
+            "the primary is where it was"
+        );
+        assert!(!super::is_dirty(&repo).expect("status reads"), "and clean");
+        assert!(
+            !repo.join(".git").join("MERGE_HEAD").exists(),
+            "--abort ran before the refusal"
+        );
+    }
+
+    /// Blueprint H-8: exit 1 is both "conflict" and "`index.lock` held", and only the second is
+    /// worth sleeping over.
+    #[tokio::test]
+    async fn a_held_index_lock_inside_merge_is_aborted_and_retried() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let before = repo_with_one_commit(&repo);
+        let step = htui_core::model::StepId::new();
+
+        let tree = dir.path().join("tree");
+        git.add_worktree(&repo, &tree, step, htui_core::model::RunId::new(), &before)
+            .await
+            .expect("the worktree is added");
+        let after = commit_file(&tree, "written", "by the agent\n", "the step's work");
+
+        // An index `gix` wrote from a tree carries no stat data, so `git` treats every path as
+        // possibly modified and reaches for its stash path rather than for the index directly —
+        // which produces `fatal: stash failed` instead of the lock wording this case is about.
+        // One `reset --hard` gives the primary the fully stat-ed index a real checkout has.
+        git.reset_hard(&repo, &before)
+            .await
+            .expect("the index is refreshed");
+
+        let lock = repo.join(".git").join("index.lock");
+        std::fs::write(&lock, "").expect("somebody else holds the index");
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            std::fs::remove_file(&lock).expect("the lock is released");
+        });
+
+        let merged = super::with_retry("merge", || git.merge_no_ff(&repo, step, &before, &after))
+            .await
+            .expect("a later attempt found the index free");
+        releaser.await.expect("the releaser finished");
+
+        assert_eq!(super::head(&repo).expect("HEAD reads"), merged.commit);
+        assert_eq!(
+            super::head_parents(&repo).expect("the parents read"),
+            vec![before, after]
+        );
+        assert!(
+            !repo.join(".git").join("MERGE_HEAD").exists(),
+            "each failed attempt aborted its own half-merge"
+        );
     }
 
     /// A `sh` script that answers `--version` like `git` does, marked executable.

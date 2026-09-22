@@ -51,7 +51,9 @@ windows = { workspace = true }
 [dev-dependencies]
 htui-core  = { workspace = true, features = ["test-support"] }
 htui-agent = { workspace = true, features = ["test-support"] }
-tokio      = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+# `test-util` (MOD-4 M3 T2): `with_retry`'s 200/400/800 ms schedule is asserted under a paused
+# clock, so the test costs no wall-clock time at all.
+tokio      = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 # Every repository the isolator's tests build is real and throwaway (plan D40); `tempfile = "3"`
 # is how the other four crates declare it (`crates/htui-core/Cargo.toml:31`).
 tempfile   = "3"
