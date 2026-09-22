@@ -197,6 +197,47 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   section — two worktree-isolated runs on one repo are refused, which is safe but narrower than
   `R-ORCH-9`. Plan: `.claude/plans/mod-4-orch-seam.plan.md`; blueprint:
   `.claude/plans/mod-4-orch-seam.blueprint.md`.
+  **Milestone 2 landed (`cacab31`..`0a53d9c`, 2026-09-19; close-out round `f87c2b7`..`1cbddc5`,
+  2026-09-22): a graph walks.** 22 implementation commits over 37 files, plus eight close-out
+  commits. `crates/htui-orch` is the fifth workspace crate — `lib.rs`, `graph.rs`, `status.rs`,
+  `command.rs`, `isolate.rs`, `engine.rs`, `gate.rs`, and `fake.rs` + `conformance.rs` behind
+  `test-support` — depending on `htui-core` and `htui-agent` and never on `htui-store` (ANA-2
+  invariant 10). It runs `prd -> plan -> implement -> review` against `FakeDriver`, a new
+  `FakeIsolator` and `MemStore`: the six-stage walk, the gate table, the review loop and its
+  no-progress predicate, with no git, no Postgres, no agent and no second migration.
+  **Milestone 1's deferred R-1 is answered**: `finish_run` is the nineteenth writer and moves the
+  run and mirrors its item in one transaction on both stores (`PgStore` takes `run` then `item`
+  `FOR UPDATE`, the order every other two-row writer already uses). **R-2 is still deferred to
+  milestone 5** — the engine adds no overlap reasoning of its own. `CASES` 47 -> 48; `htui-orch`'s
+  own case list is 15.
+  **Three decisions the implementation corrected, all recorded in the plan**: D5 retires a `failed`
+  step by cancelling it rather than leaving it alone (a `failed` latest attempt reads as a rest, so
+  the walk would stop forever); D10 records an unexpected review verdict as an `item_note` carrying
+  `via_step_id`, not in `gate_note`; D19 resolves the graph through a `GraphSource` trait
+  `htui-orch` defines itself, because eleven of milestone 1's reads are store-inherent and not on
+  any trait.
+  **The review gate found three HIGH and five MEDIUM; every finding was verified against the tree
+  and every one was applied** (`9acb166`, `106671b`, `23fef33`, `9870673`, `60120c7`, `6345a4a`,
+  `ed7756c`, `c83ae97`, `cf2f08a`, `5d4582a`, `1cbddc5`). The two that change behaviour a later
+  milestone must know about: (1) a step that errors *after* the `pending -> running` move used to
+  leave the run running forever, because `cursor` rests on `running` and every command refuses a
+  running step — the walk now delegates to `walk_live_step` and hard-fails through `fail_hard`
+  (`running -> failed` + `finish_run`), and **a spawn failure lands in `failed` under every gate**,
+  never parking, per ANA-2 `:639`; (2) `RetryStep` on a terminal run created an orphan `pending`
+  step and reported success — neither store refuses a step on a terminal run, so the refusal is the
+  engine's (`EngineError::RunStatus`). ANA-2's `failed -> retry -> queued` row (`:585`) is the
+  *item* table and remains unimplemented. `EngineError` also gained `Snapshot` and `Stalled` so the
+  walk's own invariants stop arriving as `Store(Constraint)` — milestone 6's `run_worker.rs` is the
+  first consumer that would have been misled.
+  **A second §4.2/§4.3 disagreement is now recorded in the plan's risks, beside D2's**: ANA-2
+  `:450` says a `never` gate with an exhausted `failed` settle ends the run `awaiting_approval`,
+  while `:575`/`:608` and the shipped code end it `failed`. Milestone 5 must not re-read `:450`
+  literally. Two known warts, both deliberate: an engine-side encode failure of the trim record is
+  reported as `EngineError::Record(RecordError::Encode)`, whose sentence says "recorder"; and
+  `Rest.failure` is populated only by the transition that caused the stop, with `run.failure` as
+  the durable record (documented rather than parsed back, so D12's one-way grammar keeps one home).
+  Plan: `.claude/plans/mod-4-orch-engine.plan.md`; blueprint:
+  `.claude/plans/mod-4-orch-engine.blueprint.md`.
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
   per-box paths, agent autodiscovery hook. Not blocked (MOD-6 landed,
