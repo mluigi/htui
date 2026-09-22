@@ -65,7 +65,7 @@ const LEASE_SECONDS: i64 = 120;
 /// review loop's are finite — so this is a net and not a bound. It exists because the walk is a
 /// loop over rows the engine does not own: a row moved under it by another process (plan D17) must
 /// end in a refusal a human can read, never in a spin.
-const MAX_ITERATIONS: usize = 512;
+const MAX_ITERATIONS: u32 = 512;
 
 // ---------------------------------------------------------------------------------------------
 // Seams
@@ -365,7 +365,7 @@ where
         let run = self.run(run).await?;
         let snapshot = Self::snapshot_of(&run)?;
         let step = self.step(run.id, step).await?;
-        let phase = Self::phase_at(&snapshot, step.position)?;
+        let phase = Self::phase_at(run.id, &snapshot, step.position)?;
         let item = Self::item_of(&run)?;
 
         let has_output = self.output_of(item, &phase, step.id).await?.is_some();
@@ -471,7 +471,7 @@ where
         }
         let snapshot = Self::snapshot_of(&run)?;
         let row = self.step(run.id, step).await?;
-        let phase = Self::phase_at(&snapshot, row.position)?;
+        let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = self.item(Self::item_of(&run)?).await?;
 
         // Blueprint F-J / R-4: `Status::can_move_to` has no `blocked -> in_progress` edge, so a
@@ -564,7 +564,7 @@ where
                 }
                 Cursor::Rest { .. } => return self.resting(&row).await,
                 Cursor::Create { position, attempt } => {
-                    let phase = Self::phase_at(&snapshot, position)?;
+                    let phase = Self::phase_at(run, &snapshot, position)?;
                     if let Some(rest) = self.admit(&row, &snapshot, &phase, attempt).await? {
                         return Ok(rest);
                     }
@@ -573,16 +573,17 @@ where
                     let Some(step) = steps.into_iter().find(|row| row.id == step) else {
                         continue;
                     };
-                    let phase = Self::phase_at(&snapshot, step.position)?;
+                    let phase = Self::phase_at(run, &snapshot, step.position)?;
                     if let Some(rest) = self.walk_step(&row, &snapshot, step, &phase).await? {
                         return Ok(rest);
                     }
                 }
             }
         }
-        Err(EngineError::Store(StoreError::Constraint(format!(
-            "run {run}: the walk made {MAX_ITERATIONS} passes without resting; a row moved under it"
-        ))))
+        Err(EngineError::Stalled {
+            run,
+            passes: MAX_ITERATIONS,
+        })
     }
 
     /// ANA-2 §12 criterion 3 (`docs/ANA-2.md:2090`): what §4.9's sweep does before it advances a
@@ -879,7 +880,7 @@ where
         match gate::apply(&ctx, step, phase, settled).await? {
             Landing::Advance => Ok(None),
             Landing::Retry { position, attempt } => {
-                let phase = Self::phase_at(snapshot, position)?;
+                let phase = Self::phase_at(run.id, snapshot, position)?;
                 self.admit(&row, snapshot, &phase, attempt).await
             }
             Landing::Rest(rest) => Ok(Some(rest)),
@@ -1229,16 +1230,23 @@ where
     }
 
     /// The snapshot phase at `position`.
-    fn phase_at(snapshot: &GraphSnapshot, position: i32) -> Result<SnapshotPhase, EngineError> {
+    ///
+    /// A position the snapshot does not name is an engine invariant and not a store refusal:
+    /// invariant 2 makes the snapshot the only thing a live run reads, so there is no second
+    /// source to try and nothing the store did wrong (see [`EngineError::Snapshot`]).
+    fn phase_at(
+        run: RunId,
+        snapshot: &GraphSnapshot,
+        position: i32,
+    ) -> Result<SnapshotPhase, EngineError> {
         snapshot
             .phases
             .iter()
             .find(|phase| phase.position == position)
             .cloned()
-            .ok_or_else(|| {
-                EngineError::Store(StoreError::Constraint(format!(
-                    "the run's snapshot has no phase at position {position}"
-                )))
+            .ok_or_else(|| EngineError::Snapshot {
+                run,
+                reason: format!("no phase at position {position}"),
             })
     }
 
@@ -1250,11 +1258,12 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
     ) -> Result<SnapshotCandidate, EngineError> {
-        let agent_id = step.agent_id.ok_or_else(|| {
-            EngineError::Store(StoreError::Constraint(format!(
+        let agent_id = step.agent_id.ok_or_else(|| EngineError::Snapshot {
+            run: step.run_id,
+            reason: format!(
                 "step {} names no agent; stage 1 creates none without one",
                 step.id
-            )))
+            ),
         })?;
         let named = phase
             .candidates
@@ -1529,9 +1538,9 @@ mod tests {
     use htui_agent::event::StopReason;
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch,
-        RepoId, RunMode, RunStatus, SnapshotCandidate, SnapshotPhase, Status, StepGraphId,
-        StepGraphPhase, StepStatus,
+        Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewRunStep, NewStepGraph, PhaseId,
+        PhasePatch, RepoId, RunMode, RunStatus, SnapshotCandidate, SnapshotPhase, Status,
+        StepGraphId, StepGraphPhase, StepId, StepStatus,
     };
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
@@ -2425,7 +2434,7 @@ mod tests {
     /// Every case that wants an error *inside* a walk needs the run id first, and a `StartRun`
     /// that fails on its first position never hands one over — so the failure is scripted onto
     /// position 1 and reached by approving position 0.
-    async fn started(harness: &Harness) -> (htui_core::model::RunId, htui_core::model::StepId) {
+    async fn started(harness: &Harness) -> (htui_core::model::RunId, StepId) {
         harness.free_feat_3().await;
         let CommandOutcome::Started { run, rest } = harness
             .dispatch(Command::StartRun {
@@ -2455,6 +2464,67 @@ mod tests {
                 .expect("the walk created the run with a snapshot"),
         )
         .expect("the engine wrote a `GraphSnapshot`")
+    }
+
+    /// Plan D17: a `run_step` row at a position the run's snapshot has no phase for.
+    ///
+    /// MOD-2's chat path inserts `run` and `run_step` rows outside §4.3 on purpose, so this is a
+    /// shape the walk has to refuse readably rather than assume away. It is an **engine**
+    /// invariant — invariant 2 says the walk reads its snapshot and nothing else, so there is no
+    /// second source to consult — and reporting it as `StoreError::Constraint` blamed the store
+    /// for it. Milestone 6's `run_worker.rs` is the first consumer that will match on the variant.
+    #[tokio::test]
+    async fn a_position_the_snapshot_does_not_name_is_a_snapshot_refusal() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+
+        let orphan = StepId::new();
+        harness
+            .orch
+            .store
+            .create_step(NewRunStep {
+                id: orphan,
+                run_id: run,
+                position: 9,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "nowhere".to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: Some("sonnet".to_owned()),
+            })
+            .await
+            .expect("`UNIQUE (run_id, position, attempt, fanout_index)` is free at 9");
+        let now = harness.orch.clock.now();
+        for (from, to) in [
+            (StepStatus::Pending, StepStatus::Running),
+            (StepStatus::Running, StepStatus::AwaitingApproval),
+        ] {
+            assert!(
+                harness
+                    .orch
+                    .store
+                    .transition_step(orphan, from, to, now)
+                    .await
+                    .expect("both moves are legal"),
+                "`{from}` -> `{to}`"
+            );
+        }
+
+        let refused = harness
+            .dispatch(Command::AnswerGate {
+                run,
+                step: orphan,
+                answer: GateAnswer::Approved,
+            })
+            .await
+            .expect_err("the snapshot names no phase at position 9");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::Snapshot { run: id, reason } if *id == run && reason.contains("position 9")
+            ),
+            "{refused}"
+        );
     }
 
     /// One `prepare` per step, and not two.

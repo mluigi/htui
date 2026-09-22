@@ -200,6 +200,33 @@ pub enum EngineError {
         /// `GraphSnapshot::v` as stored.
         v: u32,
     },
+    /// The run's own `graph_snapshot` cannot answer something the walk must ask of it: a position
+    /// with no phase, or a step naming no agent.
+    ///
+    /// An **engine** invariant and not a store refusal. Invariant 2 makes the snapshot the single
+    /// thing a live run reads (`docs/ANA-2.md:109-113`), so there is no second source to fall back
+    /// to and nothing the store did wrong; reporting it as `StoreError::Constraint` would put an
+    /// engine bug behind a variant milestone 6's `run_worker.rs` will be matching for store
+    /// outages. The sentence is what a human reads, per invariant 7.
+    #[error("run {run} snapshot: {reason}")]
+    Snapshot {
+        /// The run whose snapshot came up short.
+        run: RunId,
+        /// What was asked of it, in a readable sentence.
+        reason: String,
+    },
+    /// The walk spent its whole iteration budget without reaching a rest.
+    ///
+    /// Every pass either creates a step, runs one, or stops, and both the retry budget and the
+    /// review loop's are finite — so this is a net and not a bound: a row moved under the walk by
+    /// another process (plan D17) ends in a refusal a human can read rather than in a spin.
+    #[error("run {run}: the walk made {passes} passes without resting; a row moved under it")]
+    Stalled {
+        /// The run the walk could not rest.
+        run: RunId,
+        /// How many passes it made, which is the budget.
+        passes: u32,
+    },
     /// Stage 3 could not assemble the prompt.
     #[error(transparent)]
     Prompt(#[from] AssembleError),
@@ -441,6 +468,26 @@ mod tests {
             .to_string(),
             format!(
                 "run {} snapshot v9 is not readable by this engine",
+                ids::RUN_2
+            )
+        );
+        assert_eq!(
+            EngineError::Snapshot {
+                run: ids::RUN_2,
+                reason: "no phase at position 9".to_owned(),
+            }
+            .to_string(),
+            format!("run {} snapshot: no phase at position 9", ids::RUN_2),
+            "ANA-2 invariant 7 wants a row a human can read, not a store refusal"
+        );
+        assert_eq!(
+            EngineError::Stalled {
+                run: ids::RUN_2,
+                passes: 512,
+            }
+            .to_string(),
+            format!(
+                "run {}: the walk made 512 passes without resting; a row moved under it",
                 ids::RUN_2
             )
         );
