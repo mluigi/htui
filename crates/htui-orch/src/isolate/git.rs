@@ -3,9 +3,11 @@
 //! Two halves, one file, because they answer the same question from two directions (plan D42):
 //!
 //! - **The `gix` half** — every *read* and every ref *write*. Synchronous functions over `&Path`
-//!   that return owned values, each called by `isolate/real.rs` under
+//!   that return owned values, and every async caller — `isolate/real.rs`, and the verbs' own
+//!   post-conditions below — reaches them through [`blocking`], i.e. under
 //!   [`tokio::task::spawn_blocking`]; no `gix::Repository` ever crosses an `.await`, because it is
-//!   `Send` and *not* `Sync` (`gix-0.87.1/src/types.rs:148`) and `IsolatorFuture` is `Send`.
+//!   `Send` and *not* `Sync` (`gix-0.87.1/src/types.rs:148`) and `IsolatorFuture` is `Send`, and
+//!   no status walk ever runs on a runtime worker.
 //! - **The `git` half** — a `Cli` that spawns the binary for the five verbs `gix` 0.87.1 does not
 //!   implement: `worktree add`, `worktree remove`, `merge --no-ff`, `merge --abort` and
 //!   `reset --hard` (plan OQ-1, resolved by the maintainer on 2026-09-22; D23, D25, D47;
@@ -379,13 +381,18 @@ impl Cli {
             return Err(exited.failure("worktree add"));
         }
 
-        if head(path)? != before {
+        let tree = path.to_path_buf();
+        if blocking(move || head(&tree)).await? != before {
             return Err(broken_post_condition(
                 "worktree add",
                 "created a tree that does not check out",
             ));
         }
-        if !worktree_by_path(repo, path)?.is_some_and(|entry| entry.locked) {
+        let (main, tree) = (repo.to_path_buf(), path.to_path_buf());
+        if !blocking(move || worktree_by_path(&main, &tree))
+            .await?
+            .is_some_and(|entry| entry.locked)
+        {
             return Err(broken_post_condition(
                 "worktree add",
                 "created a tree that is not listed as locked",
@@ -450,7 +457,9 @@ impl Cli {
         if !exited.ok() {
             return Err(exited.failure("reset --hard"));
         }
-        if head(tree)? != target || is_dirty(tree)? {
+        let read = tree.to_path_buf();
+        let (at, dirty) = blocking(move || Ok((head(&read)?, is_dirty(&read)?))).await?;
+        if at != target || dirty {
             return Err(broken_post_condition(
                 "reset --hard",
                 "left a tree that is not at the target or not clean",
@@ -499,22 +508,23 @@ impl Cli {
             .await?;
 
         if exited.ok() {
-            let parents = head_parents(primary)?;
+            let read = primary.to_path_buf();
+            let (parents, commit) =
+                blocking(move || Ok((head_parents(&read)?, head(&read)?))).await?;
             if parents != [before, after] {
                 return Err(broken_post_condition(
                     "merge",
                     "the merge commit's parents are not [before_hash, after_hash]",
                 ));
             }
-            return Ok(Merged {
-                commit: head(primary)?,
-            });
+            return Ok(Merged { commit });
         }
 
         // A lock, a conflict or anything else: read the paths first, because `--abort` throws the
         // stage entries away, then restore the primary, then classify.
         let conflicted = if exited.code == Some(1) && lock_signature(&exited.stderr).is_none() {
-            conflicted_paths(primary)?
+            let read = primary.to_path_buf();
+            blocking(move || conflicted_paths(&read)).await?
         } else {
             Vec::new()
         };
@@ -590,6 +600,29 @@ where
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+/// Runs one synchronous `gix` or filesystem call on the blocking pool.
+///
+/// Every async caller of this file's `gix` half and of `isolate/copy.rs` goes through here with
+/// owned paths, which is what keeps a `gix::Repository` — `Send` and not `Sync` — from ever being
+/// alive across an `.await` (blueprint H-17), and a status walk over a large tree from stalling a
+/// runtime worker. A task that panicked or was cancelled is a [`IsolateError::Git`], never a
+/// panic in the caller.
+///
+/// # Errors
+/// Whatever `task` returned, or [`IsolateError::Git`] when it did not finish.
+pub(crate) async fn blocking<T, F>(task: F) -> Result<T, IsolateError>
+where
+    F: FnOnce() -> Result<T, IsolateError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(task).await {
+        Ok(result) => result,
+        Err(err) => Err(IsolateError::Git(format!(
+            "a blocking git task did not finish: {err}"
+        ))),
     }
 }
 
@@ -791,9 +824,10 @@ fn spawn_supervised(
 // ---------------------------------------------------------------------------------------------
 // The `gix` half: every read and every ref write.
 //
-// Synchronous, over `&Path`, returning owned values. `isolate/real.rs` calls each of these under
-// `tokio::task::spawn_blocking` with an owned `PathBuf`, so no `gix::Repository` — `Send` but not
-// `Sync` (`gix-0.87.1/src/types.rs:148`) — is ever held across an `.await` (blueprint H-17).
+// Synchronous, over `&Path`, returning owned values. Every async caller — `isolate/real.rs` and
+// the verbs above — calls each of these through [`blocking`] with an owned `PathBuf`, so no
+// `gix::Repository` — `Send` but not `Sync` (`gix-0.87.1/src/types.rs:148`) — is ever held across
+// an `.await` (blueprint H-17).
 // ---------------------------------------------------------------------------------------------
 
 /// A repository at `path` has no commit, so there is no `before_hash` to record (blueprint A-4).
@@ -1922,6 +1956,24 @@ mod tests {
                 "{label} is never retried"
             );
         }
+    }
+
+    /// The blocking helper hands back the task's own answer, and a task that panicked is a git
+    /// error for the caller rather than a panic in it. On the `current_thread` runtime
+    /// `#[tokio::test]` uses, which is where a sync status walk would stall everything.
+    #[tokio::test]
+    async fn blocking_returns_the_answer_and_maps_a_panic_to_an_error() {
+        assert_eq!(
+            super::blocking(|| Ok(7)).await.expect("the task answers"),
+            7
+        );
+        let err = super::blocking::<(), _>(|| panic!("the walk fell over"))
+            .await
+            .expect_err("a panicked task is an error");
+        assert!(
+            matches!(&err, IsolateError::Git(text) if text.starts_with("a blocking git task did not finish")),
+            "{err}"
+        );
     }
 
     /// D23's post-conditions, checked by both oracles: `gix`'s `worktrees()` and the very binary

@@ -4,9 +4,11 @@
 //! This is the first place ANA-2 §4.6's four isolation modes exist as *behaviour* rather than as
 //! pieces: `isolate/git.rs` knows what a worktree is, `isolate/copy.rs` knows what a copy is, and
 //! neither knows which of them a step wants. Every mode is one private `async fn` per verb, and
-//! every call into the two sync modules runs under [`tokio::task::spawn_blocking`] with owned
-//! paths — no `gix::Repository` crosses an `.await` (blueprint H-17), and no `.await` happens under
-//! a `std` lock (`crates/htui-core/src/store/mem.rs:3-7` is the precedent).
+//! every call into the two sync modules runs through [`git::blocking`] (`spawn_blocking`) with
+//! owned paths — no `gix::Repository` crosses an `.await` (blueprint H-17), and no `.await` happens
+//! under a `std` lock (`crates/htui-core/src/store/mem.rs:3-7` is the precedent). The `git` verbs
+//! are the one exception by design: they are `async` process supervision, and the `gix`
+//! post-conditions inside them go through the same helper.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +18,7 @@ use htui_core::model::{BoxId, Isolation, RepoId, RunId, RunStepCommit, RunStepTr
 use tokio::sync::OwnedMutexGuard;
 
 use super::copy;
-use super::git::{self, Cli};
+use super::git::{self, Cli, blocking};
 use super::{IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree};
 
 // One named free function per refusal sentence, the house style of `htui_core`'s store refusals
@@ -860,24 +862,6 @@ fn remove_directory(path: &Path) -> Result<(), IsolateError> {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(IsolateError::Io(err)),
-    }
-}
-
-/// Runs one synchronous `gix` or filesystem call on the blocking pool.
-///
-/// Every call into `isolate/git.rs`'s `gix` half and `isolate/copy.rs` goes through here with owned
-/// paths, which is what keeps a `gix::Repository` — `Send` and not `Sync` — from ever being alive
-/// across an `.await` (blueprint H-17).
-async fn blocking<T, F>(task: F) -> Result<T, IsolateError>
-where
-    F: FnOnce() -> Result<T, IsolateError> + Send + 'static,
-    T: Send + 'static,
-{
-    match tokio::task::spawn_blocking(task).await {
-        Ok(result) => result,
-        Err(err) => Err(IsolateError::Git(format!(
-            "a blocking git task did not finish: {err}"
-        ))),
     }
 }
 
