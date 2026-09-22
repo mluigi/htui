@@ -464,9 +464,11 @@ impl GixIsolator {
     /// refuses a branch that already exists (`git.rs`'s own
     /// `add_worktree_on_an_existing_branch_is_a_git_error_naming_the_branch` pins that), and the
     /// remove-then-add path leaves exactly that branch behind. A tree whose `HEAD` cannot even be
-    /// read is treated as not reusable for the same reason, and `reset --hard`'s own
-    /// post-condition is then what reports the real failure. The remove-and-re-add path survives
-    /// for the one case where `-b` is legal: a tree with no branch at all.
+    /// read — a `.git` file pointing at a `worktrees/<id>` entry somebody pruned — is not a
+    /// repository any more, so `reset --hard` inside it could only fail, forever: it is removed and
+    /// re-added onto the existing branch **without** `-b` ([`Cli::add_worktree_on_branch`]). The
+    /// remove-and-re-add with `-b` survives for the one case where `-b` is legal: a tree with no
+    /// branch at all.
     #[expect(
         clippy::too_many_arguments,
         reason = "every one of them is a fact of the tree being made; a struct for them would be \
@@ -488,7 +490,17 @@ impl GixIsolator {
             match blocking(move || git::branch_target(&repo, &name)).await? {
                 Some(base) => {
                     let tree = path.to_path_buf();
-                    let at_base = matches!(blocking(move || git::head(&tree)).await, Ok(head) if head == base);
+                    let Ok(head) = blocking(move || git::head(&tree)).await else {
+                        git::with_retry("worktree remove", || git.remove_worktree(&local, path))
+                            .await?;
+                        remove_directory(path)?;
+                        git::with_retry("worktree add", || {
+                            git.add_worktree_on_branch(&local, path, step, run, &base)
+                        })
+                        .await?;
+                        return Ok(base);
+                    };
+                    let at_base = head == base;
                     let tree = path.to_path_buf();
                     let clean = at_base
                         && matches!(blocking(move || git::is_dirty(&tree)).await, Ok(false));
@@ -1768,6 +1780,67 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A tree whose `.git` file points at an administrative entry somebody pruned has a branch but
+    /// no readable `HEAD`, and `reset --hard` inside it is a command run outside any repository.
+    /// It is re-made instead — removed, and re-added onto the existing branch without `-b`.
+    #[tokio::test]
+    async fn a_worktree_whose_admin_entry_was_pruned_is_re_added_onto_its_branch() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let run = RunId::new();
+        let step = StepId::new();
+        let first = isolator
+            .prepare(run, step, &[core], Isolation::Worktree)
+            .await
+            .expect("the first call prepares");
+        let tree = PathBuf::from(&first.trees[0].tree.path);
+
+        // The prune: the administrative entry goes, the tree's `.git` file still points at it.
+        let admin = core_path.join(".git").join("worktrees");
+        for entry in std::fs::read_dir(&admin).expect("the worktrees directory reads") {
+            std::fs::remove_dir_all(entry.expect("an entry").path()).expect("the entry is pruned");
+        }
+        assert!(
+            tree.join(".git").is_file(),
+            "the gitfile survives the prune"
+        );
+        assert!(crate::isolate::git::head(&tree).is_err(), "the premise");
+
+        let second = isolator
+            .prepare(run, step, &[core], Isolation::Worktree)
+            .await
+            .expect("the second call re-makes the tree");
+
+        assert_eq!(
+            second.trees[0].before_hash, head,
+            "the base is the branch's"
+        );
+        assert_eq!(second.trees[0].tree.path, first.trees[0].tree.path);
+        assert_eq!(
+            crate::isolate::git::head(&tree).expect("the tree has a HEAD again"),
+            head
+        );
+        let listed = crate::isolate::git::testkit::worktree_list(&git, &core_path).await;
+        let ours = listed
+            .iter()
+            .find(|entry| entry.path == tree)
+            .expect("git lists the re-made tree");
+        assert_eq!(
+            ours.branch.as_deref(),
+            Some(&*format!("refs/heads/htui/{step}")),
+            "on the step's own branch"
+        );
+        assert_eq!(ours.locked.as_deref(), Some(&*format!("htui run {run}")));
     }
 
     /// The mode table's own refusal: `git worktree add` checks out the gitlink and leaves the

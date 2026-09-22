@@ -333,6 +333,33 @@ pub fn merge_conflict(paths: &[String]) -> String {
     format!("merge_conflict: {}", paths.join(", "))
 }
 
+/// D23's two `gix` post-conditions of `worktree add`: the new tree's `HEAD` is `before`, and the
+/// main repository lists a locked entry at `path`.
+async fn worktree_post_condition(
+    repo: &Path,
+    path: &Path,
+    before: &str,
+) -> Result<(), IsolateError> {
+    let tree = path.to_path_buf();
+    if blocking(move || head(&tree)).await? != before {
+        return Err(broken_post_condition(
+            "worktree add",
+            "created a tree that does not check out",
+        ));
+    }
+    let (main, tree) = (repo.to_path_buf(), path.to_path_buf());
+    if !blocking(move || worktree_by_path(&main, &tree))
+        .await?
+        .is_some_and(|entry| entry.locked)
+    {
+        return Err(broken_post_condition(
+            "worktree add",
+            "created a tree that is not listed as locked",
+        ));
+    }
+    Ok(())
+}
+
 /// The post-condition of a verb held, but the tree it made does not answer for it.
 fn broken_post_condition(verb: &str, what: &str) -> IsolateError {
     IsolateError::Git(format!("git {verb}: {what}"))
@@ -380,25 +407,48 @@ impl Cli {
         if !exited.ok() {
             return Err(exited.failure("worktree add"));
         }
+        worktree_post_condition(repo, path, before).await
+    }
 
-        let tree = path.to_path_buf();
-        if blocking(move || head(&tree)).await? != before {
-            return Err(broken_post_condition(
+    /// `git worktree add --lock --reason "htui run <run>" <path> htui/<step>`: D23's verb onto a
+    /// branch that **already exists**, so without `-b`, which refuses one.
+    ///
+    /// The re-make of a tree whose administrative entry was pruned from under it: the branch — and
+    /// with it the step's `before_hash` — survived, the checkout did not. `base` is where the
+    /// branch points; the post-conditions are [`add_worktree`](Cli::add_worktree)'s.
+    ///
+    /// # Errors
+    /// As [`add_worktree`](Cli::add_worktree).
+    pub async fn add_worktree_on_branch(
+        &self,
+        repo: &Path,
+        path: &Path,
+        step: StepId,
+        run: RunId,
+        base: &str,
+    ) -> Result<(), IsolateError> {
+        let branch = format!("htui/{step}");
+        let reason = format!("htui run {run}");
+        let exited = self
+            .run(
                 "worktree add",
-                "created a tree that does not check out",
-            ));
+                repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("--lock"),
+                    OsStr::new("--reason"),
+                    OsStr::new(&reason),
+                    path.as_os_str(),
+                    OsStr::new(&branch),
+                ],
+                &[],
+            )
+            .await?;
+        if !exited.ok() {
+            return Err(exited.failure("worktree add"));
         }
-        let (main, tree) = (repo.to_path_buf(), path.to_path_buf());
-        if !blocking(move || worktree_by_path(&main, &tree))
-            .await?
-            .is_some_and(|entry| entry.locked)
-        {
-            return Err(broken_post_condition(
-                "worktree add",
-                "created a tree that is not listed as locked",
-            ));
-        }
-        Ok(())
+        worktree_post_condition(repo, path, base).await
     }
 
     /// D23 and D46: `git worktree remove --force --force <path>`, run in the managed checkout.
