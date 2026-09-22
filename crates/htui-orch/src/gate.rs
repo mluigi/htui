@@ -218,7 +218,11 @@ pub struct SettleInput<'a> {
     pub output: Option<&'a Document>,
     /// `run_step.verify_outcome`. Always `None` this milestone (plan D8, blueprint H-14).
     pub verify_outcome: Option<VerifyOutcome>,
-    /// Whether the phase's front matter is read at all: `SnapshotPhase::output_kind == "review"`.
+    /// Whether the phase's front matter is read at all: `SnapshotPhase::name == "review"`, which
+    /// is what the walk passes (`crate::engine`'s stage 5) and not `output_kind`. The two agree on
+    /// every seeded phase — `phase_row` writes `output_kind` equal to the name
+    /// (`crates/htui-core/src/seed.rs:230`) — and a graph edited through `create_phase` can set
+    /// them apart, so which one decides is worth stating.
     pub is_review: bool,
 }
 

@@ -24,7 +24,12 @@ async fn feature_snapshot_matches() {
     .unwrap();
     let expected_str = std::fs::read_to_string("tests/fixtures/feature.snapshot.json").unwrap();
     let expected: GraphSnapshot = serde_json::from_str(&expected_str).unwrap();
-    assert_eq!(resolved.snapshot.topology, expected.topology);
+    // The whole snapshot, which is what blueprint §6.1 asks for: the recorded row equals a fresh
+    // `graph::resolve` of the same graph. The digest alone would pass on a snapshot whose phases
+    // were right and whose `graph`, `mode`, `v` or `settings` were not — `topology` is hashed over
+    // `phases[]` and nothing else (plan D9) — and it would say "the digests differ" about any of
+    // the seventeen `SnapshotPhase` fields rather than naming the one that moved.
+    assert_eq!(resolved.snapshot, expected);
 }
 
 #[tokio::test]
