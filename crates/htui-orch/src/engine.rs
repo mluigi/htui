@@ -307,6 +307,7 @@ where
             } => self.start_run(item, mode, repo_scope).await,
             Command::AnswerGate { run, step, answer } => self.answer_gate(run, step, answer).await,
             Command::RetryStep { run, step } => self.retry_step(run, step).await,
+            Command::CancelRun { run } => self.cancel_run(run).await,
         }
     }
 
@@ -537,6 +538,56 @@ where
         }
         let rest = self.run_to_rest(run.id).await?;
         Ok(CommandOutcome::Retried { step: row.id, rest })
+    }
+
+    /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).
+    ///
+    /// Every step that has not settled moves to `cancelled` — `pending`, `running`,
+    /// `awaiting_approval` and `failed` all reach it (`model/run.rs`) — then the run does, then
+    /// plan D36's cleanup runs. `Ok(false)` from a step move is ignored for plan D17's reason:
+    /// another process settling a step under this call is not this call's to report, and the run
+    /// is ending either way.
+    ///
+    /// The position is read **before** the moves, because after them there is no live step left
+    /// for `cursor` to name and a caller would be told `None` — "the run finished" — about a run
+    /// that was stopped at position 2.
+    ///
+    /// `pub` for the same reason [`cleanup_run`](Self::cleanup_run) is: milestone 6's Runs tab is
+    /// the caller ANA-2 §6.2 writes this row for.
+    ///
+    /// # Errors
+    /// [`EngineError::RunStatus`] for a run that has already finished; the store's own refusals.
+    pub async fn cancel_run(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
+        let row = self.run(run).await?;
+        crate::command::cancel_enabled(&row)?;
+        let position = self.resting(&row).await?.position;
+
+        let now = self.now();
+        let steps = self.parts.store.run_steps(run).await?;
+        for step in &steps {
+            if step.status.is_terminal() {
+                continue;
+            }
+            self.parts
+                .store
+                .transition_step(step.id, step.status, StepStatus::Cancelled, now)
+                .await?;
+        }
+        // `finish_run` mirrors the item `queued | in_progress | awaiting_approval -> open`
+        // (`store/traits.rs`), which is what frees it for a second run; `failure` stays NULL
+        // because a cancel is a human's decision and not a failure.
+        self.parts
+            .store
+            .finish_run(run, RunStatus::Cancelled, None, now)
+            .await?;
+        self.cleanup_run(run).await?;
+        Ok(CommandOutcome::Cancelled {
+            rest: Rest {
+                run: RunStatus::Cancelled,
+                position,
+                failure: None,
+            },
+        })
     }
 
     // -- the walk ------------------------------------------------------------------------------

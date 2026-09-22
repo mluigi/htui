@@ -1,5 +1,5 @@
-//! The three operator commands of ANA-2 §6.2 (`docs/ANA-2.md:1557-1572`) and their enabling
-//! guards: `StartRun`, `AnswerGate` and `RetryStep`.
+//! The four operator commands of ANA-2 §6.2 (`docs/ANA-2.md:1557-1572`) and their enabling
+//! guards: `StartRun`, `AnswerGate`, `RetryStep` and `CancelRun`.
 //!
 //! §6.2's table has an "Enabled when" column, and the Runs tab (milestone 6) greys an action out
 //! by exactly the rule the engine refuses it by. That only stays true if there is one rule, so the
@@ -14,7 +14,7 @@
 //! milestone 6's Runs tab speaks it without ever constructing an `Engine`. T4 uses both from here.
 
 use htui_core::model::{
-    ItemId, RepoId, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, StepId, StepStatus,
+    ItemId, RepoId, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, StepId, StepStatus,
 };
 use htui_core::prompt::AssembleError;
 use htui_core::store::StoreError;
@@ -25,9 +25,11 @@ use crate::status::{RunFailure, may_attempt};
 
 /// What a human asks the orchestrator to do, in manual mode (ANA-2 §6.2, `docs/ANA-2.md:1557`).
 ///
-/// Three of §6.2's ten; `PromoteStep`, `CancelRun`, `CancelStep`, `OpenArtifact`, `SelectFanout`,
-/// `AcceptArtifact`, `Unblock` and `CloseOut` belong to milestones 3 to 6 and are deliberately not
+/// Four of §6.2's ten; `PromoteStep`, `CancelStep`, `OpenArtifact`, `SelectFanout`,
+/// `AcceptArtifact`, `Unblock` and `CloseOut` belong to milestones 4 to 6 and are deliberately not
 /// declared here — an enum arm with no dispatcher arm is a promise the walk has not made.
+/// `CancelRun` left that list in milestone 3 (plan D45): ANA-2 §12 criterion 13 is stated as
+/// "cancelling a run", and the cleanup it triggers is what the criterion is about.
 ///
 /// **`AnswerGate` and `RetryStep` carry `run` as well as `step`** because there is no per-step read
 /// on the store seam: `ReadStore::run_steps` is per run
@@ -61,6 +63,12 @@ pub enum Command {
         run: RunId,
         /// The step to retry.
         step: StepId,
+    },
+    /// §6.2's `cancel run` (plan D45): every live step to `cancelled`, the run to `cancelled`, and
+    /// then ANA-2 §4.6's run-terminal cleanup.
+    CancelRun {
+        /// The run to stop. It carries no step: every one of them goes.
+        run: RunId,
     },
 }
 
@@ -126,6 +134,11 @@ pub enum CommandOutcome {
         /// The step the retry replaced.
         step: StepId,
         /// Where the walk rested.
+        rest: Rest,
+    },
+    /// [`Command::CancelRun`]: where the run stopped, which is where it was.
+    Cancelled {
+        /// The run's last position, and `Cancelled` as its status.
         rest: Rest,
     },
 }
@@ -324,6 +337,34 @@ pub fn retry_enabled(step: &RunStep, phase: &SnapshotPhase) -> Result<(), Engine
     Ok(())
 }
 
+/// §6.2's "Enabled when" for `cancel run` (plan D45): the run has not finished.
+///
+/// `queued`, `running` and `awaiting_approval` are exactly the three `RunStatus::can_move_to`
+/// admits `cancelled` from (`crates/htui-core/src/model/run.rs`), and exactly
+/// [`RunStatus::is_active`]'s three — so the guard is stated against the table rather than against
+/// a list, and a status added to §4.3 cannot be silently left out of it.
+///
+/// A `queued` run has no steps and was never claimed; cancelling it is still legal and still ends
+/// with a cleanup, because the run may have been claimed and crashed between the two reads.
+///
+/// **"Only if no session is live" is not checked here.** In this milestone's synchronous walk it
+/// is true by construction — a step is `running` only inside one `dispatch` call, and a second
+/// command cannot be dispatched while it is — and milestone 6, where a session outlives a
+/// dispatch, is where the kill belongs.
+///
+/// # Errors
+/// [`EngineError::RunStatus`] for a `done`, `failed` or `cancelled` run.
+pub fn cancel_enabled(run: &Run) -> Result<(), EngineError> {
+    if run.status.is_active() {
+        return Ok(());
+    }
+    Err(EngineError::RunStatus {
+        run: run.id,
+        status: run.status,
+        expected: "queued | running | awaiting_approval",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use htui_core::fixtures::{demo_data, ids};
@@ -447,6 +488,54 @@ mod tests {
             retry_enabled(&step, &phase).expect_err("a done step is not retryable"),
             EngineError::NotGated { .. }
         ));
+    }
+
+    /// Plan D45 against §4.3's own table: the three statuses `cancelled` is reachable from are
+    /// the three the guard admits, and no other.
+    #[test]
+    fn cancel_is_enabled_exactly_where_the_run_table_allows_it() {
+        let mut run = demo_data()
+            .runs
+            .into_iter()
+            .find(|row| row.id == ids::RUN_1)
+            .expect("the fixture holds RUN_1");
+
+        for status in [
+            htui_core::model::RunStatus::Queued,
+            htui_core::model::RunStatus::Running,
+            htui_core::model::RunStatus::AwaitingApproval,
+        ] {
+            run.status = status;
+            assert!(
+                status.can_move_to(htui_core::model::RunStatus::Cancelled),
+                "`{status}` reaches `cancelled` in §4.3's table"
+            );
+            assert!(
+                super::cancel_enabled(&run).is_ok(),
+                "`{status}` is cancellable"
+            );
+        }
+
+        for status in [
+            htui_core::model::RunStatus::Done,
+            htui_core::model::RunStatus::Failed,
+            htui_core::model::RunStatus::Cancelled,
+        ] {
+            run.status = status;
+            let refused =
+                super::cancel_enabled(&run).expect_err("a finished run is not cancellable");
+            assert!(
+                matches!(
+                    &refused,
+                    EngineError::RunStatus {
+                        status: got,
+                        expected: "queued | running | awaiting_approval",
+                        ..
+                    } if *got == status
+                ),
+                "{refused}"
+            );
+        }
     }
 
     /// The named refusals are what a human reads, so their bytes are part of the contract.

@@ -137,17 +137,19 @@ impl Orchestrate for FakeOrchestrator {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Seventeen, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_seventeen` and out of crate by `tests/fake_conformance.rs` (T5) — because
-/// a binding that silently ran sixteen of them would still be green.
+/// Eighteen, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_eighteen` and out of crate by `tests/fake_conformance.rs` (T5) — because
+/// a binding that silently ran seventeen of them would still be green.
 ///
-/// Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3, 5, 6, 7); four are contract lines
+/// Seven are `docs/ANA-2.md` §12's validation criteria (1, 2, 3, 5, 6, 7 and 13's command half);
+/// four are contract lines
 /// §12 does not number but §4.2 states outright; one is the `finish_run` seam T1 shipped for this
 /// walk to use; three are the cells of §4.2's gate table nothing else reaches — plan D4's automatic
 /// loop entry and both halves of `on_failure` — which D4 predicted would go unexecuted in a
 /// manual-mode milestone and did; one is plan D5's intermediate position, which had a topology
-/// digest pinning it and no walk executing it; the last two are milestone 3's, and are the settle's
-/// two readings of a `verify_command` that ran (`fail`) and one that could not (`unavailable`).
+/// digest pinning it and no walk executing it; the last three are milestone 3's — the settle's two
+/// readings of a `verify_command` that ran (`fail`) and one that could not (`unavailable`), and
+/// `CancelRun`, which criterion 13 is stated in terms of (plan D45).
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -189,6 +191,9 @@ pub const CASES: &[&str] = &[
     // `:443`: `unavailable` never fails a step, and its `command_run` row is `failed` — the
     // command did not run. Both facts are one report and they disagree on purpose.
     "verify_unavailable_never_fails",
+    // Criterion 13 (`:2120`) as far as the fake reaches it (the trees are `tests/gix_isolator.rs`'s
+    // half): cancelling a run cancels every live step and cleans up exactly once.
+    "cancel_cleans_up_once",
 ];
 
 /// Run one case by name.
@@ -227,6 +232,7 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
         }
         "verify_fail_settles_failed" => verify_fail_settles_failed(harness).await,
         "verify_unavailable_never_fails" => verify_unavailable_never_fails(harness).await,
+        "cancel_cleans_up_once" => cancel_cleans_up_once(harness).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1861,6 +1867,83 @@ async fn verify_unavailable_never_fails<H: CaseHarness>(harness: &H) {
     );
 }
 
+/// ANA-2 §12 criterion 13 (`docs/ANA-2.md:2120`) minus its filesystem half: `CancelRun` ends the
+/// run, cancels every step that had not settled, frees the item, and cleans up **once**.
+///
+/// The trees are `tests/gix_isolator.rs`'s to assert — the fake makes none — so what this case
+/// pins is the shape of the command: which statuses it is legal from, what it moves, and that the
+/// cleanup plan D36 hangs on every terminal `finish_run` hangs on this one too.
+async fn cancel_cleans_up_once<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0)),
+        "`prd` is `always`-gated in the seed, so the walk parks there"
+    );
+
+    let outcome = orch
+        .dispatch(Command::CancelRun { run })
+        .await
+        .expect("a parked run is cancellable");
+    let CommandOutcome::Cancelled { rest } = outcome else {
+        panic!("`CancelRun` answers `Cancelled`, not {outcome:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::Cancelled, Some(0), None),
+        "a cancel is a human's decision and not a failure"
+    );
+
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::Cancelled);
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.position, step.status))
+            .collect::<Vec<_>>(),
+        [(0, StepStatus::Cancelled)],
+        "every step that had not settled goes with the run"
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Open,
+        "`finish_run` mirrors the item `awaiting_approval -> open` (plan D7)"
+    );
+    assert_eq!(
+        harness_cleanups(&orch),
+        1,
+        "plan D45 ends with plan D36's cleanup, once"
+    );
+
+    let refused = orch
+        .dispatch(Command::CancelRun { run })
+        .await
+        .expect_err("a cancelled run is not cancellable again");
+    assert!(
+        matches!(
+            &refused,
+            EngineError::RunStatus {
+                status: RunStatus::Cancelled,
+                expected: "queued | running | awaiting_approval",
+                ..
+            }
+        ),
+        "{refused}"
+    );
+    assert_eq!(
+        harness_cleanups(&orch),
+        1,
+        "the refusal wrote nothing, cleanup included"
+    );
+}
+
+/// The isolator's cleanup count, named once so the case above reads as one claim per line.
+fn harness_cleanups<O: Orchestrate>(orch: &O) -> u32 {
+    orch.isolator().cleanups()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -1878,15 +1961,15 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_seventeen() {
+    fn cases_are_unique_and_eighteen() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            17,
-            "six ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam, the three \
+            18,
+            "seven ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam, the three \
              gate-table cells only an edited gate reaches, plan D5's intermediate position and \
              milestone 3's two verify outcomes"
         );
