@@ -125,13 +125,15 @@ impl Orchestrate for FakeOrchestrator {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Eleven, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_eleven` and out of crate by `tests/fake_conformance.rs` (T5) — because a
-/// binding that silently ran ten of them would still be green.
+/// Fourteen, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_fourteen` and out of crate by `tests/fake_conformance.rs` (T5) — because a
+/// binding that silently ran thirteen of them would still be green.
 ///
 /// Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3, 5, 6, 7); four are contract lines
-/// §12 does not number but §4.2 states outright; the last is the `finish_run` seam T1 shipped for
-/// this walk to use.
+/// §12 does not number but §4.2 states outright; one is the `finish_run` seam T1 shipped for this
+/// walk to use; the last three are the two cells of §4.2's gate table nothing else reaches — plan
+/// D4's automatic loop entry and `on_failure` — which D4 predicted would go unexecuted in a
+/// manual-mode milestone and did.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -157,6 +159,13 @@ pub const CASES: &[&str] = &[
     "step_deadline_settles_failed",
     // Plan D7: the last write of a finished walk is `finish_run`, and the item mirrors it.
     "finish_run_is_the_last_write",
+    // Plan D4's *other* entry point (`:450`, the `never` × `rejected` cell): the walk itself
+    // rejects a review and runs the loop, with no human in it.
+    "a_never_gate_rejection_loops_the_review",
+    // The same entry point out of budget: `:746`'s escalation, reached without a human.
+    "a_never_gate_rejection_escalates_when_the_budget_is_out",
+    // `:449`, both halves: `on_failure` passes a settle `ok` and parks a settle `failed`.
+    "on_failure_passes_ok_and_parks_failed",
 ];
 
 /// Run one case by name.
@@ -181,6 +190,15 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
         }
         "step_deadline_settles_failed" => step_deadline_settles_failed(harness).await,
         "finish_run_is_the_last_write" => finish_run_is_the_last_write(harness).await,
+        "a_never_gate_rejection_loops_the_review" => {
+            a_never_gate_rejection_loops_the_review(harness).await;
+        }
+        "a_never_gate_rejection_escalates_when_the_budget_is_out" => {
+            a_never_gate_rejection_escalates_when_the_budget_is_out(harness).await;
+        }
+        "on_failure_passes_ok_and_parks_failed" => {
+            on_failure_passes_ok_and_parks_failed(harness).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1188,6 +1206,263 @@ async fn finish_run_is_the_last_write<H: CaseHarness>(harness: &H) {
     // instant. Pinning them equal would be pinning the store's clock, not the walk's.
 }
 
+/// Plan D4's **automatic** entry point (`docs/ANA-2.md:450`, the `never` × `rejected` cell): the
+/// walk reads `verdict: request-changes` off the review it just ran and loops with no human in it.
+///
+/// D4 predicted this path would be the unreached one — "the seeded `review` phase's gate is
+/// `always`, so in manual mode the automatic path is the unreached one" — and every other case that
+/// loops goes through `AnswerGate { Rejected }` instead. Repointing `review` to `never` is what
+/// makes the cell reachable, and the shape asserted is the same retirement criterion 6 asserts for
+/// the human path: identical rows, which is D4's "one routine, two callers" read back from the
+/// store.
+///
+/// The two review attempts are scripted apart — `request-changes` then `approve` — so the loop is
+/// entered once and then left by the review passing, which is the branch that ends in a `done` run.
+async fn a_never_gate_rejection_loops_the_review<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "review" {
+            phase.gate = Gate::Never;
+        }
+    })
+    .await;
+    orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "first"),
+    );
+    orch.script("review", 2, ScriptedStep::review("approve", "second"));
+
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+
+    // prd, plan, implement 1. The walk then runs `review` itself, settles it `rejected`, and comes
+    // back round to park the implement the loop re-created — no human answered the review.
+    let rest = approve(&orch, run, 3).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(2), None),
+        "the loop resumed at `implement` and the `always` gate there parked it"
+    );
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.position, step.attempt, step.status))
+            .collect::<Vec<_>>(),
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Superseded),
+            (2, 2, StepStatus::AwaitingApproval),
+            (3, 1, StepStatus::Cancelled),
+        ],
+        "plan D5's retirement, reached without a human: the implement is superseded and the \
+         rejecting review is cancelled, because `failed -> superseded` is illegal"
+    );
+    assert_eq!(
+        at(&steps, 3, 1).gate_outcome,
+        Some(GateOutcome::Rejected),
+        "the automatic path parks the review first precisely so `answer_gate` can record this: \
+         nothing else writes `gate_outcome = 'rejected'` with its note"
+    );
+    assert_eq!(
+        at(&steps, 3, 1).gate_note.as_deref(),
+        Some("verdict: request-changes"),
+        "the note is the review's own verdict line (`docs/ANA-2.md:748`), not a human's sentence"
+    );
+
+    // Approve the re-run implement; the second review approves itself and the run finishes.
+    let rest = approve(&orch, run, 1).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::Done, None, None),
+        "the loop terminates: a `never` review that approves walks the run straight to `done`"
+    );
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        at(&steps, 3, 2).status,
+        StepStatus::Done,
+        "the second review ran at its own attempt and passed"
+    );
+    assert_eq!(
+        at(&steps, 3, 2).gate_outcome,
+        None,
+        "`never` passes a step `running -> done` and leaves `gate_outcome` NULL (blueprint H-9)"
+    );
+    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Done);
+}
+
+/// The automatic entry point out of budget: `docs/ANA-2.md:746`'s escalation, reached with no human
+/// in the loop.
+///
+/// The twin of `review_rejection_loops_then_escalates`, which drives the same escalation through
+/// `AnswerGate { Rejected }`. Both review attempts reject and their bodies differ, so §4.4's
+/// no-progress predicate answers false on both halves and `Exhausted` — `retry_limit = 1` on
+/// `implement`, which permits two attempts — is the only thing left that can stop the loop. That is
+/// what makes the `after N attempts` count in the note mean the budget and not the predicate.
+async fn a_never_gate_rejection_escalates_when_the_budget_is_out<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "review" {
+            phase.gate = Gate::Never;
+        }
+    })
+    .await;
+    orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "first"),
+    );
+    orch.script(
+        "review",
+        2,
+        ScriptedStep::review("request-changes", "second"),
+    );
+
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    approve(&orch, run, 3).await; // prd, plan, implement 1 -> review 1 rejects -> implement 2 parks
+    let rest = approve(&orch, run, 1).await; // implement 2 -> review 2 rejects, and the budget is out
+
+    assert_eq!(
+        rest.failure,
+        Some(RunFailure::ReviewLoopExhausted(2)),
+        "`retry_limit = 1` on `implement` permits two attempts and no more"
+    );
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(3)),
+        "escalate is not terminate: the run parks at the review that rejected"
+    );
+
+    let row = run_of(&orch, run).await;
+    assert_eq!(row.status, RunStatus::AwaitingApproval);
+    assert!(
+        row.failure.is_none(),
+        "blueprint A-4: `run.failure` stays NULL on a parked run"
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Blocked
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.iter().any(|body| {
+            body.contains("review loop exhausted after 2 attempts")
+                && body.contains("phase `implement`")
+                && body.contains("stop reason `exhausted`")
+        }),
+        "`docs/ANA-2.md:746`'s wording, verbatim, on the automatic path too: {notes:?}"
+    );
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        at(&steps, 3, 2).status,
+        StepStatus::Failed,
+        "`answer_gate(Rejected)` lands the review `failed`, and the loop stopped before retiring it"
+    );
+    assert_eq!(
+        at(&steps, 3, 2).gate_outcome,
+        Some(GateOutcome::Rejected),
+        "the verdict is on the row a human is about to read"
+    );
+    assert!(
+        !steps.iter().any(|step| step.attempt > 2),
+        "the loop stopped rather than creating a third attempt"
+    );
+}
+
+/// `docs/ANA-2.md:449`, both halves: `on_failure` passes a settle `ok` through and parks a settle
+/// `failed`.
+///
+/// The only gate value no case reached. It is the one row of §4.2's table that *depends* on the
+/// settle outcome without looping — `always` parks on all three and `never` parks on none — so a
+/// single half would not pin it: a gate that always passed and a gate that always parked would each
+/// satisfy one of the two assertions below.
+///
+/// Both halves use `prd`, which is position 0, so the failing half's park is the run's first stop
+/// and nothing earlier can be mistaken for it.
+async fn on_failure_passes_ok_and_parks_failed<H: CaseHarness>(harness: &H) {
+    // Half 1: the settle is `ok`, so the gate does not stop and the walk moves on.
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::OnFailure;
+        }
+    })
+    .await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "`prd` did not stop, so the first gate the walk met is `plan`'s `always`"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.position, step.phase_name.as_str(), step.status))
+            .collect::<Vec<_>>(),
+        [
+            (0, "prd", StepStatus::Done),
+            (1, "plan", StepStatus::AwaitingApproval),
+        ]
+    );
+    assert_eq!(
+        at(&steps, 0, 1).gate_outcome,
+        None,
+        "`gate_outcome = 'skipped'` is not written: `answer_gate` is the only writer of the column \
+         and it is `awaiting_approval`-only (blueprint H-9)"
+    );
+
+    // Half 2: the same gate, the same phase, a settle that failed — and now it stops.
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::OnFailure;
+        }
+    })
+    .await;
+    orch.script("prd", 1, ScriptedStep::done_without_output());
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(0), None),
+        "a failed settle under `on_failure` parks for a human rather than failing the run"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.position, step.attempt, step.status))
+            .collect::<Vec<_>>(),
+        [(0, 1, StepStatus::AwaitingApproval)],
+        "the gate stopped the walk, so no retry was admitted — which is what separates this row \
+         from `never`'s, where the same settle spends the budget and then fails the run"
+    );
+    assert_eq!(
+        run_of(&orch, run).await.status,
+        RunStatus::AwaitingApproval,
+        "the park moves step, run and item (blueprint H-10)"
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.iter().any(|body| body.contains("missing_output")),
+        "ANA-2 invariant 7: the parked step's reason is readable on the item: {notes:?}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -1205,15 +1480,16 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_eleven() {
+    fn cases_are_unique_and_fourteen() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            11,
-            "six ANA-2 §12 criteria, four §4.2 contract lines and the `finish_run` seam"
+            14,
+            "six ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam and the three \
+             gate-table cells only an edited gate reaches"
         );
     }
 
