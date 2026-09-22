@@ -24,14 +24,37 @@ chrono     = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
-tokio      = { workspace = true, features = ["sync"] }
+# MOD-4 milestone 3 (plan D22, T2): `sync` for the per-`(box, repo)` mutex and the verify
+# semaphore, `process` + `io-util` + `time` for `isolate/git.rs`'s `git` children and their
+# 120 s budget, `rt` for the `spawn_blocking` every `gix` call runs under, `fs` for the scratch
+# root.
+tokio      = { workspace = true, features = ["sync", "rt", "process", "io-util", "time", "fs"] }
 tracing    = { workspace = true }
 uuid       = { workspace = true }
+# MOD-4 milestone 3 (plan D22, D47): every git *read* and every ref write. The five verbs `gix`
+# 0.87.1 does not implement — `worktree add`, `worktree remove`, `merge --no-ff`, `merge --abort`
+# and `reset --hard` — are spawned as the `git` binary by `isolate/git.rs` (OQ-1), which is why
+# `which` (locating it) and `process-wrap` (the process group / job object around it) are here.
+gix          = { workspace = true }
+which        = { workspace = true }
+process-wrap = { workspace = true }
+# MOD-4 milestone 3 (plan D35, T4): `isolate/copy.rs` measures and copies a checkout with a
+# bounded walk, mirroring `htui_store::vector_sync`'s.
+walkdir      = { workspace = true }
+
+# Only to name `PROCESS_CREATION_FLAGS` for `CREATE_NO_WINDOW`, exactly as `htui-agent` does
+# (`crates/htui-agent/src/launch.rs:1139-1143`): `process-wrap`'s `CreationFlags` wraps that type
+# and exposes no constructor of its own.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
 
 [dev-dependencies]
 htui-core  = { workspace = true, features = ["test-support"] }
 htui-agent = { workspace = true, features = ["test-support"] }
 tokio      = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+# Every repository the isolator's tests build is real and throwaway (plan D40); `tempfile = "3"`
+# is how the other four crates declare it (`crates/htui-core/Cargo.toml:31`).
+tempfile   = "3"
 
 [lints]
 workspace = true

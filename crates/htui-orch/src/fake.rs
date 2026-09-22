@@ -182,6 +182,10 @@ impl Isolator for FakeIsolator {
             Ok(Prepared {
                 trees,
                 cwd: PathBuf::from(cwd),
+                // The fake puts every tree under one `cwd`, which is the `worktree`/`copy` shape
+                // (plan D28); nothing is ever outside it, so there is nothing to hand
+                // `SessionSpec.extra_dirs`.
+                extra_dirs: Vec::new(),
             })
         })
     }

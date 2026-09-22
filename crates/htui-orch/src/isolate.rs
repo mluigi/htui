@@ -23,6 +23,8 @@ use htui_core::model::{
     Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId, TIMESTAMPTZ_DIGITS,
 };
 
+pub mod git;
+
 /// The boxed future every [`Isolator`] method returns.
 ///
 /// The shape of `htui_agent::driver::DriverFuture` (`crates/htui-agent/src/driver.rs:37`) and for
@@ -77,6 +79,14 @@ pub struct Prepared {
     pub trees: Vec<PreparedTree>,
     /// `SessionSpec.cwd` for the step's session.
     pub cwd: PathBuf,
+    /// `SessionSpec.extra_dirs` (`crates/htui-agent/src/driver.rs:257-258`): every tree that is
+    /// not under [`cwd`](Prepared::cwd).
+    ///
+    /// A `worktree` or `copy` step puts all of its trees under one common parent and leaves this
+    /// empty; a `shared_serialized` or `local` step runs in the primary repo's own checkout, and
+    /// the second repo of its scope is somewhere else on the box entirely (plan D28). An agent
+    /// that cannot read that tree cannot work in it.
+    pub extra_dirs: Vec<PathBuf>,
 }
 
 /// ANA-2 §4.6's four verbs, named there verbatim (`docs/ANA-2.md:1769`), behind plan D6's seam.
@@ -95,6 +105,11 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     ///
     /// An empty `scope` is not an error — it is the demo fixture's own shape — and yields no trees
     /// and a `cwd` the session can still start in.
+    ///
+    /// A real isolator makes this idempotent for `worktree` and `copy` (plan D38): a second call
+    /// for the same `(run, step)` finds the tree it made and reports the same `before_hash`. The
+    /// trait does not promise it — the fake mints a fresh one per call — and the engine calls it
+    /// once (`crates/htui-orch/src/engine.rs:1069-1073`).
     fn prepare<'a>(
         &'a self,
         run: RunId,

@@ -62,7 +62,8 @@ process-wrap          = { version = "10.0.0", features = ["tokio1", "creation-fl
 # `windows` crate's `PROCESS_CREATION_FLAGS` and exposes no constructor of its own. Same version as
 # `process-wrap`'s own dependency, so the tree holds one copy.
 windows               = { version = "0.62.2", features = ["Win32_System_Threading"] }
-similar               = "3.2.0"   # milestone 3 diff synthesis; no crate consumes it yet (A3)
+# ACP edit_proposal.diff (htui-agent); milestone 4's previous_diff renderer (MOD-4 M3 plan OQ-4)
+similar               = "3.2.0"
 which                 = "8.0.6"
 # MOD-2 milestone 5 (plan D47): the probe compiles `VersionProbe.pattern` and compares a captured
 # version with `VersionProbe.min`. Both were already in the graph as transitive dependencies
@@ -99,6 +100,14 @@ fastembed             = "3.14.1"
 ort                   = { version = "=2.0.0-rc.4", default-features = false, features = ["download-binaries"] }
 ureq                  = { version = "2.12.1", features = ["tls"] }
 walkdir               = "2"
+# MOD-4 milestone 3 (plan D22, D47): every read and every ref write of the isolator. No default
+# features: `sha1` is the only one of them we need and is named explicitly. The five that remain
+# are each tied to a call — `sha1` to every `ObjectId`, `parallel` to `Repository: Send`, `status`
+# to `is_dirty()`, `index` to `open_index()`, `max-performance-safe` to the pack cache OQ-5's
+# `copy_range` reads a commit range under. `worktree-mutation` is gone with D47: the five worktree
+# and merge verbs `gix` 0.87.1 lacks are spawned as `git` by `isolate/git.rs` (OQ-1).
+gix                   = { version = "0.87.1", default-features = false, features = [
+                          "sha1", "max-performance-safe", "parallel", "index", "status"] }
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"
