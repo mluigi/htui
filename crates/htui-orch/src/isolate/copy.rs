@@ -8,7 +8,8 @@
 //!
 //! The copy carries the source's `.git` (ANA-2 `:915`, the mode table at plan `:204`), which is
 //! what makes it a real checkout the agent can commit in and what `reconcile` later fetches the
-//! range out of. So `.git` is never excluded and [`measure`] counts it.
+//! range out of. So `.git` is never excluded and [`measure`] counts it — all but its `*.lock`
+//! files, which are another process's claim and not state ([`is_git_lock`]).
 //!
 //! Everything here is synchronous; milestone 3's `isolate::real::GixIsolator` calls it under
 //! `tokio::task::spawn_blocking` (it is named in text rather than linked because T5 creates it
@@ -162,12 +163,14 @@ pub fn measure_within_cap(src: &Path, excludes: &[Exclude], cap: u64) -> Result<
 }
 
 /// The one walk both [`measure`] and [`copy_tree`] run: depth-first, links never followed, any
-/// directory (or file) whose name an exclude matches pruned whole, the root itself never pruned.
+/// directory (or file) whose name an exclude matches pruned whole, the root itself never pruned,
+/// and no `*.lock` file under the source's own `.git` (see [`is_git_lock`]).
 fn walk(
     src: &Path,
     excludes: &[Exclude],
 ) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> {
     let owned: Vec<Exclude> = excludes.to_vec();
+    let root = src.to_path_buf();
     WalkDir::new(src)
         .follow_links(false)
         .into_iter()
@@ -177,9 +180,29 @@ fn walk(
             if entry.depth() == 0 {
                 return true;
             }
+            if is_git_lock(&root, entry) {
+                return false;
+            }
             let name = entry.file_name().to_string_lossy();
             !owned.iter().any(|exclude| exclude.matches(&name))
         })
+}
+
+/// A `*.lock` file anywhere under `<root>/.git/`: somebody else's write in flight at the moment of
+/// the copy — `index.lock`, a ref lock, `config.lock`.
+///
+/// `.git` is copied on purpose (ANA-2 `:915`), but its locks are not state, they are a claim by a
+/// process that will never run in the copy. Carried over, an `index.lock` makes the copy's own
+/// `git reset --hard` (plan D47) fail with `File exists` — which D39 classifies as retryable, and
+/// every retry meets the same lock nobody will ever release. A `Cargo.lock` in the working tree is
+/// content and is not matched: only paths whose first component under the root is `.git` are.
+fn is_git_lock(root: &Path, entry: &walkdir::DirEntry) -> bool {
+    !entry.file_type().is_dir()
+        && entry.file_name().to_string_lossy().ends_with(".lock")
+        && entry
+            .path()
+            .strip_prefix(root)
+            .is_ok_and(|relative| relative.starts_with(".git"))
 }
 
 /// A `walkdir` failure as this crate's error, keeping the `io::Error` when there is one.
@@ -573,6 +596,46 @@ mod tests {
             std::fs::read(dst.join(".git/HEAD")).expect("the copied file reads"),
             vec![b'x'; 41],
             "content is copied, not just the name"
+        );
+    }
+
+    /// A `*.lock` under the source's `.git` is somebody else's in-flight write — an `index.lock`
+    /// from a `git` the user is running, a ref lock — and copied into the tree it would make the
+    /// copy's own `reset --hard` fail on `File exists` against a lock nothing will ever release. A
+    /// `Cargo.lock` outside `.git` is content and is copied like any other file.
+    #[test]
+    fn a_lock_file_under_dot_git_is_never_copied() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let src = dir.path().join("src");
+        lay_out(
+            &src,
+            &[
+                (".git/HEAD", 41),
+                (".git/index.lock", 7),
+                (".git/refs/heads/main.lock", 7),
+                ("Cargo.lock", 11),
+                ("crate/Cargo.lock", 13),
+            ],
+        );
+
+        assert_eq!(
+            measure(&src, &excludes(&[])).expect("the walk reads the tree"),
+            41 + 11 + 13,
+            "what is never copied is never counted"
+        );
+        let dst = dir.path().join("copy");
+        copy_tree(&src, &dst, &excludes(&[])).expect("the tree copies");
+        assert_eq!(
+            layout_of(&dst),
+            vec![
+                ".git/",
+                ".git/HEAD",
+                ".git/refs/",
+                ".git/refs/heads/",
+                "Cargo.lock",
+                "crate/",
+                "crate/Cargo.lock",
+            ]
         );
     }
 
