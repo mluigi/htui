@@ -58,8 +58,8 @@ pub struct FakeIsolator {
     calls: Mutex<u32>,
     /// Scripted [`prepare`](Isolator::prepare) refusals, FIFO, one consumed per call.
     refusals: Mutex<VecDeque<String>>,
-    /// Scripted [`reconcile`](Isolator::reconcile) refusals, FIFO, one consumed per call.
-    reconcile_refusals: Mutex<VecDeque<String>>,
+    /// Scripted [`reconcile`](Isolator::reconcile) failures, FIFO, one consumed per call.
+    reconcile_failures: Mutex<VecDeque<IsolateError>>,
     /// How many times [`prepare`](Isolator::prepare) has been called, refusals included.
     prepares: Mutex<u32>,
     /// How many times [`cleanup`](Isolator::cleanup) has been called (plan D36: once per run, at
@@ -112,10 +112,25 @@ impl FakeIsolator {
     /// where `fail_hard` cannot move the row (blueprint H-2) — so what a refusal here does is a
     /// park, and a test needs to be able to cause one.
     pub fn refuse_reconcile(&self, reason: &str) {
-        self.reconcile_refusals
+        self.push_reconcile_failure(IsolateError::Refused(reason.to_owned()));
+    }
+
+    /// Make the next [`reconcile`](Isolator::reconcile) fail with a `git` error rather than a
+    /// refusal — an `index.lock` that outlived its three retries, say.
+    ///
+    /// The distinction is the one blueprint H-2 had to decide: a refusal is a sentence about the
+    /// tree, a `Git` error is a sentence about the verb, and **both** park, because the step is
+    /// `done` either way and there is no status a failure could be written to.
+    pub fn fail_reconcile(&self, reason: &str) {
+        self.push_reconcile_failure(IsolateError::Git(reason.to_owned()));
+    }
+
+    /// The queue both of the two above push to.
+    fn push_reconcile_failure(&self, err: IsolateError) {
+        self.reconcile_failures
             .lock()
             .expect("no panic holds the fake isolator's lock")
-            .push_back(reason.to_owned());
+            .push_back(err);
     }
 
     /// Make every [`prepare`](Isolator::prepare) report `dirs` as its `extra_dirs`.
@@ -273,13 +288,13 @@ impl Isolator for FakeIsolator {
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
             let _ = trees;
-            if let Some(reason) = self
-                .reconcile_refusals
+            if let Some(err) = self
+                .reconcile_failures
                 .lock()
                 .expect("no panic holds the fake isolator's lock")
                 .pop_front()
             {
-                return Err(IsolateError::Refused(reason));
+                return Err(err);
             }
             Ok(self
                 .captured

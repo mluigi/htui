@@ -3477,6 +3477,63 @@ mod tests {
         );
     }
 
+    /// Blueprint H-2's other half: a `reconcile` that failed rather than refused parks too.
+    ///
+    /// `IsolateError::Git` is a sentence about the verb and not about the tree — an `index.lock`
+    /// that outlived D39's three retries, a hook that exited non-zero — and there is still no
+    /// status a `done` step could be failed into. A run parked with the sentence keeps everything
+    /// and tells the human what the primary is in; a run failed would have to lie about the step.
+    #[tokio::test]
+    async fn a_reconcile_that_failed_parks_with_the_git_sentence() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.gate = Gate::Never;
+                }
+            })
+            .await;
+        harness
+            .orch
+            .isolator
+            .fail_reconcile("git merge: Unable to create '.git/index.lock': File exists");
+
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("a `reconcile` failure is never re-raised")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        assert_eq!(
+            harness.orch.steps(run).await[0].status,
+            StepStatus::Done,
+            "`done -> failed` is illegal, which is the whole reason this parks"
+        );
+        let notes: Vec<String> = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .map(|note| note.body)
+            .collect();
+        assert!(
+            notes
+                .iter()
+                .any(|body| body.contains("git merge: Unable to create")),
+            "the verb's own sentence survives to the item: {notes:?}"
+        );
+    }
+
     /// The other terminal path plan D36 names: a step that never settled at all.
     ///
     /// `fail_hard` ends the run, so the trees it made have to go the same way a finished run's do.
