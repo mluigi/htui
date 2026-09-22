@@ -125,15 +125,16 @@ impl Orchestrate for FakeOrchestrator {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Fourteen, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_fourteen` and out of crate by `tests/fake_conformance.rs` (T5) — because a
-/// binding that silently ran thirteen of them would still be green.
+/// Fifteen, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_fifteen` and out of crate by `tests/fake_conformance.rs` (T5) — because a
+/// binding that silently ran fourteen of them would still be green.
 ///
 /// Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3, 5, 6, 7); four are contract lines
 /// §12 does not number but §4.2 states outright; one is the `finish_run` seam T1 shipped for this
-/// walk to use; the last three are the two cells of §4.2's gate table nothing else reaches — plan
-/// D4's automatic loop entry and `on_failure` — which D4 predicted would go unexecuted in a
-/// manual-mode milestone and did.
+/// walk to use; three are the cells of §4.2's gate table nothing else reaches — plan D4's automatic
+/// loop entry and both halves of `on_failure` — which D4 predicted would go unexecuted in a
+/// manual-mode milestone and did; the last is plan D5's intermediate position, which had a topology
+/// digest pinning it and no walk executing it.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -166,6 +167,9 @@ pub const CASES: &[&str] = &[
     "a_never_gate_rejection_escalates_when_the_budget_is_out",
     // `:449`, both halves: `on_failure` passes a settle `ok` and parks a settle `failed`.
     "on_failure_passes_ok_and_parks_failed",
+    // Plan D5's intermediate position (`:721-722`): a phase between `implement` and `review` is
+    // retired with the chain and re-run at its own `attempt + 1`.
+    "an_intermediate_position_is_retired_by_the_loop",
 ];
 
 /// Run one case by name.
@@ -198,6 +202,9 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
         }
         "on_failure_passes_ok_and_parks_failed" => {
             on_failure_passes_ok_and_parks_failed(harness).await;
+        }
+        "an_intermediate_position_is_retired_by_the_loop" => {
+            an_intermediate_position_is_retired_by_the_loop(harness).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -335,6 +342,89 @@ async fn repoint<O: Orchestrate>(orch: &O, item: ItemId, mutate: impl Fn(&mut St
                 step_graph_id: Some(Some(clone.id)),
                 author_id: row.created_by,
                 reason: "a conformance case's edit of the live graph".to_owned(),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect("the item's version is current");
+}
+
+/// Repoints `item` at a clone of its graph carrying one **extra position between `implement` and
+/// `review`**, shifting every later phase up by one.
+///
+/// The shape is `tests/fixtures/feature-with-verify.snapshot.json`'s, which plan D5's risk row calls
+/// for ("a fixture graph with an intermediate position is one of T5's recorded graphs") and which
+/// nothing walked: a `verify` phase cloned off `implement`, its `template_name` left at `review`
+/// because the seed ships no `verify` template, and its `output_kind` its own name so the document
+/// the stand-in producer writes is distinguishable from `implement`'s.
+///
+/// Separate from [`repoint`] rather than a parameter of it: `repoint` edits a phase in place and
+/// every one of its five callers wants exactly that, while this one changes the *shape* of the
+/// graph and has to renumber around the insertion.
+///
+/// # Panics
+/// When any of the writes is refused, which means the fixture moved under the case.
+async fn insert_verify_phase<O: Orchestrate>(orch: &O, item: ItemId) {
+    let row = item_of(orch, item).await;
+    let graph = orch
+        .store()
+        .resolve_graph(item)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item resolves to a graph");
+    let clone = orch
+        .store()
+        .create_step_graph(NewStepGraph {
+            id: StepGraphId::new(),
+            project_id: row.project_id,
+            name: format!("{}-with-verify", row.key),
+            description: "an intermediate position between implement and review".to_owned(),
+        })
+        .await
+        .expect("the name is fresh");
+    let implement = graph
+        .phases
+        .iter()
+        .find(|phase| phase.phase.name == "implement")
+        .expect("the `feature` graph names an `implement` phase")
+        .phase
+        .position;
+    for phase in &graph.phases {
+        let mut edited = StepGraphPhase {
+            id: PhaseId::new(),
+            graph_id: clone.id,
+            ..phase.phase.clone()
+        };
+        if edited.position > implement {
+            edited.position += 1;
+        }
+        orch.store()
+            .create_phase(&edited)
+            .await
+            .expect("the clone accepts its phases");
+        if edited.name == "implement" {
+            orch.store()
+                .create_phase(&StepGraphPhase {
+                    id: PhaseId::new(),
+                    position: implement + 1,
+                    name: "verify".to_owned(),
+                    output_kind: "verify".to_owned(),
+                    template_name: "review".to_owned(),
+                    input_kinds: vec!["implement".to_owned()],
+                    ..edited.clone()
+                })
+                .await
+                .expect("the inserted position is free");
+        }
+    }
+    orch.store()
+        .update_item(
+            item,
+            row.version,
+            ItemPatch {
+                step_graph_id: Some(Some(clone.id)),
+                author_id: row.created_by,
+                reason: "a conformance case's intermediate position".to_owned(),
                 ..ItemPatch::default()
             },
         )
@@ -1463,6 +1553,108 @@ async fn on_failure_passes_ok_and_parks_failed<H: CaseHarness>(harness: &H) {
     );
 }
 
+/// Plan D5's intermediate position (`docs/ANA-2.md:721-722`), walked rather than described.
+///
+/// ANA-2 §4.4 step 3 retires the reviewed implement and the rejecting review and says nothing about
+/// what sits between them, while step 5 has every position in between "re-run, at the same `attempt`
+/// value" — which, taken literally, leaves a `done` step at the attempt the walk is about to
+/// re-insert and trips `UNIQUE (run_id, position, attempt, fanout_index)`. D5 answers it with
+/// per-position attempts and the whole chain retired; the answer had a topology digest pinning it
+/// (`tests/fixtures.rs`) and no walk executing it, so neither the `done -> superseded` of an
+/// intermediate position nor the collision it avoids was ever run.
+///
+/// The graph is `feature` with a `verify` phase at position 3, so `review` is at 4 and the chain
+/// `retire` covers is three positions rather than two. The shape asserted is the one D5 prescribes:
+/// `(2,1)` and `(3,1)` superseded, `(4,1)` cancelled, then `(2,2)`, `(3,2)` and `(4,2)` — every
+/// position at *its own* next attempt.
+async fn an_intermediate_position_is_retired_by_the_loop<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    insert_verify_phase(&orch, ids::HTUI_FEAT_3).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.position, Some(0));
+
+    // prd, plan, implement, verify; the walk then parks at `review`, which is now position 4.
+    approve(&orch, run, 4).await;
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.position, step.phase_name.as_str(), step.status))
+            .collect::<Vec<_>>(),
+        [
+            (0, "prd", StepStatus::Done),
+            (1, "plan", StepStatus::Done),
+            (2, "implement", StepStatus::Done),
+            (3, "verify", StepStatus::Done),
+            (4, "review", StepStatus::AwaitingApproval),
+        ],
+        "the inserted position is walked like any other"
+    );
+
+    let (_, rest) = answer(
+        &orch,
+        run,
+        GateAnswer::Rejected {
+            note: "no tests".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(2), None),
+        "the loop resumed at `implement`, three positions back"
+    );
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.position, step.attempt, step.status))
+            .collect::<Vec<_>>(),
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Superseded),
+            (2, 2, StepStatus::AwaitingApproval),
+            (3, 1, StepStatus::Superseded),
+            (4, 1, StepStatus::Cancelled),
+        ],
+        "the whole chain retires: the intermediate `verify` is superseded with the implement it \
+         depends on, and only the rejecting review — which is `failed` — takes the cancel"
+    );
+
+    // implement 2, verify 2; then the second review parks and approving it finishes the run.
+    approve(&orch, run, 2).await;
+    let rest = approve(&orch, run, 1).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::Done, None, None)
+    );
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.position, step.attempt, step.status))
+            .collect::<Vec<_>>(),
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::Done),
+            (2, 1, StepStatus::Superseded),
+            (2, 2, StepStatus::Done),
+            (3, 1, StepStatus::Superseded),
+            (3, 2, StepStatus::Done),
+            (4, 1, StepStatus::Cancelled),
+            (4, 2, StepStatus::Done),
+        ],
+        "each re-run position takes its own `attempt + 1`, which is what keeps \
+         `UNIQUE (run_id, position, attempt, fanout_index)` out of the way (plan D5)"
+    );
+    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Done);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -1480,16 +1672,16 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_fourteen() {
+    fn cases_are_unique_and_fifteen() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            14,
-            "six ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam and the three \
-             gate-table cells only an edited gate reaches"
+            15,
+            "six ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam, the three \
+             gate-table cells only an edited gate reaches and plan D5's intermediate position"
         );
     }
 
