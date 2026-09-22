@@ -532,6 +532,43 @@ async fn answer<O: Orchestrate>(orch: &O, run: RunId, answer: GateAnswer) -> (Ru
     (parked, rest)
 }
 
+/// Answers the run's one parked step `approved` and unparks the run **without walking it**, leaving
+/// the run `running` with its next position uncreated.
+///
+/// The three writes are `Engine::answer_gate`'s own, minus its closing `run_to_rest`
+/// (`crates/htui-orch/src/engine.rs`): `answer_gate`, then the run, then the item, in that order.
+///
+/// It exists for criterion 3. `run_to_rest` returns at its `AwaitingApproval` arm before it reads a
+/// cursor, so "resume advanced nothing" asserted on a *parked* run holds however the resume behaves
+/// — including with the topology guard deleted. A run that is `running` with a position to create is
+/// the only state in which the assertion is about the guard.
+///
+/// # Panics
+/// When no step is parked, or when any of the three writes is refused.
+async fn approve_without_walking<O: Orchestrate>(orch: &O, run: RunId, item: ItemId) {
+    let now = orch.clock().now();
+    let steps = steps_of(orch, run).await;
+    let parked = steps
+        .iter()
+        .find(|step| step.status == StepStatus::AwaitingApproval)
+        .expect("the walk parked exactly one step");
+    assert!(
+        orch.store()
+            .answer_gate(parked.id, GateOutcome::Approved, None, now)
+            .await
+            .expect("the step is awaiting"),
+        "the compare-and-set found the step where the walk left it"
+    );
+    orch.store()
+        .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+        .await
+        .expect("the run is parked");
+    orch.store()
+        .transition(item, Status::AwaitingApproval, Status::InProgress)
+        .await
+        .expect("the item is parked");
+}
+
 /// [`answer`] with `Approved`, `times` over, keeping the last walk's rest.
 ///
 /// # Panics
@@ -760,15 +797,36 @@ async fn live_run_ignores_a_gate_edit<H: CaseHarness>(harness: &H) {
 /// `SnapshotPhase` field, so patching it moves the `topology` digest — which is the whole content of
 /// the criterion. The assertion is that **nothing advanced**: the same step rows, plus a note an
 /// operator can read. The second half proves the comparison is a comparison and not a constant: an
-/// unedited run resumes into the walk.
+/// unedited run resumes into the walk and creates the next position's step.
+///
+/// **The run is left `running` with a position to create, and that is the load-bearing part.** A
+/// walk on a parked run returns at `run_to_rest`'s `AwaitingApproval` arm before it ever reads a
+/// cursor, so with the run parked the step rows are equal before and after however `resume` behaves
+/// — with the topology guard and without it. Approving the first gate through
+/// [`approve_without_walking`] puts the run in the one state where "nothing advanced" is a claim
+/// about the guard: position 0 is `done`, position 1 has no row, and a walk would create one.
 async fn topology_mismatch_parks_on_resume<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     free_feat_3(&orch).await;
     let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    approve_without_walking(&orch, run, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        run_of(&orch, run).await.status,
+        RunStatus::Running,
+        "the run is mid-walk: `resume` is the next thing that would advance it"
+    );
 
     set_input_kinds(&orch, ids::HTUI_FEAT_3, 0, &["spec"]).await;
 
     let before = steps_of(&orch, run).await;
+    assert_eq!(
+        before
+            .iter()
+            .map(|step| (step.position, step.attempt, step.status))
+            .collect::<Vec<_>>(),
+        [(0, 1, StepStatus::Done)],
+        "one answered step, and position 1 owed"
+    );
     let resumed = orch.resume(run).await.expect("the run is readable");
     let Resume::TopologyChanged {
         snapshot,
@@ -780,9 +838,10 @@ async fn topology_mismatch_parks_on_resume<H: CaseHarness>(harness: &H) {
     };
     assert_ne!(snapshot, live, "two digests, and they are not the same one");
     assert_eq!(
-        rest.run,
-        RunStatus::AwaitingApproval,
-        "the run is where it was: a mismatch is a human's decision, not the engine's"
+        (rest.run, rest.position),
+        (RunStatus::Running, Some(1)),
+        "the run is where it was, owing the position it owed: a mismatch is a human's decision, \
+         not the engine's"
     );
 
     let after = steps_of(&orch, run).await;
@@ -803,16 +862,31 @@ async fn topology_mismatch_parks_on_resume<H: CaseHarness>(harness: &H) {
         "ANA-2 invariant 7: a refusal a human can read: {notes:?}"
     );
 
-    // An unedited run resumes into the walk instead.
+    // An unedited run resumes into the walk instead — and the walk does something.
     let orch = harness.fresh();
     free_feat_3(&orch).await;
     let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
-    assert!(
-        matches!(
-            orch.resume(run).await.expect("the run is readable"),
-            Resume::Walked(_)
-        ),
-        "an untouched graph still hashes to the run's own topology"
+    approve_without_walking(&orch, run, ids::HTUI_FEAT_3).await;
+    let resumed = orch.resume(run).await.expect("the run is readable");
+    let Resume::Walked(rest) = resumed else {
+        panic!("an untouched graph still hashes to the run's own topology: {resumed:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the walk ran position 1 and parked at its gate"
+    );
+    assert_eq!(
+        steps_of(&orch, run)
+            .await
+            .iter()
+            .map(|step| (step.position, step.attempt, step.status))
+            .collect::<Vec<_>>(),
+        [
+            (0, 1, StepStatus::Done),
+            (1, 1, StepStatus::AwaitingApproval),
+        ],
+        "which is the row the edited half proves the guard withheld"
     );
 }
 
