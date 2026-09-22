@@ -122,10 +122,11 @@ pub use quota::{
     QuotaSource, QuotaWindow, SkipReason, Spend, available, normalize,
 };
 pub use run::{
-    ChatRunSpec, GateOutcome, GraphSnapshot, NewRun, NewRunStep, Run, RunKind, RunMode, RunStatus,
-    RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, SnapshotCandidate,
-    SnapshotGraph, SnapshotJudge, SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepOutcome,
-    StepStatus, TIMESTAMPTZ_DIGITS, VerifyOutcome, prompt_summary,
+    ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
+    NewRunStep, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase,
+    SnapshotSettings, SnapshotTemplate, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, VerifyOutcome,
+    prompt_summary,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{BoundSkill, Skill, SkillBinding, SkillVersion};
@@ -219,6 +220,11 @@ mod tests {
         check_enum(
             GateOutcome::ALL,
             &["approved", "rejected", "retried", "skipped"],
+        );
+        check_enum(VerifyOutcome::ALL, &["pass", "fail", "unavailable"]);
+        check_enum(
+            CommandRunStatus::ALL,
+            &["queued", "running", "done", "failed", "cancelled"],
         );
     }
 

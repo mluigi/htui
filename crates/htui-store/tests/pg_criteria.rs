@@ -14,14 +14,15 @@
 
 use htui_store::testkit as common;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, GraphSnapshot, Isolation, ItemFilter, ItemId,
-    ItemKindId, ItemKindPatch, ItemPatch, NewItem, NewProject, NewRepo, NewRun, NewWorkspace,
-    ProjectId, RepoId, RunId, RunMode, RunStatus, RunStepTree, SnapshotGraph, SnapshotSettings,
-    Status, StepId, Transport, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    Agent, AgentBox, AgentId, Billing, BoxId, CommandRunId, CommandRunStatus, GraphSnapshot,
+    Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, NewCommandRun, NewItem,
+    NewProject, NewRepo, NewRun, NewWorkspace, ProjectId, RepoId, RunId, RunMode, RunStatus,
+    RunStepTree, SnapshotGraph, SnapshotSettings, Status, StepId, TIMESTAMPTZ_DIGITS, Transport,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -3429,6 +3430,165 @@ async fn finish_run_holds_the_item_while_another_run_is_live() {
         closed_at(ids::HTUI_CLEAN_1).await,
         None,
         "and `open` is not terminal, so `closed_at` is cleared rather than stamped"
+    );
+
+    db.drop_db().await;
+}
+
+/// Plan D31's row against a real server: what `store::conformance`'s `verify_run_is_recorded`
+/// asserts of both stores, plus the two things only Postgres can answer.
+///
+/// The first is `command_run.output`. ANA-2 §4.2 caps a verify's captured output at 64 KiB per
+/// stream before it reaches the seam, so a row can carry ~128 KiB plus the command's own text.
+/// `TEXT` has no declared limit and the column is not `VARCHAR(n)`, but that is a claim about the
+/// DDL rather than about the round trip: a driver that truncated, re-encoded or normalised line
+/// endings would pass every `MemStore` assertion and lose the tail of the one artefact a human
+/// reads after a failed verify. So this writes 70 KiB - the cap plus slack - of text chosen to
+/// exercise the encoder rather than the allocator, and compares it byte for byte.
+///
+/// The second is the ordering. `MemStore` sorts in Rust; Postgres sorts in the statement, and
+/// `ORDER BY queued_at, id` over a `timestamptz` and a `uuid` is a different comparison from
+/// `chrono`'s and `Uuid`'s. Three rows queued out of insertion order, two of them sharing a
+/// `queued_at` to the microsecond, pin that the tiebreak is the `id` and not the heap.
+#[tokio::test(flavor = "multi_thread")]
+async fn command_run_round_trips_and_orders_by_queued_at() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let t0 = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+
+    // 70 KiB: the 64 KiB tail cap plus slack, and not one repeated byte — a `TEXT` round trip that
+    // survives 70 000 `a`s says less about the encoder than one that survives multi-byte
+    // characters, embedded newlines and a NUL-adjacent control character.
+    let output: String = "error: `λ` unresolved\r\n\ttest \u{1}line\n"
+        .repeat(2_000)
+        .chars()
+        .take(70 * 1024)
+        .collect();
+
+    let base = NewCommandRun {
+        id: CommandRunId::new(),
+        run_step_id: ids::STEP_R2_PRD,
+        box_id: ids::BOX,
+        class: "verify".to_owned(),
+        command: "cargo test --all-features".to_owned(),
+        cwd: "/srv/trees/prd/core".to_owned(),
+        status: CommandRunStatus::Done,
+        exit_code: Some(101),
+        output: Some(output.clone()),
+        queued_at: t0,
+        started_at: Some(t0),
+        finished_at: Some(t0 + TimeDelta::seconds(3)),
+    };
+
+    let written = db
+        .store
+        .record_command_run(base.clone())
+        .await
+        .expect("the row lands");
+    assert_eq!(
+        written.output.as_deref(),
+        Some(output.as_str()),
+        "the writer hands back exactly what it was given"
+    );
+
+    // Two more rows: one queued a second earlier, one sharing `queued_at` with the first. Written
+    // last-first, so insertion order and `queued_at` order disagree.
+    let earlier = NewCommandRun {
+        id: CommandRunId::new(),
+        status: CommandRunStatus::Failed,
+        exit_code: None,
+        output: Some("no `sh` on PATH".to_owned()),
+        queued_at: t0 - TimeDelta::seconds(1),
+        started_at: None,
+        finished_at: None,
+        ..base.clone()
+    };
+    db.store
+        .record_command_run(earlier.clone())
+        .await
+        .expect("the earlier row lands");
+    let tied = NewCommandRun {
+        id: CommandRunId::new(),
+        output: None,
+        ..base.clone()
+    };
+    assert!(
+        tied.id > base.id,
+        "UUIDv7 ids are minted in order, so the tie must break towards the later row"
+    );
+    db.store
+        .record_command_run(tied.clone())
+        .await
+        .expect("the tied row lands");
+
+    let rows = db
+        .store
+        .command_runs(ids::STEP_R2_PRD)
+        .await
+        .expect("the read");
+    assert_eq!(
+        rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![earlier.id, base.id, tied.id],
+        "`ORDER BY queued_at, id`: the earlier row first, then the tie broken by id"
+    );
+    assert_eq!(
+        rows.get(1).and_then(|row| row.output.as_deref()),
+        Some(output.as_str()),
+        "and 70 KiB of `TEXT` comes back byte for byte"
+    );
+    assert_eq!(
+        rows.first().map(|row| row.status),
+        Some(CommandRunStatus::Failed),
+        "the `status` column decodes through the `CHECK` list's text"
+    );
+    assert_eq!(
+        rows.first().and_then(|row| row.exit_code),
+        None,
+        "a command that never ran has no exit code"
+    );
+    assert_eq!(
+        rows.get(2).map(|row| row.queued_at),
+        Some(t0),
+        "the caller's instant survives the round trip at microsecond precision"
+    );
+
+    // An unknown box is the foreign key's refusal, not the step's.
+    let no_box = db
+        .store
+        .record_command_run(NewCommandRun {
+            id: CommandRunId::new(),
+            box_id: BoxId::new(),
+            ..base.clone()
+        })
+        .await;
+    assert!(
+        matches!(&no_box, Err(htui_core::store::StoreError::Constraint(text)) if text.contains("command_run")),
+        "an unknown box is a 23503 naming the table, got {no_box:?}"
+    );
+    let no_step = db
+        .store
+        .record_command_run(NewCommandRun {
+            id: CommandRunId::new(),
+            run_step_id: StepId::new(),
+            box_id: BoxId::new(),
+            ..base.clone()
+        })
+        .await;
+    assert!(
+        matches!(
+            no_step,
+            Err(htui_core::store::StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "and the step is checked before the box, got {no_step:?}"
+    );
+    assert_eq!(
+        common::count(&db.pool, "command_run").await,
+        3,
+        "neither refusal left a row behind — the insert is its own transaction"
     );
 
     db.drop_db().await;

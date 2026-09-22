@@ -20,17 +20,18 @@ use serde_json::Value;
 
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProfile,
-    BoxRow, BoxSettings, BoxTool, ChatRunSpec, DEFAULT_MAX_CONCURRENT_ITEMS, Document,
-    DocumentHead, DocumentId, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemKindPatch, ItemLink, ItemPatch, ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind,
-    LinkNode, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath,
-    RepoId, RepoPatch, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    BoxRow, BoxSettings, BoxTool, ChatRunSpec, CommandRun, CommandRunId,
+    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, GateOutcome, Item,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRevision,
+    ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
+    Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
+    PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
+    ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
+    SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
     prompt_summary,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
@@ -129,6 +130,14 @@ struct State {
     /// `run_step_commit`, keyed the same way. `MemStore` held no such rows before MOD-4, which is
     /// why [`DeleteReach::run_step_commits`] used to be a hard-coded `0`.
     step_commits: BTreeMap<(StepId, RepoId), RunStepCommit>,
+    /// `command_run` (`0001_init.sql:537`), keyed by its own id so a duplicate write is a lookup
+    /// rather than a scan, and read back sorted by `(queued_at, id)`.
+    ///
+    /// A `BTreeMap` on the id alone and not on `(run_step_id, queued_at, id)`: the table's key is
+    /// the id, `queued_at` is mutable in principle, and a step's rows are few enough that the
+    /// filter-and-sort [`State::command_runs`] does is cheaper than a compound key that would have
+    /// to be maintained. No fixture loads it — MOD-4 milestone 3 is its first writer anywhere.
+    command_runs: BTreeMap<CommandRunId, CommandRun>,
     /// `run.lease_owner`, which is deliberately not a [`Run`] field: the mirror does not carry it
     /// and a reader has no use for another process's liveness token (blueprint F-S). Kept beside
     /// the run so [`WriteStore::refresh_lease`] can compare against it.
@@ -216,6 +225,7 @@ impl MemStore {
             steps: data.steps.into_iter().map(|row| (row.id, row)).collect(),
             step_trees: BTreeMap::new(),
             step_commits: BTreeMap::new(),
+            command_runs: BTreeMap::new(),
             lease_owners: HashMap::new(),
             events: data.events,
         };
@@ -2723,10 +2733,10 @@ impl State {
     ///
     /// The counts and the id sets come out of the same predicates, which is what makes
     /// `delete_reach`'s report and `delete_project`'s act equal by construction rather than by two
-    /// lists kept in step by hand. `phase_agents` and `command_runs` are `0` because this store
-    /// holds neither table, and `workspace_box_paths` because a project is not a workspace;
-    /// `run_step_commits` and `run_step_trees` were `0` for the same reason until MOD-4 gave this
-    /// store the two maps (plan D12).
+    /// lists kept in step by hand. `phase_agents` is `0` because this store holds no such table,
+    /// and `workspace_box_paths` because a project is not a workspace; `run_step_commits` and
+    /// `run_step_trees` were `0` for the same reason until MOD-4 milestone 1 gave this store the
+    /// two maps (plan D12), and `command_runs` until milestone 3 gave it the third (plan D31).
     fn project_reach(&self, id: ProjectId) -> Option<(DeleteReach, ProjectReach)> {
         if !self.projects.contains_key(&id) {
             return None;
@@ -2833,7 +2843,12 @@ impl State {
                     .filter(|(step, _)| steps.contains(step))
                     .count(),
             ),
-            command_runs: 0,
+            command_runs: rows(
+                self.command_runs
+                    .values()
+                    .filter(|row| steps.contains(&row.run_step_id))
+                    .count(),
+            ),
             notes: rows(
                 self.notes
                     .iter()
@@ -2907,6 +2922,8 @@ impl State {
             .retain(|(step, _), _| !gone.steps.contains(step));
         self.step_commits
             .retain(|(step, _), _| !gone.steps.contains(step));
+        self.command_runs
+            .retain(|_, row| !gone.steps.contains(&row.run_step_id));
         self.steps.retain(|id, _| !gone.steps.contains(id));
         self.runs.retain(|id, _| !gone.runs.contains(id));
         self.lease_owners.retain(|id, _| !gone.runs.contains(id));
@@ -3637,6 +3654,48 @@ impl State {
             self.step_commits.insert((step, row.repo_id), row.clone());
         }
         Ok(())
+    }
+
+    /// One `command_run` row, every column the caller's (plan D31).
+    ///
+    /// The three refusals are ordered as the contract states them: the step first, so an input
+    /// wrong in two ways is `NotFound` rather than the `Constraint` the box alone would earn; then
+    /// the box, which Postgres answers with a foreign key; then the id, which Postgres answers
+    /// with the primary key.
+    fn record_command_run(&mut self, new: NewCommandRun) -> Result<CommandRun> {
+        self.require_step(new.run_step_id)?;
+        if !self.boxes.contains_key(&new.box_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "command_run.box_id",
+                new.box_id,
+                "box",
+            )));
+        }
+        if self.command_runs.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "command_run",
+                new.id,
+            )));
+        }
+        let row = CommandRun::from(new);
+        self.command_runs.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// A step's `command_run` rows in `(queued_at, id)` order; an unknown step reads empty.
+    fn command_runs(&self, step: StepId) -> Vec<CommandRun> {
+        let mut rows: Vec<CommandRun> = self
+            .command_runs
+            .values()
+            .filter(|row| row.run_step_id == step)
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            left.queued_at
+                .cmp(&right.queued_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        rows
     }
 
     /// The document at `max(version) + 1` for its `(item, kind)` (plan D6).
@@ -4442,6 +4501,14 @@ impl WriteStore for MemStore {
 
     async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
         self.write(|state| state.record_commits(step, commits))
+    }
+
+    async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
+        self.write(|state| state.record_command_run(new))
+    }
+
+    async fn command_runs(&self, step: StepId) -> Result<Vec<CommandRun>> {
+        Ok(self.read(|state| state.command_runs(step)))
     }
 
     async fn write_document(&self, new: NewDocument) -> Result<Document> {

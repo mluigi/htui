@@ -17,14 +17,15 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, BoxSettings, ChatRunSpec, DEFAULT_MAX_CONCURRENT_ITEMS,
-    Document, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemRevision, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun,
-    NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId,
-    VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, BoxSettings, ChatRunSpec, CommandRun, CommandRunId,
+    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId,
+    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision, NewCommandRun, NewDocument,
+    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
+    NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptTemplateId,
+    Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -3266,6 +3267,91 @@ impl WriteStore for PgStore {
         }
 
         tx.commit().await.map_err(map_sqlx)
+    }
+
+    /// One `command_run` row, every column the caller's (plan D31).
+    ///
+    /// A transaction for one insert, and not the bare `execute` a single statement would allow,
+    /// because the step check is a second statement and the contract orders the two: an unknown
+    /// step must be [`StoreError::NotFound`] and not the `23503` the insert alone would raise.
+    /// [`step_exists`] is the same check the two batch upserts run, in the same place and for the
+    /// same reason.
+    ///
+    /// No `RETURNING`: the row has no column the server fills in - `queued_at`'s `DEFAULT now()`
+    /// is never reached, because the seam takes that instant from the caller like every other one
+    /// (blueprint F-S) - so the stored row *is* the argument. Building it in Rust is both cheaper
+    /// than a round trip and the only way to promise that `MemStore` answers identically.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] for an
+    /// unknown `box_id` (`23503`) and for an `id` the table already holds (`23505`).
+    async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        step_exists(&mut tx, new.run_step_id).await?;
+
+        sqlx::query!(
+            "INSERT INTO command_run (id, run_step_id, box_id, class, command, cwd, status, \
+             exit_code, output, queued_at, started_at, finished_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            new.id.as_uuid(),
+            new.run_step_id.as_uuid(),
+            new.box_id.as_uuid(),
+            new.class,
+            new.command,
+            new.cwd,
+            new.status.as_str(),
+            new.exit_code,
+            new.output,
+            new.queued_at,
+            new.started_at,
+            new.finished_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(CommandRun::from(new))
+    }
+
+    /// A step's `command_run` rows in `(queued_at, id)` order; an unknown step reads empty.
+    ///
+    /// A `SELECT` in `pg::write` rather than beside its twin `step_trees` in `pg::read`, because
+    /// the trait puts it on [`WriteStore`]: `command_run` is not a mirrored table, so there was
+    /// nowhere else to carry a read the conformance suite - written against `WriteStore` alone -
+    /// can reach.
+    ///
+    /// The `id` tiebreak is load-bearing. Two verify runs of one step can share a `queued_at`
+    /// truncated to microseconds, and ids are UUIDv7, so ordering by `(queued_at, id)` breaks that
+    /// tie by mint time rather than by whatever order the heap hands back.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
+    async fn command_runs(&self, step: StepId) -> Result<Vec<CommandRun>> {
+        sqlx::query_as!(
+            CommandRun,
+            r#"
+            SELECT id          AS "id: CommandRunId",
+                   run_step_id AS "run_step_id: StepId",
+                   box_id      AS "box_id: BoxId",
+                   class,
+                   command,
+                   cwd,
+                   status      AS "status: CommandRunStatus",
+                   exit_code,
+                   output,
+                   queued_at,
+                   started_at,
+                   finished_at
+              FROM command_run WHERE run_step_id = $1 ORDER BY queued_at, id
+            "#,
+            step.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
     /// The document at `max(version) + 1` for its `(item, kind)`, allocated **under the item's row

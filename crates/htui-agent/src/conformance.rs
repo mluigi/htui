@@ -30,15 +30,15 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId,
-    EventKind, EventRole, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewDocument, NewItem, NewItemKind, NewNote,
-    NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN,
-    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Quota, QuotaSource, Repo,
-    RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
+    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, CommandRun, Document, DocumentHead,
+    DocumentId, EventKind, EventRole, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
+    Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
+    Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
@@ -1006,6 +1006,12 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     }
     async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> StoreResult<()> {
         self.inner.record_commits(step, commits).await
+    }
+    async fn record_command_run(&self, new: NewCommandRun) -> StoreResult<CommandRun> {
+        self.inner.record_command_run(new).await
+    }
+    async fn command_runs(&self, step: StepId) -> StoreResult<Vec<CommandRun>> {
+        self.inner.command_runs(step).await
     }
     async fn write_document(&self, new: NewDocument) -> StoreResult<Document> {
         self.inner.write_document(new).await

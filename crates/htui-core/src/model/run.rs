@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::ids::{
-    AgentId, BoxId, ItemId, ProjectId, RepoId, RunId, StepGraphId, StepId, UserId,
+    AgentId, BoxId, CommandRunId, ItemId, ProjectId, RepoId, RunId, StepGraphId, StepId, UserId,
 };
 use crate::model::kind::{CommandQueue, Gate, Isolation};
 
@@ -580,6 +580,126 @@ pub struct RunStepCommit {
     pub before_hash: String,
     /// `run_step_commit.after_hash`.
     pub after_hash: Option<String>,
+}
+
+str_enum!(
+    /// `command_run.status` (`0001_init.sql:544`): the `R-MCP-3` queue's own vocabulary.
+    ///
+    /// MOD-4 milestone 3 writes two of the five. A verify command that ran to an exit code —
+    /// whatever that code was — is `done`, because the queue's question is whether the command
+    /// completed and `run_step.verify_outcome` is where pass and fail are told apart (ANA-2 §4.2).
+    /// One that could not be run at all is `failed`, the row behind `unavailable`
+    /// (`docs/ANA-2.md:515`). `queued`, `running` and `cancelled` belong to MOD-11's queue, which
+    /// is the table's other writer.
+    CommandRunStatus {
+        /// Accepted, not yet started.
+        Queued => "queued",
+        /// Started and still executing.
+        Running => "running",
+        /// Ran to completion; `exit_code` says how it went.
+        Done => "done",
+        /// Could not be run, or died without an exit code.
+        Failed => "failed",
+        /// Stopped before it finished.
+        Cancelled => "cancelled",
+    }
+);
+
+/// A row of `command_run` (`0001_init.sql:537-551`), field for field (plan D31).
+///
+/// The durable home of one run of a step's `verify_command`: the command, where it ran, what it
+/// printed and when. `run_step.verify_outcome` and `run_step.verify_exit_code` are the summary a
+/// gate reads; this is the detail a human reads afterwards, and the two are written by the same
+/// caller from the same result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommandRun {
+    /// `command_run.id`, minted client-side like every other id (§3).
+    pub id: CommandRunId,
+    /// `command_run.run_step_id`.
+    pub run_step_id: StepId,
+    /// `command_run.box_id`: the box the command ran on.
+    pub box_id: BoxId,
+    /// `command_run.class`, `'verify'` for every row this milestone writes
+    /// (`docs/ANA-2.md:501`). MOD-11's queue uses the rest of `box.settings.command_limits`.
+    pub class: String,
+    /// `command_run.command`, as it was handed to the shell.
+    pub command: String,
+    /// `command_run.cwd`: the tree the command ran in — the step's primary isolation path, or the
+    /// session's own working directory when the step had no tree of its own.
+    pub cwd: String,
+    /// `command_run.status`.
+    pub status: CommandRunStatus,
+    /// `command_run.exit_code`; `None` when the command never produced one.
+    pub exit_code: Option<i32>,
+    /// `command_run.output`, already scrubbed and capped by the caller (`R-SEC-3`,
+    /// `0001_init.sql:546`): a store neither redacts nor truncates it.
+    pub output: Option<String>,
+    /// `command_run.queued_at`.
+    pub queued_at: DateTime<Utc>,
+    /// `command_run.started_at`.
+    pub started_at: Option<DateTime<Utc>>,
+    /// `command_run.finished_at`.
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// Arguments of [`WriteStore::record_command_run`](crate::store::WriteStore::record_command_run):
+/// the same twelve fields as [`CommandRun`], every instant the caller's (blueprint F-S).
+///
+/// `NewX` / `X` is the shape the rest of the seam already has ([`NewRunStep`] / [`RunStep`]), and
+/// the two are field-identical here for the same reason `NewRun` is not: the row has no column
+/// the database fills in. `queued_at` carries a `DEFAULT now()` the seam never exercises, because
+/// a writer that let the server stamp it would hand back a row the caller's own variable no longer
+/// equals — the argument [`TIMESTAMPTZ_DIGITS`] makes for the rest of §8.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewCommandRun {
+    /// `command_run.id`.
+    pub id: CommandRunId,
+    /// `command_run.run_step_id`; an unknown step is `NotFound`, not a constraint.
+    pub run_step_id: StepId,
+    /// `command_run.box_id`.
+    pub box_id: BoxId,
+    /// `command_run.class`.
+    pub class: String,
+    /// `command_run.command`.
+    pub command: String,
+    /// `command_run.cwd`.
+    pub cwd: String,
+    /// `command_run.status`.
+    pub status: CommandRunStatus,
+    /// `command_run.exit_code`.
+    pub exit_code: Option<i32>,
+    /// `command_run.output`, scrubbed before it gets here.
+    pub output: Option<String>,
+    /// `command_run.queued_at`.
+    pub queued_at: DateTime<Utc>,
+    /// `command_run.started_at`.
+    pub started_at: Option<DateTime<Utc>>,
+    /// `command_run.finished_at`.
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl From<NewCommandRun> for CommandRun {
+    /// The stored row is the argument, because no column is the database's to fill in.
+    ///
+    /// This is what lets [`WriteStore::record_command_run`](crate::store::WriteStore::record_command_run)
+    /// answer without a `RETURNING` clause and still promise that what comes back is what a later
+    /// [`command_runs`](crate::store::WriteStore::command_runs) will read.
+    fn from(new: NewCommandRun) -> Self {
+        Self {
+            id: new.id,
+            run_step_id: new.run_step_id,
+            box_id: new.box_id,
+            class: new.class,
+            command: new.command,
+            cwd: new.cwd,
+            status: new.status,
+            exit_code: new.exit_code,
+            output: new.output,
+            queued_at: new.queued_at,
+            started_at: new.started_at,
+            finished_at: new.finished_at,
+        }
+    }
 }
 
 /// Step projection carried inside a [`RunSummary`]: what the Runs sub-tab lists per step.

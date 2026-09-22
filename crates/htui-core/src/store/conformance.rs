@@ -14,16 +14,16 @@ use uuid::Uuid;
 
 use crate::fixtures::ids;
 use crate::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, CommandQueue,
-    DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Gate, GateOutcome,
-    GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemSummary, LinkKind, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun,
-    NewRunStep, NewStepGraph, NewWorkspace, NoteId, PhaseId, PhasePatch, ProjectId, ProjectPatch,
-    PromptScope, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph, SnapshotSettings, Status,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, CommandQueue, CommandRun, CommandRunId,
+    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Gate,
+    GateOutcome, GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
+    ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
+    NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, NoteId, PhaseId,
+    PhasePatch, ProjectId, ProjectPatch, PromptScope, RepoBoxPath, RepoId, RepoPatch, Run, RunId,
+    RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent,
+    SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -78,6 +78,7 @@ pub const CASES: &[&str] = &[
     "gate_answers_write_their_outcome",
     "select_fanout_is_one_transaction",
     "trees_and_commits_round_trip",
+    "verify_run_is_recorded",
     "write_document_allocates_its_version",
     "close_out_refuses_a_live_run",
     "illegal_transitions_are_constraint",
@@ -157,6 +158,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "gate_answers_write_their_outcome" => gate_answers_write_their_outcome(store).await,
         "select_fanout_is_one_transaction" => select_fanout_is_one_transaction(store).await,
         "trees_and_commits_round_trip" => trees_and_commits_round_trip(store).await,
+        "verify_run_is_recorded" => verify_run_is_recorded(store).await,
         "write_document_allocates_its_version" => write_document_allocates_its_version(store).await,
         "close_out_refuses_a_live_run" => close_out_refuses_a_live_run(store).await,
         "illegal_transitions_are_constraint" => illegal_transitions_are_constraint(store).await,
@@ -5215,6 +5217,184 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
             .expect(CASE)
             .is_empty(),
         "{CASE}: and so did the commit rows"
+    );
+}
+
+/// ANA-2 §4.2's verify report, in the table that holds it (plan D31): one `command_run` row per
+/// run of a step's `verify_command`, written whole by the caller and read back in `queued_at`
+/// order rather than insertion order.
+///
+/// `record_command_run` takes every column, `queued_at` included, for the reason blueprint F-S
+/// gives the rest of the §8 writers: the row is the durable input of a later `verify_failure`
+/// render, so the instants have to be the orchestrator's own and not two servers' clocks.
+/// `command_runs` is a total read - an unknown step is an empty answer, never `NotFound` - which
+/// is what lets the Runs tab ask for a step it has not yet seen written.
+///
+/// The refusals are asserted by variant and by the table name the sentence carries, not by the
+/// whole sentence: `MemStore` speaks [`references_no_row`](crate::store::traits::references_no_row)
+/// and [`already_exists`](crate::store::traits::already_exists) while Postgres speaks its own
+/// constraint names, and the only thing both are obliged to agree on is that the input was
+/// refused and which table refused it. The Postgres-only halves - a 70 KiB `output` byte for
+/// byte, and the column widths - are
+/// `pg_criteria.rs::command_run_round_trips_and_orders_by_queued_at`.
+async fn verify_run_is_recorded<S: WriteStore>(store: &S) {
+    const CASE: &str = "verify_run_is_recorded";
+    let t0 = seam_clock();
+
+    let first = NewCommandRun {
+        id: CommandRunId::new(),
+        run_step_id: ids::STEP_R2_PRD,
+        box_id: ids::BOX,
+        class: "verify".to_owned(),
+        command: "cargo test".to_owned(),
+        cwd: "/srv/trees/prd/core".to_owned(),
+        status: CommandRunStatus::Done,
+        exit_code: Some(0),
+        output: Some("ok".to_owned()),
+        queued_at: t0,
+        started_at: Some(t0),
+        finished_at: Some(t0 + TimeDelta::seconds(1)),
+    };
+    let written = store.record_command_run(first.clone()).await.expect(CASE);
+    assert_eq!(
+        written,
+        CommandRun {
+            id: first.id,
+            run_step_id: first.run_step_id,
+            box_id: first.box_id,
+            class: first.class.clone(),
+            command: first.command.clone(),
+            cwd: first.cwd.clone(),
+            status: first.status,
+            exit_code: first.exit_code,
+            output: first.output.clone(),
+            queued_at: first.queued_at,
+            started_at: first.started_at,
+            finished_at: first.finished_at,
+        },
+        "{CASE}: every column is the caller's, handed straight back"
+    );
+
+    // Leg 2: a second row queued *earlier* than the first, written second. The read is ordered by
+    // `queued_at`, so it comes out first — insertion order would put it last.
+    let second = NewCommandRun {
+        id: CommandRunId::new(),
+        status: CommandRunStatus::Failed,
+        exit_code: None,
+        output: Some("no `sh` on PATH".to_owned()),
+        queued_at: t0 - TimeDelta::seconds(1),
+        started_at: None,
+        finished_at: None,
+        ..first.clone()
+    };
+    store.record_command_run(second.clone()).await.expect(CASE);
+    let rows = store.command_runs(ids::STEP_R2_PRD).await.expect(CASE);
+    assert_eq!(
+        rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![second.id, first.id],
+        "{CASE}: `(queued_at, id)` order, not insertion order"
+    );
+    assert_eq!(
+        rows.first().map(|row| row.status),
+        Some(CommandRunStatus::Failed),
+        "{CASE}: and a `failed` row keeps its status through the round trip"
+    );
+    assert_eq!(
+        rows.first().and_then(|row| row.output.as_deref()),
+        Some("no `sh` on PATH"),
+        "{CASE}: ANA-2 §4.2's `unavailable` reason survives as the row's output"
+    );
+
+    // Leg 3: the read is total. A step with no rows and a step that does not exist both answer
+    // `Ok(vec![])`.
+    assert!(
+        store
+            .command_runs(ids::STEP_PLAN)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: a step with no command runs reads empty"
+    );
+    assert!(
+        store
+            .command_runs(StepId::new())
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: and so does a step id nothing has, never `NotFound`"
+    );
+
+    // Leg 4: the step is looked up before the box, so an input wrong in both ways is `NotFound`
+    // and not the `Constraint` the box alone would earn.
+    let no_step = store
+        .record_command_run(NewCommandRun {
+            id: CommandRunId::new(),
+            run_step_id: StepId::new(),
+            box_id: BoxId::new(),
+            ..first.clone()
+        })
+        .await;
+    assert!(
+        matches!(
+            no_step,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: the step is checked first, got {no_step:?}"
+    );
+
+    // Leg 5: an unknown box is the foreign key's refusal, and the sentence names the table.
+    let no_box = store
+        .record_command_run(NewCommandRun {
+            id: CommandRunId::new(),
+            box_id: BoxId::new(),
+            ..first.clone()
+        })
+        .await;
+    assert!(
+        matches!(&no_box, Err(StoreError::Constraint(text)) if text.contains("command_run")),
+        "{CASE}: an unknown box is a foreign key refusal naming the table, got {no_box:?}"
+    );
+
+    // Leg 6: the id is the caller's, so writing it twice is a duplicate key.
+    let duplicate = store.record_command_run(first.clone()).await;
+    assert!(
+        matches!(&duplicate, Err(StoreError::Constraint(text)) if text.contains("command_run")),
+        "{CASE}: a second row under the same id is refused, got {duplicate:?}"
+    );
+
+    assert_eq!(
+        store
+            .command_runs(ids::STEP_R2_PRD)
+            .await
+            .expect(CASE)
+            .len(),
+        2,
+        "{CASE}: neither refusal wrote a row"
+    );
+
+    // Leg 7: the table is part of what a project delete takes, and was a hard-coded `0` on
+    // `MemStore` until this milestone gave it rows to count (review L1).
+    let reach = store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture project exists"));
+    assert_eq!(
+        reach.command_runs, 2,
+        "{CASE}: both rows are counted under the step's project"
+    );
+    let taken = store.delete_project(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(taken, reach, "{CASE}: the report equals the act");
+    assert!(
+        store
+            .command_runs(ids::STEP_R2_PRD)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: and the rows went with their step"
     );
 }
 

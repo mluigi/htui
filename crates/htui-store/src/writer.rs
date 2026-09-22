@@ -33,14 +33,14 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, GateOutcome,
-    Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary,
-    LinkGraph, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, CommandRun, Document, DocumentHead, DocumentId,
+    GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
+    NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project,
+    ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run,
+    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -796,6 +796,20 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.record_commits(step, commits).await,
             Self::Online(pg) => pg.record_commits(step, commits).await,
+        }
+    }
+
+    async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
+        match self {
+            Self::Memory(store) => store.record_command_run(new).await,
+            Self::Online(pg) => pg.record_command_run(new).await,
+        }
+    }
+
+    async fn command_runs(&self, step: StepId) -> Result<Vec<CommandRun>> {
+        match self {
+            Self::Memory(store) => store.command_runs(step).await,
+            Self::Online(pg) => pg.command_runs(step).await,
         }
     }
 

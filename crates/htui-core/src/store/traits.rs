@@ -31,14 +31,15 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Document, DocumentHead, DocumentId, GateOutcome,
-    Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision,
-    ItemSummary, LinkGraph, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo,
-    NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run, RunId,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, CommandRun, Document, DocumentHead, DocumentId,
+    GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind,
+    NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId,
+    RepoPatch, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::store::error::Result;
@@ -856,6 +857,38 @@ pub trait WriteStore: ReadStore {
     /// `run_step_id` is not `step` or names an unknown repo.
     async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()>;
 
+    /// Records one `command_run` row (ANA-2 §4.2, `docs/ANA-2.md:501-506`; plan D31): this
+    /// milestone's `verify_command` runs, later MOD-11's queue.
+    ///
+    /// Every column is the caller's, `queued_at` included, so the row is the durable input of a
+    /// later `verify_failure` render (`docs/ANA-5.md:335`) rather than a second reading of a
+    /// second clock. Nothing is allocated server-side, so the stored row is the argument and is
+    /// handed straight back.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`,
+    /// checked before the box;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) with
+    /// [`references_no_row`] for an unknown `box_id` and with [`already_exists`] for an `id` the
+    /// store already holds. Both sentences are `MemStore`'s; Postgres answers the same variant in
+    /// its own constraint's words.
+    async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun>;
+
+    /// A step's `command_run` rows in `(queued_at, id)` order.
+    ///
+    /// A read on [`WriteStore`] rather than [`ReadStore`], by milestone 1's precedent for
+    /// [`repos`](WriteStore::repos) and [`phases`](WriteStore::phases): `command_run` is not a
+    /// mirrored table — [`MIRRORED_TABLES`](crate::store::MIRRORED_TABLES) does not list it — so a
+    /// `ReadStore` placement would put it where the conformance suite, which is written against
+    /// `WriteStore` alone, could never reach it.
+    ///
+    /// Total, like [`step_trees`](ReadStore::step_trees): a step with no rows and a step id
+    /// nothing has both answer `Ok(vec![])`.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn command_runs(&self, step: StepId) -> Result<Vec<CommandRun>>;
+
     /// Inserts the document at `max(version) + 1` for `(item, kind)` under the item's row lock
     /// (plan D6), so two writers cannot allocate the same version.
     ///
@@ -1280,9 +1313,9 @@ pub enum DeleteTarget {
 ///
 /// One struct rather than a method per table, so a table `0003` adds is a field here and the two
 /// callers of the counting code cannot disagree about it. A workspace delete fills
-/// `workspace_links` and `workspace_box_paths` only. `phase_agents` and `command_runs` are `0` on
-/// `MemStore`, which holds neither table, and `0` on the demo database, which seeds neither;
-/// `run_step_commits` and `run_step_trees` are counted on both since MOD-4.
+/// `workspace_links` and `workspace_box_paths` only. `phase_agents` is `0` on `MemStore`, which
+/// holds no such table, and `0` on the demo database, which seeds none; `run_step_commits`,
+/// `run_step_trees` and `command_runs` are counted on both since MOD-4.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeleteReach {
     /// `workspace_project` rows.
@@ -1321,9 +1354,10 @@ pub struct DeleteReach {
     pub run_step_trees: u64,
     /// `command_run` rows, which cascade from `run_step` (`0001_init.sql:539`).
     ///
-    /// Nothing in this tree writes the table yet — MOD-16's queue is its first writer — so every
-    /// count of it is `0` today. It is here anyway, because the alternative is a field added later
-    /// by whoever first notices the delete took rows it never named (review L1).
+    /// Held here since MOD-15 against a table nothing wrote, because the alternative was a field
+    /// added later by whoever first noticed the delete took rows it never named (review L1).
+    /// MOD-4 milestone 3's [`record_command_run`](WriteStore::record_command_run) is the first
+    /// writer, so the count is a real one on both stores now.
     pub command_runs: u64,
     /// `item_note` rows.
     pub notes: u64,
