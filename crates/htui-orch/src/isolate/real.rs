@@ -661,8 +661,13 @@ impl GixIsolator {
 
         // D27: a clean tree the step committed nothing to is litter, and the run may hold dozens
         // of them. A dirty one is the agent's unfinished work and stays for milestone 5's sweep.
+        // "Clean" here is stricter than D24's: an untracked file is work too, and the double
+        // `--force` below would delete it for good (ANA-2 `:2065`, risk 2).
         let read = path.clone();
-        if !blocking(move || git::is_dirty(&read)).await? {
+        let litter =
+            blocking(move || Ok(!git::is_dirty(&read)? && !git::has_untracked_files(&read)?))
+                .await?;
+        if litter {
             let git = self.cli()?.clone();
             let local = checkout.local_path.clone();
             git::with_retry("worktree remove", || git.remove_worktree(&local, &path)).await?;
@@ -1580,6 +1585,45 @@ mod tests {
                 .expect("the ref store reads"),
             Some(core_head),
             "the branch survives the removal, which is what reconcile reads"
+        );
+    }
+
+    /// D27 read against ANA-2 `:2065` risk 2: a tree whose only change is a new, never-staged file
+    /// is not "clean" in the sense that licenses `worktree remove --force --force`. D24's
+    /// `is_dirty` excludes untracked files by design, so the removal guard asks both questions.
+    #[tokio::test]
+    async fn a_no_commit_worktree_holding_only_an_untracked_file_survives_capture() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core], Isolation::Worktree)
+            .await
+            .expect("the worktree mode prepares");
+        let tree = PathBuf::from(&prepared.trees[0].tree.path);
+        std::fs::write(tree.join("notes.md"), "the agent's only work\n")
+            .expect("an untracked file is written");
+        assert!(
+            !crate::isolate::git::is_dirty(&tree).expect("the status reads"),
+            "the premise: D24 does not count it"
+        );
+
+        let commits = isolator
+            .capture(step, &rows(&prepared))
+            .await
+            .expect("the step captures");
+        assert_eq!(commits[0].after_hash, None);
+        assert_eq!(
+            std::fs::read_to_string(tree.join("notes.md")).expect("the file survives"),
+            "the agent's only work\n",
+            "an untracked file is work, and the tree holding it is kept"
         );
     }
 

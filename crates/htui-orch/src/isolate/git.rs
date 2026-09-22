@@ -870,6 +870,45 @@ pub fn is_dirty(path: &Path) -> Result<bool, IsolateError> {
     })
 }
 
+/// Whether the working tree holds any untracked, not-ignored file — the half of `git status` that
+/// [`is_dirty`] leaves out on purpose.
+///
+/// `Repository::is_dirty` runs its status walk with `dirwalk_options = None`
+/// (`gix-0.87.1/src/status/mod.rs:196-198`), so a tree whose only change is a brand-new file reads
+/// as clean. That is right for D24 and wrong for D27: `worktree remove --force --force` deletes an
+/// untracked file for good (ANA-2 `:2065`, risk 2), so the removal guard asks this question too.
+/// An ignored file is not counted — it is build output, and the ignore rules say so.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the status walk cannot be configured or fails part-way.
+pub fn has_untracked_files(path: &Path) -> Result<bool, IsolateError> {
+    let fail = |err: &dyn std::fmt::Display| {
+        IsolateError::Git(format!(
+            "cannot read untracked files of {}: {err}",
+            path.display()
+        ))
+    };
+    let repo = open(path)?;
+    let items = repo
+        .status(gix::progress::Discard)
+        .map_err(|err| fail(&err))?
+        // Explicit, so a `status.showUntrackedFiles=no` in the user's config cannot hide one.
+        .untracked_files(gix::status::UntrackedFiles::Collapsed)
+        .index_worktree_rewrites(None)
+        .index_worktree_submodules(None)
+        .into_index_worktree_iter(Vec::new())
+        .map_err(|err| fail(&err))?;
+    for item in items {
+        if let gix::status::index_worktree::Item::DirectoryContents { entry, .. } =
+            item.map_err(|err| fail(&err))?
+            && entry.status == gix::dir::entry::Status::Untracked
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether the repository declares any submodule
 /// (`gix-0.87.1/src/repository/submodule.rs:93`).
 ///
@@ -1434,6 +1473,31 @@ mod tests {
             super::is_dirty(dir.path()).expect("status reads"),
             "a modified tracked file is"
         );
+    }
+
+    /// D27's other half: an untracked file is what `is_dirty` leaves out, and exactly what
+    /// `has_untracked_files` sees; an ignored one is build output and counts for neither.
+    #[test]
+    fn has_untracked_files_sees_a_new_file_and_not_an_ignored_one() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        repo_with_one_commit(dir.path());
+        commit_file(dir.path(), ".gitignore", "target/\n", "ignore target");
+        assert!(!super::has_untracked_files(dir.path()).expect("status reads"));
+
+        std::fs::create_dir(dir.path().join("target")).expect("the directory is made");
+        std::fs::write(dir.path().join("target").join("out"), "built\n").expect("written");
+        assert!(
+            !super::has_untracked_files(dir.path()).expect("status reads"),
+            "an ignored file is not work"
+        );
+
+        std::fs::create_dir(dir.path().join("new")).expect("the directory is made");
+        std::fs::write(dir.path().join("new").join("notes"), "work\n").expect("written");
+        assert!(
+            super::has_untracked_files(dir.path()).expect("status reads"),
+            "an untracked file in an untracked directory is"
+        );
+        assert!(!super::is_dirty(dir.path()).expect("status reads"), "D24");
     }
 
     /// D26's label: written once with `MustNotExist`, read back by name, `None` for one that is
