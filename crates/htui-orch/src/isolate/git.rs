@@ -504,14 +504,645 @@ fn spawn_supervised(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The `gix` half: every read and every ref write.
+//
+// Synchronous, over `&Path`, returning owned values. `isolate/real.rs` calls each of these under
+// `tokio::task::spawn_blocking` with an owned `PathBuf`, so no `gix::Repository` — `Send` but not
+// `Sync` (`gix-0.87.1/src/types.rs:148`) — is ever held across an `.await` (blueprint H-17).
+// ---------------------------------------------------------------------------------------------
+
+/// A repository at `path` has no commit, so there is no `before_hash` to record (blueprint A-4).
+///
+/// ANA-2 `:962-963` makes `run_step_commit.before_hash` `NOT NULL`, so there is no row to write
+/// and the mode refuses rather than inventing one. `isolate/real.rs` reaches for this one too,
+/// with the repo's name rather than its path, so the sentence has a single home.
+pub fn unborn_head(name: &str) -> String {
+    format!("unborn HEAD: {name} has no commit to record as before_hash")
+}
+
+/// `gix::open` (`gix-0.87.1/src/lib.rs:418`).
+///
+/// # Errors
+/// [`IsolateError::Git`] when there is no repository at `path` or it cannot be read.
+pub fn open(path: &Path) -> Result<gix::Repository, IsolateError> {
+    gix::open(path)
+        .map_err(|err| IsolateError::Git(format!("cannot open {}: {err}", path.display())))
+}
+
+/// `HEAD`'s peeled commit as lowercase hex (`gix-0.87.1/src/repository/reference.rs:211`).
+///
+/// # Errors
+/// [`IsolateError::Refused`] with [`unborn_head`] for a repository with no commit;
+/// [`IsolateError::Git`] for anything else.
+pub fn head(path: &Path) -> Result<String, IsolateError> {
+    let repo = open(path)?;
+    let head = repo.head().map_err(|err| {
+        IsolateError::Git(format!("cannot read HEAD of {}: {err}", path.display()))
+    })?;
+    if head.is_unborn() {
+        return Err(IsolateError::Refused(unborn_head(
+            &path.display().to_string(),
+        )));
+    }
+    let id = head.into_peeled_id().map_err(|err| {
+        IsolateError::Git(format!("cannot peel HEAD of {}: {err}", path.display()))
+    })?;
+    Ok(id.detach().to_hex().to_string())
+}
+
+/// `HEAD`'s parents as hex, in order (`gix-0.87.1/src/object/commit.rs:154`).
+///
+/// D25's post-condition after `merge --no-ff`: exactly `[before, after]`.
+///
+/// # Errors
+/// [`IsolateError::Git`] when `HEAD` has no commit or cannot be read.
+pub fn head_parents(path: &Path) -> Result<Vec<String>, IsolateError> {
+    let repo = open(path)?;
+    let commit = repo.head_commit().map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot read the HEAD commit of {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(commit
+        .parent_ids()
+        .map(|id| id.detach().to_hex().to_string())
+        .collect())
+}
+
+/// `Repository::is_dirty()` (`gix-0.87.1/src/status/mod.rs:168`), which is plan D24's predicate.
+///
+/// A change in the index against `HEAD` or in the working tree against the index, submodules
+/// included, **untracked files excluded** — because the only consumer of `dirty` is milestone 5's
+/// reset to `before_hash`, and a reset never deletes an untracked file anyway.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the status walk fails.
+pub fn is_dirty(path: &Path) -> Result<bool, IsolateError> {
+    let repo = open(path)?;
+    repo.is_dirty().map_err(|err| {
+        IsolateError::Git(format!("cannot read status of {}: {err}", path.display()))
+    })
+}
+
+/// Whether the repository declares any submodule
+/// (`gix-0.87.1/src/repository/submodule.rs:93`).
+///
+/// The `worktree` mode refuses one: `git worktree add` checks out the gitlink and leaves the
+/// submodule uninitialised, which is a tree the agent cannot build in.
+///
+/// # Errors
+/// [`IsolateError::Git`] when `.gitmodules` exists and cannot be parsed.
+pub fn has_submodules(path: &Path) -> Result<bool, IsolateError> {
+    let repo = open(path)?;
+    let modules = repo.submodules().map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot read the submodules of {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(modules.is_some_and(|mut names| names.next().is_some()))
+}
+
+/// Creates `refs/heads/<name>` at `target`, refusing to move an existing one
+/// (`gix-0.87.1/src/repository/reference.rs:79`, `PreviousValue::MustNotExist`).
+///
+/// D26's label for `shared_serialized` and A-2's for `copy`. Called through [`with_retry`],
+/// because the ref store takes a `.lock` file and `gix` acquires it with `Fail::Immediately`.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the name is invalid, the target is not a hash, or the reference
+/// already exists.
+pub fn create_branch(path: &Path, name: &str, target: &str) -> Result<(), IsolateError> {
+    let repo = open(path)?;
+    let id = parse_oid(target)?;
+    repo.reference(
+        format!("refs/heads/{name}"),
+        id,
+        gix::refs::transaction::PreviousValue::MustNotExist,
+        "htui: label",
+    )
+    .map(|_| ())
+    .map_err(|err| IsolateError::Git(format!("cannot create refs/heads/{name}: {err}")))
+}
+
+/// What `refs/heads/<name>` points at, or `None` when it does not exist
+/// (`gix-0.87.1/src/repository/reference.rs:323`).
+///
+/// D38 reads this to decide whether a tree already prepared for this step can be reused, and D25
+/// reads it to find the winner's tip after the worktree itself was removed at capture.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the ref store cannot be read or the reference does not peel.
+pub fn branch_target(path: &Path, name: &str) -> Result<Option<String>, IsolateError> {
+    let repo = open(path)?;
+    let full = format!("refs/heads/{name}");
+    let Some(mut reference) = repo
+        .try_find_reference(full.as_str())
+        .map_err(|err| IsolateError::Git(format!("cannot look up {full}: {err}")))?
+    else {
+        return Ok(None);
+    };
+    let id = reference
+        .peel_to_id()
+        .map_err(|err| IsolateError::Git(format!("cannot peel {full}: {err}")))?;
+    Ok(Some(id.detach().to_hex().to_string()))
+}
+
+/// One entry of `worktrees()`, flattened so it can outlive the `Repository` that read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    /// The checkout's base directory, canonicalised where it still exists.
+    pub path: PathBuf,
+    /// Whether a `locked` file stands beside the administrative entry.
+    pub locked: bool,
+    /// The text of that `locked` file — `htui run <run_id>` for one of ours.
+    pub lock_reason: Option<String>,
+}
+
+/// The linked worktree of `main` whose base is `path`, or `None`
+/// (`gix-0.87.1/src/repository/worktree.rs:46`, `src/worktree/proxy.rs:48-103`).
+///
+/// Both sides are canonicalised before the comparison (blueprint H-11): `git` writes the base into
+/// its `gitdir` file in its own spelling, and a symlinked checkout — `/var` under `/private/var`
+/// on a mac, a `TempDir` under a symlinked `TMPDIR` — differs from ours byte for byte otherwise.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the `worktrees/` directory cannot be read.
+pub fn worktree_by_path(main: &Path, path: &Path) -> Result<Option<WorktreeEntry>, IsolateError> {
+    let wanted = canonical(path);
+    Ok(worktree_entries(main)?
+        .into_iter()
+        .find(|entry| entry.path == wanted))
+}
+
+/// Every linked worktree of `main` whose base is under `root`.
+///
+/// D46's report: cleanup runs `worktree remove` per tree and then reads this. A non-empty answer
+/// is named in the cleanup error; `git worktree prune` is never run, because it would also clear
+/// the maintainer's own stale entries and cannot be scoped to ours (blueprint F-B).
+///
+/// # Errors
+/// [`IsolateError::Git`] when the `worktrees/` directory cannot be read.
+pub fn worktrees_under(main: &Path, root: &Path) -> Result<Vec<PathBuf>, IsolateError> {
+    let root = canonical(root);
+    Ok(worktree_entries(main)?
+        .into_iter()
+        .filter(|entry| entry.path.starts_with(&root))
+        .map(|entry| entry.path)
+        .collect())
+}
+
+/// Every linked worktree of `main`, flattened and canonicalised once.
+fn worktree_entries(main: &Path) -> Result<Vec<WorktreeEntry>, IsolateError> {
+    let repo = open(main)?;
+    let proxies = repo.worktrees().map_err(|err| {
+        IsolateError::Git(format!(
+            "cannot list the worktrees of {}: {err}",
+            main.display()
+        ))
+    })?;
+    let mut entries = Vec::with_capacity(proxies.len());
+    for proxy in proxies {
+        // A base that cannot be read belongs to an entry whose `gitdir` file is gone; it is still
+        // an entry `git worktree list` shows, so D46's report must not drop it.
+        let Ok(base) = proxy.base() else { continue };
+        entries.push(WorktreeEntry {
+            path: canonical(&base),
+            locked: proxy.is_locked(),
+            lock_reason: proxy.lock_reason().map(|reason| reason.to_string()),
+        });
+    }
+    Ok(entries)
+}
+
+/// The paths of every index entry left at a conflicted stage, sorted and deduplicated
+/// (`gix-0.87.1/src/repository/index.rs:25`; `gix-index-0.55.0/src/entry/mod.rs:3-11`).
+///
+/// D25's conflict branch reads this after `git merge` exits 1 and before `git merge --abort`
+/// throws the stage entries away.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the index cannot be opened.
+pub fn conflicted_paths(path: &Path) -> Result<Vec<String>, IsolateError> {
+    let repo = open(path)?;
+    let index = match repo.open_index() {
+        Ok(index) => index,
+        // A repository whose index file was never written has no conflicts to report.
+        Err(gix::worktree::open_index::Error::IndexFile(_)) => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(IsolateError::Git(format!(
+                "cannot open the index of {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let mut paths: Vec<String> = index
+        .entries()
+        .iter()
+        .filter(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+        .map(|entry| entry.path(&index).to_string())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Copies every object of `base..tip` that `to` lacks out of `from`'s object database, and reports
+/// how many it wrote (plan OQ-5).
+///
+/// `rev_walk([tip]).with_hidden([base])` (`gix-0.87.1/src/repository/revision.rs:174`) is the
+/// range; per commit the commit itself, its tree and every tree and blob reachable from it that
+/// `to` does not already have. A `copy` reconcile runs this before `merge_no_ff`, so `<after_hash>`
+/// resolves in the primary. Writes take loose-object locks, which is why this too goes through
+/// [`with_retry`].
+///
+/// # Errors
+/// [`IsolateError::Git`] when either repository cannot be read or an object cannot be written.
+pub fn copy_range(from: &Path, to: &Path, base: &str, tip: &str) -> Result<u32, IsolateError> {
+    let source = open(from)?;
+    let target = open(to)?;
+    let tip_id = parse_oid(tip)?;
+    let base_id = parse_oid(base)?;
+
+    let walk = source
+        .rev_walk([tip_id])
+        .with_hidden([base_id])
+        .all()
+        .map_err(|err| IsolateError::Git(format!("cannot walk {base}..{tip}: {err}")))?;
+
+    let mut copied = 0;
+    for info in walk {
+        let info =
+            info.map_err(|err| IsolateError::Git(format!("cannot walk {base}..{tip}: {err}")))?;
+        let commit = source
+            .find_object(info.id)
+            .map_err(|err| IsolateError::Git(format!("cannot read commit {}: {err}", info.id)))?
+            .into_commit();
+        let tree_id = commit
+            .tree_id()
+            .map_err(|err| IsolateError::Git(format!("commit {} has no tree: {err}", info.id)))?
+            .detach();
+        copy_tree_objects(&source, &target, tree_id, &mut copied)?;
+        copy_object(&source, &target, info.id, &mut copied)?;
+    }
+    Ok(copied)
+}
+
+/// `id` and everything reachable from it, skipping a subtree the target already has.
+///
+/// A git object store that holds a tree holds everything under it, so a present tree ends the
+/// recursion — which is what makes a second `copy_range` of the same range cost one lookup.
+fn copy_tree_objects(
+    source: &gix::Repository,
+    target: &gix::Repository,
+    id: gix::ObjectId,
+    copied: &mut u32,
+) -> Result<(), IsolateError> {
+    if !copy_object(source, target, id, copied)? {
+        return Ok(());
+    }
+    let tree = source
+        .find_object(id)
+        .map_err(|err| IsolateError::Git(format!("cannot read tree {id}: {err}")))?
+        .into_tree();
+    let entries = tree
+        .iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| IsolateError::Git(format!("cannot decode tree {id}: {err}")))?;
+    for entry in entries {
+        let child = entry.oid().to_owned();
+        match entry.mode().kind() {
+            gix::objs::tree::EntryKind::Tree => {
+                copy_tree_objects(source, target, child, copied)?;
+            }
+            // A gitlink names a commit in *another* repository; the `worktree` mode refuses
+            // submodules outright and `copy` copies the directory wholesale, so there is nothing
+            // of ours on the other side of one.
+            gix::objs::tree::EntryKind::Commit => {}
+            _ => {
+                copy_object(source, target, child, copied)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes one object into `target` if it is not already there; reports whether it wrote.
+fn copy_object(
+    source: &gix::Repository,
+    target: &gix::Repository,
+    id: gix::ObjectId,
+    copied: &mut u32,
+) -> Result<bool, IsolateError> {
+    use gix::objs::Write as _;
+
+    if target.has_object(id) {
+        return Ok(false);
+    }
+    let object = source
+        .find_object(id)
+        .map_err(|err| IsolateError::Git(format!("cannot read object {id}: {err}")))?;
+    // The bytes verbatim, not a re-encode: the hash is the contract and a round trip through a
+    // decoded type is one more place it could change.
+    target
+        .objects
+        .write_buf(object.kind, &object.data)
+        .map_err(|err| IsolateError::Git(format!("cannot write object {id}: {err}")))?;
+    *copied += 1;
+    Ok(true)
+}
+
+/// A hex hash as an [`gix::ObjectId`].
+fn parse_oid(hex: &str) -> Result<gix::ObjectId, IsolateError> {
+    gix::ObjectId::from_hex(hex.as_bytes())
+        .map_err(|err| IsolateError::Git(format!("{hex} is not an object id: {err}")))
+}
+
+/// `path` resolved through the filesystem, or `path` itself when it does not exist.
+///
+/// A vanished worktree still has an administrative entry to report, and that entry's base cannot
+/// be canonicalised; falling back to the literal path keeps it comparable with the one we asked
+/// for, which is how it was spelled when we created it.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Real repositories for tests, built with `gix` alone so they need no `git` on the box (D40).
+#[cfg(any(test, feature = "test-support"))]
+pub mod testkit {
+    use std::path::Path;
+
+    /// The signature every test commit carries; a fixed timestamp keeps the hashes of a fixture
+    /// stable across runs.
+    fn who() -> gix::actor::SignatureRef<'static> {
+        gix::actor::SignatureRef {
+            name: gix::bstr::BStr::new(b"htui test"),
+            email: gix::bstr::BStr::new(b"test@localhost"),
+            time: "1600000000 +0000",
+        }
+    }
+
+    /// `gix::init` and nothing else: a repository whose `HEAD` is unborn.
+    ///
+    /// # Panics
+    /// When the directory cannot be initialised.
+    pub fn empty_repo(dir: &Path) {
+        gix::init(dir).expect("the repository is initialised");
+    }
+
+    /// A repository with one file `f` and one commit; returns the commit's hash.
+    ///
+    /// # Panics
+    /// When the repository cannot be created or committed to.
+    pub fn repo_with_one_commit(dir: &Path) -> String {
+        empty_repo(dir);
+        commit_file(dir, "f", "first\n", "one")
+    }
+
+    /// Writes `name`, commits it on whatever `HEAD` names, and leaves the index matching the new
+    /// commit so [`super::is_dirty`] reads `false` afterwards.
+    ///
+    /// # Panics
+    /// When any step of the commit fails.
+    pub fn commit_file(repo: &Path, name: &str, body: &str, message: &str) -> String {
+        let repository = gix::open(repo).expect("the repository opens");
+        let blob = repository
+            .write_blob(body.as_bytes())
+            .expect("the blob is written")
+            .detach();
+
+        let (parents, mut entries) = match repository.head_commit() {
+            Ok(commit) => {
+                let tree = commit.tree().expect("the parent commit has a tree");
+                let entries = tree
+                    .iter()
+                    .map(|entry| {
+                        let entry = entry.expect("the parent tree decodes");
+                        gix::objs::tree::Entry {
+                            mode: entry.mode(),
+                            filename: entry.filename().to_owned(),
+                            oid: entry.oid().to_owned(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (vec![commit.id], entries)
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        };
+        entries.retain(|entry| entry.filename != name);
+        entries.push(gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Blob.into(),
+            filename: name.into(),
+            oid: blob,
+        });
+        entries.sort();
+
+        let tree = repository
+            .write_object(gix::objs::Tree { entries })
+            .expect("the tree is written")
+            .detach();
+        let commit = repository
+            .commit_as(who(), who(), "HEAD", message, tree, parents)
+            .expect("the commit is written")
+            .detach();
+
+        std::fs::write(repo.join(name), body).expect("the working-tree file is written");
+        repository
+            .index_from_tree(&tree)
+            .expect("an index is built from the new tree")
+            .write(gix::index::write::Options::default())
+            .expect("the index is written");
+        commit.to_hex().to_string()
+    }
+
+    /// Whether `repo`'s object database holds `hex`.
+    ///
+    /// # Panics
+    /// When the repository cannot be opened or `hex` is not a hash.
+    #[must_use]
+    pub fn has_object(repo: &Path, hex: &str) -> bool {
+        let repository = gix::open(repo).expect("the repository opens");
+        let id = gix::ObjectId::from_hex(hex.as_bytes()).expect("a hex object id");
+        repository.has_object(id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
     use std::path::PathBuf;
     use std::time::Duration;
 
+    use super::testkit::{commit_file, empty_repo, has_object, repo_with_one_commit};
     use super::{CAPTURE_TAIL, Cli, Exited, MIN_GIT, SCRUBBED_ENV, TailBuffer, is_lock_error};
     use crate::isolate::IsolateError;
+
+    /// A repository this crate made with `gix` alone reads back through this crate's own `head`.
+    #[test]
+    fn init_commit_and_head_round_trip() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let first = repo_with_one_commit(dir.path());
+        assert_eq!(first.len(), 40, "a hex sha1: {first}");
+        assert_eq!(super::head(dir.path()).expect("HEAD reads"), first);
+
+        let second = commit_file(dir.path(), "g", "second\n", "two");
+        assert_ne!(second, first);
+        assert_eq!(super::head(dir.path()).expect("HEAD reads"), second);
+        assert_eq!(
+            super::head_parents(dir.path()).expect("the parents read"),
+            vec![first],
+            "one parent, the commit before it"
+        );
+    }
+
+    /// `gix::init` alone makes a repository with an unborn `HEAD`, and `before_hash` is `NOT NULL`
+    /// (ANA-2 `:962-963`), so there is no row to write and the mode refuses (blueprint A-4).
+    #[test]
+    fn head_of_an_unborn_repo_is_refused() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        empty_repo(dir.path());
+        let err = super::head(dir.path()).expect_err("an unborn HEAD has no hash");
+        assert!(
+            err.to_string()
+                .starts_with("isolation refused: unborn HEAD: ")
+                && err
+                    .to_string()
+                    .ends_with(" has no commit to record as before_hash"),
+            "unexpected sentence: {err}"
+        );
+    }
+
+    /// Plan D24: the index against `HEAD` and the working tree against the index — untracked files
+    /// are not a change, because milestone 5's reset would not have deleted them anyway.
+    #[test]
+    fn is_dirty_ignores_untracked_and_sees_a_modified_tracked_file() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        repo_with_one_commit(dir.path());
+        assert!(
+            !super::is_dirty(dir.path()).expect("status reads"),
+            "a fresh checkout is clean"
+        );
+
+        std::fs::write(dir.path().join("untracked"), "noise\n").expect("the file is written");
+        assert!(
+            !super::is_dirty(dir.path()).expect("status reads"),
+            "an untracked file is not a change (D24)"
+        );
+
+        std::fs::write(dir.path().join("f"), "edited\n").expect("the file is written");
+        assert!(
+            super::is_dirty(dir.path()).expect("status reads"),
+            "a modified tracked file is"
+        );
+    }
+
+    /// D26's label: written once with `MustNotExist`, read back by name, `None` for one that is
+    /// not there (D38's idempotence check reads exactly this).
+    #[test]
+    fn branch_label_is_created_once_and_read_back() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let base = repo_with_one_commit(dir.path());
+
+        assert_eq!(
+            super::branch_target(dir.path(), "htui/absent").expect("the read succeeds"),
+            None,
+            "a branch that was never made reads as None, not as an error"
+        );
+
+        super::create_branch(dir.path(), "htui/step", &base).expect("the label is written");
+        assert_eq!(
+            super::branch_target(dir.path(), "htui/step").expect("the read succeeds"),
+            Some(base.clone())
+        );
+
+        // `gix-ref-0.67.1/src/store/file/transaction/prepare.rs:157-165`: `MustNotExist` tolerates
+        // a reference that already points exactly where the write would have put it, and refuses
+        // only a move. Capture relies on the first half — a `shared_serialized` step whose capture
+        // runs twice writes the same label twice (blueprint §6.4).
+        super::create_branch(dir.path(), "htui/step", &base)
+            .expect("relabelling the same commit is not an error");
+
+        let moved = commit_file(dir.path(), "g", "second\n", "two");
+        let err = super::create_branch(dir.path(), "htui/step", &moved)
+            .expect_err("MustNotExist refuses a move");
+        assert!(
+            matches!(err, IsolateError::Git(_)),
+            "moving an existing label is a git error, not a refusal: {err}"
+        );
+        assert_eq!(
+            super::branch_target(dir.path(), "htui/step").expect("the read succeeds"),
+            Some(base),
+            "and the label did not move"
+        );
+    }
+
+    /// OQ-5: a `copy` reconcile needs `<after_hash>` to resolve in the primary before `git merge`
+    /// runs, so the range's objects move first.
+    #[test]
+    fn copy_range_moves_every_object_between_odbs() {
+        let source = tempfile::tempdir().expect("a temporary directory");
+        let target = tempfile::tempdir().expect("a temporary directory");
+        let base = repo_with_one_commit(source.path());
+        let tip = commit_file(source.path(), "added", "by the agent\n", "the step's work");
+        empty_repo(target.path());
+
+        assert!(
+            !has_object(target.path(), &tip),
+            "the target starts without it"
+        );
+        let copied =
+            super::copy_range(source.path(), target.path(), &base, &tip).expect("the range copies");
+        assert!(
+            copied >= 3,
+            "the commit, its tree and the new blob at least: {copied}"
+        );
+        assert!(
+            has_object(target.path(), &tip),
+            "the tip resolves in the target"
+        );
+        assert!(
+            !has_object(target.path(), &base),
+            "the hidden base is not walked: it is already in the primary in production"
+        );
+
+        // Idempotent: a second copy of the same range writes nothing new.
+        assert_eq!(
+            super::copy_range(source.path(), target.path(), &base, &tip).expect("the range copies"),
+            0,
+            "every object of the range is already there"
+        );
+    }
+
+    /// The three reads whose interesting half needs a real `git` still have to answer for a plain
+    /// repository, which is the state every `prepare` starts from.
+    #[test]
+    fn a_plain_repo_has_no_submodules_no_conflicts_and_no_linked_worktrees() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        repo_with_one_commit(dir.path());
+
+        assert!(!super::has_submodules(dir.path()).expect("the read succeeds"));
+        assert_eq!(
+            super::conflicted_paths(dir.path()).expect("the index reads"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            super::worktrees_under(dir.path(), dir.path()).expect("the read succeeds"),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            super::worktree_by_path(dir.path(), &dir.path().join("nowhere"))
+                .expect("the read succeeds"),
+            None
+        );
+
+        let err = super::open(&dir.path().join("not-a-repo")).expect_err("there is no repo there");
+        assert!(
+            err.to_string().starts_with("git: cannot open "),
+            "unexpected sentence: {err}"
+        );
+    }
 
     /// Three shapes `git --version` is known to print, and the refusals below them (blueprint
     /// §3.3 steps 3 and 4).
