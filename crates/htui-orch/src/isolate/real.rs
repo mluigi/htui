@@ -1,4 +1,4 @@
-//! `GixIsolator`: the production [`Isolator`](super::Isolator), four modes over `gix` reads and
+//! `GixIsolator`: the production [`Isolator`], four modes over `gix` reads and
 //! five `git` verbs (plan D22–D47).
 //!
 //! This is the first place ANA-2 §4.6's four isolation modes exist as *behaviour* rather than as
@@ -707,6 +707,77 @@ impl GixIsolator {
         }
     }
 
+    /// `reconcile` for a tree that is *not* the checkout: D25's `--no-ff` merge of the winner into
+    /// the primary tree.
+    ///
+    /// The winner's tip is read from the branch for a `worktree` (the tree itself may be gone —
+    /// D27 removed it, or milestone 5 will) and from the copy's own `HEAD` for a `copy`, whose
+    /// label never moved past the base (blueprint A-2).
+    ///
+    /// Three refusals stand between the tip and the merge: no usable `git`, a dirty primary
+    /// (ANA-2 `:978-979`), and a primary that moved. The moved case is read twice before it is
+    /// refused, because blueprint H-3's crash between the merge and `record_commits` leaves a
+    /// primary whose `HEAD` is exactly the merge this call would make — its parents say so, and
+    /// the answer is that commit rather than a refusal.
+    async fn reconcile_isolated(
+        &self,
+        step: StepId,
+        tree: &RunStepTree,
+        checkout: &RepoCheckout,
+    ) -> Result<Option<String>, IsolateError> {
+        let local = checkout.local_path.clone();
+        let tip = match tree.mode {
+            Isolation::Copy => {
+                let path = PathBuf::from(&tree.path);
+                if !path.join(".git").is_dir() {
+                    return Err(IsolateError::Refused(copy_tree_vanished(&path)));
+                }
+                Some(blocking(move || git::head(&path)).await?)
+            }
+            _ => {
+                let (repo, name) = (local.clone(), format!("htui/{step}"));
+                blocking(move || git::branch_target(&repo, &name)).await?
+            }
+        };
+        let Some(after) = tip.filter(|tip| *tip != tree.base_ref) else {
+            return Ok(None);
+        };
+
+        let git = self.cli()?.clone();
+        let read = local.clone();
+        if blocking(move || git::is_dirty(&read)).await? {
+            return Err(IsolateError::Refused(dirty_primary_tree()));
+        }
+        let read = local.clone();
+        let head = blocking(move || git::head(&read)).await?;
+        if head != tree.base_ref {
+            let read = local.clone();
+            let parents = blocking(move || git::head_parents(&read)).await?;
+            if parents == [tree.base_ref.as_str(), after.as_str()] {
+                return Ok(Some(head));
+            }
+            return Err(IsolateError::Refused(primary_moved(&head)));
+        }
+
+        if tree.mode == Isolation::Copy {
+            // OQ-5: a copy has its own object database, so `<after>` does not resolve in the
+            // primary until the range has been written there.
+            let (from, to) = (PathBuf::from(&tree.path), local.clone());
+            let (base, tip) = (tree.base_ref.clone(), after.clone());
+            git::with_retry("copy objects", move || {
+                let (from, to, base, tip) = (from.clone(), to.clone(), base.clone(), tip.clone());
+                async move { blocking(move || git::copy_range(&from, &to, &base, &tip)).await }
+            })
+            .await?;
+        }
+
+        let merged = git::with_retry("merge", || {
+            git.merge_no_ff(&local, step, &tree.base_ref, &after)
+        })
+        .await?;
+        Ok(Some(merged.commit))
+    }
+
     /// `reconcile` for a tree that is the checkout itself: nothing to merge, because the step
     /// committed into the primary tree as it went.
     async fn reconcile_in_place(
@@ -740,6 +811,13 @@ pub fn primary_moved(head: &str) -> String {
     format!("primary_moved: {head}")
 }
 
+/// ANA-2 `:978-979`: the primary tree carries uncommitted work, so a merge into it would mix the
+/// step's changes with somebody else's.
+#[must_use]
+pub fn dirty_primary_tree() -> String {
+    "dirty_primary_tree".to_owned()
+}
+
 /// `remove_dir_all` where an absent directory is the outcome asked for, not a failure.
 fn remove_directory(path: &Path) -> Result<(), IsolateError> {
     match std::fs::remove_dir_all(path) {
@@ -747,11 +825,6 @@ fn remove_directory(path: &Path) -> Result<(), IsolateError> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(IsolateError::Io(err)),
     }
-}
-
-/// A mode whose behaviour is not in the tree yet; removed as each lands (MOD-4 M3 T5).
-fn not_landed_yet(mode: Isolation) -> IsolateError {
-    IsolateError::Git(format!("the {} mode is not implemented yet", mode.as_str()))
 }
 
 /// Runs one synchronous `gix` or filesystem call on the blocking pool.
@@ -825,7 +898,9 @@ impl Isolator for GixIsolator {
                     Isolation::Local | Isolation::SharedSerialized => {
                         self.reconcile_in_place(winner, tree, &checkout).await?
                     }
-                    Isolation::Worktree | Isolation::Copy => return Err(not_landed_yet(tree.mode)),
+                    Isolation::Worktree | Isolation::Copy => {
+                        self.reconcile_isolated(winner, tree, &checkout).await?
+                    }
                 };
                 commits.push(RunStepCommit {
                     run_step_id: winner,
@@ -1889,6 +1964,251 @@ mod tests {
         assert!(
             copy.join("agent-work").is_file(),
             "the copy was reused, not remade"
+        );
+    }
+
+    /// A `worktree` step's `prepare`, its commit and its `capture`, so that a `reconcile` test has
+    /// something to merge. Returns the isolator, the checkout, the base and the step's rows.
+    async fn stepped(
+        dir: &Path,
+    ) -> (
+        GixIsolator,
+        RepoId,
+        PathBuf,
+        String,
+        String,
+        StepId,
+        Vec<RunStepTree>,
+    ) {
+        let (core, core_checkout, head) = repo(dir, "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator = GixIsolator::new(config(&dir.join("trees"), &[(core, core_checkout)]))
+            .expect("the config validates");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core], Isolation::Worktree)
+            .await
+            .expect("the worktree mode prepares");
+        let after = commit_file(
+            &PathBuf::from(&prepared.trees[0].tree.path),
+            "g",
+            "the step's work\n",
+            "the step commits",
+        );
+        let rows = rows(&prepared);
+        isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+        (isolator, core, core_path, head, after, step, rows)
+    }
+
+    /// D25: the winner is merged into the primary tree with `--no-ff`, and the merge commit is
+    /// what the step's `after_hash` becomes (ANA-2 `:987-988`).
+    #[tokio::test]
+    async fn reconcile_merges_the_winner_no_ff_and_updates_the_primary_tree() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, core_path, head, after, step, rows) = stepped(dir.path()).await;
+
+        let commits = isolator
+            .reconcile(step, &rows)
+            .await
+            .expect("the winner reconciles");
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].repo_id, core);
+        assert_eq!(commits[0].before_hash, head);
+        let merge = commits[0]
+            .after_hash
+            .clone()
+            .expect("the merge commit is the new after_hash");
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            merge
+        );
+        assert_eq!(
+            crate::isolate::git::head_parents(&core_path).expect("the parents read"),
+            vec![head, after],
+            "--no-ff made a two-parent commit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("g")).expect("the merged file reads"),
+            "the step's work\n",
+            "the primary working tree carries the step's work"
+        );
+    }
+
+    /// A step that committed nothing has nothing to merge, and `reconcile` must not invent a
+    /// commit for it.
+    #[tokio::test]
+    async fn reconcile_is_the_identity_for_a_no_commit_step() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core], Isolation::Worktree)
+            .await
+            .expect("the worktree mode prepares");
+        let rows = rows(&prepared);
+        isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+
+        let commits = isolator
+            .reconcile(step, &rows)
+            .await
+            .expect("the identity reconciles");
+        assert_eq!(commits[0].after_hash, None);
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head,
+            "the primary tree was not touched"
+        );
+    }
+
+    /// ANA-2 `:978-979`: a dirty primary tree is refused by name, and the run is parked with it.
+    #[tokio::test]
+    async fn reconcile_refuses_a_dirty_primary() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, _core, core_path, head, _after, step, rows) = stepped(dir.path()).await;
+        std::fs::write(core_path.join("f"), "the maintainer is mid-edit\n")
+            .expect("the primary is dirtied");
+
+        let err = isolator
+            .reconcile(step, &rows)
+            .await
+            .expect_err("a dirty primary is refused");
+        assert_eq!(err.to_string(), "isolation refused: dirty_primary_tree");
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head,
+            "and nothing was merged"
+        );
+    }
+
+    /// The primary moved under us and its new `HEAD` is not a merge of ours, so there is nothing
+    /// this milestone can safely do but say where it is.
+    #[tokio::test]
+    async fn reconcile_refuses_a_moved_primary() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, _core, core_path, _head, _after, step, rows) = stepped(dir.path()).await;
+        let moved = commit_file(&core_path, "h", "somebody else\n", "the primary moves");
+
+        let err = isolator
+            .reconcile(step, &rows)
+            .await
+            .expect_err("a moved primary is refused");
+        assert_eq!(
+            err.to_string(),
+            format!("isolation refused: primary_moved: {moved}")
+        );
+    }
+
+    /// Blueprint H-3: the crash between `git merge` and `record_commits` leaves the primary at a
+    /// merge commit the row does not know about; a re-run reads its parents and reports it rather
+    /// than refusing `primary_moved`.
+    #[tokio::test]
+    async fn reconcile_after_a_crash_between_merge_and_the_row_is_idempotent() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, _core, core_path, _head, _after, step, rows) = stepped(dir.path()).await;
+
+        let first = isolator
+            .reconcile(step, &rows)
+            .await
+            .expect("the winner reconciles");
+        let second = isolator
+            .reconcile(step, &rows)
+            .await
+            .expect("the second reconcile reads the merge it already made");
+
+        assert_eq!(first[0].after_hash, second[0].after_hash);
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            second[0]
+                .after_hash
+                .clone()
+                .expect("the merge commit is reported"),
+            "nothing was merged a second time"
+        );
+    }
+
+    /// Plan OQ-5: a copy has its own object database, so the step's range is written into the
+    /// primary's before the merge can resolve the hash at all.
+    #[tokio::test]
+    async fn copy_reconcile_copies_the_range_then_merges() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core], Isolation::Copy)
+            .await
+            .expect("the copy mode prepares");
+        let copy = PathBuf::from(&prepared.trees[0].tree.path);
+        let after = commit_file(&copy, "g", "the step's work\n", "the step commits");
+        let rows = rows(&prepared);
+        isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+        assert!(
+            !crate::isolate::git::testkit::has_object(&core_path, &after),
+            "the source has never seen the copy's commit"
+        );
+
+        let commits = isolator
+            .reconcile(step, &rows)
+            .await
+            .expect("the copy reconciles");
+
+        assert!(
+            crate::isolate::git::testkit::has_object(&core_path, &after),
+            "the range was copied into the primary's object database"
+        );
+        let merge = commits[0]
+            .after_hash
+            .clone()
+            .expect("the merge commit is the new after_hash");
+        assert_eq!(
+            crate::isolate::git::head_parents(&core_path).expect("the parents read"),
+            vec![head, after]
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            merge
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("g")).expect("the merged file reads"),
+            "the step's work\n"
         );
     }
 }

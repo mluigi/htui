@@ -40,7 +40,8 @@ pub use graph::{
     GraphSource, ResolveError, Resolved, override_graph, resolve, resolve_scope, topology,
 };
 pub use isolate::{
-    Clock, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree, SystemClock,
+    Clock, GixIsolator, IsolateError, Isolator, IsolatorConfig, IsolatorFuture, Prepared,
+    PreparedTree, RepoCheckout, SystemClock,
 };
 pub use status::{Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt};
 pub use verify::{ShellVerifier, Verifier, VerifierFuture, VerifyReport, VerifyRequest};

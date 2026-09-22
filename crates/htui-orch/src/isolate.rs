@@ -136,7 +136,10 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     /// per repo.
     ///
     /// Fan-out is milestone 4's, so this milestone's only winner is the single step at
-    /// `fanout_index = 0` and reconciliation is an identity.
+    /// `fanout_index = 0`. What that step's reconciliation *is* depends on the mode it ran under
+    /// (plan D25): for `worktree` and `copy` it is a real `git merge --no-ff` into the primary
+    /// checkout and the returned `after_hash` is the merge commit; for `shared_serialized` and
+    /// `local` it is the identity, because the step committed into the primary tree as it went.
     fn reconcile<'a>(
         &'a self,
         winner: StepId,
