@@ -59,6 +59,27 @@ pub fn duplicate_repo_name(name: &str) -> String {
     format!("duplicate repo name {name}")
 }
 
+/// The `worktree` mode over a repository with submodules (the plan's mode table).
+///
+/// `git worktree add` checks the gitlink out and leaves the submodule uninitialised, so the agent
+/// would be handed a tree that does not build.
+#[must_use]
+pub fn submodules_refused() -> String {
+    "submodules: worktree isolation is not supported".to_owned()
+}
+
+/// D46: an administrative entry that survived `worktree remove`, named rather than pruned.
+///
+/// Not a refusal — the payload of an [`IsolateError::Git`] — because cleanup is run-terminal and
+/// nothing is left to refuse; it is a sentence for the operator, who owns the `prune` we never run.
+#[must_use]
+pub fn stale_worktree(path: &Path) -> String {
+    format!(
+        "stale worktree entry {}; run `git worktree prune` yourself",
+        path.display()
+    )
+}
+
 /// `<root>/<run_id>/<step_id>/`: the common parent of a step's trees and the `cwd` of its session
 /// under the two isolating modes (plan D28).
 fn session_dir(root: &Path, run: RunId, step: StepId) -> PathBuf {
@@ -344,6 +365,109 @@ impl GixIsolator {
         })
     }
 
+    /// `worktree` (plan D23, D38): one locked linked worktree per repository under
+    /// `<root>/<run>/<step>/`, each on its own `htui/<step>` branch at the source's `HEAD`.
+    async fn prepare_worktree(
+        &self,
+        run: RunId,
+        step: StepId,
+        checkouts: &[(RepoId, RepoCheckout)],
+    ) -> Result<Prepared, IsolateError> {
+        let git = self.cli()?.clone();
+        let cwd = session_dir(&self.config.scratch_root, run, step);
+        std::fs::create_dir_all(&cwd)?;
+        let branch = format!("htui/{step}");
+
+        let mut trees = Vec::with_capacity(checkouts.len());
+        for (repo, checkout) in checkouts {
+            let local = checkout.local_path.clone();
+            if blocking(move || git::has_submodules(&local)).await? {
+                return Err(IsolateError::Refused(submodules_refused()));
+            }
+            let source_head = self.head_of(checkout).await?;
+            let path = cwd.join(&checkout.name);
+            let before = self
+                .worktree_at(&git, checkout, &path, &branch, &source_head, step, run)
+                .await?;
+            trees.push(PreparedTree {
+                tree: RunStepTree {
+                    run_step_id: step,
+                    repo_id: *repo,
+                    mode: Isolation::Worktree,
+                    path: path.to_string_lossy().into_owned(),
+                    base_ref: before.clone(),
+                    dirty: false,
+                },
+                before_hash: before,
+            });
+        }
+        // D28: every tree of this mode is under one common parent, so the session needs no
+        // `extra_dirs` to reach any of them.
+        Ok(Prepared {
+            trees,
+            cwd,
+            extra_dirs: Vec::new(),
+        })
+    }
+
+    /// The tree at `path`, made or found, and the `before_hash` that goes with it.
+    ///
+    /// D38's idempotence, and blueprint H-1's crash window with it: a second `prepare` for the same
+    /// `(run, step)` finds the tree it made, and the branch — not the source's `HEAD`, which may
+    /// have moved in between — is what says where the step started.
+    ///
+    /// H-5's half-made tree is **repaired** with D47's `reset --hard` rather than removed and
+    /// re-added, which is a departure from blueprint §6.3 with a reason: `git worktree add -b`
+    /// refuses a branch that already exists (`git.rs`'s own
+    /// `add_worktree_on_an_existing_branch_is_a_git_error_naming_the_branch` pins that), and the
+    /// remove-then-add path leaves exactly that branch behind. A tree whose `HEAD` cannot even be
+    /// read is treated as not reusable for the same reason, and `reset --hard`'s own
+    /// post-condition is then what reports the real failure. The remove-and-re-add path survives
+    /// for the one case where `-b` is legal: a tree with no branch at all.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every one of them is a fact of the tree being made; a struct for them would be \
+                  named once and read once"
+    )]
+    async fn worktree_at(
+        &self,
+        git: &Cli,
+        checkout: &RepoCheckout,
+        path: &Path,
+        branch: &str,
+        source_head: &str,
+        step: StepId,
+        run: RunId,
+    ) -> Result<String, IsolateError> {
+        let local = checkout.local_path.clone();
+        if path.join(".git").exists() {
+            let (repo, name) = (local.clone(), branch.to_owned());
+            match blocking(move || git::branch_target(&repo, &name)).await? {
+                Some(base) => {
+                    let tree = path.to_path_buf();
+                    let at_base = matches!(blocking(move || git::head(&tree)).await, Ok(head) if head == base);
+                    let tree = path.to_path_buf();
+                    let clean = at_base
+                        && matches!(blocking(move || git::is_dirty(&tree)).await, Ok(false));
+                    if !clean {
+                        git::with_retry("reset --hard", || git.reset_hard(path, &base)).await?;
+                    }
+                    return Ok(base);
+                }
+                None => {
+                    git::with_retry("worktree remove", || git.remove_worktree(&local, path))
+                        .await?;
+                    remove_directory(path)?;
+                }
+            }
+        }
+        git::with_retry("worktree add", || {
+            git.add_worktree(&local, path, step, run, source_head)
+        })
+        .await?;
+        Ok(source_head.to_owned())
+    }
+
     /// `capture` for one row, without the guard release the caller owns.
     async fn capture_rows(
         &self,
@@ -357,7 +481,8 @@ impl GixIsolator {
                 Isolation::Local | Isolation::SharedSerialized => {
                     self.capture_in_place(step, tree, &checkout).await?
                 }
-                Isolation::Worktree | Isolation::Copy => {
+                Isolation::Worktree => self.capture_worktree(step, tree, &checkout).await?,
+                Isolation::Copy => {
                     return Err(not_landed_yet(tree.mode));
                 }
             };
@@ -399,6 +524,65 @@ impl GixIsolator {
         Ok(Some(after))
     }
 
+    /// `capture` for a linked worktree: its `HEAD`, and D27's removal of the tree that earned
+    /// nothing.
+    ///
+    /// A tree that is no longer there is blueprint H-4: an earlier `capture` removed it and the
+    /// crash happened before `record_commits`. The branch survives every removal, so it — not the
+    /// vanished tree — is what answers the second time.
+    async fn capture_worktree(
+        &self,
+        step: StepId,
+        tree: &RunStepTree,
+        checkout: &RepoCheckout,
+    ) -> Result<Option<String>, IsolateError> {
+        let path = PathBuf::from(&tree.path);
+        if !path.join(".git").exists() {
+            let (repo, name) = (checkout.local_path.clone(), format!("htui/{step}"));
+            let label = blocking(move || git::branch_target(&repo, &name)).await?;
+            return Ok(label.filter(|target| *target != tree.base_ref));
+        }
+
+        let read = path.clone();
+        let after = blocking(move || git::head(&read)).await?;
+        if after != tree.base_ref {
+            return Ok(Some(after));
+        }
+
+        // D27: a clean tree the step committed nothing to is litter, and the run may hold dozens
+        // of them. A dirty one is the agent's unfinished work and stays for milestone 5's sweep.
+        let read = path.clone();
+        if !blocking(move || git::is_dirty(&read)).await? {
+            let git = self.cli()?.clone();
+            let local = checkout.local_path.clone();
+            git::with_retry("worktree remove", || git.remove_worktree(&local, &path)).await?;
+        }
+        Ok(None)
+    }
+
+    /// `git worktree remove --force --force` for one row, through D39's retry.
+    async fn remove_worktree_of(&self, tree: &RunStepTree) -> Result<(), IsolateError> {
+        let local = self.checkout_of(tree)?.local_path.clone();
+        let git = self.cli()?.clone();
+        let path = PathBuf::from(&tree.path);
+        git::with_retry("worktree remove", || git.remove_worktree(&local, &path)).await
+    }
+
+    /// D46's report: every entry a `worktrees()` read still lists under `run_dir`, as errors.
+    async fn stale_entries(&self, repo: RepoId, run_dir: &Path) -> Vec<IsolateError> {
+        let Some(checkout) = self.config.repos.get(&repo) else {
+            return vec![IsolateError::Refused(no_checkout_for_repo())];
+        };
+        let (local, root) = (checkout.local_path.clone(), run_dir.to_path_buf());
+        match blocking(move || git::worktrees_under(&local, &root)).await {
+            Ok(paths) => paths
+                .iter()
+                .map(|path| IsolateError::Git(stale_worktree(path)))
+                .collect(),
+            Err(err) => vec![err],
+        }
+    }
+
     /// `reconcile` for a tree that is the checkout itself: nothing to merge, because the step
     /// committed into the primary tree as it went.
     async fn reconcile_in_place(
@@ -430,6 +614,15 @@ impl GixIsolator {
 #[must_use]
 pub fn primary_moved(head: &str) -> String {
     format!("primary_moved: {head}")
+}
+
+/// `remove_dir_all` where an absent directory is the outcome asked for, not a failure.
+fn remove_directory(path: &Path) -> Result<(), IsolateError> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(IsolateError::Io(err)),
+    }
 }
 
 /// A mode whose behaviour is not in the tree yet; removed as each lands (MOD-4 M3 T5).
@@ -470,9 +663,10 @@ impl Isolator for GixIsolator {
                     self.prepare_in_place(run, step, &checkouts, isolation)
                         .await
                 }
-                Isolation::Worktree | Isolation::Copy => {
-                    // D40: the two modes that shell out answer with the probe's own sentence
-                    // before they touch a filesystem.
+                // D40: the two modes that shell out answer with the probe's own sentence before
+                // they touch a filesystem.
+                Isolation::Worktree => self.prepare_worktree(run, step, &checkouts).await,
+                Isolation::Copy => {
                     self.cli()?;
                     Err(not_landed_yet(isolation))
                 }
@@ -523,25 +717,52 @@ impl Isolator for GixIsolator {
         })
     }
 
+    /// D36: run-terminal, never at step end, and every row is processed before the first failure
+    /// is returned — a tree left behind because another one refused to go is a tree nobody
+    /// removes, since milestone 5's sweep is the only retry there is.
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
         Box::pin(async move {
+            let mut failures: Vec<IsolateError> = Vec::new();
+            let mut worktree_repos: Vec<RepoId> = Vec::new();
+
             for tree in trees {
                 match tree.mode {
+                    Isolation::Worktree => {
+                        if !worktree_repos.contains(&tree.repo_id) {
+                            worktree_repos.push(tree.repo_id);
+                        }
+                        if let Err(err) = self.remove_worktree_of(tree).await {
+                            failures.push(err);
+                        }
+                    }
+                    Isolation::Copy => failures.push(not_landed_yet(tree.mode)),
                     // D43: whatever the step's own `capture` never released (blueprint H-15).
                     Isolation::SharedSerialized => self.release(tree.run_step_id),
                     // Nothing was created, so nothing is removed.
                     Isolation::Local => {}
-                    Isolation::Worktree | Isolation::Copy => return Err(not_landed_yet(tree.mode)),
                 }
             }
+
             // F-Q: `prepare` made `<root>/<run>/<step>/` and no per-tree verb names it.
             let run_dir = self.config.scratch_root.join(run.to_string());
-            match std::fs::remove_dir_all(&run_dir) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(IsolateError::Io(err)),
+            if let Err(err) = remove_directory(&run_dir) {
+                failures.push(err);
             }
-            Ok(())
+
+            // D46, last: `git worktree prune` is never spawned, so an entry that survived its
+            // `remove` is reported here and left exactly where it is.
+            for repo in worktree_repos {
+                failures.extend(self.stale_entries(repo, &run_dir).await);
+            }
+
+            let mut failures = failures.into_iter();
+            let Some(first) = failures.next() else {
+                return Ok(());
+            };
+            for rest in failures {
+                tracing::warn!(%run, err = %rest, "a further cleanup failure of the same run");
+            }
+            Err(first)
         })
     }
 }
@@ -553,10 +774,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use htui_core::model::{BoxId, Isolation, RepoId, RunId, StepId};
+    use htui_core::model::{BoxId, Isolation, RepoId, RunId, RunStepTree, StepId};
 
-    use crate::isolate::Isolator as _;
     use crate::isolate::git::testkit::{commit_file, empty_repo, repo_with_one_commit};
+    use crate::isolate::{Isolator as _, Prepared};
 
     use super::{GixIsolator, IsolatorConfig, RepoCheckout};
 
@@ -574,6 +795,18 @@ mod tests {
             },
             head,
         )
+    }
+
+    /// The `run_step_tree` rows `capture`, `reconcile` and `cleanup` are handed, in `repo_id`
+    /// order — what `step_trees` answers, never the `Prepared`'s own scope order (blueprint H-13).
+    fn rows(prepared: &Prepared) -> Vec<RunStepTree> {
+        let mut rows: Vec<RunStepTree> = prepared
+            .trees
+            .iter()
+            .map(|prepared| prepared.tree.clone())
+            .collect();
+        rows.sort_by_key(|row| row.repo_id);
+        rows
     }
 
     /// A config over `checkouts` with a scratch root at `root` and a cap nothing reaches.
@@ -922,6 +1155,451 @@ mod tests {
             prepared.cwd.ends_with(format!("{run}/{step}")),
             "{}",
             prepared.cwd.display()
+        );
+    }
+
+    /// Criterion 11's isolator half (`docs/ANA-2.md:2115`): one tree per repository, all of them
+    /// under the scratch root and none of them inside any managed checkout, both branches at the
+    /// base, and `git` itself agreeing that the entries are locked.
+    #[tokio::test]
+    async fn worktree_prepare_writes_one_tree_per_repo_outside_every_repo() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, core_head) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, docs_head) = repo(dir.path(), "docs", false);
+        let core_path = core_checkout.local_path.clone();
+        let docs_path = docs_checkout.local_path.clone();
+        let root = dir.path().join("trees");
+        let isolator = GixIsolator::new(config(
+            &root,
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let run = RunId::new();
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(run, step, &[core, docs], Isolation::Worktree)
+            .await
+            .expect("the worktree mode prepares");
+
+        assert_eq!(prepared.trees.len(), 2);
+        assert_eq!(
+            prepared.cwd,
+            std::fs::canonicalize(&root)
+                .expect("the root canonicalises")
+                .join(run.to_string())
+                .join(step.to_string())
+        );
+        assert!(
+            prepared.extra_dirs.is_empty(),
+            "every tree is under the session directory"
+        );
+
+        for (row, (source, head)) in prepared
+            .trees
+            .iter()
+            .zip([(&core_path, &core_head), (&docs_path, &docs_head)])
+        {
+            let path = PathBuf::from(&row.tree.path);
+            assert_eq!(&row.before_hash, head);
+            assert_eq!(&row.tree.base_ref, head);
+            assert_eq!(row.tree.mode, Isolation::Worktree);
+            assert!(!row.tree.dirty, "a fresh worktree is clean");
+            assert!(path.starts_with(&prepared.cwd), "{}", path.display());
+            assert!(!path.starts_with(source), "{}", path.display());
+            assert_eq!(
+                crate::isolate::git::head(&path).expect("the tree has a HEAD"),
+                **head
+            );
+            assert_eq!(
+                crate::isolate::git::branch_target(source, &format!("htui/{step}"))
+                    .expect("the ref store reads"),
+                Some((*head).clone()),
+                "D23's -b branched the step from the base"
+            );
+            let listed = crate::isolate::git::testkit::worktree_list(&git, source).await;
+            let ours = listed
+                .iter()
+                .find(|entry| entry.path == path)
+                .expect("git worktree list names the tree");
+            assert_eq!(ours.locked.as_deref(), Some(&*format!("htui run {run}")));
+            assert_eq!(
+                ours.branch.as_deref(),
+                Some(&*format!("refs/heads/htui/{step}"))
+            );
+        }
+    }
+
+    /// Stage 5's own question: what did the step commit? The tree it committed in answers
+    /// `Some(head)`, the one it did not answers `None`.
+    #[tokio::test]
+    async fn worktree_capture_reports_the_new_head_or_none() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, core_head) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, docs_head) = repo(dir.path(), "docs", false);
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core, docs], Isolation::Worktree)
+            .await
+            .expect("the worktree mode prepares");
+        // The agent commits in `core`'s tree and leaves `docs`'s alone, but dirties it so D27
+        // does not remove it under this test's feet.
+        let core_tree = PathBuf::from(&prepared.trees[0].tree.path);
+        let docs_tree = PathBuf::from(&prepared.trees[1].tree.path);
+        let after = commit_file(&core_tree, "g", "second\n", "two");
+        std::fs::write(docs_tree.join("f"), "edited\n").expect("the file is edited");
+
+        let commits = isolator
+            .capture(step, &rows(&prepared))
+            .await
+            .expect("the step captures");
+
+        let core_row = commits
+            .iter()
+            .find(|commit| commit.repo_id == core)
+            .expect("core is captured");
+        assert_eq!(core_row.before_hash, core_head);
+        assert_eq!(core_row.after_hash.as_deref(), Some(&*after));
+        let docs_row = commits
+            .iter()
+            .find(|commit| commit.repo_id == docs)
+            .expect("docs is captured");
+        assert_eq!(docs_row.before_hash, docs_head);
+        assert_eq!(docs_row.after_hash, None, "nothing was committed there");
+    }
+
+    /// D27: the clean no-commit tree is litter and goes at capture; the dirty one is the agent's
+    /// unfinished work and stays, because milestone 5's sweep is what reads it.
+    #[tokio::test]
+    async fn a_no_commit_clean_worktree_is_removed_at_capture_and_a_dirty_one_is_kept() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, core_head) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let core_path = core_checkout.local_path.clone();
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core, docs], Isolation::Worktree)
+            .await
+            .expect("the worktree mode prepares");
+        let clean = PathBuf::from(&prepared.trees[0].tree.path);
+        let dirty = PathBuf::from(&prepared.trees[1].tree.path);
+        std::fs::write(dirty.join("f"), "edited\n").expect("the file is edited");
+
+        let commits = isolator
+            .capture(step, &rows(&prepared))
+            .await
+            .expect("the step captures");
+        assert!(commits.iter().all(|commit| commit.after_hash.is_none()));
+
+        assert!(!clean.exists(), "the clean no-commit tree is gone");
+        assert_eq!(
+            crate::isolate::git::worktree_by_path(&core_path, &clean).expect("the worktrees read"),
+            None,
+            "and so is its administrative entry"
+        );
+        assert!(dirty.is_dir(), "the dirty tree is kept for milestone 5");
+        assert_eq!(
+            crate::isolate::git::branch_target(&core_path, &format!("htui/{step}"))
+                .expect("the ref store reads"),
+            Some(core_head),
+            "the branch survives the removal, which is what reconcile reads"
+        );
+    }
+
+    /// D38 and blueprint H-1: a second `prepare` for the same `(run, step)` finds the tree it made
+    /// and reports the same `before_hash`, even after the source moved on underneath it.
+    #[tokio::test]
+    async fn prepare_is_idempotent_for_worktree() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let run = RunId::new();
+        let step = StepId::new();
+        let first = isolator
+            .prepare(run, step, &[core], Isolation::Worktree)
+            .await
+            .expect("the first call prepares");
+        // The crash window of H-1: the source moves before the retry.
+        commit_file(&core_path, "h", "moved\n", "the source moves on");
+
+        let second = isolator
+            .prepare(run, step, &[core], Isolation::Worktree)
+            .await
+            .expect("the second call reuses");
+
+        assert_eq!(
+            second.trees[0].before_hash, head,
+            "the base is the branch's"
+        );
+        assert_eq!(second.trees[0].tree.path, first.trees[0].tree.path);
+        assert_eq!(
+            crate::isolate::git::worktrees_under(
+                &core_path,
+                &PathBuf::from(&first.trees[0].tree.path)
+            )
+            .expect("the worktrees read")
+            .len(),
+            1,
+            "one tree, not two"
+        );
+    }
+
+    /// Blueprint H-5: a `worktree add` killed mid-checkout leaves a tree that is not at its own
+    /// branch. It is repaired in place with D47's `reset --hard`, because `git worktree add -b`
+    /// cannot re-create a branch that already exists.
+    #[tokio::test]
+    async fn a_half_made_worktree_is_reset_and_reused() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let run = RunId::new();
+        let step = StepId::new();
+        let first = isolator
+            .prepare(run, step, &[core], Isolation::Worktree)
+            .await
+            .expect("the first call prepares");
+        let tree = PathBuf::from(&first.trees[0].tree.path);
+        std::fs::remove_file(tree.join("f")).expect("a tracked file is deleted");
+
+        let second = isolator
+            .prepare(run, step, &[core], Isolation::Worktree)
+            .await
+            .expect("the second call repairs and reuses");
+
+        assert_eq!(second.trees[0].before_hash, head);
+        assert_eq!(second.trees[0].tree.path, first.trees[0].tree.path);
+        assert!(tree.join("f").is_file(), "the tree was reset to its base");
+        assert!(
+            !crate::isolate::git::is_dirty(&tree).expect("the status reads"),
+            "and is clean again"
+        );
+        assert_eq!(
+            crate::isolate::git::worktrees_under(&core_path, &tree)
+                .expect("the worktrees read")
+                .len(),
+            1
+        );
+    }
+
+    /// The mode table's own refusal: `git worktree add` checks out the gitlink and leaves the
+    /// submodule uninitialised, which is a tree the agent cannot build in.
+    #[tokio::test]
+    async fn a_repo_with_submodules_is_refused_for_worktree() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        commit_file(
+            &core_checkout.local_path,
+            ".gitmodules",
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+            "declare a submodule",
+        );
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let err = isolator
+            .prepare(RunId::new(), StepId::new(), &[core], Isolation::Worktree)
+            .await
+            .expect_err("a repository with submodules is refused");
+        assert_eq!(
+            err.to_string(),
+            "isolation refused: submodules: worktree isolation is not supported"
+        );
+    }
+
+    /// Criterion 13's isolator half (`:2120`): after the run-terminal cleanup neither `gix` nor
+    /// `git` lists anything under the scratch root, the maintainer's own linked worktree is
+    /// untouched, and every checkout is exactly where it was.
+    #[tokio::test]
+    async fn cleanup_removes_every_tree_and_leaves_the_repo_untouched() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, core_head) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, docs_head) = repo(dir.path(), "docs", false);
+        let core_path = core_checkout.local_path.clone();
+        let docs_path = docs_checkout.local_path.clone();
+        let root = dir.path().join("trees");
+        let isolator = GixIsolator::new(config(
+            &root,
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        // The maintainer's own linked worktree, made outside the scratch root and never ours.
+        let theirs = dir.path().join("their-own-tree");
+        git.add_worktree(&core_path, &theirs, StepId::new(), RunId::new(), &core_head)
+            .await
+            .expect("their worktree is added");
+
+        let run = RunId::new();
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(run, step, &[core, docs], Isolation::Worktree)
+            .await
+            .expect("the worktree mode prepares");
+        let trees: Vec<PathBuf> = prepared
+            .trees
+            .iter()
+            .map(|prepared| PathBuf::from(&prepared.tree.path))
+            .collect();
+
+        isolator
+            .cleanup(run, &rows(&prepared))
+            .await
+            .expect("the run cleans up");
+
+        let canonical_root = std::fs::canonicalize(&root).expect("the root canonicalises");
+        for source in [&core_path, &docs_path] {
+            assert!(
+                crate::isolate::git::worktrees_under(source, &canonical_root)
+                    .expect("the worktrees read")
+                    .is_empty(),
+                "gix lists no entry under the scratch root"
+            );
+            let listed = crate::isolate::git::testkit::worktree_list(&git, source).await;
+            assert!(
+                listed
+                    .iter()
+                    .all(|entry| !entry.path.starts_with(&canonical_root)),
+                "and neither does git"
+            );
+            assert!(
+                listed
+                    .iter()
+                    .all(|entry| entry.branch.as_deref()
+                        != Some(&*format!("refs/heads/htui/{step}"))),
+                "no htui branch is left checked out anywhere"
+            );
+            assert!(
+                crate::isolate::git::branch_target(source, &format!("htui/{step}"))
+                    .expect("the ref store reads")
+                    .is_some(),
+                "the branches themselves survive"
+            );
+        }
+        for tree in &trees {
+            assert!(!tree.exists(), "{}", tree.display());
+        }
+        assert!(
+            !canonical_root.join(run.to_string()).exists(),
+            "the run's own directory is gone (F-Q)"
+        );
+
+        assert!(theirs.is_dir(), "the maintainer's worktree survives");
+        assert!(
+            crate::isolate::git::worktree_by_path(&core_path, &theirs)
+                .expect("the worktrees read")
+                .is_some()
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            core_head
+        );
+        assert_eq!(
+            crate::isolate::git::head(&docs_path).expect("the checkout has a HEAD"),
+            docs_head
+        );
+        for source in [&core_path, &docs_path] {
+            assert!(!crate::isolate::git::is_dirty(source).expect("the status reads"));
+        }
+    }
+
+    /// D46: `git worktree prune` is never spawned, so an entry that survives `remove` is named in
+    /// the cleanup error and left for the operator.
+    #[tokio::test]
+    async fn a_stale_entry_is_reported_not_pruned() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let root = dir.path().join("trees");
+        let isolator = GixIsolator::new(config(&root, &[(core, core_checkout)]))
+            .expect("the config validates");
+
+        let run = RunId::new();
+        let prepared = isolator
+            .prepare(run, StepId::new(), &[core], Isolation::Worktree)
+            .await
+            .expect("the worktree mode prepares");
+
+        // Blueprint H-1's crash window, from the other end: a tree whose `run_step_tree` row was
+        // never written is a tree `cleanup` is never handed, so no `remove` clears its entry. Its
+        // directory goes with `<root>/<run>/`; its administrative entry is what D46 reports.
+        let orphan = std::fs::canonicalize(&root)
+            .expect("the root canonicalises")
+            .join(run.to_string())
+            .join(StepId::new().to_string())
+            .join("core");
+        git.add_worktree(
+            &core_path,
+            &orphan,
+            StepId::new(),
+            run,
+            &crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+        )
+        .await
+        .expect("the orphaned worktree is added");
+        let tree = orphan;
+
+        let err = isolator
+            .cleanup(run, &rows(&prepared))
+            .await
+            .expect_err("a surviving entry is reported");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "git: stale worktree entry {}; run `git worktree prune` yourself",
+                tree.display()
+            )
+        );
+        assert!(
+            crate::isolate::git::testkit::worktree_list(&git, &core_path)
+                .await
+                .iter()
+                .any(|entry| entry.path == tree),
+            "and is still there afterwards: nothing pruned it"
         );
     }
 }
