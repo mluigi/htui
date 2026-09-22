@@ -19,7 +19,8 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 use htui_agent::conformance::{Script, ScriptEvent, epoch};
-use htui_agent::driver::DriverCaps;
+use htui_agent::driver::{AgentDriver, AgentSession, DriverCaps, DriverFuture, SessionSpec};
+use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, DriverEvent, ErrorEvent, StopReason};
 use htui_agent::fake::{FAKE_AGENT_NAME, FakeDriver};
 use htui_core::fixtures::ids;
@@ -54,6 +55,10 @@ pub struct FakeIsolator {
     after: Mutex<VecDeque<Option<String>>>,
     /// The synthetic-hash counter, shared by `prepare` and the unscripted `capture` path.
     calls: Mutex<u32>,
+    /// Scripted [`prepare`](Isolator::prepare) refusals, FIFO, one consumed per call.
+    refusals: Mutex<VecDeque<String>>,
+    /// How many times [`prepare`](Isolator::prepare) has been called, refusals included.
+    prepares: Mutex<u32>,
 }
 
 impl FakeIsolator {
@@ -74,6 +79,33 @@ impl FakeIsolator {
             .lock()
             .expect("no panic holds the fake isolator's lock")
             .push_back(hash.map(str::to_owned));
+    }
+
+    /// Make the next [`prepare`](Isolator::prepare) refuse with `reason` instead of inventing
+    /// trees.
+    ///
+    /// Stage 2 is the first thing the walk does after it moves a step `pending -> running`
+    /// (`docs/ANA-2.md:633`), so this is the shortest way to put an error in the region where a
+    /// step is live and no settle has happened yet — the region ANA-2 `:639` gives an
+    /// unconditioned `running -> failed`.
+    pub fn refuse_prepare(&self, reason: &str) {
+        self.refusals
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(reason.to_owned());
+    }
+
+    /// How many times [`prepare`](Isolator::prepare) has been called on this isolator.
+    ///
+    /// The trait promises no idempotence (`crate::isolate::Isolator::prepare`) and this fake mints
+    /// a fresh `before_hash` per call, so "once per step" is a property a case has to be able to
+    /// assert rather than assume.
+    #[must_use]
+    pub fn prepares(&self) -> u32 {
+        *self
+            .prepares
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
     }
 
     /// The next synthetic-hash ordinal.
@@ -117,6 +149,18 @@ impl Isolator for FakeIsolator {
         isolation: Isolation,
     ) -> IsolatorFuture<'a, Prepared> {
         Box::pin(async move {
+            *self
+                .prepares
+                .lock()
+                .expect("no panic holds the fake isolator's lock") += 1;
+            if let Some(reason) = self
+                .refusals
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front()
+            {
+                return Err(IsolateError::Refused(reason));
+            }
             let cwd = format!("{FAKE_TREE_ROOT}/{run}/{step}");
             let trees = scope
                 .iter()
@@ -415,6 +459,9 @@ pub struct ScriptedStep {
     pub script: Script,
     /// The body of the document written after `Done`, or `None` for a step that produced nothing.
     pub output: Option<String>,
+    /// When set, no session is opened at all: [`FakeOrchestrator::driver_for`] hands out a driver
+    /// whose `start` refuses with `DriverError::Spawn(reason)` (ANA-2 `:639`'s "spawn failure").
+    pub spawn_failure: Option<String>,
 }
 
 impl ScriptedStep {
@@ -424,6 +471,23 @@ impl ScriptedStep {
         Self {
             script: Self::ends(StopReason::EndTurn),
             output: Some(body.to_owned()),
+            spawn_failure: None,
+        }
+    }
+
+    /// A step whose driver never starts: ANA-2 `:639`'s **spawn failure**.
+    ///
+    /// `FakeDriver` cannot express this — its `start` refuses only for an empty prompt or a script
+    /// it has already played (`crates/htui-agent/src/fake.rs:166-180`), and neither is reachable
+    /// from a walk — so the orchestrator hands out a [`RefusingDriver`] instead. The script is
+    /// still carried and is simply never pulled, which is what a process that failed to spawn
+    /// leaves behind.
+    #[must_use]
+    pub fn refusing_to_start(reason: &str) -> Self {
+        Self {
+            script: Self::ends(StopReason::EndTurn),
+            output: None,
+            spawn_failure: Some(reason.to_owned()),
         }
     }
 
@@ -433,6 +497,7 @@ impl ScriptedStep {
         Self {
             script: Self::ends(StopReason::EndTurn),
             output: None,
+            spawn_failure: None,
         }
     }
 
@@ -447,6 +512,7 @@ impl ScriptedStep {
         Self {
             script: Self::ends(StopReason::EndTurn),
             output: Some(format!("---\nverdict: {verdict}\n---\n{body}")),
+            spawn_failure: None,
         }
     }
 
@@ -457,6 +523,7 @@ impl ScriptedStep {
         Self {
             script: Self::ends(stop),
             output: None,
+            spawn_failure: None,
         }
     }
 
@@ -474,6 +541,7 @@ impl ScriptedStep {
                 message: message.to_owned(),
             }))]),
             output: None,
+            spawn_failure: None,
         }
     }
 
@@ -482,6 +550,41 @@ impl ScriptedStep {
         Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
             stop_reason: stop,
         }))])
+    }
+}
+
+/// An [`AgentDriver`] that refuses to open a session at all (ANA-2 `:639`, "spawn failure").
+///
+/// It exists because `FakeDriver` cannot be made to refuse a *first* `start` from inside a walk,
+/// and because `crates/htui-agent` is not this milestone's to edit. Everything but `start` is the
+/// fake's: the name and the capability profile, so stage 1's interlock reads the same profile it
+/// would have read for a driver that works.
+#[derive(Debug)]
+pub struct RefusingDriver {
+    name: String,
+    caps: DriverCaps,
+    reason: String,
+}
+
+impl AgentDriver for RefusingDriver {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn caps(&self) -> DriverCaps {
+        self.caps
+    }
+
+    fn start<'a>(
+        &'a self,
+        spec: SessionSpec,
+        prompt: String,
+    ) -> DriverFuture<'a, Box<dyn AgentSession>> {
+        let reason = self.reason.clone();
+        Box::pin(async move {
+            drop((spec, prompt));
+            Err(DriverError::Spawn(reason))
+        })
     }
 }
 
@@ -617,13 +720,21 @@ impl FakeOrchestrator {
 
     /// One driver per session, which is `FakeDriver`'s own rule: it plays its script once and
     /// refuses a second `start` (`crates/htui-agent/src/fake.rs:178-180`, blueprint H-12).
+    ///
+    /// Boxed rather than a bare `FakeDriver` because
+    /// [`ScriptedStep::refusing_to_start`] hands out a [`RefusingDriver`] instead, which is the
+    /// only way a case can drive ANA-2 `:639`'s spawn failure without editing `htui-agent`.
     #[must_use]
-    pub fn driver_for(&self, phase: &str, attempt: i32) -> FakeDriver {
-        FakeDriver::new(
-            FAKE_AGENT_NAME,
-            self.caps,
-            self.script_for(phase, attempt).script,
-        )
+    pub fn driver_for(&self, phase: &str, attempt: i32) -> Box<dyn AgentDriver> {
+        let scripted = self.script_for(phase, attempt);
+        match scripted.spawn_failure {
+            Some(reason) => Box::new(RefusingDriver {
+                name: FAKE_AGENT_NAME.to_owned(),
+                caps: self.caps,
+                reason,
+            }),
+            None => Box::new(FakeDriver::new(FAKE_AGENT_NAME, self.caps, scripted.script)),
+        }
     }
 
     /// Plan D13's stand-in for MOD-11's `document_write`, called between stage 4 and stage 5.
@@ -771,7 +882,7 @@ mod tests {
 
     use chrono::TimeDelta;
     use htui_agent::conformance::epoch;
-    use htui_agent::driver::{AgentDriver as _, DriverCaps};
+    use htui_agent::driver::DriverCaps;
     use htui_agent::event::StopReason;
     use htui_agent::fake::FakeDriver;
     use htui_core::fixtures::{demo_data, ids};

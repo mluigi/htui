@@ -735,6 +735,14 @@ where
     // -- stages 2 to 6 -------------------------------------------------------------------------
 
     /// Stages 2 to 6 for one `pending` step. `Some(rest)` stops the walk.
+    ///
+    /// The `pending -> running` move is made here and everything past it is delegated, because
+    /// once the step is live **no error may simply propagate**. ANA-2 §4.3 gives a `running` step
+    /// exactly one orchestrator-owned exit for "driver error, cap breach, deadline elapsed, spawn
+    /// failure": `failed` (`docs/ANA-2.md:639`). A `?` that escaped instead would leave the step
+    /// `running` and the run `running` with nothing able to move either — `cursor` rests on a
+    /// `running` step, both §6.2 guards refuse one, and the lease sweep that would adopt it is
+    /// milestone 5's. So [`Self::fail_hard`] settles first and the error is re-raised after.
     async fn walk_step(
         &self,
         run: &Run,
@@ -742,14 +750,9 @@ where
         step: RunStep,
         phase: &SnapshotPhase,
     ) -> Result<Option<Rest>, EngineError> {
-        let item = Self::item_of(run)?;
         let now = self.now();
-        // `transition_step` stamps `started_at = COALESCE(started_at, at)`, so this instant *is*
-        // the step's start. Read from the row the walk holds, it would still be `NULL` — the row
-        // was read before the move — and the step deadline would be measured from the settle.
-        let started_at = now;
 
-        // -- stage 2: prepare -----------------------------------------------------------------
+        // -- stage 2: prepare, beginning with the move that makes the step live ---------------
         if !self
             .parts
             .store
@@ -759,6 +762,34 @@ where
             // Another process moved it; the next pass re-derives from rows (plan D16, D17).
             return Ok(None);
         }
+
+        // `transition_step` stamps `started_at = COALESCE(started_at, at)`, so this instant *is*
+        // the step's start. Read from the row the walk holds, it would still be `NULL` — the row
+        // was read before the move — and the step deadline would be measured from the settle.
+        match self.walk_live_step(run, snapshot, &step, phase, now).await {
+            Ok(rest) => Ok(rest),
+            Err(err) => {
+                // `?` and not "report the original": if the settle write itself refused, the step
+                // is *still* `running`, and a caller handed the original error would believe a row
+                // that does not exist.
+                self.fail_hard(run, &step, &err.to_string()).await?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Stages 2 to 6 of a step that is already `running`, so every error here is [`fail_hard`]'s.
+    ///
+    /// [`fail_hard`]: Self::fail_hard
+    async fn walk_live_step(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        started_at: DateTime<Utc>,
+    ) -> Result<Option<Rest>, EngineError> {
+        let item = Self::item_of(run)?;
         let prepared = self
             .parts
             .isolator
@@ -784,11 +815,11 @@ where
 
         // -- stage 3: prompt ------------------------------------------------------------------
         let prompt = match self
-            .assemble_prompt(run, snapshot, &step, phase, item)
+            .assemble_prompt(run, snapshot, step, phase, item)
             .await?
         {
             Ok(prompt) => prompt,
-            Err(missing) => return self.fail_before_a_token(run, &step, phase, missing).await,
+            Err(missing) => return self.fail_before_a_token(run, step, phase, missing).await,
         };
         self.parts
             .store
@@ -800,9 +831,9 @@ where
             .await?;
 
         // -- stage 4: session -----------------------------------------------------------------
-        let (result, cap_breach) = self.session(run, &step, phase, &prompt).await?;
+        let (result, cap_breach) = self.session(run, step, phase, &prompt).await?;
         if let Ok(done) = &result {
-            self.parts.sink.after_done(item, &step, phase, done).await?;
+            self.parts.sink.after_done(item, step, phase, done).await?;
         }
 
         // -- stage 5: settle ------------------------------------------------------------------
@@ -843,7 +874,7 @@ where
         // -- stage 6: gate --------------------------------------------------------------------
         let row = self.run(run.id).await?;
         let ctx = self.gate_context(&row, snapshot);
-        match gate::apply(&ctx, &step, phase, settled).await? {
+        match gate::apply(&ctx, step, phase, settled).await? {
             Landing::Advance => Ok(None),
             Landing::Retry { position, attempt } => {
                 let phase = Self::phase_at(snapshot, position)?;
@@ -851,6 +882,34 @@ where
             }
             Landing::Rest(rest) => Ok(Some(rest)),
         }
+    }
+
+    /// `running -> failed`, then the run, with `reason` as `run.failure` (`docs/ANA-2.md:639`).
+    ///
+    /// The one shape both of the walk's hard failures use: stage 3's missing input, and any error
+    /// escaping the region where a step is live. `false` means the compare-and-set found the step
+    /// somewhere other than `running` — another process settled it — and the run is then **not**
+    /// failed, because it is no longer this call's to end (plan D17).
+    async fn fail_hard(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        reason: &str,
+    ) -> Result<bool, EngineError> {
+        let now = self.now();
+        if !self
+            .parts
+            .store
+            .transition_step(step.id, StepStatus::Running, StepStatus::Failed, now)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.parts
+            .store
+            .finish_run(run.id, RunStatus::Failed, Some(reason), now)
+            .await?;
+        Ok(true)
     }
 
     /// Stage 3's hard failure: a required input resolved to no document, before a token was spent
@@ -862,16 +921,12 @@ where
         phase: &SnapshotPhase,
         kind: String,
     ) -> Result<Option<Rest>, EngineError> {
-        let now = self.now();
         let failure = RunFailure::MissingInput(kind);
-        self.parts
-            .store
-            .transition_step(step.id, StepStatus::Running, StepStatus::Failed, now)
-            .await?;
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
-            .await?;
+        if !self.fail_hard(run, step, &failure.to_string()).await? {
+            // Another process moved the step out of `running`; the next pass re-derives from rows
+            // rather than reporting a rest this call did not write (plan D16, D17).
+            return Ok(None);
+        }
         Ok(Some(Rest {
             run: RunStatus::Failed,
             position: Some(phase.position),
@@ -1061,7 +1116,20 @@ where
             .record_prompt(&prompt.text, prompt.payload_sections_value(), self.now())
             .await?;
 
-        let mut session = driver.start(spec, prompt.text.clone()).await?;
+        // A spawn failure is folded in rather than propagated straight out of the `?`: the
+        // recorder has already written the prompt row, so it is closed out on this path exactly as
+        // it is on a `pump` error. What it is *not* is a settle outcome — ANA-2 `:639` gives
+        // "spawn failure" an unconditioned `running -> failed` and §4.2's gate table has no cell
+        // for it — so it is re-raised instead of handed to `gate::apply`, which under `always`
+        // would park a human at a gate on a session that never opened. `walk_step`'s hard failure
+        // is what lands it in `failed`, under every gate.
+        let mut session = match driver.start(spec, prompt.text.clone()).await {
+            Ok(session) => session,
+            Err(refused) => {
+                recorder.finish().await?;
+                return Err(EngineError::Driver(refused));
+            }
+        };
         let result = pump(&mut *session, &mut recorder).await;
         let summary = recorder.finish().await?;
         Ok((result, summary.cap_breach))
@@ -1364,9 +1432,8 @@ pub async fn dispatch_fake(
     command: Command,
 ) -> Result<CommandOutcome, EngineError> {
     let graphs = orch.graphs();
-    let driver = |_candidate: &SnapshotCandidate, phase: &str, attempt: i32| {
-        Box::new(orch.driver_for(phase, attempt)) as Box<dyn AgentDriver>
-    };
+    let driver =
+        |_candidate: &SnapshotCandidate, phase: &str, attempt: i32| orch.driver_for(phase, attempt);
     let scrubber = htui_core::scrub::MinimalScrubber::new([]);
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.dispatch(command).await
@@ -1382,9 +1449,8 @@ pub async fn resume_fake(
     run: RunId,
 ) -> Result<Resume, EngineError> {
     let graphs = orch.graphs();
-    let driver = |_candidate: &SnapshotCandidate, phase: &str, attempt: i32| {
-        Box::new(orch.driver_for(phase, attempt)) as Box<dyn AgentDriver>
-    };
+    let driver =
+        |_candidate: &SnapshotCandidate, phase: &str, attempt: i32| orch.driver_for(phase, attempt);
     let scrubber = htui_core::scrub::MinimalScrubber::new([]);
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.resume(run).await
@@ -1464,7 +1530,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::TimeDelta;
-    use htui_agent::driver::{AgentDriver, DriverCaps};
+    use htui_agent::driver::DriverCaps;
+    use htui_agent::error::DriverError;
     use htui_agent::event::StopReason;
     use htui_core::fixtures::ids;
     use htui_core::model::{
@@ -1477,7 +1544,7 @@ mod tests {
     use super::{AgentSelector, FirstCandidate, NoSink, Resume, required_inputs};
     use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
     use crate::fake::{FakeOrchestrator, ScriptedStep};
-    use crate::isolate::Clock as _;
+    use crate::isolate::{Clock as _, IsolateError};
     use crate::status::RunFailure;
 
     /// Everything an `Engine` borrows from a `FakeOrchestrator`, held alive for one test.
@@ -2356,6 +2423,156 @@ mod tests {
                 }
             ),
             "{refused}"
+        );
+    }
+
+    /// Starts `FEAT-3`, which parks at `prd`, and hands back the run and that parked step.
+    ///
+    /// Every case that wants an error *inside* a walk needs the run id first, and a `StartRun`
+    /// that fails on its first position never hands one over — so the failure is scripted onto
+    /// position 1 and reached by approving position 0.
+    async fn started(harness: &Harness) -> (htui_core::model::RunId, htui_core::model::StepId) {
+        harness.free_feat_3().await;
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(steps.len(), 1);
+        (run, steps[0].id)
+    }
+
+    /// `run.graph_snapshot`, decoded, for a case that has to prove which gate it ran under.
+    async fn snapshot_of(harness: &Harness, run: htui_core::model::RunId) -> GraphSnapshot {
+        serde_json::from_value(
+            harness
+                .orch
+                .run(run)
+                .await
+                .graph_snapshot
+                .expect("the walk created the run with a snapshot"),
+        )
+        .expect("the engine wrote a `GraphSnapshot`")
+    }
+
+    /// ANA-2 `:639`: an error between the `pending -> running` move and the settle is an
+    /// unconditioned `running -> failed`, with the orchestrator as its actor.
+    ///
+    /// Without it every `?` in stages 2 to 6 leaves the step `running` and the run `running`
+    /// forever: `cursor` rests on a `running` step (`status.rs:144-152`), both §6.2 guards refuse
+    /// one (`command.rs:241-247`, `:274-283`), and the lease sweep that would adopt it is
+    /// milestone 5's. Stage 2 is the shortest of the ten such sites to drive.
+    #[tokio::test]
+    async fn an_error_after_the_running_move_fails_the_step_and_the_run() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        harness
+            .orch
+            .isolator
+            .refuse_prepare("no checkout for this repo on this box");
+
+        let refused = harness
+            .dispatch(Command::AnswerGate {
+                run,
+                step: prd,
+                answer: GateAnswer::Approved,
+            })
+            .await
+            .expect_err("stage 2 refused after the step was already `running`");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::Isolate(IsolateError::Refused(why)) if why.contains("no checkout")
+            ),
+            "{refused}"
+        );
+
+        let steps = harness.orch.steps(run).await;
+        let live = steps
+            .iter()
+            .find(|step| step.position == 1)
+            .expect("the walk admitted `plan` before stage 2 refused");
+        assert_eq!(
+            live.status,
+            StepStatus::Failed,
+            "a step left `running` wedges the run: nothing else in this milestone can move it"
+        );
+        let row = harness.orch.run(run).await;
+        assert_eq!(row.status, RunStatus::Failed);
+        assert_eq!(
+            row.failure.as_deref(),
+            Some("isolation refused: no checkout for this repo on this box"),
+            "invariant 7: the reason a human reads is the error's own sentence"
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Failed,
+            "plan D7: `finish_run` mirrors the item"
+        );
+    }
+
+    /// ANA-2 `:639` lists "spawn failure" beside driver error and deadline, with **no cell in
+    /// §4.2's gate table** — so a session that never opened is not a settle outcome and must not
+    /// be parked for a human by `always`. There is no artefact to approve and no session to read.
+    #[tokio::test]
+    async fn a_spawn_failure_fails_the_step_even_under_an_always_gate() {
+        let harness = Harness::new().await;
+        harness.orch.script(
+            "plan",
+            1,
+            ScriptedStep::refusing_to_start("no `claude` on PATH"),
+        );
+        let (run, prd) = started(&harness).await;
+        assert_eq!(
+            snapshot_of(&harness, run).await.phases[1].gate_effective,
+            Gate::Always,
+            "the seeded `plan` phase gates `always`, which is the cell that would park a failure"
+        );
+
+        let refused = harness
+            .dispatch(Command::AnswerGate {
+                run,
+                step: prd,
+                answer: GateAnswer::Approved,
+            })
+            .await
+            .expect_err("the driver refused to start");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::Driver(DriverError::Spawn(why)) if why.contains("no `claude` on PATH")
+            ),
+            "{refused}"
+        );
+
+        let steps = harness.orch.steps(run).await;
+        let live = steps
+            .iter()
+            .find(|step| step.position == 1)
+            .expect("the walk admitted `plan` before the driver refused");
+        assert_eq!(
+            live.status,
+            StepStatus::Failed,
+            "`always` parks a settle, not a spawn failure (ANA-2 `:639`)"
+        );
+        assert_ne!(
+            live.status,
+            StepStatus::AwaitingApproval,
+            "there is no artefact to approve and no session to read"
+        );
+        let row = harness.orch.run(run).await;
+        assert_eq!(row.status, RunStatus::Failed);
+        assert_eq!(
+            row.failure.as_deref(),
+            Some("agent spawn failed: no `claude` on PATH")
         );
     }
 
