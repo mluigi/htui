@@ -128,9 +128,9 @@ pub enum StepFailure {
     DeadlineElapsed,
     /// No document of the phase's `output_kind` was produced by this step (`:430`).
     MissingOutput,
-    /// `run_step.verify_outcome = 'fail'`. Never produced this milestone — `verify.rs` is
-    /// milestone 3's and every seeded phase has `verify_command: None` — and matched anyway, so
-    /// milestone 3 adds a writer rather than a branch.
+    /// `run_step.verify_outcome = 'fail'`. Produced since milestone 3: `crate::verify` runs the
+    /// phase's `verify_command` between stage 4 and stage 5 and the engine hands its outcome here.
+    /// Milestone 2 matched it with no writer, which is why milestone 3 added one and no branch.
     VerifyFailed,
 }
 
@@ -216,7 +216,12 @@ pub struct SettleInput<'a> {
     pub deadline_seconds: Option<u32>,
     /// The document of the phase's `output_kind` produced by **this step**, if there is one.
     pub output: Option<&'a Document>,
-    /// `run_step.verify_outcome`. Always `None` this milestone (plan D8, blueprint H-14).
+    /// `run_step.verify_outcome`, from `crate::verify` (milestone 3, plan D30).
+    ///
+    /// `None` when the phase named no `verify_command` — the seeded shape, and the normal case —
+    /// or when the session did not finish, which is blueprint A-3: a crashed session is already
+    /// `Failed` by this function's first rule and a verify on it would record nothing. `None` is
+    /// **not** `unavailable`: the latter is a command that was asked for and could not run.
     pub verify_outcome: Option<VerifyOutcome>,
     /// Whether the phase's front matter is read at all: `SnapshotPhase::name == "review"`, which
     /// is what the walk passes (`crate::engine`'s stage 5) and not `output_kind`. The two agree on

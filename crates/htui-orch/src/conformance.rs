@@ -14,15 +14,15 @@
 use chrono::TimeDelta;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    AgentId, Gate, GateOutcome, Item, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId,
-    PhasePatch, RepoId, Run, RunId, RunMode, RunStatus, RunStep, Status, StepGraphId,
-    StepGraphPhase, StepStatus,
+    AgentId, CommandRun, CommandRunStatus, Gate, GateOutcome, Item, ItemId, ItemPatch, NewRepo,
+    NewStepGraph, PhaseId, PhasePatch, RepoId, Run, RunId, RunMode, RunStatus, RunStep, Status,
+    StepGraphId, StepGraphPhase, StepId, StepStatus, VerifyOutcome,
 };
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
 use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 use crate::engine::Resume;
-use crate::fake::{FakeIsolator, FakeOrchestrator, ScriptedStep, TestClock};
+use crate::fake::{FakeIsolator, FakeOrchestrator, FakeVerifier, ScriptedStep, TestClock};
 use crate::isolate::Clock as _;
 use crate::status::RunFailure;
 
@@ -85,6 +85,14 @@ pub trait Orchestrate {
     /// The isolator, for scripting `after_hash` values.
     fn isolator(&self) -> &FakeIsolator;
 
+    /// The verifier, for scripting stage 5's `verify_command` outcome.
+    ///
+    /// Out of the blueprint's §4.5 list for the same reason [`isolator`](Orchestrate::isolator)
+    /// and [`clock`](Orchestrate::clock) are (blueprint F-P): a case that pins what a `pass`, a
+    /// `fail` or an `unavailable` does to the settle has to be able to say which one happened,
+    /// and nothing else on this trait can.
+    fn verifier(&self) -> &FakeVerifier;
+
     /// The clock, for reading the instants the walk stamped.
     fn clock(&self) -> &TestClock;
 }
@@ -118,6 +126,10 @@ impl Orchestrate for FakeOrchestrator {
         &self.isolator
     }
 
+    fn verifier(&self) -> &FakeVerifier {
+        &self.verifier
+    }
+
     fn clock(&self) -> &TestClock {
         &self.clock
     }
@@ -125,16 +137,17 @@ impl Orchestrate for FakeOrchestrator {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Fifteen, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_fifteen` and out of crate by `tests/fake_conformance.rs` (T5) — because a
-/// binding that silently ran fourteen of them would still be green.
+/// Seventeen, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_seventeen` and out of crate by `tests/fake_conformance.rs` (T5) — because
+/// a binding that silently ran sixteen of them would still be green.
 ///
 /// Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3, 5, 6, 7); four are contract lines
 /// §12 does not number but §4.2 states outright; one is the `finish_run` seam T1 shipped for this
 /// walk to use; three are the cells of §4.2's gate table nothing else reaches — plan D4's automatic
 /// loop entry and both halves of `on_failure` — which D4 predicted would go unexecuted in a
-/// manual-mode milestone and did; the last is plan D5's intermediate position, which had a topology
-/// digest pinning it and no walk executing it.
+/// manual-mode milestone and did; one is plan D5's intermediate position, which had a topology
+/// digest pinning it and no walk executing it; the last two are milestone 3's, and are the settle's
+/// two readings of a `verify_command` that ran (`fail`) and one that could not (`unavailable`).
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -170,6 +183,12 @@ pub const CASES: &[&str] = &[
     // Plan D5's intermediate position (`:721-722`): a phase between `implement` and `review` is
     // retired with the chain and re-run at its own `attempt + 1`.
     "an_intermediate_position_is_retired_by_the_loop",
+    // `:437-443` and plan D30: a `verify_command` that exits non-zero settles the step `failed`,
+    // and the `command_run` row it is recorded in is `done` — the command ran.
+    "verify_fail_settles_failed",
+    // `:443`: `unavailable` never fails a step, and its `command_run` row is `failed` — the
+    // command did not run. Both facts are one report and they disagree on purpose.
+    "verify_unavailable_never_fails",
 ];
 
 /// Run one case by name.
@@ -206,6 +225,8 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
         "an_intermediate_position_is_retired_by_the_loop" => {
             an_intermediate_position_is_retired_by_the_loop(harness).await;
         }
+        "verify_fail_settles_failed" => verify_fail_settles_failed(harness).await,
+        "verify_unavailable_never_fails" => verify_unavailable_never_fails(harness).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -579,6 +600,17 @@ async fn approve<O: Orchestrate>(orch: &O, run: RunId, times: usize) -> Rest {
         rest = Some(answer(orch, run, GateAnswer::Approved).await.1);
     }
     rest.expect("a case never approves zero times")
+}
+
+/// The step's `command_run` rows, in `(queued_at, id)` order (T1's `WriteStore::command_runs`).
+///
+/// # Panics
+/// Never: `MemStore` fails no read.
+async fn command_runs_of<O: Orchestrate>(orch: &O, step: StepId) -> Vec<CommandRun> {
+    orch.store()
+        .command_runs(step)
+        .await
+        .expect("MemStore never fails a read")
 }
 
 /// The step at `(position, attempt)`, fan-out index 0.
@@ -1729,6 +1761,106 @@ async fn an_intermediate_position_is_retired_by_the_loop<H: CaseHarness>(harness
     assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Done);
 }
 
+/// ANA-2 `:437-443` through plan D30's verifier: a `verify_command` that exits non-zero settles
+/// the step `failed`, and under a `never` gate with no retry budget that fails the run.
+///
+/// The two columns and the row are asserted together because they are three different claims: the
+/// step's `verify_outcome`/`verify_exit_code` are what §4.2's settle reads, and the `command_run`
+/// row is where the output lives for milestone 4's `verify_failure` prompt section (plan D32). The
+/// row's `status` is `done` and not `failed` — the command *ran*, and produced a verdict.
+async fn verify_fail_settles_failed<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::Never;
+            phase.retry_limit = 0;
+            phase.verify_command = Some("cargo test".to_owned());
+        }
+    })
+    .await;
+    orch.verifier().script_report(FakeVerifier::fail(1));
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::Failed, Some(0)),
+        "a `never` gate with no budget ends the run on the failed settle"
+    );
+    assert_eq!(
+        run_of(&orch, run).await.failure.as_deref(),
+        Some("verify_outcome: fail"),
+        "`StepFailure::VerifyFailed` has no plan D12 word, so its own sentence is the run's"
+    );
+
+    let steps = steps_of(&orch, run).await;
+    let step = at(&steps, 0, 1);
+    assert_eq!(
+        (step.status, step.verify_outcome, step.verify_exit_code),
+        (StepStatus::Failed, Some(VerifyOutcome::Fail), Some(1)),
+        "both columns stop being hard-coded `None` this milestone"
+    );
+
+    let rows = command_runs_of(&orch, step.id).await;
+    assert_eq!(rows.len(), 1, "one verify, one row: {rows:?}");
+    assert_eq!(
+        (
+            rows[0].class.as_str(),
+            rows[0].command.as_str(),
+            rows[0].status,
+            rows[0].exit_code
+        ),
+        ("verify", "cargo test", CommandRunStatus::Done, Some(1)),
+        "a command that ran and failed is a `done` row (plan D31)"
+    );
+}
+
+/// ANA-2 `:443`: `unavailable` never fails a step — and its `command_run` row is `failed`, which
+/// is the one place the two vocabularies deliberately disagree.
+///
+/// `prd` is `always`-gated in the seed, so the walk parks at position 0 either way; what this case
+/// pins is that the settle read `Ok` and not `Failed` on the way there, and that the reason a
+/// human reads is in `command_run.output`.
+async fn verify_unavailable_never_fails<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.verify_command = Some("cargo test".to_owned());
+        }
+    })
+    .await;
+    orch.verifier()
+        .script_report(FakeVerifier::unavailable("no `sh` on PATH"));
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(0), None),
+        "the `always` gate parked; nothing failed"
+    );
+
+    let steps = steps_of(&orch, run).await;
+    let step = at(&steps, 0, 1);
+    assert_eq!(
+        (step.status, step.verify_outcome, step.verify_exit_code),
+        (
+            StepStatus::AwaitingApproval,
+            Some(VerifyOutcome::Unavailable),
+            None
+        ),
+        "an `unavailable` verify has no exit code and does not fail the step"
+    );
+
+    let rows = command_runs_of(&orch, step.id).await;
+    assert_eq!(rows.len(), 1, "one verify, one row: {rows:?}");
+    assert_eq!(
+        (rows[0].status, rows[0].exit_code, rows[0].output.as_deref()),
+        (CommandRunStatus::Failed, None, Some("no `sh` on PATH")),
+        "a command that could not run is a `failed` row carrying its reason (plan D31)"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -1746,16 +1878,17 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_fifteen() {
+    fn cases_are_unique_and_seventeen() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            15,
+            17,
             "six ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam, the three \
-             gate-table cells only an edited gate reaches and plan D5's intermediate position"
+             gate-table cells only an edited gate reaches, plan D5's intermediate position and \
+             milestone 3's two verify outcomes"
         );
     }
 

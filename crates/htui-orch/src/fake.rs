@@ -27,7 +27,7 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentId, BoxId, Document, DocumentId, Isolation, Item, ItemId, NewDocument, PhaseAgent,
     PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId, RunStep, RunStepCommit,
-    RunStepTree, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, UserId,
+    RunStepTree, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
 };
 use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
 use uuid::Uuid;
@@ -35,6 +35,7 @@ use uuid::Uuid;
 use crate::command::{Command, CommandOutcome, EngineError};
 use crate::graph::GraphSource;
 use crate::isolate::{Clock, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree};
+use crate::verify::{Verifier, VerifierFuture, VerifyReport, VerifyRequest};
 
 /// The root every synthetic tree path hangs from. Nothing ever creates it.
 const FAKE_TREE_ROOT: &str = "/fake/trees";
@@ -215,6 +216,102 @@ impl Isolator for FakeIsolator {
             let _ = (run, trees);
             self.tick();
             Ok::<(), IsolateError>(())
+        })
+    }
+}
+
+/// A [`Verifier`] that spawns nothing and answers what a case queued (plan D41).
+///
+/// The three outcomes of `docs/ANA-2.md:508-515` are what stage 5 has to be able to be shown, and
+/// the only way to show them with a real [`ShellVerifier`](crate::verify::ShellVerifier) is to run
+/// a process — which the suite's determinism rules forbid. So a case queues a report and the walk
+/// consumes it.
+///
+/// **An unscripted call answers `None`**, which is not one of the three outcomes: it is "the phase
+/// named no `verify_command`", the seeded shape of every phase (`crates/htui-core/src/seed.rs`)
+/// and the reason fifteen of the seventeen cases never touch this double. A `None` report writes
+/// no `command_run` row and leaves both columns `NULL`, which is exactly what `unavailable` is
+/// **not** (T3's finding; `crate::verify`'s module doc).
+#[derive(Debug, Default)]
+pub struct FakeVerifier {
+    /// Scripted reports, FIFO, one consumed per [`run`](Verifier::run) call.
+    reports: Mutex<VecDeque<VerifyReport>>,
+    /// How many times [`run`](Verifier::run) has been called, unscripted calls included.
+    runs: Mutex<u32>,
+}
+
+impl FakeVerifier {
+    /// A fresh verifier: nothing scripted, counter at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue the report the next [`run`](Verifier::run) answers.
+    ///
+    /// **The blueprint's §7.1 signature takes `Option<VerifyReport>`** and its §7.6 case bodies
+    /// pass a bare `VerifyReport`; the two cannot both be right. The bare report wins, because
+    /// scripting `None` is indistinguishable from scripting nothing — an unscripted call already
+    /// answers `None` — so the `Option` would be a parameter with one reachable meaning.
+    pub fn script_report(&self, report: VerifyReport) {
+        self.reports
+            .lock()
+            .expect("no panic holds the fake verifier's lock")
+            .push_back(report);
+    }
+
+    /// How many times the walk asked this verifier for a report.
+    #[must_use]
+    pub fn runs(&self) -> u32 {
+        *self
+            .runs
+            .lock()
+            .expect("no panic holds the fake verifier's lock")
+    }
+
+    /// A `pass` at exit `0`, stamped at the fake driver's own origin so a report and a session row
+    /// share one timeline (the [`TestClock`] convention).
+    #[must_use]
+    pub fn pass() -> VerifyReport {
+        Self::report(VerifyOutcome::Pass, Some(0), "ok")
+    }
+
+    /// A `fail` at `code`.
+    #[must_use]
+    pub fn fail(code: i32) -> VerifyReport {
+        Self::report(VerifyOutcome::Fail, Some(code), "failed")
+    }
+
+    /// An `unavailable` carrying the reason the operator reads out of `command_run.output`.
+    #[must_use]
+    pub fn unavailable(reason: &str) -> VerifyReport {
+        Self::report(VerifyOutcome::Unavailable, None, reason)
+    }
+
+    /// The three constructors above, written once.
+    fn report(outcome: VerifyOutcome, exit_code: Option<i32>, output: &str) -> VerifyReport {
+        VerifyReport {
+            outcome,
+            exit_code,
+            output: output.to_owned(),
+            started_at: epoch(),
+            finished_at: epoch(),
+        }
+    }
+}
+
+impl Verifier for FakeVerifier {
+    fn run<'a>(&'a self, request: VerifyRequest) -> VerifierFuture<'a, Option<VerifyReport>> {
+        Box::pin(async move {
+            drop(request);
+            *self
+                .runs
+                .lock()
+                .expect("no panic holds the fake verifier's lock") += 1;
+            self.reports
+                .lock()
+                .expect("no panic holds the fake verifier's lock")
+                .pop_front()
         })
     }
 }
@@ -610,6 +707,8 @@ pub struct FakeOrchestrator {
     pub store: MemStore,
     /// The isolator, so a case can script `after_hash` values.
     pub isolator: FakeIsolator,
+    /// The verifier, so a case can script stage 5's outcome without a process (plan D41).
+    pub verifier: FakeVerifier,
     /// The clock, so a case can elapse a step deadline without sleeping.
     pub clock: TestClock,
     scripts: Mutex<BTreeMap<(String, i32), ScriptedStep>>,
@@ -640,6 +739,7 @@ impl FakeOrchestrator {
         Self {
             store,
             isolator: FakeIsolator::new(),
+            verifier: FakeVerifier::new(),
             clock: TestClock::new(),
             scripts: Mutex::new(BTreeMap::new()),
             candidates: Mutex::new(BTreeMap::new()),

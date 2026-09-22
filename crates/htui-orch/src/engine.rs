@@ -24,10 +24,10 @@ use htui_agent::event::DoneEvent;
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_agent::registry::caps_for;
 use htui_core::model::{
-    BoxId, BoxProfile, Document, Gate, GateOutcome, GraphSnapshot, Item, ItemId, NewNote, NewRun,
-    NewRunStep, NoteId, Project, ProjectSettings, PromptScope, Run, RunId, RunStatus, RunStep,
-    RunStepCommit, SnapshotCandidate, SnapshotPhase, Status, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, UserId,
+    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, Gate, GateOutcome, GraphSnapshot,
+    Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectSettings,
+    PromptScope, Run, RunId, RunStatus, RunStep, RunStepCommit, SnapshotCandidate, SnapshotPhase,
+    Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
 };
 use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet};
 use htui_core::prompt::{
@@ -44,6 +44,7 @@ use crate::gate::{self, GateContext, Landing, LoopOutcome, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{Clock, Isolator};
 use crate::status::{Cursor, RunFailure, cursor, latest_at, next_attempt};
+use crate::verify::{Verifier, VerifyReport, VerifyRequest};
 
 /// The only `run_step.fanout_index` milestone 2 walks; fan-out's others are milestone 4's.
 const WALKED_FANOUT_INDEX: i32 = 0;
@@ -164,13 +165,14 @@ pub type DriverFor<'a> = &'a (dyn Fn(&SnapshotCandidate, &str, i32) -> Box<dyn A
 
 /// Everything [`Engine::new`] borrows, as a struct literal rather than a builder.
 ///
-/// A builder would let a caller forget one of thirteen fields and find out at run time; a literal
+/// A builder would let a caller forget one of fourteen fields and find out at run time; a literal
 /// cannot compile until every one of them is named.
-pub struct EngineParts<'a, S, G, I, C, A, K>
+pub struct EngineParts<'a, S, G, I, V, C, A, K>
 where
     S: WriteStore,
     G: GraphSource,
     I: Isolator + ?Sized,
+    V: Verifier + ?Sized,
     C: Clock + ?Sized,
     A: AgentSelector + ?Sized,
     K: SessionSink + ?Sized,
@@ -181,6 +183,10 @@ where
     pub graphs: &'a G,
     /// Stage 2 and stage 5's trees (plan D6).
     pub isolator: &'a I,
+    /// Stage 5's `verify_command` (plan D30, D41). Production is a `ShellVerifier` built once per
+    /// process — the `verify` class semaphore is per verifier, so one per step would serialise
+    /// nothing (blueprint H-22).
+    pub verifier: &'a V,
     /// Plan D8: the one place an instant enters the walk.
     pub clock: &'a C,
     /// Stage 1's selection.
@@ -208,11 +214,12 @@ where
 /// `Debug` is hand written for one field: a driver factory is a `dyn Fn` and `dyn Fn` is not
 /// `Debug`, while `missing_debug_implementations` is a workspace lint. The same shape
 /// `SessionSpec` uses (`crates/htui-agent/src/driver.rs:281-298`), for the same reason.
-impl<S, G, I, C, A, K> core::fmt::Debug for EngineParts<'_, S, G, I, C, A, K>
+impl<S, G, I, V, C, A, K> core::fmt::Debug for EngineParts<'_, S, G, I, V, C, A, K>
 where
     S: WriteStore,
     G: GraphSource,
     I: Isolator + ?Sized,
+    V: Verifier + ?Sized,
     C: Clock + ?Sized,
     A: AgentSelector + ?Sized,
     K: SessionSink + ?Sized,
@@ -220,6 +227,7 @@ where
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EngineParts")
             .field("isolator", &self.isolator)
+            .field("verifier", &self.verifier)
             .field("scrubber", &self.scrubber)
             .field("app", &self.app)
             .field("box_profile", &self.box_profile)
@@ -232,16 +240,17 @@ where
 
 /// ANA-2 §4.2's walk, generic over everything it touches and holding nothing between calls.
 #[derive(Debug)]
-pub struct Engine<'a, S, G, I, C, A, K>
+pub struct Engine<'a, S, G, I, V, C, A, K>
 where
     S: WriteStore,
     G: GraphSource,
     I: Isolator + ?Sized,
+    V: Verifier + ?Sized,
     C: Clock + ?Sized,
     A: AgentSelector + ?Sized,
     K: SessionSink + ?Sized,
 {
-    parts: EngineParts<'a, S, G, I, C, A, K>,
+    parts: EngineParts<'a, S, G, I, V, C, A, K>,
 }
 
 /// What [`Engine::resume`] found (ANA-2 §12 criterion 3, `docs/ANA-2.md:2090`).
@@ -266,18 +275,19 @@ pub enum Resume {
     },
 }
 
-impl<'a, S, G, I, C, A, K> Engine<'a, S, G, I, C, A, K>
+impl<'a, S, G, I, V, C, A, K> Engine<'a, S, G, I, V, C, A, K>
 where
     S: WriteStore,
     G: GraphSource,
     I: Isolator + ?Sized,
+    V: Verifier + ?Sized,
     C: Clock + ?Sized,
     A: AgentSelector + ?Sized,
     K: SessionSink + ?Sized,
 {
     /// The walk over one set of borrowed parts.
     #[must_use]
-    pub const fn new(parts: EngineParts<'a, S, G, I, C, A, K>) -> Self {
+    pub const fn new(parts: EngineParts<'a, S, G, I, V, C, A, K>) -> Self {
         Self { parts }
     }
 
@@ -831,12 +841,26 @@ where
             .await?;
 
         // -- stage 4: session -----------------------------------------------------------------
+        let session_cwd = prepared.cwd.clone();
         let (result, cap_breach) = self
             .session(run, step, phase, &prompt, prepared.cwd)
             .await?;
         if let Ok(done) = &result {
             self.parts.sink.after_done(item, step, phase, done).await?;
         }
+
+        // -- between stage 4 and stage 5: verify (plan D30, blueprint A-3) ---------------------
+        let verify = self
+            .verify(VerifyStage {
+                run,
+                step,
+                phase,
+                trees: &trees,
+                started_at,
+                session_cwd: &session_cwd,
+                result: &result,
+            })
+            .await?;
 
         // -- stage 5: settle ------------------------------------------------------------------
         let after = self.parts.isolator.capture(step.id, &trees).await?;
@@ -850,9 +874,7 @@ where
             now,
             deadline_seconds: phase.deadline_seconds,
             output: output.as_ref(),
-            // `verify.rs` is milestone 3's and every seeded phase has `verify_command: None`
-            // (`crates/htui-core/src/seed.rs:233`), so this column is never written here.
-            verify_outcome: None,
+            verify_outcome: verify.as_ref().map(|report| report.outcome),
             is_review: phase.name == REVIEW_PHASE,
         });
         self.parts
@@ -866,8 +888,10 @@ where
                     // the usage, `set_step_prompt` wrote the trim record.
                     usage: None,
                     trim_record: None,
-                    verify_outcome: None,
-                    verify_exit_code: None,
+                    // `None` leaves these two columns as well, which is what a phase with no
+                    // `verify_command` owes: `NULL`, and not `unavailable`.
+                    verify_outcome: verify.as_ref().map(|report| report.outcome),
+                    verify_exit_code: verify.as_ref().and_then(|report| report.exit_code),
                     finished_at: now,
                 },
             )
@@ -884,6 +908,109 @@ where
             }
             Landing::Rest(rest) => Ok(Some(rest)),
         }
+    }
+
+    /// `verify_command`, between the session and the settle (`docs/ANA-2.md:491-493`, plan D30).
+    ///
+    /// **It runs only when the session produced a `Done`** (blueprint A-3). A crashed session is
+    /// already `Failed` by settle's first rule, so spending a `cargo test` on a tree the agent
+    /// never finished editing records nothing a human wants and delays the failure; on that path
+    /// both columns stay `NULL` and no `command_run` row is written, which `run_step.verify_outcome
+    /// IS NULL` tells apart from `unavailable`.
+    ///
+    /// The three outcomes differ only in what they are *recorded as*. `pass` and `fail` are both
+    /// `CommandRunStatus::Done` — the command ran, and `run_step.verify_outcome` is where the two
+    /// are told apart — while `unavailable` is `CommandRunStatus::Failed`, the row behind a command
+    /// that never ran (`:515`). A `fail` is the only one that moves the settle
+    /// (`crate::gate::settle`); `unavailable` never fails a step (`:443`).
+    ///
+    /// `None` — the phase named no command — writes nothing at all. That is the seeded shape of
+    /// every phase and it is **not** `unavailable`.
+    async fn verify(&self, stage: VerifyStage<'_>) -> Result<Option<VerifyReport>, EngineError> {
+        let VerifyStage {
+            run,
+            step,
+            phase,
+            trees,
+            started_at,
+            session_cwd,
+            result,
+        } = stage;
+        if result.is_err() {
+            return Ok(None);
+        }
+        // The primary repo's tree, which is the one ANA-2 `:491-493` names. `repos` is read here
+        // rather than carried down the frame because `is_primary` is a property of the repo row
+        // and `RunStepTree` carries only the id (blueprint §7.2).
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let primary = trees.iter().find(|tree| {
+            repos
+                .iter()
+                .any(|repo| repo.id == tree.repo_id && repo.is_primary)
+        });
+
+        let report = self
+            .parts
+            .verifier
+            .run(VerifyRequest {
+                command: phase.verify_command.clone(),
+                cwd: primary.map(|tree| std::path::PathBuf::from(&tree.path)),
+                remaining: Self::remaining(phase, started_at, self.now()),
+                step: step.id,
+            })
+            .await;
+        let Some(report) = report else {
+            return Ok(None);
+        };
+
+        self.parts
+            .store
+            .record_command_run(NewCommandRun {
+                id: CommandRunId::new(),
+                run_step_id: step.id,
+                box_id: self.parts.box_id,
+                class: crate::verify::VERIFY_CLASS.to_owned(),
+                command: phase.verify_command.clone().unwrap_or_default(),
+                // `command_run.cwd` is `NOT NULL` and an `unavailable` report for `no primary
+                // tree` has no tree to name, so the session's own directory stands in
+                // (blueprint H-23).
+                cwd: primary.map_or_else(
+                    || session_cwd.to_string_lossy().into_owned(),
+                    |tree| tree.path.clone(),
+                ),
+                status: match report.outcome {
+                    VerifyOutcome::Unavailable => CommandRunStatus::Failed,
+                    VerifyOutcome::Pass | VerifyOutcome::Fail => CommandRunStatus::Done,
+                },
+                exit_code: report.exit_code,
+                output: Some(report.output.clone()),
+                // Every instant is the report's: this milestone writes finished rows only, so the
+                // command was queued at the moment it started (plan D31, blueprint §11).
+                queued_at: report.started_at,
+                started_at: Some(report.started_at),
+                finished_at: Some(report.finished_at),
+            })
+            .await?;
+        Ok(Some(report))
+    }
+
+    /// What is left of the step deadline at the moment the verify starts (plan D30).
+    ///
+    /// `None` is "no deadline"; a deadline that has already passed is `Some(ZERO)`, which the
+    /// verifier answers `unavailable` to without spawning. A `deadline_seconds` too large for a
+    /// `TimeDelta` reads as no deadline, which is `gate::settle`'s own reading of the same column.
+    fn remaining(
+        phase: &SnapshotPhase,
+        started_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<std::time::Duration> {
+        let seconds = phase.deadline_seconds?;
+        let deadline = started_at + TimeDelta::try_seconds(i64::from(seconds))?;
+        Some(
+            (deadline - now)
+                .to_std()
+                .unwrap_or(std::time::Duration::ZERO),
+        )
     }
 
     /// `running -> failed`, then the run, with `reason` as `run.failure` (`docs/ANA-2.md:639`).
@@ -1042,8 +1169,9 @@ where
                 notes: Vec::new(),
             },
             command_queue: phase.command_queue != htui_core::model::CommandQueue::Off,
-            // Both are milestone 3's: `verify.rs` produces the first and the diff needs a real
-            // isolator to have produced an `after_hash` worth rendering.
+            // `verify_failure` and `previous_diff` are milestone 4's prompt sections (MOD-4 M3
+            // plan OQ-4/D32); their inputs — `command_run.output` and `before_hash..after_hash` —
+            // are durable since milestone 3.
             verify_failure: None,
             previous_diff: None,
             judge: None,
@@ -1389,6 +1517,28 @@ where
     }
 }
 
+/// Everything [`Engine::verify`] reads, as a struct rather than seven arguments.
+///
+/// [`crate::gate::SettleInput`]'s own reason, one stage earlier: the order the checks happen in is
+/// stated once, in the function, and the call site names what it is handing over.
+#[derive(Debug)]
+struct VerifyStage<'a> {
+    /// The run, for `project_id` — `repos` is what says which tree is the primary's.
+    run: &'a Run,
+    /// The step the report belongs to (`command_run.run_step_id`).
+    step: &'a RunStep,
+    /// The phase, for `verify_command` and `deadline_seconds`.
+    phase: &'a SnapshotPhase,
+    /// Stage 2's rows, in scope order.
+    trees: &'a [htui_core::model::RunStepTree],
+    /// `run_step.started_at`, which is where the deadline's remainder is measured from.
+    started_at: DateTime<Utc>,
+    /// Stage 2's `cwd`, the `command_run.cwd` fallback when there is no primary tree (H-23).
+    session_cwd: &'a std::path::Path,
+    /// Stage 4's answer: a verify runs only on `Ok` (blueprint A-3).
+    result: &'a Result<DoneEvent, htui_agent::error::DriverError>,
+}
+
 /// Which of a phase's `input_kinds` are **required** (blueprint H-8, plan D21).
 ///
 /// A kind is required unless a **later** position of the same snapshot produces it. The seeded
@@ -1442,7 +1592,7 @@ pub fn truncated(now: DateTime<Utc>) -> DateTime<Utc> {
 /// rather than in `fake.rs` for the reason the file itself gives: every part is already public on
 /// the orchestrator, and what was missing was `engine.rs`. Putting it beside the `Engine` keeps
 /// `fake.rs` exactly as T3 shipped it, and lets `conformance.rs`'s `impl Orchestrate for
-/// FakeOrchestrator` call one function instead of re-deciding thirteen fields per case.
+/// FakeOrchestrator` call one function instead of re-deciding fourteen fields per case.
 ///
 /// A fresh `Engine` per command is not a concession to the test: the engine holds nothing across a
 /// call (plan D16), so this is the shape milestone 6's Runs tab has too.
@@ -1479,7 +1629,7 @@ pub async fn resume_fake(
     engine.resume(run).await
 }
 
-/// The thirteen fields, filled from the harness.
+/// The fourteen fields, filled from the harness.
 ///
 /// `app` is read here rather than cached because `MemStore::set_app_setting` (`mem.rs:430`) is the
 /// only writer a case can reach for `step_deadline_seconds` — `SettingKey` is a closed enum of ten
@@ -1497,6 +1647,7 @@ async fn fake_parts<'a>(
         htui_core::store::MemStore,
         crate::fake::FakeGraphSource<'a>,
         crate::fake::FakeIsolator,
+        crate::fake::FakeVerifier,
         crate::fake::TestClock,
         FirstCandidate,
         crate::fake::FakeOrchestrator,
@@ -1516,6 +1667,7 @@ async fn fake_parts<'a>(
         store: &orch.store,
         graphs,
         isolator: &orch.isolator,
+        verifier: &orch.verifier,
         clock: &orch.clock,
         selector: &FirstCandidate,
         sink: orch,
