@@ -654,7 +654,30 @@ pub async fn review_loop<S: WriteStore, C: Clock + ?Sized>(
             .await?;
         return Ok(LoopOutcome::NoTarget);
     };
-    let impl_phase = &ctx.snapshot.phases[usize::try_from(target).unwrap_or(0)];
+    // By `position`, never by index. [`loop_target`] promises a phase whose `position` is `target`
+    // and says nothing about where in the array it sits, and density is manufactured by
+    // `graph::resolve`'s renumbering alone: `ck_run_graph_snapshot` checks non-null, `NewRun` takes
+    // the blob as given, and milestone 5's sweep adopts runs this process did not mint. Read
+    // positionally, a snapshot with a hole in it indexes past the array — a panic, not a refusal —
+    // and an unsorted one silently reads a different phase's `retry_limit` and name. This is
+    // `Engine::phase_at`'s lookup, written out because that one is `engine.rs`'s private associated
+    // function and reaching it from here would mean naming the whole generic `Engine`.
+    let Some(impl_phase) = ctx
+        .snapshot
+        .phases
+        .iter()
+        .find(|phase| phase.position == target)
+    else {
+        ctx.store
+            .finish_run(
+                ctx.run.id,
+                RunStatus::Failed,
+                Some(&RunFailure::NoLoopTarget.to_string()),
+                now,
+            )
+            .await?;
+        return Ok(LoopOutcome::NoTarget);
+    };
 
     let steps = ctx.store.run_steps(ctx.run.id).await?;
     let Some(attempt) = latest_at(&steps, target).map(|step| step.attempt) else {
