@@ -23,6 +23,7 @@ use htui_core::model::{
     Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId, TIMESTAMPTZ_DIGITS,
 };
 
+pub mod copy;
 pub mod git;
 
 /// The boxed future every [`Isolator`] method returns.
