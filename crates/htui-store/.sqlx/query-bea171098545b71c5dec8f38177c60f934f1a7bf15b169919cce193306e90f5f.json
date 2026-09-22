@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT isolation_path, updated_at FROM run_step WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "isolation_path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "isolation_path"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "bea171098545b71c5dec8f38177c60f934f1a7bf15b169919cce193306e90f5f"
+}

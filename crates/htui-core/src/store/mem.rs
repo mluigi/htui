@@ -3630,15 +3630,50 @@ impl State {
         Ok(())
     }
 
-    /// `run_step_tree` upserted on `(run_step_id, repo_id)` (ANA-2 §4.6).
-    fn upsert_step_tree(&mut self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+    /// `run_step_tree` upserted on `(run_step_id, repo_id)` (ANA-2 §4.6), and the one column of
+    /// `run_step` the batch also speaks for: `isolation_path` (ANA-2 `:903`, plan D33).
+    ///
+    /// `run_step_tree` holds a path per repository and `run_step.isolation_path` holds one path,
+    /// so the batch has to choose which of its trees the step *is*. The primary repo's, else the
+    /// lowest `repo_id`'s — which is the order [`State::step_tree_rows`] answers in, so the chosen
+    /// row is the first one a reader sees. The rule is spelled as one sort key,
+    /// `(not primary, repo_id)`, rather than a `find` with a fallback, so that a project carrying
+    /// two primaries — which the schema permits — still resolves the same way here and on
+    /// Postgres instead of to whichever row the caller happened to list first.
+    ///
+    /// An empty batch names no tree and leaves the column alone rather than clearing it:
+    /// `upsert_step_tree(step, &[])` is the "check the step, write nothing" call, and clearing
+    /// would make it a write.
+    fn upsert_step_tree(
+        &mut self,
+        step: StepId,
+        trees: &[RunStepTree],
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         self.check_step_batch(
             "run_step_tree",
             step,
             trees.iter().map(|row| (row.run_step_id, row.repo_id)),
         )?;
+        let chosen = trees
+            .iter()
+            .min_by_key(|row| {
+                let primary = self
+                    .repos
+                    .get(&row.repo_id)
+                    .is_some_and(|repo| repo.is_primary);
+                (!primary, row.repo_id)
+            })
+            .map(|row| row.path.clone());
         for row in trees {
             self.step_trees.insert((step, row.repo_id), row.clone());
+        }
+        if let Some(path) = chosen {
+            // `require_step` above already proved the row is here.
+            if let Some(row) = self.steps.get_mut(&step) {
+                row.isolation_path = Some(path);
+                row.updated_at = now;
+            }
         }
         Ok(())
     }
@@ -4496,7 +4531,8 @@ impl WriteStore for MemStore {
     }
 
     async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
-        self.write(|state| state.upsert_step_tree(step, trees))
+        let now = Utc::now();
+        self.write(|state| state.upsert_step_tree(step, trees, now))
     }
 
     async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {

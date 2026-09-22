@@ -3181,6 +3181,16 @@ impl WriteStore for PgStore {
     ///
     /// An empty slice still runs the existence check and writes nothing.
     ///
+    /// The transaction also writes `run_step.isolation_path` (ANA-2 `:903`, plan D33), because a
+    /// step has many trees and one isolation path and this is the only call that sees both. The
+    /// batch's primary repo wins, else its lowest `repo_id`; the `is_primary` flag is read inside
+    /// the same transaction, so a repo promoted concurrently cannot change the answer halfway
+    /// through. An empty batch names no tree and the `UPDATE` is skipped, which is what keeps
+    /// `upsert_step_tree(step, &[])` a check rather than a write.
+    ///
+    /// `updated_at` is the `trg_run_step_updated_at` trigger's (`0001_init.sql:574-580`); no write
+    /// path sets it by hand, because the §4.4 cache cursor rides on it.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
@@ -3218,6 +3228,35 @@ impl WriteStore for PgStore {
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
+        }
+
+        // `run_step.isolation_path` (plan D33). The batch's primary repo wins, else its lowest
+        // `repo_id`; both halves of that rule are one sort key, `(not primary, repo_id)`, so a
+        // project carrying two primaries - which the schema permits - resolves the same way here
+        // as it does on `MemStore` rather than to whichever row the caller listed first.
+        if !trees.is_empty() {
+            let repo_ids: Vec<Uuid> = trees.iter().map(|row| row.repo_id.as_uuid()).collect();
+            let primaries = sqlx::query_scalar!(
+                "SELECT id FROM repo WHERE id = ANY($1) AND is_primary",
+                &repo_ids,
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+
+            if let Some(row) = trees
+                .iter()
+                .min_by_key(|row| (!primaries.contains(&row.repo_id.as_uuid()), row.repo_id))
+            {
+                sqlx::query!(
+                    "UPDATE run_step SET isolation_path = $2 WHERE id = $1",
+                    step.as_uuid(),
+                    row.path,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            }
         }
 
         tx.commit().await.map_err(map_sqlx)

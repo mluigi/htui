@@ -3593,3 +3593,103 @@ async fn command_run_round_trips_and_orders_by_queued_at() {
 
     db.drop_db().await;
 }
+
+/// Plan D33's column, read as a column rather than through the projection that carries it.
+///
+/// `store::conformance`'s `trees_and_commits_round_trip` asserts `run_step.isolation_path` through
+/// `run_steps`, which is a `SELECT` this crate also owns: a batch that wrote the wrong path and a
+/// projection that read the wrong column would agree with each other. This reads the column
+/// directly, and it reads `updated_at` either side of the write - the one thing the seam cannot
+/// show, because nothing sets it by hand. `trg_run_step_updated_at` (`0001_init.sql:574-580`) is
+/// what has to move it, and the §4.4 cache cursor rides on its doing so.
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_step_tree_writes_the_primary_isolation_path() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    let repo = async |name: &str, is_primary: bool| -> RepoId {
+        db.store
+            .create_repo(NewRepo {
+                id: RepoId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: name.to_owned(),
+                default_branch: "main".to_owned(),
+                is_primary,
+                remote_url: None,
+            })
+            .await
+            .expect("the repo lands")
+            .id
+    };
+    let core = repo("core", true).await;
+    let docs = repo("docs", false).await;
+
+    let column = async || -> (Option<String>, DateTime<Utc>) {
+        let row = sqlx::query!(
+            "SELECT isolation_path, updated_at FROM run_step WHERE id = $1",
+            ids::STEP_R2_PRD.as_uuid(),
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("the fixture step exists");
+        (row.isolation_path, row.updated_at)
+    };
+
+    let (before, stamped_before) = column().await;
+    assert_eq!(before, None, "nothing has written the column yet");
+
+    let tree = |repo_id: RepoId, path: &str| RunStepTree {
+        run_step_id: ids::STEP_R2_PRD,
+        repo_id,
+        mode: Isolation::Worktree,
+        path: path.to_owned(),
+        base_ref: "main".to_owned(),
+        dirty: false,
+    };
+    // `docs` first, so batch order and the rule disagree.
+    db.store
+        .upsert_step_tree(
+            ids::STEP_R2_PRD,
+            &[
+                tree(docs, "/srv/trees/prd/docs"),
+                tree(core, "/srv/trees/prd/core"),
+            ],
+        )
+        .await
+        .expect("the two-row batch lands");
+
+    let (after, stamped_after) = column().await;
+    assert_eq!(
+        after.as_deref(),
+        Some("/srv/trees/prd/core"),
+        "the primary repo's path is the step's, whatever order the batch listed"
+    );
+    assert!(
+        stamped_after > stamped_before,
+        "the `UPDATE` fired `trg_run_step_updated_at`, which is what the cache cursor rides on"
+    );
+
+    // A batch with no primary in it falls back to the lowest `repo_id`, which is a batch of one.
+    db.store
+        .upsert_step_tree(ids::STEP_R2_PRD, &[tree(docs, "/srv/trees/prd/docs")])
+        .await
+        .expect("the one-row batch lands");
+    assert_eq!(
+        column().await.0.as_deref(),
+        Some("/srv/trees/prd/docs"),
+        "a batch with no primary chooses its lowest `repo_id`"
+    );
+
+    db.store
+        .upsert_step_tree(ids::STEP_R2_PRD, &[])
+        .await
+        .expect("the empty batch is a check, not a write");
+    assert_eq!(
+        column().await.0.as_deref(),
+        Some("/srv/trees/prd/docs"),
+        "an empty batch names no tree, so it leaves the column alone"
+    );
+
+    db.drop_db().await;
+}

@@ -842,6 +842,12 @@ pub trait WriteStore: ReadStore {
     /// Upserts `run_step_tree` rows on the table's `(run_step_id, repo_id)` key; an empty slice
     /// checks the step and writes nothing.
     ///
+    /// Also writes `run_step.isolation_path` (ANA-2 `:903`, plan D33): the `path` of the batch's
+    /// row whose repo `is_primary`, else of its lowest `repo_id` — the order
+    /// [`step_trees`](ReadStore::step_trees) answers in. An empty batch names no tree, so the
+    /// column is left as it was rather than cleared. One step has many trees and one
+    /// `isolation_path`, and this is where that choice is made, so the two can never disagree.
+    ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a row's

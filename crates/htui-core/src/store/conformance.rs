@@ -4994,6 +4994,15 @@ async fn select_fanout_is_one_transaction<S: WriteStore>(store: &S) {
 /// MOD-4 (plan D12). The `MemStore` twin is
 /// `mem.rs::trees_and_commits_upsert_on_their_repo_key_and_the_delete_counts_them`; the cascade
 /// itself is `pg_criteria.rs::step_tree_rows_cascade_with_their_step` on Postgres.
+///
+/// The same call also writes `run_step.isolation_path` (ANA-2 `:903`, plan D33), which is why the
+/// two repos here are given paths that differ: the column carries **one** path, so the batch has
+/// to choose, and a fixture where both rows say the same thing would pass whichever choice the
+/// store made. The rule is the primary repo's path, else the lowest `repo_id`'s — the order
+/// `step_trees` answers in — and an empty batch leaves the column alone. Read here through
+/// `run_steps`, which is the only projection that carries it; the column itself, and the
+/// `updated_at` trigger the write has to fire, are
+/// `pg_criteria.rs::upsert_step_tree_writes_the_primary_isolation_path`.
 async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
     const CASE: &str = "trees_and_commits_round_trip";
     let core = store
@@ -5016,10 +5025,31 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
         run_step_id: ids::STEP_R2_PRD,
         repo_id: repo,
         mode: Isolation::Worktree,
-        path: "/srv/trees/prd".to_owned(),
+        path: format!(
+            "/srv/trees/prd/{}",
+            if repo == core { "core" } else { "docs" }
+        ),
         base_ref: "main".to_owned(),
         dirty,
     };
+    // `STEP_R2_PRD` belongs to the fixture's `RUN_2`; `run_steps` is the only read that carries
+    // `run_step.isolation_path` through the seam.
+    let isolation_path = async || -> Option<String> {
+        store
+            .run_steps(ids::RUN_2)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .find(|row| row.id == ids::STEP_R2_PRD)
+            .unwrap_or_else(|| panic!("{CASE}: RUN_2 carries STEP_R2_PRD"))
+            .isolation_path
+    };
+    assert_eq!(
+        isolation_path().await,
+        None,
+        "{CASE}: nothing has written the column yet"
+    );
+
     store
         .upsert_step_tree(ids::STEP_R2_PRD, &[tree(second, false), tree(first, false)])
         .await
@@ -5035,10 +5065,21 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
         vec![first, second],
         "{CASE}: repo_id order regardless of input order"
     );
+    assert_eq!(
+        isolation_path().await,
+        Some("/srv/trees/prd/core".to_owned()),
+        "{CASE}: `core` is the primary repo, so its path is the step's (plan D33)"
+    );
+
     store
         .upsert_step_tree(ids::STEP_R2_PRD, &[tree(first, true)])
         .await
         .expect(CASE);
+    assert_eq!(
+        isolation_path().await,
+        Some(tree(first, true).path),
+        "{CASE}: a one-row batch chooses that row, primary or not"
+    );
     let trees = store.step_trees(ids::STEP_R2_PRD).await.expect(CASE);
     assert_eq!(
         trees.len(),
@@ -5108,6 +5149,11 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
         .upsert_step_tree(ids::STEP_R2_PRD, &[])
         .await
         .expect(CASE);
+    assert_eq!(
+        isolation_path().await,
+        Some(tree(first, true).path),
+        "{CASE}: an empty batch names no tree, so it leaves the column alone (plan D33)"
+    );
 
     let commit = |repo: RepoId, after: Option<&str>| RunStepCommit {
         run_step_id: ids::STEP_R2_PRD,
