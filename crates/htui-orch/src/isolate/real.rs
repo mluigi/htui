@@ -139,8 +139,9 @@ pub struct IsolatorConfig {
 /// D43's guard table: one `tokio` mutex per `(box, repo)`, minted on first use and never removed.
 type Guards = Mutex<BTreeMap<(BoxId, RepoId), Arc<tokio::sync::Mutex<()>>>>;
 
-/// The guards a step is holding between its own `prepare` and its own `capture` (blueprint A-1).
-type Held = Mutex<BTreeMap<StepId, Vec<OwnedMutexGuard<()>>>>;
+/// The guards a step is holding between its own `prepare` and its own `capture` (blueprint A-1),
+/// keyed by the run too so the run's `cleanup` can reach a guard no row names.
+type Held = Mutex<BTreeMap<(RunId, StepId), Vec<OwnedMutexGuard<()>>>>;
 
 /// The production [`Isolator`]: four modes over `gix` reads and five `git` verbs (plan D22–D47).
 #[derive(Debug)]
@@ -155,10 +156,12 @@ pub struct GixIsolator {
     locks: Guards,
     /// Blueprint A-1: the guards a step is holding, from its `prepare` to its own `capture`.
     ///
-    /// Keyed by step and not by run because the guard is the *step*'s: every phase of a run
-    /// resolves to the project's `default_isolation` (`model/kind.rs:256`), so a guard held to the
-    /// run's `cleanup` would deadlock the second step of any multi-step `shared_serialized` run
-    /// against the first. [`cleanup`](Isolator::cleanup) releases what a crashed step left.
+    /// The guard is the *step*'s, released at its own `capture`: every phase of a run resolves to
+    /// the project's `default_isolation` (`model/kind.rs:256`), so a guard held to the run's
+    /// `cleanup` would deadlock the second step of any multi-step `shared_serialized` run against
+    /// the first. The key carries the run as well because [`cleanup`](Isolator::cleanup) must
+    /// release what a crashed step left **without** a row to name it: the engine's
+    /// `upsert_step_tree` can fail after `prepare` took the guard, and then no row exists.
     held: Held,
 }
 
@@ -287,7 +290,7 @@ impl GixIsolator {
     ///
     /// The `std` lock is released before the `tokio` one is awaited: an `.await` under a `std`
     /// guard is what `mem.rs:3-7` forbids, and here it would also deadlock the next `prepare`.
-    async fn acquire(&self, step: StepId, checkouts: &[(RepoId, RepoCheckout)]) {
+    async fn acquire(&self, run: RunId, step: StepId, checkouts: &[(RepoId, RepoCheckout)]) {
         for (repo, _) in checkouts {
             let lock = {
                 let mut locks = self
@@ -300,7 +303,7 @@ impl GixIsolator {
             self.held
                 .lock()
                 .expect("no panic holds the isolator's held guards")
-                .entry(step)
+                .entry((run, step))
                 .or_default()
                 .push(guard);
         }
@@ -308,12 +311,40 @@ impl GixIsolator {
 
     /// Drops every guard `step` is holding; a step that holds none is not an error.
     fn release(&self, step: StepId) {
-        let guards = self
+        let mut held = self
             .held
             .lock()
-            .expect("no panic holds the isolator's held guards")
-            .remove(&step);
-        drop(guards);
+            .expect("no panic holds the isolator's held guards");
+        let mut released = Vec::new();
+        held.retain(|(_, held_step), guards| {
+            if *held_step == step {
+                released.append(guards);
+                false
+            } else {
+                true
+            }
+        });
+        drop(held);
+        drop(released);
+    }
+
+    /// Drops every guard any step of `run` is holding, whether or not a row names that step.
+    fn release_run(&self, run: RunId) {
+        let mut held = self
+            .held
+            .lock()
+            .expect("no panic holds the isolator's held guards");
+        let mut released = Vec::new();
+        held.retain(|(held_run, _), guards| {
+            if *held_run == run {
+                released.append(guards);
+                false
+            } else {
+                true
+            }
+        });
+        drop(held);
+        drop(released);
     }
 
     /// `local` and `shared_serialized`: the checkout itself is the tree (plan D24, D29).
@@ -328,7 +359,7 @@ impl GixIsolator {
         mode: Isolation,
     ) -> Result<Prepared, IsolateError> {
         if mode == Isolation::SharedSerialized {
-            self.acquire(step, checkouts).await;
+            self.acquire(run, step, checkouts).await;
         }
 
         let mut trees = Vec::with_capacity(checkouts.len());
@@ -951,12 +982,16 @@ impl Isolator for GixIsolator {
                             failures.push(err);
                         }
                     }
-                    // D43: whatever the step's own `capture` never released (blueprint H-15).
-                    Isolation::SharedSerialized => self.release(tree.run_step_id),
+                    // D43's guards are released for the whole run below, rows or not.
                     // Nothing was created, so nothing is removed.
-                    Isolation::Local => {}
+                    Isolation::SharedSerialized | Isolation::Local => {}
                 }
             }
+
+            // D43: whatever a step's own `capture` never released (blueprint H-15) — including
+            // the guard of a step whose `run_step_tree` row was never written, which no loop over
+            // the rows could reach.
+            self.release_run(run);
 
             // F-Q: `prepare` made `<root>/<run>/<step>/` and no per-tree verb names it.
             let run_dir = self.config.scratch_root.join(run.to_string());
@@ -1339,6 +1374,41 @@ mod tests {
         )
         .await
         .expect("the guard was released by cleanup")
+        .expect("the next step prepares");
+    }
+
+    /// The engine's `upsert_step_tree` can fail after `prepare` took the guard, and then the run's
+    /// `cleanup` is handed no row for that step at all. Releasing by row alone would leak the guard
+    /// until restart, so `cleanup(run, _)` drops every guard of the run whatever the rows say.
+    #[tokio::test]
+    async fn cleanup_releases_a_guard_whose_step_has_no_row() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (id, checkout, _) = repo(dir.path(), "core", true);
+        let isolator = GixIsolator::new(config(&dir.path().join("trees"), &[(id, checkout)]))
+            .expect("the config validates");
+
+        let run = RunId::new();
+        isolator
+            .prepare(run, StepId::new(), &[id], Isolation::SharedSerialized)
+            .await
+            .expect("the step prepared, and its row was never written");
+
+        isolator
+            .cleanup(run, &[])
+            .await
+            .expect("the run cleans up with no rows");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            isolator.prepare(
+                RunId::new(),
+                StepId::new(),
+                &[id],
+                Isolation::SharedSerialized,
+            ),
+        )
+        .await
+        .expect("the run's cleanup released the rowless guard")
         .expect("the next step prepares");
     }
 
