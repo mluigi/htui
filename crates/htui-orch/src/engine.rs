@@ -42,7 +42,7 @@ use uuid::Uuid;
 use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 use crate::gate::{self, GateContext, Landing, LoopOutcome, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
-use crate::isolate::{Clock, Isolator, Prepared};
+use crate::isolate::{Clock, Isolator};
 use crate::status::{Cursor, RunFailure, cursor, latest_at, next_attempt};
 
 /// The only `run_step.fanout_index` milestone 2 walks; fan-out's others are milestone 4's.
@@ -831,7 +831,9 @@ where
             .await?;
 
         // -- stage 4: session -----------------------------------------------------------------
-        let (result, cap_breach) = self.session(run, step, phase, &prompt).await?;
+        let (result, cap_breach) = self
+            .session(run, step, phase, &prompt, prepared.cwd)
+            .await?;
         if let Ok(done) = &result {
             self.parts.sink.after_done(item, step, phase, done).await?;
         }
@@ -1063,12 +1065,19 @@ where
     /// A closed stream is a [`htui_agent::error::DriverError`] and not a `done`
     /// (`crates/htui-agent/src/record.rs:1689-1691`), which is what makes settle's first rule
     /// reachable at all.
+    ///
+    /// `cwd` is stage 2's, handed down the call frame rather than asked for again: `prepare` is
+    /// not idempotent by contract (`crate::isolate::Isolator::prepare` promises nothing of the
+    /// kind) and milestone 3's `gix` layer will do real work on every call, so a second one per
+    /// step is a second set of trees and a second `before_hash`. Plan D16 forbids state held
+    /// *across* calls; a parameter inside one is not that.
     async fn session(
         &self,
         run: &Run,
         step: &RunStep,
         phase: &SnapshotPhase,
         prompt: &AssembledPrompt,
+        cwd: std::path::PathBuf,
     ) -> Result<
         (
             Result<DoneEvent, htui_agent::error::DriverError>,
@@ -1084,7 +1093,7 @@ where
         let spec = SessionSpec {
             agent_id: candidate.agent_id,
             step_id: step.id,
-            cwd: self.cwd_of(run, step).await?,
+            cwd,
             extra_dirs: Vec::new(),
             // `R-SEC-2`: ANA-7 resolves secrets and milestone 6 wires them; the walk invents none.
             env: BTreeMap::new(),
@@ -1260,21 +1269,6 @@ where
                 .or_else(|| named.map(|candidate| candidate.model.clone()))
                 .unwrap_or_default(),
         })
-    }
-
-    /// The session's working directory, re-derived from the step's own trees.
-    ///
-    /// `prepare` is idempotent on the tree rows but its `Prepared::cwd` is not persisted, so the
-    /// directory is asked for again rather than carried — which is plan D16 applied to a value
-    /// that looks harmless to cache and would be the first piece of cross-call state.
-    async fn cwd_of(&self, run: &Run, step: &RunStep) -> Result<std::path::PathBuf, EngineError> {
-        let phase = Self::phase_at(&Self::snapshot_of(run)?, step.position)?;
-        let Prepared { cwd, .. } = self
-            .parts
-            .isolator
-            .prepare(run.id, step.id, &run.repo_scope, phase.isolation)
-            .await?;
-        Ok(cwd)
     }
 
     /// The document of `phase.output_kind` produced by **this step**, at its highest version.
@@ -2461,6 +2455,48 @@ mod tests {
                 .expect("the walk created the run with a snapshot"),
         )
         .expect("the engine wrote a `GraphSnapshot`")
+    }
+
+    /// One `prepare` per step, and not two.
+    ///
+    /// `Isolator::prepare` promises no idempotence (`crate::isolate::Isolator::prepare`) and
+    /// `FakeIsolator` mints a fresh `before_hash` on every call, so a second one inside a single
+    /// step is a second, *different* base for the same tree — and milestone 3's `gix` layer will
+    /// do real work twice. The step's `cwd` is a value stage 2 already computed; carrying it
+    /// through one call frame is not the cross-restart state plan D16 forbids.
+    #[tokio::test]
+    async fn a_walk_prepares_each_step_exactly_once() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        assert_eq!(
+            harness.orch.isolator.prepares(),
+            1,
+            "one step has been walked"
+        );
+
+        for _ in 0..4 {
+            let steps = harness.orch.steps(run).await;
+            let step = steps
+                .iter()
+                .find(|step| step.status == StepStatus::AwaitingApproval)
+                .expect("a parked step");
+            harness
+                .dispatch(Command::AnswerGate {
+                    run,
+                    step: step.id,
+                    answer: GateAnswer::Approved,
+                })
+                .await
+                .expect("the artefact is there");
+        }
+
+        assert_eq!(harness.orch.run(run).await.status, RunStatus::Done);
+        assert_eq!(harness.orch.steps(run).await.len(), 4);
+        assert_eq!(
+            harness.orch.isolator.prepares(),
+            4,
+            "four steps, four `prepare` calls"
+        );
     }
 
     /// ANA-2 `:639`: an error between the `pending -> running` move and the settle is an
