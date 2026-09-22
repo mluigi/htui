@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use htui_core::model::{BoxId, Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId};
 use tokio::sync::OwnedMutexGuard;
 
+use super::copy;
 use super::git::{self, Cli};
 use super::{IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree};
 
@@ -78,6 +79,15 @@ pub fn stale_worktree(path: &Path) -> String {
         "stale worktree entry {}; run `git worktree prune` yourself",
         path.display()
     )
+}
+
+/// Blueprint H-4 for the `copy` mode: the tree a row names is not there any more.
+///
+/// A copy is never removed before the run is terminal, so — unlike a `worktree` row, whose branch
+/// survives every removal and answers for it — there is nothing left to read the step's work from.
+#[must_use]
+pub fn copy_tree_vanished(path: &Path) -> String {
+    format!("the copy at {} is gone", path.display())
 }
 
 /// `<root>/<run_id>/<step_id>/`: the common parent of a step's trees and the `cwd` of its session
@@ -468,6 +478,108 @@ impl GixIsolator {
         Ok(source_head.to_owned())
     }
 
+    /// `copy` (plan D35, D47; blueprint A-2): a whole filesystem copy of the checkout per
+    /// repository, reset to the source's `HEAD` and labelled with the base it was taken from.
+    async fn prepare_copy(
+        &self,
+        run: RunId,
+        step: StepId,
+        checkouts: &[(RepoId, RepoCheckout)],
+    ) -> Result<Prepared, IsolateError> {
+        let git = self.cli()?.clone();
+        let cwd = session_dir(&self.config.scratch_root, run, step);
+        std::fs::create_dir_all(&cwd)?;
+        let branch = format!("htui/{step}");
+        let excludes = copy::excludes(&self.config.copy_exclude);
+
+        let mut trees = Vec::with_capacity(checkouts.len());
+        for (repo, checkout) in checkouts {
+            // Blueprint §6.3's order: D35's two `.git` refusals answer before anything is
+            // measured and before the reuse branch is even consulted.
+            let source = checkout.local_path.clone();
+            blocking(move || copy::check_source(&source)).await?;
+            let source_head = self.head_of(checkout).await?;
+            let path = cwd.join(&checkout.name);
+            let before = self
+                .copy_at(&git, checkout, &path, &branch, &source_head, &excludes)
+                .await?;
+            trees.push(PreparedTree {
+                tree: RunStepTree {
+                    run_step_id: step,
+                    repo_id: *repo,
+                    mode: Isolation::Copy,
+                    path: path.to_string_lossy().into_owned(),
+                    base_ref: before.clone(),
+                    dirty: false,
+                },
+                before_hash: before,
+            });
+        }
+        Ok(Prepared {
+            trees,
+            cwd,
+            extra_dirs: Vec::new(),
+        })
+    }
+
+    /// The copy at `path`, made or found, and the `before_hash` that goes with it.
+    ///
+    /// D38's reuse reads the `htui/<step>` label **inside the copy** (blueprint A-2): `copy` never
+    /// writes a ref into the source, so the label in the scratch tree is the only durable record of
+    /// the base once the agent has committed over the copy's `HEAD`.
+    ///
+    /// The order of the last four steps is this module's, and it is load-bearing (T4's third
+    /// finding): the copy is built as `<name>.partial`, then reset, then labelled, and only then
+    /// renamed. An interruption anywhere before the rename leaves nothing the reuse branch above
+    /// will look at, so the next `prepare` starts the copy again rather than handing an agent a
+    /// tree that was never reset.
+    async fn copy_at(
+        &self,
+        git: &Cli,
+        checkout: &RepoCheckout,
+        path: &Path,
+        branch: &str,
+        source_head: &str,
+        excludes: &[copy::Exclude],
+    ) -> Result<String, IsolateError> {
+        if path.exists() {
+            let (tree, name) = (path.to_path_buf(), branch.to_owned());
+            if path.join(".git").is_dir()
+                && let Some(base) = blocking(move || git::branch_target(&tree, &name)).await?
+            {
+                return Ok(base);
+            }
+            // Anything else standing where the copy goes was not finished by us — the rename is
+            // what makes a copy visible, and it runs after the label.
+            remove_directory(path)?;
+        }
+
+        let (source, owned) = (checkout.local_path.clone(), excludes.to_vec());
+        let cap = self.config.copy_max_total_bytes;
+        blocking(move || copy::measure_within_cap(&source, &owned, cap)).await?;
+
+        let (source, owned, destination) = (
+            checkout.local_path.clone(),
+            excludes.to_vec(),
+            path.to_path_buf(),
+        );
+        let partial =
+            blocking(move || copy::copy_into_partial(&source, &destination, &owned)).await?;
+
+        // D47: the reset is `git reset --hard` and nothing is composed out of `gix` primitives.
+        git::with_retry("reset --hard", || git.reset_hard(&partial, source_head)).await?;
+        let (tree, name, target) = (partial.clone(), branch.to_owned(), source_head.to_owned());
+        git::with_retry("create branch", move || {
+            let (tree, name, target) = (tree.clone(), name.clone(), target.clone());
+            async move { blocking(move || git::create_branch(&tree, &name, &target)).await }
+        })
+        .await?;
+
+        let destination = path.to_path_buf();
+        blocking(move || copy::finish_partial(&destination)).await?;
+        Ok(source_head.to_owned())
+    }
+
     /// `capture` for one row, without the guard release the caller owns.
     async fn capture_rows(
         &self,
@@ -482,9 +594,7 @@ impl GixIsolator {
                     self.capture_in_place(step, tree, &checkout).await?
                 }
                 Isolation::Worktree => self.capture_worktree(step, tree, &checkout).await?,
-                Isolation::Copy => {
-                    return Err(not_landed_yet(tree.mode));
-                }
+                Isolation::Copy => self.capture_copy(tree).await?,
             };
             commits.push(RunStepCommit {
                 run_step_id: step,
@@ -558,6 +668,20 @@ impl GixIsolator {
             git::with_retry("worktree remove", || git.remove_worktree(&local, &path)).await?;
         }
         Ok(None)
+    }
+
+    /// `capture` for a copy: its `HEAD`, and nothing else.
+    ///
+    /// Cleanup is run-terminal, so a copy is never removed at capture (D27 is the `worktree`
+    /// mode's rule alone) and a copy that is gone is a tree somebody else deleted — blueprint H-4's
+    /// refusal, because there is no branch in the source to read the answer from.
+    async fn capture_copy(&self, tree: &RunStepTree) -> Result<Option<String>, IsolateError> {
+        let path = PathBuf::from(&tree.path);
+        if !path.join(".git").is_dir() {
+            return Err(IsolateError::Refused(copy_tree_vanished(&path)));
+        }
+        let after = blocking(move || git::head(&path)).await?;
+        Ok((after != tree.base_ref).then_some(after))
     }
 
     /// `git worktree remove --force --force` for one row, through D39's retry.
@@ -666,10 +790,7 @@ impl Isolator for GixIsolator {
                 // D40: the two modes that shell out answer with the probe's own sentence before
                 // they touch a filesystem.
                 Isolation::Worktree => self.prepare_worktree(run, step, &checkouts).await,
-                Isolation::Copy => {
-                    self.cli()?;
-                    Err(not_landed_yet(isolation))
-                }
+                Isolation::Copy => self.prepare_copy(run, step, &checkouts).await,
             }
         })
     }
@@ -735,7 +856,13 @@ impl Isolator for GixIsolator {
                             failures.push(err);
                         }
                     }
-                    Isolation::Copy => failures.push(not_landed_yet(tree.mode)),
+                    // The copy is a plain directory under the scratch root; `git` knows nothing
+                    // about it, so there is nothing to tell it.
+                    Isolation::Copy => {
+                        if let Err(err) = remove_directory(Path::new(&tree.path)) {
+                            failures.push(err);
+                        }
+                    }
                     // D43: whatever the step's own `capture` never released (blueprint H-15).
                     Isolation::SharedSerialized => self.release(tree.run_step_id),
                     // Nothing was created, so nothing is removed.
@@ -1600,6 +1727,168 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == tree),
             "and is still there afterwards: nothing pruned it"
+        );
+    }
+
+    /// D35, D47 and blueprint A-2: the copy is a whole checkout, `git reset --hard` erases the
+    /// source's dirtiness inside it, and the `htui/<step>` label that records the base is written
+    /// **in the copy** — `copy` never writes a ref into the source.
+    #[tokio::test]
+    async fn copy_resets_a_dirty_source_and_labels_the_base() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        std::fs::write(core_path.join("f"), "edited\n").expect("the source is dirtied");
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let run = RunId::new();
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::Copy)
+            .await
+            .expect("the copy mode prepares");
+
+        let copy = PathBuf::from(&prepared.trees[0].tree.path);
+        assert_eq!(prepared.trees[0].before_hash, head);
+        assert!(
+            !prepared.trees[0].tree.dirty,
+            "the reset erased the source's dirtiness (the mode table)"
+        );
+        assert_eq!(copy, prepared.cwd.join("core"));
+        assert_eq!(
+            std::fs::read_to_string(copy.join("f")).expect("the copied file reads"),
+            "first\n",
+            "the copy is at the base, not at the source's edit"
+        );
+        assert_eq!(
+            crate::isolate::git::branch_target(&copy, &format!("htui/{step}"))
+                .expect("the ref store reads"),
+            Some(head.clone()),
+            "A-2: the label is inside the copy"
+        );
+        assert_eq!(
+            crate::isolate::git::branch_target(&core_path, &format!("htui/{step}"))
+                .expect("the ref store reads"),
+            None,
+            "and never in the source"
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("f")).expect("the source file reads"),
+            "edited\n",
+            "the source itself was not touched"
+        );
+
+        let after = commit_file(&copy, "g", "second\n", "two");
+        let commits = isolator
+            .capture(step, &rows(&prepared))
+            .await
+            .expect("the step captures");
+        assert_eq!(commits[0].after_hash.as_deref(), Some(&*after));
+        assert!(copy.is_dir(), "a copy is never removed at capture");
+
+        isolator
+            .cleanup(run, &rows(&prepared))
+            .await
+            .expect("the run cleans up");
+        assert!(!copy.exists(), "the copy goes at run end");
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head
+        );
+    }
+
+    /// ANA-2 `:930-932`: the tree is measured before the first byte is copied, and the refusal
+    /// names both numbers. The sentence is `copy.rs`'s own — there is no second spelling of it.
+    #[tokio::test]
+    async fn copy_refuses_over_the_cap() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let mut config = config(&dir.path().join("trees"), &[(core, core_checkout)]);
+        config.copy_max_total_bytes = 1;
+        let isolator = GixIsolator::new(config).expect("the config validates");
+
+        let err = isolator
+            .prepare(RunId::new(), StepId::new(), &[core], Isolation::Copy)
+            .await
+            .expect_err("the copy is over the cap");
+        let text = err.to_string();
+        assert!(
+            text.starts_with("isolation refused: copy would need ")
+                && text.ends_with(" bytes; cap is 1"),
+            "{text}"
+        );
+    }
+
+    /// T4's second finding and blueprint §6.3's order: the two `.git` refusals run before the
+    /// measure. A cap of one byte would refuse anything, and the sentence proves which check ran.
+    #[tokio::test]
+    async fn copy_refuses_a_source_that_is_not_a_checkout_before_it_measures() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let local_path = dir.path().join("core");
+        std::fs::create_dir_all(&local_path).expect("the directory is made");
+        std::fs::write(local_path.join("f"), "not a checkout\n").expect("the file is written");
+        let core = RepoId::new();
+        let checkout = RepoCheckout {
+            name: "core".to_owned(),
+            local_path,
+            is_primary: true,
+        };
+        let mut config = config(&dir.path().join("trees"), &[(core, checkout)]);
+        config.copy_max_total_bytes = 1;
+        let isolator = GixIsolator::new(config).expect("the config validates");
+
+        let err = isolator
+            .prepare(RunId::new(), StepId::new(), &[core], Isolation::Copy)
+            .await
+            .expect_err("a directory that is not a checkout is refused");
+        assert_eq!(err.to_string(), "isolation refused: not a git checkout");
+    }
+
+    /// D38 through A-2: a copy's base is read from the label inside it, so a second `prepare`
+    /// reuses the copy and reports the same `before_hash` even after the source moved on.
+    #[tokio::test]
+    async fn prepare_is_idempotent_for_copy() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let run = RunId::new();
+        let step = StepId::new();
+        let first = isolator
+            .prepare(run, step, &[core], Isolation::Copy)
+            .await
+            .expect("the first call prepares");
+        let copy = PathBuf::from(&first.trees[0].tree.path);
+        std::fs::write(copy.join("agent-work"), "in progress\n").expect("the agent writes");
+        commit_file(&core_path, "h", "moved\n", "the source moves on");
+
+        let second = isolator
+            .prepare(run, step, &[core], Isolation::Copy)
+            .await
+            .expect("the second call reuses");
+
+        assert_eq!(second.trees[0].before_hash, head, "the base is the label's");
+        assert_eq!(second.trees[0].tree.path, first.trees[0].tree.path);
+        assert!(
+            copy.join("agent-work").is_file(),
+            "the copy was reused, not remade"
         );
     }
 }
