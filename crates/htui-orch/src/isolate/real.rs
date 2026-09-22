@@ -857,8 +857,16 @@ impl Isolator for GixIsolator {
             let checkouts = self.resolve_scope(scope)?;
             match isolation {
                 Isolation::Local | Isolation::SharedSerialized => {
-                    self.prepare_in_place(run, step, &checkouts, isolation)
-                        .await
+                    let prepared = self
+                        .prepare_in_place(run, step, &checkouts, isolation)
+                        .await;
+                    if prepared.is_err() {
+                        // A refusal after the guard was taken has no `run_step_tree` row to its
+                        // name, so no `cleanup` would ever be handed it (blueprint A-1 releases
+                        // by row): the guard goes back here or it never goes back at all.
+                        self.release(step);
+                    }
+                    prepared
                 }
                 // D40: the two modes that shell out answer with the probe's own sentence before
                 // they touch a filesystem.
@@ -1244,6 +1252,52 @@ mod tests {
             .expect("the task did not panic")
             .expect("the second step prepares");
         assert_eq!(admitted, 1);
+    }
+
+    /// A `prepare` that refuses **after** taking D43's guard has no `run_step_tree` row to its
+    /// name, so no `cleanup` would ever be handed it: the guard has to go back where it was taken.
+    #[tokio::test]
+    async fn a_refused_shared_serialized_prepare_releases_what_it_took() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let unborn_path = dir.path().join("unborn");
+        std::fs::create_dir_all(&unborn_path).expect("the repository directory is made");
+        empty_repo(&unborn_path);
+        let unborn = RepoId::new();
+        let unborn_checkout = RepoCheckout {
+            name: "unborn".to_owned(),
+            local_path: unborn_path,
+            is_primary: false,
+        };
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (unborn, unborn_checkout)],
+        ))
+        .expect("the config validates");
+
+        let err = isolator
+            .prepare(
+                RunId::new(),
+                StepId::new(),
+                &[core, unborn],
+                Isolation::SharedSerialized,
+            )
+            .await
+            .expect_err("the unborn repository is refused");
+        assert!(err.to_string().contains("unborn HEAD"), "{err}");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            isolator.prepare(
+                RunId::new(),
+                StepId::new(),
+                &[core],
+                Isolation::SharedSerialized,
+            ),
+        )
+        .await
+        .expect("the refused step holds nothing")
+        .expect("the next step prepares");
     }
 
     /// Blueprint H-15: a step killed between `prepare` and `capture` leaves its guard behind, and
