@@ -1259,9 +1259,10 @@ pub fn head_parents(path: &Path) -> Result<Vec<String>, IsolateError> {
 ///
 /// A `gix` read (`gix-0.87.1/src/repository/revision.rs:174`); `merge_base` would answer the
 /// same question but sits behind the `revision` feature this workspace does not enable. The
-/// walk hides `ancestor` (plan D142): it yields only the commits above it, or above the point
-/// where the two lines meet, and never the history below, because it runs under the
-/// repository's admin lock. An `ancestor` this repository does not hold is not one.
+/// walk hides `ancestor` (plan D142), because it runs under the repository's admin lock: it
+/// yields only the commits above it, or above the point where the two lines meet. `gix` still
+/// reads until the two histories meet, so an `ancestor` that shares no history with
+/// `descendant` is read to its root. An `ancestor` this repository does not hold is not one.
 ///
 /// # Errors
 /// [`IsolateError::Git`] when either hash is not a hash, or the walk cannot read a commit.
@@ -1311,7 +1312,8 @@ fn ancestor_walk(
 /// another run's later merge sits on top of it, so `HEAD`'s own parents no longer name it. The
 /// walk hides `base` (plan D142): when `base` is not on the first-parent line it stops where the
 /// line meets `base`'s history, not at a root commit, because it runs under the repository's
-/// admin lock.
+/// admin lock. `gix` reads until the two histories meet, so a `base` that shares no history with
+/// `head` is still read to its root.
 ///
 /// # Errors
 /// [`IsolateError::Git`] when a hash is not a hash or a commit on the walk cannot be read.

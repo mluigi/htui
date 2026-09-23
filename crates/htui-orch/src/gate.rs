@@ -982,7 +982,7 @@ pub(crate) async fn retire_slot<S: WriteStore, C: Clock + ?Sized>(
 /// `run.failure` stays NULL: no shipped writer sets `failure` on a non-terminal run, and
 /// `finish_run` is terminal-only by plan D7. The exact wording therefore lives in the `item_note`
 /// — which is what criterion 6 asserts (`docs/ANA-2.md:2101-2102`) — and in the
-/// [`RunFailure::ReviewLoopExhausted`] the caller receives. Carried as **R-3** for milestone 5.
+/// [`RunFailure::ReviewLoopExhausted`] the caller receives. Carried as **R-3** for milestone 6 (milestone 5 left it open, blueprint R-25).
 async fn escalate<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     review: &RunStep,
