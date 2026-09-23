@@ -1109,9 +1109,7 @@ where
         {
             // D96: `gate::park`'s run and item writes, the step's having landed before the crash.
             let now = self.now();
-            self.parts
-                .store
-                .transition_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
+            self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
                 .await?;
             self.parts
                 .store
@@ -1167,9 +1165,7 @@ where
                 // M4 D48's candidate settle: the verify is recorded, not applied.
                 self.finish_recovered(step, verify, verify_exit_code, now)
                     .await?;
-                self.parts
-                    .store
-                    .transition_step(step.id, StepStatus::Running, StepStatus::Done, now)
+                self.move_step(run.id, step.id, StepStatus::Running, StepStatus::Done, now)
                     .await?;
                 Ok(None)
             }
@@ -1394,9 +1390,7 @@ where
         note: String,
     ) -> Result<Rest, EngineError> {
         let now = self.now();
-        self.parts
-            .store
-            .transition_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
+        self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
             .await?;
         if let Some(item) = run.item_id {
             self.parts
@@ -2568,9 +2562,7 @@ where
             .await?;
         match settled {
             Settle::Ok { note } => {
-                self.parts
-                    .store
-                    .transition_step(step.id, StepStatus::Running, StepStatus::Done, now)
+                self.move_step(run.id, step.id, StepStatus::Running, StepStatus::Done, now)
                     .await?;
                 if let Some(note) = note {
                     self.note(item, note, Some(step.id), now).await?;
@@ -2765,9 +2757,7 @@ where
         reason: &str,
     ) -> Result<Rest, EngineError> {
         let now = self.now();
-        self.parts
-            .store
-            .transition_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
+        self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
             .await?;
         if let Some(item) = run.item_id {
             self.parts
@@ -3403,15 +3393,14 @@ where
         failure: JudgeFailure,
     ) -> Result<Rest, EngineError> {
         let now = self.now();
-        self.parts
-            .store
-            .transition_step(
-                judge.id,
-                StepStatus::Running,
-                StepStatus::AwaitingApproval,
-                now,
-            )
-            .await?;
+        self.move_step(
+            run.id,
+            judge.id,
+            StepStatus::Running,
+            StepStatus::AwaitingApproval,
+            now,
+        )
+        .await?;
         self.parts
             .store
             .answer_gate(
@@ -3497,9 +3486,7 @@ where
     /// (`gate.rs`'s `note_step`, blueprint H-9).
     async fn park_run(&self, run: &Run, step: &RunStep, reason: &str) -> Result<Rest, EngineError> {
         let now = self.now();
-        self.parts
-            .store
-            .transition_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
+        self.move_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
             .await?;
         if let Some(item) = run.item_id {
             self.parts
@@ -3941,6 +3928,43 @@ where
                 .await?;
         }
         Ok(())
+    }
+
+    /// One step compare-and-set on the walk's path; `Ok(false)` is plan D125's
+    /// [`EngineError::StaleWrite`], and the walk writes nothing further.
+    async fn move_step(
+        &self,
+        run: RunId,
+        step: StepId,
+        from: StepStatus,
+        to: StepStatus,
+        now: DateTime<Utc>,
+    ) -> Result<(), EngineError> {
+        if self
+            .parts
+            .store
+            .transition_step(step, from, to, now)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(crate::command::stale_step(run, step, from, to))
+        }
+    }
+
+    /// [`Self::move_step`] for the run row.
+    async fn move_run(
+        &self,
+        run: RunId,
+        from: RunStatus,
+        to: RunStatus,
+        now: DateTime<Utc>,
+    ) -> Result<(), EngineError> {
+        if self.parts.store.transition_run(run, from, to, now).await? {
+            Ok(())
+        } else {
+            Err(crate::command::stale_run(run, from, to))
+        }
     }
 
     /// Where the run is, without moving it.

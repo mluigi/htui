@@ -13,12 +13,12 @@ use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::CapBreach;
 use htui_core::model::{
     BoxId, Document, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, NoteId, Run, RunStatus,
-    RunStep, SnapshotPhase, Status, StepStatus, UserId, VerifyOutcome,
+    RunStep, SnapshotPhase, Status, StepId, StepStatus, UserId, VerifyOutcome,
 };
 use htui_core::prompt::digest::{canonical, sha256_hex};
 use htui_core::store::{StoreError, WriteStore};
 
-use crate::command::{EngineError, Rest};
+use crate::command::{EngineError, Rest, stale_run, stale_step};
 use crate::isolate::Clock;
 use crate::status::{RunFailure, latest_at, may_attempt, winner_at};
 
@@ -368,8 +368,12 @@ pub enum Landing {
 /// - **fail run** — `transition_step(Running -> Failed)` then `finish_run(run, Failed, …)`, which
 ///   mirrors the item in the same transaction (plan D7).
 ///
+/// Every step and run compare-and-set honours `Ok(false)` (plan D125): the row was moved by
+/// another writer, so the answer is [`EngineError::StaleWrite`] and nothing after the refused move
+/// is written. The item moves keep plan D17's "already moved" reading.
+///
 /// # Errors
-/// Every [`EngineError`] the writes can raise.
+/// [`EngineError::StaleWrite`], and every [`EngineError`] the writes can raise.
 pub async fn apply<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: &RunStep,
@@ -386,9 +390,7 @@ pub async fn apply<S: WriteStore, C: Clock + ?Sized>(
         }
         (Gate::OnFailure | Gate::Never, Settle::Ok { note }) => {
             note_step(ctx, step, note.as_deref(), now).await?;
-            ctx.store
-                .transition_step(step.id, StepStatus::Running, StepStatus::Done, now)
-                .await?;
+            move_step(ctx, step.id, StepStatus::Running, StepStatus::Done, now).await?;
             Ok(Landing::Advance)
         }
         (Gate::OnFailure, outcome @ (Settle::Failed(_) | Settle::Rejected { .. })) => {
@@ -404,14 +406,14 @@ pub async fn apply<S: WriteStore, C: Clock + ?Sized>(
             // D4's "one routine" costs: the automatic path parks the step first, because
             // `answer_gate` is a compare-and-set on `awaiting_approval` and there is no other
             // writer that records `gate_outcome = 'rejected'` with the note.
-            ctx.store
-                .transition_step(
-                    step.id,
-                    StepStatus::Running,
-                    StepStatus::AwaitingApproval,
-                    now,
-                )
-                .await?;
+            move_step(
+                ctx,
+                step.id,
+                StepStatus::Running,
+                StepStatus::AwaitingApproval,
+                now,
+            )
+            .await?;
             ctx.store
                 .answer_gate(
                     step.id,
@@ -492,22 +494,15 @@ async fn park<S: WriteStore, C: Clock + ?Sized>(
     phase: &SnapshotPhase,
     now: DateTime<Utc>,
 ) -> Result<Landing, EngineError> {
-    ctx.store
-        .transition_step(
-            step.id,
-            StepStatus::Running,
-            StepStatus::AwaitingApproval,
-            now,
-        )
-        .await?;
-    ctx.store
-        .transition_run(
-            ctx.run.id,
-            RunStatus::Running,
-            RunStatus::AwaitingApproval,
-            now,
-        )
-        .await?;
+    move_step(
+        ctx,
+        step.id,
+        StepStatus::Running,
+        StepStatus::AwaitingApproval,
+        now,
+    )
+    .await?;
+    move_run(ctx, RunStatus::Running, RunStatus::AwaitingApproval, now).await?;
     ctx.move_item(Status::InProgress, Status::AwaitingApproval)
         .await?;
     Ok(Landing::Rest(Rest {
@@ -530,9 +525,7 @@ async fn retry_or_fail<S: WriteStore, C: Clock + ?Sized>(
     failure: &StepFailure,
     now: DateTime<Utc>,
 ) -> Result<Landing, EngineError> {
-    ctx.store
-        .transition_step(step.id, StepStatus::Running, StepStatus::Failed, now)
-        .await?;
+    move_step(ctx, step.id, StepStatus::Running, StepStatus::Failed, now).await?;
     // The successor is named rather than created: `cursor` reads a `failed` latest attempt as a
     // rest (`crate::status::cursor`), so the walk would stop here — and only stage 1 may create a
     // step, because the capability interlock has to run for every attempt (plan D6).
@@ -555,6 +548,37 @@ async fn retry_or_fail<S: WriteStore, C: Clock + ?Sized>(
         position: Some(phase.position),
         failure: failure.run_failure(),
     }))
+}
+
+/// One step compare-and-set on the walk's path. `Ok(false)` is plan D125's
+/// [`EngineError::StaleWrite`]: another writer moved the row first, and the walk writes nothing
+/// further.
+async fn move_step<S: WriteStore, C: Clock + ?Sized>(
+    ctx: &GateContext<'_, S, C>,
+    step: StepId,
+    from: StepStatus,
+    to: StepStatus,
+    now: DateTime<Utc>,
+) -> Result<(), EngineError> {
+    if ctx.store.transition_step(step, from, to, now).await? {
+        Ok(())
+    } else {
+        Err(stale_step(ctx.run.id, step, from, to))
+    }
+}
+
+/// [`move_step`] for the run row.
+async fn move_run<S: WriteStore, C: Clock + ?Sized>(
+    ctx: &GateContext<'_, S, C>,
+    from: RunStatus,
+    to: RunStatus,
+    now: DateTime<Utc>,
+) -> Result<(), EngineError> {
+    if ctx.store.transition_run(ctx.run.id, from, to, now).await? {
+        Ok(())
+    } else {
+        Err(stale_run(ctx.run.id, from, to))
+    }
 }
 
 /// Re-reads one step row after a write moved it (plan D16: nothing is remembered across a write).
@@ -880,7 +904,8 @@ async fn retire<S: WriteStore, C: Clock + ?Sized>(
 /// A position with no rows is skipped.
 ///
 /// # Errors
-/// Every [`EngineError`] `supersede_step` and `transition_step` can raise.
+/// Every [`EngineError`] `supersede_step` and `transition_step` can raise, and
+/// [`EngineError::StaleWrite`] when a `running` or `failed` row was moved first (plan D125).
 pub(crate) async fn retire_slot<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
@@ -917,9 +942,7 @@ pub(crate) async fn retire_slot<S: WriteStore, C: Clock + ?Sized>(
             // for the exclusion was that `superseded` is illegal from `failed`, and it is; the
             // conclusion it drew from that is the part this corrects.
             StepStatus::Running | StepStatus::Failed => {
-                ctx.store
-                    .transition_step(step.id, step.status, StepStatus::Cancelled, now)
-                    .await?;
+                move_step(ctx, step.id, step.status, StepStatus::Cancelled, now).await?;
             }
             StepStatus::Superseded | StepStatus::Cancelled => {}
         }
@@ -941,6 +964,11 @@ async fn escalate<S: WriteStore, C: Clock + ?Sized>(
     reason: LoopStop,
     now: DateTime<Utc>,
 ) -> Result<LoopOutcome, EngineError> {
+    // Not [`move_run`]: `tests/review_loop.rs` drives this loop over a `queued` run it never
+    // claimed and pins the escalation, so plan D125 stops short of this one move until that suite
+    // claims its run. A stale walk cannot reach it unfenced: the automatic entry's
+    // `running -> awaiting_approval` on the review step is honoured first, and the human entry
+    // runs under a lease its command took.
     ctx.store
         .transition_run(
             ctx.run.id,
