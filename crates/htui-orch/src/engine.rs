@@ -652,23 +652,31 @@ where
                 StepStatus::Failed,
             ),
         };
-        // Plan D133: `Ok(false)` is another command's answer landing between the guard and this
-        // write. Unparking now would walk on whatever gate the run is parked at by then.
-        if !self
-            .parts
-            .store
-            .answer_gate(step.id, outcome, note.clone(), now)
-            .await?
-        {
-            let stale = stale_step(run.id, step.id, StepStatus::AwaitingApproval, to);
-            return Err(self.stale_first_write(run.id, stale).await);
-        }
+        self.leased_window(run.id, async {
+            // Plan D133: `Ok(false)` is another command's answer landing between the guard and
+            // this write. Unparking now would walk on whatever gate the run is parked at by then.
+            if !self
+                .parts
+                .store
+                .answer_gate(step.id, outcome, note.clone(), now)
+                .await?
+            {
+                return Err(stale_step(
+                    run.id,
+                    step.id,
+                    StepStatus::AwaitingApproval,
+                    to,
+                ));
+            }
 
-        // Both answers unpark the run and the item first. For a rejection that is blueprint A-5's
-        // order and it is not cosmetic: `awaiting_approval -> blocked` is **illegal** for an item
-        // (`model/item.rs:54`), so an escalation that did not pass through `in_progress` first
-        // would earn `StoreError::Constraint`.
-        self.unpark(run, now).await?;
+            // Both answers unpark the run and the item first. For a rejection that is blueprint
+            // A-5's order and it is not cosmetic: `awaiting_approval -> blocked` is **illegal**
+            // for an item (`model/item.rs:54`), so an escalation that did not pass through
+            // `in_progress` first would earn `StoreError::Constraint`.
+            self.unpark(run, now).await?;
+            Ok(())
+        })
+        .await?;
 
         // Blueprint F-M: everything after the unpark writes to a `running` run, so all of it —
         // the review loop or the reconcile, not only `run_to_rest` — runs under the heartbeat.
@@ -816,42 +824,49 @@ where
         let until = self.take_lease(run.id).await?;
 
         let now = self.now();
-        match row.status {
-            // `retried -> superseded` is `answer_gate`'s own arm (`store/traits.rs:786-791`).
-            StepStatus::AwaitingApproval => {
-                // Plan D133: the step was answered between the guard and this write.
-                if !self
-                    .parts
-                    .store
-                    .answer_gate(row.id, GateOutcome::Retried, None, now)
-                    .await?
-                {
-                    let stale = stale_step(
-                        run.id,
-                        row.id,
-                        StepStatus::AwaitingApproval,
-                        StepStatus::Superseded,
-                    );
-                    return Err(self.stale_first_write(run.id, stale).await);
+        self.leased_window(run.id, async {
+            match row.status {
+                // `retried -> superseded` is `answer_gate`'s own arm (`store/traits.rs:786-791`).
+                StepStatus::AwaitingApproval => {
+                    // Plan D133: the step was answered between the guard and this write.
+                    if !self
+                        .parts
+                        .store
+                        .answer_gate(row.id, GateOutcome::Retried, None, now)
+                        .await?
+                    {
+                        return Err(stale_step(
+                            run.id,
+                            row.id,
+                            StepStatus::AwaitingApproval,
+                            StepStatus::Superseded,
+                        ));
+                    }
+                }
+                // A `failed` step is left alone: `failed` reaches only `awaiting_approval` and
+                // `cancelled` (`model/run.rs:126`), so superseding it is a `Constraint` (plan D5).
+                StepStatus::Failed => {}
+                _ => {
+                    return Err(EngineError::NotGated {
+                        step: row.id,
+                        status: row.status,
+                        expected: "awaiting_approval | failed",
+                    });
                 }
             }
-            // A `failed` step is left alone: `failed` reaches only `awaiting_approval` and
-            // `cancelled` (`model/run.rs:126`), so superseding it is a `Constraint` (plan D5).
-            StepStatus::Failed => {}
-            _ => {
-                return Err(EngineError::NotGated {
-                    step: row.id,
-                    status: row.status,
-                    expected: "awaiting_approval | failed",
-                });
+            // Plan D133: for a `failed` step nothing above wrote, so the unpark is the first
+            // compare-and-set, and a parked run that is no longer parked was moved by another
+            // command.
+            if !self.unpark(run, now).await? && run.status == RunStatus::AwaitingApproval {
+                return Err(stale_run(
+                    run.id,
+                    RunStatus::AwaitingApproval,
+                    RunStatus::Running,
+                ));
             }
-        }
-        // Plan D133: for a `failed` step nothing above wrote, so the unpark is the first
-        // compare-and-set, and a parked run that is no longer parked was moved by another command.
-        if !self.unpark(run, now).await? && run.status == RunStatus::AwaitingApproval {
-            let stale = stale_run(run.id, RunStatus::AwaitingApproval, RunStatus::Running);
-            return Err(self.stale_first_write(run.id, stale).await);
-        }
+            Ok(())
+        })
+        .await?;
 
         // Admitted rather than created outright, so the next attempt passes through the capability
         // interlock like any other — a phase whose only candidate lost its inline-approval
@@ -915,17 +930,14 @@ where
         let until = self.take_lease(run.id).await?;
 
         let now = self.now();
-        // Plan D133: a member moved between the guard and its retirement stops the retry, and
-        // the lease is given back.
-        if let Err(err) =
-            gate::retire_slot(&self.gate_context(run, snapshot), steps, row.position, now).await
-        {
-            if matches!(err, EngineError::StaleWrite { .. }) {
-                self.release_lease(run.id).await;
-            }
-            return Err(err);
-        }
-        self.unpark(run, now).await?;
+        self.leased_window(run.id, async {
+            // Plan D133: a member moved between the guard and its retirement stops the retry,
+            // and the lease is given back (plan D149, as for every error of the window).
+            gate::retire_slot(&self.gate_context(run, snapshot), steps, row.position, now).await?;
+            self.unpark(run, now).await?;
+            Ok(())
+        })
+        .await?;
 
         let tail = async {
             let run = self.run(run.id).await?;
@@ -961,32 +973,36 @@ where
         let siblings = Self::siblings(&slot, winner);
         let until = self.take_lease(run.id).await?;
 
-        self.parts
-            .store
-            .select_fanout(
-                run.id,
-                position,
-                attempt,
-                winner,
-                Some(HUMAN_PICK_REASON.to_owned()),
-            )
-            .await?;
         let now = self.now();
         let index = slot
             .iter()
             .find(|step| step.id == winner)
             .map_or(0, |step| step.fanout_index);
-        self.note_selection(
-            &run,
-            winner,
-            format!(
-                "fan-out `{}` attempt {attempt}: candidate {index} {HUMAN_PICK_REASON}",
-                phase.name
-            ),
-            now,
-        )
+        self.leased_window(run.id, async {
+            self.parts
+                .store
+                .select_fanout(
+                    run.id,
+                    position,
+                    attempt,
+                    winner,
+                    Some(HUMAN_PICK_REASON.to_owned()),
+                )
+                .await?;
+            self.note_selection(
+                &run,
+                winner,
+                format!(
+                    "fan-out `{}` attempt {attempt}: candidate {index} {HUMAN_PICK_REASON}",
+                    phase.name
+                ),
+                now,
+            )
+            .await?;
+            self.unpark(&run, now).await?;
+            Ok(())
+        })
         .await?;
-        self.unpark(&run, now).await?;
 
         let tail = async {
             let run = self.run(run.id).await?;
@@ -1218,11 +1234,22 @@ where
         Ok(taken.then_some(until))
     }
 
-    /// Plan D133: a command whose first compare-and-set answered `Ok(false)` gives back the lease
-    /// it took (best-effort, as [`Self::release_lease`]) and stops with `stale`.
-    async fn stale_first_write(&self, run: RunId, stale: EngineError) -> EngineError {
-        self.release_lease(run).await;
-        stale
+    /// Plan D149 (R-34): a command's window between its lease take and its
+    /// [`Self::walk_leased`], run so that any `Err` it answers gives the lease back, once
+    /// (best-effort, as [`Self::release_lease`]). A failed release enters [`DeadWalks`] (plan
+    /// D140). Either way this process's next sweep may adopt the run, which plan D88 would
+    /// otherwise keep it off while its lease names this process. Plan D133's `StaleWrite` on a
+    /// command's first compare-and-set is one such `Err`.
+    async fn leased_window<T>(
+        &self,
+        run: RunId,
+        window: impl Future<Output = Result<T, EngineError>>,
+    ) -> Result<T, EngineError> {
+        let out = window.await;
+        if out.is_err() {
+            self.release_lease(run).await;
+        }
+        out
     }
 
     /// The `until` a lease taken at this instant runs to: what a test hands
@@ -1905,7 +1932,8 @@ where
     ///
     /// **The lease is taken first** (blueprint A-1): for a run the sweep adopted it is a renewal,
     /// for a released parked run it is harmless, and for a run a live stranger holds it is
-    /// [`EngineError::LeaseHeld`] with nothing resolved or walked. The walk itself runs under the
+    /// [`EngineError::LeaseHeld`] with nothing resolved or walked. Any error after the take and
+    /// before the walk gives that lease back (plan D149). The walk itself runs under the
     /// heartbeat, and first unparks a run a command left parked over an answered step (plan D132,
     /// `walk_resumed`). Milestone 5's sweep adopts and adjudicates but does not walk; this is the
     /// walk it hands a `Walk` run off to, and milestone 6's `run_worker` is the caller that does.
@@ -1918,6 +1946,18 @@ where
     /// [`EngineError`].
     pub async fn resume(&self, run: RunId) -> Result<Resume, EngineError> {
         let until = self.take_lease(run).await?;
+        // Plan D149: the reads, the live graph's resolve and both notes give the lease back on
+        // any error. `Some` is the topology mismatch, which walks nothing.
+        if let Some(changed) = self.leased_window(run, self.resume_window(run)).await? {
+            return Ok(changed);
+        }
+        let rest = self.walk_leased(run, until, self.walk_resumed(run)).await?;
+        Ok(Resume::Walked(rest))
+    }
+
+    /// [`Self::resume`] between its lease take and its walk: `None` walks the run, and
+    /// `Some(Resume::TopologyChanged)` is the mismatch, with its note written.
+    async fn resume_window(&self, run: RunId) -> Result<Option<Resume>, EngineError> {
         let row = self.run(run).await?;
         let snapshot = Self::snapshot_of(&row)?;
         let item = self.item(Self::item_of(&row)?).await?;
@@ -1947,8 +1987,7 @@ where
                     snapshot.topology
                 );
                 self.note(item.id, body, None, self.now()).await?;
-                let rest = self.walk_leased(run, until, self.walk_resumed(run)).await?;
-                return Ok(Resume::Walked(rest));
+                return Ok(None);
             }
             Err(err) => return Err(err.into()),
         };
@@ -1976,14 +2015,13 @@ where
             if row.status != RunStatus::Running {
                 self.release_lease(run).await;
             }
-            return Ok(Resume::TopologyChanged {
+            return Ok(Some(Resume::TopologyChanged {
                 snapshot: snapshot.topology,
                 live: live.snapshot.topology,
                 rest,
-            });
+            }));
         }
-        let rest = self.walk_leased(run, until, self.walk_resumed(run)).await?;
-        Ok(Resume::Walked(rest))
+        Ok(None)
     }
 
     /// [`Self::resume`]'s walk. Plan D132 (review H3): an `awaiting_approval` run whose cursor
