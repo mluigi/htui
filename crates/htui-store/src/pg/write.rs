@@ -2712,6 +2712,24 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)
     }
 
+    /// Plan D87: the lease of a run that is ours or free, in one compare-and-set `UPDATE`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
+    /// from "not takeable" by the follow-up read [`WriteStore::refresh_lease`] uses.
+    async fn take_lease(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<bool> {
+        let _ = (run, box_id, owner, now, until);
+        todo!("T2 (c): take_lease")
+    }
+
     /// A `run_step` at `pending` with every settle column `NULL`; `fanout_index = -1` is the judge
     /// and is accepted, because no `CHECK` on that column exists or may be added (ANA-2 risk 12).
     ///

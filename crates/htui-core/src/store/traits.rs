@@ -750,6 +750,27 @@ pub trait WriteStore: ReadStore {
         lease_until: DateTime<Utc>,
     ) -> Result<Vec<Run>>;
 
+    /// Plan D87: the lease of a run that is ours or free, taken before a command's first write on
+    /// a parked or running run. `UPDATE run SET lease_owner = owner, lease_box_id = box_id,
+    /// lease_expires_at = until WHERE id = run AND status IN ('running','awaiting_approval') AND
+    /// executing_box_id = box_id AND (lease_owner = owner OR lease_owner IS NULL OR
+    /// lease_expires_at IS NULL OR lease_expires_at <= now)`.
+    ///
+    /// `Ok(false)` = zero rows: another owner holds a live lease, or the run is not takeable here
+    /// (not `running`/`awaiting_approval`, or executing on another box). Nothing is written then.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, told
+    /// apart from "not takeable" by one follow-up read.
+    async fn take_lease(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<bool>;
+
     /// Inserts a step at `pending`. `fanout_index = -1` is the judge and is accepted.
     ///
     /// # Errors

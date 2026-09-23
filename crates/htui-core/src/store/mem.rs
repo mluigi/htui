@@ -3349,6 +3349,20 @@ impl State {
         adopted
     }
 
+    /// Plan D87: the lease of a run that is ours or free; `false` writes nothing.
+    fn take_lease(
+        &mut self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        at: DateTime<Utc>,
+        until: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let _ = (run, box_id, owner, at, until, now);
+        todo!("T2 (c): take_lease")
+    }
+
     /// A `run_step` at `pending` with every settle column `NULL`.
     fn create_step(&mut self, new: NewRunStep, now: DateTime<Utc>) -> Result<RunStep> {
         if self.steps.contains_key(&new.id) {
@@ -4501,6 +4515,18 @@ impl WriteStore for MemStore {
     ) -> Result<Vec<Run>> {
         let now = Utc::now();
         Ok(self.write(|state| state.adopt_runs(box_id, owner, at, lease_until, now)))
+    }
+
+    async fn take_lease(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<bool> {
+        let stamp = Utc::now();
+        self.write(|state| state.take_lease(run, box_id, owner, now, until, stamp))
     }
 
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {

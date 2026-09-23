@@ -85,6 +85,7 @@ pub const CASES: &[&str] = &[
     "illegal_transitions_are_constraint",
     "finish_run_moves_run_and_item_together",
     "claim_run_applies_the_isolation_and_path_rules",
+    "take_lease_moves_only_our_own_or_an_expired_lease",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -169,6 +170,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "claim_run_applies_the_isolation_and_path_rules" => {
             claim_run_applies_the_isolation_and_path_rules(store).await;
+        }
+        "take_lease_moves_only_our_own_or_an_expired_lease" => {
+            take_lease_moves_only_our_own_or_an_expired_lease(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -4554,6 +4558,164 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
             .expect(CASE)
             .is_empty(),
         "{CASE}: a box that does not exist adopts nothing rather than refusing"
+    );
+}
+
+/// Plan D87: `take_lease` moves a lease only when it is the taker's own or has expired, and only
+/// on a `running` or `awaiting_approval` run executing on the taker's box.
+///
+/// `lease_owner` is not a [`Run`] field, so who holds the lease after each take is asserted
+/// through what [`WriteStore::refresh_lease`] answers, as `lease_refresh_is_a_cas_on_owner` does.
+async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store: &S) {
+    const CASE: &str = "take_lease_moves_only_our_own_or_an_expired_lease";
+    let (x, y, z) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let minutes = |n: i64| at + TimeDelta::minutes(n);
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, x, at, minutes(5))
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: X claims the run until at + 5 min"
+    );
+
+    assert!(
+        !store
+            .take_lease(run, ids::BOX, y, at, minutes(10))
+            .await
+            .expect(CASE),
+        "{CASE}: X's lease is live, so Y cannot take it"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await.lease_expires_at,
+        Some(minutes(5)),
+        "{CASE}: a refused take writes nothing"
+    );
+    assert!(
+        store
+            .take_lease(run, ids::BOX, x, at, minutes(10))
+            .await
+            .expect(CASE),
+        "{CASE}: X renews its own live lease"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await.lease_expires_at,
+        Some(minutes(10)),
+        "{CASE}: the renewal stores the new expiry"
+    );
+    assert!(
+        store
+            .take_lease(run, ids::BOX, y, minutes(11), minutes(20))
+            .await
+            .expect(CASE),
+        "{CASE}: once X's lease has expired, Y takes it"
+    );
+    assert!(
+        !store.refresh_lease(run, x, minutes(20)).await.expect(CASE),
+        "{CASE}: X has lost it"
+    );
+    assert!(
+        store.refresh_lease(run, y, minutes(20)).await.expect(CASE),
+        "{CASE}: Y holds it"
+    );
+
+    assert!(
+        store
+            .transition_run(
+                run,
+                RunStatus::Running,
+                RunStatus::AwaitingApproval,
+                minutes(11)
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the run parks at a gate"
+    );
+    assert!(
+        store.refresh_lease(run, y, minutes(11)).await.expect(CASE),
+        "{CASE}: Y releases the lease at the park (lease_expires_at = now)"
+    );
+    assert!(
+        store
+            .take_lease(run, ids::BOX, z, minutes(11), minutes(30))
+            .await
+            .expect(CASE),
+        "{CASE}: a released lease on a parked run is Z's to take"
+    );
+    let taken = run_row(CASE, store, run).await;
+    assert_eq!(
+        (taken.lease_box_id, taken.lease_expires_at),
+        (Some(ids::BOX), Some(minutes(30))),
+        "{CASE}: the take writes the box and the expiry"
+    );
+    assert!(
+        !store
+            .take_lease(run, BoxId::new(), z, minutes(40), minutes(50))
+            .await
+            .expect(CASE),
+        "{CASE}: a run executing on another box is not takeable"
+    );
+
+    let queued_item = store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, "Queued"))
+        .await
+        .expect(CASE)
+        .id;
+    let queued = store
+        .create_run(new_run(ids::PROJECT_HTUI, queued_item, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert!(
+        !store
+            .take_lease(queued, ids::BOX, z, at, minutes(5))
+            .await
+            .expect(CASE),
+        "{CASE}: an unclaimed queued run has no lease to take"
+    );
+    assert_eq!(
+        run_row(CASE, store, queued).await.lease_expires_at,
+        None,
+        "{CASE}: and the refusal wrote none"
+    );
+
+    let finished = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(finished, ids::BOX, x, at, minutes(5))
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the second run is admitted"
+    );
+    store
+        .finish_run(finished, RunStatus::Done, None, minutes(1))
+        .await
+        .expect(CASE);
+    assert!(
+        !store
+            .take_lease(finished, ids::BOX, x, minutes(10), minutes(20))
+            .await
+            .expect(CASE),
+        "{CASE}: a terminal run is not takeable, even by its own expired owner"
+    );
+
+    let unknown = store
+        .take_lease(RunId::new(), ids::BOX, x, at, minutes(5))
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
+        "{CASE}: an unknown run is NotFound, got {unknown:?}"
     );
 }
 

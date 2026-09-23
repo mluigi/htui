@@ -648,6 +648,16 @@ impl WriteStore for SpyStore {
     ) -> StoreResult<Vec<Run>> {
         self.inner.adopt_runs(box_id, owner, now, lease_until).await
     }
+    async fn take_lease(
+        &self,
+        run: RunId,
+        box_id: BoxId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.inner.take_lease(run, box_id, owner, now, until).await
+    }
     async fn create_step(&self, new: NewRunStep) -> StoreResult<RunStep> {
         self.inner.create_step(new).await
     }
