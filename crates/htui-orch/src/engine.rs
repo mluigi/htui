@@ -519,7 +519,7 @@ where
     }
 
     /// Plan D62's rung 4 at `StartRun`: no run row exists, so the refusal is written to the item —
-    /// `open -> blocked`, then `no_candidate_agent: phase `<p>`` as a note — and handed back for
+    /// `open -> blocked`, then ``no_candidate_agent: phase `<p>` `` as a note — and handed back for
     /// the caller to raise. A `failed` item has no `blocked` edge (`model/item.rs:56`) and the
     /// compare-and-set answers `Ok(false)`, which leaves it where it is with the note still
     /// written: a refusal nobody can read is what invariant 7 forbids.
@@ -1728,7 +1728,7 @@ where
     ///
     /// Two sentences. A walk whose every skip was the inline-approval interlock keeps the shipped
     /// `missing_capability: inline_approval` (`docs/ANA-2.md:482`), noted with its phase exactly as
-    /// before. Anything else is `no_candidate_agent: phase `<p>`; <agent> (<reason>), …`, or, when
+    /// before. Anything else is ``no_candidate_agent: phase `<p>`; <agent> (<reason>), …``, or, when
     /// the walk skipped nothing and the selector itself declined, that sentence.
     async fn refuse_no_candidate(
         &self,
