@@ -1371,37 +1371,54 @@ fn reconcile_message(step: StepId) -> String {
     format!("htui: reconcile {step}")
 }
 
-/// The first parent of `after` when `after` is `step`'s own reconcile merge, or `None` for any
-/// other commit (plan D141).
+/// The first parent of `after` when `after` is `step`'s own reconcile merge on the primary
+/// `checkout`, or `None` for any other commit (plan D141, D146).
 ///
 /// D136 merges a step onto a primary that another run moved, so the row reads `(base, merge)`
 /// and `base..merge` holds the other run's work too. The step's own change is the merge against
-/// its first parent. The second parent is tied to the step by the merge itself: a commit with
-/// exactly two parents whose message is D25's `htui: reconcile <step>` is the merge
-/// [`Cli::merge_no_ff`] made for that step, and its second parent is the tip it merged. Only the
-/// message's subject is compared (plan D147). Any other
-/// commit — a step's own commit, an agent's merge, a merge for another step — answers `None`.
+/// its first parent. Plan D146 ties the merge to the primary, git-only, and all four must hold:
+/// `after` has exactly two parents `[first, second]`; its subject is D25's
+/// `htui: reconcile <step>` (plan D147); `before` is `first` or an ancestor of it; and the merge
+/// on the checkout's first-parent line, from its `HEAD` read now down to `before`, whose second
+/// parent is `second` ([`merge_of`]) is `after` itself. The first two are cheap and checked first.
+///
+/// An agent's own two-parent commit with that message is never on the primary's first-parent
+/// line (`merge --no-ff` puts the agent's tip on the second-parent side), so it answers `None`,
+/// as does a step's own commit, an agent's merge, or a merge for another step. So does a commit
+/// `checkout` does not hold: the merge exists only there, so this is always asked of the
+/// checkout, never of a `copy` tree. A primary whose `HEAD` a user reset below the merge answers
+/// `None` too, and the caller then diffs `before..after`, a superset (R-33's residual).
 ///
 /// # Errors
-/// [`IsolateError::Git`] when `after` is not a hash or its commit cannot be read.
+/// [`IsolateError::Git`] when a hash is not a hash, or a commit or `HEAD` cannot be read.
 pub fn reconcile_parent(
-    path: &Path,
+    checkout: &Path,
+    before: &str,
     after: &str,
     step: StepId,
 ) -> Result<Option<String>, IsolateError> {
     let id = parse_oid(after)?;
-    let repo = open(path)?;
+    if !has_commit(checkout, after)? {
+        return Ok(None);
+    }
+    let repo = open(checkout)?;
     let commit = repo
         .find_commit(id)
         .map_err(|err| IsolateError::Git(format!("cannot find commit {after}: {err}")))?;
     let parents: Vec<gix::ObjectId> = commit.parent_ids().map(gix::Id::detach).collect();
-    let [first, _] = parents.as_slice() else {
+    let [first, second] = parents.as_slice() else {
         return Ok(None);
     };
-    Ok(
-        (subject(commit.message_raw_sloppy()) == reconcile_message(step).as_bytes())
-            .then(|| first.to_hex().to_string()),
-    )
+    if subject(commit.message_raw_sloppy()) != reconcile_message(step).as_bytes() {
+        return Ok(None);
+    }
+    let (first, second) = (first.to_hex().to_string(), second.to_hex().to_string());
+    if !is_ancestor(checkout, before, &first)? {
+        return Ok(None);
+    }
+    let head = head(checkout)?;
+    let merge = merge_of(checkout, &head, before, &second)?;
+    Ok((merge == Some(id.to_hex().to_string())).then_some(first))
 }
 
 /// Plan D147: a raw commit message's subject, up to its first `\n` and ASCII-trimmed, so a body

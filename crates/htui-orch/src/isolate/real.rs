@@ -1279,7 +1279,9 @@ impl GixIsolator {
     ///
     /// The range is the row's `before..after`, except for a step's own reconcile merge (plan
     /// D141, [`git::reconcile_parent`]): that is diffed from its first parent, which is the base
-    /// itself unless another run's merge moved the primary first (D136).
+    /// itself unless another run's merge moved the primary first (D136). Plan D146: whether
+    /// `after` is that merge is always asked of the checkout, where the merge lives, never of a
+    /// `copy` tree.
     async fn diff_of(
         &self,
         git: &Cli,
@@ -1306,7 +1308,7 @@ impl GixIsolator {
         {
             let copy = PathBuf::from(&tree.path);
             // A copy that is gone, or does not hold the commit, falls back to the checkout; a
-            // commit neither holds is `git::reconcile_parent`'s readable "cannot find commit".
+            // commit neither holds is `git diff`'s own refusal.
             let (probe, hex) = (copy.clone(), after.to_owned());
             if blocking(move || git::has_commit(&probe, &hex))
                 .await
@@ -1316,9 +1318,16 @@ impl GixIsolator {
             }
         }
         // D141: a merge onto a primary another run moved is diffed against its first parent, so
-        // the range holds this step's change and never the other run's.
-        let (probe, hex, step) = (repo.clone(), after.to_owned(), commit.run_step_id);
-        let merged_onto = blocking(move || git::reconcile_parent(&probe, &hex, step)).await?;
+        // the range holds this step's change and never the other run's. D146: the merge is
+        // recognised on the checkout only, tied to its first-parent line.
+        let (probe, base, hex, step) = (
+            checkout.local_path.clone(),
+            before.to_owned(),
+            after.to_owned(),
+            commit.run_step_id,
+        );
+        let merged_onto =
+            blocking(move || git::reconcile_parent(&probe, &base, &hex, step)).await?;
         let before = merged_onto.as_deref().unwrap_or(before);
         let stat = git.diff(&repo, before, after, true).await?;
         let patch = git.diff(&repo, before, after, false).await?;
