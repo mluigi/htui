@@ -1263,23 +1263,34 @@ pub fn head_parents(path: &Path) -> Result<Vec<String>, IsolateError> {
 /// # Errors
 /// [`IsolateError::Git`] when either hash is not a hash, or the walk cannot read a commit.
 pub fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<bool, IsolateError> {
+    ancestor_walk(path, ancestor, descendant).map(|(found, _)| found)
+}
+
+/// [`is_ancestor`]'s answer and the number of commits its walk yielded (plan D142's pin).
+fn ancestor_walk(
+    path: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<(bool, usize), IsolateError> {
     let (wanted, tip) = (parse_oid(ancestor)?, parse_oid(descendant)?);
     if wanted == tip {
-        return Ok(true);
+        return Ok((true, 0));
     }
     let repo = open(path)?;
     let walk = repo
         .rev_walk([tip])
         .all()
         .map_err(|err| IsolateError::Git(format!("cannot walk from {descendant}: {err}")))?;
+    let mut yielded = 0;
     for info in walk {
         let info =
             info.map_err(|err| IsolateError::Git(format!("cannot walk from {descendant}: {err}")))?;
+        yielded += 1;
         if info.id == wanted {
-            return Ok(true);
+            return Ok((true, yielded));
         }
     }
-    Ok(false)
+    Ok((false, yielded))
 }
 
 /// The merge on `head`'s first-parent history whose second parent is `after`, walking from
@@ -1297,23 +1308,35 @@ pub fn merge_of(
     base: &str,
     after: &str,
 ) -> Result<Option<String>, IsolateError> {
+    merge_walk(path, head, base, after).map(|(merge, _)| merge)
+}
+
+/// [`merge_of`]'s answer and the number of commits its walk read (plan D142's pin).
+fn merge_walk(
+    path: &Path,
+    head: &str,
+    base: &str,
+    after: &str,
+) -> Result<(Option<String>, usize), IsolateError> {
     let (base, after) = (parse_oid(base)?, parse_oid(after)?);
     let repo = open(path)?;
     let mut at = parse_oid(head)?;
+    let mut read = 0;
     while at != base {
         let commit = repo
             .find_commit(at)
             .map_err(|err| IsolateError::Git(format!("cannot find commit {at}: {err}")))?;
+        read += 1;
         let parents: Vec<gix::ObjectId> = commit.parent_ids().map(gix::Id::detach).collect();
         if parents.get(1) == Some(&after) {
-            return Ok(Some(at.to_hex().to_string()));
+            return Ok((Some(at.to_hex().to_string()), read));
         }
         match parents.first() {
             Some(first) => at = *first,
             None => break,
         }
     }
-    Ok(None)
+    Ok((None, read))
 }
 
 /// D25's merge message for `step`: what names a merge commit as that step's reconcile.
@@ -2018,7 +2041,7 @@ mod tests {
     };
     use super::{
         CAPTURE_TAIL, Cli, DIFF_CAP, Exited, HeadBuffer, MIN_GIT, SCRUBBED_ENV, TailBuffer,
-        is_lock_error,
+        ancestor_walk, is_lock_error, merge_walk,
     };
     use crate::isolate::IsolateError;
 
@@ -2058,6 +2081,83 @@ mod tests {
         assert!(!ancestor(&second, &first));
         // `unrelated` is not an object of this repository; the walk from `second` never meets it.
         assert!(!ancestor(&unrelated, &second));
+    }
+
+    /// An empty-tree commit on `parents` at `1600000000 + minute * 60`, written without moving any
+    /// reference: history shaped by hand, with commit times that grow the way real ones do.
+    fn commit_at(dir: &std::path::Path, parents: &[&str], minute: i64) -> String {
+        let repo = gix::open(dir).expect("the repository opens");
+        let time = format!("{} +0000", 1_600_000_000 + minute * 60);
+        let who = gix::actor::SignatureRef {
+            name: gix::bstr::BStr::new(b"htui test"),
+            email: gix::bstr::BStr::new(b"test@localhost"),
+            time: &time,
+        };
+        let parents: Vec<gix::ObjectId> = parents
+            .iter()
+            .map(|hex| gix::ObjectId::from_hex(hex.as_bytes()).expect("a hex object id"))
+            .collect();
+        let tree = gix::ObjectId::empty_tree(gix::hash::Kind::Sha1);
+        repo.new_commit_as(who, who, format!("minute {minute}"), tree, parents)
+            .expect("the commit is written")
+            .id
+            .to_hex()
+            .to_string()
+    }
+
+    /// Forty commits in a line, each a minute after the last; the last one is returned.
+    fn long_history(dir: &std::path::Path) -> String {
+        empty_repo(dir);
+        let mut tip = commit_at(dir, &[], 0);
+        for minute in 1..40 {
+            tip = commit_at(dir, &[&tip], minute);
+        }
+        tip
+    }
+
+    /// Plan D142 (review M-B): `is_ancestor` runs under the repository's admin lock, so it must
+    /// not walk the history below the ancestor it looks for. Two commits sit above `base`, forty
+    /// below; the walk yields the two, whether `base` is on the line or beside it.
+    #[test]
+    fn is_ancestor_never_walks_below_the_ancestor() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let base = long_history(dir.path());
+        let side = commit_at(dir.path(), &[&base], 41);
+        let above = commit_at(dir.path(), &[&base], 42);
+        let head = commit_at(dir.path(), &[&above], 43);
+
+        let (found, yielded) = ancestor_walk(dir.path(), &base, &head).expect("the walk");
+        assert!(found, "the base is under HEAD");
+        assert!(
+            yielded <= 2,
+            "the walk stopped at the base: {yielded} commits"
+        );
+        let (found, yielded) = ancestor_walk(dir.path(), &side, &head).expect("the walk");
+        assert!(!found, "a commit beside HEAD's line is not under it");
+        assert!(
+            yielded <= 2,
+            "the walk stopped at the fork: {yielded} commits"
+        );
+    }
+
+    /// Plan D142 (review M-B): `merge_of` walks `HEAD`'s first-parent line down to `base`, and a
+    /// `base` that is not on that line — `HEAD` went a way of its own from an older commit — must
+    /// stop the walk where the two lines meet, not at the root forty commits further down.
+    #[test]
+    fn merge_of_never_walks_below_the_base() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let fork = long_history(dir.path());
+        let base = commit_at(dir.path(), &[&fork], 41);
+        let tip = commit_at(dir.path(), &[&base], 42);
+        let head = commit_at(dir.path(), &[&fork], 43);
+        let merge = commit_at(dir.path(), &[&base, &tip], 44);
+
+        let (found, read) = merge_walk(dir.path(), &head, &base, &tip).expect("the walk");
+        assert_eq!(found, None, "HEAD's line holds no merge of the tip");
+        assert!(read <= 1, "the walk stopped at the fork: {read} commits");
+        let (found, read) = merge_walk(dir.path(), &merge, &base, &tip).expect("the walk");
+        assert_eq!(found.as_deref(), Some(merge.as_str()), "the merge is found");
+        assert!(read <= 1, "and nothing under it is read: {read} commits");
     }
 
     /// `gix::init` alone makes a repository with an unborn `HEAD`, and `before_hash` is `NOT NULL`
