@@ -55,6 +55,23 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Default)]
 pub struct MemStore {
     state: Arc<RwLock<State>>,
+    /// The writes [`MemStore::set_fault`] switched on, shared through clones as `state` is.
+    faults: Arc<RwLock<HashSet<MemFault>>>,
+}
+
+/// MOD-4 plan D152: a write [`MemStore::set_fault`] can make fail, so a test can tell "the store
+/// cannot answer" apart from "the row is gone".
+///
+/// A test seam only: nothing in production switches one on. A faulted write answers
+/// [`StoreError::Unreachable`] before it touches any state, until it is switched off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemFault {
+    /// [`WriteStore::refresh_lease`].
+    RefreshLease,
+    /// [`WriteStore::release_lease`].
+    ReleaseLease,
+    /// [`WriteStore::transition`], the item compare-and-set.
+    ItemTransition,
 }
 
 /// Every §5 table the TUI reads, keyed the way the queries of §7 look rows up.
@@ -231,6 +248,7 @@ impl MemStore {
         };
         Self {
             state: Arc::new(RwLock::new(state)),
+            faults: Arc::default(),
         }
     }
 
@@ -684,6 +702,29 @@ impl MemStore {
     fn write<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let mut guard = self.state.write().unwrap_or_else(PoisonError::into_inner);
         f(&mut guard)
+    }
+
+    /// MOD-4 plan D152: `on` makes the write `fault` names answer [`StoreError::Unreachable`]
+    /// before it touches any state, on this store and every clone of it, until a call with
+    /// `on == false` switches it off. A test seam; see [`MemFault`].
+    pub fn set_fault(&self, fault: MemFault, on: bool) {
+        let mut faults = self.faults.write().unwrap_or_else(PoisonError::into_inner);
+        if on {
+            faults.insert(fault);
+        } else {
+            faults.remove(&fault);
+        }
+    }
+
+    /// `Err(Unreachable)` when `fault` is switched on (plan D152), `Ok(())` otherwise.
+    fn check_fault(&self, fault: MemFault) -> Result<()> {
+        let faults = self.faults.read().unwrap_or_else(PoisonError::into_inner);
+        if faults.contains(&fault) {
+            return Err(StoreError::Unreachable(format!(
+                "MemFault::{fault:?} is switched on"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -4290,6 +4331,7 @@ impl WriteStore for MemStore {
     }
 
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
+        self.check_fault(MemFault::ItemTransition)?;
         let now = Utc::now();
         self.write(|state| state.transition(id, from, to, now))
     }
@@ -4567,6 +4609,7 @@ impl WriteStore for MemStore {
     }
 
     async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
+        self.check_fault(MemFault::RefreshLease)?;
         let now = Utc::now();
         self.write(|state| state.refresh_lease(run, owner, until, now))
     }
@@ -4595,6 +4638,7 @@ impl WriteStore for MemStore {
     }
 
     async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+        self.check_fault(MemFault::ReleaseLease)?;
         let stamp = Utc::now();
         self.write(|state| state.release_lease(run, owner, now, stamp))
     }
@@ -4739,6 +4783,41 @@ mod tests {
     use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    /// MOD-4 plan D152: a switched-on fault answers `Unreachable` on every clone, before the
+    /// write looks at a row, and the write answers as before once it is switched off.
+    #[tokio::test]
+    async fn a_switched_on_fault_answers_unreachable_until_switched_off() {
+        let store = MemStore::demo();
+        let clone = store.clone();
+        let ghost = crate::model::RunId::new();
+        let now = Utc::now();
+
+        store.set_fault(super::MemFault::ReleaseLease, true);
+        assert!(
+            matches!(
+                clone.release_lease(ghost, Uuid::now_v7(), now).await,
+                Err(StoreError::Unreachable(_))
+            ),
+            "the clone shares the switch, and the missing row is never looked up"
+        );
+        assert!(
+            matches!(
+                clone.refresh_lease(ghost, Uuid::now_v7(), now).await,
+                Err(StoreError::NotFound { .. })
+            ),
+            "only the named write fails"
+        );
+
+        store.set_fault(super::MemFault::ReleaseLease, false);
+        assert!(
+            matches!(
+                clone.release_lease(ghost, Uuid::now_v7(), now).await,
+                Err(StoreError::NotFound { .. })
+            ),
+            "switched off, the write answers as it did"
+        );
+    }
 
     /// Plan D69: the tests-only writer reaches `project.settings`, the column no seam writer
     /// touches, and both readers see it: the trait's `project` and the inherent
