@@ -9,13 +9,15 @@ use std::future::Future;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use htui_agent::event::{DoneEvent, StopReason};
 use htui_core::model::{
-    CommandRun, CommandRunStatus, Isolation, RepoId, RunStep, RunStepCommit, RunStepTree,
+    CommandRun, CommandRunStatus, Document, Isolation, RepoId, RunStep, RunStepCommit, RunStepTree,
     SnapshotPhase, VerifyOutcome,
 };
 use htui_core::store::StoreError;
 use serde_json::Value;
 
+use crate::gate::{Settle, SettleInput, settle};
 use crate::isolate::Clock;
 use crate::verify::VERIFY_CLASS;
 
@@ -238,6 +240,24 @@ pub fn verify_of(
     }
 }
 
+/// D91: `gate::settle` with `driver: Ok(DoneEvent { stop_reason: EndTurn })`, `cap_breach: None`,
+/// `deadline_seconds: None`.
+///
+/// The deadline is dropped because the sweep's clock is not the step's, and the cap because the
+/// recorder's breach is not durable (plan R-13); `now` is therefore inert. `verify` is
+/// [`verify_of`]'s, and `is_review` is `SnapshotPhase::name == "review"`, as stage 5 passes it.
+#[must_use]
+pub fn resettle(
+    output: Option<&Document>,
+    verify: Option<VerifyOutcome>,
+    is_review: bool,
+    started_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Settle {
+    let _ = (output, verify, is_review, started_at, now);
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -250,13 +270,15 @@ mod tests {
 
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{
-        BoxId, CommandRun, CommandRunId, CommandRunStatus, GraphSnapshot, Isolation, RepoId,
-        RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, StepStatus, VerifyOutcome,
+        BoxId, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentId, GraphSnapshot,
+        Isolation, ItemId, RepoId, RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId,
+        StepStatus, UserId, VerifyOutcome,
     };
 
+    use crate::gate::{Settle, StepFailure};
     use crate::isolate::Clock;
     use crate::recover::{
-        Adjudication, Heartbeat, LeaseTimes, StepKind, classify, heartbeat, verify_of,
+        Adjudication, Heartbeat, LeaseTimes, StepKind, classify, heartbeat, resettle, verify_of,
     };
 
     // -----------------------------------------------------------------------------------------
@@ -815,6 +837,80 @@ mod tests {
         assert_eq!(
             verify_of(&finished, &runs),
             (Some(VerifyOutcome::Unavailable), None)
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // resettle
+    // -----------------------------------------------------------------------------------------
+
+    fn document(kind: &str, body: &str, step: &RunStep) -> Document {
+        Document {
+            id: DocumentId::new(),
+            item_id: ItemId::new(),
+            kind: kind.to_owned(),
+            version: 1,
+            title: kind.to_owned(),
+            body: body.to_owned(),
+            produced_by_step_id: Some(step.id),
+            created_by: UserId::new(),
+            created_at: at(4),
+        }
+    }
+
+    #[test]
+    fn resettle_maps_command_runs_to_verify_outcomes() {
+        let step = running();
+        let output = document("implement", "done", &step);
+        // A day after the step started: the sweep drops the deadline, so lateness fails nothing.
+        let now = at(24 * 60);
+        let settle_with = |runs: &[CommandRun]| {
+            let (verify, _) = verify_of(&step, runs);
+            resettle(Some(&output), verify, false, at(0), now)
+        };
+        assert_eq!(
+            settle_with(&[verify_run(&step, CommandRunStatus::Done, Some(1))]),
+            Settle::Failed(StepFailure::VerifyFailed)
+        );
+        assert_eq!(
+            settle_with(&[verify_run(&step, CommandRunStatus::Done, Some(0))]),
+            Settle::Ok { note: None }
+        );
+        assert_eq!(
+            settle_with(&[verify_run(&step, CommandRunStatus::Failed, None)]),
+            Settle::Ok { note: None },
+            "`unavailable` never fails a step"
+        );
+        assert_eq!(settle_with(&[]), Settle::Ok { note: None });
+        assert_eq!(
+            resettle(None, Some(VerifyOutcome::Pass), false, at(0), now),
+            Settle::Failed(StepFailure::MissingOutput)
+        );
+    }
+
+    #[test]
+    fn resettle_reads_a_review_verdict() {
+        let step = step(3, 1, 0, StepStatus::Running);
+        let rejecting = document(
+            "review",
+            "---\nverdict: request-changes\n---\nThe tests are missing.\n",
+            &step,
+        );
+        assert_eq!(
+            resettle(Some(&rejecting), None, true, at(0), at(5)),
+            Settle::Rejected {
+                verdict_line: "verdict: request-changes".to_owned(),
+            }
+        );
+        assert_eq!(
+            resettle(Some(&rejecting), None, false, at(0), at(5)),
+            Settle::Ok { note: None },
+            "a phase not named `review` never reads the front matter"
+        );
+        let approving = document("review", "---\nverdict: approve\n---\nShip it.\n", &step);
+        assert_eq!(
+            resettle(Some(&approving), None, true, at(0), at(5)),
+            Settle::Ok { note: None }
         );
     }
 }
