@@ -6865,6 +6865,149 @@ mod tests {
         );
     }
 
+    /// Two runs a second process's sweep adopts, and a stranger who takes both leases while the
+    /// sweep is inside the first: `first` is `running` with `prd` approved and never merged (its
+    /// frontier reconcile stalls on the restarted isolator), `second` is `running` with its step
+    /// still `awaiting_approval` (plan D96 would complete its park). Returns the sweep's answer,
+    /// the two runs, the stranger's lease expiry and the restarted harness.
+    async fn swept_while_a_stranger_takes_over(
+        harness: &Harness,
+    ) -> (
+        Vec<super::Adopted>,
+        htui_core::model::RunId,
+        htui_core::model::RunId,
+        chrono::DateTime<chrono::Utc>,
+        Harness,
+    ) {
+        let (first, prd) = started(harness).await;
+        harness.orch.clock.advance(TimeDelta::seconds(1));
+        let CommandOutcome::Started { run: second, .. } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_ANA_2,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("no repo, so nothing overlaps")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        let now = harness.orch.clock.now();
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(prd, htui_core::model::GateOutcome::Approved, None, now)
+                .await
+                .expect("MemStore takes the answer"),
+            "`prd` is `done` and its merge never ran: the frontier"
+        );
+        for run in [first, second] {
+            assert!(
+                harness
+                    .orch
+                    .store
+                    .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                    .await
+                    .expect("MemStore takes the move"),
+                "a crash mid-command, by hand"
+            );
+        }
+
+        let other = Harness {
+            orch: harness.orch.restarted(),
+        };
+        let stalled = other.orch.isolator.stall_nth_reconcile(1);
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        let stranger = uuid::Uuid::now_v7();
+        let later = other.orch.clock.now() + ttl + TimeDelta::seconds(1);
+        let until = later + TimeDelta::days(1);
+        let take_over = async {
+            stalled.notified().await;
+            for run in [first, second] {
+                assert!(
+                    other
+                        .orch
+                        .store
+                        .take_lease(run, ids::BOX, stranger, later, until)
+                        .await
+                        .expect("MemStore takes the lease"),
+                    "the stranger's clock is past this sweep's lease"
+                );
+            }
+        };
+        let (adopted, ()) = tokio::join!(super::sweep_fake(&other.orch), take_over);
+        let adopted = adopted.expect("the adoption itself succeeds");
+        (adopted, first, second, until, other)
+    }
+
+    /// Plan D126 (review M1): each adopted run's lease is taken again just before it is
+    /// recovered. A run whose lease a stranger took while the sweep recovered an earlier one is
+    /// skipped: it is not in the answer, and nothing is written to it.
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_skips_a_run_whose_lease_a_stranger_took_meanwhile() {
+        let harness = Harness::new().await;
+        let (adopted, first, second, until, other) =
+            swept_while_a_stranger_takes_over(&harness).await;
+        assert_eq!(
+            adopted.iter().map(|row| row.run).collect::<Vec<_>>(),
+            [first],
+            "the second run is the stranger's now, and skipped: {adopted:?}"
+        );
+        let row = other.orch.run(second).await;
+        assert_eq!(
+            row.status,
+            RunStatus::Running,
+            "plan D96's park was not written"
+        );
+        assert_eq!(
+            row.lease_expires_at,
+            Some(until),
+            "the stranger's lease stands"
+        );
+        assert!(
+            other
+                .orch
+                .steps(second)
+                .await
+                .iter()
+                .all(|step| step.status == StepStatus::AwaitingApproval),
+            "no step of the skipped run moved"
+        );
+    }
+
+    /// Plan D128 (review K3): a recovery whose lease is lost mid-sweep is `Next::Error` with the
+    /// `LeaseLost` text and a `warn`, and nothing else: no `item_note` (the lease is gone, so the
+    /// run is not this process's to write to) and no release.
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_lost_mid_sweep_writes_no_note() {
+        let harness = Harness::new().await;
+        let (adopted, first, _second, until, other) =
+            swept_while_a_stranger_takes_over(&harness).await;
+        assert_eq!(adopted[0].run, first);
+        assert_eq!(
+            adopted[0].next,
+            super::Next::Error(EngineError::LeaseLost { run: first }.to_string())
+        );
+        let notes = other
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.body.starts_with("sweep could not recover run")),
+            "no note after the lease is gone: {notes:?}"
+        );
+        assert_eq!(
+            other.orch.run(first).await.lease_expires_at,
+            Some(until),
+            "the stranger's lease stands"
+        );
+    }
+
     /// Plan D83 through `start_run`: a real refusal's `Display` names the holding run and the
     /// rule, and the refused run stays `queued`.
     #[tokio::test]
