@@ -1828,18 +1828,15 @@ impl SessionSink for StallingSink<'_> {
         key: &SessionKey<'_>,
         done: &htui_agent::event::DoneEvent,
     ) -> Result<(), StoreError> {
-        let _ = (
-            item,
-            step,
-            phase,
-            key,
-            done,
-            &self.inner,
-            self.write_output,
-            &self.key,
-        );
-        let _ = &self.stalled;
-        todo!("T8: commit through the inner sink, maybe the document, then signal and pend")
+        if (phase.name.as_str(), step.attempt) != (self.key.0.as_str(), self.key.1) {
+            return self.inner.after_done(item, step, phase, key, done).await;
+        }
+        self.inner.commit(step, phase, key).await?;
+        if self.write_output {
+            FakeOrchestrator::after_done(self.inner.orch, item, step, phase, key).await?;
+        }
+        self.stalled.notify_one();
+        std::future::pending().await
     }
 }
 
@@ -1937,8 +1934,10 @@ impl Fixture {
     /// dead process held is waited on (blueprint H-12) — a new `owner`, which makes the dead
     /// process's lease a stranger's, and a clock [`RESTART_GAP`] later, past every TTL.
     fn second_process(&self) -> (GixIsolator, Uuid, TestClock) {
-        let _ = (&self.config, RESTART_GAP);
-        todo!("T8: a fresh isolator, owner and clock")
+        let isolator =
+            GixIsolator::new(self.config.clone()).expect("the first process's config was accepted");
+        let clock = TestClock::at(self.orch.clock.now() + RESTART_GAP);
+        (isolator, Uuid::now_v7(), clock)
     }
 
     /// The crash (blueprint A-2): `dispatched` is driven until `stalled` fires and then dropped,
