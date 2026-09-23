@@ -4644,7 +4644,7 @@ mod tests {
             .expect("the fixture project");
         assert_eq!(after.settings, settings, "the blob is replaced whole");
         assert!(
-            after.updated_at >= before.updated_at,
+            after.updated_at > before.updated_at,
             "the write stamps `updated_at`"
         );
         assert_eq!(
