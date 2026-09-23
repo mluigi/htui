@@ -4360,8 +4360,8 @@ fn trees_text(step: StepId, trees: &[RunStepTree], labelled: &[(RepoId, String)]
 
 /// Whether a run has a live step at `position` this walk would have to wait on.
 ///
-/// Exposed because milestone 6's Runs tab renders the same answer and milestone 5's sweep reads it
-/// to decide what an adopted run owes; both would otherwise re-derive it from `run_steps`.
+/// Exposed because milestone 6's Runs tab renders the same answer, which it would otherwise
+/// re-derive from `run_steps`.
 #[must_use]
 pub fn live_step_at(steps: &[RunStep], position: i32) -> Option<&RunStep> {
     latest_at(steps, position).filter(|step| {

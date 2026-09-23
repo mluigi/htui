@@ -3780,6 +3780,11 @@ async fn a_finished_step_is_adopted_through_its_gate<H: CaseHarness>(harness: &H
                 }]
             );
             assert_eq!(prd.status, StepStatus::Done, "D91: re-settled and passed");
+            assert_eq!(
+                other.isolator().reconciles(),
+                [(prd.id, Vec::new())],
+                "D91's `Advance` merges the winner, and exactly once (blueprint A-3)"
+            );
             let resumed = other.resume(run).await.expect("the adopter walks it");
             assert!(
                 matches!(
