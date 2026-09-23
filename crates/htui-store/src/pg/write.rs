@@ -25,7 +25,7 @@ use htui_core::model::{
     Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
     RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
     StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -2454,13 +2454,17 @@ impl WriteStore for PgStore {
     /// and its unmerged branch (invariant 6). A `queued` run is in neither: it has no
     /// `executing_box_id`.
     ///
-    /// An empty `repo_scope` intersects nothing — `'{}' && anything` is false — so a run that
-    /// declared no scope is never refused for overlap (hazard H-10).
+    /// The overlap check reads the live rows that share a repo (`repo_scope && $2`) in
+    /// `(queued_at, id)` order and decides §4.7's rules L, I, P in Rust with the predicate
+    /// `MemStore` shares, each side's scope decoded from its `graph_snapshot` by `scope_of`
+    /// (plan D80, D111). An empty `repo_scope` intersects nothing — `'{}' && anything` is false
+    /// — so a run that declared no scope is never refused for overlap (hazard H-10).
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "run" }` or `{ entity: "box" }`, the run looked up
-    /// first. Every refusal that is not an error is `Ok(false)` with nothing written.
+    /// first. Every refusal that is not an error is an `Ok` [`Claim`] other than
+    /// [`Claim::Admitted`], with nothing written.
     async fn claim_run(
         &self,
         run: RunId,
@@ -2469,8 +2473,140 @@ impl WriteStore for PgStore {
         at: DateTime<Utc>,
         lease_until: DateTime<Utc>,
     ) -> Result<Claim> {
-        let _ = (run, box_id, owner, at, lease_until);
-        todo!("T2 (b): the final overlap predicate")
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let claimed = sqlx::query!(
+            r#"
+            SELECT status         AS "status: RunStatus",
+                   target_box_id  AS "target_box_id: BoxId",
+                   repo_scope     AS "repo_scope: Vec<RepoId>",
+                   graph_snapshot
+              FROM run WHERE id = $1 FOR UPDATE
+            "#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: run.to_string(),
+        })?;
+
+        let settings = sqlx::query_scalar!(
+            "SELECT settings FROM box WHERE id = $1 FOR UPDATE",
+            box_id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "box",
+            id: box_id.to_string(),
+        })?;
+
+        if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
+            return Ok(Claim::NotClaimable);
+        }
+
+        let limit = match serde_json::from_value::<BoxSettings>(settings)
+            .ok()
+            .and_then(|settings| settings.max_concurrent_items)
+        {
+            Some(limit) => limit,
+            None => sqlx::query_scalar!(
+                "SELECT value FROM app_setting WHERE key = 'max_concurrent_items'"
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_ITEMS),
+        };
+
+        let running = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM run WHERE executing_box_id = $1 AND status = 'running'",
+            box_id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .unwrap_or(0);
+        let running = rows(running);
+        if running >= u64::from(limit) {
+            return Ok(Claim::SlotFull { running, limit });
+        }
+
+        let scope: Vec<Uuid> = claimed
+            .repo_scope
+            .iter()
+            .copied()
+            .map(RepoId::as_uuid)
+            .collect();
+        // The live rows sharing a repo with the claim, in `(queued_at, id)` order, read while the
+        // box row is still locked; §4.7's rules are decided here in Rust by the one predicate both
+        // stores share (plan D80, D111). A scope-less snapshot reads conservatively.
+        let live = sqlx::query!(
+            r#"
+            SELECT id AS "id: RunId", graph_snapshot, repo_scope AS "repo_scope: Vec<RepoId>"
+              FROM run
+             WHERE executing_box_id = $1 AND status IN ('running','awaiting_approval')
+               AND repo_scope && $2::uuid[]
+             ORDER BY queued_at, id
+            "#,
+            box_id.as_uuid(),
+            &scope,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let mine = scope_of(
+            claimed.graph_snapshot.as_ref().unwrap_or(&Value::Null),
+            &claimed.repo_scope,
+        );
+        if let Some(verdict) = live.iter().find_map(|row| {
+            let theirs = scope_of(
+                row.graph_snapshot.as_ref().unwrap_or(&Value::Null),
+                &row.repo_scope,
+            );
+            overlaps(&mine, &theirs).map(|rule| Claim::Overlaps { with: row.id, rule })
+        }) {
+            return Ok(verdict);
+        }
+
+        sqlx::query!(
+            "UPDATE run \
+                SET status           = 'running', \
+                    executing_box_id = $2, \
+                    started_at       = COALESCE(started_at, $4), \
+                    lease_box_id     = $2, \
+                    lease_owner      = $3, \
+                    lease_expires_at = $5 \
+              WHERE id = $1 AND status = 'queued'",
+            run.as_uuid(),
+            box_id.as_uuid(),
+            owner,
+            at,
+            lease_until,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        // A stale item status is not a refusal: the run is what is being claimed, and zero rows
+        // here means someone else already moved the item on.
+        sqlx::query!(
+            "UPDATE item SET status = 'in_progress', closed_at = NULL \
+              WHERE id = (SELECT item_id FROM run WHERE id = $1) AND status = 'queued'",
+            run.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(Claim::Admitted)
     }
 
     /// ANA-2 §4.9's heartbeat: a compare-and-set on `lease_owner`, not on the expiry.

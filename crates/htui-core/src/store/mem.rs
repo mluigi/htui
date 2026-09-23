@@ -31,8 +31,8 @@ use crate::model::{
     RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
     SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
     StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
-    prompt_summary,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, overlaps,
+    prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -3215,8 +3215,85 @@ impl State {
         lease_until: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Claim> {
-        let _ = (run, box_id, owner, at, lease_until, now);
-        todo!("T2 (b): the final overlap predicate")
+        let claimed = self.require_run(run)?.clone();
+        if !self.boxes.contains_key(&box_id) {
+            return Err(StoreError::NotFound {
+                entity: "box",
+                id: box_id.to_string(),
+            });
+        }
+        if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
+            return Ok(Claim::NotClaimable);
+        }
+
+        // Two predicates over two sets, which §4.7 draws apart on purpose. The slot count is
+        // `status = 'running'` alone — "an `awaiting_approval` run consumes no compute and must
+        // not hold a slot" — while the overlap predicate "ranges over non-terminal runs, including
+        // `awaiting_approval` ones, because a parked run still owns its trees and its unmerged
+        // branch" (invariant 6). A `queued` run is in neither: it has no `executing_box_id` and no
+        // tree.
+        let mut live: Vec<&Run> = self
+            .runs
+            .values()
+            .filter(|row| {
+                row.executing_box_id == Some(box_id)
+                    && matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
+            })
+            .collect();
+        let running = rows(
+            live.iter()
+                .filter(|row| row.status == RunStatus::Running)
+                .count(),
+        );
+        let limit = self.max_concurrent_items(box_id);
+        if running >= u64::from(limit) {
+            return Ok(Claim::SlotFull { running, limit });
+        }
+        // §4.7's rules L, I, P over the rows that share a repo with the claim, the first hit in
+        // `(queued_at, id)` order naming the holder (plan D83, D111). A scope-less snapshot reads
+        // conservatively, so a pre-milestone-5 run overlaps on any shared repo; an empty
+        // `repo_scope` shares none and is never refused for overlap (hazard H-10).
+        live.sort_unstable_by_key(|row| (row.queued_at, row.id));
+        let scope = |row: &Run| {
+            scope_of(
+                row.graph_snapshot.as_ref().unwrap_or(&Value::Null),
+                &row.repo_scope,
+            )
+        };
+        let mine = scope(&claimed);
+        if let Some(verdict) = live
+            .iter()
+            .filter(|row| {
+                row.repo_scope
+                    .iter()
+                    .any(|repo| claimed.repo_scope.contains(repo))
+            })
+            .find_map(|row| {
+                overlaps(&mine, &scope(row)).map(|rule| Claim::Overlaps { with: row.id, rule })
+            })
+        {
+            return Ok(verdict);
+        }
+
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.status = RunStatus::Running;
+            row.executing_box_id = Some(box_id);
+            row.started_at = row.started_at.or(Some(at));
+            row.lease_box_id = Some(box_id);
+            row.lease_expires_at = Some(lease_until);
+            row.updated_at = now;
+        }
+        self.lease_owners.insert(run, owner);
+        if let Some(item) = claimed.item_id
+            && self
+                .items
+                .get(&item)
+                .is_some_and(|row| row.status == Status::Queued)
+        {
+            // A stale item status is not a refusal: the run is what is being claimed.
+            self.transition(item, Status::Queued, Status::InProgress, now)?;
+        }
+        Ok(Claim::Admitted)
     }
 
     /// ANA-2 §4.9's heartbeat: a compare-and-set on `lease_owner`, not on the expiry.
