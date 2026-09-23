@@ -7980,6 +7980,71 @@ mod tests {
         );
     }
 
+    /// Plan D145 (review L-d): a recovery that meets another writer's row is `StaleWrite`, and
+    /// the sweep treats it as D128 treats a lost lease: `Next::Error` with the text and a `warn`,
+    /// and no `item_note`. The run crashed mid-command with `prd` approved and never merged; the
+    /// sweep's frontier reconcile refuses, and while it is inside the reconcile another writer
+    /// parks the run, so the sweep's own park finds it moved.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_write_mid_sweep_writes_no_note() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        let store = &harness.orch.store;
+        let now = harness.orch.clock.now();
+        assert!(
+            store
+                .answer_gate(prd, GateOutcome::Approved, None, now)
+                .await
+                .expect("MemStore takes the answer"),
+            "`prd` is `done` and its merge never ran: the frontier"
+        );
+        assert!(
+            store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move"),
+            "a crash mid-command, by hand"
+        );
+
+        let other = Harness {
+            orch: harness.orch.restarted(),
+        };
+        other.orch.isolator.refuse_reconcile("the primary moved");
+        let (reached, resume) = other.orch.isolator.pause_nth_reconcile(1);
+        let meddle = async {
+            reached.notified().await;
+            assert!(
+                other
+                    .orch
+                    .store
+                    .transition_run(run, RunStatus::Running, RunStatus::AwaitingApproval, now)
+                    .await
+                    .expect("MemStore takes the move"),
+                "another writer parks the run first"
+            );
+            resume.notify_one();
+        };
+        let (adopted, ()) = tokio::join!(super::sweep_fake(&other.orch), meddle);
+        let adopted = adopted.expect("the adoption itself succeeds");
+
+        assert_eq!(adopted.len(), 1, "{adopted:?}");
+        assert_eq!(adopted[0].run, run);
+        let stale = crate::command::stale_run(run, RunStatus::Running, RunStatus::AwaitingApproval);
+        assert_eq!(adopted[0].next, super::Next::Error(stale.to_string()));
+        let notes = other
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.body.starts_with("sweep could not recover run")),
+            "no note for a stale write: {notes:?}"
+        );
+    }
+
     /// How plan D131's `plan` step came to be `failed` before the crash.
     #[derive(Clone, Copy)]
     enum FailedBy {

@@ -99,8 +99,9 @@ pub struct FakeIsolator {
     /// How many times [`release`](Isolator::release) has been called.
     releases: Mutex<u32>,
     /// Blueprint F-A: the 1-based [`reconcile`](Isolator::reconcile) call that never returns, and
-    /// the signal it raises first. One-shot.
-    reconcile_stall: Mutex<Option<(u32, Arc<Notify>)>>,
+    /// the signal it raises first; with a resume signal (plan D145), the call that waits for it
+    /// instead. One-shot.
+    reconcile_stall: Mutex<Option<(u32, Arc<Notify>, Option<Arc<Notify>>)>>,
 }
 
 /// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
@@ -293,19 +294,42 @@ impl FakeIsolator {
         *self
             .reconcile_stall
             .lock()
-            .expect("no panic holds the fake isolator's lock") = Some((n, Arc::clone(&notify)));
+            .expect("no panic holds the fake isolator's lock") =
+            Some((n, Arc::clone(&notify), None));
         notify
     }
 
-    /// The stall's signal when `call` is the stalled one, taking it (one-shot).
-    fn reconcile_stall_at(&self, call: usize) -> Option<Arc<Notify>> {
+    /// Make the `n`-th [`reconcile`](Isolator::reconcile) call (1-based, as
+    /// [`stall_nth_reconcile`](Self::stall_nth_reconcile)) record itself, signal the first
+    /// returned [`Notify`], and wait for the second before it answers as it otherwise would.
+    ///
+    /// Plan D145's seam: another writer moves a row while a sweep's recovery is inside the
+    /// reconcile, so the write after it finds the row moved.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn pause_nth_reconcile(&self, n: u32) -> (Arc<Notify>, Arc<Notify>) {
+        let (reached, resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        *self
+            .reconcile_stall
+            .lock()
+            .expect("no panic holds the fake isolator's lock") =
+            Some((n, Arc::clone(&reached), Some(Arc::clone(&resume))));
+        (reached, resume)
+    }
+
+    /// The stall's signal and, for a pause, its resume, when `call` is the stalled one, taking
+    /// them (one-shot).
+    #[allow(clippy::type_complexity)]
+    fn reconcile_stall_at(&self, call: usize) -> Option<(Arc<Notify>, Option<Arc<Notify>>)> {
         let mut stall = self
             .reconcile_stall
             .lock()
             .expect("no panic holds the fake isolator's lock");
         match stall.as_ref() {
-            Some((n, _)) if usize::try_from(*n).is_ok_and(|n| n == call) => {
-                stall.take().map(|(_, notify)| notify)
+            Some((n, _, _)) if usize::try_from(*n).is_ok_and(|n| n == call) => {
+                stall.take().map(|(_, notify, resume)| (notify, resume))
             }
             _ => None,
         }
@@ -477,9 +501,12 @@ impl Isolator for FakeIsolator {
             };
             // Blueprint F-A: the crash between `done` and the merge. Recorded, signalled, and
             // then this call never answers; the case drops the walk.
-            if let Some(stalled) = self.reconcile_stall_at(call) {
+            if let Some((stalled, resume)) = self.reconcile_stall_at(call) {
                 stalled.notify_one();
-                std::future::pending::<()>().await;
+                match resume {
+                    Some(resume) => resume.notified().await,
+                    None => std::future::pending::<()>().await,
+                }
             }
             if let Some(err) = self
                 .reconcile_failures
