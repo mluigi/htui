@@ -17,6 +17,7 @@
 //! lands.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
@@ -458,6 +459,19 @@ where
         Ok(CommandOutcome::Started { run: id, rest })
     }
 
+    /// Plan D84: `claim_run`, then the leased walk — `start_run`'s tail, factored out so a run a
+    /// refusal left `queued` can be re-attempted. No [`Command`] variant carries it (ANA-2 §6.2
+    /// has none); milestone 6 decides the verb that calls it.
+    ///
+    /// # Errors
+    /// [`EngineError::ClaimRefused`] naming the rule when `claim_run` does not admit the run,
+    /// which then stays `queued` with nothing written; [`EngineError::LeaseLost`] when another
+    /// orchestrator takes the lease mid-walk; every other [`EngineError`] the walk raises.
+    pub async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
+        let _ = run;
+        todo!("T6 commit c: claim_run, then walk_leased(run_to_rest)")
+    }
+
     /// Plan D62's rung 4 at `StartRun`: no run row exists, so the refusal is written to the item —
     /// `open -> blocked`, then `no_candidate_agent: phase `<p>`` as a note — and handed back for
     /// the caller to raise. A `failed` item has no `blocked` edge (`model/item.rs:56`) and the
@@ -830,6 +844,38 @@ where
                 failure: None,
             },
         })
+    }
+
+    // -- the lease (ANA-2 §4.9, plan D86, D87, D107, D108) ---------------------------------------
+
+    /// Plan D86/D107: `walk` raced against [`crate::recover::heartbeat`] in this task.
+    ///
+    /// On the walk's answer, the lease is released when the run rests anywhere but `running`
+    /// (D87); an `Err` writes nothing more, because the store may be what failed. On
+    /// [`crate::recover::Heartbeat::Abandoned`] the walk is dropped where it stands, **before** anything else, then
+    /// `Isolator::release` drops this process's guards for the run (D99), and the caller gets
+    /// [`EngineError::LeaseLost`]. Generic over the walk's output, so one wrapper serves every
+    /// command's post-unpark tail (blueprint F-M).
+    async fn walk_leased<T, F>(&self, run: RunId, walk: F) -> Result<T, EngineError>
+    where
+        F: Future<Output = Result<T, EngineError>>,
+    {
+        let _ = (run, walk);
+        todo!("T6 commit c: select(walk, heartbeat)")
+    }
+
+    /// Plan D87/D108: `take_lease(run, box, owner, now, now + ttl)`, after a command's pure guard
+    /// and before its first write.
+    async fn take_lease(&self, run: RunId) -> Result<(), EngineError> {
+        let _ = run;
+        todo!("T6 commit c: take_lease")
+    }
+
+    /// Plan D87: `refresh_lease(run, owner, now)`, so the lease reads as expired at once. A
+    /// zero-row answer is ignored and an error is warned; neither is raised.
+    async fn release_lease(&self, run: RunId) {
+        let _ = run;
+        todo!("T6 commit c: release_lease")
     }
 
     // -- the walk ------------------------------------------------------------------------------
@@ -3998,6 +4044,25 @@ mod tests {
                 .await
                 .expect("the seeded run is queued and cancellable");
         }
+
+        /// The HTUI project's primary repo, so an undeclared item's scope is that whole repo
+        /// (ANA-2 §4.7) rather than nothing.
+        async fn add_primary_repo(&self) -> RepoId {
+            let repo = RepoId::new();
+            self.orch
+                .store
+                .create_repo(NewRepo {
+                    id: repo,
+                    project_id: ids::PROJECT_HTUI,
+                    name: "htui".to_owned(),
+                    remote_url: None,
+                    default_branch: "main".to_owned(),
+                    is_primary: true,
+                })
+                .await
+                .expect("the demo project has no repo yet");
+            repo
+        }
     }
 
     /// Blueprint H-8 in one assertion: `review` is produced at position 3, so `implement` at
@@ -5776,6 +5841,257 @@ mod tests {
             run.lease_expires_at,
             Some(claimed_at + TimeDelta::seconds(300)),
             "the claim's lease is `now + lease_ttl_seconds`"
+        );
+    }
+
+    /// Plan D86/D107: a heartbeat whose refresh touches zero rows abandons the walk. The walk is
+    /// dropped, the isolator releases the run's guards once, the caller reads `LeaseLost`, and no
+    /// row moves after the stranger's adoption — the walk writes nothing further.
+    #[tokio::test(start_paused = true)]
+    async fn a_walk_whose_lease_is_taken_is_abandoned_and_writes_nothing() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Flags its own drop, so the test can tell the walk future really went away.
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        let now = harness.orch.clock.now();
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        // The parked run, unparked by hand and leased to this harness again: a live walk's rows.
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+        assert!(
+            harness
+                .orch
+                .store
+                .take_lease(run, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .await
+                .expect("MemStore takes the lease"),
+            "the released lease is this harness's to take back"
+        );
+
+        let graphs = harness.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = super::Engine::new(
+            super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = Dropped(Arc::clone(&dropped));
+        let walk = async move {
+            let _probe = probe;
+            std::future::pending::<Result<crate::command::Rest, EngineError>>().await
+        };
+        let stranger = uuid::Uuid::now_v7();
+        let steal = async {
+            let adopted = harness
+                .orch
+                .store
+                .adopt_runs(
+                    ids::BOX,
+                    stranger,
+                    now + ttl + TimeDelta::seconds(1),
+                    now + ttl + TimeDelta::days(1),
+                )
+                .await
+                .expect("MemStore adopts");
+            assert_eq!(
+                adopted.iter().map(|row| row.id).collect::<Vec<_>>(),
+                [run],
+                "the stranger adopts the expired lease"
+            );
+            (harness.orch.run(run).await, harness.orch.steps(run).await)
+        };
+        let (walked, (run_after_steal, steps_after_steal)) =
+            tokio::join!(engine.walk_leased(run, walk), steal);
+
+        let refused = walked.expect_err("the heartbeat's refresh touched zero rows");
+        assert!(
+            matches!(refused, EngineError::LeaseLost { run: lost } if lost == run),
+            "{refused}"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the walk future was dropped"
+        );
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            1,
+            "plan D99's release, once"
+        );
+        assert_eq!(
+            harness.orch.run(run).await,
+            run_after_steal,
+            "nothing written to the run"
+        );
+        assert_eq!(
+            harness.orch.steps(run).await,
+            steps_after_steal,
+            "nothing written to its steps"
+        );
+    }
+
+    /// Plan D83 through `start_run`: a real refusal's `Display` names the holding run and the
+    /// rule, and the refused run stays `queued`.
+    #[tokio::test]
+    async fn claim_refused_names_the_rule() {
+        let harness = Harness::new().await;
+        harness.add_primary_repo().await;
+        let (holder, _) = started(&harness).await;
+
+        let refused = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_ANA_2,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect_err("both items hold the whole primary repo");
+        let EngineError::ClaimRefused { run, claim } = &refused else {
+            panic!("a claim refusal, not {refused}");
+        };
+        let htui_core::model::Claim::Overlaps { with, rule } = claim else {
+            panic!("an overlap, not {claim}");
+        };
+        assert_eq!(*with, holder, "the parked run still holds its scope");
+        assert_eq!(
+            refused.to_string(),
+            format!("claim refused: overlaps run {holder} ({rule})")
+        );
+        assert_eq!(harness.orch.run(*run).await.status, RunStatus::Queued);
+        assert_eq!(
+            harness.orch.item(ids::HTUI_ANA_2).await.status,
+            Status::Queued,
+            "plan D84: a refused run and its item stay queued"
+        );
+    }
+
+    /// Plan D81 on the resume path: `touched_paths` edited after `StartRun` to name a repo the
+    /// project does not carry is a rule about starting a run, so the live graph is not
+    /// comparable and the run walks its snapshot, with the note that says so.
+    #[tokio::test]
+    async fn resume_walks_a_run_whose_touched_paths_name_an_unknown_repo() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        let item = harness.orch.item(ids::HTUI_FEAT_3).await;
+        harness
+            .orch
+            .store
+            .update_item(
+                item.id,
+                item.version,
+                ItemPatch {
+                    touched_paths: Some(vec!["web:src/**".to_owned()]),
+                    author_id: item.created_by,
+                    reason: "a qualifier no repo carries".to_owned(),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
+            .expect("the item's version is current");
+
+        let resumed = harness
+            .resume(run)
+            .await
+            .expect("the run walks its snapshot");
+        assert!(matches!(resumed, Resume::Walked(_)), "{resumed:?}");
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.body.contains("live graph not comparable")
+                    && note.body.contains("`web`")),
+            "{notes:?}"
+        );
+    }
+
+    /// Blueprint A-1: `resume` takes the lease before it resolves or walks, so a run a live
+    /// stranger holds is refused and nothing is advanced.
+    #[tokio::test]
+    async fn resume_refuses_a_run_a_live_stranger_holds() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        let now = harness.orch.clock.now();
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+        let adopted = harness
+            .orch
+            .store
+            .adopt_runs(
+                ids::BOX,
+                uuid::Uuid::now_v7(),
+                now,
+                now + TimeDelta::days(1),
+            )
+            .await
+            .expect("MemStore adopts");
+        assert_eq!(adopted.len(), 1, "the released lease is adoptable at once");
+        let before = harness.orch.steps(run).await;
+
+        let refused = harness
+            .resume(run)
+            .await
+            .expect_err("a live lease elsewhere");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { run: held } if held == run),
+            "{refused}"
+        );
+        assert_eq!(harness.orch.steps(run).await, before, "nothing was walked");
+    }
+
+    /// Plan D87: a walk that rests parked releases the lease (`lease_expires_at = now`), and an
+    /// answer from the same process takes it back and walks on.
+    #[tokio::test]
+    async fn a_parked_walk_releases_its_lease_and_the_answer_takes_it_back() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        let now = harness.orch.clock.now();
+        assert_eq!(harness.orch.run(run).await.lease_expires_at, Some(now));
+
+        let CommandOutcome::Answered { rest } = harness
+            .dispatch(Command::AnswerGate {
+                run,
+                step: prd,
+                answer: GateAnswer::Approved,
+            })
+            .await
+            .expect("our own released lease is ours to take")
+        else {
+            panic!("`AnswerGate` answers `Answered`");
+        };
+        assert_eq!(rest.run, RunStatus::AwaitingApproval, "parked at `plan`");
+        assert_eq!(
+            harness.orch.run(run).await.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "and released again at that park"
         );
     }
 
