@@ -3819,15 +3819,7 @@ where
             now,
         )
         .await?;
-        self.parts
-            .store
-            .answer_gate(
-                judge.id,
-                GateOutcome::Rejected,
-                Some(failure.to_string()),
-                now,
-            )
-            .await?;
+        gate::reject_step(self.parts.store, run.id, judge.id, failure.to_string(), now).await?;
         let reason = HumanReason::JudgeFailed(failure).to_string();
         self.park_selection(run, phase, attempt, slot, &reason)
             .await
@@ -7513,6 +7505,131 @@ mod tests {
         );
         assert_eq!(after.failure, None);
         assert_eq!(harness.orch.isolator.cleanups(), cleanups, "nor cleaned up");
+    }
+
+    /// The parked `prd` row of a started run as a stale read would hold it: `pending`, while the
+    /// store holds it at `awaiting_approval`. A `pending -> running` on it answers `Ok(false)`.
+    async fn stale_pending(
+        harness: &Harness,
+        run: htui_core::model::RunId,
+        step: StepId,
+    ) -> htui_core::model::RunStep {
+        let mut stale = harness
+            .orch
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|candidate| candidate.id == step)
+            .expect("the parked step exists");
+        stale.status = StepStatus::Pending;
+        stale
+    }
+
+    /// Plan D144's shared tail: `refused` is the stale `pending -> running` of `step`, and the
+    /// store still holds the step and the run where the park left them.
+    async fn assert_stale_start(
+        harness: &Harness,
+        run: htui_core::model::RunId,
+        step: StepId,
+        refused: &EngineError,
+    ) {
+        let EngineError::StaleWrite {
+            run: stopped,
+            row,
+            from,
+            to,
+        } = refused
+        else {
+            panic!("a stale start is a `StaleWrite`, not {refused}");
+        };
+        assert_eq!(*stopped, run);
+        assert_eq!(
+            (row.as_str(), from.as_str(), to.as_str()),
+            (format!("step {step}").as_str(), "pending", "running")
+        );
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(steps.len(), 1, "no row was added: {steps:?}");
+        assert_eq!(steps[0].status, StepStatus::AwaitingApproval);
+        assert_eq!(
+            harness.orch.run(run).await.status,
+            RunStatus::AwaitingApproval
+        );
+    }
+
+    /// Plan D144 (review L-c): the walk's `pending -> running` is a compare-and-set on the walk's
+    /// path like any other. `Ok(false)` means another writer moved the row the walk read, so the
+    /// walk stops with `StaleWrite` rather than re-deriving and walking on.
+    #[tokio::test]
+    async fn a_stale_step_start_is_a_stale_write() {
+        let harness = Harness::new().await;
+        let (run, step) = started(&harness).await;
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let stale = stale_pending(&harness, run, step).await;
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .walk_step(&row, &snapshot, stale, &snapshot.phases[0])
+            .await
+            .expect_err("the step's compare-and-set found the row moved");
+        assert_stale_start(&harness, run, step, &refused).await;
+    }
+
+    /// Plan D144 (review L-c): a fan-out candidate's `pending -> running` answering `Ok(false)` is
+    /// `StaleWrite`, not a candidate silently skipped while its siblings run on.
+    #[tokio::test]
+    async fn a_stale_candidate_start_is_a_stale_write() {
+        let harness = Harness::new().await;
+        let (run, step) = started(&harness).await;
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let phase = &snapshot.phases[0];
+        let stale = stale_pending(&harness, run, step).await;
+        harness_engine!(harness.orch, engine);
+        let item = row.item_id.expect("the run has an item");
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &stale, phase, item)
+            .await
+            .expect("the prompt's reads succeed")
+            .expect("`prd` needs no input");
+
+        let refused = engine
+            .run_candidate(super::CandidateStage {
+                run: &row,
+                phase,
+                step: &stale,
+                prompt: &prompt,
+                base: &BTreeMap::new(),
+            })
+            .await
+            .expect_err("the candidate's compare-and-set found the row moved");
+        assert_stale_start(&harness, run, step, &refused).await;
+    }
+
+    /// Plan D144 (review L-c): the judge's `pending -> running` answering `Ok(false)` is
+    /// `StaleWrite`. Here the judge is a crash's leftover row reused as `existing`, read `pending`
+    /// while another writer moved it.
+    #[tokio::test]
+    async fn a_stale_judge_start_is_a_stale_write() {
+        let harness = Harness::new().await;
+        let (run, step) = started(&harness).await;
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let stale = stale_pending(&harness, run, step).await;
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .run_judge(
+                &row,
+                &snapshot,
+                &snapshot.phases[0],
+                1,
+                Vec::new(),
+                Some(stale),
+            )
+            .await
+            .expect_err("the judge's compare-and-set found the row moved");
+        assert_stale_start(&harness, run, step, &refused).await;
     }
 
     /// Plan D125 (review H1), end to end: after the session, and before the settle, a stranger's

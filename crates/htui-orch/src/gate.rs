@@ -12,8 +12,8 @@ use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::CapBreach;
 use htui_core::model::{
-    BoxId, Document, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, NoteId, Run, RunStatus,
-    RunStep, SnapshotPhase, Status, StepId, StepStatus, UserId, VerifyOutcome,
+    BoxId, Document, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, NoteId, Run, RunId,
+    RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, UserId, VerifyOutcome,
 };
 use htui_core::prompt::digest::{canonical, sha256_hex};
 use htui_core::store::{StoreError, WriteStore};
@@ -418,14 +418,7 @@ pub async fn apply<S: WriteStore, C: Clock + ?Sized>(
                 now,
             )
             .await?;
-            ctx.store
-                .answer_gate(
-                    step.id,
-                    GateOutcome::Rejected,
-                    Some(verdict_line.clone()),
-                    now,
-                )
-                .await?;
+            reject_step(ctx.store, ctx.run.id, step.id, verdict_line.clone(), now).await?;
             let step = reread(ctx, step).await?;
             match review_loop(ctx, &step).await? {
                 LoopOutcome::Resumed { .. } => Ok(Landing::Retired),
@@ -569,6 +562,22 @@ async fn move_step<S: WriteStore, C: Clock + ?Sized>(
     } else {
         Err(stale_step(ctx.run.id, step, from, to))
     }
+}
+
+/// An automatic rejection's `answer_gate(Rejected, note)` on a step the walk has just parked:
+/// `awaiting_approval -> failed`, with `note` as its `gate_note`. The gate's review rejection and
+/// the engine's judge failure (plan D51) both write it.
+pub(crate) async fn reject_step<S: WriteStore + ?Sized>(
+    store: &S,
+    _run: RunId,
+    step: StepId,
+    note: String,
+    now: DateTime<Utc>,
+) -> Result<(), EngineError> {
+    store
+        .answer_gate(step, GateOutcome::Rejected, Some(note), now)
+        .await?;
+    Ok(())
 }
 
 /// [`move_step`] for the run row.
@@ -1655,5 +1664,38 @@ mod tests {
         .await
         .expect_err("the run is not `running`");
         stale(&refused, "the run", "running", "awaiting_approval");
+    }
+
+    /// Plan D144 (review L-c): the automatic rejection's `answer_gate` is a compare-and-set on
+    /// `awaiting_approval` like any other. A step another writer moved off `awaiting_approval`
+    /// between the park and the answer answers `Ok(false)`, and that is a `StaleWrite`: no
+    /// `gate_note`, and nothing after it.
+    #[tokio::test]
+    async fn a_stale_automatic_rejection_is_a_stale_write() {
+        use crate::command::EngineError;
+
+        let store = MemStore::demo();
+        let done = step(&store, 2, 0, &[StepStatus::Running, StepStatus::Done]).await;
+        let refused = super::reject_step(
+            &store,
+            ids::RUN_3,
+            done.id,
+            "verdict: request-changes".to_owned(),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("the step is not `awaiting_approval`");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::StaleWrite { run, row, from, to }
+                    if *run == ids::RUN_3
+                        && *row == format!("step {}", done.id)
+                        && from == "awaiting_approval"
+                        && to == "failed"
+            ),
+            "{refused}"
+        );
+        assert_eq!(status_of(&store, done.id).await, StepStatus::Done);
     }
 }
