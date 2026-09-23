@@ -1100,6 +1100,7 @@ where
         let (store, owner) = (self.parts.store, self.parts.owner);
         let beat = recover::heartbeat(
             |until| store.refresh_lease(run, owner, until),
+            self.now() + times.ttl,
             self.parts.clock,
             times,
         );

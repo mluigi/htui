@@ -109,7 +109,12 @@ const MIN_RETRY: Duration = Duration::from_secs(1);
 /// A single store error is not a taken lease: offline, the lease is left to expire and the
 /// reconnect sweep adjudicates (`docs/ANA-2.md:1325-1336`). Needs a runtime with the time driver
 /// (H-3).
-pub async fn heartbeat<F, Fut, C>(mut refresh: F, clock: &C, times: LeaseTimes) -> Heartbeat
+pub async fn heartbeat<F, Fut, C>(
+    mut refresh: F,
+    _written: DateTime<Utc>,
+    clock: &C,
+    times: LeaseTimes,
+) -> Heartbeat
 where
     F: FnMut(DateTime<Utc>) -> Fut,
     Fut: Future<Output = Result<bool, StoreError>>,
@@ -552,8 +557,11 @@ mod tests {
         let clock = PausedClock::new();
         let times = default_times();
         let (calls, refresh) = scripted(&clock, vec![Ok(true), Ok(true), Ok(true)]);
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(125), heartbeat(refresh, &clock, times)).await;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(125),
+            heartbeat(refresh, clock.now() + times.ttl, &clock, times),
+        )
+        .await;
         assert!(
             outcome.is_err(),
             "the heartbeat never returns on `Ok(true)`"
@@ -570,7 +578,13 @@ mod tests {
     async fn heartbeat_returns_abandoned_on_a_zero_row_refresh() {
         let clock = PausedClock::new();
         let (calls, refresh) = scripted(&clock, vec![Ok(true), Ok(false)]);
-        let outcome = heartbeat(refresh, &clock, default_times()).await;
+        let outcome = heartbeat(
+            refresh,
+            clock.now() + default_times().ttl,
+            &clock,
+            default_times(),
+        )
+        .await;
         assert_eq!(outcome, Heartbeat::Abandoned);
         assert_eq!(clock.elapsed(), Duration::from_secs(80));
         assert_eq!(calls.lock().unwrap().len(), 2);
@@ -589,7 +603,13 @@ mod tests {
                 Ok(false),
             ],
         );
-        let outcome = heartbeat(refresh, &clock, default_times()).await;
+        let outcome = heartbeat(
+            refresh,
+            clock.now() + default_times().ttl,
+            &clock,
+            default_times(),
+        )
+        .await;
         assert_eq!(outcome, Heartbeat::Abandoned);
         assert_eq!(
             beats(&calls, clock.origin),
@@ -608,7 +628,7 @@ mod tests {
         let (calls, refresh) = scripted(&clock, unreachable(100));
         let outcome = tokio::time::timeout(
             Duration::from_millis(600_500),
-            heartbeat(refresh, &clock, times),
+            heartbeat(refresh, clock.now() + times.ttl, &clock, times),
         )
         .await
         .expect("the heartbeat fences itself instead of beating for ever");
@@ -619,6 +639,30 @@ mod tests {
             "stopped before the lease lapsed"
         );
         assert_eq!(beats(&calls, clock.origin), [40, 50, 60, 70, 80]);
+    }
+
+    /// Plan D143 (review L-a): the fence starts from the lease the caller actually wrote, not
+    /// from the heartbeat's own start. That lease was written 30 s before the heartbeat began, so
+    /// it lapses at 90 s and the fence stands at 50 s, where every refresh failing stops the walk.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_fences_from_the_until_its_caller_wrote() {
+        let clock = PausedClock::new();
+        let times = default_times();
+        let written = clock.now() + times.ttl - TimeDelta::seconds(30);
+        let (calls, refresh) = scripted(&clock, unreachable(100));
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(600_500),
+            heartbeat(refresh, written, &clock, times),
+        )
+        .await
+        .expect("the heartbeat fences itself instead of beating for ever");
+        assert_eq!(outcome, Heartbeat::Expired);
+        assert_eq!(clock.elapsed(), Duration::from_secs(50));
+        assert!(
+            clock.now() < written,
+            "stopped before the written lease lapsed"
+        );
+        assert_eq!(beats(&calls, clock.origin), [40, 50]);
     }
 
     /// Plan D122: a refresh that neither answers nor fails (a stuck connection) is raced against
@@ -636,7 +680,7 @@ mod tests {
         };
         let outcome = tokio::time::timeout(
             Duration::from_millis(600_500),
-            heartbeat(refresh, &clock, times),
+            heartbeat(refresh, clock.now() + times.ttl, &clock, times),
         )
         .await
         .expect("the heartbeat gives up a hung refresh at the fence");
@@ -656,7 +700,12 @@ mod tests {
         let (calls, refresh) = scripted(&clock, script);
         let outcome = tokio::time::timeout(
             Duration::from_millis(600_500),
-            heartbeat(refresh, &clock, default_times()),
+            heartbeat(
+                refresh,
+                clock.now() + default_times().ttl,
+                &clock,
+                default_times(),
+            ),
         )
         .await
         .expect("the heartbeat fences itself instead of beating for ever");
@@ -678,7 +727,12 @@ mod tests {
         let (calls, refresh) = scripted(&clock, script);
         let outcome = tokio::time::timeout(
             Duration::from_secs(95),
-            heartbeat(refresh, &clock, default_times()),
+            heartbeat(
+                refresh,
+                clock.now() + default_times().ttl,
+                &clock,
+                default_times(),
+            ),
         )
         .await;
         assert!(outcome.is_err(), "the lease is held again");
@@ -697,8 +751,11 @@ mod tests {
         let mut script = unreachable(1);
         script.push(Ok(true));
         let (calls, refresh) = scripted(&clock, script);
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(4), heartbeat(refresh, &clock, times)).await;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(4),
+            heartbeat(refresh, clock.now() + times.ttl, &clock, times),
+        )
+        .await;
         assert!(outcome.is_err(), "the lease is held again");
         assert_eq!(beats(&calls, clock.origin), [2, 3]);
     }
