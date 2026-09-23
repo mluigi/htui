@@ -1177,7 +1177,30 @@ impl FakeOrchestrator {
     /// When a lock is poisoned, which no case does.
     #[must_use]
     pub fn restarted(&self) -> Self {
-        todo!("T6 commit d: FakeOrchestrator::restarted")
+        let scripts = self
+            .scripts
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .clone();
+        let candidates = self
+            .candidates
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .clone();
+        Self {
+            store: self.store.clone(),
+            isolator: FakeIsolator::new(),
+            verifier: FakeVerifier::new(),
+            clock: TestClock::at(self.clock.now() + RESTART_GAP),
+            scripts: Mutex::new(scripts),
+            candidates: Mutex::new(candidates),
+            after_done_advance: Mutex::new(None),
+            default_script: self.default_script.clone(),
+            caps: self.caps,
+            box_id: self.box_id,
+            user: self.user,
+            owner: Uuid::now_v7(),
+        }
     }
 
     /// Script one `(phase name, attempt)`: every session of that attempt that has no script of
