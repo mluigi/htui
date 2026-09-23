@@ -43,12 +43,25 @@ impl LeaseTimes {
     /// box's sweep would adopt a run this process is still walking.
     #[must_use]
     pub fn from_app(app: &BTreeMap<String, Value>) -> Self {
-        todo!("{app:?}")
+        // A TTL too large for a `TimeDelta` (or for its half in milliseconds) is read as silence.
+        let ttl_seconds = app_positive(app, LEASE_TTL_KEY)
+            .filter(|seconds| TimeDelta::try_seconds(*seconds).is_some())
+            .unwrap_or(DEFAULT_LEASE_TTL_SECONDS);
+        let refresh_seconds =
+            app_positive(app, LEASE_REFRESH_KEY).unwrap_or(DEFAULT_LEASE_REFRESH_SECONDS);
+        let ttl = TimeDelta::seconds(ttl_seconds);
+        let refresh = if refresh_seconds >= ttl_seconds {
+            Duration::from_millis(ttl.num_milliseconds().unsigned_abs() / 2)
+        } else {
+            Duration::from_secs(refresh_seconds.unsigned_abs())
+        };
+        Self { ttl, refresh }
     }
 }
 
-/// Plan D106's positive-`i64` reader, `graph.rs`'s rule restated (blueprint F-U): absent, `null`,
-/// a string, a bool, zero and a negative all mean "not set".
+/// One `app_setting` value as a positive `i64`: `graph.rs`'s private rule, restated here rather
+/// than shared (blueprint F-U). Absent, `null`, a string, a bool, zero and a negative all mean
+/// "not set", so a planted `0` falls back to the default rather than pinning the lease to nothing.
 fn app_positive(app: &BTreeMap<String, Value>, key: &str) -> Option<i64> {
     app.get(key).and_then(Value::as_i64).filter(|n| *n > 0)
 }
@@ -73,8 +86,16 @@ where
     Fut: Future<Output = Result<bool, StoreError>>,
     C: Clock + ?Sized,
 {
-    let _ = (&mut refresh, clock, times);
-    todo!()
+    loop {
+        tokio::time::sleep(times.refresh).await;
+        match refresh(clock.now() + times.ttl).await {
+            Ok(true) => {}
+            Ok(false) => return Heartbeat::Abandoned,
+            Err(error) => {
+                tracing::warn!(%error, "lease refresh failed; beating again at the next interval");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -205,7 +226,10 @@ mod tests {
         let (calls, refresh) = scripted(&clock, vec![Ok(true), Ok(true), Ok(true)]);
         let outcome =
             tokio::time::timeout(Duration::from_secs(185), heartbeat(refresh, &clock, times)).await;
-        assert!(outcome.is_err(), "the heartbeat never returns on `Ok(true)`");
+        assert!(
+            outcome.is_err(),
+            "the heartbeat never returns on `Ok(true)`"
+        );
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 3, "a beat at 60 s, 120 s and 180 s");
         for (beat, (now, until)) in (1..).zip(calls.iter()) {
@@ -237,7 +261,11 @@ mod tests {
         );
         let outcome = heartbeat(refresh, &clock, default_times()).await;
         assert_eq!(outcome, Heartbeat::Abandoned);
-        assert_eq!(calls.lock().unwrap().len(), 3, "abandoned on the third beat");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "abandoned on the third beat"
+        );
         assert_eq!(clock.elapsed(), Duration::from_secs(180));
     }
 }
