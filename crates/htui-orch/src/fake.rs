@@ -45,6 +45,10 @@ use crate::verify::{Verifier, VerifierFuture, VerifyReport, VerifyRequest};
 /// The root every synthetic tree path hangs from. Nothing ever creates it.
 const FAKE_TREE_ROOT: &str = "/fake/trees";
 
+/// A reconcile stall: the 1-based call it takes, the signal that call raises, and the resume it
+/// waits for — `None` for a call that never answers (blueprint F-A, plan D145).
+type ReconcileStall = (u32, Arc<Notify>, Option<Arc<Notify>>);
+
 /// An [`Isolator`] that creates **no filesystem state at all**.
 ///
 /// The plan asks for a fake "creating no directory tree that outlives the test"; this one creates
@@ -101,7 +105,7 @@ pub struct FakeIsolator {
     /// Blueprint F-A: the 1-based [`reconcile`](Isolator::reconcile) call that never returns, and
     /// the signal it raises first; with a resume signal (plan D145), the call that waits for it
     /// instead. One-shot.
-    reconcile_stall: Mutex<Option<(u32, Arc<Notify>, Option<Arc<Notify>>)>>,
+    reconcile_stall: Mutex<Option<ReconcileStall>>,
 }
 
 /// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
@@ -321,7 +325,6 @@ impl FakeIsolator {
 
     /// The stall's signal and, for a pause, its resume, when `call` is the stalled one, taking
     /// them (one-shot).
-    #[allow(clippy::type_complexity)]
     fn reconcile_stall_at(&self, call: usize) -> Option<(Arc<Notify>, Option<Arc<Notify>>)> {
         let mut stall = self
             .reconcile_stall
