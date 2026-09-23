@@ -1382,10 +1382,12 @@ fn reconcile_message(step: StepId) -> String {
 /// on the checkout's first-parent line, from its `HEAD` read now down to `before`, whose second
 /// parent is `second` ([`merge_of`]) is `after` itself. The first two are cheap and checked first.
 ///
-/// An agent's own two-parent commit with that message is never on the primary's first-parent
-/// line (`merge --no-ff` puts the agent's tip on the second-parent side), so it answers `None`,
-/// as does a step's own commit, an agent's merge, or a merge for another step. So does a commit
-/// `checkout` does not hold: the merge exists only there, so this is always asked of the
+/// For a `worktree` or `copy` row, an agent's own two-parent commit with that message is never
+/// on the primary's first-parent line (`merge --no-ff` puts the agent's tip on the second-parent
+/// side), so it answers `None`, as does a step's own commit, an agent's merge, or a merge for
+/// another step. Under `local` and `shared_serialized` the agent commits onto that line itself
+/// and nothing merges, so the caller never asks for those rows. A commit `checkout` does not
+/// hold answers `None` too: the merge exists only there, so this is always asked of the
 /// checkout, never of a `copy` tree. A primary whose `HEAD` a user reset below the merge answers
 /// `None` too, and the caller then diffs `before..after`, a superset (R-33's residual).
 ///
