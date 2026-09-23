@@ -1019,10 +1019,13 @@ impl GixIsolator {
     /// label never moved past the base (blueprint A-2).
     ///
     /// Three refusals stand between the tip and the merge: no usable `git`, a dirty primary
-    /// (ANA-2 `:978-979`), and a primary that moved. The moved case is read twice before it is
-    /// refused, because blueprint H-3's crash between the merge and `record_commits` leaves a
-    /// primary whose `HEAD` is exactly the merge this call would make — its parents say so, and
-    /// the answer is that commit rather than a refusal.
+    /// (ANA-2 `:978-979`), and a primary that moved off the base's line. A primary that moved
+    /// *ahead* — the base is an ancestor of `HEAD`, as when another run on disjoint paths merged
+    /// first (plan D136, rule P) — is merged into on top of its `HEAD`; a real conflict is
+    /// [`git::merge_conflict`]'s refusal like any other. Before that, blueprint H-3's crash
+    /// between the merge and `record_commits` is looked for: a merge on `HEAD`'s first-parent
+    /// history back to the base whose second parent is the tip is this step's, even under a later
+    /// run's merge, and the answer is that commit rather than a second merge.
     async fn reconcile_isolated(
         &self,
         step: StepId,
@@ -1055,12 +1058,20 @@ impl GixIsolator {
         let read = local.clone();
         let head = blocking(move || git::head(&read)).await?;
         if head != tree.base_ref {
-            let read = local.clone();
-            let parents = blocking(move || git::head_parents(&read)).await?;
-            if parents == [tree.base_ref.as_str(), after.as_str()] {
-                return Ok(Some(head));
+            // D136: the merge this step would make may be `HEAD`, or lie under a later run's.
+            let (read, at, base, tip) = (
+                local.clone(),
+                head.clone(),
+                tree.base_ref.clone(),
+                after.clone(),
+            );
+            if let Some(merge) = blocking(move || git::merge_of(&read, &at, &base, &tip)).await? {
+                return Ok(Some(merge));
             }
-            return Err(IsolateError::Refused(primary_moved(&head)));
+            let (read, at, base) = (local.clone(), head.clone(), tree.base_ref.clone());
+            if !blocking(move || git::is_ancestor(&read, &base, &at)).await? {
+                return Err(IsolateError::Refused(primary_moved(&head)));
+            }
         }
 
         if tree.mode == Isolation::Copy {
@@ -1075,10 +1086,9 @@ impl GixIsolator {
             .await?;
         }
 
-        let merged = git::with_retry("merge", || {
-            git.merge_no_ff(&local, step, &tree.base_ref, &after)
-        })
-        .await?;
+        // D136: onto `HEAD`, which is the base itself or a descendant of it.
+        let merged =
+            git::with_retry("merge", || git.merge_no_ff(&local, step, &head, &after)).await?;
         Ok(Some(merged.commit))
     }
 

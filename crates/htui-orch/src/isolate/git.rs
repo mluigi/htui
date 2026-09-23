@@ -1262,8 +1262,23 @@ pub fn head_parents(path: &Path) -> Result<Vec<String>, IsolateError> {
 /// # Errors
 /// [`IsolateError::Git`] when either hash is not a hash, or the walk cannot read a commit.
 pub fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<bool, IsolateError> {
-    let _ = (path, ancestor, descendant);
-    todo!("plan D136")
+    let (wanted, tip) = (parse_oid(ancestor)?, parse_oid(descendant)?);
+    if wanted == tip {
+        return Ok(true);
+    }
+    let repo = open(path)?;
+    let walk = repo
+        .rev_walk([tip])
+        .all()
+        .map_err(|err| IsolateError::Git(format!("cannot walk from {descendant}: {err}")))?;
+    for info in walk {
+        let info =
+            info.map_err(|err| IsolateError::Git(format!("cannot walk from {descendant}: {err}")))?;
+        if info.id == wanted {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The merge on `head`'s first-parent history whose second parent is `after`, walking from
@@ -1281,8 +1296,23 @@ pub fn merge_of(
     base: &str,
     after: &str,
 ) -> Result<Option<String>, IsolateError> {
-    let _ = (path, head, base, after);
-    todo!("plan D136")
+    let (base, after) = (parse_oid(base)?, parse_oid(after)?);
+    let repo = open(path)?;
+    let mut at = parse_oid(head)?;
+    while at != base {
+        let commit = repo
+            .find_commit(at)
+            .map_err(|err| IsolateError::Git(format!("cannot find commit {at}: {err}")))?;
+        let parents: Vec<gix::ObjectId> = commit.parent_ids().map(gix::Id::detach).collect();
+        if parents.get(1) == Some(&after) {
+            return Ok(Some(at.to_hex().to_string()));
+        }
+        match parents.first() {
+            Some(first) => at = *first,
+            None => break,
+        }
+    }
+    Ok(None)
 }
 
 /// `Repository::is_dirty()` (`gix-0.87.1/src/status/mod.rs:168`), which is plan D24's predicate.
