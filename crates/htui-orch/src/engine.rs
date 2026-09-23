@@ -7311,6 +7311,64 @@ mod tests {
         );
     }
 
+    /// Plan D130's third branch: a `running` run whose lease a stranger held and let lapse, but
+    /// that executes on another box, cannot be taken here either. That is not `LeaseHeld`, since
+    /// no one holds the lease; the refusal names the status and the box rule instead. The engine
+    /// is this harness's, on a box the run does not execute on.
+    #[tokio::test]
+    async fn resume_on_another_box_s_run_with_a_lapsed_lease_is_not_lease_held() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        let now = harness.orch.clock.now();
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+        let adopted = harness
+            .orch
+            .store
+            .adopt_runs(ids::BOX, uuid::Uuid::now_v7(), now, now)
+            .await
+            .expect("MemStore adopts");
+        assert_eq!(
+            adopted.len(),
+            1,
+            "a stranger holds a lease that lapses at once"
+        );
+        let before = harness.orch.steps(run).await;
+
+        let graphs = harness.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let mut parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        parts.box_id = htui_core::model::BoxId::new();
+        let engine = super::Engine::new(parts);
+
+        let refused = engine
+            .resume(run)
+            .await
+            .expect_err("the run executes on another box");
+        assert!(
+            matches!(
+                refused,
+                EngineError::RunStatus {
+                    run: named,
+                    status: RunStatus::Running,
+                    expected: "running | awaiting_approval, executing on this box",
+                } if named == run
+            ),
+            "{refused}"
+        );
+        assert_eq!(harness.orch.steps(run).await, before, "nothing was walked");
+    }
+
     /// Blueprint A-1: `resume` takes the lease before it resolves or walks, so a run a live
     /// stranger holds is refused and nothing is advanced.
     #[tokio::test]
