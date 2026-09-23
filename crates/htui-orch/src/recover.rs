@@ -107,6 +107,10 @@ where
 // Adjudicating one `running` step (plan D90, D92, D93)
 // ---------------------------------------------------------------------------------------------
 
+/// The `fanout_index` of a fan-out slot's judge row (`docs/ANA-2.md` §4.5); `status.rs` keeps
+/// its own copy private.
+const JUDGE_FANOUT_INDEX: i32 = -1;
+
 /// Which of a slot's rows a step is, which decides what the sweep does with its answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
@@ -122,8 +126,13 @@ impl StepKind {
     /// `fanout_index == -1` → Judge; `phase.fan_out > 1` → Candidate; else Plain.
     #[must_use]
     pub const fn of(step: &RunStep, phase: &SnapshotPhase) -> Self {
-        let _ = (step, phase);
-        todo!()
+        if step.fanout_index == JUDGE_FANOUT_INDEX {
+            Self::Judge
+        } else if phase.fan_out > 1 {
+            Self::Candidate
+        } else {
+            Self::Plain
+        }
     }
 }
 
@@ -163,16 +172,39 @@ pub fn classify(
     output_present: bool,
     command_runs: &[CommandRun],
 ) -> (StepKind, Adjudication) {
-    let _ = (
-        step,
-        phase,
-        run_scope,
-        trees,
-        commits,
-        output_present,
-        command_runs,
-    );
-    todo!()
+    let kind = StepKind::of(step, phase);
+    let captured = run_scope.iter().all(|repo| {
+        commits
+            .iter()
+            .any(|row| row.repo_id == *repo && row.after_hash.is_some())
+    });
+    if output_present && (step.finished_at.is_some() || captured) {
+        let (verify, verify_exit_code) = verify_of(step, command_runs);
+        return (
+            kind,
+            Adjudication::Finished {
+                verify,
+                verify_exit_code,
+            },
+        );
+    }
+    if trees.iter().all(resettable) {
+        return (kind, Adjudication::Reset);
+    }
+    let trees = trees
+        .iter()
+        .map(|row| (row.repo_id, row.path.clone(), row.base_ref.clone()))
+        .collect();
+    (kind, Adjudication::NeverReset { trees })
+}
+
+/// ANA-2 §4.9 `:1298`: a separate tree is always resettable (the reset touches nothing, OQ-8); a
+/// checkout used in place is resettable only when stage 2 found it clean (M3 D24).
+const fn resettable(row: &RunStepTree) -> bool {
+    match row.mode {
+        Isolation::Worktree | Isolation::Copy => true,
+        Isolation::SharedSerialized | Isolation::Local => !row.dirty,
+    }
 }
 
 /// D91: the step's verify from rows. `finished_at` set → the row's own columns. Otherwise the last
@@ -187,8 +219,23 @@ pub fn verify_of(
     step: &RunStep,
     command_runs: &[CommandRun],
 ) -> (Option<VerifyOutcome>, Option<i32>) {
-    let _ = (step, command_runs);
-    todo!()
+    if step.finished_at.is_some() {
+        return (step.verify_outcome, step.verify_exit_code);
+    }
+    let last = command_runs
+        .iter()
+        .filter(|row| row.class == VERIFY_CLASS)
+        .max_by_key(|row| row.queued_at);
+    match last.map(|row| (row.status, row.exit_code)) {
+        Some((CommandRunStatus::Done, Some(0))) => (Some(VerifyOutcome::Pass), Some(0)),
+        Some((CommandRunStatus::Done, exit_code)) => (Some(VerifyOutcome::Fail), exit_code),
+        Some((CommandRunStatus::Failed, _)) => (Some(VerifyOutcome::Unavailable), None),
+        Some((
+            CommandRunStatus::Queued | CommandRunStatus::Running | CommandRunStatus::Cancelled,
+            _,
+        ))
+        | None => (None, None),
+    }
 }
 
 #[cfg(test)]
@@ -203,7 +250,7 @@ mod tests {
 
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{
-        BoxId, CommandRun, CommandRunId, CommandRunStatus, GraphSnapshot, Isolation, RepoId, RunId,
+        BoxId, CommandRun, CommandRunId, CommandRunStatus, GraphSnapshot, Isolation, RepoId,
         RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, StepStatus, VerifyOutcome,
     };
 
