@@ -346,6 +346,7 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
         mode,
         phases,
         settings,
+        scope: None,
     };
 
     let repos = store.repos(item.project_id).await?;

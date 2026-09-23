@@ -5808,6 +5808,7 @@ mod tests {
                 max_fan_out: 4,
                 max_agents_per_run: 6,
             },
+            scope: None,
         }
     }
 

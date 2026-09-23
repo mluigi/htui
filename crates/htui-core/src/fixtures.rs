@@ -1342,6 +1342,7 @@ fn demo_graph_snapshot() -> Value {
             max_fan_out: 4,
             max_agents_per_run: 8,
         },
+        scope: None,
     })
     .expect("a literal this module owns serialises")
 }

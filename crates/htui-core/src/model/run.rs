@@ -458,6 +458,12 @@ pub struct GraphSnapshot {
     pub phases: Vec<SnapshotPhase>,
     /// The project settings the resolution used.
     pub settings: SnapshotSettings,
+    /// Plan D79: §4.7's resolved scope, written by `graph::resolve` at `StartRun`. **Not** hashed
+    /// by `topology` (which reads `phases[]` alone) and [`GraphSnapshot::V`] is not bumped for it;
+    /// `None` on every snapshot written before milestone 5, read conservatively by
+    /// [`scope_of`](crate::model::overlap::scope_of).
+    #[serde(default)]
+    pub scope: Option<crate::model::overlap::RunScope>,
 }
 
 impl GraphSnapshot {

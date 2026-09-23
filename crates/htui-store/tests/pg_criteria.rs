@@ -705,6 +705,7 @@ fn race_run(item: ItemId) -> NewRun {
                 max_fan_out: 4,
                 max_agents_per_run: 6,
             },
+            scope: None,
         },
         repo_scope: Vec::new(),
         queued_at: Utc::now(),

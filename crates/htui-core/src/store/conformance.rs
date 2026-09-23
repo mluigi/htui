@@ -3775,6 +3775,7 @@ fn run_snapshot() -> GraphSnapshot {
             max_fan_out: 4,
             max_agents_per_run: 8,
         },
+        scope: None,
     }
 }
 
