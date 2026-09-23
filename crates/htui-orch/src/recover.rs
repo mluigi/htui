@@ -103,7 +103,8 @@ const MIN_RETRY: Duration = Duration::from_secs(1);
 /// written (`claim_run`, `take_lease`). Once refreshes have failed until
 /// `clock.now() >= last_until - times.refresh`, it returns `Expired`: the walk cannot prove its
 /// lease, and one `refresh` before it lapses is where it stops, so no other box's sweep adopts a
-/// run this walk still writes to. A retry never sleeps past that fence.
+/// run this walk still writes to. A retry never sleeps past that fence, and a refresh still
+/// pending at the fence (a stuck connection) is dropped there and read as `Expired` too.
 ///
 /// A single store error is not a taken lease: offline, the lease is left to expire and the
 /// reconnect sweep adjudicates (`docs/ANA-2.md:1325-1336`). Needs a runtime with the time driver
@@ -120,8 +121,15 @@ where
     let mut interval = times.refresh;
     loop {
         tokio::time::sleep(interval).await;
-        let until = clock.now() + times.ttl;
-        match refresh(until).await {
+        let now = clock.now();
+        let until = now + times.ttl;
+        // Plan D122: a refresh that hangs is given up at the fence, not waited on past it.
+        let left = (fence - now).to_std().unwrap_or(Duration::ZERO);
+        let Ok(answer) = tokio::time::timeout(left, refresh(until)).await else {
+            tracing::warn!("lease refresh still pending at the fence; the walk stops");
+            return Heartbeat::Expired;
+        };
+        match answer {
             Ok(true) => {
                 fence = until - margin;
                 interval = times.refresh;
