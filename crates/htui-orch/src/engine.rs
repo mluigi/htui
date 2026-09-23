@@ -2557,6 +2557,133 @@ mod tests {
         }
     }
 
+    /// Plants `project.settings.per_token_cap_run = cap_micros` on FEAT-3's project, keeping every
+    /// other key of the blob: `set_project_settings` replaces the whole document.
+    async fn cap_feat_3(harness: &Harness, cap_micros: i64) {
+        let project = harness.orch.item(ids::HTUI_FEAT_3).await.project_id;
+        let mut settings = harness
+            .orch
+            .store
+            .project_settings(project)
+            .await
+            .expect("MemStore never fails a read")
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        settings["per_token_cap_run"] = serde_json::json!(cap_micros);
+        harness.orch.store.set_project_settings(project, settings);
+    }
+
+    /// Starts FEAT-3 with `prd` and `plan` edited to `never`, so the walk admits position after
+    /// position with no human in it and every stage 1 past the first sees a run that has spent.
+    async fn start_ungated(harness: &Harness) -> (htui_core::model::RunId, crate::command::Rest) {
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" || phase.name == "plan" {
+                    phase.gate = Gate::Never;
+                }
+            })
+            .await;
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        (run, rest)
+    }
+
+    /// Plan D60 rule 5 **through `stage_one`'s wiring**, not `select::walk` by itself: the spend
+    /// is the run's own `Σ usage.cost_micros`, the cap the snapshot's `per_token_cap_run`, and the
+    /// minimum `app_setting.min_budget_for_new_attempt`. `prd` spends 600 of a 1000 cap, so
+    /// `plan`'s stage 1 sees 400 left against 500 required and refuses the run. Any of the three
+    /// inputs wired as `0`/`None` lets `plan` run instead.
+    #[tokio::test]
+    async fn stage_one_refuses_a_run_whose_remaining_budget_is_below_the_minimum() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        cap_feat_3(&harness, 1_000).await;
+        harness
+            .orch
+            .store
+            .set_app_setting("min_budget_for_new_attempt", serde_json::json!(500));
+        harness
+            .orch
+            .script("prd", 1, ScriptedStep::done_costing("the prd", 600));
+
+        let (run, rest) = start_ungated(&harness).await;
+        let expected = RunFailure::NoCandidateAgent {
+            phase: "plan".to_owned(),
+            detail: "claude (budget: 400 micros left, 500 required)".to_owned(),
+        };
+        assert_eq!(
+            (rest.run, rest.position, rest.failure.as_ref()),
+            (RunStatus::Failed, Some(1), Some(&expected))
+        );
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step.phase_name.as_str(), step.status))
+                .collect::<Vec<_>>(),
+            [("prd", StepStatus::Done)],
+            "`prd`'s stage 1 had no spend to compare, and `plan`'s refused before a step row"
+        );
+        assert_eq!(
+            steps[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("cost_micros"))
+                .and_then(serde_json::Value::as_i64),
+            Some(600),
+            "the spend stage 1 read is the recorder's sum"
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Blocked
+        );
+    }
+
+    /// The cap half of plan D60 rule 2 through the same wiring: `prd` and `plan` each spend 600 —
+    /// under the 1000 cap per session, so the recorder's own breach (plan D70) never fires — and
+    /// `implement`'s stage 1 sees the run at 1200 of 1000 and refuses it with no minimum set.
+    #[tokio::test]
+    async fn stage_one_refuses_a_run_whose_spend_reached_the_cap() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        cap_feat_3(&harness, 1_000).await;
+        harness
+            .orch
+            .script("prd", 1, ScriptedStep::done_costing("the prd", 600));
+        harness
+            .orch
+            .script("plan", 1, ScriptedStep::done_costing("the plan", 600));
+
+        let (run, rest) = start_ungated(&harness).await;
+        let expected = RunFailure::NoCandidateAgent {
+            phase: "implement".to_owned(),
+            detail: "claude (quota: cap reached (1200 of 1000 micros))".to_owned(),
+        };
+        assert_eq!(
+            (rest.run, rest.position, rest.failure.as_ref()),
+            (RunStatus::Failed, Some(2), Some(&expected))
+        );
+        assert_eq!(
+            harness
+                .orch
+                .steps(run)
+                .await
+                .iter()
+                .map(|step| (step.phase_name.as_str(), step.status))
+                .collect::<Vec<_>>(),
+            [("prd", StepStatus::Done), ("plan", StepStatus::Done)]
+        );
+    }
+
     /// Plan D60's note names only the skipped rows that **outrank** the choice, by position — so a
     /// skipped row below it is not a substitution, and one agent listed twice under two models is
     /// ranked by its row and not by its id.

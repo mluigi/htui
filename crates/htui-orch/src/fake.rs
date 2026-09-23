@@ -21,7 +21,7 @@ use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 use htui_agent::conformance::{Script, ScriptEvent, epoch};
 use htui_agent::driver::{AgentDriver, AgentSession, DriverCaps, DriverFuture, SessionSpec};
 use htui_agent::error::DriverError;
-use htui_agent::event::{DoneEvent, DriverEvent, ErrorEvent, StopReason};
+use htui_agent::event::{DoneEvent, DriverEvent, ErrorEvent, StopReason, UsageEvent};
 use htui_agent::fake::{FAKE_AGENT_NAME, FakeDriver};
 use htui_core::fixtures::ids;
 use htui_core::model::{
@@ -733,6 +733,29 @@ impl ScriptedStep {
     pub fn done_with_output(body: &str) -> Self {
         Self {
             script: Self::ends(StopReason::EndTurn),
+            output: Some(body.to_owned()),
+            spawn_failure: None,
+        }
+    }
+
+    /// The happy path with a price: one `usage` report of `cost_micros` USD micros, then `Done {
+    /// EndTurn }`, and a document with `body`.
+    ///
+    /// The recorder sums the report into `run_step.usage["cost_micros"]`, which is the figure
+    /// `select::run_spend` reads back — so this is how a case gives a run a spend for stage 1's
+    /// cap and budget rules (plan D60 rules 2 and 5) to compare against.
+    #[must_use]
+    pub fn done_costing(body: &str, cost_micros: i64) -> Self {
+        Self {
+            script: Script::one_turn(vec![
+                ScriptEvent::Emit(DriverEvent::Usage(UsageEvent {
+                    cost_micros: Some(cost_micros),
+                    ..UsageEvent::default()
+                })),
+                ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                })),
+            ]),
             output: Some(body.to_owned()),
             spawn_failure: None,
         }
