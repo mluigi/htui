@@ -87,6 +87,10 @@ const NOT_RESET: &str = "interrupted, tree not reset";
 /// N2's reason for a tree stage 2 recorded dirty (plan D115).
 const DIRTY_AT_START: &str = "dirty at step start";
 
+/// N2's reason when plan D131 completes a D93 park a crash cut short: the reason the sweep had
+/// was in the note it never wrote, and a clean tree says it was a refusal, not a dirty start.
+const PARK_CUT_SHORT: &str = "the sweep that failed the step stopped before it parked the run";
+
 /// The `app_setting` key of stage 1's budget rule (plan D60 rule 5, OQ-6). Unseeded: absent is `0`.
 const MIN_BUDGET_KEY: &str = "min_budget_for_new_attempt";
 
@@ -609,6 +613,23 @@ where
         phase: &SnapshotPhase,
         now: DateTime<Utc>,
     ) -> Result<Rest, EngineError> {
+        match self.rejection(run, snapshot, step, phase, now).await? {
+            Some(rest) => Ok(rest),
+            None => self.run_to_rest(run.id).await,
+        }
+    }
+
+    /// [`Self::after_rejection`] up to the walk: `None` is the review loop's `Resumed`, and the
+    /// caller walks on. Plan D131 reaches it for a rejection a crash left unfinished, with the
+    /// step already `failed`.
+    async fn rejection(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Rest>, EngineError> {
         let loopable =
             phase.name == REVIEW_PHASE && gate::loop_target(snapshot, step.position).is_some();
         if !loopable {
@@ -627,34 +648,34 @@ where
                 )
                 .await?;
             self.cleanup_run(run.id).await?;
-            return Ok(Rest {
+            return Ok(Some(Rest {
                 run: RunStatus::Failed,
                 position: Some(step.position),
                 failure: Some(RunFailure::Rejected {
                     phase: phase.name.clone(),
                 }),
-            });
+            }));
         }
 
         let run = self.run(run.id).await?;
         let ctx = self.gate_context(&run, snapshot);
         match gate::review_loop(&ctx, step).await? {
-            LoopOutcome::Resumed { .. } => self.run_to_rest(run.id).await,
-            LoopOutcome::Escalated { attempts, .. } => Ok(Rest {
+            LoopOutcome::Resumed { .. } => Ok(None),
+            LoopOutcome::Escalated { attempts, .. } => Ok(Some(Rest {
                 run: RunStatus::AwaitingApproval,
                 position: Some(step.position),
                 failure: Some(RunFailure::ReviewLoopExhausted(attempts)),
-            }),
+            })),
             LoopOutcome::NoTarget => {
                 // `review_loop` failed the run itself (`gate.rs`'s three `NoTarget` sites), so
                 // this is a terminal `finish_run` the engine did not write and still owes a
                 // cleanup for (plan D36).
                 self.cleanup_run(run.id).await?;
-                Ok(Rest {
+                Ok(Some(Rest {
                     run: RunStatus::Failed,
                     position: Some(step.position),
                     failure: Some(RunFailure::NoLoopTarget),
-                })
+                }))
             }
         }
     }
@@ -1145,6 +1166,8 @@ where
     /// 2. Every `running` step in `(position, attempt, fanout_index)` order (D90-D95).
     /// 3. The run's status re-derived from its steps (D96): a waiting step under a `running` run
     ///    completes the park.
+    /// 4. A `failed` latest step under a `running` run is finished as unfinished gate work
+    ///    (D131, [`Self::settle_failed`]).
     ///
     /// An `interrupt_step` that answers `Ok(false)` found the step moved by another writer; that
     /// step is skipped and step 3 re-derives.
@@ -1194,6 +1217,20 @@ where
                 .await?;
             let row = self.run(run.id).await?;
             return Ok(Next::Parked(self.resting(&row).await?));
+        }
+        // Plan D131: a `failed` latest step under a `running` run is a failure whose next write
+        // (`admit`, the park, `finish_run`) a crash cut off; the walk would only rest on it.
+        if row.status == RunStatus::Running
+            && let Cursor::Rest {
+                step,
+                status: StepStatus::Failed,
+            } = cursor(&snapshot, &steps)
+            && let Some(failed) = steps.iter().find(|candidate| candidate.id == step)
+        {
+            return Ok(self
+                .settle_failed(&row, &snapshot, failed)
+                .await?
+                .map_or(Next::Walk, Self::landed));
         }
         Ok(Next::Walk)
     }
@@ -1414,11 +1451,7 @@ where
                 .await?
                 .map(Self::landed));
         }
-        let body = format!(
-            "{INTERRUPTED}: retry budget spent: step {} (`{name}` attempt {attempt}); trees: \
-             {listed}; the run is parked",
-            step.id
-        );
+        let body = spent_note(step, phase, &listed);
         let rest = self.park_interrupted(run, step, phase, true, body).await?;
         Ok(Some(Next::Parked(rest)))
     }
@@ -1443,16 +1476,75 @@ where
             // Another writer moved the step; D96's re-derivation owns what is left.
             return Ok(None);
         }
-        let body = format!(
-            "{NOT_RESET}: step {} (`{}` attempt {}); trees: {}; reason: {reason}; the run is \
-             parked for a human",
-            step.id,
-            phase.name,
-            step.attempt,
-            trees_text(step.id, trees, labelled)
-        );
+        let body = not_reset_note(step, phase, &trees_text(step.id, trees, labelled), reason);
         let rest = self.park_interrupted(run, step, phase, false, body).await?;
         Ok(Some(Next::Parked(rest)))
+    }
+
+    /// Plan D131 (review H2): the gate work a crash cut short after `step`, the latest step at
+    /// the cursor of a `running` run, was failed — `retry_or_fail`'s and the sweep's
+    /// `running -> failed` are each followed by a write (`admit`, the park, `finish_run`) that
+    /// the crash never made, and without this the cursor rests on the `failed` row with the run
+    /// `running` for ever. What the step's own columns say decides, in this order:
+    ///
+    /// 1. `gate_outcome = rejected`: a human's (or a review's) rejection, which ends the run or
+    ///    runs the review loop exactly as `answer_gate` does ([`Self::rejection`]). Retrying a
+    ///    step a human turned down would be the one wrong answer.
+    /// 2. `gate_note = interrupted, tree not reset`: D93's park, whatever the budget says; a tree
+    ///    the sweep left alone is never walked over.
+    /// 3. Budget left: `admit` the next attempt, as `retry_or_fail` and D92 both would have.
+    /// 4. `gate_note = interrupted`: D94's out-of-budget park.
+    /// 5. Otherwise `finish_run(failed)` and plan D36's cleanup.
+    ///
+    /// `Some(rest)` is where the run came to rest; `None` means the walk goes on.
+    async fn settle_failed(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+    ) -> Result<Option<Rest>, EngineError> {
+        let phase = Self::phase_at(run.id, snapshot, step.position)?;
+        let now = self.now();
+        if step.gate_outcome == Some(GateOutcome::Rejected) {
+            return self.rejection(run, snapshot, step, &phase, now).await;
+        }
+        let note = step.gate_note.as_deref().unwrap_or_default();
+        let not_reset = note == NOT_RESET;
+        if !not_reset && may_attempt(step.attempt + 1, phase.retry_limit) {
+            return self.admit(run, snapshot, &phase, step.attempt + 1).await;
+        }
+        if note.starts_with(INTERRUPTED) {
+            let trees = self.parts.store.step_trees(step.id).await?;
+            let listed = trees_text(step.id, &trees, &[]);
+            let body = if not_reset {
+                let reason = if trees.iter().any(|tree| tree.dirty) {
+                    DIRTY_AT_START
+                } else {
+                    PARK_CUT_SHORT
+                };
+                not_reset_note(step, &phase, &listed, reason)
+            } else {
+                spent_note(step, &phase, &listed)
+            };
+            return self
+                .park_interrupted(run, step, &phase, !not_reset, body)
+                .await
+                .map(Some);
+        }
+        let failure = format!(
+            "retry budget spent: step `{}` attempt {} failed",
+            phase.name, step.attempt
+        );
+        self.parts
+            .store
+            .finish_run(run.id, RunStatus::Failed, Some(&failure), now)
+            .await?;
+        self.cleanup_run(run.id).await?;
+        Ok(Some(Rest {
+            run: RunStatus::Failed,
+            position: Some(step.position),
+            failure: None,
+        }))
     }
 
     /// Plan D94: park a run whose `step` the sweep already failed — `park_run`'s order: the run
@@ -1532,6 +1624,20 @@ where
                         position: None,
                         failure: None,
                     });
+                }
+                // Plan D131: a `failed` latest step under a `running` run is gate work a crash
+                // cut short, not a rest.
+                Cursor::Rest {
+                    step,
+                    status: StepStatus::Failed,
+                } => {
+                    let Some(step) = steps.into_iter().find(|candidate| candidate.id == step)
+                    else {
+                        continue;
+                    };
+                    if let Some(rest) = self.settle_failed(&row, &snapshot, &step).await? {
+                        return Ok(rest);
+                    }
                 }
                 Cursor::Rest { .. } => return self.resting(&row).await,
                 Cursor::Create { position, attempt } => {
@@ -4446,6 +4552,24 @@ fn skipped_above<'w>(
 /// Blueprint §9.3's `{tree}, …`: `{repo} {path} before_hash {base_ref}` per row, plus
 /// ` labelled htui/{step} at {head}` when the reset named a label in that repo. A step with no
 /// tree row (a crash before `upsert_step_tree`) reads `none`.
+/// N3 (plan D115): an interrupted step whose trees were reset, parked with its budget spent.
+fn spent_note(step: &RunStep, phase: &SnapshotPhase, listed: &str) -> String {
+    format!(
+        "{INTERRUPTED}: retry budget spent: step {} (`{}` attempt {}); trees: {listed}; the run \
+         is parked",
+        step.id, phase.name, step.attempt
+    )
+}
+
+/// N2 (plan D115): an interrupted step whose trees were left exactly as found.
+fn not_reset_note(step: &RunStep, phase: &SnapshotPhase, listed: &str, reason: &str) -> String {
+    format!(
+        "{NOT_RESET}: step {} (`{}` attempt {}); trees: {listed}; reason: {reason}; the run is \
+         parked for a human",
+        step.id, phase.name, step.attempt
+    )
+}
+
 fn trees_text(step: StepId, trees: &[RunStepTree], labelled: &[(RepoId, String)]) -> String {
     if trees.is_empty() {
         return "none".to_owned();
