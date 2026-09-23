@@ -14,10 +14,12 @@
 use chrono::TimeDelta;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    AgentId, CommandRun, CommandRunStatus, Gate, GateOutcome, Item, ItemId, ItemPatch, NewRepo,
-    NewStepGraph, PhaseId, PhasePatch, RepoId, Run, RunId, RunMode, RunStatus, RunStep, Status,
-    StepGraphId, StepGraphPhase, StepId, StepStatus, VerifyOutcome,
+    AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, Gate, GateOutcome, Item, ItemId,
+    ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Run, RunId, RunMode, RunStatus,
+    RunStep, Status, StepGraphId, StepGraphPhase, StepId, StepStatus, VerifyOutcome,
 };
+use htui_core::model::{Quota, QuotaSource, Spend};
+use htui_core::prompt::DiffBlock;
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
 use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
@@ -137,9 +139,9 @@ impl Orchestrate for FakeOrchestrator {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Eighteen, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_eighteen` and out of crate by `tests/fake_conformance.rs` (T5) — because
-/// a binding that silently ran seventeen of them would still be green.
+/// Twenty-three, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_twenty_three` and out of crate by `tests/fake_conformance.rs` — because
+/// a binding that silently ran twenty-two of them would still be green.
 ///
 /// Seven are `docs/ANA-2.md` §12's validation criteria (1, 2, 3, 5, 6, 7 and 13's command half);
 /// four are contract lines
@@ -149,7 +151,10 @@ impl Orchestrate for FakeOrchestrator {
 /// manual-mode milestone and did; one is plan D5's intermediate position, which had a topology
 /// digest pinning it and no walk executing it; the last three are milestone 3's — the settle's two
 /// readings of a `verify_command` that ran (`fail`) and one that could not (`unavailable`), and
-/// `CancelRun`, which criterion 13 is stated in terms of (plan D45).
+/// `CancelRun`, which criterion 13 is stated in terms of (plan D45). Milestone 4 adds five: stage 1
+/// as `R-AGT-8`'s walk selecting an `allowed_warning` row and falling through a skipped one (plan
+/// D60, D61), both halves of the empty-candidate refusal (plan D62), and the loop's forwarded
+/// `verify_failure` and `previous_diff` (plan D67).
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -194,6 +199,17 @@ pub const CASES: &[&str] = &[
     // Criterion 13 (`:2120`) as far as the fake reaches it (the trees are `tests/gix_isolator.rs`'s
     // half): cancelling a run cancels every live step and cleans up exactly once.
     "cancel_cleans_up_once",
+    // Milestone 4, plan D60/D61: stage 1 is `R-AGT-8`'s walk, and PRD D3's `allowed_warning` is a
+    // quota status it selects.
+    "allowed_warning_candidate_is_selected",
+    // Plan D60: a skipped candidate falls through to the next, and the substitution is a note.
+    "a_skipped_candidate_falls_through_to_the_next",
+    // Plan D62, rung 4 at `StartRun`: no run row, the item `blocked`, a note naming the phase.
+    "no_candidate_agent_blocks_the_item",
+    // Plan D62, stage 1: a walk that skips every candidate fails the run `no_candidate_agent`.
+    "every_candidate_skipped_refuses_the_run",
+    // Plan D67: a second attempt's prompt carries `verify_failure` and `previous_diff`.
+    "a_second_attempt_carries_verify_failure_and_previous_diff",
 ];
 
 /// Run one case by name.
@@ -233,6 +249,19 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
         "verify_fail_settles_failed" => verify_fail_settles_failed(harness).await,
         "verify_unavailable_never_fails" => verify_unavailable_never_fails(harness).await,
         "cancel_cleans_up_once" => cancel_cleans_up_once(harness).await,
+        "allowed_warning_candidate_is_selected" => {
+            allowed_warning_candidate_is_selected(harness).await;
+        }
+        "a_skipped_candidate_falls_through_to_the_next" => {
+            a_skipped_candidate_falls_through_to_the_next(harness).await;
+        }
+        "no_candidate_agent_blocks_the_item" => no_candidate_agent_blocks_the_item(harness).await,
+        "every_candidate_skipped_refuses_the_run" => {
+            every_candidate_skipped_refuses_the_run(harness).await;
+        }
+        "a_second_attempt_carries_verify_failure_and_previous_diff" => {
+            a_second_attempt_carries_verify_failure_and_previous_diff(harness).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1944,6 +1973,286 @@ fn harness_cleanups<O: Orchestrate>(orch: &O) -> u32 {
     orch.isolator().cleanups()
 }
 
+// -- milestone 4: stage 1 is `R-AGT-8`'s walk (plan D60–D62, D67) --------------------------------
+
+/// Latches an ANA-4 §7 quota document with `status` onto `agent`'s `agent_box` row on the fixture
+/// box, creating the row first: `set_agent_box_quota` is the column's only writer and refuses a
+/// row that is not there (`crates/htui-core/src/store/traits.rs:295-305`).
+///
+/// # Panics
+/// When either write is refused, which means the fixture moved under the case.
+async fn latch_quota<O: Orchestrate>(orch: &O, agent: AgentId, status: &str) {
+    let now = orch.clock().now();
+    orch.store()
+        .upsert_agent_box(&AgentBox {
+            agent_id: agent,
+            box_id: ids::BOX,
+            enabled: true,
+            version: None,
+            path: None,
+            probed_at: None,
+            quota: None,
+            quota_at: None,
+            updated_at: now,
+            probe: None,
+        })
+        .await
+        .expect("the fixture box takes an `agent_box` row");
+    let quota = Quota {
+        source: QuotaSource::AcpMetaRateLimit,
+        billing: Billing::Subscription,
+        status: Some(status.to_owned()),
+        exhausted: false,
+        windows: Vec::new(),
+        spend: Spend::default(),
+        observed_at: now,
+    };
+    orch.store()
+        .set_agent_box_quota(agent, ids::BOX, quota.to_value(), now)
+        .await
+        .expect("the row was just written");
+}
+
+/// The item's notes that record a stage-1 substitution (plan D60), by their fixed opening.
+async fn substitution_notes<O: Orchestrate>(orch: &O, item: ItemId) -> Vec<String> {
+    notes_of(orch, item)
+        .await
+        .into_iter()
+        .filter(|body| body.starts_with("stage 1 at "))
+        .collect()
+}
+
+/// The section names of a step's seq-0 `prompt` event, as `Recorder::record_prompt` stored them.
+///
+/// # Panics
+/// When the step recorded no session, which is what the caller is asserting it did.
+async fn prompt_sections<O: Orchestrate>(orch: &O, step: StepId) -> Vec<String> {
+    let events = orch
+        .store()
+        .step_events(step)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the step recorded its session");
+    let prompt = events
+        .iter()
+        .find(|event| event.seq == 0)
+        .expect("seq 0 is the prompt");
+    prompt.payload["sections"]
+        .as_array()
+        .expect("the prompt payload carries its sections")
+        .iter()
+        .filter_map(|section| section["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Plan D61 through the walk that reads it (plan D60): PRD D3's `allowed_warning` is a quota
+/// status stage 1 **selects**, so the only candidate runs and parks at its gate with no
+/// substitution to report. `exhausted`, a full window and every other status still skip; the
+/// next case pins one of them.
+async fn allowed_warning_candidate_is_selected<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    latch_quota(&orch, ids::AGENT_CLAUDE, "allowed_warning").await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(0), None),
+        "`allowed_warning` is selectable, so `prd` ran and parked at its `always` gate"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(steps.len(), 1);
+    assert_eq!(
+        (steps[0].agent_id, steps[0].status),
+        (Some(ids::AGENT_CLAUDE), StepStatus::AwaitingApproval)
+    );
+    assert_eq!(
+        substitution_notes(&orch, ids::HTUI_FEAT_3).await,
+        Vec::<String>::new(),
+        "nothing was skipped, so nothing was substituted"
+    );
+}
+
+/// Plan D60: the walk skips a `rejected` first candidate and the selector takes the next one — and
+/// the substitution is never silent (`R-ORCH-10`): one `item_note` names the skipped row, its
+/// reason, and the row that ran instead.
+async fn a_skipped_candidate_falls_through_to_the_next<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    orch.with_candidates(
+        "prd",
+        vec![
+            (ids::AGENT_CLAUDE, "sonnet"),
+            (ids::AGENT_AGY, "gemini-3.7-flash-high"),
+        ],
+    );
+    latch_quota(&orch, ids::AGENT_CLAUDE, "rejected").await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0))
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(steps.len(), 1);
+    assert_eq!(
+        (steps[0].agent_id, steps[0].model.as_deref()),
+        (Some(ids::AGENT_AGY), Some("gemini-3.7-flash-high")),
+        "the second candidate ran"
+    );
+    assert_eq!(
+        substitution_notes(&orch, ids::HTUI_FEAT_3).await,
+        [
+            "stage 1 at `prd` attempt 1 (candidate 0): skipped claude (quota: status rejected); \
+          chose agy/gemini-3.7-flash-high"
+        ],
+        "exactly one note, naming both rows (plan D60)"
+    );
+}
+
+/// Plan D62, rung 4 at `StartRun`: `graph::resolve` finds no candidate, so no run row is created —
+/// and the refusal is not invisible (invariant 7): the item moves `open -> blocked` and carries a
+/// note naming the phase before the error is returned.
+async fn no_candidate_agent_blocks_the_item<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    orch.with_candidates("prd", Vec::new());
+    let runs_before = orch
+        .store()
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .len();
+
+    let refused = orch
+        .dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        })
+        .await
+        .expect_err("rung 4 refuses before a run row exists");
+    assert!(
+        matches!(
+            &refused,
+            EngineError::Resolve(crate::graph::ResolveError::NoCandidate { phase }) if phase == "prd"
+        ),
+        "{refused}"
+    );
+    assert_eq!(
+        orch.store()
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len(),
+        runs_before,
+        "no run row was created"
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Blocked
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes
+            .iter()
+            .any(|body| body == "no_candidate_agent: phase `prd`"),
+        "the rung-4 note has no detail suffix: {notes:?}"
+    );
+}
+
+/// Plan D62, stage 1: the walk skips every candidate for a reason other than the inline-approval
+/// interlock, so the run fails `no_candidate_agent` with each skip named, in blueprint H-16's
+/// order — the item is `blocked` before the run is failed — and no step row exists.
+async fn every_candidate_skipped_refuses_the_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    latch_quota(&orch, ids::AGENT_CLAUDE, "rejected").await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    let expected = RunFailure::NoCandidateAgent {
+        phase: "prd".to_owned(),
+        detail: "claude (quota: status rejected)".to_owned(),
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.as_ref()),
+        (RunStatus::Failed, Some(0), Some(&expected))
+    );
+    assert_eq!(
+        run_of(&orch, run).await.failure.as_deref(),
+        Some("no_candidate_agent: phase `prd`; claude (quota: status rejected)")
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Blocked,
+        "blocked before the run failed (blueprint H-16), or it would read `failed`"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.iter().any(|body| *body == expected.to_string()),
+        "the refusal is a note a human reads: {notes:?}"
+    );
+    assert!(
+        steps_of(&orch, run).await.is_empty(),
+        "stage 1 refuses before a step row exists"
+    );
+}
+
+/// Plan D67 (M3 D32's forward): a `never` phase whose attempt 1 fails its `verify_command` retries,
+/// and attempt 2's prompt carries both loop sections — `verify_failure` from attempt 1's
+/// `command_run` row, and `previous_diff` from `Isolator::diff` over attempt 1's rows.
+///
+/// **The phase renders with the `implement` template.** The seeded `prd` body has neither
+/// placeholder (`crates/htui-core/src/prompt/defaults.rs:29-44`) and a section with no placeholder
+/// is not rendered, so a `prd` prompt could never show them; `implement`'s body has both (`:66-67`).
+async fn a_second_attempt_carries_verify_failure_and_previous_diff<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::Never;
+            phase.retry_limit = 1;
+            phase.verify_command = Some("cargo test".to_owned());
+            phase.template_name = "implement".to_owned();
+        }
+    })
+    .await;
+    orch.verifier().script_report(FakeVerifier::fail(1));
+    orch.isolator().script_diff(Some(DiffBlock {
+        range: "fake:base:1..fake:after:1".to_owned(),
+        stat: " src/lib.rs | 2 +-".to_owned(),
+        diff: "diff --git a/src/lib.rs b/src/lib.rs\n".to_owned(),
+    }));
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "attempt 2 passed (the verifier has nothing left to fail) and `plan` parked"
+    );
+    let steps = steps_of(&orch, run).await;
+    let first = at(&steps, 0, 1);
+    assert_eq!(
+        (first.status, first.verify_outcome),
+        (StepStatus::Failed, Some(VerifyOutcome::Fail))
+    );
+
+    let first_sections = prompt_sections(&orch, first.id).await;
+    assert!(
+        !first_sections
+            .iter()
+            .any(|name| name == "verify_failure" || name == "previous_diff"),
+        "attempt 1 has nothing to forward: {first_sections:?}"
+    );
+    let second_sections = prompt_sections(&orch, at(&steps, 0, 2).id).await;
+    for name in ["verify_failure", "previous_diff"] {
+        assert!(
+            second_sections.iter().any(|section| section == name),
+            "attempt 2's prompt carries `{name}`: {second_sections:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -1961,17 +2270,20 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_eighteen() {
+    fn cases_are_unique_and_twenty_three() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            18,
+            23,
             "seven ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam, the three \
-             gate-table cells only an edited gate reaches, plan D5's intermediate position and \
-             milestone 3's two verify outcomes"
+             gate-table cells only an edited gate reaches, plan D5's intermediate position, \
+             milestone 3's two verify outcomes and `CancelRun`, and milestone 4's five: the \
+             `allowed_warning` selection, the fall-through to the next candidate, the rung-4 \
+             refusal at `StartRun`, the stage-1 walk that skips every candidate, and the second \
+             attempt's forwarded `verify_failure` and `previous_diff`"
         );
     }
 
