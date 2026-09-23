@@ -376,6 +376,9 @@ where
 
     /// Answers one of ANA-2 §6.2's three verbs and walks the run to its next rest.
     ///
+    /// The walk runs under the lease's heartbeat, which sleeps on `tokio::time`: the caller needs
+    /// a Tokio runtime with the time driver enabled (blueprint H-3).
+    ///
     /// # Errors
     /// Every [`EngineError`]: the enabling guards of [`crate::command`], the store's refusals, the
     /// resolver's, the assembler's, the recorder's and the driver's.
@@ -450,6 +453,9 @@ where
     /// Plan D84: `claim_run`, then the leased walk — `start_run`'s tail, factored out so a run a
     /// refusal left `queued` can be re-attempted. No [`Command`] variant carries it (ANA-2 §6.2
     /// has none); milestone 6 decides the verb that calls it.
+    ///
+    /// The walk runs under the lease's heartbeat, which sleeps on `tokio::time`: the caller needs
+    /// a Tokio runtime with the time driver enabled (blueprint H-3).
     ///
     /// # Errors
     /// [`EngineError::ClaimRefused`] naming the rule when `claim_run` does not admit the run,
@@ -878,6 +884,12 @@ where
     /// `Isolator::release` drops this process's guards for the run (D99), and the caller gets
     /// [`EngineError::LeaseLost`]. Generic over the walk's output, so one wrapper serves every
     /// command's post-unpark tail (blueprint F-M).
+    ///
+    /// **A runtime with a time driver is required** (blueprint H-3): the heartbeat sleeps on
+    /// `tokio::time::sleep`, so every engine entry that walks — [`Self::dispatch`],
+    /// [`Self::claim`] and [`Self::resume`] — panics outside a Tokio runtime built with the time
+    /// driver enabled. Every shipped harness is `#[tokio::test]`; milestone 6's caller must build
+    /// its runtime with `enable_time` (or `enable_all`).
     async fn walk_leased<T, F>(&self, run: RunId, walk: F) -> Result<T, EngineError>
     where
         F: Future<Output = Result<T, EngineError>>,
@@ -1055,6 +1067,8 @@ where
     /// [`EngineError::LeaseHeld`] with nothing resolved or walked. The walk itself runs under the
     /// heartbeat. Milestone 5's sweep adopts and adjudicates but does not walk; this is the walk
     /// it hands a `Walk` run off to, and milestone 6's `run_worker` is the caller that does.
+    /// That heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
+    /// driver enabled (blueprint H-3).
     ///
     /// # Errors
     /// [`EngineError::LeaseHeld`], [`EngineError::LeaseLost`], and every other [`EngineError`].
