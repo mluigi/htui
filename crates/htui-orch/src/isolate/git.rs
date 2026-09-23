@@ -2029,8 +2029,8 @@ mod tests {
         assert!(!super::is_dirty(dir.path()).expect("status reads"), "D24");
     }
 
-    /// D121: an untracked file the base does not track survives the reset and is not reported,
-    /// neither is an ignored one; `HEAD`'s own tree does not decide, the base's does.
+    /// D121: an untracked file the base does not track survives the reset and is not reported;
+    /// `HEAD`'s own tree does not decide, the base's does.
     #[test]
     fn untracked_paths_base_tracks_ignores_a_path_the_base_does_not_track() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -2061,6 +2061,117 @@ mod tests {
         assert_eq!(
             super::untracked_paths_base_tracks(dir.path(), &base).expect("status reads"),
             vec!["f/x".to_owned()]
+        );
+    }
+
+    /// D121: an untracked file where the base tracks a directory is lost too, because the reset
+    /// replaces the file with the base's directory; the full path is reported whatever its kind.
+    #[test]
+    fn untracked_paths_base_tracks_sees_a_file_at_a_path_the_base_tracks_as_a_directory() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        repo_with_one_commit(dir.path());
+        let repository = gix::open(dir.path()).expect("the repository opens");
+        let head = repository.head_commit().expect("HEAD has a commit");
+        let agent_tree = head.tree().expect("the commit has a tree").id;
+        let blob = repository
+            .write_blob(b"inside\n")
+            .expect("the blob is written")
+            .detach();
+        let sub = repository
+            .write_object(gix::objs::Tree {
+                entries: vec![gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: "x".into(),
+                    oid: blob,
+                }],
+            })
+            .expect("the subtree is written")
+            .detach();
+        let mut entries = head
+            .tree()
+            .expect("the commit has a tree")
+            .iter()
+            .map(|entry| {
+                let entry = entry.expect("the tree decodes");
+                gix::objs::tree::Entry {
+                    mode: entry.mode(),
+                    filename: entry.filename().to_owned(),
+                    oid: entry.oid().to_owned(),
+                }
+            })
+            .collect::<Vec<_>>();
+        entries.push(gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Tree.into(),
+            filename: "d".into(),
+            oid: sub,
+        });
+        entries.sort();
+        let base_tree = repository
+            .write_object(gix::objs::Tree { entries })
+            .expect("the tree is written")
+            .detach();
+        let who = gix::actor::SignatureRef {
+            name: gix::bstr::BStr::new(b"test"),
+            email: gix::bstr::BStr::new(b"test@localhost"),
+            time: "1600000000 +0000",
+        };
+        let base = repository
+            .commit_as(
+                who,
+                who,
+                "HEAD",
+                "base tracks d/x",
+                base_tree,
+                vec![head.id],
+            )
+            .expect("the commit is written")
+            .detach();
+        // The agent deletes `d/`: HEAD's tree and the index go back to the one without it.
+        repository
+            .commit_as(
+                who,
+                who,
+                "HEAD",
+                "the agent deletes d",
+                agent_tree,
+                vec![base],
+            )
+            .expect("the commit is written");
+        repository
+            .index_from_tree(&agent_tree)
+            .expect("an index is built from the tree")
+            .write(gix::index::write::Options::default())
+            .expect("the index is written");
+
+        std::fs::write(dir.path().join("d"), "the maintainer's notes\n").expect("written");
+        assert_eq!(
+            super::untracked_paths_base_tracks(dir.path(), &base.to_hex().to_string())
+                .expect("status reads"),
+            vec!["d".to_owned()]
+        );
+    }
+
+    /// D121: an ignored file is not reported even at a path the base tracks; only untracked,
+    /// not-ignored files are the maintainer's work a reset must not overwrite.
+    #[test]
+    fn untracked_paths_base_tracks_skips_an_ignored_file_at_a_path_the_base_tracks() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        repo_with_one_commit(dir.path());
+        let base = commit_file(dir.path(), "target", "tracked\n", "base tracks target");
+        commit_removal(dir.path(), "target", "the agent deletes target");
+        commit_file(
+            dir.path(),
+            ".gitignore",
+            "target\n",
+            "the agent ignores target",
+        );
+        std::fs::write(dir.path().join("target"), "built\n").expect("written");
+
+        assert!(
+            super::untracked_paths_base_tracks(dir.path(), &base)
+                .expect("status reads")
+                .is_empty(),
+            "an ignored file is not reported"
         );
     }
 
