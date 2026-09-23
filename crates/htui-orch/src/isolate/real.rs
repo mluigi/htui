@@ -1154,6 +1154,8 @@ impl GixIsolator {
         if blocking(move || git::is_dirty(&read)).await? {
             return Err(IsolateError::Refused(dirty_primary_tree()));
         }
+        #[cfg(test)]
+        self.probe_reconcile_admin(tree.repo_id);
         let read = local.clone();
         let head = blocking(move || git::head(&read)).await?;
         if head != tree.base_ref {
@@ -1194,6 +1196,8 @@ impl GixIsolator {
         // D136: onto `HEAD`, which is the base itself or a descendant of it.
         let merged =
             git::with_retry("merge", || git.merge_no_ff(&local, step, &head, &after)).await?;
+        #[cfg(test)]
+        self.probe_reconcile_admin(tree.repo_id);
         Ok(Some(merged.commit))
     }
 
