@@ -1121,6 +1121,12 @@ impl GixIsolator {
             if !blocking(move || git::is_ancestor(&read, &base, &at)).await? {
                 return Err(IsolateError::Refused(primary_moved(&head)));
             }
+            // `HEAD` already holds `after` with no merge naming it (the branch was fast-forwarded
+            // onto the step): `merge --no-ff` would make no commit, so this is refused as before.
+            let (read, at, tip) = (local.clone(), head.clone(), after.clone());
+            if blocking(move || git::is_ancestor(&read, &tip, &at)).await? {
+                return Err(IsolateError::Refused(primary_moved(&head)));
+            }
         }
 
         if tree.mode == Isolation::Copy {

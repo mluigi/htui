@@ -638,7 +638,8 @@ impl Cli {
     /// checkout, under the four identity variables.
     ///
     /// Exit 0 is checked against `gix`: the new `HEAD`'s parents must be exactly
-    /// `[before, after]`. Exit 1 is where the care goes — it is both "conflict" and "somebody
+    /// `[before, after]`, `before` being the primary's `HEAD` at the call — the step's base, or a
+    /// descendant of it once another run has merged (plan D136). Exit 1 is where the care goes — it is both "conflict" and "somebody
     /// holds `index.lock`" (blueprint H-8), and both leave `MERGE_HEAD` behind — so the lock
     /// signature is consulted *first* and only the remainder is a conflict. Every failing path
     /// aborts the half-merge before it returns, and the abort is itself retried, so a caller that
@@ -695,7 +696,7 @@ impl Cli {
             if parents != [before, after] {
                 return Err(broken_post_condition(
                     "merge",
-                    "the merge commit's parents are not [before_hash, after_hash]",
+                    "the merge commit's parents are not [HEAD, after_hash]",
                 ));
             }
             return Ok(Merged { commit });
