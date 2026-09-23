@@ -1682,7 +1682,9 @@ mod tests {
     /// Plan D144 (review L-c): the automatic rejection's `answer_gate` is a compare-and-set on
     /// `awaiting_approval` like any other. A step another writer moved off `awaiting_approval`
     /// between the park and the answer answers `Ok(false)`, and that is a `StaleWrite`: no
-    /// `gate_note`, and nothing after it.
+    /// `gate_note`, and nothing after it. The test drives `reject_step` itself: no seam lands
+    /// another writer between `apply`'s park and its answer, nor inside the engine's
+    /// `fail_judge`, so that both call `reject_step` rests on reading them.
     #[tokio::test]
     async fn a_stale_automatic_rejection_is_a_stale_write() {
         use crate::command::EngineError;

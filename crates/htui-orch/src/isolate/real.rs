@@ -1306,7 +1306,7 @@ impl GixIsolator {
         {
             let copy = PathBuf::from(&tree.path);
             // A copy that is gone, or does not hold the commit, falls back to the checkout; a
-            // commit neither holds is `git diff`'s own readable failure.
+            // commit neither holds is `git::reconcile_parent`'s readable "cannot find commit".
             let (probe, hex) = (copy.clone(), after.to_owned());
             if blocking(move || git::has_commit(&probe, &hex))
                 .await

@@ -2138,7 +2138,10 @@ mod tests {
 
     /// Plan D142 (review M-B): `is_ancestor` runs under the repository's admin lock, so it must
     /// not walk the history below the ancestor it looks for. Two commits sit above `base`, forty
-    /// below; the walk yields the two, whether `base` is on the line or beside it.
+    /// below; the walk yields the two, whether `base` is on the line or beside it. The side
+    /// commit is the case that walked to the root before; on the line, the old walk stopped on
+    /// meeting `base`. The count is of commits the walk yields: gix's paint of the hidden
+    /// frontier reads a little further, and stops once every queued commit is stale.
     #[test]
     fn is_ancestor_never_walks_below_the_ancestor() {
         let dir = tempfile::tempdir().expect("a temporary directory");
