@@ -408,7 +408,9 @@ impl GixIsolator {
     /// Every checkout's dirtiness is read **before** anything is reset, so a refusal leaves the
     /// whole scope where it was: a dirty checkout is the user's work or a sibling's, and neither
     /// may be destroyed. A clean checkout off the base — where the previous sibling left it — is
-    /// `reset --hard` to it (M3 D47's verb).
+    /// `reset --hard` to it (M3 D47's verb). "Clean" includes plan D121's half, which `is_dirty`
+    /// leaves out (D137): no untracked file at a path the base tracks, which the reset would write
+    /// over.
     async fn reset_to_slot_base(
         &self,
         checkouts: &[(RepoId, RepoCheckout)],
@@ -424,16 +426,33 @@ impl GixIsolator {
                     &checkout.local_path,
                 )));
             }
+            if self.head_of(checkout).await? == base {
+                continue;
+            }
+            self.refuse_untracked_under(&checkout.local_path, &base)
+                .await?;
             targets.push((checkout, base));
         }
         for (checkout, base) in targets {
-            if self.head_of(checkout).await? != base {
-                let git = self.cli()?.clone();
-                let local = checkout.local_path.clone();
-                git::with_retry("reset --hard", || git.reset_hard(&local, &base)).await?;
-            }
+            let git = self.cli()?.clone();
+            let local = checkout.local_path.clone();
+            git::with_retry("reset --hard", || git.reset_hard(&local, &base)).await?;
         }
         Ok(())
+    }
+
+    /// Plan D121's guard, as D137 applies it before every other `reset --hard`: `dirty_tree_not_reset`
+    /// when `path` holds an untracked, not-ignored file at a path `target` tracks.
+    async fn refuse_untracked_under(&self, path: &Path, target: &str) -> Result<(), IsolateError> {
+        let (read, base) = (path.to_path_buf(), target.to_owned());
+        if blocking(move || git::untracked_paths_base_tracks(&read, &base))
+            .await?
+            .is_empty()
+        {
+            Ok(())
+        } else {
+            Err(IsolateError::Refused(dirty_tree_not_reset(path)))
+        }
     }
 
     /// D43's guard for every repository of the scope, taken **before** the mode's reads (A-1).
@@ -1099,7 +1118,9 @@ impl GixIsolator {
     /// sibling left it, so the checked-out branch is moved to the winner's label — or to the base,
     /// for a winner that committed nothing — with `reset --hard`. That move is taken only when it
     /// destroys nothing: the checkout is clean, and its `HEAD` is the group base or a sibling's
-    /// label. With no siblings (`fan_out = 1`) the M3 rule stands unchanged.
+    /// label. With no siblings (`fan_out = 1`) the M3 rule stands unchanged. Clean includes plan
+    /// D121's half (D137): an untracked file at a path the target tracks refuses
+    /// `dirty_tree_not_reset`.
     async fn reconcile_in_place(
         &self,
         step: StepId,
@@ -1139,6 +1160,9 @@ impl GixIsolator {
         if !left_by_us {
             return Err(IsolateError::Refused(primary_moved(&head)));
         }
+        // D137: `is_dirty` above leaves untracked files out; the reset would not.
+        self.refuse_untracked_under(&checkout.local_path, &target)
+            .await?;
         let git = self.cli()?.clone();
         let local = checkout.local_path.clone();
         git::with_retry("reset --hard", || git.reset_hard(&local, &target)).await?;
