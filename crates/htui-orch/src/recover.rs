@@ -613,6 +613,30 @@ mod tests {
         assert_eq!(beats(&calls, clock.origin), [40, 50, 60, 70, 80]);
     }
 
+    /// Plan D122: a refresh that neither answers nor fails (a stuck connection) is raced against
+    /// the fence, so the heartbeat still returns `Expired` there rather than waiting inside it
+    /// while the lease lapses. The lease the caller wrote runs to 120 s: the one refresh starts at
+    /// 40 s and is given up at the 80 s fence.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_expires_at_the_fence_while_a_refresh_hangs() {
+        let clock = PausedClock::new();
+        let times = default_times();
+        let calls = Mutex::new(0_u32);
+        let refresh = |_until| {
+            *calls.lock().unwrap() += 1;
+            std::future::pending::<Result<bool, StoreError>>()
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(600_500),
+            heartbeat(refresh, &clock, times),
+        )
+        .await
+        .expect("the heartbeat gives up a hung refresh at the fence");
+        assert_eq!(outcome, Heartbeat::Expired);
+        assert_eq!(clock.elapsed(), Duration::from_secs(80));
+        assert_eq!(*calls.lock().unwrap(), 1, "the one refresh never answered");
+    }
+
     /// Plan D122: the fence follows the last `until` written **successfully**. A success at 50 s
     /// writes 170 s, so the next run of failures fences at 130 s.
     #[tokio::test(start_paused = true)]
