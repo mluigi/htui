@@ -986,13 +986,32 @@ where
 
     /// Plan D87/D108: `take_lease(run, box, owner, now, now + ttl)`, after a command's pure guard
     /// and before its first write.
+    ///
+    /// Plan D130: a zero-row answer re-reads the run to say why. Not `running` or
+    /// `awaiting_approval` → [`EngineError::RunStatus`] naming the status; a live lease (never
+    /// this process's, which the take would have renewed) → [`EngineError::LeaseHeld`]; neither
+    /// (the run executes on another box with its lease lapsed) → [`EngineError::RunStatus`] saying
+    /// so.
     async fn take_lease(&self, run: RunId) -> Result<(), EngineError> {
-        let taken = self.renew_lease(run).await?;
-        if taken {
-            Ok(())
-        } else {
-            Err(EngineError::LeaseHeld { run })
+        if self.renew_lease(run).await? {
+            return Ok(());
         }
+        let row = self.run(run).await?;
+        if !matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval) {
+            return Err(EngineError::RunStatus {
+                run,
+                status: row.status,
+                expected: "running | awaiting_approval",
+            });
+        }
+        if row.lease_expires_at.is_some_and(|until| until > self.now()) {
+            return Err(EngineError::LeaseHeld { run });
+        }
+        Err(EngineError::RunStatus {
+            run,
+            status: row.status,
+            expected: "running | awaiting_approval, executing on this box",
+        })
     }
 
     /// The store's `take_lease(run, box, owner, now, now + ttl)` and its bare answer: `false` is
@@ -1569,7 +1588,9 @@ where
     /// driver enabled (blueprint H-3).
     ///
     /// # Errors
-    /// [`EngineError::LeaseHeld`], [`EngineError::LeaseLost`], and every other [`EngineError`].
+    /// [`EngineError::LeaseHeld`] for a live foreign lease, [`EngineError::RunStatus`] for a run
+    /// no lease can be taken on otherwise (plan D130), [`EngineError::LeaseLost`], and every other
+    /// [`EngineError`].
     pub async fn resume(&self, run: RunId) -> Result<Resume, EngineError> {
         self.take_lease(run).await?;
         let row = self.run(run).await?;

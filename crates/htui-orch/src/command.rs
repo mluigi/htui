@@ -258,7 +258,10 @@ pub enum EngineError {
     },
     /// Plan D87 (and blueprint A-1's resume): the run's lease is live and this process does not
     /// hold it, so nothing was written. A lease this process took before a write that then failed
-    /// stays live until its TTL (blueprint H-7), and reads the same way meanwhile.
+    /// stays live until its TTL (blueprint H-7), and reads the same way meanwhile. Only a **live**
+    /// lease reads this way (plan D130): a run no lease can be taken on for another reason — not
+    /// `running`/`awaiting_approval`, or executing elsewhere with its lease lapsed — is
+    /// [`EngineError::RunStatus`].
     #[error("run {run}: another orchestrator holds a live lease (ANA-2 §4.9)")]
     LeaseHeld {
         /// The run whose lease is held elsewhere.
