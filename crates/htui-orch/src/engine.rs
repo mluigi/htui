@@ -6800,6 +6800,55 @@ mod tests {
         );
     }
 
+    /// Plan D125: failing a group before a token spends a `pending -> running` per candidate, and
+    /// one that answers `Ok(false)` means another writer moved that row. The walk stops there with
+    /// `StaleWrite`: it neither fails the run nor cleans it up. The walk's stale read is the
+    /// parked `prd` row seen as `pending`; the store holds it at `awaiting_approval`.
+    #[tokio::test]
+    async fn a_stale_candidate_stops_the_group_failure_before_the_run_is_failed() {
+        let harness = Harness::new().await;
+        let (run, step) = started(&harness).await;
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let mut stale = harness
+            .orch
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|candidate| candidate.id == step)
+            .expect("the parked step exists");
+        stale.status = StepStatus::Pending;
+        let cleanups = harness.orch.isolator.cleanups();
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .fail_group_before_a_token(&row, &snapshot.phases[0], &[&stale], "spec".to_owned())
+            .await
+            .expect_err("the candidate's compare-and-set found the row moved");
+        let EngineError::StaleWrite {
+            run: stopped,
+            row: named,
+            from,
+            to,
+        } = &refused
+        else {
+            panic!("a stale candidate is a `StaleWrite`, not {refused}");
+        };
+        assert_eq!(*stopped, run);
+        assert_eq!(
+            (named.as_str(), from.as_str(), to.as_str()),
+            (format!("step {step}").as_str(), "pending", "running")
+        );
+        let after = harness.orch.run(run).await;
+        assert_eq!(
+            after.status,
+            RunStatus::AwaitingApproval,
+            "the run is not failed"
+        );
+        assert_eq!(after.failure, None);
+        assert_eq!(harness.orch.isolator.cleanups(), cleanups, "nor cleaned up");
+    }
+
     /// Plan D125 (review H1), end to end: after the session, and before the settle, a stranger's
     /// sweep fails `prd` attempt 1 (`interrupt_step`), as it may once this walk's lease lapsed.
     /// The stale walk reaches the gate's `running -> done`, reads `Ok(false)`, and stops with
