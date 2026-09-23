@@ -291,6 +291,13 @@ pub struct GixIsolator {
     /// The most that ever ran at once; `max_admin_in_flight` reads it.
     #[cfg(test)]
     max_in_flight: std::sync::atomic::AtomicU32,
+    /// How many of `reconcile_isolated`'s D136 probes found the repository's admin lock held;
+    /// test instrumentation only.
+    #[cfg(test)]
+    reconcile_held: std::sync::atomic::AtomicU32,
+    /// How many of those probes found it free.
+    #[cfg(test)]
+    reconcile_unheld: std::sync::atomic::AtomicU32,
 }
 
 impl GixIsolator {
@@ -361,6 +368,10 @@ impl GixIsolator {
             in_flight: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             max_in_flight: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            reconcile_held: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            reconcile_unheld: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -557,6 +568,36 @@ impl GixIsolator {
     #[cfg(test)]
     fn max_admin_in_flight(&self) -> u32 {
         self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// D136's probe: records whether `repo`'s admin lock is held at this point of an isolated
+    /// `reconcile`. Only meaningful while nothing else could hold that lock.
+    #[cfg(test)]
+    fn probe_reconcile_admin(&self, repo: RepoId) {
+        use std::sync::atomic::Ordering;
+        let held = self
+            .admin
+            .lock()
+            .expect("no panic holds the isolator's admin locks")
+            .get(&repo)
+            .is_some_and(|lock| lock.try_lock().is_err());
+        let counter = if held {
+            &self.reconcile_held
+        } else {
+            &self.reconcile_unheld
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// `(held, unheld)`: how often `reconcile_isolated`'s probes found the admin lock held, and
+    /// free.
+    #[cfg(test)]
+    fn reconcile_admin_probes(&self) -> (u32, u32) {
+        use std::sync::atomic::Ordering;
+        (
+            self.reconcile_held.load(Ordering::SeqCst),
+            self.reconcile_unheld.load(Ordering::SeqCst),
+        )
     }
 
     /// Drops every guard `step` is holding; a step that holds none is not an error.
@@ -4217,6 +4258,33 @@ mod tests {
             commits[0].after_hash,
             Some(crate::isolate::git::head(&core_path).expect("the checkout has a HEAD")),
             "the merge landed"
+        );
+    }
+
+    /// Plan D136: the admin lock is not only awaited but *held* by an isolated `reconcile` at its
+    /// `HEAD` read and still after the merge's post-condition, so taking and dropping it at once,
+    /// or taking it only after the read, is caught here and not left to a race.
+    #[tokio::test]
+    async fn an_isolated_reconcile_holds_the_admin_lock_from_its_head_read_through_its_merge() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, _core, core_path, _head, _, step, rows) = stepped(dir.path()).await;
+
+        let commits = isolator
+            .reconcile(step, &rows, &[])
+            .await
+            .expect("the winner reconciles");
+        assert_eq!(
+            commits[0].after_hash,
+            Some(crate::isolate::git::head(&core_path).expect("the checkout has a HEAD")),
+            "the merge landed"
+        );
+        assert_eq!(
+            isolator.reconcile_admin_probes(),
+            (2, 0),
+            "the lock was held at the HEAD read and after the post-condition"
         );
     }
 
