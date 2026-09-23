@@ -682,6 +682,14 @@ impl WriteStore for SpyStore {
     async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> StoreResult<()> {
         self.inner.finish_step(step, outcome).await
     }
+    async fn interrupt_step(
+        &self,
+        step: StepId,
+        note: &str,
+        at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.inner.interrupt_step(step, note, at).await
+    }
     async fn answer_gate(
         &self,
         step: StepId,

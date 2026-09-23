@@ -86,6 +86,7 @@ pub const CASES: &[&str] = &[
     "finish_run_moves_run_and_item_together",
     "claim_run_applies_the_isolation_and_path_rules",
     "take_lease_moves_only_our_own_or_an_expired_lease",
+    "interrupt_step_is_a_cas_on_running",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -174,6 +175,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "take_lease_moves_only_our_own_or_an_expired_lease" => {
             take_lease_moves_only_our_own_or_an_expired_lease(store).await;
         }
+        "interrupt_step_is_a_cas_on_running" => interrupt_step_is_a_cas_on_running(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -4553,6 +4555,35 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
     );
     assert!(
         store
+            .adopt_runs(
+                ids::BOX,
+                second_owner,
+                swept + TimeDelta::seconds(1),
+                swept + TimeDelta::minutes(5),
+            )
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: a process never adopts its own lease, even expired (plan D88)"
+    );
+    assert_eq!(
+        store
+            .adopt_runs(
+                ids::BOX,
+                first_owner,
+                swept + TimeDelta::seconds(1),
+                swept + TimeDelta::minutes(5),
+            )
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        vec![run],
+        "{CASE}: but a stranger's sweep adopts it"
+    );
+    assert!(
+        store
             .adopt_runs(BoxId::new(), second_owner, swept, swept)
             .await
             .expect(CASE)
@@ -4716,6 +4747,138 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
         "{CASE}: an unknown run is NotFound, got {unknown:?}"
+    );
+}
+
+/// Plan D89: `interrupt_step` is a compare-and-set on `running`. It writes `failed`, the note and
+/// the first `finished_at`, and leaves `gate_outcome` `NULL`, because a crash is not a gate
+/// answer. On any other status it writes nothing at all.
+async fn interrupt_step_is_a_cas_on_running<S: WriteStore>(store: &S) {
+    const CASE: &str = "interrupt_step_is_a_cas_on_running";
+    let at = seam_clock();
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let running = |position: i32| {
+        let spec = new_run_step(run, position, 1, 0);
+        let id = spec.id;
+        async move {
+            store.create_step(spec).await.expect(CASE);
+            assert!(
+                store
+                    .transition_step(id, StepStatus::Pending, StepStatus::Running, at)
+                    .await
+                    .expect(CASE),
+                "{CASE}: pending -> running is a sanctioned move"
+            );
+            id
+        }
+    };
+
+    let step = running(0).await;
+    let later = at + TimeDelta::minutes(1);
+    assert!(
+        store
+            .interrupt_step(step, "interrupted", later)
+            .await
+            .expect(CASE),
+        "{CASE}: a running step is interrupted"
+    );
+    let interrupted = step_row(CASE, store, run, step).await;
+    assert_eq!(
+        (
+            interrupted.status,
+            interrupted.gate_note.as_deref(),
+            interrupted.gate_outcome,
+            interrupted.finished_at,
+        ),
+        (StepStatus::Failed, Some("interrupted"), None, Some(later)),
+        "{CASE}: failed, the note, no gate outcome, and the caller's instant"
+    );
+    assert!(
+        !store
+            .interrupt_step(step, "interrupted", later + TimeDelta::minutes(1))
+            .await
+            .expect(CASE),
+        "{CASE}: a second interruption finds the step no longer running"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, step).await,
+        interrupted,
+        "{CASE}: and writes nothing"
+    );
+
+    let settled = running(1).await;
+    store
+        .finish_step(
+            settled,
+            StepOutcome {
+                exit_code: Some(0),
+                finished_at: at,
+                ..StepOutcome::default()
+            },
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        store
+            .interrupt_step(settled, "interrupted", later)
+            .await
+            .expect(CASE),
+        "{CASE}: a settled but still running step is interrupted too"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, settled).await.finished_at,
+        Some(at),
+        "{CASE}: the earlier finished_at is kept (COALESCE)"
+    );
+
+    let pending = new_run_step(run, 2, 1, 0);
+    let pending_id = pending.id;
+    store.create_step(pending).await.expect(CASE);
+    let parked = gated_step(CASE, store, new_run_step(run, 3, 1, 0)).await;
+    let done = running(4).await;
+    assert!(
+        store
+            .transition_step(done, StepStatus::Running, StepStatus::Done, at)
+            .await
+            .expect(CASE),
+        "{CASE}: running -> done is a sanctioned move"
+    );
+    for (label, id) in [
+        ("pending", pending_id),
+        ("awaiting_approval", parked),
+        ("done", done),
+    ] {
+        let before = step_row(CASE, store, run, id).await;
+        assert!(
+            !store
+                .interrupt_step(id, "interrupted", later)
+                .await
+                .expect(CASE),
+            "{CASE}: a {label} step is not running"
+        );
+        assert_eq!(
+            step_row(CASE, store, run, id).await,
+            before,
+            "{CASE}: the {label} row is untouched"
+        );
+    }
+
+    let unknown = store
+        .interrupt_step(StepId::new(), "interrupted", later)
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {unknown:?}"
     );
 }
 

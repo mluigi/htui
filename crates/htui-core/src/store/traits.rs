@@ -740,6 +740,9 @@ pub trait WriteStore: ReadStore {
     /// broken by `id` so the order is total and the same on every backend; empty when nothing was
     /// abandoned. A box that does not exist adopts nothing (`Ok(vec![])`).
     ///
+    /// **Never** a run whose `lease_owner` is `owner` (plan D88): a process whose heartbeat
+    /// stalled past its TTL must not adopt its own live walk and run it twice under one owner.
+    ///
     /// # Errors
     /// The backend's own failures only.
     async fn adopt_runs(
@@ -815,6 +818,15 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`.
     async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()>;
+
+    /// Plan D89, ANA-2 §4.9's interrupted step: a compare-and-set `running -> failed` with
+    /// `gate_note = note` and `finished_at = COALESCE(finished_at, at)`, `gate_outcome` left
+    /// untouched (`NULL`: a crash is not a gate answer). `Ok(false)` when the step is not
+    /// `running`, with nothing written.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`.
+    async fn interrupt_step(&self, step: StepId, note: &str, at: DateTime<Utc>) -> Result<bool>;
 
     /// The four `R-ORCH-2` answers, a compare-and-set on `awaiting_approval`:
     /// `Approved | Skipped -> done`, `Rejected -> failed`, `Retried -> superseded`, with

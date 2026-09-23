@@ -2995,6 +2995,17 @@ impl WriteStore for PgStore {
         Ok(())
     }
 
+    /// Plan D89: one compare-and-set `UPDATE`, `running -> failed` with the note.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }` when there is no such step, told apart
+    /// from "not running" by `step_exists`' follow-up read.
+    async fn interrupt_step(&self, step: StepId, note: &str, at: DateTime<Utc>) -> Result<bool> {
+        let _ = (step, note, at);
+        todo!("T2 (d): interrupt_step")
+    }
+
     /// `R-ORCH-2`'s four answers, a compare-and-set on `awaiting_approval` rather than on the
     /// caller's idea of the status: the gate is answered from a pane that may have been open a
     /// while, and a step that moved on in the meantime must say `Ok(false)`, not overwrite.

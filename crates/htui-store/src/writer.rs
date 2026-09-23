@@ -759,6 +759,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn interrupt_step(&self, step: StepId, note: &str, at: DateTime<Utc>) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.interrupt_step(step, note, at).await,
+            Self::Online(pg) => pg.interrupt_step(step, note, at).await,
+        }
+    }
+
     async fn answer_gate(
         &self,
         step: StepId,

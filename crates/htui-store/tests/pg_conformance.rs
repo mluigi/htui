@@ -16,7 +16,7 @@ use htui_store::testkit as common;
 
 /// The number of cases `crates/htui-core/tests/mem_store.rs` carries, asserted here too so a case
 /// added to `CASES` without a Postgres run fails loudly.
-const EXPECTED_CASES: usize = 51;
+const EXPECTED_CASES: usize = 52;
 
 #[test]
 fn case_list_matches_mem_store() {

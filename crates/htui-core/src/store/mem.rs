@@ -3535,6 +3535,18 @@ impl State {
         Ok(())
     }
 
+    /// Plan D89: `running -> failed` with the note, `gate_outcome` untouched.
+    fn interrupt_step(
+        &mut self,
+        step: StepId,
+        note: &str,
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let _ = (step, note, at, now);
+        todo!("T2 (d): interrupt_step")
+    }
+
     /// `R-ORCH-2`'s four answers, a compare-and-set on `awaiting_approval`.
     fn answer_gate(
         &mut self,
@@ -4576,6 +4588,11 @@ impl WriteStore for MemStore {
     async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()> {
         let now = Utc::now();
         self.write(|state| state.finish_step(step, outcome, now))
+    }
+
+    async fn interrupt_step(&self, step: StepId, note: &str, at: DateTime<Utc>) -> Result<bool> {
+        let now = Utc::now();
+        self.write(|state| state.interrupt_step(step, note, at, now))
     }
 
     async fn answer_gate(
@@ -6234,6 +6251,26 @@ mod tests {
                 .await
                 .expect("the refresh is answered"),
             "the new owner holds it"
+        );
+        let later = swept + TimeDelta::minutes(5);
+        assert!(
+            store
+                .adopt_runs(ids::BOX, second_owner, swept + TimeDelta::seconds(1), later)
+                .await
+                .expect("the sweep is answered")
+                .is_empty(),
+            "a process never adopts its own lease, even expired (plan D88)"
+        );
+        assert_eq!(
+            store
+                .adopt_runs(ids::BOX, first_owner, swept + TimeDelta::seconds(1), later)
+                .await
+                .expect("the sweep is answered")
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![run],
+            "but a stranger's sweep adopts it"
         );
         assert!(
             store
