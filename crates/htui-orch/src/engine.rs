@@ -356,6 +356,34 @@ pub enum Resume {
     },
 }
 
+/// One run [`Engine::sweep`] adopted, and what it left the run owing (plan D98, D117).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adopted {
+    /// The adopted run.
+    pub run: RunId,
+    /// What the caller does next with it.
+    pub next: Next,
+}
+
+/// What the sweep's adjudication left an adopted run owing (plan D98, blueprint A-4).
+///
+/// The sweep **walks nothing**: a [`Next::Walk`] run is walked by the caller through
+/// [`Engine::resume`], which is criterion 3's topology check and D86's heartbeat, and which
+/// milestone 6's `run_worker` calls once per run so one run's sessions never wait on another's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Next {
+    /// The run is `running` with its rows adjudicated: walk it on through [`Engine::resume`].
+    Walk,
+    /// The sweep parked the run for a human, and released its lease (plan D87, D94, D96).
+    Parked(Rest),
+    /// A re-settled step ended the run, and it was cleaned up (plan D36, D91).
+    Finished(Rest),
+    /// Blueprint A-4: this run's recovery failed with the error's `Display`. The failure is a
+    /// `warn`, an `item_note` and a released lease, so another process may adopt the run at once,
+    /// and the sweep went on with the next run.
+    Error(String),
+}
+
 impl<'a, S, G, I, V, C, A, K> Engine<'a, S, G, I, V, C, A, K>
 where
     S: WriteStore,
@@ -961,6 +989,27 @@ where
                 tracing::warn!(%run, %err, "releasing the lease failed; it expires at its TTL")
             }
         }
+    }
+
+    // -- the recovery sweep (ANA-2 §4.9, plan D89-D98, blueprint A-3, A-4, A-7) -----------------
+
+    /// ANA-2 §4.9 `:1284-1307`, plan D98: adopt every `running` run on this box whose lease
+    /// expired (never this process's own, D88), adjudicate each one's rows, and **walk nothing**:
+    /// the caller walks each [`Next::Walk`] run through [`Self::resume`].
+    ///
+    /// Runs are recovered one at a time in `queued_at` order, each inside the leased walk
+    /// (blueprint A-7), so another orchestrator taking the lease mid-recovery abandons it like any
+    /// walk. A run left parked or finished has its lease released. One run's failure does not
+    /// stop the sweep (blueprint A-4): it is [`Next::Error`], a `warn`, an `item_note` and a
+    /// released lease, and the next run is recovered.
+    ///
+    /// The heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
+    /// driver enabled (blueprint H-3).
+    ///
+    /// # Errors
+    /// Only `adopt_runs`' own store error: nothing was adopted then.
+    pub async fn sweep(&self) -> Result<Vec<Adopted>, EngineError> {
+        todo!("plan D98")
     }
 
     // -- the walk ------------------------------------------------------------------------------
@@ -3960,6 +4009,20 @@ pub async fn resume_fake(
     let scrubber = htui_core::scrub::MinimalScrubber::new([]);
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.resume(run).await
+}
+
+/// [`Engine::sweep`] over the same parts (plan D98): the second process's sweep in every
+/// recovery case, over a `FakeOrchestrator::restarted` harness.
+///
+/// # Errors
+/// As [`Engine::sweep`].
+#[cfg(feature = "test-support")]
+pub async fn sweep_fake(orch: &crate::fake::FakeOrchestrator) -> Result<Vec<Adopted>, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    engine.sweep().await
 }
 
 /// The fourteen fields, filled from the harness.

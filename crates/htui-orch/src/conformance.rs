@@ -11,7 +11,11 @@
 //! per step, document kinds and their `produced_by_step_id`, the item's `closed_at`, the run's
 //! `finished_at` — and never merely that the walk did not error.
 
+use std::future::Future;
+use std::sync::Arc;
+
 use chrono::TimeDelta;
+use futures::future::Either;
 use htui_core::fixtures::ids;
 use htui_core::model::{
     AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, EventKind, Gate, GateOutcome,
@@ -22,10 +26,11 @@ use htui_core::model::{
 use htui_core::model::{Claim, NewItem, OverlapRule, Quota, QuotaSource, Spend};
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
-use crate::engine::Resume;
+use crate::engine::{Adopted, Resume};
 use crate::fake::{FakeIsolator, FakeOrchestrator, FakeVerifier, ScriptedStep, TestClock};
 use crate::isolate::Clock as _;
 use crate::status::RunFailure;
@@ -132,6 +137,25 @@ pub trait Orchestrate {
     /// The lease owner this orchestrator writes (blueprint F-J), so a case can tell whose lease
     /// a run carries.
     fn owner(&self) -> Uuid;
+
+    /// `Engine::sweep` (plan D98): adopt every expired lease on the box, adjudicate, walk nothing.
+    ///
+    /// # Errors
+    /// Whatever the adoption itself refuses with.
+    async fn sweep(&self) -> Result<Vec<Adopted>, EngineError>;
+
+    /// Make one session's `after_done` never return, after writing its document when
+    /// `write_output` (plan D100, blueprint A-2, F-O): the crash every recovery case starts from.
+    /// `slot` is `script_candidate`'s `(fanout_index, call)`, or `None` for any session of
+    /// `(phase, attempt)`. Drive the walk with [`until_stalled`] and the returned signal.
+    #[must_use]
+    fn stall_after_done(
+        &self,
+        phase: &str,
+        attempt: i32,
+        slot: Option<(i32, u32)>,
+        write_output: bool,
+    ) -> Arc<Notify>;
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -192,6 +216,35 @@ impl Orchestrate for FakeOrchestrator {
 
     fn owner(&self) -> Uuid {
         Self::owner(self)
+    }
+
+    async fn sweep(&self) -> Result<Vec<Adopted>, EngineError> {
+        Self::sweep(self).await
+    }
+
+    fn stall_after_done(
+        &self,
+        phase: &str,
+        attempt: i32,
+        slot: Option<(i32, u32)>,
+        write_output: bool,
+    ) -> Arc<Notify> {
+        Self::stall_after_done(self, phase, attempt, slot, write_output)
+    }
+}
+
+/// Blueprint A-2: poll `fut` until `stalled` fires, then **drop it** where it stands — a process
+/// killed mid-walk, leaving every row exactly as the walk last wrote it (plan D100).
+///
+/// Both futures are boxed so `select` sees `Unpin` and the dropped walk really goes (blueprint
+/// H-11). `pub` so the real-git suite (`tests/gix_isolator.rs`) crashes its walks the same way.
+///
+/// # Panics
+/// When `fut` finishes before the stall fires: the case scripted a stall the walk never reached.
+pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
+    match futures::future::select(Box::pin(fut), Box::pin(stalled.notified())).await {
+        Either::Left(_) => panic!("the walk finished instead of stalling"),
+        Either::Right(((), walk)) => drop(walk),
     }
 }
 

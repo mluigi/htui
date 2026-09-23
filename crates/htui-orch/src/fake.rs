@@ -31,6 +31,7 @@ use htui_core::model::{
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::command::{Command, CommandOutcome, EngineError};
@@ -97,6 +98,9 @@ pub struct FakeIsolator {
     resets: Mutex<u32>,
     /// How many times [`release`](Isolator::release) has been called.
     releases: Mutex<u32>,
+    /// Blueprint F-A: the 1-based [`reconcile`](Isolator::reconcile) call that never returns, and
+    /// the signal it raises first. One-shot.
+    reconcile_stall: Mutex<Option<(u32, Arc<Notify>)>>,
 }
 
 /// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
@@ -272,6 +276,41 @@ impl FakeIsolator {
             .expect("no panic holds the fake isolator's lock")
     }
 
+    /// Make the `n`-th [`reconcile`](Isolator::reconcile) call (1-based, counting every call this
+    /// isolator has seen) record itself, signal the returned [`Notify`] and then **never return**
+    /// (blueprint F-A, A-2).
+    ///
+    /// This is the crash between stage 6's `done` and the merge (plan D97): a *failed* reconcile
+    /// parks the run, which no sweep adopts, so only a reconcile that never answers leaves the run
+    /// `running` with an unmerged winner. The case drops the walk once the signal fires
+    /// (`conformance::until_stalled`).
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn stall_nth_reconcile(&self, n: u32) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        *self
+            .reconcile_stall
+            .lock()
+            .expect("no panic holds the fake isolator's lock") = Some((n, Arc::clone(&notify)));
+        notify
+    }
+
+    /// The stall's signal when `call` is the stalled one, taking it (one-shot).
+    fn reconcile_stall_at(&self, call: usize) -> Option<Arc<Notify>> {
+        let mut stall = self
+            .reconcile_stall
+            .lock()
+            .expect("no panic holds the fake isolator's lock");
+        match stall.as_ref() {
+            Some((n, _)) if usize::try_from(*n).is_ok_and(|n| n == call) => {
+                stall.take().map(|(_, notify)| notify)
+            }
+            _ => None,
+        }
+    }
+
     /// Take `step`'s `shared_serialized` guard, if it holds one; dropping it frees the lock.
     ///
     /// Keyed by the step half alone (blueprint F-I): a step id names one run's step.
@@ -428,10 +467,20 @@ impl Isolator for FakeIsolator {
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
             let _ = trees;
-            self.reconciles
-                .lock()
-                .expect("no panic holds the fake isolator's lock")
-                .push((winner, siblings.to_vec()));
+            let call = {
+                let mut reconciles = self
+                    .reconciles
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock");
+                reconciles.push((winner, siblings.to_vec()));
+                reconciles.len()
+            };
+            // Blueprint F-A: the crash between `done` and the merge. Recorded, signalled, and
+            // then this call never answers; the case drops the walk.
+            if let Some(stalled) = self.reconcile_stall_at(call) {
+                stalled.notify_one();
+                std::future::pending::<()>().await;
+            }
             if let Some(err) = self
                 .reconcile_failures
                 .lock()
@@ -1126,6 +1175,10 @@ pub struct FakeOrchestrator {
     scripts: Mutex<BTreeMap<ScriptKey, ScriptedStep>>,
     candidates: Mutex<BTreeMap<String, Vec<(AgentId, String)>>>,
     after_done_advance: Mutex<Option<TimeDelta>>,
+    /// Blueprint A-2, F-O: the sessions whose `after_done` never returns, keyed like `scripts`,
+    /// each with whether the document is written first and the signal raised. Never carried by
+    /// [`restarted`](Self::restarted).
+    stalls: Mutex<BTreeMap<ScriptKey, (bool, Arc<Notify>)>>,
     default_script: ScriptedStep,
     caps: DriverCaps,
     box_id: BoxId,
@@ -1156,6 +1209,7 @@ impl FakeOrchestrator {
             scripts: Mutex::new(BTreeMap::new()),
             candidates: Mutex::new(BTreeMap::new()),
             after_done_advance: Mutex::new(None),
+            stalls: Mutex::new(BTreeMap::new()),
             default_script: ScriptedStep::done_with_output("scripted output"),
             caps: FakeDriver::full_caps(),
             box_id: ids::BOX,
@@ -1171,7 +1225,8 @@ impl FakeOrchestrator {
     /// are fresh, because neither survives a process. The clock starts [`RESTART_GAP`] past this
     /// one's, the scripts, candidates, default script and capabilities are cloned, the box and user
     /// are the same, and the `owner` is **new** — which is what makes the lease this process wrote
-    /// someone else's. An `advance_after_done` is not carried.
+    /// someone else's. An `advance_after_done` is not carried, and neither is a
+    /// [`stall_after_done`](Self::stall_after_done): the crash was the first process's.
     ///
     /// # Panics
     /// When a lock is poisoned, which no case does.
@@ -1195,6 +1250,7 @@ impl FakeOrchestrator {
             scripts: Mutex::new(scripts),
             candidates: Mutex::new(candidates),
             after_done_advance: Mutex::new(None),
+            stalls: Mutex::new(BTreeMap::new()),
             default_script: self.default_script.clone(),
             caps: self.caps,
             box_id: self.box_id,
@@ -1261,6 +1317,53 @@ impl FakeOrchestrator {
     /// Give a phase no candidate at all, for the rung-4 refusal.
     pub fn without_candidates(&self, phase: &str) {
         self.with_candidates(phase, Vec::new());
+    }
+
+    /// Make one session's [`after_done`](Self::after_done) **never return** — a process killed
+    /// between the driver's `done` and the settle (plan D100, blueprint A-2).
+    ///
+    /// Keyed like [`script_candidate`](Self::script_candidate) (blueprint F-O): `slot = None`
+    /// stalls any session of `(phase, attempt)` without a stall of its own, and
+    /// `Some((fanout_index, call))` one session exactly — a candidate, or a judge's call at
+    /// `fanout_index = -1` under `phase = "<phase>:judge"`. The stall fires after any
+    /// [`advance_after_done`](Self::advance_after_done) and, when `write_output`, after the
+    /// scripted document is written; it then signals the returned [`Notify`] and awaits forever.
+    /// One-shot: a later session with the same key plays normally.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn stall_after_done(
+        &self,
+        phase: &str,
+        attempt: i32,
+        slot: Option<(i32, u32)>,
+        write_output: bool,
+    ) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        self.stalls
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert(
+                (phase.to_owned(), attempt, slot),
+                (write_output, Arc::clone(&notify)),
+            );
+        notify
+    }
+
+    /// The stall for one session, the exact key's before its `(phase, attempt)`'s, taken.
+    fn take_stall(&self, key: &SessionKey<'_>) -> Option<(bool, Arc<Notify>)> {
+        let mut stalls = self
+            .stalls
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock");
+        stalls
+            .remove(&(
+                key.phase.to_owned(),
+                key.attempt,
+                Some((key.fanout_index, key.call)),
+            ))
+            .or_else(|| stalls.remove(&(key.phase.to_owned(), key.attempt, None)))
     }
 
     /// Elapse `by` between the driver's `done` and the settle, so a step outlives its deadline
@@ -1352,7 +1455,7 @@ impl FakeOrchestrator {
     /// Elapses any [`advance_after_done`](Self::advance_after_done) first — that is what "after the
     /// session and before the settle" means for a deadline case — then writes the scripted output
     /// document, or none. T4's `impl SessionSink for FakeOrchestrator` forwards to this and adds
-    /// nothing.
+    /// nothing. A [`stall_after_done`](Self::stall_after_done) of this session never returns.
     ///
     /// # Errors
     /// The store's own refusals.
@@ -1370,6 +1473,24 @@ impl FakeOrchestrator {
         {
             self.clock.advance(by);
         }
+        if let Some((write_output, stalled)) = self.take_stall(key) {
+            if write_output {
+                self.write_output(item, step, phase, key).await?;
+            }
+            stalled.notify_one();
+            return std::future::pending().await;
+        }
+        self.write_output(item, step, phase, key).await
+    }
+
+    /// The scripted output document of one session, or none.
+    async fn write_output(
+        &self,
+        item: ItemId,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
+    ) -> Result<Option<Document>> {
         let Some(body) = self.script_for_key(key).output else {
             return Ok(None);
         };
@@ -1439,6 +1560,15 @@ impl FakeOrchestrator {
     /// Every [`EngineError`] the claim and the walk raise.
     pub async fn claim(&self, run: RunId) -> std::result::Result<CommandOutcome, EngineError> {
         crate::engine::claim_fake(self, run).await
+    }
+
+    /// `Engine::sweep` over the same parts (plan D98): adopt every expired lease on this box,
+    /// adjudicate, and walk nothing.
+    ///
+    /// # Errors
+    /// The adoption's own store error; a run's recovery failure is its `Next::Error`.
+    pub async fn sweep(&self) -> std::result::Result<Vec<crate::engine::Adopted>, EngineError> {
+        crate::engine::sweep_fake(self).await
     }
 
     /// `Engine::resume` over the same parts (ANA-2 §12 criterion 3).
@@ -2126,6 +2256,110 @@ mod tests {
                 .expect("the store is not asked")
                 .is_none(),
             "no scripted body, no document (ANA-2 `:429-430`)"
+        );
+    }
+
+    /// Blueprint A-2, F-O: a stalled session writes its document when asked, signals, and never
+    /// returns; the stall is one-shot and keyed like a script, and a restart does not carry it.
+    #[tokio::test]
+    async fn a_stalled_after_done_signals_and_never_returns() {
+        use futures::FutureExt as _;
+
+        let orch = FakeOrchestrator::demo();
+        orch.script("prd", 1, ScriptedStep::done_with_output("prd v1"));
+        let step = prd_step();
+        let phase = prd_phase(&orch.store).await;
+        let key = SessionKey::of(&step);
+
+        let stalled = orch.stall_after_done("prd", 1, None, true);
+        let restarted = orch.restarted();
+        let mut call = Box::pin(orch.after_done(ids::HTUI_FEAT_1, &step, &phase, &key));
+        assert!(
+            call.as_mut().now_or_never().is_none(),
+            "the call never answers"
+        );
+        stalled
+            .notified()
+            .now_or_never()
+            .expect("the stall signalled first");
+        drop(call);
+        let written = orch
+            .store
+            .documents(ids::HTUI_FEAT_1)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .filter(|head| head.produced_by_step_id == Some(step.id))
+            .count();
+        assert_eq!(
+            written, 1,
+            "`write_output` wrote the document before stalling"
+        );
+
+        let again = orch
+            .after_done(ids::HTUI_FEAT_1, &step, &phase, &key)
+            .now_or_never()
+            .expect("a stall is one-shot")
+            .expect("the store accepts the write");
+        assert!(again.is_some());
+        assert!(
+            restarted
+                .after_done(ids::HTUI_FEAT_1, &step, &phase, &key)
+                .now_or_never()
+                .is_some(),
+            "a restart carries no stall (plan D118)"
+        );
+
+        let quiet = FakeOrchestrator::demo();
+        let other = quiet.stall_after_done("prd", 1, Some((1, 0)), false);
+        assert!(
+            quiet
+                .after_done(ids::HTUI_FEAT_1, &step, &phase, &key)
+                .now_or_never()
+                .is_some(),
+            "index 0 is not the stalled `(1, 0)` session"
+        );
+        let candidate = SessionKey {
+            fanout_index: 1,
+            ..key
+        };
+        let mut call = Box::pin(quiet.after_done(ids::HTUI_FEAT_1, &step, &phase, &candidate));
+        assert!(call.as_mut().now_or_never().is_none());
+        other
+            .notified()
+            .now_or_never()
+            .expect("the exact key stalled");
+    }
+
+    /// Blueprint F-A: the n-th reconcile records itself, signals, and never returns; the others
+    /// answer as before.
+    #[tokio::test]
+    async fn the_nth_reconcile_stalls_after_recording_itself() {
+        use futures::FutureExt as _;
+
+        let isolator = FakeIsolator::new();
+        let stalled = isolator.stall_nth_reconcile(2);
+        let (first, second, third) = (StepId::new(), StepId::new(), StepId::new());
+        assert!(isolator.reconcile(first, &[], &[]).now_or_never().is_some());
+        let siblings = [third];
+        let mut call = isolator.reconcile(second, &[], &siblings);
+        assert!(
+            call.as_mut().now_or_never().is_none(),
+            "the second never answers"
+        );
+        stalled
+            .notified()
+            .now_or_never()
+            .expect("and signalled first");
+        drop(call);
+        assert!(isolator.reconcile(third, &[], &[]).now_or_never().is_some());
+        assert_eq!(
+            isolator.reconciles(),
+            [
+                (first, Vec::new()),
+                (second, vec![third]),
+                (third, Vec::new())
+            ]
         );
     }
 
