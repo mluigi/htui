@@ -143,6 +143,35 @@ pub enum ResolveError {
         /// `step_graph_phase.fan_out`.
         fan_out: i32,
     },
+    /// Plan D64 (OQ-5): a `review` phase cannot fan out, because the loop's gate reads one review
+    /// verdict and a group's review would need a judge of reviews nothing defines.
+    #[error("phase `{phase}` is a review with fan_out {fan_out}; a review cannot fan out (plan D64)")]
+    ReviewFanOut {
+        /// `step_graph_phase.name`.
+        phase: String,
+        /// `step_graph_phase.fan_out`.
+        fan_out: i32,
+    },
+    /// Plan D63: a phase fans out above `app_setting.max_fan_out`, refused at admission and
+    /// never silently truncated (ANA-2 `:868`).
+    #[error("phase `{phase}` fans out {fan_out}; max_fan_out is {max} (ANA-2 :868)")]
+    FanOutCap {
+        /// `step_graph_phase.name`.
+        phase: String,
+        /// `step_graph_phase.fan_out`.
+        fan_out: i32,
+        /// [`SnapshotSettings::max_fan_out`], resolved.
+        max: u32,
+    },
+    /// Plan D63 (OQ-1): `Σ fan_out` plus one judge per judged phase exceeds
+    /// `app_setting.max_agents_per_run` (ANA-2 `:870-875`). Retry attempts are not counted.
+    #[error("run plans {planned} agents; max_agents_per_run is {max} (ANA-2 :870-875)")]
+    AgentCap {
+        /// The planned agent count.
+        planned: u32,
+        /// [`SnapshotSettings::max_agents_per_run`], resolved.
+        max: u32,
+    },
     /// Plan D14: an empty `repo_scope` overlaps nothing, because `'{}' && x` is false in Postgres,
     /// while ANA-2 §4.7 intends an empty `touched_paths` to overlap the whole primary repo. An
     /// item queued with an empty scope would silently defeat `claim_run`'s admission predicate, so
@@ -279,6 +308,16 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
         );
     }
 
+    let settings = SnapshotSettings {
+        default_isolation: settings.default_isolation,
+        per_token_cap_run: settings.per_token_cap_run,
+        per_token_cap_batch: settings.per_token_cap_batch,
+        max_fan_out: app_u32(app, "max_fan_out").unwrap_or(DEFAULT_MAX_FAN_OUT),
+        max_agents_per_run: app_u32(app, "max_agents_per_run")
+            .unwrap_or(DEFAULT_MAX_AGENTS_PER_RUN),
+    };
+    check_fan_out_caps(&phases, &settings)?;
+
     let snapshot = GraphSnapshot {
         v: GraphSnapshot::V,
         graph: SnapshotGraph {
@@ -289,14 +328,7 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
         topology: topology(&phases)?,
         mode,
         phases,
-        settings: SnapshotSettings {
-            default_isolation: settings.default_isolation,
-            per_token_cap_run: settings.per_token_cap_run,
-            per_token_cap_batch: settings.per_token_cap_batch,
-            max_fan_out: app_u32(app, "max_fan_out").unwrap_or(DEFAULT_MAX_FAN_OUT),
-            max_agents_per_run: app_u32(app, "max_agents_per_run")
-                .unwrap_or(DEFAULT_MAX_AGENTS_PER_RUN),
-        },
+        settings,
     };
 
     let repos = store.repos(item.project_id).await?;
@@ -384,6 +416,45 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
     }
 }
 
+/// Plan D63's two caps, in order: any phase above `max_fan_out` first, then the planned agent
+/// count against `max_agents_per_run`. Both are refused before a run row exists (ANA-2
+/// `:868-876`, "refused at admission … never silently truncated").
+///
+/// The planned count is `Σ fan_out` plus one for each *judged* phase, `fan_out > 1` with a judge
+/// (OQ-1). A fanned-out phase with no judge is selected by a human and costs no agent. Retry
+/// attempts are not counted, which is the recorded deviation from `:871-872`.
+fn check_fan_out_caps(
+    phases: &[SnapshotPhase],
+    settings: &SnapshotSettings,
+) -> std::result::Result<(), ResolveError> {
+    let max = settings.max_fan_out;
+    if let Some(phase) = phases
+        .iter()
+        .find(|phase| u32::try_from(phase.fan_out).is_ok_and(|fan_out| fan_out > max))
+    {
+        return Err(ResolveError::FanOutCap {
+            phase: phase.name.clone(),
+            fan_out: phase.fan_out,
+            max,
+        });
+    }
+
+    let planned: u32 = phases
+        .iter()
+        .map(|phase| {
+            // A non-positive `fan_out` plans nothing; the store's CHECK keeps it at one or more.
+            let own = u32::try_from(phase.fan_out).unwrap_or(0);
+            let judge = u32::from(phase.fan_out > 1 && phase.judge.is_some());
+            own.saturating_add(judge)
+        })
+        .fold(0, u32::saturating_add);
+    let max = settings.max_agents_per_run;
+    if planned > max {
+        return Err(ResolveError::AgentCap { planned, max });
+    }
+    Ok(())
+}
+
 /// `project.settings` as ANA-2 §4.7 reads it; a blob that does not decode is read as defaults
 /// rather than as a failure, which is [`ProjectSettings`]'s own rule (every field defaults, so
 /// `'{}'` decodes).
@@ -424,6 +495,12 @@ async fn snapshot_phase<G: GraphSource>(
     let isolation = phase.isolation.unwrap_or(settings.default_isolation);
     if isolation == Isolation::Local && phase.fan_out > 1 {
         return Err(ResolveError::LocalFanOut {
+            phase: phase.name.clone(),
+            fan_out: phase.fan_out,
+        });
+    }
+    if phase.name == "review" && phase.fan_out > 1 {
+        return Err(ResolveError::ReviewFanOut {
             phase: phase.name.clone(),
             fan_out: phase.fan_out,
         });
@@ -486,7 +563,7 @@ async fn snapshot_phase<G: GraphSource>(
                 agent_id: id,
                 agent_name: agent_name(source, &phase.name, id).await?,
                 model: None,
-                template: None,
+                template: judge_template(source, project).await?,
             }),
         },
     })
@@ -556,6 +633,23 @@ async fn candidates<G: GraphSource>(
     }])
 }
 
+/// The latest `judge` template of the project, pinned beside the judged phase at run creation
+/// (plan D53; ANA-5's table, `:1862`). `None` when the project holds no `judge` template: that is
+/// not a refusal, because `None` already means "the latest at judge time" for a snapshot written
+/// before milestone 4.
+async fn judge_template<G: GraphSource>(
+    source: &G,
+    project: ProjectId,
+) -> std::result::Result<Option<SnapshotTemplate>, ResolveError> {
+    Ok(source
+        .prompt_template(project, "judge", None)
+        .await?
+        .map(|row| SnapshotTemplate {
+            name: row.name,
+            version: row.version,
+        }))
+}
+
 /// `agent.name`, denormalised onto the snapshot so an offline reader needs no registry (§5.1).
 async fn agent_name<G: GraphSource>(
     source: &G,
@@ -575,14 +669,15 @@ async fn agent_name<G: GraphSource>(
 #[cfg(test)]
 mod tests {
     use htui_core::fixtures::{DemoData, demo_data, ids};
-    use htui_core::model::{Gate, NewRepo, RepoId};
+    use htui_core::model::{Gate, NewRepo, PromptTemplateId, RepoId};
     use htui_core::store::MemStore;
     use serde_json::json;
 
     use super::{
         Agent, AgentId, BTreeMap, GraphSource, Isolation, Item, ItemId, PhaseAgent, PhaseId,
         ProjectId, PromptTemplate, ReadStore, ResolveError, Resolved, ResolvedGraph, Result,
-        RunMode, StepGraphPhase, Value, WriteStore, override_graph, resolve,
+        RunMode, SnapshotTemplate, StepGraphId, StepGraphPhase, Value, WriteStore, override_graph,
+        resolve,
     };
 
     /// The digest of the seeded `feature` graph, resolved against the demo fixture with one
@@ -859,6 +954,14 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(judge.agent_id, ids::AGENT_AGY);
         assert_eq!(judge.agent_name, "agy");
         assert_eq!(judge.model, None, "no phase column carries a judge model");
+        assert_eq!(
+            judge.template,
+            Some(SnapshotTemplate {
+                name: "judge".to_owned(),
+                version: 1
+            }),
+            "the seeded `judge` template is pinned at resolution (plan D53)"
+        );
         assert_eq!(snapshot.settings.default_isolation, Isolation::Copy);
         assert_eq!(snapshot.settings.per_token_cap_run, Some(7));
         assert_eq!(snapshot.settings.per_token_cap_batch, Some(9));
@@ -878,7 +981,9 @@ question and not a test fix. Decide the version bump first, then paste the new d
             ("token_budget".to_owned(), json!(9_000)),
             ("step_deadline_seconds".to_owned(), json!(300)),
             ("max_fan_out".to_owned(), json!(2)),
-            ("max_agents_per_run".to_owned(), json!(3)),
+            // Four, not less: `feature` plans one agent per phase, and D63 refuses a run that
+            // plans more agents than this cap.
+            ("max_agents_per_run".to_owned(), json!(4)),
         ]
         .into_iter()
         .collect();
@@ -897,7 +1002,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(snapshot.phases[0].token_budget, Some(9_000));
         assert_eq!(snapshot.phases[0].deadline_seconds, Some(300));
         assert_eq!(snapshot.settings.max_fan_out, 2);
-        assert_eq!(snapshot.settings.max_agents_per_run, 3);
+        assert_eq!(snapshot.settings.max_agents_per_run, 4);
         assert_eq!(snapshot.mode, RunMode::Auto);
 
         let silent: BTreeMap<String, Value> = [
@@ -1194,5 +1299,237 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .await
             .expect_err("the kind's default graph is gone");
         assert_eq!(error, ResolveError::NoGraph(ids::HTUI_FEAT_1));
+    }
+
+    /// `feature`'s `phase` with `fan_out` set, and `htui`'s settings naming `agy` as the judge.
+    fn store_fanned(graph: StepGraphId, phase: &str, fan_out: i32) -> MemStore {
+        let store = store_with(|data| {
+            for row in &mut data.phases {
+                if row.graph_id == graph && row.name == phase {
+                    row.fan_out = fan_out;
+                }
+            }
+        });
+        store.set_project_settings(
+            ids::PROJECT_HTUI,
+            json!({ "judge_agent_id": ids::AGENT_AGY }),
+        );
+        store
+    }
+
+    /// `resolve` for any fixture item, with an `app_setting` map and no requested scope.
+    async fn resolve_item(
+        store: &MemStore,
+        item: ItemId,
+        app: &BTreeMap<String, Value>,
+    ) -> std::result::Result<Resolved, ResolveError> {
+        let item = store
+            .item(item)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture holds the item");
+        resolve(
+            store,
+            &TestSource::claude(store),
+            &item,
+            RunMode::Manual,
+            app,
+            None,
+        )
+        .await
+    }
+
+    /// Plan D53 and ANA-5's table (`:1862`): the judge template is resolved to a concrete version
+    /// at run creation, beside the judged phase, so an edit to `judge` mid-run does not move a
+    /// run that already exists. The latest version wins; a project with no `judge` template at all
+    /// pins nothing and is not refused, because `None` already means "latest at judge time".
+    #[tokio::test]
+    async fn the_judge_template_is_pinned_beside_the_judged_phase() {
+        let store = store_with(|data| {
+            let latest = data
+                .templates
+                .iter()
+                .find(|row| row.project_id == ids::PROJECT_HTUI && row.name == "judge")
+                .cloned()
+                .expect("the fixture seeds a `judge` template");
+            data.templates.push(PromptTemplate {
+                id: PromptTemplateId::new(),
+                version: latest.version + 1,
+                ..latest
+            });
+            for row in &mut data.phases {
+                if row.graph_id == ids::GRAPH_HTUI_FEAT && row.name == "implement" {
+                    row.fan_out = 2;
+                }
+            }
+        });
+        store.set_project_settings(
+            ids::PROJECT_HTUI,
+            json!({ "judge_agent_id": ids::AGENT_AGY }),
+        );
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the fanned-out feature graph resolves")
+            .snapshot;
+        let implement = &snapshot.phases[2];
+        assert_eq!(implement.name, "implement");
+        assert_eq!(
+            implement
+                .judge
+                .as_ref()
+                .expect("the project names a judge")
+                .template,
+            Some(SnapshotTemplate {
+                name: "judge".to_owned(),
+                version: 2
+            }),
+            "the latest `judge` version at run creation is pinned"
+        );
+        assert_eq!(
+            implement.template.name, "implement",
+            "the judged phase keeps its own template beside the judge's"
+        );
+
+        let store = store_with(|data| data.templates.retain(|row| row.name != "judge"));
+        store.set_project_settings(
+            ids::PROJECT_HTUI,
+            json!({ "judge_agent_id": ids::AGENT_AGY }),
+        );
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("an absent judge template is not a refusal")
+            .snapshot;
+        let judge = snapshot.phases[2]
+            .judge
+            .as_ref()
+            .expect("the project names a judge");
+        assert_eq!(judge.template, None, "nothing to pin, so latest at judge time");
+    }
+
+    /// Plan D63, first cap: `app_setting.max_fan_out`, refused before a run row exists.
+    #[tokio::test]
+    async fn a_fan_out_above_max_fan_out_is_refused_naming_both_figures() {
+        let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 5);
+        let error = resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
+            .await
+            .expect_err("5 is above the built-in 4");
+        assert_eq!(
+            error,
+            ResolveError::FanOutCap {
+                phase: "implement".to_owned(),
+                fan_out: 5,
+                max: 4,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "phase `implement` fans out 5; max_fan_out is 4 (ANA-2 :868)"
+        );
+
+        // The `app_setting` rung moves the cap, and the refusal names the resolved figure.
+        let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 3);
+        let app: BTreeMap<String, Value> = [("max_fan_out".to_owned(), json!(2))]
+            .into_iter()
+            .collect();
+        let error = resolve_item(&store, ids::HTUI_FEAT_1, &app)
+            .await
+            .expect_err("3 is above a planted 2");
+        assert_eq!(
+            error,
+            ResolveError::FanOutCap {
+                phase: "implement".to_owned(),
+                fan_out: 3,
+                max: 2,
+            }
+        );
+
+        // At the cap is not above it.
+        let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 2);
+        resolve_item(&store, ids::HTUI_FEAT_1, &app)
+            .await
+            .expect("2 is at a cap of 2");
+    }
+
+    /// Plan D63, second cap (OQ-1): `Σ fan_out` plus one per judged phase. On `feature` with
+    /// `implement` at 3 and a judge that is `1 + 1 + 3 + 1 + 1 = 7`, above the built-in 6
+    /// (blueprint F-F). At 2 it is exactly 6, which is allowed.
+    #[tokio::test]
+    async fn planned_agents_above_the_cap_are_refused_at_resolution() {
+        let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 3);
+        let error = resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
+            .await
+            .expect_err("7 planned agents is above 6");
+        assert_eq!(error, ResolveError::AgentCap { planned: 7, max: 6 });
+        assert_eq!(
+            error.to_string(),
+            "run plans 7 agents; max_agents_per_run is 6 (ANA-2 :870-875)"
+        );
+
+        let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 2);
+        resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
+            .await
+            .expect("6 planned agents is at the cap");
+
+        // With no judge a fanned-out phase is judged by a human, which costs no agent.
+        let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 3);
+        store.set_project_settings(ids::PROJECT_HTUI, json!({}));
+        resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
+            .await
+            .expect("1 + 1 + 3 + 1 = 6 with no judge");
+
+        // The `app_setting` rung moves this cap too.
+        let app: BTreeMap<String, Value> = [("max_agents_per_run".to_owned(), json!(5))]
+            .into_iter()
+            .collect();
+        let error = resolve_item(&store, ids::HTUI_FEAT_1, &app)
+            .await
+            .expect_err("6 is above a planted 5");
+        assert_eq!(error, ResolveError::AgentCap { planned: 6, max: 5 });
+    }
+
+    /// Criterion 8's shape: `analysis` is `research` then `verdict`, so `research` at 3 with a
+    /// judge plans `3 + 1 + 1 = 5`, under the built-in 6.
+    #[tokio::test]
+    async fn the_analysis_graph_fans_out_three_under_the_default_cap() {
+        let store = store_fanned(ids::GRAPH_HTUI_ANA, "research", 3);
+        let snapshot = resolve_item(&store, ids::HTUI_ANA_2, &BTreeMap::new())
+            .await
+            .expect("5 planned agents is under 6")
+            .snapshot;
+        let names: Vec<&str> = snapshot
+            .phases
+            .iter()
+            .map(|phase| phase.name.as_str())
+            .collect();
+        assert_eq!(names, ["research", "verdict"]);
+        assert_eq!(snapshot.phases[0].fan_out, 3);
+        assert!(snapshot.phases[0].judge.is_some(), "the project names a judge");
+        assert_eq!(snapshot.settings.max_fan_out, 4);
+        assert_eq!(snapshot.settings.max_agents_per_run, 6);
+    }
+
+    /// Plan D64 (OQ-5): a `review` phase cannot fan out, refused at snapshot time.
+    #[tokio::test]
+    async fn a_review_phase_cannot_fan_out() {
+        let store = store_fanned(ids::GRAPH_HTUI_FEAT, "review", 2);
+        let error = resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
+            .await
+            .expect_err("`review` at fan_out 2 is refused");
+        assert_eq!(
+            error,
+            ResolveError::ReviewFanOut {
+                phase: "review".to_owned(),
+                fan_out: 2,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "phase `review` is a review with fan_out 2; a review cannot fan out (plan D64)"
+        );
+
+        let store = store_fanned(ids::GRAPH_HTUI_FEAT, "review", 1);
+        resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
+            .await
+            .expect("`review` at fan_out 1 is the ordinary case");
     }
 }
