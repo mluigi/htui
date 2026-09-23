@@ -41,6 +41,10 @@ process-wrap = { workspace = true }
 # MOD-4 milestone 3 (plan D35, T4): `isolate/copy.rs` measures and copies a checkout with a
 # bounded walk, mirroring `htui_store::vector_sync`'s.
 walkdir      = { workspace = true }
+# MOD-4 milestone 4 (plan D58): a fan-out group's candidates run concurrently inside one engine
+# call through `futures::future::join_all`. `tokio::task::JoinSet` would need `'static` futures,
+# and every candidate borrows the engine's `&'a` parts and the group's one assembled prompt.
+futures      = { workspace = true }
 
 # Only to name `PROCESS_CREATION_FLAGS` for `CREATE_NO_WINDOW`, exactly as `htui-agent` does
 # (`crates/htui-agent/src/launch.rs:1139-1143`): `process-wrap`'s `CreationFlags` wraps that type

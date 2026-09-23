@@ -203,6 +203,9 @@ impl<'a> SessionKey<'a> {
     }
 }
 
+/// What one pumped session answered: its `done`, or the driver error a closed stream is.
+type SessionResult = Result<DoneEvent, htui_agent::error::DriverError>;
+
 /// How the walk gets a driver for one session.
 ///
 /// **The blueprint's §5.1 factory was `Fn(&SnapshotCandidate) -> Box<dyn AgentDriver>` and could
@@ -1670,6 +1673,10 @@ where
     /// kind) and milestone 3's `gix` layer will do real work on every call, so a second one per
     /// step is a second set of trees and a second `before_hash`. Plan D16 forbids state held
     /// *across* calls; a parameter inside one is not that.
+    ///
+    /// [`open_recorder`](Self::open_recorder), one [`drive_once`](Self::drive_once) and the
+    /// recorder's `finish`: the judge (plan D52) is the same three with a second `drive_once` in
+    /// between, under the one recorder.
     async fn session(
         &self,
         run: &Run,
@@ -1678,17 +1685,98 @@ where
         prompt: &AssembledPrompt,
         cwd: std::path::PathBuf,
         extra_dirs: Vec<std::path::PathBuf>,
-    ) -> Result<
-        (
-            Result<DoneEvent, htui_agent::error::DriverError>,
-            Option<htui_agent::record::CapBreach>,
-        ),
-        EngineError,
-    > {
+    ) -> Result<(SessionResult, Option<htui_agent::record::CapBreach>), EngineError> {
+        let mut recorder = self.open_recorder(run, step, prompt).await?;
+        // A spawn failure is folded in rather than propagated straight out of the `?`: the
+        // recorder has already written the prompt row, so it is closed out on this path exactly as
+        // it is on a `pump` error. What it is *not* is a settle outcome — ANA-2 `:639` gives
+        // "spawn failure" an unconditioned `running -> failed` and §4.2's gate table has no cell
+        // for it — so it is re-raised instead of handed to `gate::apply`, which under `always`
+        // would park a human at a gate on a session that never opened. `walk_step`'s hard failure
+        // is what lands it in `failed`, under every gate.
+        let result = match self
+            .drive_once(
+                run,
+                step,
+                phase,
+                &SessionKey::of(step),
+                &prompt.text,
+                cwd,
+                extra_dirs,
+                &mut recorder,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(refused) => {
+                recorder.finish().await?;
+                return Err(refused);
+            }
+        };
+        let summary = recorder.finish().await?;
+        Ok((result, summary.cap_breach))
+    }
+
+    /// A step's [`Recorder`], with the run cap applied and `prompt` recorded as its seq-0 row.
+    ///
+    /// `record_prompt` also writes `run_step.prompt_digest`, so every session a step opens — a
+    /// candidate's one, the judge's two (plan D52) — is recorded against the digest of the prompt
+    /// it was opened with.
+    async fn open_recorder(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        prompt: &AssembledPrompt,
+    ) -> Result<Recorder<'a, S>, EngineError> {
+        let project = self.project(run.project_id).await?;
+        let settings = Self::project_settings(&project);
+        let mut recorder = Recorder::new(
+            self.parts.store,
+            self.parts.scrubber,
+            step.id,
+            settings.keep_raw_events,
+            None,
+        );
+        if let Some(micros) = settings.per_token_cap_run {
+            recorder = recorder.with_run_cap(RunCap {
+                micros,
+                // Nothing in this milestone spawns a process, so a grace of zero is the honest
+                // figure; milestone 3's worker passes its own (`record.rs:157-159`).
+                grace: std::time::Duration::ZERO,
+            });
+        }
+        recorder
+            .record_prompt(&prompt.text, prompt.payload_sections_value(), self.now())
+            .await?;
+        Ok(recorder)
+    }
+
+    /// One driver session under `recorder`: the driver for `key`, `start` with `text`, and the
+    /// pump to its `done`.
+    ///
+    /// The outer `Err` is a driver that refused to **start** ([`EngineError::Driver`]) or a
+    /// read that failed before it; the inner `Result` is what the pump answered, which is a settle
+    /// input and not an engine fault. The recorder is the caller's to finish on either path.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the session's four coordinates and its three per-call inputs; a struct would be \
+                  built at exactly two call sites and read here only"
+    )]
+    async fn drive_once(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
+        text: &str,
+        cwd: std::path::PathBuf,
+        extra_dirs: Vec<std::path::PathBuf>,
+        recorder: &mut Recorder<'a, S>,
+    ) -> Result<SessionResult, EngineError> {
         let project = self.project(run.project_id).await?;
         let settings = Self::project_settings(&project);
         let candidate = Self::candidate_of(step, phase)?;
-        let driver = (self.parts.driver)(&candidate, &SessionKey::of(step));
+        let driver = (self.parts.driver)(&candidate, key);
 
         let spec = SessionSpec {
             agent_id: candidate.agent_id,
@@ -1708,43 +1796,8 @@ where
             resume: None,
             budget_micros: settings.per_token_cap_run,
         };
-
-        let mut recorder = Recorder::new(
-            self.parts.store,
-            self.parts.scrubber,
-            step.id,
-            settings.keep_raw_events,
-            None,
-        );
-        if let Some(micros) = settings.per_token_cap_run {
-            recorder = recorder.with_run_cap(RunCap {
-                micros,
-                // Nothing in this milestone spawns a process, so a grace of zero is the honest
-                // figure; milestone 3's worker passes its own (`record.rs:157-159`).
-                grace: std::time::Duration::ZERO,
-            });
-        }
-        recorder
-            .record_prompt(&prompt.text, prompt.payload_sections_value(), self.now())
-            .await?;
-
-        // A spawn failure is folded in rather than propagated straight out of the `?`: the
-        // recorder has already written the prompt row, so it is closed out on this path exactly as
-        // it is on a `pump` error. What it is *not* is a settle outcome — ANA-2 `:639` gives
-        // "spawn failure" an unconditioned `running -> failed` and §4.2's gate table has no cell
-        // for it — so it is re-raised instead of handed to `gate::apply`, which under `always`
-        // would park a human at a gate on a session that never opened. `walk_step`'s hard failure
-        // is what lands it in `failed`, under every gate.
-        let mut session = match driver.start(spec, prompt.text.clone()).await {
-            Ok(session) => session,
-            Err(refused) => {
-                recorder.finish().await?;
-                return Err(EngineError::Driver(refused));
-            }
-        };
-        let result = pump(&mut *session, &mut recorder).await;
-        let summary = recorder.finish().await?;
-        Ok((result, summary.cap_breach))
+        let mut session = driver.start(spec, text.to_owned()).await?;
+        Ok(pump(&mut *session, recorder).await)
     }
 
     // -- helpers -------------------------------------------------------------------------------
@@ -1904,22 +1957,31 @@ where
     }
 
     /// The document of `phase.output_kind` produced by **this step**, at its highest version.
+    ///
+    /// Read over **every** version's head (`ReadStore::documents`) and then by id, not through
+    /// `documents_of_kinds`, which answers only the item's latest version of each kind
+    /// (blueprint F-A): three fan-out candidates each write a version of one kind, and a
+    /// latest-only read would find the output of one of them and settle the other two
+    /// `missing_output`. The judge's two calls are the same shape — each call's verdict is the
+    /// newest `judge` document *this* step wrote (plan D52).
     async fn output_of(
         &self,
         item: ItemId,
         phase: &SnapshotPhase,
         step: StepId,
     ) -> Result<Option<Document>, EngineError> {
-        let mut mine: Vec<Document> = self
+        let newest = self
             .parts
             .store
-            .documents_of_kinds(item, std::slice::from_ref(&phase.output_kind))
+            .documents(item)
             .await?
             .into_iter()
-            .filter(|document| document.produced_by_step_id == Some(step))
-            .collect();
-        mine.sort_by_key(|document| document.version);
-        Ok(mine.pop())
+            .filter(|head| head.kind == phase.output_kind && head.produced_by_step_id == Some(step))
+            .max_by_key(|head| head.version);
+        let Some(head) = newest else {
+            return Ok(None);
+        };
+        Ok(self.parts.store.document(head.id).await?)
     }
 
     /// One item row.
