@@ -140,8 +140,29 @@ pub fn local_moved(path: &Path, head: &str, base: &str) -> String {
 /// `never_reset` reason says which trees *were* moved and where their work is.
 #[must_use]
 pub fn already_reset(rows: &[(RepoId, &Path, &str, &str)]) -> String {
-    let _ = rows;
-    todo!("plan D138")
+    let rows = rows
+        .iter()
+        .map(|(repo, path, head, base)| format!("{repo} {} from {head} to {base}", path.display()))
+        .collect::<Vec<_>>();
+    format!("already reset: {}", rows.join(", "))
+}
+
+/// D138: `err` in its own variant with [`already_reset`] appended, when `done` names any row; an
+/// `Io` failure has no text of its own to extend and is carried as `Git`.
+fn part_way(err: IsolateError, done: &[(RepoId, PathBuf, String, String)]) -> IsolateError {
+    if done.is_empty() {
+        return err;
+    }
+    let rows = done
+        .iter()
+        .map(|(repo, path, head, base)| (*repo, path.as_path(), head.as_str(), base.as_str()))
+        .collect::<Vec<_>>();
+    let named = already_reset(&rows);
+    match err {
+        IsolateError::Refused(text) => IsolateError::Refused(format!("{text}; {named}")),
+        IsolateError::Git(text) => IsolateError::Git(format!("{text}; {named}")),
+        IsolateError::Io(io) => IsolateError::Git(format!("{io}; {named}")),
+    }
 }
 
 /// Where a tree of this repository starts: the slot's base when there is a slot (D54(a)), the
@@ -1536,6 +1557,8 @@ impl Isolator for GixIsolator {
 
             // D40: the probe's refusal answers before the first write, not between two.
             let git = self.cli()?.clone();
+            // D138: what a later row's failure must still say was moved.
+            let mut done = Vec::new();
             for (tree, path, head, create) in planned {
                 if create {
                     let (at, name, target) = (path.clone(), label.clone(), head.clone());
@@ -1543,10 +1566,14 @@ impl Isolator for GixIsolator {
                         let (at, name, target) = (at.clone(), name.clone(), target.clone());
                         async move { blocking(move || git::create_branch(&at, &name, &target)).await }
                     })
-                    .await?;
+                    .await
+                    .map_err(|err| part_way(err, &done))?;
                 }
-                report.labelled.push((tree.repo_id, head));
-                git::with_retry("reset --hard", || git.reset_hard(&path, &tree.base_ref)).await?;
+                report.labelled.push((tree.repo_id, head.clone()));
+                git::with_retry("reset --hard", || git.reset_hard(&path, &tree.base_ref))
+                    .await
+                    .map_err(|err| part_way(err, &done))?;
+                done.push((tree.repo_id, path, head, tree.base_ref.clone()));
             }
             Ok(report)
         })
