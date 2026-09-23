@@ -4242,7 +4242,7 @@ where
         {
             Ok(())
         } else {
-            Err(crate::command::stale_step(run, step, from, to))
+            Err(stale_step(run, step, from, to))
         }
     }
 
@@ -4257,7 +4257,7 @@ where
         if self.parts.store.transition_run(run, from, to, now).await? {
             Ok(())
         } else {
-            Err(crate::command::stale_run(run, from, to))
+            Err(stale_run(run, from, to))
         }
     }
 
