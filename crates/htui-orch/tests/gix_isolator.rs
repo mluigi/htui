@@ -2773,6 +2773,49 @@ async fn a_merge_onto_a_moved_primary_diffs_only_its_own_paths() {
     );
 }
 
+/// Plan D147/D148 (R-33): a primary whose own config sets `merge.log=true` would have `git merge`
+/// append a shortlog body to D25's message. `merge_no_ff` turns it off, so the merge's message is
+/// exactly `htui: reconcile <step>`, and the second run's merge still diffs from its first parent.
+#[tokio::test]
+async fn a_primary_with_merge_log_still_diffs_a_moved_primary_merge_from_its_first_parent() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    git_out(&git, &fix.core.path, &["config", "merge.log", "true"]).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let m1 = head_of(&git, &fix.core.path).await;
+    let second = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles on top of the first one's merge");
+    let m2 = head_of(&git, &fix.core.path).await;
+
+    let diff = fix
+        .isolator
+        .diff(&b_rows, &second)
+        .await
+        .expect("the diff reads")
+        .expect("the second run committed");
+    assert_eq!(diff.range, format!("{m1}..{m2}"), "the merge's own range");
+    assert!(
+        !diff.stat.contains("a.txt"),
+        "never the other run's path: {}",
+        diff.stat
+    );
+    assert_eq!(
+        git_out(&git, &fix.core.path, &["log", "-1", "--format=%B", &m2]).await,
+        format!("htui: reconcile {b}"),
+        "D25's message, with no shortlog body"
+    );
+}
+
 /// Plan D136's in-process race: rule P admits two isolated runs on one repository, and one
 /// process may reconcile both at once. Without D70's admin lock held from the `HEAD` read to the
 /// merge's post-condition, B can read `HEAD` at the base, A merge, and B's merge land on A's — B's
