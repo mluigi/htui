@@ -836,6 +836,20 @@ where
         }
         let slot = group_at(&steps, row.position, row.attempt);
         crate::command::retry_group_enabled(run, &slot, phase)?;
+        self.retry_group_guarded(run, snapshot, row, phase, &steps)
+            .await
+    }
+
+    /// [`Self::retry_group`] past its guards, over the `steps` they read: the lease, the slot's
+    /// retirement, the unpark and the leased walk.
+    async fn retry_group_guarded(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        row: &RunStep,
+        phase: &SnapshotPhase,
+        steps: &[RunStep],
+    ) -> Result<CommandOutcome, EngineError> {
         let attempt = row.attempt;
         self.take_lease(run.id).await?;
 
@@ -843,7 +857,7 @@ where
         // Plan D133: a member moved between the guard and its retirement stops the retry, and
         // the lease is given back.
         if let Err(err) =
-            gate::retire_slot(&self.gate_context(run, snapshot), &steps, row.position, now).await
+            gate::retire_slot(&self.gate_context(run, snapshot), steps, row.position, now).await
         {
             if matches!(err, EngineError::StaleWrite { .. }) {
                 self.release_lease(run.id).await;
@@ -7829,6 +7843,13 @@ mod tests {
             })
         );
         assert!(harness.orch.isolator.reconciles().is_empty());
+        let row = harness.orch.run(run).await;
+        assert_eq!(row.status, RunStatus::AwaitingApproval);
+        assert_eq!(
+            row.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "the lease `resume` took is given back"
+        );
         let steps = harness.orch.steps(run).await;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].id, prd);
@@ -8007,7 +8028,93 @@ mod tests {
             (named.as_str(), from.as_str(), to.as_str()),
             ("the run", "awaiting_approval", "running")
         );
+        assert_eq!(
+            harness.orch.run(run).await.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "the lease the retry took is given back"
+        );
         assert_eq!(harness.orch.steps(run).await.len(), 2, "no attempt 2");
+    }
+
+    /// Plan D133 for a group `RetryStep`: `retire_slot`'s `failed -> cancelled` on a member is a
+    /// compare-and-set, and another command retired that member between the guard's read and the
+    /// write. The retry stops with `StaleWrite`, gives back the lease it took and unparks nothing.
+    #[tokio::test]
+    async fn a_stale_group_retry_stops_and_gives_the_lease_back() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.fan_out = 2;
+                }
+            })
+            .await;
+        harness
+            .orch
+            .script_candidate("prd", 1, 1, 0, ScriptedStep::failing(StopReason::Refusal));
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(0)),
+            "a group with one survivor parks for a human"
+        );
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let stale = harness.orch.steps(run).await;
+        let failed = stale
+            .iter()
+            .find(|step| step.position == 0 && step.fanout_index == 1)
+            .expect("the group has index 1")
+            .clone();
+        assert_eq!(failed.status, StepStatus::Failed, "{stale:?}");
+        // Another command retired the failed member first: the rows read above are stale.
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_step(
+                    failed.id,
+                    StepStatus::Failed,
+                    StepStatus::Cancelled,
+                    harness.orch.clock.now(),
+                )
+                .await
+                .expect("MemStore takes the move"),
+        );
+        harness.orch.clock.advance(TimeDelta::seconds(1));
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .retry_group_guarded(&row, &snapshot, &failed, &snapshot.phases[0], &stale)
+            .await
+            .expect_err("`retire_slot`'s compare-and-set found the member moved");
+        assert_stale_and_released(
+            &harness,
+            run,
+            &refused,
+            (&format!("step {}", failed.id), "failed", "cancelled"),
+        )
+        .await;
+        assert!(
+            harness
+                .orch
+                .steps(run)
+                .await
+                .iter()
+                .all(|step| step.attempt == 1),
+            "no group admitted at attempt 2"
+        );
     }
 
     /// Plan D135 (review K2): the automatic path's `request-changes` retires the review through
