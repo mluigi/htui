@@ -236,7 +236,7 @@ pub enum EngineError {
     /// Plan D83: why `claim_run` refused — the box is at `max_concurrent_items`, or the run's
     /// scope overlaps a live one under ANA-2 §4.7's rules L, I or P. The run stays `queued`, and
     /// `Engine::claim` re-attempts it (plan D84).
-    #[error("claim refused: the box is full or the scope overlaps (ANA-2 §4.7)")]
+    #[error("claim refused: {claim}")]
     ClaimRefused {
         /// The run that stayed queued.
         run: RunId,
@@ -411,6 +411,11 @@ pub fn answer_gate_enabled(
 /// prospective reading, which is the only one under which the shipped `retry_limit = 1` permits the
 /// two attempts `docs/ANA-2.md:487` says it does.
 ///
+/// **An interrupted step is exempt from the budget** (blueprint A-8): a `failed` step whose
+/// `gate_note` starts with `interrupted` was failed by the recovery sweep after a crash, which
+/// plan D92 says "is not the agent's failed settle". The budget bounds automatic retries, and a
+/// human choosing to retry after a crash is not one.
+///
 /// Two things this guard deliberately does **not** check, because they need rows it is not given:
 /// that the run is non-terminal, and that the item is not `blocked`
 /// ([`EngineError::ItemBlocked`], blueprint F-J). Both are the engine's, at dispatch.
@@ -429,7 +434,7 @@ pub fn retry_enabled(step: &RunStep, phase: &SnapshotPhase) -> Result<(), Engine
             expected: "awaiting_approval | failed",
         });
     }
-    if !may_attempt(step.attempt + 1, phase.retry_limit) {
+    if !may_attempt(step.attempt + 1, phase.retry_limit) && !interrupted(step) {
         return Err(EngineError::RetryExhausted {
             step: step.id,
             attempt: step.attempt,
@@ -437,6 +442,17 @@ pub fn retry_enabled(step: &RunStep, phase: &SnapshotPhase) -> Result<(), Engine
         });
     }
     Ok(())
+}
+
+/// Blueprint A-8: a `failed` step whose `gate_note` the sweep wrote (`interrupted`, or
+/// `interrupted, tree not reset`, plan D115). The prefix is the whole rule, as the blueprint
+/// states it; no settle of the walk's own writes a note that starts with it.
+fn interrupted(step: &RunStep) -> bool {
+    step.status == StepStatus::Failed
+        && step
+            .gate_note
+            .as_deref()
+            .is_some_and(|note| note.starts_with("interrupted"))
 }
 
 /// §6.2's "Enabled when" for `select` (`docs/ANA-2.md:1566`, plan D65).
@@ -450,7 +466,7 @@ pub fn retry_enabled(step: &RunStep, phase: &SnapshotPhase) -> Result<(), Engine
 ///
 /// **A parked run has no other resume verb** (blueprint R-7): a group parked because its winner's
 /// reconcile was refused carries `selected = true` and is refused here as
-/// [`EngineError::AlreadySelected`]; milestone 5's sweep owns that retry.
+/// [`EngineError::AlreadySelected`]; milestone 6's `Unblock`-shaped verb owns that retry (R-7).
 ///
 /// # Errors
 /// [`EngineError::RunStatus`], [`EngineError::NotAFanout`], [`EngineError::AlreadySelected`],
