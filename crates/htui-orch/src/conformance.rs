@@ -19,9 +19,10 @@ use htui_core::model::{
     RunId, RunMode, RunStatus, RunStep, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
     VerifyOutcome,
 };
-use htui_core::model::{Quota, QuotaSource, Spend};
+use htui_core::model::{Claim, NewItem, OverlapRule, Quota, QuotaSource, Spend};
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use uuid::Uuid;
 
 use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 use crate::engine::Resume;
@@ -110,6 +111,27 @@ pub trait Orchestrate {
 
     /// The clock, for reading the instants the walk stamped.
     fn clock(&self) -> &TestClock;
+
+    /// `Engine::claim` (plan D84): re-attempt a run a refusal left `queued`.
+    ///
+    /// Out of the blueprint's §4.5 list, and needed (blueprint F-J): criterion 15's first half
+    /// ends with the refused run claimed once its holder is gone, and nothing else re-attempts a
+    /// `queued` run.
+    ///
+    /// # Errors
+    /// Whatever the engine refuses with.
+    async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError>;
+
+    /// A second orchestrator over the same store, as a process started after this one died
+    /// (plan D118): a new `owner`, fresh isolator and verifier, a clock past every lease.
+    #[must_use]
+    fn restarted(&self) -> Self
+    where
+        Self: Sized;
+
+    /// The lease owner this orchestrator writes (blueprint F-J), so a case can tell whose lease
+    /// a run carries.
+    fn owner(&self) -> Uuid;
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -159,13 +181,25 @@ impl Orchestrate for FakeOrchestrator {
     fn clock(&self) -> &TestClock {
         &self.clock
     }
+
+    async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
+        Self::claim(self, run).await
+    }
+
+    fn restarted(&self) -> Self {
+        Self::restarted(self)
+    }
+
+    fn owner(&self) -> Uuid {
+        Self::owner(self)
+    }
 }
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Thirty-six, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_thirty_six` and out of crate by `tests/fake_conformance.rs` — because
-/// a binding that silently ran thirty-five of them would still be green.
+/// Forty-two, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_forty_two` and out of crate by `tests/fake_conformance.rs` — because
+/// a binding that silently ran forty-one of them would still be green.
 ///
 /// Seven are `docs/ANA-2.md` §12's validation criteria (1, 2, 3, 5, 6, 7 and 13's command half);
 /// four are contract lines
@@ -182,7 +216,10 @@ impl Orchestrate for FakeOrchestrator {
 /// and 10 (plan D49-D53, D65), the gated and judgeless routes to a human (D49, D50), a failed
 /// candidate (D48), a group with no survivor (D49(1)), the review loop over a group (D66), and
 /// the two caps refused at `StartRun` (D63) — and one more for a `shared_serialized` sibling's
-/// deadline, which counts from its own `prepare` (D48).
+/// deadline, which counts from its own `prepare` (D48). Milestone 5 adds six: criterion 15's
+/// three halves (plan D83, D84) and criterion 16, where overlap and the slot reach the walk, and
+/// the lease's two cross-process answers — a park releases it for another process's answer, and
+/// a live one refuses that answer before anything is written (plan D87, D108).
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -265,6 +302,20 @@ pub const CASES: &[&str] = &[
     // Plan D48 under `shared_serialized`: a candidate's deadline counts from its own `prepare`,
     // not from the siblings it queued behind.
     "a_serialized_sibling_is_not_charged_for_the_ones_before_it",
+    // Milestone 5, criterion 15 (`:2125`, plan D83, D84): two runs declaring `src/**` on one
+    // repo serialise, and `Engine::claim` walks the second once the first is gone.
+    "overlapping_touched_paths_serialise",
+    // Criterion 15 (`:2125-2126`): the same paths in two repos run concurrently.
+    "the_same_paths_in_two_repos_run_concurrently",
+    // Criterion 15 (`:2126-2127`): an undeclared item holds its whole primary repo.
+    "an_undeclared_item_holds_its_whole_primary_repo",
+    // Criterion 16 (`:2128-2129`): a parked run holds no slot but still blocks an overlap, and a
+    // full box refuses before any overlap is read.
+    "a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap",
+    // Plan D87: a park releases the lease, and another process's answer takes it.
+    "a_parked_run_releases_its_lease_and_an_answer_takes_it",
+    // Plan D87, D108: a live lease refuses another process's answer before its first write.
+    "a_live_lease_blocks_an_answer_from_another_process",
 ];
 
 /// Run one case by name.
@@ -353,6 +404,22 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
         }
         "a_serialized_sibling_is_not_charged_for_the_ones_before_it" => {
             a_serialized_sibling_is_not_charged_for_the_ones_before_it(harness).await;
+        }
+        "overlapping_touched_paths_serialise" => overlapping_touched_paths_serialise(harness).await,
+        "the_same_paths_in_two_repos_run_concurrently" => {
+            the_same_paths_in_two_repos_run_concurrently(harness).await;
+        }
+        "an_undeclared_item_holds_its_whole_primary_repo" => {
+            an_undeclared_item_holds_its_whole_primary_repo(harness).await;
+        }
+        "a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap" => {
+            a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap(harness).await;
+        }
+        "a_parked_run_releases_its_lease_and_an_answer_takes_it" => {
+            a_parked_run_releases_its_lease_and_an_answer_takes_it(harness).await;
+        }
+        "a_live_lease_blocks_an_answer_from_another_process" => {
+            a_live_lease_blocks_an_answer_from_another_process(harness).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -3134,6 +3201,326 @@ async fn a_serialized_sibling_is_not_charged_for_the_ones_before_it<H: CaseHarne
     );
 }
 
+// -- MOD-4 milestone 5: overlap reaches the walk, and the engine holds its lease ------------------
+
+/// Sets `item.touched_paths` through the patch writer, so the next `StartRun` resolves it.
+///
+/// # Panics
+/// When the item's version moved under the case.
+async fn touch<O: Orchestrate>(orch: &O, item: ItemId, paths: &[&str]) {
+    let row = item_of(orch, item).await;
+    orch.store()
+        .update_item(
+            item,
+            row.version,
+            ItemPatch {
+                touched_paths: Some(paths.iter().map(|path| (*path).to_owned()).collect()),
+                author_id: row.created_by,
+                reason: "a conformance case's declared paths".to_owned(),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect("the item's version is current");
+}
+
+/// A fresh `open` FEAT item on the HTUI project declaring `paths`: criterion 16 needs five
+/// startable items and the fixture seeds three (`ANA-2`, `FEAT-3` once freed, `CLEAN-1`).
+///
+/// # Panics
+/// When the mint is refused, which means the fixture moved.
+async fn mint_feat<O: Orchestrate>(orch: &O, title: &str, paths: &[&str]) -> ItemId {
+    let user = orch
+        .store()
+        .this_user()
+        .expect("the demo fixture seeds exactly one `app_user`");
+    orch.store()
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            title: title.to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: user,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("the FEAT kind mints on the HTUI project")
+        .id
+}
+
+/// `StartRun` that the claim refuses, unwrapped to the queued run and the claim's answer.
+///
+/// # Panics
+/// When the command is not a [`EngineError::ClaimRefused`].
+async fn start_refused<O: Orchestrate>(orch: &O, item: ItemId) -> (RunId, Claim) {
+    let refused = orch
+        .dispatch(Command::StartRun {
+            item,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        })
+        .await
+        .expect_err("the claim is refused");
+    let EngineError::ClaimRefused { run, claim } = refused else {
+        panic!("a claim refusal, not {refused}");
+    };
+    (run, claim)
+}
+
+/// ANA-2 §12 criterion 15, first half (`docs/ANA-2.md:2125`, plan D83, D84): two items
+/// declaring `src/**` on one repo do not run together. The second `StartRun` is refused with the
+/// rule and the holder, the run and its item stay `queued`, and once the holder ends
+/// `Engine::claim` walks it.
+async fn overlapping_touched_paths_serialise<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    touch(&orch, ids::HTUI_FEAT_3, &["src/**"]).await;
+    touch(&orch, ids::HTUI_ANA_2, &["src/**"]).await;
+
+    let (first, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0)),
+        "the first run parks at its first gate, and a parked run still holds its scope"
+    );
+
+    let (second, claim) = start_refused(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        claim,
+        Claim::Overlaps {
+            with: first,
+            rule: OverlapRule::Paths,
+        }
+    );
+    assert_eq!(run_of(&orch, second).await.status, RunStatus::Queued);
+    assert_eq!(
+        item_of(&orch, ids::HTUI_ANA_2).await.status,
+        Status::Queued,
+        "plan D84: a refusal writes nothing"
+    );
+    assert!(
+        steps_of(&orch, second).await.is_empty(),
+        "nothing walked the refused run"
+    );
+
+    orch.dispatch(Command::CancelRun { run: first })
+        .await
+        .expect("the holder is cancellable");
+    let outcome = orch
+        .claim(second)
+        .await
+        .expect("the holder is gone, so the claim is admitted");
+    assert!(
+        matches!(outcome, CommandOutcome::Started { run, .. } if run == second),
+        "{outcome:?}"
+    );
+    assert_ne!(run_of(&orch, second).await.status, RunStatus::Queued);
+}
+
+/// Criterion 15, second half (`:2125-2126`): the same paths in two repos are two scopes, so
+/// both runs are admitted, and each run's `repo_scope` is the repo its item qualified.
+async fn the_same_paths_in_two_repos_run_concurrently<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let htui = primary_repo(&orch).await;
+    let web = RepoId::new();
+    orch.store()
+        .create_repo(NewRepo {
+            id: web,
+            project_id: ids::PROJECT_HTUI,
+            name: "web".to_owned(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            is_primary: false,
+        })
+        .await
+        .expect("the demo project has no `web` repo yet");
+    free_feat_3(&orch).await;
+    touch(&orch, ids::HTUI_FEAT_3, &["htui:src/**"]).await;
+    touch(&orch, ids::HTUI_ANA_2, &["web:src/**"]).await;
+
+    let (first, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let (second, _) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(run_of(&orch, first).await.repo_scope, [htui]);
+    assert_eq!(run_of(&orch, second).await.repo_scope, [web]);
+}
+
+/// Criterion 15, `:2126-2127`: an item that declares nothing overlaps the whole of its primary repo,
+/// so a run on `docs/**` holds it off.
+async fn an_undeclared_item_holds_its_whole_primary_repo<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    touch(&orch, ids::HTUI_FEAT_3, &["docs/**"]).await;
+    touch(&orch, ids::HTUI_ANA_2, &[]).await;
+
+    let (first, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let (_, claim) = start_refused(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        claim,
+        Claim::Overlaps {
+            with: first,
+            rule: OverlapRule::Paths,
+        }
+    );
+}
+
+/// ANA-2 §12 criterion 16 (`:2128-2129`, plan D83): a parked run holds no slot but still holds
+/// its scope, and `SlotFull` is decided before overlap.
+///
+/// **A and B stand in for two live walks by hand** — both are started, park at their first gate,
+/// and are moved `awaiting_approval -> running` with the item mirrored. A walk that stays
+/// `running` across a `dispatch` does not exist in the fake (every script finishes before its
+/// first beat, plan D86), and a `queued` run with a resolved scope has no other constructor on
+/// the case's surface. The clock moves a second between starts so `queued_at` orders the runs
+/// (blueprint H-5).
+async fn a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    let parked = mint_feat(&orch, "P", &["lib/**"]).await;
+    let waiting = mint_feat(&orch, "E", &["lib/**"]).await;
+    let first = mint_feat(&orch, "A", &["src/**"]).await;
+    let second = mint_feat(&orch, "B", &["docs/**"]).await;
+    let third = mint_feat(&orch, "C", &["web/**"]).await;
+
+    let (holder, rest) = start(&orch, parked).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    orch.clock().advance(TimeDelta::seconds(1));
+
+    let (_, claim) = start_refused(&orch, waiting).await;
+    assert_eq!(
+        claim,
+        Claim::Overlaps {
+            with: holder,
+            rule: OverlapRule::Paths,
+        },
+        "no run is `running`, so the refusal is the parked run's scope and not a slot"
+    );
+
+    for item in [first, second] {
+        orch.clock().advance(TimeDelta::seconds(1));
+        let (run, rest) = start(&orch, item).await;
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        let now = orch.clock().now();
+        assert!(
+            orch.store()
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move"),
+            "the run was parked"
+        );
+        assert!(
+            orch.store()
+                .transition(item, Status::AwaitingApproval, Status::InProgress)
+                .await
+                .expect("MemStore takes the move"),
+            "the item was parked"
+        );
+    }
+
+    orch.clock().advance(TimeDelta::seconds(1));
+    let (queued, claim) = start_refused(&orch, third).await;
+    assert_eq!(
+        claim,
+        Claim::SlotFull {
+            running: 2,
+            limit: 2,
+        },
+        "`web/**` overlaps nothing; the box is full"
+    );
+    assert_eq!(run_of(&orch, queued).await.status, RunStatus::Queued);
+}
+
+/// Plan D87: a walk that parks releases its lease (`lease_expires_at = now`), so a process
+/// started after this one takes it at once with its answer, and the lease is then the new
+/// owner's: its refresh lands and the old owner's touches nothing.
+async fn a_parked_run_releases_its_lease_and_an_answer_takes_it<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    assert_eq!(
+        run_of(&orch, run).await.lease_expires_at,
+        Some(orch.clock().now()),
+        "the park released the lease"
+    );
+
+    let other = orch.restarted();
+    assert_ne!(other.owner(), orch.owner(), "a restart is a new owner");
+    let (_, rest) = answer(&other, run, GateAnswer::Approved).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the second process walked `plan` and parked at its gate"
+    );
+
+    let later = other.clock().now() + TimeDelta::minutes(1);
+    assert!(
+        orch.store()
+            .refresh_lease(run, other.owner(), later)
+            .await
+            .expect("MemStore refreshes"),
+        "the lease is the second process's"
+    );
+    assert!(
+        !orch
+            .store()
+            .refresh_lease(run, orch.owner(), later)
+            .await
+            .expect("MemStore refreshes"),
+        "and no longer the first's"
+    );
+}
+
+/// Plan D87 and D108: an answer from another process meets a live lease it does not hold, and is
+/// refused **before** its first write — the step is still parked and unanswered.
+async fn a_live_lease_blocks_an_answer_from_another_process<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let other = orch.restarted();
+    assert!(
+        orch.store()
+            .refresh_lease(run, orch.owner(), other.clock().now() + TimeDelta::days(1))
+            .await
+            .expect("MemStore refreshes"),
+        "the first process still owns the released lease, and renews it"
+    );
+    let parked = steps_of(&orch, run)
+        .await
+        .into_iter()
+        .find(|step| step.status == StepStatus::AwaitingApproval)
+        .expect("the walk parked `prd`");
+
+    let refused = other
+        .dispatch(Command::AnswerGate {
+            run,
+            step: parked.id,
+            answer: GateAnswer::Approved,
+        })
+        .await
+        .expect_err("a live lease elsewhere");
+    assert!(
+        matches!(refused, EngineError::LeaseHeld { run: held } if held == run),
+        "{refused}"
+    );
+    let step = steps_of(&orch, run)
+        .await
+        .into_iter()
+        .find(|step| step.id == parked.id)
+        .expect("the step is still there");
+    assert_eq!(step.status, StepStatus::AwaitingApproval);
+    assert_eq!(step.gate_outcome, None, "plan D108: nothing written");
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -3151,14 +3538,14 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_thirty_six() {
+    fn cases_are_unique_and_forty_two() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            36,
+            42,
             "seven ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam, the three \
              gate-table cells only an edited gate reaches, plan D5's intermediate position, \
              milestone 3's two verify outcomes and `CancelRun`, milestone 4's five stage-1 cases \
@@ -3167,7 +3554,10 @@ mod tests {
              second attempt's forwarded `verify_failure` and `previous_diff` — and its twelve \
              fan-out cases: criteria 8, 9 (twice) and 10 (twice), the gated and judgeless human \
              selections, a failed candidate, a group with no survivor, the review loop over a \
-             group, the two caps, and a `shared_serialized` sibling's own deadline"
+             group, the two caps, and a `shared_serialized` sibling's own deadline — and \
+             milestone 5's six: criterion 15's serialised overlap, its two repos and its \
+             undeclared item, criterion 16's slot and parked overlap, a park's released lease \
+             taken by another process's answer, and a live lease refusing that answer"
         );
     }
 

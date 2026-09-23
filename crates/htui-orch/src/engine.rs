@@ -3916,6 +3916,22 @@ pub async fn dispatch_fake(
     engine.dispatch(command).await
 }
 
+/// [`Engine::claim`] over the same parts (plan D84).
+///
+/// # Errors
+/// Every [`EngineError`] the claim and the walk raise.
+#[cfg(feature = "test-support")]
+pub async fn claim_fake(
+    orch: &crate::fake::FakeOrchestrator,
+    run: RunId,
+) -> Result<CommandOutcome, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    engine.claim(run).await
+}
+
 /// [`Engine::resume`] over the same parts (ANA-2 §12 criterion 3).
 ///
 /// # Errors

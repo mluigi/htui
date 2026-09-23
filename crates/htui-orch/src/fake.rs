@@ -1093,6 +1093,11 @@ impl AgentDriver for RefusingDriver {
     }
 }
 
+/// How far [`FakeOrchestrator::restarted`] moves the clock past the crashed process's: ten
+/// minutes, above every seeded (`lease_ttl_seconds = 120`) and fallback TTL, so every lease the
+/// first process wrote has expired when the second one looks (plan D118).
+pub const RESTART_GAP: TimeDelta = TimeDelta::minutes(10);
+
 /// What [`FakeOrchestrator`] scripts by: `(phase, attempt)` and, for one session of a group,
 /// `(fanout_index, call)` (plan D68).
 type ScriptKey = (String, i32, Option<(i32, u32)>);
@@ -1157,6 +1162,22 @@ impl FakeOrchestrator {
             user,
             owner: Uuid::now_v7(),
         }
+    }
+
+    /// A second orchestrator over the **same** store, as a process started after this one died
+    /// (plan D118).
+    ///
+    /// The `MemStore` clone shares its rows (`Arc<RwLock<State>>`). The isolator and the verifier
+    /// are fresh, because neither survives a process. The clock starts [`RESTART_GAP`] past this
+    /// one's, the scripts, candidates, default script and capabilities are cloned, the box and user
+    /// are the same, and the `owner` is **new** — which is what makes the lease this process wrote
+    /// someone else's. An `advance_after_done` is not carried.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn restarted(&self) -> Self {
+        todo!("T6 commit d: FakeOrchestrator::restarted")
     }
 
     /// Script one `(phase name, attempt)`: every session of that attempt that has no script of
@@ -1387,6 +1408,14 @@ impl FakeOrchestrator {
         command: Command,
     ) -> std::result::Result<CommandOutcome, EngineError> {
         crate::engine::dispatch_fake(self, command).await
+    }
+
+    /// `Engine::claim` over the same parts (plan D84): re-attempt a run a refusal left `queued`.
+    ///
+    /// # Errors
+    /// Every [`EngineError`] the claim and the walk raise.
+    pub async fn claim(&self, run: RunId) -> std::result::Result<CommandOutcome, EngineError> {
+        crate::engine::claim_fake(self, run).await
     }
 
     /// `Engine::resume` over the same parts (ANA-2 §12 criterion 3).

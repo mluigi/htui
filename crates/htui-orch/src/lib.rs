@@ -39,7 +39,7 @@ pub use engine::{
     SessionSink, live_step_at, required_inputs,
 };
 #[cfg(feature = "test-support")]
-pub use engine::{dispatch_fake, resume_fake};
+pub use engine::{claim_fake, dispatch_fake, resume_fake};
 pub use fanout::{JudgeFailure, Route};
 pub use gate::{
     Landing, LoopOutcome, LoopStop, Settle, SettleInput, StepFailure, Verdict, parse_verdict,
@@ -47,8 +47,9 @@ pub use gate::{
 pub use graph::{GraphSource, ResolveError, Resolved, override_graph, resolve, topology};
 pub use isolate::{
     Clock, FanoutSlot, GixIsolator, IsolateError, Isolator, IsolatorConfig, IsolatorFuture,
-    Prepared, PreparedTree, RepoCheckout, SystemClock,
+    Prepared, PreparedTree, RepoCheckout, ResetReport, SystemClock,
 };
+pub use recover::{Heartbeat, LeaseTimes};
 pub use select::{SkipCause, Walk, walk};
 pub use status::{Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt};
 pub use verify::{ShellVerifier, Verifier, VerifierFuture, VerifyReport, VerifyRequest};
