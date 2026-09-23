@@ -4258,8 +4258,10 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
 /// both run). Criterion 16's two halves are C–F and G–H: a **parked** run still refuses an
 /// overlapping scope, and holds no slot, so two runs on another repo still fit beside it. The
 /// two admitted runs are parked before the overlap legs because the fixture box has two slots
-/// and `SlotFull` is decided before `Overlaps` (blueprint F-E); every run gets its own
-/// `queued_at` so "the first" never rests on `RunId` order.
+/// and `SlotFull` is decided before `Overlaps` (blueprint F-E); leg J pins that order, since it
+/// both overlaps G and meets a full box. Every run gets its own `queued_at`, and B's is set before
+/// A's although B's `RunId` is minted after, so "the first" in legs D–F rests on `queued_at` and
+/// not on `RunId` order.
 async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S) {
     const CASE: &str = "claim_run_applies_the_isolation_and_path_rules";
     let core = store
@@ -4278,7 +4280,7 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
         local: false,
         prefixes: prefixes.iter().map(|prefix| (*prefix).to_owned()).collect(),
     };
-    let legs: [(char, Vec<(RepoId, RepoScope)>); 9] = [
+    let legs: [(char, Vec<(RepoId, RepoScope)>); 10] = [
         ('A', vec![(core, isolated(&["src/"]))]),
         ('B', vec![(core, isolated(&["docs/"]))]),
         ('C', vec![(core, isolated(&["src/lib/"]))]),
@@ -4297,6 +4299,7 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
         ('G', vec![(web, isolated(&["src/"]))]),
         ('H', vec![(web, isolated(&["docs/"]))]),
         ('I', Vec::new()),
+        ('J', vec![(web, isolated(&["src/"]))]),
     ];
 
     let at = seam_clock();
@@ -4321,7 +4324,8 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
                     scope,
                     ..run_snapshot()
                 },
-                queued_at: at + TimeDelta::seconds(offset),
+                // B is queued before A, against their `RunId` order (UUIDv7, minted in leg order).
+                queued_at: at + TimeDelta::seconds(if leg == 'B' { -1 } else { offset }),
                 ..new_run(ids::PROJECT_HTUI, item, repo_scope)
             })
             .await
@@ -4339,9 +4343,10 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
         (_, g),
         (_, h),
         (_, i),
+        (_, j),
     ] = runs[..]
     else {
-        panic!("{CASE}: nine runs were queued")
+        panic!("{CASE}: ten runs were queued")
     };
 
     let owner = Uuid::now_v7();
@@ -4395,26 +4400,26 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
     assert_eq!(
         claim(d).await.expect(CASE),
         Claim::Overlaps {
-            with: a,
+            with: b,
             rule: OverlapRule::NotIsolated
         },
-        "{CASE}: D is not isolated on core (rule I), and A is the first live run"
+        "{CASE}: D is not isolated on core (rule I) and overlaps A and B; B was queued first"
     );
     assert_eq!(
         claim(e).await.expect(CASE),
         Claim::Overlaps {
-            with: a,
+            with: b,
             rule: OverlapRule::Local
         },
-        "{CASE}: E is local on core (rule L)"
+        "{CASE}: E is local on core (rule L), and B is the first live run"
     );
     assert_eq!(
         claim(f).await.expect(CASE),
         Claim::Overlaps {
-            with: a,
+            with: b,
             rule: OverlapRule::Paths
         },
-        "{CASE}: F declared no path, which is the whole repo"
+        "{CASE}: F declared no path, which is the whole repo, so B's docs/ is inside it"
     );
 
     assert_eq!(
@@ -4443,6 +4448,19 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
         run_row(CASE, store, i).await.status,
         RunStatus::Queued,
         "{CASE}: a full box writes nothing either"
+    );
+    assert_eq!(
+        claim(j).await.expect(CASE),
+        Claim::SlotFull {
+            running: 2,
+            limit: 2
+        },
+        "{CASE}: J overlaps G's src/ too, but the full box is decided first (blueprint F-E)"
+    );
+    assert_eq!(
+        run_row(CASE, store, j).await.status,
+        RunStatus::Queued,
+        "{CASE}: and J stays queued"
     );
 }
 
