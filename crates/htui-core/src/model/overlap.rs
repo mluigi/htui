@@ -348,11 +348,11 @@ mod tests {
         assert_eq!(Claim::NotClaimable.to_string(), "not claimable");
         assert_eq!(
             Claim::SlotFull {
-                running: 2,
+                running: 3,
                 limit: 2
             }
             .to_string(),
-            "box full (2 of 2 running)"
+            "box full (3 of 2 running)"
         );
         let with = RunId::from_uuid(Uuid::from_u128(7));
         assert_eq!(
@@ -365,5 +365,19 @@ mod tests {
         );
         assert!(Claim::Admitted.is_admitted());
         assert!(!Claim::NotClaimable.is_admitted());
+        assert!(
+            !Claim::SlotFull {
+                running: 3,
+                limit: 2
+            }
+            .is_admitted()
+        );
+        assert!(
+            !Claim::Overlaps {
+                with,
+                rule: OverlapRule::Paths
+            }
+            .is_admitted()
+        );
     }
 }
