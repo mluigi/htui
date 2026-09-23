@@ -3758,4 +3758,76 @@ mod tests {
             assert_eq!(prepared, 1);
         }
     }
+
+    /// D73 (blueprint A-2): every `git worktree remove` takes the admin lock too — D27's removal of
+    /// a clean, empty tree at `capture`, and `cleanup`'s removal of every tree.
+    #[tokio::test]
+    async fn worktree_removals_wait_for_the_admin_lock() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let isolator = Arc::new(
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates"),
+        );
+        let run = RunId::new();
+
+        // `capture` of a step that committed nothing removes its tree.
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::Worktree, None)
+            .await
+            .expect("the worktree mode prepares");
+        let captured_rows = rows(&prepared);
+        let tree = PathBuf::from(&captured_rows[0].path);
+        let guard = isolator.admin_guard(core).await;
+        let mut capture = {
+            let (isolator, rows) = (Arc::clone(&isolator), captured_rows.clone());
+            tokio::spawn(async move { isolator.capture(step, &rows).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut capture)
+                .await
+                .is_err(),
+            "capture's removal waits for the lock"
+        );
+        assert!(tree.exists(), "and the tree is still there");
+        drop(guard);
+        let commits = tokio::time::timeout(Duration::from_secs(10), capture)
+            .await
+            .expect("the removal proceeds once the lock is free")
+            .expect("the task did not panic")
+            .expect("the step captures");
+        assert_eq!(commits[0].after_hash, None);
+        assert!(!tree.exists(), "the empty tree was removed");
+
+        // `cleanup` removes a tree that is still there.
+        let kept = isolator
+            .prepare(run, StepId::new(), &[core], Isolation::Worktree, None)
+            .await
+            .expect("the worktree mode prepares");
+        let kept_rows = rows(&kept);
+        let tree = PathBuf::from(&kept_rows[0].path);
+        let guard = isolator.admin_guard(core).await;
+        let mut cleanup = {
+            let isolator = Arc::clone(&isolator);
+            tokio::spawn(async move { isolator.cleanup(run, &kept_rows).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut cleanup)
+                .await
+                .is_err(),
+            "cleanup's removal waits for the lock"
+        );
+        assert!(tree.exists(), "and the tree is still there");
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(10), cleanup)
+            .await
+            .expect("the removal proceeds once the lock is free")
+            .expect("the task did not panic")
+            .expect("the run cleans up");
+        assert!(!tree.exists(), "the tree was removed");
+    }
 }
