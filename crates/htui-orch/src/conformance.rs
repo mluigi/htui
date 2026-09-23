@@ -3043,10 +3043,15 @@ async fn fan_out_above_max_fan_out_is_refused_at_start<H: CaseHarness>(harness: 
 }
 
 /// Plan D63 (OQ-1): `prd 1 + plan 1 + implement 3 + its judge 1 + review 1 = 7` agents against
-/// `max_agents_per_run = 6`, refused at `StartRun` naming both figures.
+/// an explicit `max_agents_per_run = 6`, refused at `StartRun` naming both figures.
+///
+/// The 6 is planted: the default is 8 (`0004_max_agents_per_run_default.sql`), which admits this
+/// graph, and ANA-2's original 6 is what refuses it.
 async fn max_agents_per_run_is_refused_at_start<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     free_feat_3(&orch).await;
+    orch.store()
+        .set_app_setting("max_agents_per_run", serde_json::json!(6));
     repoint(&orch, ids::HTUI_FEAT_3, |phase| {
         if phase.name == "implement" {
             phase.fan_out = 3;

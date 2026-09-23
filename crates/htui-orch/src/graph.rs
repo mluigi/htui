@@ -24,8 +24,10 @@ use serde_json::Value;
 const DEFAULT_DEADLINE_SECONDS: u32 = 7200;
 /// `app_setting.max_fan_out`'s built-in default (ANA-2 §10, §5.1's example).
 const DEFAULT_MAX_FAN_OUT: u32 = 4;
-/// `app_setting.max_agents_per_run`'s built-in default (ANA-2 §10, §5.1's example).
-const DEFAULT_MAX_AGENTS_PER_RUN: u32 = 6;
+/// `app_setting.max_agents_per_run`'s built-in default: 8, the maintainer's raise of ANA-2 §10's 6
+/// so the seeded `feature` graph with a judged 3-way `implement` (seven agents) runs by default.
+/// `0004_max_agents_per_run_default.sql` moves the seeded row to the same figure.
+const DEFAULT_MAX_AGENTS_PER_RUN: u32 = 8;
 
 /// What `htui-orch` needs from a store to build a [`GraphSnapshot`] and that no `ReadStore`
 /// method answers (plan D19).
@@ -985,7 +987,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
 
         // The `app_setting` rungs of the envelope.
         assert_eq!(snapshot.settings.max_fan_out, 4);
-        assert_eq!(snapshot.settings.max_agents_per_run, 6);
+        assert_eq!(snapshot.settings.max_agents_per_run, 8);
         assert_eq!(snapshot.mode, RunMode::Manual);
         assert_eq!(snapshot.graph.id, ids::GRAPH_HTUI_FEAT);
         assert!(!snapshot.graph.is_override);
@@ -1603,24 +1605,56 @@ question and not a test fix. Decide the version bump first, then paste the new d
     }
 
     /// Plan D63, second cap (OQ-1): `Σ fan_out` plus one per judged phase. On `feature` with
-    /// `implement` at 3 and a judge that is `1 + 1 + 3 + 1 + 1 = 7`, above the built-in 6
-    /// (blueprint F-F). At 2 it is exactly 6, which is allowed.
+    /// `implement` at 3 and a judge that is `1 + 1 + 3 + 1 + 1 = 7`, under the built-in 8 — the
+    /// maintainer raised the default from ANA-2's 6 so this ordinary judged fan-out runs
+    /// (`0004_max_agents_per_run_default.sql`). At 4 it is exactly 8, which is allowed; `plan` at 2
+    /// as well, both judged, is `1 + 2 + 1 + 3 + 1 + 1 = 9`, which is not. The old reading
+    /// (blueprint F-F) survives as an explicit 6.
     #[tokio::test]
     async fn planned_agents_above_the_cap_are_refused_at_resolution() {
         let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 3);
-        let error = resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
+        let snapshot = resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
             .await
-            .expect_err("7 planned agents is above 6");
+            .expect("7 planned agents is under the built-in 8")
+            .snapshot;
+        assert_eq!(snapshot.settings.max_agents_per_run, 8);
+
+        let app: BTreeMap<String, Value> = [("max_agents_per_run".to_owned(), json!(6))]
+            .into_iter()
+            .collect();
+        let error = resolve_item(&store, ids::HTUI_FEAT_1, &app)
+            .await
+            .expect_err("7 planned agents is above a planted 6");
         assert_eq!(error, ResolveError::AgentCap { planned: 7, max: 6 });
         assert_eq!(
             error.to_string(),
             "run plans 7 agents; max_agents_per_run is 6 (ANA-2 :870-875)"
         );
 
-        let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 2);
+        let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 4);
         resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
             .await
-            .expect("6 planned agents is at the cap");
+            .expect("8 planned agents is at the cap");
+
+        let store = store_with(|data| {
+            for row in &mut data.phases {
+                if row.graph_id == ids::GRAPH_HTUI_FEAT {
+                    match row.name.as_str() {
+                        "plan" => row.fan_out = 2,
+                        "implement" => row.fan_out = 3,
+                        _ => {}
+                    }
+                }
+            }
+        });
+        store.set_project_settings(
+            ids::PROJECT_HTUI,
+            json!({ "judge_agent_id": ids::AGENT_AGY }),
+        );
+        let error = resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
+            .await
+            .expect_err("9 planned agents is above the built-in 8");
+        assert_eq!(error, ResolveError::AgentCap { planned: 9, max: 8 });
 
         // With no judge a fanned-out phase is judged by a human, which costs no agent.
         let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 3);
@@ -1640,13 +1674,13 @@ question and not a test fix. Decide the version bump first, then paste the new d
     }
 
     /// Criterion 8's shape: `analysis` is `research` then `verdict`, so `research` at 3 with a
-    /// judge plans `3 + 1 + 1 = 5`, under the built-in 6.
+    /// judge plans `3 + 1 + 1 = 5`, under the built-in 8.
     #[tokio::test]
     async fn the_analysis_graph_fans_out_three_under_the_default_cap() {
         let store = store_fanned(ids::GRAPH_HTUI_ANA, "research", 3);
         let snapshot = resolve_item(&store, ids::HTUI_ANA_2, &BTreeMap::new())
             .await
-            .expect("5 planned agents is under 6")
+            .expect("5 planned agents is under 8")
             .snapshot;
         let names: Vec<&str> = snapshot
             .phases
@@ -1660,7 +1694,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             "the project names a judge"
         );
         assert_eq!(snapshot.settings.max_fan_out, 4);
-        assert_eq!(snapshot.settings.max_agents_per_run, 6);
+        assert_eq!(snapshot.settings.max_agents_per_run, 8);
     }
 
     /// Plan D64 (OQ-5): a `review` phase cannot fan out, refused at snapshot time.

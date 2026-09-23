@@ -716,8 +716,10 @@ impl Fixture {
     /// parks on `verdict` once the group is decided, with every tree the group left still in place
     /// for the oracle. Both phases run in this fixture's isolation.
     ///
-    /// `analysis` rather than `feature` because D63 counts agents at resolution: a judged 3-way
-    /// `prd` plans seven on `feature` and is refused against `max_agents_per_run = 6`.
+    /// `analysis` rather than `feature` because it is the smaller graph: `research` at 3 plans at
+    /// most five agents, judged or not. (Under ANA-2's original `max_agents_per_run = 6` a judged
+    /// 3-way phase on `feature` planned seven and was refused; the default is 8 now, which admits
+    /// it.)
     async fn fan_research(&self, gate: Gate) {
         let isolation = self.isolation;
         repoint(&self.orch.store, ids::HTUI_ANA_2, |phase| {

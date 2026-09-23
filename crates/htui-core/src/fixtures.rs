@@ -1340,7 +1340,7 @@ fn demo_graph_snapshot() -> Value {
             per_token_cap_run: None,
             per_token_cap_batch: None,
             max_fan_out: 4,
-            max_agents_per_run: 6,
+            max_agents_per_run: 8,
         },
     })
     .expect("a literal this module owns serialises")
