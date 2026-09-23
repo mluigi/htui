@@ -390,7 +390,8 @@ pub enum Next {
     Finished(Rest),
     /// Blueprint A-4: this run's recovery failed with the error's `Display`. The failure is a
     /// `warn`, an `item_note` and a released lease, so another process may adopt the run at once,
-    /// and the sweep went on with the next run.
+    /// and the sweep went on with the next run. A lease lost mid-recovery is a `warn` only, with
+    /// no note and no release (plan D128): the run is another process's by then.
     Error(String),
 }
 
@@ -968,8 +969,19 @@ where
     /// Plan D87/D108: `take_lease(run, box, owner, now, now + ttl)`, after a command's pure guard
     /// and before its first write.
     async fn take_lease(&self, run: RunId) -> Result<(), EngineError> {
+        let taken = self.renew_lease(run).await?;
+        if taken {
+            Ok(())
+        } else {
+            Err(EngineError::LeaseHeld { run })
+        }
+    }
+
+    /// The store's `take_lease(run, box, owner, now, now + ttl)` and its bare answer: `false` is
+    /// "not takeable here", which [`Self::take_lease`] words and the sweep skips (plan D126).
+    async fn renew_lease(&self, run: RunId) -> Result<bool, EngineError> {
         let now = self.now();
-        let taken = self
+        Ok(self
             .parts
             .store
             .take_lease(
@@ -979,12 +991,7 @@ where
                 now,
                 now + self.lease_times().ttl,
             )
-            .await?;
-        if taken {
-            Ok(())
-        } else {
-            Err(EngineError::LeaseHeld { run })
-        }
+            .await?)
     }
 
     /// Plan D87: `refresh_lease(run, owner, now)`, so the lease reads as expired at once. A
@@ -1012,9 +1019,13 @@ where
     ///
     /// Runs are recovered one at a time in `queued_at` order, each inside the leased walk
     /// (blueprint A-7), so another orchestrator taking the lease mid-recovery abandons it like any
-    /// walk. A run left parked or finished has its lease released. One run's failure does not
-    /// stop the sweep (blueprint A-4): it is [`Next::Error`], a `warn`, an `item_note` and a
-    /// released lease, and the next run is recovered.
+    /// walk: that run is [`Next::Error`] with the `LeaseLost` text and a `warn`, and nothing else
+    /// (plan D128). Each run's lease is taken again just before its recovery (plan D126), because
+    /// the adoption leased them all at once; a run whose lease another process took meanwhile is
+    /// skipped and absent from the answer. A run left parked or finished has its lease released.
+    /// Any other failure of one run does not stop the sweep (blueprint A-4): it is
+    /// [`Next::Error`], a `warn`, an `item_note` and a released lease, and the next run is
+    /// recovered.
     ///
     /// The heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
     /// driver enabled (blueprint H-3).
@@ -1031,11 +1042,34 @@ where
             .await?;
         let mut swept = Vec::with_capacity(adopted.len());
         for run in adopted {
+            // Plan D126: `adopt_runs` leased every run at once, and only the one being recovered
+            // is heartbeaten, so a later run's lease may have lapsed and been taken meanwhile.
+            // Renew it first; a run that is no longer ours is skipped, with nothing written.
+            match self.renew_lease(run.id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(run = %run.id, "the sweep's lease was taken before recovery; skipped");
+                    continue;
+                }
+                Err(err) => {
+                    swept.push(Adopted {
+                        run: run.id,
+                        next: self.unrecovered(&run, &err).await,
+                    });
+                    continue;
+                }
+            }
             // Blueprint A-7: under the heartbeat, so a stranger taking the lease mid-recovery
             // abandons it like any walk. `walk_leased` releases the lease of a run it leaves
             // anywhere but `running`, which is every `Parked` and `Finished`.
             let next = match self.walk_leased(run.id, self.recover_run(&run)).await {
                 Ok(next) => next,
+                // Plan D128: the lease is gone, so nothing more is this process's to write — no
+                // note and no release; the warn is all.
+                Err(err @ EngineError::LeaseLost { .. }) => {
+                    tracing::warn!(run = %run.id, %err, "the sweep lost an adopted run's lease");
+                    Next::Error(err.to_string())
+                }
                 Err(err) => self.unrecovered(&run, &err).await,
             };
             swept.push(Adopted { run: run.id, next });
@@ -6897,7 +6931,7 @@ mod tests {
             harness
                 .orch
                 .store
-                .answer_gate(prd, htui_core::model::GateOutcome::Approved, None, now)
+                .answer_gate(prd, GateOutcome::Approved, None, now)
                 .await
                 .expect("MemStore takes the answer"),
             "`prd` is `done` and its merge never ran: the frontier"
