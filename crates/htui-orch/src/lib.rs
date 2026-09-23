@@ -32,8 +32,8 @@ pub mod verify;
 
 pub use command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 pub use engine::{
-    AgentSelector, DriverFor, Engine, EngineParts, FirstCandidate, NoSink, Resume, SessionSink,
-    live_step_at, required_inputs,
+    AgentSelector, DriverFor, Engine, EngineParts, FirstCandidate, NoSink, Resume, SessionKey,
+    SessionSink, live_step_at, required_inputs,
 };
 #[cfg(feature = "test-support")]
 pub use engine::{dispatch_fake, resume_fake};
@@ -47,6 +47,7 @@ pub use isolate::{
     Clock, GixIsolator, IsolateError, Isolator, IsolatorConfig, IsolatorFuture, Prepared,
     PreparedTree, RepoCheckout, SystemClock,
 };
+pub use select::{SkipCause, Walk, walk};
 pub use status::{Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt};
 pub use verify::{ShellVerifier, Verifier, VerifierFuture, VerifyReport, VerifyRequest};
 

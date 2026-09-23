@@ -34,6 +34,7 @@ use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
 use uuid::Uuid;
 
 use crate::command::{Command, CommandOutcome, EngineError};
+use crate::engine::SessionKey;
 use crate::graph::GraphSource;
 use crate::isolate::{
     Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree,
@@ -853,6 +854,10 @@ impl AgentDriver for RefusingDriver {
     }
 }
 
+/// What [`FakeOrchestrator`] scripts by: `(phase, attempt)` and, for one session of a group,
+/// `(fanout_index, call)` (plan D68).
+type ScriptKey = (String, i32, Option<(i32, u32)>);
+
 /// `MemStore` + `FakeDriver` + [`FakeIsolator`] + [`TestClock`] + [`FakeGraphSource`], which is
 /// ANA-2's own description of the fake orchestrator (`docs/ANA-2.md:1764-1766`).
 ///
@@ -872,7 +877,9 @@ pub struct FakeOrchestrator {
     pub verifier: FakeVerifier,
     /// The clock, so a case can elapse a step deadline without sleeping.
     pub clock: TestClock,
-    scripts: Mutex<BTreeMap<(String, i32), ScriptedStep>>,
+    /// Keyed `(phase, attempt, None)` for a `(phase, attempt)` script and
+    /// `(phase, attempt, Some((fanout_index, call)))` for one session's (plan D68).
+    scripts: Mutex<BTreeMap<ScriptKey, ScriptedStep>>,
     candidates: Mutex<BTreeMap<String, Vec<(AgentId, String)>>>,
     after_done_advance: Mutex<Option<TimeDelta>>,
     default_script: ScriptedStep,
@@ -913,12 +920,33 @@ impl FakeOrchestrator {
         }
     }
 
-    /// Script one `(phase name, attempt)`. An unscripted attempt plays the default.
+    /// Script one `(phase name, attempt)`: every session of that attempt that has no script of
+    /// its own plays it. An unscripted attempt plays the default.
     pub fn script(&self, phase: &str, attempt: i32, step: ScriptedStep) {
         self.scripts
             .lock()
             .expect("no panic holds the fake orchestrator's lock")
-            .insert((phase.to_owned(), attempt), step);
+            .insert((phase.to_owned(), attempt, None), step);
+    }
+
+    /// Script one session exactly (plan D68): candidate `fanout_index` of `(phase, attempt)`, or
+    /// the judge's ordering `call` at `fanout_index = -1` with `phase` = `<phase>:judge`. It wins
+    /// over a [`script`](Self::script) of the same `(phase, attempt)`.
+    pub fn script_candidate(
+        &self,
+        phase: &str,
+        attempt: i32,
+        fanout_index: i32,
+        call: u32,
+        step: ScriptedStep,
+    ) {
+        self.scripts
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert(
+                (phase.to_owned(), attempt, Some((fanout_index, call))),
+                step,
+            );
     }
 
     /// Replace the driver capabilities every session is built with.
@@ -975,13 +1003,32 @@ impl FakeOrchestrator {
         source
     }
 
-    /// The script for one `(phase, attempt)`, or the default.
+    /// The script for one `(phase, attempt)`'s index-0 session, or the default.
     #[must_use]
     pub fn script_for(&self, phase: &str, attempt: i32) -> ScriptedStep {
-        self.scripts
+        self.script_for_key(&SessionKey {
+            phase,
+            attempt,
+            fanout_index: 0,
+            call: 0,
+        })
+    }
+
+    /// The script for one session (plan D68): the exact key's, else its `(phase, attempt)`'s, else
+    /// the default — so every script written before fan-out keeps working unchanged.
+    #[must_use]
+    pub fn script_for_key(&self, key: &SessionKey<'_>) -> ScriptedStep {
+        let scripts = self
+            .scripts
             .lock()
-            .expect("no panic holds the fake orchestrator's lock")
-            .get(&(phase.to_owned(), attempt))
+            .expect("no panic holds the fake orchestrator's lock");
+        scripts
+            .get(&(
+                key.phase.to_owned(),
+                key.attempt,
+                Some((key.fanout_index, key.call)),
+            ))
+            .or_else(|| scripts.get(&(key.phase.to_owned(), key.attempt, None)))
             .cloned()
             .unwrap_or_else(|| self.default_script.clone())
     }
@@ -994,7 +1041,19 @@ impl FakeOrchestrator {
     /// only way a case can drive ANA-2 `:639`'s spawn failure without editing `htui-agent`.
     #[must_use]
     pub fn driver_for(&self, phase: &str, attempt: i32) -> Box<dyn AgentDriver> {
-        let scripted = self.script_for(phase, attempt);
+        self.driver_for_key(&SessionKey {
+            phase,
+            attempt,
+            fanout_index: 0,
+            call: 0,
+        })
+    }
+
+    /// [`driver_for`](Self::driver_for) for one session, by its whole [`SessionKey`] (plan D68):
+    /// the shape `engine::DriverFor` hands the walk.
+    #[must_use]
+    pub fn driver_for_key(&self, key: &SessionKey<'_>) -> Box<dyn AgentDriver> {
+        let scripted = self.script_for_key(key);
         match scripted.spawn_failure {
             Some(reason) => Box::new(RefusingDriver {
                 name: FAKE_AGENT_NAME.to_owned(),
@@ -1019,6 +1078,7 @@ impl FakeOrchestrator {
         item: ItemId,
         step: &RunStep,
         phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
     ) -> Result<Option<Document>> {
         if let Some(by) = *self
             .after_done_advance
@@ -1027,7 +1087,7 @@ impl FakeOrchestrator {
         {
             self.clock.advance(by);
         }
-        let Some(body) = self.script_for(&step.phase_name, step.attempt).output else {
+        let Some(body) = self.script_for_key(key).output else {
             return Ok(None);
         };
         let document = self
@@ -1163,6 +1223,7 @@ mod tests {
     use super::{
         FakeGraphSource, FakeIsolator, FakeOrchestrator, GraphSource, ScriptedStep, TestClock,
     };
+    use crate::engine::SessionKey;
     use crate::graph::{ResolveError, Resolved, resolve};
     use crate::isolate::{Clock as _, FanoutSlot, Isolator as _};
 
@@ -1585,6 +1646,60 @@ mod tests {
         assert!(!cli.driver_for("prd", 1).caps().edit_proposals);
     }
 
+    /// Plan D68: one session is scripted by its whole key, and every key without a script of its
+    /// own falls back to its `(phase, attempt)`'s, then to the default.
+    #[test]
+    fn the_orchestrator_scripts_by_session_key_with_the_attempt_fallback() {
+        let orch = FakeOrchestrator::demo();
+        orch.script("research", 1, ScriptedStep::done_with_output("group"));
+        orch.script_candidate(
+            "research",
+            1,
+            2,
+            0,
+            ScriptedStep::done_with_output("candidate 2"),
+        );
+        orch.script_candidate(
+            "research:judge",
+            1,
+            -1,
+            1,
+            ScriptedStep::done_with_output("reversed"),
+        );
+        let key = |phase, fanout_index, call| SessionKey {
+            phase,
+            attempt: 1,
+            fanout_index,
+            call,
+        };
+
+        let output = |key: SessionKey<'_>| orch.script_for_key(&key).output;
+        assert_eq!(
+            output(key("research", 2, 0)).as_deref(),
+            Some("candidate 2")
+        );
+        assert_eq!(
+            output(key("research", 1, 0)).as_deref(),
+            Some("group"),
+            "an unscripted candidate plays its attempt's script"
+        );
+        assert_eq!(
+            orch.script_for("research", 1).output.as_deref(),
+            Some("group"),
+            "`script_for` is index 0's key"
+        );
+        assert_eq!(
+            output(key("research:judge", -1, 1)).as_deref(),
+            Some("reversed")
+        );
+        assert_eq!(
+            output(key("research:judge", -1, 0)).as_deref(),
+            Some("scripted output"),
+            "the forward call is a different session and plays the default"
+        );
+        assert_eq!(orch.driver_for_key(&key("research", 2, 0)).name(), "fake");
+    }
+
     /// Plan D13: the harness is the document producer, the clock moves only here, and a step that
     /// scripted no output writes nothing at all — which is the `missing_output` path.
     #[tokio::test]
@@ -1596,7 +1711,7 @@ mod tests {
         let step = prd_step();
         let phase = prd_phase(&orch.store).await;
         let document = orch
-            .after_done(ids::HTUI_FEAT_1, &step, &phase)
+            .after_done(ids::HTUI_FEAT_1, &step, &phase, &SessionKey::of(&step))
             .await
             .expect("the store accepts the write")
             .expect("the step scripted an output");
@@ -1613,7 +1728,7 @@ mod tests {
         quiet.script("prd", 1, ScriptedStep::done_without_output());
         assert!(
             quiet
-                .after_done(ids::HTUI_FEAT_1, &step, &phase)
+                .after_done(ids::HTUI_FEAT_1, &step, &phase, &SessionKey::of(&step))
                 .await
                 .expect("the store is not asked")
                 .is_none(),

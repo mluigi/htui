@@ -29,7 +29,7 @@ use htui_core::model::{
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
 use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer};
-use htui_orch::engine::{Engine, EngineParts, FirstCandidate, SessionSink};
+use htui_orch::engine::{Engine, EngineParts, FirstCandidate, SessionKey, SessionSink};
 use htui_orch::fake::FakeOrchestrator;
 use htui_orch::isolate::Clock as _;
 use htui_orch::isolate::git::Cli;
@@ -140,9 +140,8 @@ impl Fixture {
         command: Command,
     ) -> Result<CommandOutcome, EngineError> {
         let graphs = self.orch.graphs();
-        let driver = |_candidate: &SnapshotCandidate, phase: &str, attempt: i32| {
-            self.orch.driver_for(phase, attempt)
-        };
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| self.orch.driver_for_key(key);
         let scrubber = MinimalScrubber::new([]);
         let app = self
             .orch
@@ -361,6 +360,7 @@ impl SessionSink for CommittingSink<'_> {
         item: ItemId,
         step: &RunStep,
         phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
         _done: &htui_agent::event::DoneEvent,
     ) -> Result<(), StoreError> {
         let trees = self.orch.store.step_trees(step.id).await?;
@@ -380,7 +380,7 @@ impl SessionSink for CommittingSink<'_> {
             );
         }
         // `after_done` answers the document it wrote; the seam wants a unit.
-        FakeOrchestrator::after_done(self.orch, item, step, phase).await?;
+        FakeOrchestrator::after_done(self.orch, item, step, phase, key).await?;
         Ok(())
     }
 }

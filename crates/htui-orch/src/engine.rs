@@ -80,18 +80,27 @@ const MAX_ITERATIONS: u32 = 512;
 /// re-admit a CLI-only agent to a gated phase would be a selector that can break `R-ORCH`'s
 /// refusal (`docs/ANA-4.md:554`).
 pub trait AgentSelector: Send + Sync {
-    /// The candidate to run, or `None` to refuse the phase.
+    /// The candidate to run as `fanout_index`, or `None` to refuse the phase.
     ///
-    /// `eligible` has already survived the capability interlock and is in `phase_agent.position`
+    /// `eligible` has already survived stage 1's `R-AGT-8` walk and is in `phase_agent.position`
     /// order, so "the first one" is "the highest-preference one".
+    ///
+    /// Asked once per candidate of a group, with that candidate's `fanout_index` (plan D71): each
+    /// candidate's agent, model, driver and session key come from its own answer, never from a
+    /// group-level one, so a selector that spreads a group across agents needs no other change. A
+    /// `fan_out = 1` phase asks with `0`; the judge (`-1`) is never asked, because its agent is the
+    /// project's judge (plan D51).
     fn select<'c>(
         &self,
         phase: &SnapshotPhase,
         eligible: &'c [SnapshotCandidate],
+        fanout_index: i32,
     ) -> Option<&'c SnapshotCandidate>;
 }
 
-/// The only selector this milestone: the first candidate that survived stage 1.
+/// The only selector this milestone: the first candidate that survived stage 1, whatever the
+/// index — every candidate of a group runs on the same agent until MOD-36's weighted selector
+/// (plan D71, OQ-7).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FirstCandidate;
 
@@ -100,6 +109,7 @@ impl AgentSelector for FirstCandidate {
         &self,
         _phase: &SnapshotPhase,
         eligible: &'c [SnapshotCandidate],
+        _fanout_index: i32,
     ) -> Option<&'c SnapshotCandidate> {
         eligible.first()
     }
@@ -122,6 +132,10 @@ impl AgentSelector for FirstCandidate {
 pub trait SessionSink: Sync {
     /// Whatever has to happen between the session ending and the settle reading its artefact.
     ///
+    /// `key` is the session's [`SessionKey`] (plan D68): three candidates share `(phase, attempt)`
+    /// and a judge's two calls share its `fanout_index`, so a sink that produces a different
+    /// document per session needs all four parts.
+    ///
     /// # Errors
     /// The store's own refusals, which the walk raises as [`EngineError::Store`].
     async fn after_done(
@@ -129,6 +143,7 @@ pub trait SessionSink: Sync {
         item: ItemId,
         step: &RunStep,
         phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
         done: &DoneEvent,
     ) -> Result<(), StoreError>;
 }
@@ -143,21 +158,57 @@ impl SessionSink for NoSink {
         _item: ItemId,
         _step: &RunStep,
         _phase: &SnapshotPhase,
+        _key: &SessionKey<'_>,
         _done: &DoneEvent,
     ) -> Result<(), StoreError> {
         Ok(())
     }
 }
 
+/// What one agent session is (plan D68), for the driver factory and the [`SessionSink`].
+///
+/// `(phase, attempt)` alone named a session until fan-out: three candidates share it, and the
+/// judge's two orderings share `(phase, attempt, -1)`, while `FakeDriver` refuses a second `start`
+/// (`crates/htui-agent/src/fake.rs:178-180`) — so a harness that must play each a different script
+/// needs the whole key. Production's registry ignores it and builds per `(agent, box)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionKey<'a> {
+    /// `run_step.phase_name`: the phase's own name, or `<phase>:judge` for a judge.
+    pub phase: &'a str,
+    /// `run_step.attempt`, 1-based.
+    pub attempt: i32,
+    /// `run_step.fanout_index`: `0..fan_out` for a candidate, `-1` for the judge.
+    pub fanout_index: i32,
+    /// The judge's ordering, `0` forward and `1` reversed (plan D52); `0` for every other session.
+    pub call: u32,
+}
+
+impl<'a> SessionKey<'a> {
+    /// The key of `step`'s first (for a judge, forward) session.
+    #[must_use]
+    pub fn of(step: &'a RunStep) -> Self {
+        Self {
+            phase: &step.phase_name,
+            attempt: step.attempt,
+            fanout_index: step.fanout_index,
+            call: 0,
+        }
+    }
+}
+
 /// How the walk gets a driver for one session.
 ///
-/// **The blueprint's §5.1 factory is `Fn(&SnapshotCandidate) -> Box<dyn AgentDriver>` and cannot
-/// work**: `FakeDriver` plays its script once and refuses a second `start`
-/// (`crates/htui-agent/src/fake.rs:178-180`), and a harness that scripts by `(phase name, attempt)`
-/// — which is the only way a review loop's second attempt can differ from its first — has no way
-/// to answer a factory that is handed neither. Both travel here. Milestone 3's registry ignores
-/// them and builds per `(agent, box)` as it already does (`registry.rs:132`).
-pub type DriverFor<'a> = &'a (dyn Fn(&SnapshotCandidate, &str, i32) -> Box<dyn AgentDriver> + Sync);
+/// **The blueprint's §5.1 factory was `Fn(&SnapshotCandidate) -> Box<dyn AgentDriver>` and could
+/// not work**: `FakeDriver` plays its script once and refuses a second `start`, and a harness that
+/// scripts per session has no way to answer a factory that is handed nothing about the session. The
+/// [`SessionKey`] travels here (plan D68). Milestone 3's registry ignores it and builds per
+/// `(agent, box)` as it already does (`registry.rs:132`).
+///
+/// A closure bound to this type must annotate **both** parameter types (blueprint H-18), e.g.
+/// `|_c: &SnapshotCandidate, key: &SessionKey<'_>| …`: the key's lifetime is higher-ranked, and
+/// inference does not generalise an unannotated closure over it.
+pub type DriverFor<'a> =
+    &'a (dyn Fn(&SnapshotCandidate, &SessionKey<'_>) -> Box<dyn AgentDriver> + Sync);
 
 // ---------------------------------------------------------------------------------------------
 // The engine
@@ -749,7 +800,12 @@ where
             eligible.push(candidate.clone());
         }
 
-        let Some(chosen) = self.parts.selector.select(phase, &eligible).cloned() else {
+        let Some(chosen) = self
+            .parts
+            .selector
+            .select(phase, &eligible, WALKED_FANOUT_INDEX)
+            .cloned()
+        else {
             return self.refuse_capability(run, phase).await.map(Some);
         };
 
@@ -915,7 +971,10 @@ where
             .session(run, step, phase, &prompt, prepared.cwd, prepared.extra_dirs)
             .await?;
         if let Ok(done) = &result {
-            self.parts.sink.after_done(item, step, phase, done).await?;
+            self.parts
+                .sink
+                .after_done(item, step, phase, &SessionKey::of(step), done)
+                .await?;
         }
 
         // -- between stage 4 and stage 5: verify (plan D30, blueprint A-3) ---------------------
@@ -1423,7 +1482,7 @@ where
         let project = self.project(run.project_id).await?;
         let settings = Self::project_settings(&project);
         let candidate = Self::candidate_of(step, phase)?;
-        let driver = (self.parts.driver)(&candidate, &phase.name, step.attempt);
+        let driver = (self.parts.driver)(&candidate, &SessionKey::of(step));
 
         let spec = SessionSpec {
             agent_id: candidate.agent_id,
@@ -1815,8 +1874,7 @@ pub async fn dispatch_fake(
     command: Command,
 ) -> Result<CommandOutcome, EngineError> {
     let graphs = orch.graphs();
-    let driver =
-        |_candidate: &SnapshotCandidate, phase: &str, attempt: i32| orch.driver_for(phase, attempt);
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
     let scrubber = htui_core::scrub::MinimalScrubber::new([]);
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.dispatch(command).await
@@ -1832,8 +1890,7 @@ pub async fn resume_fake(
     run: RunId,
 ) -> Result<Resume, EngineError> {
     let graphs = orch.graphs();
-    let driver =
-        |_candidate: &SnapshotCandidate, phase: &str, attempt: i32| orch.driver_for(phase, attempt);
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
     let scrubber = htui_core::scrub::MinimalScrubber::new([]);
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.resume(run).await
@@ -1903,9 +1960,10 @@ impl SessionSink for crate::fake::FakeOrchestrator {
         item: ItemId,
         step: &RunStep,
         phase: &SnapshotPhase,
+        key: &SessionKey<'_>,
         _done: &DoneEvent,
     ) -> Result<(), StoreError> {
-        Self::after_done(self, item, step, phase).await?;
+        Self::after_done(self, item, step, phase, key).await?;
         Ok(())
     }
 }
@@ -1926,7 +1984,7 @@ mod tests {
     };
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
-    use super::{AgentSelector, FirstCandidate, NoSink, Resume, required_inputs};
+    use super::{AgentSelector, FirstCandidate, NoSink, Resume, SessionKey, required_inputs};
     use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
     use crate::fake::{FakeOrchestrator, ScriptedStep};
     use crate::isolate::{Clock as _, IsolateError};
@@ -2122,10 +2180,120 @@ mod tests {
             },
         ];
         assert_eq!(
-            FirstCandidate.select(&phase, &candidates),
+            FirstCandidate.select(&phase, &candidates, 0),
             Some(&candidates[0])
         );
-        assert_eq!(FirstCandidate.select(&phase, &[]), None);
+        assert_eq!(
+            FirstCandidate.select(&phase, &candidates, 2),
+            Some(&candidates[0]),
+            "`FirstCandidate` ignores the index: every candidate of a group runs on the first \
+             eligible agent (plan D71, OQ-7)"
+        );
+        assert_eq!(FirstCandidate.select(&phase, &[], 0), None);
+    }
+
+    /// A selector that records every `fanout_index` it is asked about and answers the candidate
+    /// one past it, so a walk that ignored its answer — or asked with the wrong index — is visible.
+    #[derive(Debug, Default)]
+    struct IndexSelector {
+        asked: std::sync::Mutex<Vec<i32>>,
+    }
+
+    impl AgentSelector for IndexSelector {
+        fn select<'c>(
+            &self,
+            _phase: &SnapshotPhase,
+            eligible: &'c [SnapshotCandidate],
+            fanout_index: i32,
+        ) -> Option<&'c SnapshotCandidate> {
+            self.asked
+                .lock()
+                .expect("no panic holds the selector's lock")
+                .push(fanout_index);
+            let next = usize::try_from(fanout_index).ok()?.checked_add(1)?;
+            eligible.get(next.checked_rem(eligible.len())?)
+        }
+    }
+
+    /// Plan D71: stage 1 hands the selector the candidate's `fanout_index`, and the step row carries
+    /// the selector's own answer rather than the first eligible candidate. A `fan_out = 1` phase
+    /// asks once, with `0`.
+    #[tokio::test]
+    async fn a_selector_is_asked_with_the_fanout_index() {
+        let orch = FakeOrchestrator::demo();
+        orch.store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock.now())
+            .await
+            .expect("the seeded run is queued and cancellable");
+        orch.with_candidates(
+            "prd",
+            vec![
+                (ids::AGENT_CLAUDE, "sonnet"),
+                (ids::AGENT_AGY, "gemini-3.7-flash-high"),
+            ],
+        );
+
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let selector = IndexSelector::default();
+        let engine = super::Engine::new(super::EngineParts {
+            store: &orch.store,
+            graphs: &graphs,
+            isolator: &orch.isolator,
+            verifier: &orch.verifier,
+            clock: &orch.clock,
+            selector: &selector,
+            sink: &orch,
+            driver: &driver,
+            scrubber: &scrubber,
+            app: orch
+                .store
+                .app_settings()
+                .await
+                .expect("MemStore never fails a read"),
+            box_profile: orch
+                .store
+                .box_profile(orch.box_id())
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the demo fixture seeds this box"),
+            box_id: orch.box_id(),
+            owner: orch.owner(),
+            user: orch.user(),
+        });
+
+        let CommandOutcome::Started { run, .. } = engine
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        let steps = orch.steps(run).await;
+        assert_eq!(steps.len(), 1, "`prd` parks at its `always` gate");
+        assert_eq!(
+            (
+                steps[0].fanout_index,
+                steps[0].agent_id,
+                steps[0].model.as_deref()
+            ),
+            (0, Some(ids::AGENT_AGY), Some("gemini-3.7-flash-high")),
+            "the row is the selector's answer for index 0, not the first eligible candidate"
+        );
+        assert_eq!(
+            *selector
+                .asked
+                .lock()
+                .expect("no panic holds the selector's lock"),
+            [0],
+            "a `fan_out = 1` phase asks once, for index 0"
+        );
     }
 
     /// The whole walk, once: `FEAT-3` reaches its first gate, four approvals finish it, and the
@@ -3338,6 +3506,7 @@ mod tests {
                 ids::HTUI_FEAT_1,
                 &steps,
                 &phase_of(&orch).await,
+                &SessionKey::of(&steps),
                 &htui_agent::event::DoneEvent {
                     stop_reason: StopReason::EndTurn,
                 },
@@ -3583,8 +3752,7 @@ mod tests {
         let graphs = orch.graphs();
         let spy = seen.clone();
         let driver = move |_candidate: &SnapshotCandidate,
-                           _phase: &str,
-                           _attempt: i32|
+                           _key: &SessionKey<'_>|
               -> Box<dyn htui_agent::driver::AgentDriver> {
             Box::new(SpecSpy { seen: spy.clone() })
         };
