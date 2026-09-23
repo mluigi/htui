@@ -2310,6 +2310,41 @@ where
             // `decide` range-checked it against these same rows.
             return Ok(None);
         };
+        // The judge is `running` here, so an escaped `?` would leave it and the run `running`
+        // forever: a store error is `fail_judge`'s like any other, and is still raised.
+        if let Err(err) = self
+            .settle_judge(run, phase, attempt, &judge, winner, reason)
+            .await
+        {
+            if let Err(also) = self
+                .fail_judge(
+                    run,
+                    phase,
+                    attempt,
+                    &judge,
+                    &slot,
+                    JudgeFailure::SessionFailed(err.to_string()),
+                )
+                .await
+            {
+                tracing::warn!(step = %judge.id, %also, "a judge whose settle failed was not parked");
+            }
+            return Err(err);
+        }
+        self.reconcile_winner(run, &slot, winner).await
+    }
+
+    /// Step 4 of [`run_judge`](Self::run_judge): the judge's settle, then `select_fanout` moving
+    /// it `running -> done` beside the winner with the reason.
+    async fn settle_judge(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        attempt: i32,
+        judge: &RunStep,
+        winner: StepId,
+        reason: String,
+    ) -> Result<(), EngineError> {
         let now = self.now();
         self.parts
             .store
@@ -2329,7 +2364,7 @@ where
             .store
             .select_fanout(run.id, phase.position, attempt, winner, Some(reason))
             .await?;
-        self.reconcile_winner(run, &slot, winner).await
+        Ok(())
     }
 
     /// The judge's inputs and both orderings (plan D53), with nothing written.
@@ -3711,7 +3746,7 @@ pub async fn resume_fake(
 /// that does not carry it, and `ProjectPatch` has no `settings` field — so a map captured at
 /// construction would silently ignore the one knob the deadline case has.
 #[cfg(feature = "test-support")]
-async fn fake_parts<'a>(
+pub(crate) async fn fake_parts<'a>(
     orch: &'a crate::fake::FakeOrchestrator,
     graphs: &'a crate::fake::FakeGraphSource<'a>,
     driver: DriverFor<'a>,

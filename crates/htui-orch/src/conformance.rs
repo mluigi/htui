@@ -3800,4 +3800,117 @@ mod fanout_paths {
             "{parks:?}"
         );
     }
+
+    /// A sink that supersedes the slot's candidate `winner` the moment the judge's first call
+    /// ends, so the verdict names a row `select_fanout` then refuses as not settled — a store
+    /// error once the judge is `running`, which no scripted session can reach.
+    struct SupersedeWinner<'a> {
+        orch: &'a FakeOrchestrator,
+        winner: i32,
+    }
+
+    impl crate::engine::SessionSink for SupersedeWinner<'_> {
+        async fn after_done(
+            &self,
+            item: htui_core::model::ItemId,
+            step: &RunStep,
+            phase: &htui_core::model::SnapshotPhase,
+            key: &crate::engine::SessionKey<'_>,
+            done: &htui_agent::event::DoneEvent,
+        ) -> Result<(), htui_core::store::StoreError> {
+            if step.fanout_index < 0 {
+                let steps = self.orch.store().run_steps(step.run_id).await?;
+                if let Some(winner) = steps.iter().find(|row| {
+                    row.position == step.position
+                        && row.attempt == step.attempt
+                        && row.fanout_index == self.winner
+                        && row.status != StepStatus::Superseded
+                }) {
+                    self.orch.store().supersede_step(winner.id).await?;
+                }
+            }
+            crate::engine::SessionSink::after_done(self.orch, item, step, phase, key, done).await
+        }
+    }
+
+    /// Plan D51: a store error after the judge went `running` — here `select_fanout`
+    /// refusing a winner that is no longer settled — lands the judge `failed` and parks the group,
+    /// and the walk still raises the error. Before, the `?` left the judge and the run `running`.
+    #[tokio::test]
+    async fn a_store_error_after_the_judge_started_fails_it_and_parks() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        judge_both(&orch, "research", 1, 1, "best");
+        let before: Vec<_> = orch
+            .store()
+            .runs(ids::HTUI_ANA_2)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &htui_core::model::SnapshotCandidate,
+             key: &crate::engine::SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let parts = crate::engine::fake_parts(&orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the fake's parts build");
+        let sink = SupersedeWinner {
+            orch: &orch,
+            winner: 1,
+        };
+        let engine = crate::engine::Engine::new(crate::engine::EngineParts {
+            store: parts.store,
+            graphs: parts.graphs,
+            isolator: parts.isolator,
+            verifier: parts.verifier,
+            clock: parts.clock,
+            selector: parts.selector,
+            sink: &sink,
+            driver: parts.driver,
+            scrubber: parts.scrubber,
+            app: parts.app,
+            box_profile: parts.box_profile,
+            box_id: parts.box_id,
+            owner: parts.owner,
+            user: parts.user,
+        });
+
+        let err = engine
+            .dispatch(crate::command::Command::StartRun {
+                item: ids::HTUI_ANA_2,
+                mode: htui_core::model::RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect_err("the refused selection is raised");
+        assert!(
+            matches!(
+                err,
+                crate::command::EngineError::Store(htui_core::store::StoreError::Constraint(_))
+            ),
+            "{err:?}"
+        );
+
+        let run = orch
+            .store()
+            .runs(ids::HTUI_ANA_2)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .map(|run| run.id)
+            .find(|id| !before.contains(id))
+            .expect("the run was created");
+        assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+        let steps = steps_of(&orch, run).await;
+        let judge = judge_of(&steps, 0, 1).expect("the judge ran");
+        assert_eq!(judge.status, StepStatus::Failed);
+        let note = judge.gate_note.as_deref().unwrap_or_default();
+        assert!(note.starts_with("judge_session_failed: "), "{note}");
+    }
 }
