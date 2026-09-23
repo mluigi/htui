@@ -80,6 +80,9 @@ pub struct FakeIsolator {
     /// The `run_step_id`s of the tree and commit rows each [`diff`](Isolator::diff) call was
     /// handed, in call order — so a case can tell *whose* rows plan D67 diffed.
     diff_requests: Mutex<Vec<DiffRequest>>,
+    /// Every [`reconcile`](Isolator::reconcile) call, as `(winner, siblings)`, in call order — so a
+    /// case can tell which siblings plan D54(d) handed the isolator.
+    reconciles: Mutex<Vec<(StepId, Vec<StepId>)>>,
 }
 
 /// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
@@ -188,6 +191,16 @@ impl FakeIsolator {
     #[must_use]
     pub fn diff_requests(&self) -> Vec<DiffRequest> {
         self.diff_requests
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .clone()
+    }
+
+    /// Every [`reconcile`](Isolator::reconcile) call so far, as `(winner, siblings)`, refusals
+    /// included.
+    #[must_use]
+    pub fn reconciles(&self) -> Vec<(StepId, Vec<StepId>)> {
+        self.reconciles
             .lock()
             .expect("no panic holds the fake isolator's lock")
             .clone()
@@ -325,8 +338,9 @@ impl Isolator for FakeIsolator {
     }
 
     /// For a fake that made no tree, a merge is the identity: this reports exactly what
-    /// [`capture`](Isolator::capture) reported for the winner. `siblings` are ignored — there is no
-    /// shared checkout for a sibling to have left anywhere.
+    /// [`capture`](Isolator::capture) reported for the winner. `siblings` move nothing — there is
+    /// no shared checkout for a sibling to have left anywhere — and are only recorded, for
+    /// [`reconciles`](FakeIsolator::reconciles).
     ///
     /// **It does not consume a [`script_after`](FakeIsolator::script_after) value**, which is the
     /// one behavioural change T6 made to this double. Milestone 2 shipped `reconcile` echoing
@@ -341,7 +355,11 @@ impl Isolator for FakeIsolator {
         siblings: &'a [StepId],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
-            let _ = (trees, siblings);
+            let _ = trees;
+            self.reconciles
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .push((winner, siblings.to_vec()));
             if let Some(err) = self
                 .reconcile_failures
                 .lock()

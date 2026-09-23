@@ -4213,6 +4213,80 @@ mod tests {
 
     /// Blueprint H-19: `min_budget_for_new_attempt` is unseeded, so only a positive integer is a
     /// minimum; `0`, a negative, a string and a float are all silence.
+    /// A `judge` document whose body is `body`, for [`super::decide`].
+    fn verdict(body: &str) -> htui_core::model::Document {
+        htui_core::model::Document {
+            id: htui_core::model::DocumentId::new(),
+            item_id: ids::HTUI_ANA_2,
+            kind: "judge".to_owned(),
+            version: 1,
+            title: "judge".to_owned(),
+            body: body.to_owned(),
+            produced_by_step_id: None,
+            created_by: ids::USER,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// A fenced verdict naming `winner`, with `reasons` as `(index, reason)`.
+    fn block(winner: i32, reasons: &[(i32, &str)]) -> htui_core::model::Document {
+        let reasons: serde_json::Map<String, serde_json::Value> = reasons
+            .iter()
+            .map(|(index, reason)| (index.to_string(), serde_json::Value::from(*reason)))
+            .collect();
+        let json = serde_json::json!({ "winner": winner, "reasons": reasons });
+        verdict(&format!("Compared.\n\n```json\n{json}\n```"))
+    }
+
+    /// Plan D52's verdict, every arm: agreement with call 0's reason, the `judge: <i>` fallback,
+    /// a winner out of range on **either** call, a disagreement, and an unparseable call.
+    #[test]
+    fn decide_reads_both_calls_and_range_checks_each() {
+        use crate::fanout::JudgeFailure;
+
+        let survivors = [0, 2];
+        assert_eq!(
+            super::decide(
+                &[block(2, &[(2, "shorter")]), block(2, &[(2, "later")])],
+                &survivors
+            ),
+            Ok((2, "shorter".to_owned())),
+            "the reason is call 0's"
+        );
+        assert_eq!(
+            super::decide(
+                &[block(0, &[(2, "not the winner")]), block(0, &[])],
+                &survivors
+            ),
+            Ok((0, "judge: 0".to_owned())),
+            "no reason for the winner"
+        );
+        for documents in [
+            [block(1, &[]), block(0, &[])],
+            [block(0, &[]), block(1, &[])],
+        ] {
+            assert_eq!(
+                super::decide(&documents, &survivors),
+                Err(JudgeFailure::OutOfRange {
+                    winner: 1,
+                    survivors: vec![0, 2],
+                }),
+                "an eliminated candidate is out of range on either call"
+            );
+        }
+        assert_eq!(
+            super::decide(&[block(0, &[]), block(2, &[])], &survivors),
+            Err(JudgeFailure::Disagreement {
+                forward: 0,
+                reversed: 2,
+            })
+        );
+        assert!(matches!(
+            super::decide(&[block(0, &[]), verdict("candidate 0, surely")], &survivors),
+            Err(JudgeFailure::Unparseable(_))
+        ));
+    }
+
     #[test]
     fn min_budget_reads_only_a_positive_integer() {
         let app = |value: serde_json::Value| {

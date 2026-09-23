@@ -3116,3 +3116,622 @@ mod tests {
         run_all(&Demo).await;
     }
 }
+
+/// Fan-out paths no [`CASES`] entry reaches: a candidate's own errors once live (plan D48, D78),
+/// a group whose one prompt is missing an input (D76), the judge prompt's dropped candidate (D53),
+/// the crash leftovers `Select` and `Fan` resume from (D59), the judge failures criteria 8-10 do
+/// not name (D51, D52), the winner's siblings (D54(d)) and the `shared_serialized` park note.
+///
+/// Unit tests rather than cases: several seed a crash's rows straight into the store, which is a
+/// `MemStore` write no transport-neutral binding promises.
+#[cfg(test)]
+mod fanout_paths {
+    use htui_core::fixtures::ids;
+    use htui_core::model::{
+        Gate, Isolation, NewRunStep, RunStatus, RunStep, RunStepCommit, Status, StepId, StepStatus,
+    };
+    use htui_core::store::{ReadStore as _, WriteStore as _};
+
+    use super::{
+        FakeOrchestrator, Orchestrate, RunFailure, ScriptedStep, candidate, fan_research,
+        free_feat_3, item_of, judge_both, judge_of, latch_quota, notes_of, primary_repo, repoint,
+        research_candidates, run_of, selection_parks, set_input_kinds, set_judge, slot_of, start,
+        steps_of,
+    };
+    use crate::engine::Resume;
+    use crate::isolate::Clock as _;
+
+    /// A crash's leftover run: `awaiting_approval -> running` and the item back to `in_progress`,
+    /// by hand, so `resume` walks rows no command answered.
+    async fn unpark_by_hand(orch: &FakeOrchestrator, run: htui_core::model::RunId) {
+        let now = orch.clock().now();
+        assert!(
+            orch.store()
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move"),
+            "the run was parked"
+        );
+        let item = run_of(orch, run)
+            .await
+            .item_id
+            .expect("the run has an item");
+        assert!(
+            orch.store()
+                .transition(item, Status::AwaitingApproval, Status::InProgress)
+                .await
+                .expect("MemStore takes the move"),
+            "the item was parked"
+        );
+    }
+
+    /// `resume`, unwrapped to the rest of a walk that ran.
+    async fn resumed(orch: &FakeOrchestrator, run: htui_core::model::RunId) -> super::Rest {
+        match orch.resume(run).await.expect("the walk resumes") {
+            Resume::Walked(rest) => rest,
+            Resume::TopologyChanged { .. } => panic!("nothing edited the graph"),
+        }
+    }
+
+    /// A `pending` judge row at `(0, 1)` as a crash between `create_judge` and its
+    /// `pending -> running` leaves it.
+    async fn seed_pending_judge(orch: &FakeOrchestrator, run: htui_core::model::RunId) -> StepId {
+        orch.store()
+            .create_step(NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: 0,
+                attempt: 1,
+                fanout_index: -1,
+                phase_name: "research:judge".to_owned(),
+                agent_id: Some(ids::AGENT_AGY),
+                model: Some("seeded".to_owned()),
+            })
+            .await
+            .expect("the slot has no judge yet")
+            .id
+    }
+
+    /// Candidate `index` of `(0, 1)`'s id.
+    fn candidate_id(steps: &[RunStep], index: i32) -> StepId {
+        candidate(steps, 0, 1, index).id
+    }
+
+    /// Plan D48's second clause and plan D78. Candidate 0's `prepare` errors (nothing to release)
+    /// and candidate 1's driver refuses to start after its `prepare` succeeded: each lands
+    /// `failed` with a note naming it, and candidate 1's trees are still captured on the way out.
+    /// The run neither fails nor errors — the one survivor wins outright (D49(4)), reconciled with
+    /// both failed siblings (D54(d)).
+    #[tokio::test]
+    async fn a_candidate_that_errors_once_live_fails_alone_and_is_captured() {
+        let orch = FakeOrchestrator::demo();
+        primary_repo(&orch).await;
+        fan_research(&orch, Gate::Never, false).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        orch.isolator().refuse_prepare("the worktree is locked");
+        orch.script_candidate(
+            "research",
+            1,
+            1,
+            0,
+            ScriptedStep::refusing_to_start("no `agy` on PATH"),
+        );
+
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+        let steps = steps_of(&orch, run).await;
+        assert_eq!(
+            slot_of(&steps, 0, 1),
+            [
+                (0, StepStatus::Failed, Some(false)),
+                (1, StepStatus::Failed, Some(false)),
+                (2, StepStatus::Done, Some(true)),
+            ]
+        );
+        let notes = notes_of(&orch, ids::HTUI_ANA_2).await;
+        for (index, why) in [(0, "the worktree is locked"), (1, "no `agy` on PATH")] {
+            let opening = format!("fan-out candidate {index} of `research` attempt 1: ");
+            assert!(
+                notes
+                    .iter()
+                    .any(|body| body.starts_with(&opening) && body.contains(why)),
+                "candidate {index}'s error is its own note: {notes:?}"
+            );
+        }
+
+        let never_prepared = orch
+            .store()
+            .step_commits(candidate_id(&steps, 0))
+            .await
+            .expect("MemStore never fails a read");
+        assert!(never_prepared.is_empty(), "{never_prepared:?}");
+        let released = orch
+            .store()
+            .step_commits(candidate_id(&steps, 1))
+            .await
+            .expect("MemStore never fails a read");
+        assert!(!released.is_empty(), "candidate 1 was prepared");
+        assert!(
+            released.iter().all(|commit| commit.after_hash.is_some()),
+            "a candidate failing between `prepare` and `capture` is captured best-effort (D78): \
+             {released:?}"
+        );
+
+        let winner = candidate(&steps, 0, 1, 2).id;
+        assert_eq!(
+            orch.isolator().reconciles().first(),
+            Some(&(
+                winner,
+                vec![candidate(&steps, 0, 1, 0).id, candidate(&steps, 0, 1, 1).id]
+            )),
+            "the auto-win is reconciled with its siblings (D54(d))"
+        );
+    }
+
+    /// Plan D76 (blueprint A-5): a fanned-out phase whose one prompt is missing a required input
+    /// fails every candidate `pending -> running -> failed` with a note, then the run, before any
+    /// session or tree.
+    #[tokio::test]
+    async fn a_group_missing_an_input_fails_every_candidate_before_a_token() {
+        let orch = FakeOrchestrator::demo();
+        free_feat_3(&orch).await;
+        repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+            if phase.position == 0 {
+                phase.fan_out = 3;
+            }
+        })
+        .await;
+        set_input_kinds(&orch, ids::HTUI_FEAT_3, 0, &["spec"]).await;
+
+        let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+        assert_eq!(
+            (rest.run, rest.position, rest.failure),
+            (
+                RunStatus::Failed,
+                Some(0),
+                Some(RunFailure::MissingInput("spec".to_owned()))
+            )
+        );
+        assert_eq!(
+            run_of(&orch, run).await.failure.as_deref(),
+            Some("missing input document: spec")
+        );
+        let steps = steps_of(&orch, run).await;
+        assert_eq!(
+            slot_of(&steps, 0, 1),
+            [
+                (0, StepStatus::Failed, None),
+                (1, StepStatus::Failed, None),
+                (2, StepStatus::Failed, None),
+            ],
+            "no candidate is left `pending` under a failed run"
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.prompt_digest.is_none() && step.usage.is_none()),
+            "no prompt, no session"
+        );
+        assert_eq!(orch.isolator().prepares(), 0, "no tree was prepared");
+        let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+        let phase = &steps[0].phase_name;
+        for index in 0..3 {
+            let note = format!(
+                "fan-out candidate {index} of `{phase}` attempt 1: missing input document: spec"
+            );
+            assert!(notes.contains(&note), "{note} in {notes:?}");
+        }
+    }
+
+    /// Plan D53: a candidate the judge prompt's trimmer drops outright sends the group to a human
+    /// with `judge_candidate_dropped: <i>`, and no judge row is written.
+    #[tokio::test]
+    async fn a_candidate_dropped_from_the_judge_prompt_parks_with_no_judge_row() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        let huge = "an exhaustive finding that goes on and on. ".repeat(40_000);
+        orch.script_candidate("research", 1, 2, 0, ScriptedStep::done_with_output(&huge));
+
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(
+            (rest.run, rest.position, rest.failure),
+            (RunStatus::AwaitingApproval, Some(0), None)
+        );
+        let steps = steps_of(&orch, run).await;
+        assert!(judge_of(&steps, 0, 1).is_none(), "no judge row (D53)");
+        let parks = selection_parks(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(parks.len(), 1, "{parks:?}");
+        assert!(
+            parks[0].contains(" awaits selection: judge_candidate_dropped: 2; "),
+            "{parks:?}"
+        );
+    }
+
+    /// Plan D59: a `failed` judge left by a crash between `fail_judge`'s writes and its park is
+    /// re-parked with its own reason, and never re-run.
+    #[tokio::test]
+    async fn a_leftover_failed_judge_reparks_without_rejudging() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        orch.script_candidate("research:judge", 1, -1, 0, ScriptedStep::judge(0, &[]));
+        orch.script_candidate("research:judge", 1, -1, 1, ScriptedStep::judge(2, &[]));
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        let judge = judge_of(&steps_of(&orch, run).await, 0, 1)
+            .expect("the judge ran")
+            .clone();
+        let events = orch
+            .store()
+            .step_events(judge.id)
+            .await
+            .expect("MemStore never fails a read")
+            .map_or(0, |events| events.len());
+
+        unpark_by_hand(&orch, run).await;
+        let rest = resumed(&orch, run).await;
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(0))
+        );
+        let steps = steps_of(&orch, run).await;
+        let judges: Vec<_> = steps
+            .iter()
+            .filter(|step| step.fanout_index == -1)
+            .collect();
+        assert_eq!(judges.len(), 1, "no second judge: {judges:?}");
+        assert_eq!(
+            (
+                judges[0].id,
+                judges[0].status,
+                judges[0].gate_note.as_deref()
+            ),
+            (
+                judge.id,
+                StepStatus::Failed,
+                Some("judge_disagreement: forward 0, reversed 2")
+            )
+        );
+        assert_eq!(
+            orch.store()
+                .step_events(judge.id)
+                .await
+                .expect("MemStore never fails a read")
+                .map_or(0, |events| events.len()),
+            events,
+            "the judge ran no new session"
+        );
+        let parks = selection_parks(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(parks.len(), 2, "{parks:?}");
+        assert_eq!(parks[0], parks[1], "the same reason, re-parked");
+    }
+
+    /// Plan D59: a `pending` judge left by a crash is **that** judge — run with the passing set
+    /// recomputed, not replaced — and the winner is reconciled with its siblings (D54(d)).
+    #[tokio::test]
+    async fn a_leftover_pending_judge_is_the_one_that_runs() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Always, false).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        judge_both(&orch, "research", 1, 1, "the most thorough");
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(rest.run, RunStatus::AwaitingApproval, "gated: no judge yet");
+        let judge = seed_pending_judge(&orch, run).await;
+
+        unpark_by_hand(&orch, run).await;
+        let rest = resumed(&orch, run).await;
+        assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+        let steps = steps_of(&orch, run).await;
+        let judges: Vec<_> = steps
+            .iter()
+            .filter(|step| step.fanout_index == -1)
+            .collect();
+        assert_eq!(judges.len(), 1, "{judges:?}");
+        assert_eq!(
+            (
+                judges[0].id,
+                judges[0].status,
+                judges[0].gate_note.as_deref()
+            ),
+            (judge, StepStatus::Done, Some("the most thorough"))
+        );
+        assert_eq!(
+            slot_of(&steps, 0, 1),
+            [
+                (0, StepStatus::Superseded, Some(false)),
+                (1, StepStatus::Done, Some(true)),
+                (2, StepStatus::Superseded, Some(false)),
+            ]
+        );
+        assert_eq!(
+            orch.isolator().reconciles().first(),
+            Some(&(
+                candidate(&steps, 0, 1, 1).id,
+                vec![candidate(&steps, 0, 1, 0).id, candidate(&steps, 0, 1, 2).id]
+            )),
+            "the judged winner is reconciled with its siblings (D54(d))"
+        );
+    }
+
+    /// Plan D51, blueprint F-I: a judge agent the walk skips is `judge_unavailable` — the judge
+    /// row `failed` with the walk's cause as its `gate_note`, and the group parked.
+    #[tokio::test]
+    async fn a_judge_the_walk_skips_is_unavailable_and_parks() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Always, false).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        judge_both(&orch, "research", 1, 1, "never read");
+        let (run, _) = start(&orch, ids::HTUI_ANA_2).await;
+        let judge = seed_pending_judge(&orch, run).await;
+        latch_quota(&orch, ids::AGENT_AGY, "rejected").await;
+
+        unpark_by_hand(&orch, run).await;
+        let rest = resumed(&orch, run).await;
+        assert_eq!(
+            (rest.run, rest.position, rest.failure),
+            (RunStatus::AwaitingApproval, Some(0), None)
+        );
+        let steps = steps_of(&orch, run).await;
+        let row = judge_of(&steps, 0, 1).expect("the judge row stays");
+        assert_eq!((row.id, row.status), (judge, StepStatus::Failed));
+        let note = row.gate_note.clone().expect("the reason is on the row");
+        assert!(note.starts_with("judge_unavailable: "), "{note}");
+        assert!(
+            orch.store()
+                .step_events(judge)
+                .await
+                .expect("MemStore never fails a read")
+                .is_none_or(|events| events.is_empty()),
+            "a skipped judge opens no session"
+        );
+        let parks = selection_parks(&orch, ids::HTUI_ANA_2).await;
+        assert!(
+            parks
+                .last()
+                .is_some_and(|park| park.contains(&format!(" awaits selection: {note}; "))),
+            "{parks:?}"
+        );
+        assert!(
+            slot_of(&steps, 0, 1)
+                .iter()
+                .all(|(_, _, selected)| selected.is_none())
+        );
+    }
+
+    /// Plan D52: call 1 must write a **new** `judge` document; re-reading call 0's is
+    /// `judge_missing_document: call 1`.
+    #[tokio::test]
+    async fn a_judge_call_that_writes_nothing_is_a_missing_document() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        orch.script_candidate("research:judge", 1, -1, 0, ScriptedStep::judge(1, &[]));
+        orch.script_candidate(
+            "research:judge",
+            1,
+            -1,
+            1,
+            ScriptedStep::done_without_output(),
+        );
+
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        let steps = steps_of(&orch, run).await;
+        let judge = judge_of(&steps, 0, 1).expect("the judge ran");
+        assert_eq!(
+            (judge.status, judge.gate_note.as_deref()),
+            (StepStatus::Failed, Some("judge_missing_document: call 1"))
+        );
+    }
+
+    /// Plan D52: the two calls share one recorder, so a run cap the pair breaches between them is
+    /// `judge_session_failed: cap breached`, even when both verdicts agree.
+    #[tokio::test]
+    async fn a_judge_that_breaches_the_run_cap_fails() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        let project = item_of(&orch, ids::HTUI_ANA_2).await.project_id;
+        orch.store().set_project_settings(
+            project,
+            serde_json::json!({ "judge_agent_id": ids::AGENT_AGY, "per_token_cap_run": 1_000 }),
+        );
+        research_candidates(&orch, 1);
+        let verdict = "Compared.\n\n```json\n{\"winner\": 1, \"reasons\": {\"1\": \"best\"}}\n```";
+        for call in 0..2 {
+            orch.script_candidate(
+                "research:judge",
+                1,
+                -1,
+                call,
+                ScriptedStep::done_costing(verdict, 600),
+            );
+        }
+
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        let steps = steps_of(&orch, run).await;
+        let judge = judge_of(&steps, 0, 1).expect("the judge ran");
+        assert_eq!(judge.status, StepStatus::Failed);
+        let note = judge.gate_note.as_deref().unwrap_or_default();
+        assert!(
+            note.starts_with("judge_session_failed: cap breached"),
+            "{note}"
+        );
+    }
+
+    /// Plan D51: a judge that names the seeded `claude`, which has no model to run, is
+    /// `judge_unavailable: no model` on a judge row, and the group parks.
+    #[tokio::test]
+    async fn a_judge_with_no_model_is_unavailable() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        let project = item_of(&orch, ids::HTUI_ANA_2).await.project_id;
+        orch.store().set_project_settings(
+            project,
+            serde_json::json!({ "judge_agent_id": ids::AGENT_CLAUDE }),
+        );
+        research_candidates(&orch, 1);
+
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        let steps = steps_of(&orch, run).await;
+        let judge = judge_of(&steps, 0, 1).expect("the reason is on a row");
+        assert_eq!(
+            (
+                judge.status,
+                judge.gate_note.as_deref(),
+                judge.model.as_deref()
+            ),
+            (
+                StepStatus::Failed,
+                Some("judge_unavailable: no model"),
+                None
+            )
+        );
+    }
+
+    /// Plan D59, `Fan`: a slot a crash left with only candidate 0 has the missing indices admitted
+    /// and driven, and they start from the base candidate 0 already recorded (D54(b)).
+    #[tokio::test]
+    async fn a_partial_group_admits_the_missing_indices_from_the_recorded_base() {
+        let orch = FakeOrchestrator::demo();
+        let repo = primary_repo(&orch).await;
+        fan_research(&orch, Gate::Always, false).await;
+        research_candidates(&orch, 1);
+        research_candidates(&orch, 2);
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+
+        // Attempt 1 retired, and attempt 2 created as far as candidate 0 before the crash.
+        let now = orch.clock().now();
+        let steps = steps_of(&orch, run).await;
+        for index in 0..3 {
+            orch.store()
+                .transition_step(
+                    candidate(&steps, 0, 1, index).id,
+                    StepStatus::Done,
+                    StepStatus::Superseded,
+                    now,
+                )
+                .await
+                .expect("MemStore takes the move");
+        }
+        let first = candidate(&steps, 0, 1, 0);
+        let zero = orch
+            .store()
+            .create_step(NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: 0,
+                attempt: 2,
+                fanout_index: 0,
+                phase_name: first.phase_name.clone(),
+                agent_id: first.agent_id,
+                model: first.model.clone(),
+            })
+            .await
+            .expect("the slot is new")
+            .id;
+        for (from, to) in [
+            (StepStatus::Pending, StepStatus::Running),
+            (StepStatus::Running, StepStatus::Done),
+        ] {
+            orch.store()
+                .transition_step(zero, from, to, now)
+                .await
+                .expect("MemStore takes the move");
+        }
+        orch.store()
+            .record_commits(
+                zero,
+                &[RunStepCommit {
+                    run_step_id: zero,
+                    repo_id: repo,
+                    before_hash: "seeded:base".to_owned(),
+                    after_hash: Some("seeded:after".to_owned()),
+                }],
+            )
+            .await
+            .expect("MemStore takes the rows");
+
+        unpark_by_hand(&orch, run).await;
+        let rest = resumed(&orch, run).await;
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(0)),
+            "the completed group is gated"
+        );
+        let steps = steps_of(&orch, run).await;
+        assert_eq!(
+            slot_of(&steps, 0, 2),
+            [
+                (0, StepStatus::Done, None),
+                (1, StepStatus::Done, None),
+                (2, StepStatus::Done, None),
+            ],
+            "indices 1 and 2 were admitted and driven"
+        );
+        for index in [1, 2] {
+            let step = steps
+                .iter()
+                .find(|step| step.attempt == 2 && step.fanout_index == index)
+                .expect("admitted");
+            let commits = orch
+                .store()
+                .step_commits(step.id)
+                .await
+                .expect("MemStore never fails a read");
+            assert_eq!(
+                commits
+                    .iter()
+                    .map(|commit| commit.before_hash.as_str())
+                    .collect::<Vec<_>>(),
+                ["seeded:base"],
+                "candidate {index} starts from the slot's recorded base"
+            );
+        }
+    }
+
+    /// The plan's Risks row: a `shared_serialized` group's park note says the checkout stays at
+    /// the last sibling's commit, naming the base and every sibling's `htui/<step>` label.
+    #[tokio::test]
+    async fn a_shared_serialized_park_names_the_checkout() {
+        let orch = FakeOrchestrator::demo();
+        let repo = primary_repo(&orch).await;
+        repoint(&orch, ids::HTUI_ANA_2, |phase| {
+            if phase.name == "research" {
+                phase.fan_out = 3;
+                phase.gate = Gate::Always;
+                phase.isolation = Some(Isolation::SharedSerialized);
+            } else {
+                phase.gate = Gate::Never;
+            }
+        })
+        .await;
+        research_candidates(&orch, 1);
+
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        let steps = steps_of(&orch, run).await;
+        let labels = (0..3)
+            .map(|index| format!("htui/{}", candidate(&steps, 0, 1, index).id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let parks = selection_parks(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(parks.len(), 1, "{parks:?}");
+        assert!(
+            parks[0].ends_with(&format!(
+                "; the shared checkout stays at the last sibling's commit (base \
+                 {repo}@fake:group-base:{repo}; labels {labels})"
+            )),
+            "{parks:?}"
+        );
+    }
+}
