@@ -1081,3 +1081,39 @@ cargo doc -p htui-core --no-deps --all-features # no new error beyond MIRRORED_T
 
 - **C-6** as written cannot pass: `GixIsolator::resolve_scope` (`real.rs:348`) is an unrelated private method. Read C-6 as: `LEASE_SECONDS` absent, and `resolve_scope` only in `isolate/real.rs`.
 - Plan D85's "a refresh of `0` reads as `ttl / 2`" is superseded by §5.3/F-U (a `0` refresh is unset and gives 60 s), and now also by D124's clamp.
+
+## 22. Review round 2 (rust-reviewer over `fcdb217..829586f`, 2026-09-23)
+
+The second `rust-reviewer` pass over the round-1 repairs returned **request-changes**. The main thread checked H-A and M-A in the code before the maintainer saw them. The maintainer **accepted the recommended bundle** on 2026-09-23: fix H-A, M-A, M-B, L-a, L-c and L-d; record L-e as R-31 and L-f as R-32. L-b (a hung refresh can still commit on the server) is closed by D139. Each fix is test-first.
+
+### 22.1 Round-1 deviations from §21 (as landed)
+
+- **D131** is a five-branch order: rejected → `rejection()`; not reset → park; budget left → `admit`; interrupted → park; anything else → `finish_run`. It adds `RunFailure::RetryBudgetSpent` (`Display`: "retry budget spent: step `{phase}` attempt {n} failed") and the N2 reason `PARK_CUT_SHORT`.
+- **D132** unparks only when the cursor is `Create`, `Run` or `Finished`. A crash right after `AnswerGate(Rejected)` stays parked on a failed step (R-31).
+- **D133** cannot cover `select_fanout`: its store write returns `()`.
+- **D134** applies to every retry, not only the A-8 exemption (`StaleSlot`).
+- **D135** adds `Landing::Retired`. The C129 case moved `stall_nth_reconcile` from 5 to 4.
+- **D124**: the default beat is now 40 s.
+- **D126**: a lost re-take is omitted from the sweep's `Vec`, not reported as `Next::Error`.
+- **D138** adds the `already_reset` text to the `never_reset` reason.
+- **D136** also holds the repo's admin lock from `reconcile_isolated`'s `HEAD` read through its merge (commits `a35d69b`, `829586f`).
+- **C-6**'s grep must exclude `GixIsolator::resolve_scope` (§21.3).
+- About five intermediate commits fail `clippy -D warnings` on their own (e.g. `74c10b5`, `e58d508`, `135dacd`, `b5f0573`). HEAD is clean. Squashing before merge is the maintainer's call.
+
+### 22.2 Fixed in milestone 5
+
+| # | Finding | Decision (D139–D145) |
+|---|---|---|
+| **H-A** | M2 is not closed for the owning process. `Engine::release_lease` (`engine.rs:1147`) calls `refresh_lease(run, owner, now)`, so `lease_owner` stays this process, and `adopt_runs` skips `lease_owner IS DISTINCT FROM $2` (D88). This process's own sweep never re-adopts a run whose walk died. D122 makes this common: a store outage of more than one fence strands every running walk until restart. | **D139** A new `WriteStore` verb `release_lease(run, owner, now) -> Result<bool>`: `UPDATE run SET lease_owner = NULL, lease_expires_at = $3 WHERE id = $1 AND lease_owner = $2`. `Ok(false)` = zero rows = not ours; `NotFound` is told apart by the reused `SELECT 1 FROM run WHERE id = $1` literal. `Engine::release_lease` uses it on every release path (walk `Err`, `release_after_walk`, `stale_first_write`, the sweep's `unrecovered`). A refresh that hangs and commits late then matches no row (closes L-b). One new conformance case: store pins 52 → 53 (`mem_store.rs`, `pg_conformance.rs`). `.sqlx` 226 → 227. **D140** An in-process dead-walk set, a process-owned value the engine borrows. A run enters it when its walk ended on `Heartbeat::Expired` (never `Abandoned`: a stranger holds that lease), or when a `release_lease` failed. `sweep` first retries `release_lease` for every run in the set and drops each one that answers `Ok(_)`, then calls `adopt_runs`, which now sees those runs as free. D88 still holds for every walk that is live. First failing test: the D127 test extended, so a second `sweep()` from the same process adopts the run. |
+| **M-A** | Introduced by D136. A step merged onto a moved primary records `(base_ref, merge)`. `GixIsolator::diff_of` (`real.rs:1279`) diffs `base..merge`, which includes another run's merge, and that diff becomes the next attempt's `previous_diff` (`engine.rs` ~:4053). | **D141** When `after` is a merge whose second parent is the step's tip, `diff_of` diffs `after^1..after`. First failing test (real git, `gix_isolator.rs`): two disjoint runs; the second's diff names only its own paths. |
+| **M-B** | `git::is_ancestor` (`git.rs:1265`) and `git::merge_of` (`:1294`) walk to the root while `reconcile_isolated` holds the repo's admin lock (`real.rs` ~:1152–1179), which blocks prepare and cleanup on big repos. | **D142** `is_ancestor` hides `ancestor` in its rev walk, and `merge_of` stops at `base`'s commit time. First failing test: a history below base that the walk must not visit (a walk-count assertion or a long history). |
+| **L-a** | The heartbeat fence starts from `clock.now()` at `walk_leased` (`recover.rs` ~:120), not from the `until` the lease take actually wrote. | **D143** `walk_leased` and `recover::heartbeat` take the `until` that the preceding `claim_run` / `take_lease` / `adopt_runs` wrote, and the first fence is `until - margin`. |
+| **L-c** | Some compare-and-sets are still unchecked: `answer_gate` right after `move_step` (`gate.rs` ~:422, `engine.rs` ~:3717), and the `Pending → Running` moves at `engine.rs` ~:2162, ~:2695, ~:3208. | **D144** Each of them honours `Ok(false)` as `EngineError::StaleWrite`, as D125 says. Where a conversion is not sound, D125's doc is narrowed to say which writes are exempt and why. |
+| **L-d** | A `StaleWrite` in the sweep goes through `unrecovered` (`engine.rs` ~:1221) and writes an `item_note`. | **D145** The sweep treats `StaleWrite` like `LeaseLost` (D128): `Next::Error` and a `tracing::warn!` only, with no item_note. |
+
+### 22.3 Deferred to milestone 6 (risks)
+
+| Risk | Likelihood | Handling |
+|---|---|---|
+| **R-31** (L-e) `walk_resumed` (`engine.rs:1870`) ignores `unpark`'s `false`. It re-merges on every resume of a run parked by a refused reconcile: the merge is idempotent, but it writes a note each time. Only one of D132's four crash paths is tested. A crash right after `AnswerGate(Rejected)` stays parked on a failed step. | Low | Milestone 6: honour `unpark`'s answer, test the other three crash paths, and give the rejected crash a resume path. |
+| **R-32** (L-f) D131's not-reset park loses its labelled detail, and D138's `part_way` turns an `Io` error into a `Git` error. | Low (both are diagnostics only) | Milestone 6: keep the detail and the error kind. |
