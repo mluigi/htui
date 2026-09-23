@@ -5035,6 +5035,7 @@ mod tests {
         PhasePatch, RepoId, RunMode, RunStatus, SnapshotCandidate, SnapshotPhase, Status,
         StepGraphId, StepGraphPhase, StepId, StepStatus,
     };
+    use htui_core::store::mem::MemFault;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
     use super::{AgentSelector, FirstCandidate, NoSink, Resume, SessionKey, required_inputs};
@@ -6754,6 +6755,44 @@ mod tests {
         .expect("the engine wrote a `GraphSnapshot`")
     }
 
+    /// A `running` run on `ANA-2` over `FEAT-3`'s snapshot, claimed by this process at the
+    /// harness clock's instant, so its lease runs one `ttl` from now. Plan D152's lease tests
+    /// fault the store around it.
+    async fn leased_run(harness: &Harness) -> htui_core::model::RunId {
+        let (parked, _) = started(harness).await;
+        let snapshot = snapshot_of(harness, parked).await;
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        let run = htui_core::model::RunId::new();
+        let now = harness.orch.clock.now();
+        harness
+            .orch
+            .store
+            .create_run(htui_core::model::NewRun {
+                id: run,
+                project_id: ids::PROJECT_HTUI,
+                item_id: ids::HTUI_ANA_2,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                started_by: harness.orch.user(),
+                graph_snapshot: snapshot,
+                repo_scope: Vec::new(),
+                queued_at: now,
+            })
+            .await
+            .expect("MemStore creates the run");
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .claim_run(run, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .await
+                .expect("MemStore claims"),
+            htui_core::model::Claim::Admitted,
+            "the run's lease is this process's"
+        );
+        run
+    }
+
     /// Plan D17: a `run_step` row at a position the run's snapshot has no phase for.
     ///
     /// MOD-2's chat path inserts `run` and `run_step` rows outside §4.3 on purpose, so this is a
@@ -7197,10 +7236,9 @@ mod tests {
 
     /// Plan D122 (review H1): a walk whose every refresh fails stops itself one `refresh` before
     /// the lease it holds lapses, so no other box's sweep can adopt a run this walk still writes
-    /// to. The run is one the store does not hold, so every refresh is `Err(NotFound)`, which is
-    /// what a store that cannot answer looks like to the heartbeat; the walk mirrors tokio's
-    /// paused time onto the harness clock. The walk is dropped, the isolator releases the run's
-    /// guards once, and the caller reads `LeaseLost`.
+    /// to. The store cannot answer: `MemFault::RefreshLease` makes every refresh `Unreachable`
+    /// (plan D152). The walk mirrors tokio's paused time onto the harness clock. The walk is
+    /// dropped, the isolator releases the run's guards once, and the caller reads `LeaseLost`.
     #[tokio::test(start_paused = true)]
     async fn a_walk_whose_refresh_keeps_failing_stops_before_the_lease_lapses() {
         use std::sync::Arc;
@@ -7218,7 +7256,8 @@ mod tests {
         harness_engine!(harness.orch, engine);
         let times = crate::recover::LeaseTimes::from_app(&BTreeMap::new());
         let leased_at = harness.orch.clock.now();
-        let ghost = htui_core::model::RunId::new();
+        let run = leased_run(&harness).await;
+        harness.orch.store.set_fault(MemFault::RefreshLease, true);
 
         let dropped = Arc::new(AtomicBool::new(false));
         let probe = Dropped(Arc::clone(&dropped));
@@ -7234,14 +7273,14 @@ mod tests {
         };
         let walked = tokio::time::timeout(
             std::time::Duration::from_millis(600_500),
-            engine.walk_leased(ghost, engine.fresh_until(), walk),
+            engine.walk_leased(run, engine.fresh_until(), walk),
         )
         .await
         .expect("the walk stops itself instead of writing past its lease");
 
         let refused = walked.expect_err("no refresh ever succeeded");
         assert!(
-            matches!(refused, EngineError::LeaseLost { run } if run == ghost),
+            matches!(refused, EngineError::LeaseLost { run: lost } if lost == run),
             "{refused}"
         );
         assert!(
@@ -7266,18 +7305,17 @@ mod tests {
     /// store answers again, this same process's sweep gives the lease back first and then adopts
     /// the run, although plan D88 keeps it off every lease it still owns.
     ///
-    /// The outage is the D122 test's: the run does not exist yet, so every refresh is
-    /// `Err(NotFound)`, which is what a store that cannot answer looks like to the heartbeat. The
-    /// store comes back as the row that dead walk left behind: `running`, leased to this process,
-    /// and expired.
+    /// The outage is the D122 test's: `MemFault::RefreshLease` makes every refresh of a
+    /// `running` run this process leased `Unreachable` (plan D152). The store comes back when the
+    /// fault is switched off, and the row the dead walk left behind is `running`, leased to this
+    /// process, and expired.
     #[tokio::test(start_paused = true)]
     async fn an_expired_walk_is_adopted_by_its_own_process_once_the_store_is_back() {
         let harness = Harness::new().await;
-        let (parked, _) = started(&harness).await;
-        let snapshot = snapshot_of(&harness, parked).await;
         harness_engine!(harness.orch, engine);
         let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
-        let dead = htui_core::model::RunId::new();
+        let dead = leased_run(&harness).await;
+        harness.orch.store.set_fault(MemFault::RefreshLease, true);
 
         let clock = &harness.orch.clock;
         let walk = async move {
@@ -7304,33 +7342,7 @@ mod tests {
             "the fenced walk's run waits for its lease to be given back"
         );
 
-        let now = harness.orch.clock.now();
-        harness
-            .orch
-            .store
-            .create_run(htui_core::model::NewRun {
-                id: dead,
-                project_id: ids::PROJECT_HTUI,
-                item_id: ids::HTUI_ANA_2,
-                mode: RunMode::Manual,
-                target_box_id: ids::BOX,
-                started_by: harness.orch.user(),
-                graph_snapshot: snapshot,
-                repo_scope: Vec::new(),
-                queued_at: now,
-            })
-            .await
-            .expect("MemStore creates the run");
-        assert_eq!(
-            harness
-                .orch
-                .store
-                .claim_run(dead, ids::BOX, harness.orch.owner(), now, now + ttl)
-                .await
-                .expect("MemStore claims"),
-            htui_core::model::Claim::Admitted,
-            "the dead walk's lease is this process's"
-        );
+        harness.orch.store.set_fault(MemFault::RefreshLease, false);
         harness.orch.clock.advance(ttl + TimeDelta::seconds(1));
 
         let swept = engine.sweep().await.expect("the sweep runs");
@@ -7353,11 +7365,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dead_walk_taken_again_leaves_the_set_and_keeps_its_lease() {
         let harness = Harness::new().await;
-        let (parked, _) = started(&harness).await;
-        let snapshot = snapshot_of(&harness, parked).await;
         harness_engine!(harness.orch, engine);
-        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
-        let dead = htui_core::model::RunId::new();
+        let dead = leased_run(&harness).await;
+        harness.orch.store.set_fault(MemFault::RefreshLease, true);
 
         let clock = &harness.orch.clock;
         let walk = async move {
@@ -7380,34 +7390,7 @@ mod tests {
             "the fenced walk's run waits for its lease to be given back"
         );
 
-        let now = harness.orch.clock.now();
-        harness
-            .orch
-            .store
-            .create_run(htui_core::model::NewRun {
-                id: dead,
-                project_id: ids::PROJECT_HTUI,
-                item_id: ids::HTUI_ANA_2,
-                mode: RunMode::Manual,
-                target_box_id: ids::BOX,
-                started_by: harness.orch.user(),
-                graph_snapshot: snapshot,
-                repo_scope: Vec::new(),
-                queued_at: now,
-            })
-            .await
-            .expect("MemStore creates the run");
-        assert_eq!(
-            harness
-                .orch
-                .store
-                .claim_run(dead, ids::BOX, harness.orch.owner(), now, now + ttl)
-                .await
-                .expect("MemStore claims"),
-            htui_core::model::Claim::Admitted,
-            "the dead walk's lease is this process's"
-        );
-
+        harness.orch.store.set_fault(MemFault::RefreshLease, false);
         engine
             .take_lease(dead)
             .await
@@ -7433,59 +7416,35 @@ mod tests {
     }
 
     /// Plan D140: a release that fails puts the run in the dead-walk set, and the sweep retries
-    /// it until the store answers. The run does not exist at first, so the release is
-    /// `Err(NotFound)`, which stands for a store that cannot answer, as in the D122 test. Once the
-    /// row exists, the next sweep's retry answers and the run leaves the set.
+    /// it until the store answers. `MemFault::ReleaseLease` makes every release `Unreachable` at
+    /// first (plan D152), so the sweep's retry fails too and plan D88 keeps it off the run, whose
+    /// lease is still this process's. Once the fault is switched off, the next sweep's retry
+    /// answers and the run leaves the set.
     #[tokio::test(start_paused = true)]
     async fn a_failed_release_is_retried_by_the_sweep() {
         let harness = Harness::new().await;
-        let (parked, _) = started(&harness).await;
-        let snapshot = snapshot_of(&harness, parked).await;
         harness_engine!(harness.orch, engine);
-        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
-        let ghost = htui_core::model::RunId::new();
+        let run = leased_run(&harness).await;
+        harness.orch.store.set_fault(MemFault::ReleaseLease, true);
 
-        engine.release_lease(ghost).await;
+        engine.release_lease(run).await;
         assert_eq!(
             harness.orch.dead_walks.runs(),
-            [ghost],
+            [run],
             "the failed release is remembered"
         );
-        engine.sweep().await.expect("the sweep runs");
+        let swept = engine.sweep().await.expect("the sweep runs");
         assert_eq!(
             harness.orch.dead_walks.runs(),
-            [ghost],
+            [run],
             "the sweep retried it, and it failed again"
         );
-
-        let now = harness.orch.clock.now();
-        harness
-            .orch
-            .store
-            .create_run(htui_core::model::NewRun {
-                id: ghost,
-                project_id: ids::PROJECT_HTUI,
-                item_id: ids::HTUI_ANA_2,
-                mode: RunMode::Manual,
-                target_box_id: ids::BOX,
-                started_by: harness.orch.user(),
-                graph_snapshot: snapshot,
-                repo_scope: Vec::new(),
-                queued_at: now,
-            })
-            .await
-            .expect("MemStore creates the run");
-        assert_eq!(
-            harness
-                .orch
-                .store
-                .claim_run(ghost, ids::BOX, harness.orch.owner(), now, now + ttl)
-                .await
-                .expect("MemStore claims"),
-            htui_core::model::Claim::Admitted,
-            "the lease the failed release left is this process's"
+        assert!(
+            swept.iter().all(|adopted| adopted.run != run),
+            "plan D88: the lease the failed release left is still this process's"
         );
 
+        harness.orch.store.set_fault(MemFault::ReleaseLease, false);
         let swept = engine.sweep().await.expect("the sweep runs");
         assert!(
             harness.orch.dead_walks.runs().is_empty(),
@@ -7493,7 +7452,7 @@ mod tests {
         );
         assert_eq!(
             swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
-            [ghost],
+            [run],
             "the lease was given back before adopt_runs, so this process adopts the run"
         );
     }
