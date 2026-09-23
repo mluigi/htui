@@ -918,7 +918,10 @@ where
     /// Plan D86/D107: `walk` raced against [`crate::recover::heartbeat`] in this task.
     ///
     /// On the walk's answer, the lease is released when the run rests anywhere but `running`
-    /// (D87); an `Err` writes nothing more, because the store may be what failed. On
+    /// (D87), and also when the re-read that decides it fails (D129: warned, and the walk's `Ok`
+    /// stands). An `Err` writes nothing more, because the store may be what failed, except the
+    /// best-effort release of the lease (D127), so a run whose walk raised is adoptable by any
+    /// process's sweep once it reads as expired. On
     /// [`crate::recover::Heartbeat::Abandoned`], and on [`crate::recover::Heartbeat::Expired`]
     /// (plan D122: refreshes kept failing until the lease was one interval from lapsing), the
     /// walk is dropped where it stands, **before** anything else, then
@@ -947,10 +950,25 @@ where
         match futures::future::select(Box::pin(walk), Box::pin(beat)).await {
             Either::Left((out, beat)) => {
                 drop(beat);
-                // An `Err` writes nothing more: the store may be what failed.
-                let out = out?;
-                if self.run(run).await?.status != RunStatus::Running {
-                    self.release_lease(run).await;
+                let out = match out {
+                    Ok(out) => out,
+                    Err(err) => {
+                        // Plan D127: nothing else is written, but the lease is given back,
+                        // best-effort, so any process's sweep adopts the run (plan D88 keeps this
+                        // one's off it). A release that fails is warned and the lease lapses.
+                        self.release_lease(run).await;
+                        return Err(err);
+                    }
+                };
+                // Plan D129: the re-read only decides the release, so its failure is warned, the
+                // release is tried anyway, and the walk's answer stands.
+                match self.run(run).await {
+                    Ok(row) if row.status == RunStatus::Running => {}
+                    Ok(_) => self.release_lease(run).await,
+                    Err(err) => {
+                        tracing::warn!(%run, %err, "re-reading the run after its walk failed");
+                        self.release_lease(run).await;
+                    }
                 }
                 Ok(out)
             }
