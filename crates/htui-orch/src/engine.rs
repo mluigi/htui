@@ -42,7 +42,9 @@ use htui_core::store::{StoreError, WriteStore};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
+use crate::command::{
+    Command, CommandOutcome, EngineError, GateAnswer, Rest, stale_run, stale_step,
+};
 use crate::fanout::{
     AUTO_WIN_REASON, CandidateView, HUMAN_PICK_REASON, HumanReason, JUDGE_KIND, JudgeFailure,
     Route, judge_candidate, judge_inputs, judge_phase, judge_phase_name, parse_judge_verdict,
@@ -580,15 +582,26 @@ where
         self.take_lease(run.id).await?;
 
         let now = self.now();
-        let (outcome, note) = match &answer {
-            GateAnswer::Approved => (GateOutcome::Approved, None),
-            GateAnswer::Skipped => (GateOutcome::Skipped, None),
-            GateAnswer::Rejected { note } => (GateOutcome::Rejected, Some(note.clone())),
+        let (outcome, note, to) = match &answer {
+            GateAnswer::Approved => (GateOutcome::Approved, None, StepStatus::Done),
+            GateAnswer::Skipped => (GateOutcome::Skipped, None, StepStatus::Done),
+            GateAnswer::Rejected { note } => (
+                GateOutcome::Rejected,
+                Some(note.clone()),
+                StepStatus::Failed,
+            ),
         };
-        self.parts
+        // Plan D133: `Ok(false)` is another command's answer landing between the guard and this
+        // write. Unparking now would walk on whatever gate the run is parked at by then.
+        if !self
+            .parts
             .store
             .answer_gate(step.id, outcome, note.clone(), now)
-            .await?;
+            .await?
+        {
+            let stale = stale_step(run.id, step.id, StepStatus::AwaitingApproval, to);
+            return Err(self.stale_first_write(run.id, stale).await);
+        }
 
         // Both answers unpark the run and the item first. For a rejection that is blueprint A-5's
         // order and it is not cosmetic: `awaiting_approval -> blocked` is **illegal** for an item
@@ -744,10 +757,21 @@ where
         match row.status {
             // `retried -> superseded` is `answer_gate`'s own arm (`store/traits.rs:786-791`).
             StepStatus::AwaitingApproval => {
-                self.parts
+                // Plan D133: the step was answered between the guard and this write.
+                if !self
+                    .parts
                     .store
                     .answer_gate(row.id, GateOutcome::Retried, None, now)
-                    .await?;
+                    .await?
+                {
+                    let stale = stale_step(
+                        run.id,
+                        row.id,
+                        StepStatus::AwaitingApproval,
+                        StepStatus::Superseded,
+                    );
+                    return Err(self.stale_first_write(run.id, stale).await);
+                }
             }
             // A `failed` step is left alone: `failed` reaches only `awaiting_approval` and
             // `cancelled` (`model/run.rs:126`), so superseding it is a `Constraint` (plan D5).
@@ -760,7 +784,12 @@ where
                 });
             }
         }
-        self.unpark(run, now).await?;
+        // Plan D133: for a `failed` step nothing above wrote, so the unpark is the first
+        // compare-and-set, and a parked run that is no longer parked was moved by another command.
+        if !self.unpark(run, now).await? && run.status == RunStatus::AwaitingApproval {
+            let stale = stale_run(run.id, RunStatus::AwaitingApproval, RunStatus::Running);
+            return Err(self.stale_first_write(run.id, stale).await);
+        }
 
         // Admitted rather than created outright, so the next attempt passes through the capability
         // interlock like any other — a phase whose only candidate lost its inline-approval
@@ -810,7 +839,16 @@ where
         self.take_lease(run.id).await?;
 
         let now = self.now();
-        gate::retire_slot(&self.gate_context(run, snapshot), &steps, row.position, now).await?;
+        // Plan D133: a member moved between the guard and its retirement stops the retry, and
+        // the lease is given back.
+        if let Err(err) =
+            gate::retire_slot(&self.gate_context(run, snapshot), &steps, row.position, now).await
+        {
+            if matches!(err, EngineError::StaleWrite { .. }) {
+                self.release_lease(run.id).await;
+            }
+            return Err(err);
+        }
         self.unpark(run, now).await?;
 
         let tail = async {
@@ -1080,6 +1118,13 @@ where
                 now + self.lease_times().ttl,
             )
             .await?)
+    }
+
+    /// Plan D133: a command whose first compare-and-set answered `Ok(false)` gives back the lease
+    /// it took (best-effort, as [`Self::release_lease`]) and stops with `stale`.
+    async fn stale_first_write(&self, run: RunId, stale: EngineError) -> EngineError {
+        self.release_lease(run).await;
+        stale
     }
 
     /// Plan D87: `refresh_lease(run, owner, now)`, so the lease reads as expired at once. A
@@ -4161,9 +4206,12 @@ where
         }
     }
 
-    /// The run and the item back to `running` / `in_progress` after a gate answer.
-    async fn unpark(&self, run: &Run, now: DateTime<Utc>) -> Result<(), EngineError> {
-        self.parts
+    /// The run and the item back to `running` / `in_progress` after a gate answer. The answer is
+    /// the run's compare-and-set: `false` when the run was not `awaiting_approval`, which only a
+    /// caller whose unpark is its first write reads (plan D133).
+    async fn unpark(&self, run: &Run, now: DateTime<Utc>) -> Result<bool, EngineError> {
+        let unparked = self
+            .parts
             .store
             .transition_run(run.id, RunStatus::AwaitingApproval, RunStatus::Running, now)
             .await?;
@@ -4173,7 +4221,7 @@ where
                 .transition(item, Status::AwaitingApproval, Status::InProgress)
                 .await?;
         }
-        Ok(())
+        Ok(unparked)
     }
 
     /// One step compare-and-set on the walk's path; `Ok(false)` is plan D125's
