@@ -8,9 +8,9 @@
 //! byte-stable with no sleeps" (`docs/ANA-2.md:1764-1768`).
 //!
 //! Note for whoever reads `FakeGraphSource`: `MemStore::phase_agents` returns `Vec::new()`
-//! unconditionally (`crates/htui-core/src/store/mem.rs:470-473`) and every demo agent is `enabled`
-//! (`crates/htui-core/src/model/agent.rs:156`), so rungs 1 and 3 of ANA-2 §4.1's candidate chain
-//! are both empty on `MemStore::demo()` — the fake carries an explicit per-phase candidates map as
+//! unconditionally (`crates/htui-core/src/store/mem.rs:470-473`) and the demo fixture seeds no
+//! `agent_box` row (`crates/htui-core/src/store/mem.rs:109`), so rungs 1 and 3 of ANA-2 §4.1's
+//! candidate chain are both empty on `MemStore::demo()` — the fake carries an explicit per-phase candidates map as
 //! its documented stand-in (plan D20, blueprint A-1).
 
 use std::collections::{BTreeMap, VecDeque};
@@ -25,9 +25,9 @@ use htui_agent::event::{DoneEvent, DriverEvent, ErrorEvent, StopReason};
 use htui_agent::fake::{FAKE_AGENT_NAME, FakeDriver};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentId, BoxId, Document, DocumentId, Isolation, Item, ItemId, NewDocument, PhaseAgent,
-    PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId, RunStep, RunStepCommit,
-    RunStepTree, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    Agent, AgentBox, AgentId, BoxId, Document, DocumentId, Isolation, Item, ItemId, NewDocument,
+    PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId, RunStep,
+    RunStepCommit, RunStepTree, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
@@ -541,7 +541,7 @@ impl Clock for TestClock {
 /// would refuse every phase.
 const STAND_IN_MODEL: &str = "sonnet";
 
-/// The four inherent orchestration reads of `MemStore`, as the trait `graph.rs` defines
+/// The five inherent orchestration reads of `MemStore`, as the trait `graph.rs` defines
 /// (blueprint F-N).
 ///
 /// Implemented on `MemStore` itself rather than on `&MemStore`: a trait impl on the reference would
@@ -552,7 +552,7 @@ const STAND_IN_MODEL: &str = "sonnet";
 ///
 /// Each body calls the *inherent* method of the same name. Method resolution prefers inherent
 /// candidates over trait ones, so this is delegation and not recursion — and
-/// [`the trait's own unit test`](self) calls all four through the trait to prove it.
+/// [`the trait's own unit test`](self) calls all five through the trait to prove it.
 impl GraphSource for MemStore {
     async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
         self.resolve_graph(item).await
@@ -579,6 +579,10 @@ impl GraphSource for MemStore {
             .map(|summary| summary.agent)
             .find(|agent| agent.id == id))
     }
+
+    async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
+        self.agent_boxes(box_id).await
+    }
 }
 
 /// A [`GraphSource`] over `MemStore` with a per-phase candidates map (plan D20).
@@ -586,8 +590,8 @@ impl GraphSource for MemStore {
 /// **Rungs 1 and 3 of ANA-2 §4.1's candidate chain are both structurally empty here**, which is why
 /// this type exists. Rung 1 is `phase_agent`, and `MemStore` holds no such table — `phase_agents`
 /// returns `Vec::new()` unconditionally (`crates/htui-core/src/store/mem.rs:470-473`). Rung 3 is
-/// "the single enabled agent on the box", and the demo fixture's three agents are all `enabled`
-/// from one seed literal (`crates/htui-core/src/model/agent.rs:156`), so there is no *single* one.
+/// "the single enabled agent on the box" (plan D62), read from `agent_box`, and the demo fixture
+/// seeds no `agent_box` row at all, so a resolution finds no enabled agent on the box.
 /// Rung 2 — `project.settings.default_agent_id` — stays real in `graph.rs` and is empty on the
 /// fixture too. A resolution with no stand-in would therefore refuse every phase with
 /// `NoCandidate`, for a reason that is about the fixture and not about the walk.
@@ -697,6 +701,10 @@ impl GraphSource for FakeGraphSource<'_> {
 
     async fn agent(&self, id: AgentId) -> Result<Option<Agent>> {
         GraphSource::agent(self.store, id).await
+    }
+
+    async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
+        GraphSource::agent_boxes(self.store, box_id).await
     }
 }
 
@@ -1175,6 +1183,7 @@ mod tests {
             RunMode::Manual,
             &BTreeMap::new(),
             None,
+            ids::BOX,
         )
         .await
     }
@@ -1394,7 +1403,7 @@ mod tests {
         assert_eq!(isolator.diff(&[], &[]).await.expect("unscripted"), None);
     }
 
-    /// `impl GraphSource for MemStore` delegates to the four inherent reads of the same names.
+    /// `impl GraphSource for MemStore` delegates to the five inherent reads of the same names.
     ///
     /// Method resolution prefers an inherent candidate over a trait one, so the bodies are
     /// delegation — but "prefers" is the kind of rule that is worth a test rather than a comment,
@@ -1430,6 +1439,13 @@ mod tests {
             (agent.default_model, agent.models),
             (None, Vec::new()),
             "which is exactly why the fake has to name a model itself"
+        );
+        assert!(
+            GraphSource::agent_boxes(&store, ids::BOX)
+                .await
+                .expect("MemStore never fails a read")
+                .is_empty(),
+            "the demo fixture seeds no `agent_box` row, so rung 3 finds nothing on it (plan D62)"
         );
     }
 

@@ -19,6 +19,7 @@ async fn feature_snapshot_matches() {
         RunMode::Manual,
         &BTreeMap::new(),
         None,
+        ids::BOX,
     )
     .await
     .unwrap();
@@ -111,6 +112,7 @@ async fn feature_with_verify_snapshot_matches() {
         RunMode::Manual,
         &BTreeMap::new(),
         None,
+        ids::BOX,
     )
     .await
     .unwrap();

@@ -326,6 +326,7 @@ where
             mode,
             &self.parts.app,
             repo_scope.as_deref(),
+            self.parts.box_id,
         )
         .await?;
 
@@ -685,6 +686,7 @@ where
             row.mode,
             &self.parts.app,
             Some(&row.repo_scope),
+            self.parts.box_id,
         )
         .await?;
 
@@ -3662,6 +3664,7 @@ mod tests {
             RunMode::Manual,
             &BTreeMap::new(),
             None,
+            orch.box_id(),
         )
         .await
         .expect("the stand-in supplies rung 1")

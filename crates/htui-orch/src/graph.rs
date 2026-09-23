@@ -12,10 +12,10 @@
 use std::collections::BTreeMap;
 
 use htui_core::model::{
-    Agent, AgentId, GraphSnapshot, Isolation, Item, ItemId, ItemPatch, NewStepGraph, PhaseAgent,
-    PhaseId, Project, ProjectId, ProjectSettings, PromptTemplate, Repo, RepoId, ResolvedGraph,
-    RunMode, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase, SnapshotSettings,
-    SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
+    Agent, AgentBox, AgentId, BoxId, GraphSnapshot, Isolation, Item, ItemId, ItemPatch,
+    NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId, ProjectSettings, PromptTemplate, Repo,
+    RepoId, ResolvedGraph, RunMode, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase,
+    SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
 };
 use htui_core::store::{ReadStore, Result, StoreError, UpdateOutcome, WriteStore};
 use serde_json::Value;
@@ -88,6 +88,14 @@ pub trait GraphSource: Sync {
     /// # Errors
     /// The backend's own failures.
     async fn agent(&self, id: AgentId) -> Result<Option<Agent>>;
+
+    /// Every `agent_box` row of one box (plan D60, D62): rung 3 of ANA-2 §4.1's candidate chain
+    /// reads it at resolution, and stage 1's `R-AGT-8` walk reads it fresh before every step,
+    /// because the recorder latches quota mid-run and a listing taken earlier would be stale.
+    ///
+    /// # Errors
+    /// The backend's own failures.
+    async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>>;
 }
 
 /// What [`resolve`] answers: the snapshot and the scope, ready for
@@ -255,6 +263,9 @@ pub fn resolve_scope(
 /// `Backend::app_settings()` at milestone 6 — passed rather than read through [`GraphSource`],
 /// because the `app_setting` reads are inherent too (blueprint A-2).
 ///
+/// `box_id` is the box the run will target: rung 3 of the candidate chain is "the single enabled
+/// agent on the box" (plan D62), so which box is a resolution input.
+///
 /// `mode` is recorded on the snapshot so it is self-contained. It does **not** move
 /// `gate_effective`: §4.10's auto-mode gate downgrade (`R-ORCH-6`) is a later milestone's, and
 /// until it exists `gate_effective` equals `gate` for every phase in either mode.
@@ -268,6 +279,7 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
     mode: RunMode,
     app: &BTreeMap<String, Value>,
     requested_scope: Option<&[RepoId]>,
+    box_id: BoxId,
 ) -> std::result::Result<Resolved, ResolveError> {
     let resolved = source
         .resolve_graph(item.id)
@@ -305,6 +317,7 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
                 project.id,
                 &settings,
                 app,
+                box_id,
             )
             .await?,
         );
@@ -485,6 +498,11 @@ fn app_i32(app: &BTreeMap<String, Value>, key: &str) -> Option<i32> {
 }
 
 /// One phase of the live graph, with every §4.1 chain walked (`docs/ANA-2.md:281-288`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every one of them is a rung some chain reads; a struct for them would be named once \
+              and read once"
+)]
 async fn snapshot_phase<G: GraphSource>(
     source: &G,
     phase: &StepGraphPhase,
@@ -493,6 +511,7 @@ async fn snapshot_phase<G: GraphSource>(
     project: ProjectId,
     settings: &ProjectSettings,
     app: &BTreeMap<String, Value>,
+    box_id: BoxId,
 ) -> std::result::Result<SnapshotPhase, ResolveError> {
     let isolation = phase.isolation.unwrap_or(settings.default_isolation);
     if isolation == Isolation::Local && phase.fan_out > 1 {
@@ -556,7 +575,7 @@ async fn snapshot_phase<G: GraphSource>(
             .filter(|n| *n > 0)
             .or_else(|| settings.token_budget.filter(|n| *n > 0))
             .or_else(|| app_i32(app, "token_budget")),
-        candidates: candidates(source, phase, rung_one, settings).await?,
+        candidates: candidates(source, phase, rung_one, settings, box_id).await?,
         // `StepGraphPhase` carries no `judge_agent_id` / `judge_model` either (blueprint H-14), so
         // this chain also starts at the project rung; `None` means human selection (§4.5).
         judge: match settings.judge_agent_id {
@@ -571,19 +590,21 @@ async fn snapshot_phase<G: GraphSource>(
     })
 }
 
-/// ANA-2 §4.1's candidate chain (`docs/ANA-2.md:288`), the rungs this crate owns.
+/// ANA-2 §4.1's candidate chain (`docs/ANA-2.md:288`), all four rungs.
 ///
 /// Rung 1 is `phase_agent` in `position` order; rung 2 is `project.settings.default_agent_id`;
-/// rung 4 is the refusal. **Rung 3 — "the single enabled agent on the box" — is deliberately not
-/// here**: it needs a box-scoped agent listing, which [`GraphSource`] does not carry and which
-/// would be a fifth method for one fallback. The implementation of [`GraphSource::phase_agents`]
-/// folds it in instead, which is also where T3's fake puts its stand-in candidates (plan D20,
-/// blueprint A-1). A phase that reaches rung 4 is a named refusal and never a silent empty walk.
+/// rung 3 is "the single enabled agent on the box" — exactly one `agent` with `enabled` whose
+/// `agent_box` row on `box_id` is `enabled` (plan D62) — read through
+/// [`GraphSource::agent_boxes`], and asked only when rung 2 is silent, so a project default is never
+/// overridden by the box. Rung 4 is the refusal. Rungs 2 and 3 model the candidate on the agent's
+/// `default_model`, else its first `models` entry; an agent that names neither is not a candidate.
+/// A phase that reaches rung 4 is a named refusal and never a silent empty walk.
 async fn candidates<G: GraphSource>(
     source: &G,
     phase: &StepGraphPhase,
     rung_one: &[PhaseAgent],
     settings: &ProjectSettings,
+    box_id: BoxId,
 ) -> std::result::Result<Vec<SnapshotCandidate>, ResolveError> {
     // `ResolvedGraph` already carries the phase's `phase_agent` rows on backends that hold the
     // table; asking the source again is how a backend that answers them separately (or a fake that
@@ -607,9 +628,7 @@ async fn candidates<G: GraphSource>(
     }
 
     let Some(id) = settings.default_agent_id else {
-        return Err(ResolveError::NoCandidate {
-            phase: phase.name.clone(),
-        });
+        return rung_three(source, phase, box_id).await;
     };
     let agent = source
         .agent(id)
@@ -628,6 +647,43 @@ async fn candidates<G: GraphSource>(
         .ok_or_else(|| ResolveError::NoCandidate {
             phase: phase.name.clone(),
         })?;
+    Ok(vec![SnapshotCandidate {
+        agent_id: agent.id,
+        agent_name: agent.name,
+        model,
+    }])
+}
+
+/// Rung 3 (plan D62): the one enabled agent whose `agent_box` row on `box_id` is enabled, else
+/// rung 4's [`ResolveError::NoCandidate`].
+///
+/// "Single" is literal: two enabled agents on the box are ambiguous and nothing is guessed. A box
+/// row naming an agent the registry does not hold, or one that is disabled, is not counted.
+async fn rung_three<G: GraphSource>(
+    source: &G,
+    phase: &StepGraphPhase,
+    box_id: BoxId,
+) -> std::result::Result<Vec<SnapshotCandidate>, ResolveError> {
+    let refused = || ResolveError::NoCandidate {
+        phase: phase.name.clone(),
+    };
+    let mut enabled = Vec::new();
+    for row in source.agent_boxes(box_id).await? {
+        if !row.enabled {
+            continue;
+        }
+        if let Some(agent) = source.agent(row.agent_id).await?
+            && agent.enabled
+        {
+            enabled.push(agent);
+        }
+    }
+    let [agent] = <[Agent; 1]>::try_from(enabled).map_err(|_| refused())?;
+    let model = agent
+        .default_model
+        .clone()
+        .or_else(|| agent.models.first().cloned())
+        .ok_or_else(refused)?;
     Ok(vec![SnapshotCandidate {
         agent_id: agent.id,
         agent_name: agent.name,
@@ -676,10 +732,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Agent, AgentId, BTreeMap, GraphSource, Isolation, Item, ItemId, PhaseAgent, PhaseId,
-        ProjectId, PromptTemplate, ReadStore, ResolveError, Resolved, ResolvedGraph, Result,
-        RunMode, SnapshotTemplate, StepGraphId, StepGraphPhase, Value, WriteStore, override_graph,
-        resolve,
+        Agent, AgentBox, AgentId, BTreeMap, BoxId, GraphSource, Isolation, Item, ItemId,
+        PhaseAgent, PhaseId, ProjectId, PromptTemplate, ReadStore, ResolveError, Resolved,
+        ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraphId, StepGraphPhase, Value,
+        WriteStore, override_graph, resolve,
     };
 
     /// The digest of the seeded `feature` graph, resolved against the demo fixture with one
@@ -702,8 +758,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
     ///
     /// T3's `FakeGraphSource` is the real one; this is the smallest thing that makes `graph.rs`
     /// testable on its own, and it exists for the reason plan D20 gives: `MemStore::phase_agents`
-    /// answers empty unconditionally (`crates/htui-core/src/store/mem.rs:470-473`) and every demo
-    /// agent is `enabled`, so rungs 1 and 3 of §4.1's chain are both empty here and a resolution
+    /// answers empty unconditionally (`crates/htui-core/src/store/mem.rs:470-473`) and the demo
+    /// seeds no `agent_box` row, so rungs 1 and 3 of §4.1's chain are both empty here and a resolution
     /// with no stand-in would refuse every phase for a reason that is about the fixture rather
     /// than about the walk.
     struct TestSource<'a> {
@@ -766,6 +822,10 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 .map(|row| row.agent)
                 .find(|agent| agent.id == id))
         }
+
+        async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
+            self.store.agent_boxes(box_id).await
+        }
     }
 
     /// The demo fixture with `htui`'s `project.settings` replaced.
@@ -807,6 +867,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             RunMode::Manual,
             &BTreeMap::new(),
             None,
+            ids::BOX,
         )
         .await
     }
@@ -996,6 +1057,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             RunMode::Auto,
             &app,
             None,
+            ids::BOX,
         )
         .await
         .expect("the seeded feature graph resolves")
@@ -1021,6 +1083,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             RunMode::Manual,
             &silent,
             None,
+            ids::BOX,
         )
         .await
         .expect("the seeded feature graph resolves")
@@ -1044,6 +1107,86 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(candidates[0].agent_id, ids::AGENT_AGY);
         assert_eq!(candidates[0].agent_name, "agy");
         assert_eq!(candidates[0].model, "gemini-3.7-flash-high");
+    }
+
+    /// An `agent_box` row on the fixture box for `agent`, never probed and never latched.
+    fn box_row(agent: AgentId, enabled: bool) -> AgentBox {
+        AgentBox {
+            agent_id: agent,
+            box_id: ids::BOX,
+            enabled,
+            version: None,
+            path: None,
+            probed_at: None,
+            quota: None,
+            quota_at: None,
+            updated_at: htui_agent::conformance::epoch(),
+            probe: None,
+        }
+    }
+
+    /// Plan D62: rung 3 is "exactly one `agent` with `enabled` whose `agent_box` on this box is
+    /// `enabled`", modelled on the agent's `default_model`. A disabled box row is not a second
+    /// enabled agent, so it does not spoil the rung.
+    #[tokio::test]
+    async fn rung_three_is_the_single_enabled_agent_on_this_box() {
+        let store = MemStore::demo();
+        store
+            .upsert_agent_box(&box_row(ids::AGENT_AGY, true))
+            .await
+            .expect("the fixture box takes a row");
+        store
+            .upsert_agent_box(&box_row(ids::AGENT_CLAUDE, false))
+            .await
+            .expect("the fixture box takes a row");
+
+        let snapshot = resolve_feat(&store, &TestSource::barren(&store))
+            .await
+            .expect("rung 3 answers where rungs 1 and 2 are silent")
+            .snapshot;
+        let candidates = &snapshot.phases[0].candidates;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].agent_id, ids::AGENT_AGY);
+        assert_eq!(candidates[0].agent_name, "agy");
+        assert_eq!(candidates[0].model, "gemini-3.7-flash-high");
+    }
+
+    /// Two enabled agents on the box are not "the single" one: rung 3 guesses nothing and the chain
+    /// falls through to rung 4's named refusal.
+    #[tokio::test]
+    async fn two_enabled_agents_are_not_a_rung_three() {
+        let store = MemStore::demo();
+        for agent in [ids::AGENT_AGY, ids::AGENT_CLAUDE] {
+            store
+                .upsert_agent_box(&box_row(agent, true))
+                .await
+                .expect("the fixture box takes a row");
+        }
+        let error = resolve_feat(&store, &TestSource::barren(&store))
+            .await
+            .expect_err("two enabled agents on the box are ambiguous");
+        assert_eq!(
+            error,
+            ResolveError::NoCandidate {
+                phase: "prd".to_owned()
+            }
+        );
+
+        // Rung 2 still wins over rung 3: a project default is asked for before the box is.
+        let store = store_with_settings(json!({ "default_agent_id": ids::AGENT_CLAUDE }));
+        store
+            .upsert_agent_box(&box_row(ids::AGENT_AGY, true))
+            .await
+            .expect("the fixture box takes a row");
+        let error = resolve_feat(&store, &TestSource::barren(&store))
+            .await
+            .expect_err("rung 2 names `claude`, which has no model; rung 3 is not consulted");
+        assert_eq!(
+            error,
+            ResolveError::NoCandidate {
+                phase: "prd".to_owned()
+            }
+        );
     }
 
     /// Rung 4: refuse, by name. A phase that resolved to no candidate and said nothing would make
@@ -1154,6 +1297,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             RunMode::Manual,
             &BTreeMap::new(),
             Some(&[]),
+            ids::BOX,
         )
         .await
         .expect("a project with no repository resolves to an empty scope");
@@ -1178,6 +1322,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             RunMode::Manual,
             &BTreeMap::new(),
             Some(&[]),
+            ids::BOX,
         )
         .await
         .expect_err("an empty scope overlaps nothing, which defeats `claim_run`");
@@ -1198,6 +1343,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             RunMode::Manual,
             &BTreeMap::new(),
             None,
+            ids::BOX,
         )
         .await
         .expect("the primary answers");
@@ -1286,6 +1432,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             RunMode::Manual,
             &BTreeMap::new(),
             None,
+            ids::BOX,
         )
         .await
         .expect("the override resolves");
@@ -1337,6 +1484,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             RunMode::Manual,
             app,
             None,
+            ids::BOX,
         )
         .await
     }
