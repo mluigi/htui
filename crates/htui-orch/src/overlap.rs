@@ -41,8 +41,80 @@ pub fn resolve(
     phases: &[SnapshotPhase],
     requested: Option<&[RepoId]>,
 ) -> Result<(Vec<RepoId>, RunScope), ResolveError> {
-    let _ = (item, repos, phases, requested);
-    todo!("T4: overlap::resolve")
+    let primary = repos.iter().find(|repo| repo.is_primary);
+    let primary_name = primary.map_or("", |repo| repo.name.as_str());
+
+    // Every entry that maps to a repo, as `(repo, prefix)`. A bare glob parses to the primary's
+    // name, so "bare" and "qualified with the primary's name" are one case here.
+    let mut entries: Vec<(RepoId, String)> = Vec::with_capacity(item.touched_paths.len());
+    for touched in &item.touched_paths {
+        let parsed = PathPrefix::parse(touched, primary_name);
+        let repo = match primary {
+            Some(primary) if parsed.repo == primary.name => primary.id,
+            // No primary: a bare glob parsed to the empty slug, which no qualifier can be.
+            None if parsed.repo.is_empty() => continue,
+            _ => {
+                repos
+                    .iter()
+                    .find(|repo| repo.name == parsed.repo)
+                    .ok_or_else(|| ResolveError::UnknownTouchedRepo {
+                        item: item.id,
+                        name: parsed.repo.clone(),
+                    })?
+                    .id
+            }
+        };
+        entries.push((repo, parsed.prefix));
+    }
+
+    let repo_scope = match (requested, primary) {
+        (Some([]), Some(primary)) => {
+            return Err(ResolveError::EmptyScopeWithPrimary {
+                item: item.id,
+                repo: primary.id,
+            });
+        }
+        (Some(scope), _) => scope.to_vec(),
+        (None, _) => {
+            let mut derived: Vec<RepoId> = entries.iter().map(|(repo, _)| *repo).collect();
+            if item.touched_paths.is_empty() {
+                derived.extend(primary.map(|primary| primary.id));
+            }
+            derived.sort_unstable();
+            derived.dedup();
+            derived
+        }
+    };
+
+    // The snapshot's phases are not per repo, so one pair of flags holds for every repo.
+    let isolated = phases
+        .iter()
+        .all(|phase| matches!(phase.isolation, Isolation::Worktree | Isolation::Copy));
+    let local = phases
+        .iter()
+        .any(|phase| phase.isolation == Isolation::Local);
+
+    let mut prefixes: BTreeMap<RepoId, Vec<String>> = BTreeMap::new();
+    for (repo, prefix) in entries {
+        prefixes.entry(repo).or_default().push(prefix);
+    }
+    let repos = repo_scope
+        .iter()
+        .map(|repo| {
+            let mut prefixes = prefixes.get(repo).cloned().unwrap_or_default();
+            prefixes.sort_unstable();
+            prefixes.dedup();
+            (
+                *repo,
+                RepoScope {
+                    isolated,
+                    local,
+                    prefixes,
+                },
+            )
+        })
+        .collect();
+    Ok((repo_scope, RunScope { repos }))
 }
 
 #[cfg(test)]
