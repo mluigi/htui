@@ -14,9 +14,9 @@
 use chrono::TimeDelta;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, Gate, GateOutcome, Item, ItemId,
-    ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Run, RunId, RunMode, RunStatus,
-    RunStep, Status, StepGraphId, StepGraphPhase, StepId, StepStatus, VerifyOutcome,
+    AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, EventKind, Gate, GateOutcome, Item,
+    ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Run, RunId, RunMode,
+    RunStatus, RunStep, Status, StepGraphId, StepGraphPhase, StepId, StepStatus, VerifyOutcome,
 };
 use htui_core::model::{Quota, QuotaSource, Spend};
 use htui_core::prompt::DiffBlock;
@@ -74,6 +74,18 @@ pub trait Orchestrate {
     /// Script one `(phase name, attempt)`.
     fn script(&self, phase: &str, attempt: i32, step: ScriptedStep);
 
+    /// Script one session exactly (plan D68): candidate `fanout_index` of `(phase, attempt)`, or
+    /// a judge's ordering `call` at `fanout_index = -1` with `phase` = `<phase>:judge`. Wins over
+    /// [`script`](Orchestrate::script) for the same `(phase, attempt)`.
+    fn script_candidate(
+        &self,
+        phase: &str,
+        attempt: i32,
+        fanout_index: i32,
+        call: u32,
+        step: ScriptedStep,
+    );
+
     /// Name a phase's candidate agents, for the stage-1 interlock.
     ///
     /// Not in the blueprint's §4.5 list, and needed: `cli_agent_is_refused_at_a_gated_phase` is a
@@ -116,6 +128,17 @@ impl Orchestrate for FakeOrchestrator {
         Self::script(self, phase, attempt, step);
     }
 
+    fn script_candidate(
+        &self,
+        phase: &str,
+        attempt: i32,
+        fanout_index: i32,
+        call: u32,
+        step: ScriptedStep,
+    ) {
+        Self::script_candidate(self, phase, attempt, fanout_index, call, step);
+    }
+
     fn with_candidates(&self, phase: &str, agents: Vec<(AgentId, &str)>) {
         Self::with_candidates(self, phase, agents);
     }
@@ -139,9 +162,9 @@ impl Orchestrate for FakeOrchestrator {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Twenty-three, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_twenty_three` and out of crate by `tests/fake_conformance.rs` — because
-/// a binding that silently ran twenty-two of them would still be green.
+/// Thirty-five, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_thirty_five` and out of crate by `tests/fake_conformance.rs` — because
+/// a binding that silently ran thirty-four of them would still be green.
 ///
 /// Seven are `docs/ANA-2.md` §12's validation criteria (1, 2, 3, 5, 6, 7 and 13's command half);
 /// four are contract lines
@@ -154,7 +177,10 @@ impl Orchestrate for FakeOrchestrator {
 /// `CancelRun`, which criterion 13 is stated in terms of (plan D45). Milestone 4 adds five: stage 1
 /// as `R-AGT-8`'s walk selecting an `allowed_warning` row and falling through a skipped one (plan
 /// D60, D61), both halves of the empty-candidate refusal (plan D62), and the loop's forwarded
-/// `verify_failure` and `previous_diff` (plan D67).
+/// `verify_failure` and `previous_diff` (plan D67) — and then twelve for fan-out: criteria 8, 9
+/// and 10 (plan D49-D53, D65), the gated and judgeless routes to a human (D49, D50), a failed
+/// candidate (D48), a group with no survivor (D49(1)), the review loop over a group (D66), and
+/// the two caps refused at `StartRun` (D63).
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -210,6 +236,30 @@ pub const CASES: &[&str] = &[
     "every_candidate_skipped_refuses_the_run",
     // Plan D67: a second attempt's prompt carries `verify_failure` and `previous_diff`.
     "a_second_attempt_carries_verify_failure_and_previous_diff",
+    // Criterion 8 (`:2106`): three candidates and a judge, one winner, the losers superseded.
+    "fan_out_three_with_a_judge_selects_one_winner",
+    // Criterion 9 (`:2109`): a verify failure is eliminated before the judge when two pass.
+    "a_failing_verify_is_eliminated_before_the_judge",
+    // Criterion 9 (`:2110`): exactly one passing candidate wins with no judge step.
+    "one_passing_candidate_wins_without_a_judge",
+    // Criterion 10 (`:2112`): the judge's two orderings disagree, and the group parks.
+    "judge_orderings_that_disagree_park_for_selection",
+    // Criterion 10 (`:2113`): an unparseable verdict parks, and `SelectFanout` completes it.
+    "an_unparseable_verdict_parks_and_select_fanout_completes",
+    // Plan D49(2): an `always` group parks for a human with no judge.
+    "a_gated_fan_out_parks_for_human_selection",
+    // Plan D49(3): no judge configured means a human selects.
+    "no_judge_means_human_selection",
+    // Plan D48: a failed candidate fails alone.
+    "a_failed_candidate_does_not_fail_its_siblings",
+    // Plan D49(1): a `never` group with no survivor retries whole, then fails the run.
+    "a_group_with_no_survivor_retries_then_fails",
+    // Plan D66: the review loop retires a fanned-out slot whole and judges the next group.
+    "the_review_loop_reruns_a_fanned_out_implement",
+    // Plan D63: `max_fan_out` is refused at `StartRun`.
+    "fan_out_above_max_fan_out_is_refused_at_start",
+    // Plan D63 (OQ-1): `max_agents_per_run` is refused at `StartRun`.
+    "max_agents_per_run_is_refused_at_start",
 ];
 
 /// Run one case by name.
@@ -261,6 +311,40 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
         }
         "a_second_attempt_carries_verify_failure_and_previous_diff" => {
             a_second_attempt_carries_verify_failure_and_previous_diff(harness).await;
+        }
+        "fan_out_three_with_a_judge_selects_one_winner" => {
+            fan_out_three_with_a_judge_selects_one_winner(harness).await;
+        }
+        "a_failing_verify_is_eliminated_before_the_judge" => {
+            a_failing_verify_is_eliminated_before_the_judge(harness).await;
+        }
+        "one_passing_candidate_wins_without_a_judge" => {
+            one_passing_candidate_wins_without_a_judge(harness).await;
+        }
+        "judge_orderings_that_disagree_park_for_selection" => {
+            judge_orderings_that_disagree_park_for_selection(harness).await;
+        }
+        "an_unparseable_verdict_parks_and_select_fanout_completes" => {
+            an_unparseable_verdict_parks_and_select_fanout_completes(harness).await;
+        }
+        "a_gated_fan_out_parks_for_human_selection" => {
+            a_gated_fan_out_parks_for_human_selection(harness).await;
+        }
+        "no_judge_means_human_selection" => no_judge_means_human_selection(harness).await,
+        "a_failed_candidate_does_not_fail_its_siblings" => {
+            a_failed_candidate_does_not_fail_its_siblings(harness).await;
+        }
+        "a_group_with_no_survivor_retries_then_fails" => {
+            a_group_with_no_survivor_retries_then_fails(harness).await;
+        }
+        "the_review_loop_reruns_a_fanned_out_implement" => {
+            the_review_loop_reruns_a_fanned_out_implement(harness).await;
+        }
+        "fan_out_above_max_fan_out_is_refused_at_start" => {
+            fan_out_above_max_fan_out_is_refused_at_start(harness).await;
+        }
+        "max_agents_per_run_is_refused_at_start" => {
+            max_agents_per_run_is_refused_at_start(harness).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -2307,6 +2391,678 @@ async fn a_second_attempt_carries_verify_failure_and_previous_diff<H: CaseHarnes
     );
 }
 
+// -- milestone 4: three candidates, one winner (plan D48-D53, D63, D65, D66) ---------------------
+
+/// Plan D69: names `agy` the project's fan-out judge through the tests-only settings writer.
+///
+/// `agy` because it is the seeded agent with a model to run: `seeds/agent_agy.json` carries a
+/// `default_model`, while `claude` has neither a default model nor a model list, so a `claude`
+/// judge would be `judge_unavailable: no model`.
+async fn set_judge<O: Orchestrate>(orch: &O, item: ItemId) {
+    let project = item_of(orch, item).await.project_id;
+    let mut settings = orch
+        .store()
+        .project_settings(project)
+        .await
+        .expect("MemStore never fails a read")
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    settings["judge_agent_id"] = serde_json::json!(ids::AGENT_AGY);
+    orch.store().set_project_settings(project, settings);
+}
+
+/// `ANA-2` on the `analysis` graph with `research` fanned out three ways under `gate`, and
+/// `verdict` ungated so a selected group walks on to `done` (blueprint F-E).
+async fn fan_research<O: Orchestrate>(orch: &O, gate: Gate, verify: bool) {
+    repoint(orch, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "research" {
+            phase.fan_out = 3;
+            phase.gate = gate;
+            if verify {
+                phase.verify_command = Some("true".to_owned());
+            }
+        } else {
+            phase.gate = Gate::Never;
+        }
+    })
+    .await;
+}
+
+/// Each of `research`'s three candidates at `attempt` writes a document naming itself.
+fn research_candidates<O: Orchestrate>(orch: &O, attempt: i32) {
+    for index in 0..3 {
+        orch.script_candidate(
+            "research",
+            attempt,
+            index,
+            0,
+            ScriptedStep::done_with_output(&format!("research by candidate {index}")),
+        );
+    }
+}
+
+/// Both of a judge's calls at `(phase, attempt)` answer `winner`.
+fn judge_both<O: Orchestrate>(orch: &O, phase: &str, attempt: i32, winner: i32, reason: &str) {
+    for call in 0..2 {
+        orch.script_candidate(
+            &format!("{phase}:judge"),
+            attempt,
+            -1,
+            call,
+            ScriptedStep::judge(winner, &[(winner, reason)]),
+        );
+    }
+}
+
+/// The candidates of slot `(position, attempt)`, in `fanout_index` order, as
+/// `(fanout_index, status, selected)`.
+fn slot_of(steps: &[RunStep], position: i32, attempt: i32) -> Vec<(i32, StepStatus, Option<bool>)> {
+    let mut slot: Vec<_> = steps
+        .iter()
+        .filter(|step| step.position == position && step.attempt == attempt)
+        .filter(|step| step.fanout_index >= 0)
+        .map(|step| (step.fanout_index, step.status, step.selected))
+        .collect();
+    slot.sort_by_key(|(index, _, _)| *index);
+    slot
+}
+
+/// The judge row of slot `(position, attempt)`, if the walk created one.
+fn judge_of(steps: &[RunStep], position: i32, attempt: i32) -> Option<&RunStep> {
+    steps.iter().find(|step| {
+        step.position == position && step.attempt == attempt && step.fanout_index == -1
+    })
+}
+
+/// The candidate at `(position, attempt, fanout_index)`.
+///
+/// # Panics
+/// When the walk never created it.
+fn candidate(steps: &[RunStep], position: i32, attempt: i32, index: i32) -> &RunStep {
+    steps
+        .iter()
+        .find(|step| {
+            step.position == position && step.attempt == attempt && step.fanout_index == index
+        })
+        .unwrap_or_else(|| panic!("the walk created ({position},{attempt},{index})"))
+}
+
+/// The item notes that D50's park writes, by their fixed opening.
+async fn selection_parks<O: Orchestrate>(orch: &O, item: ItemId) -> Vec<String> {
+    notes_of(orch, item)
+        .await
+        .into_iter()
+        .filter(|body| body.starts_with("fan-out `") && body.contains(" awaits selection: "))
+        .collect()
+}
+
+/// ANA-2 §12 criterion 8 (`docs/ANA-2.md:2106`): three candidates, a judge, one winner.
+///
+/// The judge ran as a real step at `fanout_index = -1` named `research:judge`, two sessions under
+/// one recorder — the forward prompt at seq 0 and the reversed one as a `follow_up` opening turn 1
+/// (plan D52) — and both answered candidate 1, whose reason became its `gate_note`. The losers are
+/// `superseded`, every candidate's document survives, and the next phase reads only the winner's.
+async fn fan_out_three_with_a_judge_selects_one_winner<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Never, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    judge_both(&orch, "research", 1, 1, "the most thorough");
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::Done, None, None)
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1),
+        [
+            (0, StepStatus::Superseded, Some(false)),
+            (1, StepStatus::Done, Some(true)),
+            (2, StepStatus::Superseded, Some(false)),
+        ]
+    );
+    let judge = judge_of(&steps, 0, 1).expect("the judge is a step");
+    assert_eq!(
+        (
+            judge.phase_name.as_str(),
+            judge.status,
+            judge.gate_note.as_deref()
+        ),
+        (
+            "research:judge",
+            StepStatus::Done,
+            Some("the most thorough")
+        )
+    );
+    assert!(judge.prompt_digest.is_some(), "the forward prompt's digest");
+    let events = orch
+        .store()
+        .step_events(judge.id)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the judge recorded its sessions");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.seq == 0 && event.kind == EventKind::Prompt),
+        "call 0 is the seq-0 prompt"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::FollowUp)
+            .map(|event| event.turn)
+            .collect::<Vec<_>>(),
+        [1],
+        "call 1 is one follow_up, opening turn 1 (plan D52)"
+    );
+
+    let heads = orch
+        .store()
+        .documents(ids::HTUI_ANA_2)
+        .await
+        .expect("MemStore never fails a read");
+    let research: Vec<_> = heads
+        .iter()
+        .filter(|head| head.kind == "research")
+        .filter(|head| {
+            steps
+                .iter()
+                .any(|step| step.position == 0 && Some(step.id) == head.produced_by_step_id)
+        })
+        .collect();
+    assert_eq!(research.len(), 3, "every candidate's document survives");
+
+    let verdict = steps
+        .iter()
+        .find(|step| step.phase_name == "verdict")
+        .expect("the walk went on to `verdict`");
+    let text = prompt_text(&orch, verdict.id).await;
+    assert!(text.contains("research by candidate 1"), "{text}");
+    for loser in ["research by candidate 0", "research by candidate 2"] {
+        assert!(
+            !text.contains(loser),
+            "a loser's document is not an input: {text}"
+        );
+    }
+}
+
+/// Criterion 9's first half (`:2109`): with two or more passing, a `verify_command` failure is
+/// eliminated before the judge — it is not in the judge's prompt at all — and the failed
+/// candidate itself still settles `done` (plan D48), so it would have been selectable.
+async fn a_failing_verify_is_eliminated_before_the_judge<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Never, true).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    for report in [
+        FakeVerifier::pass(),
+        FakeVerifier::fail(1),
+        FakeVerifier::pass(),
+    ] {
+        orch.verifier().script_report(report);
+    }
+    judge_both(&orch, "research", 1, 2, "passes and is shorter");
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    let steps = steps_of(&orch, run).await;
+    let failed = candidate(&steps, 0, 1, 1);
+    assert_eq!(
+        (failed.status, failed.verify_outcome, failed.selected),
+        (
+            StepStatus::Superseded,
+            Some(VerifyOutcome::Fail),
+            Some(false)
+        ),
+        "the verify outcome is recorded and not applied to the settle (plan D48): the candidate \
+         settled `done` and lost, rather than `failed`"
+    );
+    let judge = judge_of(&steps, 0, 1).expect("two passed, so the judge ran");
+    let sections = prompt_sections(&orch, judge.id).await;
+    for name in ["judge_candidate:0", "judge_candidate:2"] {
+        assert!(
+            sections.iter().any(|section| section == name),
+            "{sections:?}"
+        );
+    }
+    assert!(
+        !sections
+            .iter()
+            .any(|section| section == "judge_candidate:1"),
+        "the verify failure was eliminated: {sections:?}"
+    );
+    assert_eq!(candidate(&steps, 0, 1, 2).selected, Some(true));
+}
+
+/// Criterion 9's second half (`:2110`): exactly one candidate passes, so it wins outright — no
+/// judge step is created — and the reason is an `item_note` naming the winner (plan D77).
+async fn one_passing_candidate_wins_without_a_judge<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Never, true).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    for report in [
+        FakeVerifier::fail(1),
+        FakeVerifier::pass(),
+        FakeVerifier::fail(2),
+    ] {
+        orch.verifier().script_report(report);
+    }
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    let steps = steps_of(&orch, run).await;
+    assert!(
+        steps.iter().all(|step| step.fanout_index != -1),
+        "no judge row (plan D49(4))"
+    );
+    assert_eq!(
+        slot_of(&steps, 0, 1),
+        [
+            (0, StepStatus::Superseded, Some(false)),
+            (1, StepStatus::Done, Some(true)),
+            (2, StepStatus::Superseded, Some(false)),
+        ]
+    );
+    let notes = notes_of(&orch, ids::HTUI_ANA_2).await;
+    assert!(
+        notes.iter().any(|body| body
+            == "fan-out `research` attempt 1: candidate 1 wins as the only candidate whose \
+                verify_command did not fail"),
+        "the auto-win's reason is not dropped (plan D77): {notes:?}"
+    );
+}
+
+/// Criterion 10's first half (`:2112`): the two orderings disagree, so the judge fails with the
+/// reason as its `gate_note`, every candidate stays as it settled with `selected` NULL, and the
+/// run and the item park for a human with `run.failure` NULL (plan D50).
+async fn judge_orderings_that_disagree_park_for_selection<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Never, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    orch.script_candidate("research:judge", 1, -1, 0, ScriptedStep::judge(0, &[]));
+    orch.script_candidate("research:judge", 1, -1, 1, ScriptedStep::judge(2, &[]));
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(0), None)
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1),
+        [
+            (0, StepStatus::Done, None),
+            (1, StepStatus::Done, None),
+            (2, StepStatus::Done, None),
+        ]
+    );
+    let judge = judge_of(&steps, 0, 1).expect("the judge ran");
+    assert_eq!(
+        (judge.status, judge.gate_note.as_deref()),
+        (
+            StepStatus::Failed,
+            Some("judge_disagreement: forward 0, reversed 2")
+        )
+    );
+    let row = run_of(&orch, run).await;
+    assert_eq!(
+        (row.status, row.failure),
+        (RunStatus::AwaitingApproval, None)
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_ANA_2).await.status,
+        Status::AwaitingApproval
+    );
+    assert_eq!(
+        selection_parks(&orch, ids::HTUI_ANA_2).await,
+        [
+            "fan-out `research` attempt 1 awaits selection: judge_disagreement: forward 0, \
+             reversed 2; candidates: 0 done (verify none), 1 done (verify none), 2 done (verify \
+             none)"
+        ]
+    );
+}
+
+/// Criterion 10's second half (`:2113`): an unparseable verdict parks the group, and
+/// `SelectFanout` completes it — the human's pick wins, the failed judge keeps its reason, and the
+/// walk goes on to `done`.
+async fn an_unparseable_verdict_parks_and_select_fanout_completes<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Never, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    orch.script_candidate(
+        "research:judge",
+        1,
+        -1,
+        0,
+        ScriptedStep::done_with_output("Candidate 2 is clearly the better one."),
+    );
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    let steps = steps_of(&orch, run).await;
+    let judge = judge_of(&steps, 0, 1).expect("the judge ran").clone();
+    assert_eq!(judge.status, StepStatus::Failed);
+    assert_eq!(
+        judge.gate_note.as_deref(),
+        Some("judge_unparseable: no fenced json block")
+    );
+
+    let winner = candidate(&steps, 0, 1, 2).id;
+    let outcome = orch
+        .dispatch(Command::SelectFanout {
+            run,
+            position: 0,
+            attempt: 1,
+            winner,
+        })
+        .await
+        .expect("the parked group is selectable");
+    let CommandOutcome::Selected { rest } = outcome else {
+        panic!("`SelectFanout` answers `Selected`, not {outcome:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::Done, None, None)
+    );
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1),
+        [
+            (0, StepStatus::Superseded, Some(false)),
+            (1, StepStatus::Superseded, Some(false)),
+            (2, StepStatus::Done, Some(true)),
+        ]
+    );
+    let after = judge_of(&steps, 0, 1).expect("the judge is still there");
+    assert_eq!(
+        (after.status, after.gate_note.as_deref()),
+        (StepStatus::Failed, judge.gate_note.as_deref()),
+        "a judge that already failed is left alone, reason and all"
+    );
+    let notes = notes_of(&orch, ids::HTUI_ANA_2).await;
+    assert!(
+        notes
+            .iter()
+            .any(|body| body == "fan-out `research` attempt 1: candidate 2 selected by a human"),
+        "the human's pick is a note (plan D77): {notes:?}"
+    );
+    assert_eq!(item_of(&orch, ids::HTUI_ANA_2).await.status, Status::Done);
+}
+
+/// Plan D49(2): an `always` group goes straight to a human — no prefilter verdict, no judge row.
+async fn a_gated_fan_out_parks_for_human_selection<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Always, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0))
+    );
+    let steps = steps_of(&orch, run).await;
+    assert!(
+        judge_of(&steps, 0, 1).is_none(),
+        "a gated group runs no judge"
+    );
+    assert_eq!(
+        slot_of(&steps, 0, 1),
+        [
+            (0, StepStatus::Done, None),
+            (1, StepStatus::Done, None),
+            (2, StepStatus::Done, None),
+        ],
+        "no candidate parks; the run does (plan D50)"
+    );
+    let parks = selection_parks(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(parks.len(), 1, "{parks:?}");
+    assert!(parks[0].contains(" awaits selection: gated; "), "{parks:?}");
+}
+
+/// Plan D49(3): an ungated group with no judge configured goes to a human.
+async fn no_judge_means_human_selection<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Never, false).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    assert!(judge_of(&steps_of(&orch, run).await, 0, 1).is_none());
+    let parks = selection_parks(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(parks.len(), 1, "{parks:?}");
+    assert!(
+        parks[0].contains(" awaits selection: no judge configured; "),
+        "{parks:?}"
+    );
+}
+
+/// Plan D48: a candidate's failure is its own. Candidate 1 refuses; it lands `failed` with a note
+/// naming it, its siblings settle `done`, the judge compares the two, and the run goes on.
+async fn a_failed_candidate_does_not_fail_its_siblings<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Never, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    orch.script_candidate(
+        "research",
+        1,
+        1,
+        0,
+        ScriptedStep::failing(htui_agent::event::StopReason::Refusal),
+    );
+    judge_both(&orch, "research", 1, 0, "complete");
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(rest.run, RunStatus::Done, "the run continues");
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1),
+        [
+            (0, StepStatus::Done, Some(true)),
+            (1, StepStatus::Failed, Some(false)),
+            (2, StepStatus::Superseded, Some(false)),
+        ],
+        "a failed loser keeps `failed` (`store/traits.rs:808`)"
+    );
+    let notes = notes_of(&orch, ids::HTUI_ANA_2).await;
+    assert!(
+        notes
+            .iter()
+            .any(|body| body.starts_with("fan-out candidate 1 of `research` attempt 1: ")),
+        "the failure is a note naming the candidate: {notes:?}"
+    );
+    let judge = judge_of(&steps, 0, 1).expect("two survived, so the judge ran");
+    assert!(
+        !prompt_sections(&orch, judge.id)
+            .await
+            .iter()
+            .any(|section| section == "judge_candidate:1"),
+        "a failed candidate is not in the pool"
+    );
+}
+
+/// Plan D49(1): a `never` group with no survivor is §4.2's `failed` cell for the whole group — it
+/// retries at `attempt + 1` while the budget holds, retiring attempt 1, and then fails the run.
+async fn a_group_with_no_survivor_retries_then_fails<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    repoint(&orch, ids::HTUI_ANA_2, |phase| {
+        phase.gate = Gate::Never;
+        if phase.name == "research" {
+            phase.fan_out = 3;
+            phase.retry_limit = 1;
+        }
+    })
+    .await;
+    for attempt in [1, 2] {
+        orch.script(
+            "research",
+            attempt,
+            ScriptedStep::failing(htui_agent::event::StopReason::Refusal),
+        );
+    }
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    let failure = RunFailure::NoSurvivingCandidate {
+        phase: "research".to_owned(),
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.as_ref()),
+        (RunStatus::Failed, Some(0), Some(&failure))
+    );
+    assert_eq!(
+        run_of(&orch, run).await.failure.as_deref(),
+        Some("no_surviving_candidate: research")
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1),
+        [
+            (0, StepStatus::Cancelled, None),
+            (1, StepStatus::Cancelled, None),
+            (2, StepStatus::Cancelled, None),
+        ],
+        "attempt 1 was retired whole"
+    );
+    assert_eq!(
+        slot_of(&steps, 0, 2),
+        [
+            (0, StepStatus::Failed, None),
+            (1, StepStatus::Failed, None),
+            (2, StepStatus::Failed, None),
+        ],
+        "attempt 2 is a whole group"
+    );
+    assert_eq!(
+        harness_cleanups(&orch),
+        1,
+        "a terminal run is cleaned up once"
+    );
+}
+
+/// Plan D66 (ANA-2 `:754-758`): a review rejection of a fanned-out `implement` retires its whole
+/// slot — winner, loser and judge — and the next attempt is a new group, judged again.
+async fn the_review_loop_reruns_a_fanned_out_implement<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        phase.gate = Gate::Never;
+        if phase.name == "implement" {
+            phase.fan_out = 2;
+        }
+    })
+    .await;
+    set_judge(&orch, ids::HTUI_FEAT_3).await;
+    for attempt in [1, 2] {
+        judge_both(&orch, "implement", attempt, 0, "the smaller change");
+    }
+    orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "the error path is untested"),
+    );
+    orch.script("review", 2, ScriptedStep::review("approve", "good"));
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!((rest.run, rest.failure), (RunStatus::Done, None));
+    let steps = steps_of(&orch, run).await;
+    assert!(
+        slot_of(&steps, 2, 1)
+            .iter()
+            .all(|(_, status, _)| matches!(status, StepStatus::Superseded | StepStatus::Cancelled)),
+        "slot (2,1) is retired whole: {:?}",
+        slot_of(&steps, 2, 1)
+    );
+    assert_eq!(
+        judge_of(&steps, 2, 1).map(|judge| judge.status),
+        Some(StepStatus::Superseded),
+        "the first judge is retired with its slot"
+    );
+    assert_eq!(
+        slot_of(&steps, 2, 2),
+        [
+            (0, StepStatus::Done, Some(true)),
+            (1, StepStatus::Superseded, Some(false)),
+        ],
+        "attempt 2 is a new group"
+    );
+    assert_eq!(
+        judge_of(&steps, 2, 2).map(|judge| judge.status),
+        Some(StepStatus::Done),
+        "the judge runs again"
+    );
+}
+
+/// Plan D63: a phase above `max_fan_out` (4) is refused at `StartRun`, before a run row exists.
+async fn fan_out_above_max_fan_out_is_refused_at_start<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    repoint(&orch, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "research" {
+            phase.fan_out = 5;
+        }
+    })
+    .await;
+    let refused = orch
+        .dispatch(Command::StartRun {
+            item: ids::HTUI_ANA_2,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        })
+        .await
+        .expect_err("fan_out 5 exceeds max_fan_out 4");
+    assert!(
+        matches!(
+            &refused,
+            EngineError::Resolve(crate::graph::ResolveError::FanOutCap { phase, fan_out: 5, max: 4 })
+                if phase == "research"
+        ),
+        "{refused}"
+    );
+    assert!(
+        orch.store()
+            .runs(ids::HTUI_ANA_2)
+            .await
+            .expect("MemStore never fails a read")
+            .is_empty(),
+        "no run row"
+    );
+}
+
+/// Plan D63 (OQ-1): `prd 1 + plan 1 + implement 3 + its judge 1 + review 1 = 7` agents against
+/// `max_agents_per_run = 6`, refused at `StartRun` naming both figures.
+async fn max_agents_per_run_is_refused_at_start<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "implement" {
+            phase.fan_out = 3;
+        }
+    })
+    .await;
+    set_judge(&orch, ids::HTUI_FEAT_3).await;
+    let refused = orch
+        .dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        })
+        .await
+        .expect_err("seven agents exceed six");
+    assert!(
+        matches!(
+            refused,
+            EngineError::Resolve(crate::graph::ResolveError::AgentCap { planned: 7, max: 6 })
+        ),
+        "{refused}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -2324,20 +3080,23 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_twenty_three() {
+    fn cases_are_unique_and_thirty_five() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            23,
+            35,
             "seven ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam, the three \
              gate-table cells only an edited gate reaches, plan D5's intermediate position, \
-             milestone 3's two verify outcomes and `CancelRun`, and milestone 4's five: the \
-             `allowed_warning` selection, the fall-through to the next candidate, the rung-4 \
-             refusal at `StartRun`, the stage-1 walk that skips every candidate, and the second \
-             attempt's forwarded `verify_failure` and `previous_diff`"
+             milestone 3's two verify outcomes and `CancelRun`, milestone 4's five stage-1 cases \
+             — the `allowed_warning` selection, the fall-through to the next candidate, the \
+             rung-4 refusal at `StartRun`, the stage-1 walk that skips every candidate, and the \
+             second attempt's forwarded `verify_failure` and `previous_diff` — and its twelve \
+             fan-out cases: criteria 8, 9 (twice) and 10 (twice), the gated and judgeless human \
+             selections, a failed candidate, a group with no survivor, the review loop over a \
+             group, and the two caps"
         );
     }
 

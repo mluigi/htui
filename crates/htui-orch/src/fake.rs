@@ -815,6 +815,22 @@ impl ScriptedStep {
         }
     }
 
+    /// A judge call's verdict (plan D52): a paragraph, then exactly one fenced `json` block
+    /// `{ "winner": <winner>, "reasons": { "<i>": "<reason>" } }`, and nothing after it — the
+    /// shape the seeded judge body asks for (`crates/htui-core/src/prompt/defaults.rs:189-190`).
+    #[must_use]
+    pub fn judge(winner: i32, reasons: &[(i32, &str)]) -> Self {
+        let reasons: serde_json::Map<String, serde_json::Value> = reasons
+            .iter()
+            .map(|(index, reason)| (index.to_string(), serde_json::Value::from(*reason)))
+            .collect();
+        let verdict = serde_json::json!({ "winner": winner, "reasons": reasons });
+        Self::done_with_output(&format!(
+            "The candidates were compared on the task, their verification and their diffs.\n\n\
+             ```json\n{verdict}\n```"
+        ))
+    }
+
     /// A turn that ends cleanly and writes nothing: the `missing_output` path (`:430`).
     #[must_use]
     pub fn done_without_output() -> Self {

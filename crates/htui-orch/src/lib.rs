@@ -37,6 +37,7 @@ pub use engine::{
 };
 #[cfg(feature = "test-support")]
 pub use engine::{dispatch_fake, resume_fake};
+pub use fanout::{JudgeFailure, Route};
 pub use gate::{
     Landing, LoopOutcome, LoopStop, Settle, SettleInput, StepFailure, Verdict, parse_verdict,
 };
@@ -44,8 +45,8 @@ pub use graph::{
     GraphSource, ResolveError, Resolved, override_graph, resolve, resolve_scope, topology,
 };
 pub use isolate::{
-    Clock, GixIsolator, IsolateError, Isolator, IsolatorConfig, IsolatorFuture, Prepared,
-    PreparedTree, RepoCheckout, SystemClock,
+    Clock, FanoutSlot, GixIsolator, IsolateError, Isolator, IsolatorConfig, IsolatorFuture,
+    Prepared, PreparedTree, RepoCheckout, SystemClock,
 };
 pub use select::{SkipCause, Walk, walk};
 pub use status::{Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt};
