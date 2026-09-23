@@ -41,6 +41,16 @@ pub fn copy_over_cap(need: u64, cap: u64) -> String {
     format!("copy would need {need} bytes; cap is {cap}")
 }
 
+/// MOD-4 milestone 4 D57's refusal for a fan-out group: `copies` candidates each need their own
+/// copy, so the one measured size is named, the multiplier, the product and the cap.
+///
+/// A single copy keeps [`copy_over_cap`]'s sentence, byte for byte.
+#[must_use]
+pub fn copy_over_cap_copies(need: u64, copies: u64, cap: u64) -> String {
+    let total = need.saturating_mul(copies);
+    format!("copy would need {need} bytes × {copies} copies = {total}; cap is {cap}")
+}
+
 /// One exclusion entry: a path **component** with at most one trailing `*`.
 ///
 /// "No glob crate" is ANA-2 `:1783`'s own rule, so this is the whole matcher: no `**`, no
@@ -148,16 +158,26 @@ pub fn measure(src: &Path, excludes: &[Exclude]) -> Result<u64, IsolateError> {
 /// [`measure`], refused above `cap`.
 ///
 /// ANA-2 `:930-932`: the tree is measured before the first copy of a run and the refusal names the
-/// size. `cap` is `app_setting.copy_max_total_bytes` times the number of copies — one, this
-/// milestone — so the multiplication is the caller's.
+/// size. `cap` is `app_setting.copy_max_total_bytes`; `copies` is how many copies of this tree the
+/// group makes — a fan-out slot's `width`, one otherwise (MOD-4 milestone 4 D57) — and the size is
+/// counted once per copy, saturating. Returns one copy's size.
 ///
 /// # Errors
-/// [`IsolateError::Io`] from the walk; [`IsolateError::Refused`] with [`copy_over_cap`] when the
-/// measured size is above `cap`.
-pub fn measure_within_cap(src: &Path, excludes: &[Exclude], cap: u64) -> Result<u64, IsolateError> {
+/// [`IsolateError::Io`] from the walk; [`IsolateError::Refused`] when `size × copies` is above
+/// `cap`, with [`copy_over_cap`] for a single copy and [`copy_over_cap_copies`] for several.
+pub fn measure_within_cap(
+    src: &Path,
+    excludes: &[Exclude],
+    cap: u64,
+    copies: u64,
+) -> Result<u64, IsolateError> {
     let need = measure(src, excludes)?;
-    if need > cap {
-        return Err(IsolateError::Refused(copy_over_cap(need, cap)));
+    if need.saturating_mul(copies) > cap {
+        return Err(IsolateError::Refused(if copies <= 1 {
+            copy_over_cap(need, cap)
+        } else {
+            copy_over_cap_copies(need, copies, cap)
+        }));
     }
     Ok(need)
 }
@@ -543,13 +563,45 @@ mod tests {
 
         let list = excludes(&[]);
         assert_eq!(
-            super::measure_within_cap(&src, &list, 4_096).expect("exactly at the cap is allowed"),
+            super::measure_within_cap(&src, &list, 4_096, 1)
+                .expect("exactly at the cap is allowed"),
             4_096
         );
-        let err = super::measure_within_cap(&src, &list, 4_095).expect_err("one byte over");
+        let err = super::measure_within_cap(&src, &list, 4_095, 1).expect_err("one byte over");
         assert_eq!(
             err.to_string(),
             "isolation refused: copy would need 4096 bytes; cap is 4095"
+        );
+    }
+
+    /// MOD-4 milestone 4 D57: `width` candidates each get their own copy, so the size counts once
+    /// per copy against the cap, and the refusal names both figures.
+    #[test]
+    fn measure_refuses_when_size_times_copies_exceeds_the_cap() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let src = dir.path().join("src");
+        lay_out(&src, &[("f", 4_096)]);
+
+        let list = excludes(&[]);
+        assert_eq!(
+            super::measure_within_cap(&src, &list, 12_288, 3).expect("three copies fit exactly"),
+            4_096,
+            "the answer is one copy's size"
+        );
+        let err = super::measure_within_cap(&src, &list, 12_287, 3).expect_err("one byte over");
+        assert_eq!(
+            err.to_string(),
+            "isolation refused: copy would need 4096 bytes × 3 copies = 12288; cap is 12287"
+        );
+        let max = u64::MAX;
+        assert_eq!(
+            super::measure_within_cap(&src, &list, max - 1, max)
+                .expect_err("the product saturates rather than wrapping")
+                .to_string(),
+            format!(
+                "isolation refused: copy would need 4096 bytes × {max} copies = {max}; cap is {}",
+                max - 1
+            ),
         );
     }
 
@@ -841,7 +893,7 @@ mod tests {
         let step = "htui/0198c0de-0000-7000-8000-00000000000a";
 
         assert_eq!(
-            super::measure_within_cap(&src, &list, u64::MAX).expect("the source measures"),
+            super::measure_within_cap(&src, &list, u64::MAX, 1).expect("the source measures"),
             measure(&src, &list).expect("the source measures"),
             "the cap guard runs the same walk"
         );

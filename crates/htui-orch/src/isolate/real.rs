@@ -606,7 +606,7 @@ impl GixIsolator {
 
         let (source, owned) = (checkout.local_path.clone(), excludes.to_vec());
         let cap = self.config.copy_max_total_bytes;
-        blocking(move || copy::measure_within_cap(&source, &owned, cap)).await?;
+        blocking(move || copy::measure_within_cap(&source, &owned, cap, 1)).await?;
 
         let (source, owned, destination) = (
             checkout.local_path.clone(),
