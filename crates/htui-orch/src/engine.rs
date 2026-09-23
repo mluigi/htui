@@ -1647,10 +1647,17 @@ where
             })
         }))
         .await;
-        for result in settled {
-            result?;
+        // Every candidate settled, so every failure is reported: the first is raised, and the
+        // rest — which `?` alone would drop — are logged against the run.
+        let mut first = None;
+        for err in settled.into_iter().filter_map(Result::err) {
+            if first.is_none() {
+                first = Some(err);
+            } else {
+                tracing::warn!(run = %run.id, %err, "a further candidate's failure write failed; the first is raised");
+            }
         }
-        Ok(None)
+        first.map_or(Ok(None), Err)
     }
 
     /// The group's base per repo (plan D54(b)): the `before_hash`es a candidate of the slot already
@@ -2088,16 +2095,9 @@ where
                 .await
                 .map(Some),
             Route::AutoWin(winner) => {
-                self.parts
-                    .store
-                    .select_fanout(
-                        run.id,
-                        phase.position,
-                        attempt,
-                        winner,
-                        Some(AUTO_WIN_REASON.to_owned()),
-                    )
-                    .await?;
+                // The note before the selection (plan D77): once `select_fanout` lands, no later
+                // pass routes this slot again, so a crash between the two writes would lose the
+                // reason for good. This way round it costs, at worst, the note written twice.
                 let index = slot
                     .iter()
                     .find(|step| step.id == winner)
@@ -2112,6 +2112,16 @@ where
                     self.now(),
                 )
                 .await?;
+                self.parts
+                    .store
+                    .select_fanout(
+                        run.id,
+                        phase.position,
+                        attempt,
+                        winner,
+                        Some(AUTO_WIN_REASON.to_owned()),
+                    )
+                    .await?;
                 self.reconcile_winner(run, &slot, winner).await
             }
             Route::Judge(passing) => {
