@@ -43,8 +43,12 @@ impl RunScope {
     /// which is exactly the pre-milestone-5 "any shared repo overlaps".
     #[must_use]
     pub fn conservative(repo_scope: &[RepoId]) -> Self {
-        let _ = repo_scope;
-        todo!()
+        Self {
+            repos: repo_scope
+                .iter()
+                .map(|repo| (*repo, RepoScope::default()))
+                .collect(),
+        }
     }
 }
 
@@ -61,8 +65,11 @@ pub enum OverlapRule {
 
 impl fmt::Display for OverlapRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = f;
-        todo!()
+        f.write_str(match self {
+            Self::Local => "local",
+            Self::NotIsolated => "not_isolated",
+            Self::Paths => "paths",
+        })
     }
 }
 
@@ -70,16 +77,32 @@ impl fmt::Display for OverlapRule {
 /// then P, and return the first hit. `None` = no overlap.
 #[must_use]
 pub fn overlaps(a: &RunScope, b: &RunScope) -> Option<OverlapRule> {
-    let _ = (a, b);
-    todo!()
+    // Both maps iterate in `RepoId` order, so the first hit is the lowest shared repo's.
+    a.repos.iter().find_map(|(repo, x)| {
+        let y = b.repos.get(repo)?;
+        if x.local || y.local {
+            Some(OverlapRule::Local)
+        } else if !(x.isolated && y.isolated) {
+            Some(OverlapRule::NotIsolated)
+        } else if intersect(&x.prefixes, &y.prefixes) {
+            Some(OverlapRule::Paths)
+        } else {
+            None
+        }
+    })
 }
 
 /// §4.7's `intersect(xs, ys)`: an empty list is unknown and overlaps everything; otherwise some
 /// prefix of one side is a prefix of some prefix of the other. Bytes, no case folding
 /// (`excerpt.rs`'s `PathPrefix::matches` rule).
 fn intersect(xs: &[String], ys: &[String]) -> bool {
-    let _ = (xs, ys);
-    todo!()
+    xs.is_empty()
+        || ys.is_empty()
+        || xs.iter().any(|x| {
+            ys.iter().any(|y| {
+                x.as_bytes().starts_with(y.as_bytes()) || y.as_bytes().starts_with(x.as_bytes())
+            })
+        })
 }
 
 /// D80, D109: decode `snapshot["scope"]`. If it is absent, `null` or undecodable, the answer is
@@ -87,8 +110,17 @@ fn intersect(xs: &[String], ys: &[String]) -> bool {
 /// every `repo_scope` repo it lacks (the safe direction).
 #[must_use]
 pub fn scope_of(snapshot: &Value, repo_scope: &[RepoId]) -> RunScope {
-    let _ = (snapshot, repo_scope);
-    todo!()
+    let decoded = snapshot
+        .get("scope")
+        .filter(|scope| !scope.is_null())
+        .and_then(|scope| RunScope::deserialize(scope).ok());
+    let Some(mut scope) = decoded else {
+        return RunScope::conservative(repo_scope);
+    };
+    for repo in repo_scope {
+        scope.repos.entry(*repo).or_default();
+    }
+    scope
 }
 
 /// Plan D83: `WriteStore::claim_run`'s verdict.
@@ -119,14 +151,20 @@ impl Claim {
     /// Whether the claim was [`Claim::Admitted`].
     #[must_use]
     pub const fn is_admitted(&self) -> bool {
-        todo!()
+        matches!(self, Self::Admitted)
     }
 }
 
 impl fmt::Display for Claim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = f;
-        todo!()
+        match self {
+            Self::Admitted => f.write_str("admitted"),
+            Self::NotClaimable => f.write_str("not claimable"),
+            Self::SlotFull { running, limit } => {
+                write!(f, "box full ({running} of {limit} running)")
+            }
+            Self::Overlaps { with, rule } => write!(f, "overlaps run {with} ({rule})"),
+        }
     }
 }
 
