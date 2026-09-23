@@ -742,7 +742,7 @@ async fn agent_name<G: GraphSource>(
 #[cfg(test)]
 mod tests {
     use htui_core::fixtures::{DemoData, demo_data, ids};
-    use htui_core::model::{Gate, NewRepo, PromptTemplateId, RepoId};
+    use htui_core::model::{Gate, NewRepo, PromptTemplateId, RepoId, RepoScope, RunScope};
     use htui_core::store::MemStore;
     use serde_json::json;
 
@@ -1363,6 +1363,74 @@ question and not a test fix. Decide the version bump first, then paste the new d
         .await
         .expect("the primary answers");
         assert_eq!(resolved.repo_scope, vec![repo.id]);
+    }
+
+    /// Plan D79: `StartRun`'s resolution writes §4.7's scope into the snapshot, beside the
+    /// `repo_scope` it derives from the same `touched_paths`.
+    #[tokio::test]
+    async fn resolve_writes_the_scope_into_the_snapshot() {
+        let store = MemStore::demo();
+        let core = store
+            .create_repo(NewRepo {
+                id: RepoId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "core".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect("the fixture project takes a repo");
+        let mut item = feat_1(&store).await;
+        item.touched_paths = vec!["src/**".to_owned()];
+
+        let resolved = resolve(
+            &store,
+            &TestSource::claude(&store),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the seeded feature graph resolves");
+        assert_eq!(resolved.repo_scope, vec![core.id]);
+        assert_eq!(
+            resolved.snapshot.scope,
+            Some(RunScope {
+                repos: BTreeMap::from([(
+                    core.id,
+                    RepoScope {
+                        isolated: true,
+                        local: false,
+                        prefixes: vec!["src/".to_owned()],
+                    },
+                )]),
+            }),
+            "every seeded phase resolves to the `worktree` default"
+        );
+
+        // A qualifier the project does not carry refuses before a run row exists.
+        item.touched_paths = vec!["web:app/**".to_owned()];
+        let error = resolve(
+            &store,
+            &TestSource::claude(&store),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect_err("`web` is no repo of the project");
+        assert_eq!(
+            error,
+            ResolveError::UnknownTouchedRepo {
+                item: item.id,
+                name: "web".to_owned(),
+            }
+        );
     }
 
     /// ANA-2 §4.1: the clone is deep over `step_graph_phase` and **never** over `skill_binding`,
