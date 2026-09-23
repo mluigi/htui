@@ -2735,6 +2735,44 @@ async fn two_disjoint_isolated_runs_on_one_repo_both_reconcile() {
     assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
 }
 
+/// Plan D141 (review M-A): the second run's merge sits on the first one's, so its row reads
+/// `(base, merge)` and `base..merge` holds both runs' files. The diff a retry reads as its
+/// `previous_diff` is this step's own: the merge against its first parent, naming `b.txt` only.
+#[tokio::test]
+async fn a_merge_onto_a_moved_primary_diffs_only_its_own_paths() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let m1 = head_of(&git, &fix.core.path).await;
+    let second = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles on top of the first one's merge");
+    let m2 = head_of(&git, &fix.core.path).await;
+
+    let diff = fix
+        .isolator
+        .diff(&b_rows, &second)
+        .await
+        .expect("the diff reads")
+        .expect("the second run committed");
+    assert_eq!(diff.range, format!("{m1}..{m2}"), "the merge's own range");
+    assert!(diff.stat.contains("b.txt"), "its own path: {}", diff.stat);
+    assert!(
+        !diff.stat.contains("a.txt") && !diff.diff.contains("a.txt"),
+        "never the other run's path: {}",
+        diff.diff
+    );
+}
+
 /// Plan D136's in-process race: rule P admits two isolated runs on one repository, and one
 /// process may reconcile both at once. Without D70's admin lock held from the `HEAD` read to the
 /// merge's post-condition, B can read `HEAD` at the base, A merge, and B's merge land on A's — B's
