@@ -1374,7 +1374,8 @@ fn reconcile_message(step: StepId) -> String {
 /// and `base..merge` holds the other run's work too. The step's own change is the merge against
 /// its first parent. The second parent is tied to the step by the merge itself: a commit with
 /// exactly two parents whose message is D25's `htui: reconcile <step>` is the merge
-/// [`Cli::merge_no_ff`] made for that step, and its second parent is the tip it merged. Any other
+/// [`Cli::merge_no_ff`] made for that step, and its second parent is the tip it merged. Only the
+/// message's subject is compared (plan D147). Any other
 /// commit — a step's own commit, an agent's merge, a merge for another step — answers `None`.
 ///
 /// # Errors
@@ -1393,9 +1394,20 @@ pub fn reconcile_parent(
     let [first, _] = parents.as_slice() else {
         return Ok(None);
     };
-    let message = commit.message_raw_sloppy();
-    Ok((message.trim_ascii() == reconcile_message(step).as_bytes())
-        .then(|| first.to_hex().to_string()))
+    Ok(
+        (subject(commit.message_raw_sloppy()) == reconcile_message(step).as_bytes())
+            .then(|| first.to_hex().to_string()),
+    )
+}
+
+/// Plan D147: a raw commit message's subject, up to its first `\n` and ASCII-trimmed, so a body
+/// a `merge.log` shortlog or a commit-msg hook appends never hides D25's message.
+fn subject(message: &[u8]) -> &[u8] {
+    message
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default()
+        .trim_ascii()
 }
 
 /// `Repository::is_dirty()` (`gix-0.87.1/src/status/mod.rs:168`), which is plan D24's predicate.
