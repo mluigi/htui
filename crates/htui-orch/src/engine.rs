@@ -23,15 +23,16 @@ use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposur
 use htui_agent::event::DoneEvent;
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
-    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, GateOutcome, GraphSnapshot, Item,
-    ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectSettings,
-    PromptScope, Run, RunId, RunStatus, RunStep, RunStepCommit, SnapshotCandidate, SnapshotPhase,
-    Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, EventKind, Gate, GateOutcome,
+    GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId,
+    Project, ProjectSettings, PromptScope, RepoId, Run, RunId, RunStatus, RunStep, RunStepCommit,
+    SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus,
+    TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
 };
 use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet};
 use htui_core::prompt::{
-    AssembledPrompt, DiffBlock, InputDocument, PromptSpec, TemplateRef, TemplateRole,
-    TokenEstimator, VerifyFailure, assemble, settings,
+    AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PromptSpec, SectionName,
+    TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
 };
 use htui_core::scrub::Scrubber;
 use htui_core::store::{StoreError, WriteStore};
@@ -39,16 +40,19 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
-use crate::fanout::HUMAN_PICK_REASON;
-use crate::gate::{self, GateContext, Landing, LoopOutcome, SettleInput};
+use crate::fanout::{
+    AUTO_WIN_REASON, CandidateView, HUMAN_PICK_REASON, HumanReason, JUDGE_KIND, JudgeFailure,
+    Route, judge_candidate, judge_inputs, judge_phase, judge_phase_name, parse_judge_verdict,
+    prefilter, route,
+};
+use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
-use crate::isolate::{Clock, Isolator};
+use crate::isolate::{Clock, FanoutSlot, Isolator};
 use crate::select::{self, SelectInput, Skipped, Walk};
-use crate::status::{Cursor, RunFailure, cursor, group_at, latest_at, next_attempt, winner_at};
+use crate::status::{
+    Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt, winner_at,
+};
 use crate::verify::{Verifier, VerifyReport, VerifyRequest};
-
-/// The only `run_step.fanout_index` milestone 2 walks; fan-out's others are milestone 4's.
-const WALKED_FANOUT_INDEX: i32 = 0;
 
 /// The phase whose output document carries ANA-2 §4.4's front-matter verdict (`:440`).
 ///
@@ -57,6 +61,17 @@ const WALKED_FANOUT_INDEX: i32 = 0;
 /// (`crates/htui-core/src/seed.rs:88-160`). The `bug` graph's implement-shaped phase is `fix` and
 /// its review phase is still `review`, which is the case that shows the name is the rule.
 const REVIEW_PHASE: &str = "review";
+
+/// The `prompt_template.name` of the judge role (`crates/htui-core/src/prompt/template.rs:54`),
+/// read when the snapshot pinned no judge template (plan D53).
+const JUDGE_TEMPLATE: &str = "judge";
+
+/// `run_step.fanout_index` of a slot's judge row (`docs/ANA-2.md` §4.5, plan D51).
+const JUDGE_FANOUT_INDEX: i32 = -1;
+
+/// A failed judge's park reason when its row carries no `gate_note` — a crash between D51's two
+/// failure writes left it `awaiting_approval`, or another writer failed it.
+const JUDGE_FAILED: &str = "judge failed";
 
 /// The `app_setting` key of stage 1's budget rule (plan D60 rule 5, OQ-6). Unseeded: absent is `0`.
 const MIN_BUDGET_KEY: &str = "min_budget_for_new_attempt";
@@ -384,7 +399,7 @@ where
         &self,
         item: ItemId,
         mode: htui_core::model::RunMode,
-        repo_scope: Option<Vec<htui_core::model::RepoId>>,
+        repo_scope: Option<Vec<RepoId>>,
     ) -> Result<CommandOutcome, EngineError> {
         let item = self.item(item).await?;
         let resolved = match graph::resolve(
@@ -655,9 +670,24 @@ where
         phase: &SnapshotPhase,
     ) -> Result<CommandOutcome, EngineError> {
         let steps = self.parts.store.run_steps(run.id).await?;
+        // A member of a slot already retired names nothing a retry could replace: `retire_slot`
+        // retires the position's **latest** slot, so only a member of that one is admitted.
+        let latest = steps
+            .iter()
+            .filter(|step| step.position == row.position)
+            .map(|step| step.attempt)
+            .max()
+            .unwrap_or(row.attempt);
+        if row.attempt != latest {
+            return Err(EngineError::NotGated {
+                step: row.id,
+                status: row.status,
+                expected: "a member of the position's latest slot",
+            });
+        }
         let slot = group_at(&steps, row.position, row.attempt);
         crate::command::retry_group_enabled(run, &slot, phase)?;
-        let attempt = slot.first().map_or(row.attempt, |first| first.attempt);
+        let attempt = row.attempt;
 
         let now = self.now();
         gate::retire_slot(&self.gate_context(run, snapshot), &steps, row.position, now).await?;
@@ -855,6 +885,18 @@ where
                         return Ok(rest);
                     }
                 }
+                Cursor::Fan { position, attempt } => {
+                    let phase = Self::phase_at(run, &snapshot, position)?;
+                    if let Some(rest) = self.drive_group(&row, &snapshot, &phase, attempt).await? {
+                        return Ok(rest);
+                    }
+                }
+                Cursor::Select { position, attempt } => {
+                    let phase = Self::phase_at(run, &snapshot, position)?;
+                    if let Some(rest) = self.select_stage(&row, &snapshot, &phase, attempt).await? {
+                        return Ok(rest);
+                    }
+                }
                 Cursor::Run(step) => {
                     let Some(step) = steps.into_iter().find(|row| row.id == step) else {
                         continue;
@@ -929,14 +971,15 @@ where
 
     // -- stage 1 -------------------------------------------------------------------------------
 
-    /// **Stage 1 — admit.** `R-AGT-8`'s walk, the selection, the substitution note, the step row.
+    /// **Stage 1 — admit.** `R-AGT-8`'s walk, the selection, the substitution note, the step
+    /// rows: one per `fanout_index` of `0..fan_out` (plan D71), so a `fan_out = 1` phase is the
+    /// case of a single index.
     ///
     /// `Some(rest)` is the refusal: the walk left nothing the selector would take, the item goes
     /// to `blocked` **before** the run is failed (blueprint H-16 — the reverse order leaves the
     /// item `failed`, because `finish_run` mirrors `in_progress -> failed`), and an `item_note`
-    /// records the reason (plan D62). `None` means a `pending` step exists and the walk may run it.
-    ///
-    /// The selector is asked with `fanout_index 0` (plan D71); a fan-out group asks once per index.
+    /// records the reason (plan D62). `None` means the `pending` rows exist and the walk may run
+    /// them.
     async fn admit(
         &self,
         run: &Run,
@@ -944,31 +987,58 @@ where
         phase: &SnapshotPhase,
         attempt: i32,
     ) -> Result<Option<Rest>, EngineError> {
-        let walk = self.stage_one(run, snapshot, phase).await?;
-        let Some(chosen) = self
-            .parts
-            .selector
-            .select(phase, &walk.eligible, WALKED_FANOUT_INDEX)
-            .cloned()
-        else {
-            return self.refuse_no_candidate(run, phase, &walk).await.map(Some);
-        };
-        self.note_substitution(run, phase, attempt, WALKED_FANOUT_INDEX, &chosen, &walk)
-            .await?;
+        let indices: Vec<i32> = (0..phase.fan_out.max(1)).collect();
+        self.admit_indices(run, snapshot, phase, attempt, &indices)
+            .await
+    }
 
-        self.parts
-            .store
-            .create_step(NewRunStep {
-                id: StepId::new(),
-                run_id: run.id,
-                position: phase.position,
-                attempt,
-                fanout_index: WALKED_FANOUT_INDEX,
-                phase_name: phase.name.clone(),
-                agent_id: Some(chosen.agent_id),
-                model: Some(chosen.model.clone()),
-            })
-            .await?;
+    /// [`admit`](Self::admit) for the named `fanout_index`es only: `drive_group` creates the
+    /// indices a slot is missing through this, after a crash between two `create_step`s.
+    ///
+    /// **Every index is selected before any row is written** (blueprint F-K): the selector is
+    /// pure, and a `None` for index `i > 0` after index 0 was chosen must refuse the phase through
+    /// plan D62's path with no partial group left behind. Each candidate's agent and model are its
+    /// own answer's, never a group-level one (plan D71), and D60's substitution note is written per
+    /// candidate whose choice passed over a higher-priority row (blueprint H-23).
+    async fn admit_indices(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+        attempt: i32,
+        indices: &[i32],
+    ) -> Result<Option<Rest>, EngineError> {
+        let walk = self.stage_one(run, snapshot, phase).await?;
+        let mut picks = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let Some(chosen) = self
+                .parts
+                .selector
+                .select(phase, &walk.eligible, index)
+                .cloned()
+            else {
+                return self.refuse_no_candidate(run, phase, &walk).await.map(Some);
+            };
+            picks.push((index, chosen));
+        }
+
+        for (index, chosen) in picks {
+            self.note_substitution(run, phase, attempt, index, &chosen, &walk)
+                .await?;
+            self.parts
+                .store
+                .create_step(NewRunStep {
+                    id: StepId::new(),
+                    run_id: run.id,
+                    position: phase.position,
+                    attempt,
+                    fanout_index: index,
+                    phase_name: phase.name.clone(),
+                    agent_id: Some(chosen.agent_id),
+                    model: Some(chosen.model),
+                })
+                .await?;
+        }
         Ok(None)
     }
 
@@ -988,8 +1058,22 @@ where
         snapshot: &GraphSnapshot,
         phase: &SnapshotPhase,
     ) -> Result<Walk, EngineError> {
+        self.walk_candidates(run, snapshot, &phase.candidates, phase.gate_effective)
+            .await
+    }
+
+    /// `select::walk` over `candidates` under `gate`, read fresh: [`stage_one`](Self::stage_one)'s
+    /// body, which the judge's own walk (plan D51) shares with `gate` fixed at `never` — the judge
+    /// answers no permission, so the inline-approval interlock does not apply to it.
+    async fn walk_candidates(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        candidates: &[SnapshotCandidate],
+        gate: Gate,
+    ) -> Result<Walk, EngineError> {
         let mut agents = BTreeMap::new();
-        for candidate in &phase.candidates {
+        for candidate in candidates {
             if agents.contains_key(&candidate.agent_id) {
                 continue;
             }
@@ -1007,10 +1091,10 @@ where
             .collect();
         let steps = self.parts.store.run_steps(run.id).await?;
         Ok(select::walk(&SelectInput {
-            candidates: &phase.candidates,
+            candidates,
             agents: &agents,
             boxes: &boxes,
-            gate_effective: phase.gate_effective,
+            gate_effective: gate,
             spent_micros: select::run_spend(&steps),
             cap_micros: snapshot.settings.per_token_cap_run,
             min_budget_micros: min_budget(&self.parts.app),
@@ -1449,6 +1533,1131 @@ where
         Ok(true)
     }
 
+    // -- fan-out: the group's drive, its selection and its judge (plan D48-D53, D58, D59) ------
+
+    /// Plan D59's `Fan`: create the slot's missing candidates, then drive every `pending` one
+    /// concurrently through stages 2 to 5 (plan D58). `Some(rest)` is a refusal that stopped the
+    /// run; `None` means the next pass re-derives — normally `Select`.
+    ///
+    /// The prompt is assembled **once**, before any candidate is live (plan D58): every candidate
+    /// records the same text and `prompt_digest`, and none reads `resolve_inputs` while a sibling
+    /// writes its output. A missing required input therefore fails the group before a token is
+    /// spent (plan D76, [`fail_group_before_a_token`](Self::fail_group_before_a_token)).
+    ///
+    /// The group's base is read before any candidate is prepared — from the slot's own
+    /// `run_step_commit` rows once one has them (M2 D16), else `Isolator::base` — and an error
+    /// reading it propagates with the run still `running` at `Fan` (blueprint H-22): nothing is
+    /// live yet, and the next call re-derives it.
+    ///
+    /// `join_all` rather than a `JoinSet` because every candidate's future borrows `&self` and this
+    /// frame's `prompt`, `base` and rows, and `join_all` is awaited here, so no `'static` bound
+    /// applies. No `std` guard is held across its `.await`. Only a candidate's own failure write
+    /// can raise: [`run_candidate`](Self::run_candidate) owns every other failure, so a failed
+    /// sibling never fails the others (plan D48).
+    async fn drive_group(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+        attempt: i32,
+    ) -> Result<Option<Rest>, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let present: Vec<i32> = group_at(&steps, phase.position, attempt)
+            .iter()
+            .map(|step| step.fanout_index)
+            .collect();
+        let missing: Vec<i32> = (0..phase.fan_out)
+            .filter(|index| !present.contains(index))
+            .collect();
+        if !missing.is_empty()
+            && let Some(rest) = self
+                .admit_indices(run, snapshot, phase, attempt, &missing)
+                .await?
+        {
+            return Ok(Some(rest));
+        }
+
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let slot = group_at(&steps, phase.position, attempt);
+        let pending: Vec<&RunStep> = slot
+            .iter()
+            .copied()
+            .filter(|step| step.status == StepStatus::Pending)
+            .collect();
+        let Some(first) = pending.first() else {
+            return Ok(None);
+        };
+        let base = self.group_base(run, &slot).await?;
+        let item = Self::item_of(run)?;
+        let prompt = match self
+            .assemble_prompt(run, snapshot, first, phase, item)
+            .await?
+        {
+            Ok(prompt) => prompt,
+            Err(missing) => {
+                return self
+                    .fail_group_before_a_token(run, phase, &pending, missing)
+                    .await
+                    .map(Some);
+            }
+        };
+
+        let settled = futures::future::join_all(pending.iter().map(|step| {
+            self.run_candidate(CandidateStage {
+                run,
+                phase,
+                step,
+                prompt: &prompt,
+                base: &base,
+            })
+        }))
+        .await;
+        for result in settled {
+            result?;
+        }
+        Ok(None)
+    }
+
+    /// The group's base per repo (plan D54(b)): the `before_hash`es a candidate of the slot already
+    /// recorded, else the repositories' `HEAD`s read once through `Isolator::base`.
+    async fn group_base(
+        &self,
+        run: &Run,
+        slot: &[&RunStep],
+    ) -> Result<BTreeMap<RepoId, String>, EngineError> {
+        for step in slot {
+            let commits = self.parts.store.step_commits(step.id).await?;
+            if !commits.is_empty() {
+                return Ok(commits
+                    .into_iter()
+                    .map(|commit| (commit.repo_id, commit.before_hash))
+                    .collect());
+            }
+        }
+        Ok(self.parts.isolator.base(&run.repo_scope).await?)
+    }
+
+    /// Plan D76 (blueprint A-5): a required input missing from the group's one prompt. No
+    /// candidate is live yet, so each `pending` one is moved `pending -> running -> failed` with
+    /// a note — `pending -> failed` is illegal (`model/run.rs:113`) — and then the run fails
+    /// exactly as a `fan_out = 1` step's missing input fails it.
+    async fn fail_group_before_a_token(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        pending: &[&RunStep],
+        kind: String,
+    ) -> Result<Rest, EngineError> {
+        let failure = RunFailure::MissingInput(kind);
+        let now = self.now();
+        for step in pending {
+            if self
+                .parts
+                .store
+                .transition_step(step.id, StepStatus::Pending, StepStatus::Running, now)
+                .await?
+            {
+                self.fail_candidate(run, phase, step, &failure.to_string())
+                    .await?;
+            }
+        }
+        self.parts
+            .store
+            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+            .await?;
+        self.cleanup_run(run.id).await?;
+        Ok(Rest {
+            run: RunStatus::Failed,
+            position: Some(phase.position),
+            failure: Some(failure),
+        })
+    }
+
+    /// One candidate's stages 2 to 5 (plan D48): it lands `done` or `failed` on its own and never
+    /// parks, and an error once it is live fails **that candidate** — never the run, and never its
+    /// siblings. The only error raised is a failure write that itself failed.
+    ///
+    /// A candidate that fails after `prepare` succeeded and before its `capture` ran is captured
+    /// best-effort on the way out (plan D78, blueprint A-7): a `shared_serialized` guard is released
+    /// only at `capture`, and D48 removed the `fail_hard -> cleanup_run` path that used to release
+    /// it, so without this the siblings in the same `join_all` would wait on it forever.
+    async fn run_candidate(&self, stage: CandidateStage<'_>) -> Result<(), EngineError> {
+        let started_at = self.now();
+        if !self
+            .parts
+            .store
+            .transition_step(
+                stage.step.id,
+                StepStatus::Pending,
+                StepStatus::Running,
+                started_at,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        let mut trees = None;
+        let mut captured = false;
+        match self
+            .candidate_live(&stage, started_at, &mut trees, &mut captured)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if let (Some(trees), false) = (&trees, captured) {
+                    self.release_trees(stage.step, trees).await;
+                }
+                self.fail_candidate(stage.run, stage.phase, stage.step, &err.to_string())
+                    .await
+            }
+        }
+    }
+
+    /// Plan D78's best-effort capture: its commits are recorded when it answers, and every failure
+    /// — the isolator's or the write's — is logged, because the candidate is failing already.
+    async fn release_trees(&self, step: &RunStep, trees: &[htui_core::model::RunStepTree]) {
+        match self.parts.isolator.capture(step.id, trees).await {
+            Ok(after) => {
+                if let Err(err) = self.parts.store.record_commits(step.id, &after).await {
+                    tracing::warn!(step = %step.id, %err, "a failed candidate's commits were not recorded");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(step = %step.id, %err, "a failed candidate's trees were not captured");
+            }
+        }
+    }
+
+    /// The live half of [`run_candidate`](Self::run_candidate). `trees` is set the moment `prepare`
+    /// answered and `captured` the moment `capture` did, so the caller knows what to release.
+    async fn candidate_live(
+        &self,
+        stage: &CandidateStage<'_>,
+        started_at: DateTime<Utc>,
+        trees: &mut Option<Vec<htui_core::model::RunStepTree>>,
+        captured: &mut bool,
+    ) -> Result<(), EngineError> {
+        let CandidateStage {
+            run,
+            phase,
+            step,
+            prompt,
+            base,
+        } = *stage;
+        let item = Self::item_of(run)?;
+
+        // -- stage 2: prepare, from the group's base (plan D54(a)) ----------------------------
+        let prepared = self
+            .parts
+            .isolator
+            .prepare(
+                run.id,
+                step.id,
+                &run.repo_scope,
+                phase.isolation,
+                Some(FanoutSlot {
+                    index: step.fanout_index,
+                    width: phase.fan_out,
+                    base,
+                }),
+            )
+            .await?;
+        let rows: Vec<_> = prepared
+            .trees
+            .iter()
+            .map(|tree| tree.tree.clone())
+            .collect();
+        *trees = Some(rows.clone());
+        self.parts.store.upsert_step_tree(step.id, &rows).await?;
+        let before: Vec<RunStepCommit> = prepared
+            .trees
+            .iter()
+            .map(|tree| RunStepCommit {
+                run_step_id: step.id,
+                repo_id: tree.tree.repo_id,
+                before_hash: tree.before_hash.clone(),
+                after_hash: None,
+            })
+            .collect();
+        self.parts.store.record_commits(step.id, &before).await?;
+
+        // -- stage 3: the group's one prompt (plan D58) ----------------------------------------
+        let trim = serde_json::to_value(&prompt.trim).map_err(|err| {
+            htui_agent::RecordError::Encode(format!("the step's trim record: {err}"))
+        })?;
+        self.parts
+            .store
+            .set_step_prompt(step.id, &prompt.digest, &trim)
+            .await?;
+
+        // -- stage 4: this candidate's own session (plan D68) ---------------------------------
+        let key = SessionKey::of(step);
+        let mut recorder = self.open_recorder(run, step, prompt).await?;
+        let result = match self
+            .drive_once(
+                run,
+                step,
+                phase,
+                &key,
+                &prompt.text,
+                prepared.cwd.clone(),
+                prepared.extra_dirs,
+                &mut recorder,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(refused) => {
+                recorder.finish().await?;
+                return Err(refused);
+            }
+        };
+        let cap_breach = recorder.finish().await?.cap_breach;
+        if let Ok(done) = &result {
+            self.parts
+                .sink
+                .after_done(item, step, phase, &key, done)
+                .await?;
+        }
+        let verify = self
+            .verify(VerifyStage {
+                run,
+                step,
+                phase,
+                trees: &rows,
+                started_at,
+                session_cwd: &prepared.cwd,
+                result: &result,
+            })
+            .await?;
+
+        // -- stage 5: settle on the candidate's own terms (plan D48) ---------------------------
+        let after = self.parts.isolator.capture(step.id, &rows).await?;
+        *captured = true;
+        self.parts.store.record_commits(step.id, &after).await?;
+        let output = self.output_of(item, phase, step.id).await?;
+        let now = self.now();
+        // `verify_outcome: None`: a candidate's verify is the prefilter's to read (plan D49), not
+        // its settle's — a `fail` here would make criterion 9's surviving candidate unselectable.
+        let settled = gate::settle(&SettleInput {
+            driver: &result,
+            cap_breach,
+            started_at,
+            now,
+            deadline_seconds: phase.deadline_seconds,
+            output: output.as_ref(),
+            verify_outcome: None,
+            is_review: phase.name == REVIEW_PHASE,
+        });
+        self.parts
+            .store
+            .finish_step(
+                step.id,
+                StepOutcome {
+                    exit_code: None,
+                    usage: None,
+                    trim_record: None,
+                    // The **real** outcome, which is what the prefilter reads.
+                    verify_outcome: verify.as_ref().map(|report| report.outcome),
+                    verify_exit_code: verify.as_ref().and_then(|report| report.exit_code),
+                    finished_at: now,
+                },
+            )
+            .await?;
+        match settled {
+            Settle::Ok { note } => {
+                self.parts
+                    .store
+                    .transition_step(step.id, StepStatus::Running, StepStatus::Done, now)
+                    .await?;
+                if let Some(note) = note {
+                    self.note(item, note, Some(step.id), now).await?;
+                }
+                Ok(())
+            }
+            Settle::Failed(failure) => {
+                self.fail_candidate(run, phase, step, &failure.to_string())
+                    .await
+            }
+            // Plan D64 refuses `fan_out > 1` on `review` at resolution, so no candidate reads a
+            // verdict; were one to, a rejection is still not a candidate's to act on.
+            Settle::Rejected { verdict_line } => {
+                self.fail_candidate(run, phase, step, &verdict_line).await
+            }
+        }
+    }
+
+    /// One candidate `running -> failed`, with the reason as an `item_note` naming it (plan D48).
+    /// A step another process already moved is left alone and gets no note (plan D17).
+    async fn fail_candidate(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        step: &RunStep,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        let now = self.now();
+        if !self
+            .parts
+            .store
+            .transition_step(step.id, StepStatus::Running, StepStatus::Failed, now)
+            .await?
+        {
+            return Ok(());
+        }
+        let Some(item) = run.item_id else {
+            return Ok(());
+        };
+        self.note(
+            item,
+            format!(
+                "fan-out candidate {} of `{}` attempt {}: {reason}",
+                step.fanout_index, phase.name, step.attempt
+            ),
+            Some(step.id),
+            now,
+        )
+        .await
+    }
+
+    /// Plan D59's `Select`: route a settled group (plan D49) and land it.
+    ///
+    /// A judge row already in the slot is a crash's leftover: a `failed` one re-parks with its
+    /// own reason and is **not** re-run (D59), and a `pending` one is run with the passing set
+    /// recomputed. Otherwise `fanout::route` decides — the group's retry or failure under `never`,
+    /// D50's park, the one passing candidate's win (with plan D77's note), or the judge.
+    async fn select_stage(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+        attempt: i32,
+    ) -> Result<Option<Rest>, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let slot: Vec<RunStep> = group_at(&steps, phase.position, attempt)
+            .into_iter()
+            .cloned()
+            .collect();
+        let views: Vec<CandidateView> = slot.iter().map(CandidateView::of).collect();
+        let pre = prefilter(&views);
+
+        if let Some(judge) = judge_at(&steps, phase.position, attempt) {
+            match judge.status {
+                StepStatus::Failed | StepStatus::AwaitingApproval => {
+                    let reason = judge.gate_note.as_deref().unwrap_or(JUDGE_FAILED);
+                    return self
+                        .park_selection(run, phase, attempt, &slot, reason)
+                        .await
+                        .map(Some);
+                }
+                StepStatus::Pending => {
+                    let passing = pre.passing.iter().map(|view| view.step).collect();
+                    return self
+                        .run_judge(run, snapshot, phase, attempt, passing, Some(judge.clone()))
+                        .await;
+                }
+                StepStatus::Running
+                | StepStatus::Done
+                | StepStatus::Superseded
+                | StepStatus::Cancelled => {}
+            }
+        }
+
+        match route(phase.gate_effective, phase.judge.is_some(), &pre) {
+            Route::GroupFailed => {
+                let now = self.now();
+                if may_attempt(attempt + 1, phase.retry_limit) {
+                    // §4.2's `never` × `failed` cell for the whole group: retire it, and the
+                    // cursor creates `attempt + 1` (plan D49(1)).
+                    gate::retire_slot(
+                        &self.gate_context(run, snapshot),
+                        &steps,
+                        phase.position,
+                        now,
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+                let failure = RunFailure::NoSurvivingCandidate {
+                    phase: phase.name.clone(),
+                };
+                self.parts
+                    .store
+                    .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+                    .await?;
+                self.cleanup_run(run.id).await?;
+                Ok(Some(Rest {
+                    run: RunStatus::Failed,
+                    position: Some(phase.position),
+                    failure: Some(failure),
+                }))
+            }
+            Route::Human(reason) => self
+                .park_selection(run, phase, attempt, &slot, &reason.to_string())
+                .await
+                .map(Some),
+            Route::AutoWin(winner) => {
+                self.parts
+                    .store
+                    .select_fanout(
+                        run.id,
+                        phase.position,
+                        attempt,
+                        winner,
+                        Some(AUTO_WIN_REASON.to_owned()),
+                    )
+                    .await?;
+                let index = slot
+                    .iter()
+                    .find(|step| step.id == winner)
+                    .map_or(0, |step| step.fanout_index);
+                self.note_selection(
+                    run,
+                    winner,
+                    format!(
+                        "fan-out `{}` attempt {attempt}: candidate {index} wins as {AUTO_WIN_REASON}",
+                        phase.name
+                    ),
+                    self.now(),
+                )
+                .await?;
+                self.reconcile_winner(run, &slot, winner).await
+            }
+            Route::Judge(passing) => {
+                self.run_judge(run, snapshot, phase, attempt, passing, None)
+                    .await
+            }
+        }
+    }
+
+    /// The selected winner, re-read, reconciled with its slot's other candidates (plan D54(d)).
+    async fn reconcile_winner(
+        &self,
+        run: &Run,
+        slot: &[RunStep],
+        winner: StepId,
+    ) -> Result<Option<Rest>, EngineError> {
+        let refs: Vec<&RunStep> = slot.iter().collect();
+        let siblings = Self::siblings(&refs, winner);
+        let winner = self.step(run.id, winner).await?;
+        self.reconcile_done_step(run, &winner, &siblings).await
+    }
+
+    /// Plan D50's one park shape for a human selection: every candidate as it settled, `selected`
+    /// NULL, the run `running -> awaiting_approval`, the item `in_progress -> awaiting_approval`,
+    /// and one `item_note` naming the phase, the attempt, each candidate and the reason.
+    ///
+    /// No step is parked — `park_run`'s deviation from §4.3's propagation rule, for the same
+    /// reason — and `run.failure` stays NULL (R-3). A `shared_serialized` group's note says where
+    /// the maintainer's checkout was left: at the last sibling's commit, with the base and every
+    /// sibling's label named (the plan's Risks row).
+    async fn park_selection(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        attempt: i32,
+        slot: &[RunStep],
+        reason: &str,
+    ) -> Result<Rest, EngineError> {
+        let now = self.now();
+        self.parts
+            .store
+            .transition_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
+            .await?;
+        if let Some(item) = run.item_id {
+            self.parts
+                .store
+                .transition(item, Status::InProgress, Status::AwaitingApproval)
+                .await?;
+            let candidates = slot
+                .iter()
+                .map(|step| {
+                    format!(
+                        "{} {} (verify {})",
+                        step.fanout_index,
+                        step.status,
+                        step.verify_outcome.map_or("none", VerifyOutcome::as_str)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut body = format!(
+                "fan-out `{}` attempt {attempt} awaits selection: {reason}; candidates: {candidates}",
+                phase.name
+            );
+            if phase.isolation == Isolation::SharedSerialized {
+                body.push_str(&self.shared_checkout_note(slot).await?);
+            }
+            self.note(item, body, None, now).await?;
+        }
+        Ok(Rest {
+            run: RunStatus::AwaitingApproval,
+            position: Some(phase.position),
+            failure: None,
+        })
+    }
+
+    /// The park note's `shared_serialized` sentence: the checkout stays at the last sibling's
+    /// commit, and the base and each sibling's `htui/<step>` label are where a human finds them.
+    async fn shared_checkout_note(&self, slot: &[RunStep]) -> Result<String, EngineError> {
+        let mut bases: Vec<String> = Vec::new();
+        for step in slot {
+            for commit in self.parts.store.step_commits(step.id).await? {
+                let base = format!("{}@{}", commit.repo_id, commit.before_hash);
+                if !bases.contains(&base) {
+                    bases.push(base);
+                }
+            }
+        }
+        let labels = slot
+            .iter()
+            .map(|step| format!("htui/{}", step.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!(
+            "; the shared checkout stays at the last sibling's commit (base {}; labels {labels})",
+            bases.join(", ")
+        ))
+    }
+
+    /// The judge (plan D51-D53): its two prompts, its row, its two sessions, its verdict.
+    ///
+    /// **The order is blueprint H-8's.** The inputs and both prompts come first and no row is
+    /// written for them; a candidate the trimmer dropped from the forward prompt sends the group to
+    /// D50's park with no judge row at all (D53). Only then is the judge created — or `existing`,
+    /// a crash's `pending` leftover, reused — walked, and moved `pending -> running`. Every failure
+    /// from there on (an input that could not be built, an agent the walk skips, a session error,
+    /// a verdict that does not parse, is out of range or disagrees) is [`fail_judge`]'s: the judge
+    /// `failed` with the reason as its `gate_note`, and the group parked for a human.
+    ///
+    /// [`fail_judge`]: Self::fail_judge
+    async fn run_judge(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+        attempt: i32,
+        passing: Vec<StepId>,
+        existing: Option<RunStep>,
+    ) -> Result<Option<Rest>, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let slot: Vec<RunStep> = group_at(&steps, phase.position, attempt)
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut survivors: Vec<&RunStep> = slot
+            .iter()
+            .filter(|step| passing.contains(&step.id))
+            .collect();
+        survivors.sort_by_key(|step| step.fanout_index);
+
+        // -- 1. inputs and both orderings, before any row (H-8) --------------------------------
+        let prompts = self.judge_prompts(run, phase, attempt, &survivors).await?;
+        if let Ok(JudgePrompts { forward, .. }) = &prompts
+            && let Some(index) = dropped_candidate(forward)
+        {
+            let reason = HumanReason::CandidateDropped(index).to_string();
+            return self
+                .park_selection(run, phase, attempt, &slot, &reason)
+                .await
+                .map(Some);
+        }
+
+        // -- 2. the row, and the judge's own walk (D51, F-I) ----------------------------------
+        let (judge, candidate) = self
+            .judge_row(run, snapshot, phase, attempt, existing)
+            .await?;
+        let now = self.now();
+        if !self
+            .parts
+            .store
+            .transition_step(judge.id, StepStatus::Pending, StepStatus::Running, now)
+            .await?
+        {
+            return Ok(None);
+        }
+        let prompts = match prompts {
+            Ok(prompts) => prompts,
+            Err(failure) => {
+                return self
+                    .fail_judge(run, phase, attempt, &judge, &slot, failure)
+                    .await
+                    .map(Some);
+            }
+        };
+        let candidate = match candidate {
+            Ok(candidate) => candidate,
+            Err(failure) => {
+                return self
+                    .fail_judge(run, phase, attempt, &judge, &slot, failure)
+                    .await
+                    .map(Some);
+            }
+        };
+
+        // -- 3. two fresh sessions, the second reversed (D52) ---------------------------------
+        let indices: Vec<i32> = survivors.iter().map(|step| step.fanout_index).collect();
+        let verdict = match self
+            .judge_sessions(run, phase, attempt, &judge, &candidate, &prompts)
+            .await
+        {
+            Ok(Ok(documents)) => decide(&documents, &indices),
+            Ok(Err(failure)) => Err(failure),
+            Err(err) => Err(JudgeFailure::SessionFailed(err.to_string())),
+        };
+        let (winner, reason) = match verdict {
+            Ok(verdict) => verdict,
+            Err(failure) => {
+                return self
+                    .fail_judge(run, phase, attempt, &judge, &slot, failure)
+                    .await
+                    .map(Some);
+            }
+        };
+
+        // -- 4. the winner: `select_fanout` moves the judge `running -> done` with the reason --
+        let Some(winner) = survivors
+            .iter()
+            .find(|step| step.fanout_index == winner)
+            .map(|step| step.id)
+        else {
+            // `decide` range-checked it against these same rows.
+            return Ok(None);
+        };
+        let now = self.now();
+        self.parts
+            .store
+            .finish_step(
+                judge.id,
+                StepOutcome {
+                    exit_code: None,
+                    usage: None,
+                    trim_record: None,
+                    verify_outcome: None,
+                    verify_exit_code: None,
+                    finished_at: now,
+                },
+            )
+            .await?;
+        self.parts
+            .store
+            .select_fanout(run.id, phase.position, attempt, winner, Some(reason))
+            .await?;
+        self.reconcile_winner(run, &slot, winner).await
+    }
+
+    /// The judge's inputs and both orderings (plan D53), with nothing written.
+    ///
+    /// `task` is the seq-0 `prompt` text the lowest-index survivor recorded — replayed, not
+    /// re-assembled (ANA-5 `:1256-1263`). One [`JudgeCandidate`] per survivor: its verify outcome
+    /// and exit code, its output document, `Isolator::diff` over its rows (an error is a trim note,
+    /// the diff is advisory, D55) and its last `command_run` output. The template is the snapshot's
+    /// pinned one, else the latest `judge` row (D53); the budget is the judged phase's; every other
+    /// section is empty, and `phase` renders as the **judged** phase's name (blueprint F-G).
+    ///
+    /// The inner `Err` is a [`JudgeFailure`] the caller lands on a judge row: a candidate with no
+    /// recorded prompt or an assembly refusal is `judge_session_failed`, and no template at all is
+    /// `judge_unavailable`.
+    async fn judge_prompts(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        attempt: i32,
+        survivors: &[&RunStep],
+    ) -> Result<Result<JudgePrompts, JudgeFailure>, EngineError> {
+        let item = Self::item_of(run)?;
+        let row = self.item(item).await?;
+        let project = self.project(row.project_id).await?;
+        let mut notes = Vec::new();
+
+        let Some(first) = survivors.first() else {
+            return Ok(Err(JudgeFailure::SessionFailed(
+                "no candidate to judge".to_owned(),
+            )));
+        };
+        let task = self
+            .parts
+            .store
+            .step_events(first.id)
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .find(|event| event.seq == 0 && event.kind == EventKind::Prompt)
+            .and_then(|event| {
+                event
+                    .payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let Some(task) = task else {
+            return Ok(Err(JudgeFailure::SessionFailed(format!(
+                "candidate {} recorded no prompt to replay as the task",
+                first.fanout_index
+            ))));
+        };
+
+        let mut candidates = Vec::with_capacity(survivors.len());
+        for step in survivors {
+            let document =
+                self.output_of(item, phase, step.id)
+                    .await?
+                    .map(|document| InputDocument {
+                        kind: document.kind,
+                        version: document.version,
+                        body: document.body,
+                    });
+            let trees = self.parts.store.step_trees(step.id).await?;
+            let commits = self.parts.store.step_commits(step.id).await?;
+            let diff = match self.parts.isolator.diff(&trees, &commits).await {
+                Ok(diff) => diff,
+                Err(err) => {
+                    notes.push(format!(
+                        "judge_candidate:{} diff unavailable: {err}",
+                        step.fanout_index
+                    ));
+                    None
+                }
+            };
+            let verification_tail = self
+                .parts
+                .store
+                .command_runs(step.id)
+                .await?
+                .pop()
+                .and_then(|row| row.output);
+            candidates.push(JudgeCandidate {
+                fanout_index: step.fanout_index,
+                verify: match step.verify_outcome {
+                    Some(VerifyOutcome::Pass) => Some(true),
+                    Some(VerifyOutcome::Fail) => Some(false),
+                    Some(VerifyOutcome::Unavailable) | None => None,
+                },
+                exit_code: step.verify_exit_code,
+                document,
+                diff,
+                verification_tail,
+            });
+        }
+
+        let pinned = phase
+            .judge
+            .as_ref()
+            .and_then(|judge| judge.template.as_ref());
+        let template = match pinned {
+            Some(pinned) => {
+                self.parts
+                    .graphs
+                    .prompt_template(project.id, &pinned.name, Some(pinned.version))
+                    .await?
+            }
+            None => {
+                self.parts
+                    .graphs
+                    .prompt_template(project.id, JUDGE_TEMPLATE, None)
+                    .await?
+            }
+        };
+        let Some(template) = template else {
+            return Ok(Err(JudgeFailure::Unavailable(format!(
+                "no `{JUDGE_TEMPLATE}` template"
+            ))));
+        };
+
+        let kind = self.item_kind_name(&row).await?;
+        let (caps, _scan, _deadline) = settings::resolve_excerpt_caps(&self.parts.app);
+        let spec = |reverse: bool| PromptSpec {
+            role: TemplateRole::of_name(&template.name),
+            template: TemplateRef {
+                name: template.name.clone(),
+                version: template.version,
+            },
+            body: template.body.clone(),
+            item_key: format!("{}:{}", project.slug, row.key),
+            item_title: row.title.clone(),
+            item_kind: kind.clone(),
+            item_body: row.body.clone(),
+            // Blueprint F-G: the judge body renders `{{phase}}` as the phase being judged; only
+            // the step row carries `<phase>:judge`.
+            phase: phase.name.clone(),
+            output_kind: Some(JUDGE_KIND.to_owned()),
+            attempt,
+            documents: Vec::new(),
+            upstream: Vec::new(),
+            box_profile: self.parts.box_profile.clone(),
+            skills: Vec::new(),
+            excerpts: no_excerpts(caps),
+            command_queue: false,
+            verify_failure: None,
+            previous_diff: None,
+            judge: Some(judge_inputs(task.clone(), candidates.clone(), reverse)),
+            handoff: None,
+            budget: settings::resolve_budget(
+                phase.token_budget,
+                Some(&project.settings),
+                &self.parts.app,
+            ),
+            max_skill_tokens: settings::resolve_max_skill_tokens(&self.parts.app),
+            estimator: TokenEstimator::DEFAULT,
+            notes: notes.clone(),
+        };
+        // The assembler reverses the candidates itself (`prompt/mod.rs:573-580`), so both calls
+        // hand it the same list and differ only in `reverse` (plan D53).
+        let assembled = assemble(&spec(false), self.parts.scrubber)
+            .and_then(|forward| Ok((forward, assemble(&spec(true), self.parts.scrubber)?)));
+        Ok(match assembled {
+            Ok((forward, reversed)) => Ok(JudgePrompts {
+                forward,
+                reversed,
+                template: SnapshotTemplate {
+                    name: template.name.clone(),
+                    version: template.version,
+                },
+            }),
+            Err(err) => Err(JudgeFailure::SessionFailed(err.to_string())),
+        })
+    }
+
+    /// The judge's row and the candidate it runs as (plan D51, blueprint F-I).
+    ///
+    /// `existing` is reused as it is. Otherwise the row is created at `fanout_index = -1`, named
+    /// `<phase>:judge`, whatever the judge's walk says — a judge the walk skips is still created and
+    /// then failed, so the reason is on a row. The inner `Err` is that reason: no `agent` row (the
+    /// row is then created with no agent, which `create_step` would otherwise refuse), no model
+    /// to run, or the walk's own skip with the phase's gate read as `never`, because the judge
+    /// answers no permission.
+    async fn judge_row(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+        attempt: i32,
+        existing: Option<RunStep>,
+    ) -> Result<(RunStep, Result<SnapshotCandidate, JudgeFailure>), EngineError> {
+        let Some(judge) = phase.judge.as_ref() else {
+            let failure = JudgeFailure::Unavailable(HumanReason::NoJudge.to_string());
+            let row = match existing {
+                Some(row) => row,
+                None => self.create_judge(run, phase, attempt, None, None).await?,
+            };
+            return Ok((row, Err(failure)));
+        };
+        let agent = self.parts.graphs.agent(judge.agent_id).await?;
+        let (agent_id, model, choice) = match &agent {
+            None => (
+                None,
+                None,
+                Err(JudgeFailure::Unavailable("no agent row".to_owned())),
+            ),
+            Some(agent) => match judge_candidate(judge, agent) {
+                None => (
+                    Some(agent.id),
+                    None,
+                    Err(JudgeFailure::Unavailable("no model".to_owned())),
+                ),
+                Some(candidate) => {
+                    let walk = self
+                        .walk_candidates(
+                            run,
+                            snapshot,
+                            core::slice::from_ref(&candidate),
+                            Gate::Never,
+                        )
+                        .await?;
+                    let model = Some(candidate.model.clone());
+                    let choice = match walk.skipped.first() {
+                        Some(skipped) => Err(JudgeFailure::Unavailable(skipped.cause.to_string())),
+                        None => Ok(candidate),
+                    };
+                    (Some(agent.id), model, choice)
+                }
+            },
+        };
+        let row = match existing {
+            Some(row) => row,
+            None => {
+                self.create_judge(run, phase, attempt, agent_id, model)
+                    .await?
+            }
+        };
+        Ok((row, choice))
+    }
+
+    /// `create_step` for a judge: `fanout_index = -1` at the group's slot, `<phase>:judge`.
+    async fn create_judge(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        attempt: i32,
+        agent_id: Option<htui_core::model::AgentId>,
+        model: Option<String>,
+    ) -> Result<RunStep, EngineError> {
+        Ok(self
+            .parts
+            .store
+            .create_step(NewRunStep {
+                id: StepId::new(),
+                run_id: run.id,
+                position: phase.position,
+                attempt,
+                fanout_index: JUDGE_FANOUT_INDEX,
+                phase_name: judge_phase_name(&phase.name),
+                agent_id,
+                model,
+            })
+            .await?)
+    }
+
+    /// The judge's two sessions under one recorder (plan D52), and the document each wrote.
+    ///
+    /// The judge runs in no tree: `prepare(…, &[], Local, None)` gives a scratch `cwd` and no row
+    /// (D51). The forward text is `record_prompt` at seq 0 — `prompt_digest` and `set_step_prompt`
+    /// are the forward prompt's — and the reversed text is a `follow_up` opening turn 1. The
+    /// recorder is finished on every path; a cap breach over the two is `judge_session_failed`.
+    async fn judge_sessions(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        attempt: i32,
+        judge: &RunStep,
+        candidate: &SnapshotCandidate,
+        prompts: &JudgePrompts,
+    ) -> Result<Result<[Document; 2], JudgeFailure>, EngineError> {
+        let prepared = self
+            .parts
+            .isolator
+            .prepare(run.id, judge.id, &[], Isolation::Local, None)
+            .await?;
+        let trim = serde_json::to_value(&prompts.forward.trim).map_err(|err| {
+            htui_agent::RecordError::Encode(format!("the judge's trim record: {err}"))
+        })?;
+        self.parts
+            .store
+            .set_step_prompt(judge.id, &prompts.forward.digest, &trim)
+            .await?;
+        let jp = judge_phase(phase, prompts.template.clone(), candidate);
+
+        let mut recorder = self.open_recorder(run, judge, &prompts.forward).await?;
+        let calls = self
+            .judge_calls(run, &jp, attempt, judge, prompts, &prepared, &mut recorder)
+            .await;
+        let finished = recorder.finish().await;
+        let documents = match calls? {
+            Ok(documents) => documents,
+            Err(failure) => return Ok(Err(failure)),
+        };
+        if let Some(breach) = finished?.cap_breach {
+            return Ok(Err(JudgeFailure::SessionFailed(format!(
+                "{} ({breach:?})",
+                gate::StepFailure::CapBreached
+            ))));
+        }
+        Ok(Ok(documents))
+    }
+
+    /// Call 0 and call 1 of [`judge_sessions`](Self::judge_sessions): each drives a fresh session
+    /// keyed `(<phase>:judge, attempt, -1, call)`, hands its `done` to the sink, and reads the
+    /// newest `judge` document the judge step wrote — which must be **new** after each call.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the judge's row and phase, its two prompts, its tree and the recorder both calls \
+                  share; bundling them would name a struct used here only"
+    )]
+    async fn judge_calls(
+        &self,
+        run: &Run,
+        jp: &SnapshotPhase,
+        attempt: i32,
+        judge: &RunStep,
+        prompts: &JudgePrompts,
+        prepared: &crate::isolate::Prepared,
+        recorder: &mut Recorder<'a, S>,
+    ) -> Result<Result<[Document; 2], JudgeFailure>, EngineError> {
+        let item = Self::item_of(run)?;
+        let mut documents: Vec<Document> = Vec::with_capacity(2);
+        for (call, text) in [(0, &prompts.forward.text), (1, &prompts.reversed.text)] {
+            if call > 0 {
+                recorder.record_follow_up(text, self.now()).await?;
+            }
+            let key = SessionKey {
+                phase: &judge.phase_name,
+                attempt,
+                fanout_index: judge.fanout_index,
+                call,
+            };
+            let done = match self
+                .drive_once(
+                    run,
+                    judge,
+                    jp,
+                    &key,
+                    text,
+                    prepared.cwd.clone(),
+                    prepared.extra_dirs.clone(),
+                    recorder,
+                )
+                .await?
+            {
+                Ok(done) => done,
+                Err(err) => return Ok(Err(JudgeFailure::SessionFailed(err.to_string()))),
+            };
+            self.parts
+                .sink
+                .after_done(item, judge, jp, &key, &done)
+                .await?;
+            let document = self.output_of(item, jp, judge.id).await?;
+            match document {
+                Some(document) if !documents.iter().any(|seen| seen.id == document.id) => {
+                    documents.push(document);
+                }
+                _ => return Ok(Err(JudgeFailure::MissingDocument { call })),
+            }
+        }
+        let [forward, reversed]: [Document; 2] =
+            documents.try_into().map_err(|_| EngineError::Snapshot {
+                run: run.id,
+                reason: "the judge's two calls did not yield two documents".to_owned(),
+            })?;
+        Ok(Ok([forward, reversed]))
+    }
+
+    /// Plan D51's failure: the judge `running -> awaiting_approval`, then `answer_gate(Rejected,
+    /// reason)` → `failed` with the reason as its `gate_note` — the two writes `gate::apply` uses
+    /// for an automatic review rejection, and the only way a `gate_note` reaches a failed row —
+    /// then D50's park, naming the same reason.
+    async fn fail_judge(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        attempt: i32,
+        judge: &RunStep,
+        slot: &[RunStep],
+        failure: JudgeFailure,
+    ) -> Result<Rest, EngineError> {
+        let now = self.now();
+        self.parts
+            .store
+            .transition_step(
+                judge.id,
+                StepStatus::Running,
+                StepStatus::AwaitingApproval,
+                now,
+            )
+            .await?;
+        self.parts
+            .store
+            .answer_gate(
+                judge.id,
+                GateOutcome::Rejected,
+                Some(failure.to_string()),
+                now,
+            )
+            .await?;
+        let reason = HumanReason::JudgeFailed(failure).to_string();
+        self.park_selection(run, phase, attempt, slot, &reason)
+            .await
+    }
+
     // -- plan D25's reconcile and plan D36's cleanup -------------------------------------------
 
     /// After a step reached `done` and before the walk advances: the winner into the primary tree
@@ -1701,18 +2910,7 @@ where
             // §4.5's ranker needs a resolved repo root and `repo_box_path` has no writer the walk
             // can reach, so the audit records the caps a pass *would* have run under and nothing
             // else — the shape `crates/htui/src/preview.rs:274-295` already ships.
-            excerpts: ExcerptSet {
-                files: Vec::new(),
-                audit: ExcerptAudit {
-                    provider_set: vec![BUILTIN_ID.to_owned()],
-                    roots: Vec::new(),
-                    considered: 0,
-                    selected: 0,
-                    caps,
-                    files: Vec::new(),
-                },
-                notes: Vec::new(),
-            },
+            excerpts: no_excerpts(caps),
             command_queue: phase.command_queue != htui_core::model::CommandQueue::Off,
             // Plan D67: what the previous attempt's winner left — its failed verify and its diff —
             // forwarded to a phase step's next attempt; `None` on attempt 1 and for a judge.
@@ -1982,7 +3180,9 @@ where
         let steps = self.parts.store.run_steps(run.id).await?;
         let position = match cursor(&snapshot, &steps) {
             Cursor::Finished => None,
-            Cursor::Create { position, .. } => Some(position),
+            Cursor::Create { position, .. }
+            | Cursor::Fan { position, .. }
+            | Cursor::Select { position, .. } => Some(position),
             Cursor::Run(step) | Cursor::Rest { step, .. } => steps
                 .iter()
                 .find(|row| row.id == step)
@@ -2183,6 +3383,75 @@ where
     }
 }
 
+/// One fan-out candidate's inputs to [`Engine::run_candidate`]: everything its stages 2 to 5 read
+/// that the group shares (plan D58).
+#[derive(Debug, Clone, Copy)]
+struct CandidateStage<'s> {
+    /// The run, re-read by the group's pass.
+    run: &'s Run,
+    /// The fanned-out phase.
+    phase: &'s SnapshotPhase,
+    /// The candidate, still `pending`.
+    step: &'s RunStep,
+    /// The group's one assembled prompt.
+    prompt: &'s AssembledPrompt,
+    /// The group's base per repo (plan D54(a)).
+    base: &'s BTreeMap<RepoId, String>,
+}
+
+/// The judge's two orderings and the template they were assembled from (plan D52, D53).
+#[derive(Debug)]
+struct JudgePrompts {
+    /// Call 0: the survivors in `fanout_index` order.
+    forward: AssembledPrompt,
+    /// Call 1: the same survivors reversed.
+    reversed: AssembledPrompt,
+    /// The `judge` row the prompts rendered, as the judge phase's template.
+    template: SnapshotTemplate,
+}
+
+/// The `fanout_index` of a candidate the judge prompt's trimmer dropped outright (plan D53).
+fn dropped_candidate(forward: &AssembledPrompt) -> Option<i32> {
+    forward
+        .trim
+        .sections
+        .iter()
+        .find_map(|section| match section.name {
+            SectionName::JudgeCandidate(index) if section.strategy == TrimStrategy::Dropped => {
+                Some(index)
+            }
+            _ => None,
+        })
+}
+
+/// Plan D52's verdict over the two calls' documents: each must parse, name one of `survivors`,
+/// and agree with the other. The reason is call 0's for the winner, else `judge: <winner>`.
+fn decide(documents: &[Document; 2], survivors: &[i32]) -> Result<(i32, String), JudgeFailure> {
+    let [forward, reversed] = documents;
+    let forward = parse_judge_verdict(&forward.body)?;
+    let reversed = parse_judge_verdict(&reversed.body)?;
+    for verdict in [&forward, &reversed] {
+        if !survivors.contains(&verdict.winner) {
+            return Err(JudgeFailure::OutOfRange {
+                winner: verdict.winner,
+                survivors: survivors.to_vec(),
+            });
+        }
+    }
+    if forward.winner != reversed.winner {
+        return Err(JudgeFailure::Disagreement {
+            forward: forward.winner,
+            reversed: reversed.winner,
+        });
+    }
+    let reason = forward
+        .reasons
+        .get(&forward.winner.to_string())
+        .cloned()
+        .unwrap_or_else(|| format!("judge: {}", forward.winner));
+    Ok((forward.winner, reason))
+}
+
 /// Everything [`Engine::verify`] reads, as a struct rather than seven arguments.
 ///
 /// [`crate::gate::SettleInput`]'s own reason, one stage earlier: the order the checks happen in is
@@ -2240,6 +3509,26 @@ fn min_budget(app: &BTreeMap<String, Value>) -> i64 {
         .and_then(Value::as_i64)
         .filter(|micros| *micros > 0)
         .unwrap_or(0)
+}
+
+/// An excerpt set with no files whose audit records the caps a pass *would* have run under.
+///
+/// §4.5's ranker needs a resolved repo root and `repo_box_path` has no writer the walk can reach,
+/// so this is the shape `crates/htui/src/preview.rs:274-295` already ships — for a phase step and,
+/// with nothing to rank at all, for the judge (plan D53).
+fn no_excerpts(caps: htui_core::prompt::excerpt::ExcerptCaps) -> ExcerptSet {
+    ExcerptSet {
+        files: Vec::new(),
+        audit: ExcerptAudit {
+            provider_set: vec![BUILTIN_ID.to_owned()],
+            roots: Vec::new(),
+            considered: 0,
+            selected: 0,
+            caps,
+            files: Vec::new(),
+        },
+        notes: Vec::new(),
+    }
 }
 
 /// The rows `walk` skipped that rank above `chosen` in `phase.candidates` (plan D60).
@@ -2726,6 +4015,199 @@ mod tests {
                 .expect("no panic holds the selector's lock"),
             [0],
             "a `fan_out = 1` phase asks once, for index 0"
+        );
+    }
+
+    /// Plan D71 across a group: the selector is asked once per `fanout_index`, every index before
+    /// any row is written (blueprint F-K), and each candidate row carries **its own** answer — so a
+    /// selector keyed on the index spreads one group over two agents with no other change.
+    #[tokio::test]
+    async fn a_fanout_keyed_selector_may_choose_differently_per_index() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.fan_out = 2;
+                }
+            })
+            .await;
+        let orch = &harness.orch;
+        orch.with_candidates(
+            "prd",
+            vec![
+                (ids::AGENT_CLAUDE, "sonnet"),
+                (ids::AGENT_AGY, "gemini-3.7-flash-high"),
+            ],
+        );
+
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let selector = IndexSelector::default();
+        let engine = super::Engine::new(super::EngineParts {
+            store: &orch.store,
+            graphs: &graphs,
+            isolator: &orch.isolator,
+            verifier: &orch.verifier,
+            clock: &orch.clock,
+            selector: &selector,
+            sink: orch,
+            driver: &driver,
+            scrubber: &scrubber,
+            app: orch
+                .store
+                .app_settings()
+                .await
+                .expect("MemStore never fails a read"),
+            box_profile: orch
+                .store
+                .box_profile(orch.box_id())
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the demo fixture seeds this box"),
+            box_id: orch.box_id(),
+            owner: orch.owner(),
+            user: orch.user(),
+        });
+
+        let CommandOutcome::Started { run, rest } = engine
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(0)),
+            "an `always` group parks for a human selection (plan D49(2))"
+        );
+        let steps = orch.steps(run).await;
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step.fanout_index, step.agent_id, step.status))
+                .collect::<Vec<_>>(),
+            [
+                (0, Some(ids::AGENT_AGY), StepStatus::Done),
+                (1, Some(ids::AGENT_CLAUDE), StepStatus::Done),
+            ],
+            "each candidate is its own selection, and both ran"
+        );
+        assert_eq!(
+            *selector
+                .asked
+                .lock()
+                .expect("no panic holds the selector's lock"),
+            [0, 1],
+            "asked once per index, in index order"
+        );
+    }
+
+    /// Plan D65, blueprint F-D: `RetryStep` on any member of a parked group retires the whole slot
+    /// and admits the whole group again at `attempt + 1`; out of budget, the guard refuses and
+    /// nothing is written.
+    #[tokio::test]
+    async fn retry_on_a_parked_group_retries_the_whole_group() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.fan_out = 2;
+                    phase.retry_limit = 1;
+                }
+            })
+            .await;
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(0)),
+            "an `always` group parks for a human"
+        );
+        let member = harness
+            .orch
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|step| step.fanout_index == 1)
+            .expect("the group has index 1")
+            .id;
+
+        let outcome = harness
+            .dispatch(Command::RetryStep { run, step: member })
+            .await
+            .expect("a parked group retries as a whole");
+        let CommandOutcome::Retried { step, rest } = outcome else {
+            panic!("`RetryStep` answers `Retried`, not {outcome:?}");
+        };
+        assert_eq!(step, member);
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(0)),
+            "attempt 2's group parks again"
+        );
+        let steps = harness.orch.steps(run).await;
+        let slot = |attempt: i32| {
+            steps
+                .iter()
+                .filter(|step| step.position == 0 && step.attempt == attempt)
+                .map(|step| (step.fanout_index, step.status))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            slot(1),
+            [(0, StepStatus::Superseded), (1, StepStatus::Superseded)],
+            "the whole slot was retired, not the one member named"
+        );
+        assert_eq!(
+            slot(2),
+            [(0, StepStatus::Done), (1, StepStatus::Done)],
+            "the whole group was admitted again"
+        );
+
+        let before = harness.orch.steps(run).await;
+        let stale = harness
+            .dispatch(Command::RetryStep { run, step: member })
+            .await
+            .expect_err("a member of the retired slot names nothing to retry");
+        assert!(
+            matches!(stale, EngineError::NotGated { step, .. } if step == member),
+            "{stale}"
+        );
+        let current = before
+            .iter()
+            .find(|step| step.attempt == 2 && step.fanout_index == 0)
+            .expect("attempt 2 has index 0")
+            .id;
+        let refused = harness
+            .dispatch(Command::RetryStep { run, step: current })
+            .await
+            .expect_err("attempt 3 is out of budget");
+        assert!(
+            matches!(refused, EngineError::RetryExhausted { attempt: 2, .. }),
+            "{refused}"
+        );
+        assert_eq!(
+            harness.orch.steps(run).await,
+            before,
+            "and nothing was written"
         );
     }
 

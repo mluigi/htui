@@ -9,11 +9,11 @@ use core::fmt;
 
 use htui_core::model::{GraphSnapshot, RunStep, StepId, StepStatus};
 
-/// The only `run_step.fanout_index` milestone 2 walks.
+/// The `run_step.fanout_index` a `fan_out = 1` phase walks, and the one every fan-out slot has.
 ///
-/// Fan-out is milestone 4's: it adds candidates at `1..fan_out` and a judge at `-1`
-/// (`docs/ANA-2.md` §4.5), and until then a run has exactly one step per `(position, attempt)`.
-/// Named rather than spelled `0` at each of the three sites so milestone 4 can find them.
+/// A fanned-out phase holds candidates at `0..fan_out` and a judge at `-1` (`docs/ANA-2.md` §4.5);
+/// [`cursor`] reads such a slot as a group (plan D59), while [`latest_at`], [`next_attempt`] and
+/// [`winner_at`]'s fallback keep reading index 0, which a group created whole always holds.
 const WALKED_FANOUT_INDEX: i32 = 0;
 
 /// ANA-2 §4.2's retry admission, read prospectively (plan D3): may `next_attempt` be *created*?
@@ -117,14 +117,30 @@ pub enum Cursor {
         /// Its status, so the caller need not read the row again.
         status: StepStatus,
     },
+    /// Plan D59: a fan-out slot with fewer than `fan_out` candidates, or with one still
+    /// `pending`: the engine creates the missing indices and drives the group together.
+    Fan {
+        /// `run_step.position` of the slot.
+        position: i32,
+        /// `run_step.attempt` of the slot.
+        attempt: i32,
+    },
+    /// Plan D59: every candidate of a fan-out slot settled and none is `selected`: route the
+    /// group (plan D49) — a winner, the judge, a human, or the group's failure.
+    Select {
+        /// `run_step.position` of the slot.
+        position: i32,
+        /// `run_step.attempt` of the slot.
+        attempt: i32,
+    },
     /// Every position of the snapshot has a `done` step at its latest attempt.
     Finished,
 }
 
 /// The latest-attempt step at `position`, or `None` when the walk has not reached it.
 ///
-/// Only `fanout_index = 0` is considered; fan-out's other indices and its `-1` judge step are
-/// milestone 4's.
+/// Only `fanout_index = 0` is considered: a `fan_out = 1` phase's one row, or any slot's first
+/// candidate. [`cursor`] reads a fanned-out slot whole (plan D59).
 #[must_use]
 pub fn latest_at(steps: &[RunStep], position: i32) -> Option<&RunStep> {
     steps
@@ -197,6 +213,9 @@ pub fn winner_at(steps: &[RunStep], position: i32, attempt: i32) -> Option<&RunS
 /// [`Cursor::Create`] at [`next_attempt`] — the lazy re-insertion plan D5's review loop relies on,
 /// which supersedes the chain and leaves the creating to the walk.
 ///
+/// A phase with `fan_out > 1` is read as a slot (plan D59, `group_cursor`); a `fan_out = 1`
+/// phase is read exactly as it was before fan-out, at `fanout_index 0`.
+///
 /// Every status a row can hold is matched, including the ones §4.3 would not have produced: MOD-2
 /// inserts `run_step` rows outside the status law on purpose, so the walk must never assume a row
 /// passed through `can_move_to` (plan D17).
@@ -204,6 +223,12 @@ pub fn winner_at(steps: &[RunStep], position: i32, attempt: i32) -> Option<&RunS
 pub fn cursor(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Cursor {
     for phase in &snapshot.phases {
         let position = phase.position;
+        if phase.fan_out > 1 {
+            match group_cursor(steps, position, phase.fan_out) {
+                Some(stop) => return stop,
+                None => continue,
+            }
+        }
         let Some(step) = latest_at(steps, position) else {
             return Cursor::Create {
                 position,
@@ -228,6 +253,62 @@ pub fn cursor(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Cursor {
         }
     }
     Cursor::Finished
+}
+
+/// Plan D59 for one fanned-out position; `None` when the slot is complete and the walk goes on.
+///
+/// The order is load-bearing (blueprint §9.3, H-14): a `selected` `done` candidate completes the
+/// position before anything else is read; a slot retired whole is re-created at `attempt + 1`; a
+/// `running` candidate or judge rests the walk before a `pending` sibling is driven; a short or
+/// `pending` slot is driven; anything else is settled and goes to selection.
+///
+/// The slot's attempt is the highest over its candidates (every `fanout_index >= 0` row) rather
+/// than [`latest_at`]'s index-0 reading, which agrees whenever a group was created whole (plan
+/// D71, blueprint F-K) and cannot split a slot when one was not.
+fn group_cursor(steps: &[RunStep], position: i32, fan_out: i32) -> Option<Cursor> {
+    let Some(attempt) = steps
+        .iter()
+        .filter(|step| step.position == position && step.fanout_index >= 0)
+        .map(|step| step.attempt)
+        .max()
+    else {
+        return Some(Cursor::Create {
+            position,
+            attempt: 1,
+        });
+    };
+    let group = group_at(steps, position, attempt);
+    if group
+        .iter()
+        .any(|step| step.selected == Some(true) && step.status == StepStatus::Done)
+    {
+        return None;
+    }
+    if group
+        .iter()
+        .all(|step| matches!(step.status, StepStatus::Superseded | StepStatus::Cancelled))
+    {
+        return Some(Cursor::Create {
+            position,
+            attempt: attempt + 1,
+        });
+    }
+    if let Some(live) = group
+        .iter()
+        .copied()
+        .chain(judge_at(steps, position, attempt))
+        .find(|step| step.status == StepStatus::Running)
+    {
+        return Some(Cursor::Rest {
+            step: live.id,
+            status: live.status,
+        });
+    }
+    let short = i32::try_from(group.len()).is_ok_and(|len| len < fan_out);
+    if short || group.iter().any(|step| step.status == StepStatus::Pending) {
+        return Some(Cursor::Fan { position, attempt });
+    }
+    Some(Cursor::Select { position, attempt })
 }
 
 #[cfg(test)]
@@ -505,10 +586,16 @@ mod tests {
         }
     }
 
-    /// Only `fanout_index = 0` is walked this milestone: `RUN_3`'s judge step would be `-1` and
-    /// its losers `1..n`, and milestone 4 is what teaches the cursor about them.
+    /// Plan D59: a `fan_out = 1` phase is walked exactly as before fan-out — its cursor reads
+    /// `fanout_index 0` only. `RUN_1`'s `review` has `fan_out = 1`, so a stray index-1 row at a
+    /// later attempt (the shape of a loser or a judge) does not move the cursor off `Finished`.
     #[test]
     fn cursor_reads_the_zeroth_fanout_index_only() {
+        let snapshot = snapshot();
+        assert_eq!(
+            snapshot.phases[3].fan_out, 1,
+            "the fixture's `review` is single"
+        );
         let mut steps = steps_of(ids::RUN_1);
         let mut loser = steps[3].clone();
         loser.id = ids::STEP_R3_RESEARCH_B;
@@ -517,9 +604,143 @@ mod tests {
         loser.status = StepStatus::Superseded;
         steps.push(loser);
         assert_eq!(
-            cursor(&snapshot(), &steps),
+            cursor(&snapshot, &steps),
             Cursor::Finished,
-            "a non-zero fan-out index is not the walk's cursor"
+            "a non-zero fan-out index is not a `fan_out = 1` phase's cursor"
+        );
+    }
+
+    /// `RUN_1`'s snapshot with `prd` (position 0) fanned out three ways, and `RUN_1`'s steps with
+    /// its `prd` row replaced by `group`: one candidate per `(fanout_index, status, selected)`.
+    fn fanned(group: &[(i32, StepStatus, Option<bool>)]) -> (GraphSnapshot, Vec<RunStep>) {
+        let mut snapshot = snapshot();
+        snapshot.phases[0].fan_out = 3;
+        let mut steps = steps_of(ids::RUN_1);
+        let prd = steps.remove(0);
+        assert_eq!(prd.position, 0, "the first `RUN_1` row is `prd`");
+        for (index, status, selected) in group {
+            let mut candidate = prd.clone();
+            candidate.id = StepId::new();
+            candidate.fanout_index = *index;
+            candidate.status = *status;
+            candidate.selected = *selected;
+            steps.push(candidate);
+        }
+        (snapshot, steps)
+    }
+
+    /// Plan D59's `Fan`: a group with a `pending` candidate, or with fewer than `fan_out`, is
+    /// driven — the walk does not run index 0 alone and wait on the rest.
+    #[test]
+    fn cursor_drives_an_incomplete_group() {
+        let (snapshot, steps) = fanned(&[
+            (0, StepStatus::Done, None),
+            (1, StepStatus::Pending, None),
+            (2, StepStatus::Pending, None),
+        ]);
+        assert_eq!(
+            cursor(&snapshot, &steps),
+            Cursor::Fan {
+                position: 0,
+                attempt: 1
+            },
+            "a `pending` candidate is driven with its group"
+        );
+
+        let (snapshot, steps) = fanned(&[(0, StepStatus::Done, None), (1, StepStatus::Done, None)]);
+        assert_eq!(
+            cursor(&snapshot, &steps),
+            Cursor::Fan {
+                position: 0,
+                attempt: 1
+            },
+            "two of three: the missing index is created by the drive"
+        );
+    }
+
+    /// Plan D59's `Select`: every candidate settled — `done` or `failed` — and none selected.
+    #[test]
+    fn cursor_selects_a_settled_group() {
+        let (snapshot, steps) = fanned(&[
+            (0, StepStatus::Done, None),
+            (1, StepStatus::Failed, None),
+            (2, StepStatus::Done, None),
+        ]);
+        assert_eq!(
+            cursor(&snapshot, &steps),
+            Cursor::Select {
+                position: 0,
+                attempt: 1
+            }
+        );
+    }
+
+    /// A `selected` `done` candidate completes the position, wherever it sits in the group — here
+    /// at index 2, with index 0 a superseded loser the old cursor would have re-created.
+    #[test]
+    fn cursor_passes_a_selected_group() {
+        let (snapshot, steps) = fanned(&[
+            (0, StepStatus::Superseded, Some(false)),
+            (1, StepStatus::Superseded, Some(false)),
+            (2, StepStatus::Done, Some(true)),
+        ]);
+        assert_eq!(cursor(&snapshot, &steps), Cursor::Finished);
+    }
+
+    /// A group retired whole — superseded by the review loop or cancelled by a retry — is "no
+    /// live slot here", and the next attempt is created.
+    #[test]
+    fn cursor_creates_the_next_attempt_after_a_retired_group() {
+        let (snapshot, steps) = fanned(&[
+            (0, StepStatus::Superseded, Some(false)),
+            (1, StepStatus::Cancelled, Some(false)),
+            (2, StepStatus::Superseded, Some(true)),
+        ]);
+        assert_eq!(
+            cursor(&snapshot, &steps),
+            Cursor::Create {
+                position: 0,
+                attempt: 2
+            }
+        );
+    }
+
+    /// Blueprint H-14: a `running` candidate or a `running` judge rests the walk, and a `running`
+    /// candidate outranks a `pending` sibling — one call never drives half a group twice.
+    #[test]
+    fn a_running_judge_rests() {
+        let (snapshot, mut steps) = fanned(&[
+            (0, StepStatus::Done, None),
+            (1, StepStatus::Done, None),
+            (2, StepStatus::Done, None),
+        ]);
+        let mut judge = steps[steps.len() - 1].clone();
+        judge.id = StepId::new();
+        judge.fanout_index = -1;
+        judge.status = StepStatus::Running;
+        steps.push(judge.clone());
+        assert_eq!(
+            cursor(&snapshot, &steps),
+            Cursor::Rest {
+                step: judge.id,
+                status: StepStatus::Running
+            }
+        );
+
+        let (snapshot, steps) = fanned(&[
+            (0, StepStatus::Running, None),
+            (1, StepStatus::Pending, None),
+            (2, StepStatus::Pending, None),
+        ]);
+        assert!(
+            matches!(
+                cursor(&snapshot, &steps),
+                Cursor::Rest {
+                    status: StepStatus::Running,
+                    ..
+                }
+            ),
+            "a live candidate rests the walk before its pending siblings are driven"
         );
     }
 }
