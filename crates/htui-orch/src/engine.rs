@@ -7662,6 +7662,70 @@ mod tests {
         );
     }
 
+    /// Plan D132 (review H3): `answer_gate` wrote its answer and the process died before its
+    /// `unpark`, so the run is `awaiting_approval` over a `done` step that no guard accepts again.
+    /// `resume` unparks it, reconciles the answered step it never merged, and walks on to the
+    /// next gate.
+    #[tokio::test]
+    async fn a_crash_between_the_answer_and_the_unpark_is_resumed() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(prd, GateOutcome::Approved, None, harness.orch.clock.now())
+                .await
+                .expect("MemStore takes the answer"),
+            "the answer landed and the unpark did not"
+        );
+
+        let resumed = harness.resume(run).await.expect("the walk resumes");
+        assert_eq!(
+            resumed,
+            Resume::Walked(crate::command::Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(1),
+                failure: None,
+            })
+        );
+        assert_eq!(
+            harness.orch.isolator.reconciles(),
+            [(prd, Vec::new())],
+            "the answered step is merged once"
+        );
+        let steps = harness.orch.steps(run).await;
+        assert!(
+            steps.iter().any(
+                |step| step.phase_name == "plan" && step.status == StepStatus::AwaitingApproval
+            ),
+            "the walk reached `plan`'s gate: {steps:?}"
+        );
+    }
+
+    /// Plan D132's other half: a run parked at a real gate is left parked by `resume`, and its
+    /// lease is given back.
+    #[tokio::test]
+    async fn resume_leaves_a_run_parked_at_a_gate_parked() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+
+        let resumed = harness.resume(run).await.expect("the walk resumes");
+        assert_eq!(
+            resumed,
+            Resume::Walked(crate::command::Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(0),
+                failure: None,
+            })
+        );
+        assert!(harness.orch.isolator.reconciles().is_empty());
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].id, prd);
+        assert_eq!(steps[0].status, StepStatus::AwaitingApproval);
+    }
+
     /// Plan D83 through `start_run`: a real refusal's `Display` names the holding run and the
     /// rule, and the refused run stays `queued`.
     #[tokio::test]
