@@ -49,7 +49,11 @@ round; the architect and the reviewer stay plain agents.
 and CONFIRMED by the maintainer 2026-09-23; OQ-1..OQ-11 take the adopted default.** The two falsified claims changed design: C10 rewrote D82 and added
 OQ-11/R-20; C129 redefined D97's frontier and added a T7 case. The independence check added
 D104–D106 and reshaped the waves. Branch `mod-4-m5`, cut from `main` at
-`d854ff1`.
+`d854ff1`. **Blueprint ACCEPTED by the maintainer 2026-09-23**
+(`mod-4-orch-lease.blueprint.md`, D107–D120): every finding F-A..F-W is
+accepted with its fix, and every proposed change A-1..A-8 is accepted. A-8
+supersedes F-C's test rewrite and closes R-21; R-22, R-23 and R-24 are not
+incurred. Implementation in progress.
 
 **Graphify note**: `graphify-out/GRAPH_REPORT.md` was built from `3e34610` (`GRAPH_REPORT.md:12`),
 which predates `htui-orch` and the `0003`/`0004` migrations (`git ls-tree 3e34610
