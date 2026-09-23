@@ -617,6 +617,76 @@ mod tests {
         );
     }
 
+    /// D60's rules are "first match wins": where two rules would skip one candidate, the earlier
+    /// one is the recorded cause, and that choice decides D62's `only_inline_approval`.
+    #[test]
+    fn the_first_matching_rule_is_the_cause() {
+        let agents = agents();
+        let exhausted = || {
+            let mut row = box_row(ids::AGENT_CLAUDE_CLI);
+            row.quota = Some(quota_document(Some("allowed"), true, &[]));
+            row
+        };
+
+        // Rule 1 before rule 2: a ghost with an exhausted box row has no agent row.
+        let ghost = AgentId::new();
+        let ghost_candidates = [candidate(ghost, "ghost")];
+        let mut ghost_row = exhausted();
+        ghost_row.agent_id = ghost;
+        let boxes = boxes_of([ghost_row]);
+        let walked = walk(&input(&ghost_candidates, &agents, &boxes));
+        assert_eq!(first_cause(&walked), &SkipCause::NoAgentRow, "rule 1 before 2");
+
+        // Rule 2 before rule 3: a gated cli row with an exhausted quota is a quota skip.
+        let cli = [candidate(ids::AGENT_CLAUDE_CLI, "claude-cli")];
+        let boxes = boxes_of([exhausted()]);
+        let walked = walk(&SelectInput {
+            gate_effective: Gate::Always,
+            ..input(&cli, &agents, &boxes)
+        });
+        assert_eq!(
+            first_cause(&walked),
+            &SkipCause::Quota(SkipReason::Exhausted),
+            "rule 2 before 3"
+        );
+        assert!(!walked.only_inline_approval(), "a quota skip is no refusal");
+
+        // Rule 3 before rule 4: a gated, disabled cli row is the interlock.
+        let mut disabled = agents.clone();
+        disabled
+            .get_mut(&ids::AGENT_CLAUDE_CLI)
+            .expect("the fixture seeds claude-cli")
+            .enabled = false;
+        let none = BTreeMap::new();
+        let walked = walk(&SelectInput {
+            gate_effective: Gate::Always,
+            ..input(&cli, &disabled, &none)
+        });
+        assert_eq!(
+            first_cause(&walked),
+            &SkipCause::InlineApproval,
+            "rule 3 before 4"
+        );
+        assert!(walked.only_inline_approval());
+
+        // Rule 4 before rule 5: a failed probe on a short budget is not ready.
+        let acp = [candidate(ids::AGENT_CLAUDE, "claude")];
+        let mut failed = box_row(ids::AGENT_CLAUDE);
+        failed.probe = Some(probe("failed"));
+        let boxes = boxes_of([failed]);
+        let walked = walk(&SelectInput {
+            spent_micros: Some(900),
+            cap_micros: Some(1_000),
+            min_budget_micros: 200,
+            ..input(&acp, &agents, &boxes)
+        });
+        assert_eq!(
+            first_cause(&walked),
+            &SkipCause::NotReady("probe failed".to_owned()),
+            "rule 4 before 5"
+        );
+    }
+
     #[test]
     fn run_spend_sums_cost_micros() {
         let template = demo_data()
