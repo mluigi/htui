@@ -1239,7 +1239,9 @@ where
     /// answer is ignored and an error is warned; neither is raised.
     ///
     /// Plan D140: a release that fails puts the run in [`DeadWalks`], and the next
-    /// [`Self::sweep`] tries again. Any answer from the store takes the run out.
+    /// [`Self::sweep`] tries again. Any answer from the store takes the run out. Plan D151:
+    /// `NotFound { entity: "run" }` is such an answer: the row is gone, so no lease is left to
+    /// give back, and the run leaves the set with a `warn`.
     async fn release_lease(&self, run: RunId) {
         match self
             .parts
@@ -1249,6 +1251,10 @@ where
         {
             // `false`: the lease is no longer ours, so there is nothing of ours to give back.
             Ok(_) => self.parts.dead_walks.remove(run),
+            Err(err @ StoreError::NotFound { entity: "run", .. }) => {
+                tracing::warn!(%run, %err, "releasing the lease found no run; nothing to give back");
+                self.parts.dead_walks.remove(run);
+            }
             Err(err) => {
                 tracing::warn!(%run, %err, "releasing the lease failed; the next sweep retries it");
                 self.parts.dead_walks.insert(run);
