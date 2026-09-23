@@ -3283,6 +3283,55 @@ mod tests {
         );
     }
 
+    /// Plan D137 (review K1), D121's guard on the slot reset: a sibling removed `f` and left the
+    /// checkout there, and the maintainer then created an untracked `f`. `is_dirty` does not see
+    /// it, but `reset --hard <base>` would write the base's `f` over it, so the next sibling's
+    /// `prepare` refuses `dirty_tree_not_reset` and leaves both the file and `HEAD` alone.
+    #[tokio::test]
+    async fn a_slot_reset_refuses_an_untracked_file_at_a_path_the_base_tracks() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+        let base = isolator.base(&[core]).await.expect("the base reads");
+        let moved = commit_removal(&core_path, "f", "a sibling removes f");
+        std::fs::write(core_path.join("f"), "the maintainer's new f\n")
+            .expect("an untracked f is written");
+
+        let err = isolator
+            .prepare(
+                RunId::new(),
+                StepId::new(),
+                &[core],
+                Isolation::SharedSerialized,
+                Some(slot(1, 2, &base)),
+            )
+            .await
+            .expect_err("the untracked file is not overwritten");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "isolation refused: dirty_tree_not_reset: {}",
+                core_path.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("f")).expect("the file reads"),
+            "the maintainer's new f\n",
+            "the untracked file survives"
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            moved,
+            "and nothing was reset"
+        );
+    }
+
     /// D72: every checkout of the scope is read for dirtiness before any is reset, so a dirty
     /// second repository leaves the first — clean, but off the base — exactly where it was.
     #[tokio::test]
@@ -3537,6 +3586,44 @@ mod tests {
             crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
             moved,
             "and nothing was reset"
+        );
+    }
+
+    /// Plan D137 (review K1), D121's guard on the in-place reconcile: sibling 0 won with `g`,
+    /// sibling 1 committed nothing and left the checkout at the base, and the maintainer then
+    /// created an untracked `g`. Moving the branch to the winner's label would write the label's
+    /// `g` over it, so the reconcile refuses `dirty_tree_not_reset` and moves nothing.
+    #[tokio::test]
+    async fn shared_serialized_reconcile_refuses_an_untracked_file_the_winners_label_tracks() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core_path, head, [zero, one]) =
+            shared_siblings(dir.path(), [true, false]).await;
+        std::fs::write(core_path.join("g"), "the maintainer's own g\n")
+            .expect("an untracked g is written");
+
+        let err = isolator
+            .reconcile(zero.0, &zero.2, &[one.0])
+            .await
+            .expect_err("the untracked file is not overwritten");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "isolation refused: dirty_tree_not_reset: {}",
+                core_path.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("g")).expect("the file reads"),
+            "the maintainer's own g\n",
+            "the untracked file survives"
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head,
+            "and the branch did not move"
         );
     }
 
