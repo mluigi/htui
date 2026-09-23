@@ -179,6 +179,10 @@ pub struct IsolatorConfig {
 /// D43's guard table: one `tokio` mutex per `(box, repo)`, minted on first use and never removed.
 type Guards = Mutex<BTreeMap<(BoxId, RepoId), Arc<tokio::sync::Mutex<()>>>>;
 
+/// D70 and D73's admin locks: one `tokio` mutex per repository, minted on first use and never
+/// removed, held around one `git worktree add`/`remove` child at a time.
+type AdminLocks = Mutex<BTreeMap<RepoId, Arc<tokio::sync::Mutex<()>>>>;
+
 /// The guards a step is holding between its own `prepare` and its own `capture` (blueprint A-1),
 /// keyed by the run too so the run's `cleanup` can reach a guard no row names.
 type Held = Mutex<BTreeMap<(RunId, StepId), Vec<OwnedMutexGuard<()>>>>;
@@ -203,6 +207,22 @@ pub struct GixIsolator {
     /// release what a crashed step left **without** a row to name it: the engine's
     /// `upsert_step_tree` can fail after `prepare` took the guard, and then no row exists.
     held: Held,
+    /// MOD-4 milestone 4 D70 and D73 (blueprint A-2): every `git worktree add` and
+    /// `git worktree remove` on one repository runs under that repository's lock.
+    ///
+    /// Two concurrent `add`s on one repository fail about one time in 250 with `fatal: failed to
+    /// read .git/worktrees/<id>/commondir` (the plan's probe on git 2.43.0), a wording no retry
+    /// recognises, after already creating the branch; `remove` mutates the same directory. The
+    /// lock is keyed by repository alone, independent of D43's `(box, repo)` step guard, and is
+    /// held for the one child and nothing else — never across another lock or an agent session —
+    /// so it cannot take part in a deadlock.
+    admin: AdminLocks,
+    /// How many admin-locked children are running right now; test instrumentation only.
+    #[cfg(test)]
+    in_flight: std::sync::atomic::AtomicU32,
+    /// The most that ever ran at once; `max_admin_in_flight` reads it.
+    #[cfg(test)]
+    max_in_flight: std::sync::atomic::AtomicU32,
 }
 
 impl GixIsolator {
@@ -268,6 +288,11 @@ impl GixIsolator {
             git,
             locks: Mutex::default(),
             held: Mutex::default(),
+            admin: Mutex::default(),
+            #[cfg(test)]
+            in_flight: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            max_in_flight: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -399,6 +424,52 @@ impl GixIsolator {
                 .or_default()
                 .push(guard);
         }
+    }
+
+    /// D70's lock for `repo`, awaited.
+    ///
+    /// The shape of [`acquire`](GixIsolator::acquire): the `Arc` is cloned under the `std` lock,
+    /// that lock is dropped, and only then is the `tokio` one awaited.
+    async fn admin_guard(&self, repo: RepoId) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut admin = self
+                .admin
+                .lock()
+                .expect("no panic holds the isolator's admin locks");
+            Arc::clone(admin.entry(repo).or_default())
+        };
+        lock.lock_owned().await
+    }
+
+    /// Runs one `worktree add`/`remove` (with its D39 retries) under `repo`'s admin lock (D70,
+    /// D73), and holds the lock for nothing else.
+    async fn under_admin<T, Fut>(
+        &self,
+        repo: RepoId,
+        verb: impl FnOnce() -> Fut,
+    ) -> Result<T, IsolateError>
+    where
+        Fut: Future<Output = Result<T, IsolateError>>,
+    {
+        let guard = self.admin_guard(repo).await;
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        }
+        let result = verb().await;
+        #[cfg(test)]
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        drop(guard);
+        result
+    }
+
+    /// The most admin-locked `git` children that were ever in flight at once.
+    #[cfg(test)]
+    fn max_admin_in_flight(&self) -> u32 {
+        self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Drops every guard `step` is holding; a step that holds none is not an error.
@@ -533,7 +604,16 @@ impl GixIsolator {
             let source_head = self.start_of(slot, *repo, checkout).await?;
             let path = cwd.join(&checkout.name);
             let before = self
-                .worktree_at(&git, checkout, &path, &branch, &source_head, step, run)
+                .worktree_at(
+                    &git,
+                    *repo,
+                    checkout,
+                    &path,
+                    &branch,
+                    &source_head,
+                    step,
+                    run,
+                )
                 .await?;
             trees.push(PreparedTree {
                 tree: RunStepTree {
@@ -580,6 +660,7 @@ impl GixIsolator {
     async fn worktree_at(
         &self,
         git: &Cli,
+        repo_id: RepoId,
         checkout: &RepoCheckout,
         path: &Path,
         branch: &str,
@@ -594,11 +675,15 @@ impl GixIsolator {
                 Some(base) => {
                     let tree = path.to_path_buf();
                     let Ok(head) = blocking(move || git::head(&tree)).await else {
-                        git::with_retry("worktree remove", || git.remove_worktree(&local, path))
-                            .await?;
+                        self.under_admin(repo_id, || {
+                            git::with_retry("worktree remove", || git.remove_worktree(&local, path))
+                        })
+                        .await?;
                         remove_directory(path).await?;
-                        git::with_retry("worktree add", || {
-                            git.add_worktree_on_branch(&local, path, step, run, &base)
+                        self.under_admin(repo_id, || {
+                            git::with_retry("worktree add", || {
+                                git.add_worktree_on_branch(&local, path, step, run, &base)
+                            })
                         })
                         .await?;
                         return Ok(base);
@@ -613,14 +698,18 @@ impl GixIsolator {
                     return Ok(base);
                 }
                 None => {
-                    git::with_retry("worktree remove", || git.remove_worktree(&local, path))
-                        .await?;
+                    self.under_admin(repo_id, || {
+                        git::with_retry("worktree remove", || git.remove_worktree(&local, path))
+                    })
+                    .await?;
                     remove_directory(path).await?;
                 }
             }
         }
-        git::with_retry("worktree add", || {
-            git.add_worktree(&local, path, step, run, source_head)
+        self.under_admin(repo_id, || {
+            git::with_retry("worktree add", || {
+                git.add_worktree(&local, path, step, run, source_head)
+            })
         })
         .await?;
         Ok(source_head.to_owned())
@@ -836,7 +925,10 @@ impl GixIsolator {
         if litter {
             let git = self.cli()?.clone();
             let local = checkout.local_path.clone();
-            git::with_retry("worktree remove", || git.remove_worktree(&local, &path)).await?;
+            self.under_admin(tree.repo_id, || {
+                git::with_retry("worktree remove", || git.remove_worktree(&local, &path))
+            })
+            .await?;
         }
         Ok(None)
     }
@@ -860,7 +952,10 @@ impl GixIsolator {
         let local = self.checkout_of(tree)?.local_path.clone();
         let git = self.cli()?.clone();
         let path = PathBuf::from(&tree.path);
-        git::with_retry("worktree remove", || git.remove_worktree(&local, &path)).await
+        self.under_admin(tree.repo_id, || {
+            git::with_retry("worktree remove", || git.remove_worktree(&local, &path))
+        })
+        .await
     }
 
     /// D46's report: every entry a `worktrees()` read still lists under `run_dir`, as errors.
@@ -3399,5 +3494,107 @@ mod tests {
             err.to_string(),
             "isolation refused: local isolation cannot fan out"
         );
+    }
+
+    /// D70 and D73: 24 slotted `worktree` prepares of distinct steps on one repository, under a
+    /// multi-thread runtime, all succeed — and the per-repository admin lock never lets two
+    /// `worktree add`/`remove` children run at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_worktree_prepares_on_one_repo_never_overlap_their_adds() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let isolator = Arc::new(
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates"),
+        );
+        let base = Arc::new(isolator.base(&[core]).await.expect("the base reads"));
+        let run = RunId::new();
+
+        let tasks: Vec<_> = (0..24)
+            .map(|index| {
+                let (isolator, base) = (Arc::clone(&isolator), Arc::clone(&base));
+                tokio::spawn(async move {
+                    let prepared = isolator
+                        .prepare(
+                            run,
+                            StepId::new(),
+                            &[core],
+                            Isolation::Worktree,
+                            Some(slot(index, 24, &base)),
+                        )
+                        .await?;
+                    Ok::<_, crate::isolate::IsolateError>(prepared.trees[0].before_hash.clone())
+                })
+            })
+            .collect();
+        for task in tasks {
+            let before = task
+                .await
+                .expect("the task did not panic")
+                .expect("every candidate prepares");
+            assert_eq!(before, head);
+        }
+        assert_eq!(
+            isolator.max_admin_in_flight(),
+            1,
+            "the adds ran, one at a time"
+        );
+    }
+
+    /// D70: the admin lock is per repository — a held lock on one repository does not hold up a
+    /// `worktree add` on another, and does hold up one on itself.
+    #[tokio::test]
+    async fn adds_on_two_repositories_do_not_wait_for_each_other() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let isolator = Arc::new(
+            GixIsolator::new(config(
+                &dir.path().join("trees"),
+                &[(core, core_checkout), (docs, docs_checkout)],
+            ))
+            .expect("the config validates"),
+        );
+        let run = RunId::new();
+
+        for (held, free) in [(core, docs), (docs, core)] {
+            let guard = isolator.admin_guard(held).await;
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                isolator.prepare(run, StepId::new(), &[free], Isolation::Worktree, None),
+            )
+            .await
+            .expect("the other repository's add does not wait")
+            .expect("the other repository prepares");
+
+            let mut blocked = {
+                let isolator = Arc::clone(&isolator);
+                tokio::spawn(async move {
+                    isolator
+                        .prepare(run, StepId::new(), &[held], Isolation::Worktree, None)
+                        .await
+                        .map(|prepared| prepared.trees.len())
+                })
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut blocked)
+                    .await
+                    .is_err(),
+                "an add on the held repository waits for its lock"
+            );
+            drop(guard);
+            let prepared = tokio::time::timeout(Duration::from_secs(10), blocked)
+                .await
+                .expect("the add proceeds once the lock is free")
+                .expect("the task did not panic")
+                .expect("the held repository prepares");
+            assert_eq!(prepared, 1);
+        }
     }
 }

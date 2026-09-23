@@ -73,6 +73,9 @@ pub struct FakeIsolator {
     /// What [`capture`](Isolator::capture) last reported per step, which is what the identity
     /// [`reconcile`](Isolator::reconcile) echoes.
     captured: Mutex<BTreeMap<StepId, Vec<RunStepCommit>>>,
+    /// Scripted [`diff`](Isolator::diff) answers, FIFO, one consumed per call; unscripted is
+    /// `None` (MOD-4 milestone 4 D54(c)).
+    diffs: Mutex<VecDeque<Option<DiffBlock>>>,
 }
 
 impl FakeIsolator {
@@ -148,6 +151,16 @@ impl FakeIsolator {
             .expect("no panic holds the fake isolator's lock") = dirs;
     }
 
+    /// Queue the answer of the next [`diff`](Isolator::diff): a block, or `None` for "nothing to
+    /// show". An unscripted call answers `None`, so a case that never scripts one sees the shape
+    /// of a box with no `git`.
+    pub fn script_diff(&self, block: Option<DiffBlock>) {
+        self.diffs
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(block);
+    }
+
     /// How many times [`prepare`](Isolator::prepare) has been called on this isolator.
     ///
     /// The trait promises no idempotence (`crate::isolate::Isolator::prepare`) and this fake mints
@@ -215,7 +228,6 @@ impl Isolator for FakeIsolator {
         slot: Option<FanoutSlot<'a>>,
     ) -> IsolatorFuture<'a, Prepared> {
         Box::pin(async move {
-            let _ = slot;
             *self
                 .prepares
                 .lock()
@@ -232,7 +244,11 @@ impl Isolator for FakeIsolator {
             let trees = scope
                 .iter()
                 .map(|repo| {
-                    let base = format!("fake:base:{}", self.tick());
+                    // D54(a): a candidate starts from its group's base; anything else, and a repo
+                    // the base does not name, gets a fresh synthetic one.
+                    let base = slot
+                        .and_then(|slot| slot.base.get(repo).cloned())
+                        .unwrap_or_else(|| format!("fake:base:{}", self.tick()));
                     PreparedTree {
                         tree: RunStepTree {
                             run_step_id: step,
@@ -276,9 +292,9 @@ impl Isolator for FakeIsolator {
         })
     }
 
-    /// Fan-out is milestone 4's, so the winner is the only candidate — and for a fake that made no
-    /// tree, a merge is the identity: this reports exactly what
-    /// [`capture`](Isolator::capture) reported for the same step.
+    /// For a fake that made no tree, a merge is the identity: this reports exactly what
+    /// [`capture`](Isolator::capture) reported for the winner. `siblings` are ignored — there is no
+    /// shared checkout for a sibling to have left anywhere.
     ///
     /// **It does not consume a [`script_after`](FakeIsolator::script_after) value**, which is the
     /// one behavioural change T6 made to this double. Milestone 2 shipped `reconcile` echoing
@@ -312,13 +328,18 @@ impl Isolator for FakeIsolator {
         })
     }
 
+    /// `fake:group-base:<repo>` per repo: stable, and **not** drawn from the hash counter, whose
+    /// `fake:base:<n>` ordinals milestone 2's cases pin (blueprint H-13).
     fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
         Box::pin(async move {
-            let _ = scope;
-            Ok(BTreeMap::new())
+            Ok(scope
+                .iter()
+                .map(|repo| (*repo, format!("fake:group-base:{repo}")))
+                .collect())
         })
     }
 
+    /// The next [`script_diff`](FakeIsolator::script_diff) answer, or `None` unscripted.
     fn diff<'a>(
         &'a self,
         trees: &'a [RunStepTree],
@@ -326,7 +347,12 @@ impl Isolator for FakeIsolator {
     ) -> IsolatorFuture<'a, Option<DiffBlock>> {
         Box::pin(async move {
             let _ = (trees, commits);
-            Ok(None)
+            Ok(self
+                .diffs
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front()
+                .flatten())
         })
     }
 
@@ -1123,13 +1149,14 @@ mod tests {
     use htui_core::model::{
         Isolation, RepoId, RunMode, RunStep, SnapshotCandidate, SnapshotPhase, StepId,
     };
+    use htui_core::prompt::DiffBlock;
     use htui_core::store::{MemStore, ReadStore as _};
 
     use super::{
         FakeGraphSource, FakeIsolator, FakeOrchestrator, GraphSource, ScriptedStep, TestClock,
     };
     use crate::graph::{ResolveError, Resolved, resolve};
-    use crate::isolate::{Clock as _, Isolator as _};
+    use crate::isolate::{Clock as _, FanoutSlot, Isolator as _};
 
     /// `graph::resolve` of `HTUI_FEAT-1`, manual, no `app_setting`, no requested scope.
     async fn resolve_feat<G: GraphSource>(
@@ -1264,6 +1291,107 @@ mod tests {
             Some(format!("fake:after:{step}:3"))
         );
         assert_ne!(synthetic[0].after_hash, synthetic[1].after_hash);
+    }
+
+    /// MOD-4 milestone 4 D54: the fake's group base is stable per repo and costs no hash ordinal
+    /// (blueprint H-13), and a slotted `prepare` starts from it.
+    #[tokio::test]
+    async fn the_fake_honours_the_slot_base() {
+        let isolator = FakeIsolator::new();
+        let scope = repos();
+        let base = isolator.base(&scope).await.expect("the fake never refuses");
+        assert_eq!(
+            base,
+            scope
+                .iter()
+                .map(|repo| (*repo, format!("fake:group-base:{repo}")))
+                .collect::<BTreeMap<_, _>>()
+        );
+        assert!(
+            isolator
+                .base(&[])
+                .await
+                .expect("the fake never refuses")
+                .is_empty()
+        );
+
+        let slotted = isolator
+            .prepare(
+                ids::RUN_2,
+                StepId::new(),
+                &scope,
+                Isolation::Worktree,
+                Some(FanoutSlot {
+                    index: 1,
+                    width: 3,
+                    base: &base,
+                }),
+            )
+            .await
+            .expect("the fake never refuses");
+        for (prepared, repo) in slotted.trees.iter().zip(&scope) {
+            assert_eq!(prepared.before_hash, base[repo]);
+            assert_eq!(prepared.tree.base_ref, base[repo]);
+        }
+        assert_eq!(isolator.prepares(), 1, "a slotted prepare is still counted");
+
+        // `base` and the slotted `prepare` took no ordinal: the next unslotted one is the first.
+        let plain = isolator
+            .prepare(
+                ids::RUN_2,
+                StepId::new(),
+                &scope[..1],
+                Isolation::Worktree,
+                None,
+            )
+            .await
+            .expect("the fake never refuses");
+        assert_eq!(plain.trees[0].before_hash, "fake:base:1");
+
+        // A repo the base does not name falls back to a synthetic hash.
+        let partial = BTreeMap::from([(scope[0], "fake:group-base:only".to_owned())]);
+        let mixed = isolator
+            .prepare(
+                ids::RUN_2,
+                StepId::new(),
+                &scope,
+                Isolation::Worktree,
+                Some(FanoutSlot {
+                    index: 0,
+                    width: 2,
+                    base: &partial,
+                }),
+            )
+            .await
+            .expect("the fake never refuses");
+        assert_eq!(mixed.trees[0].before_hash, "fake:group-base:only");
+        assert_eq!(mixed.trees[1].before_hash, "fake:base:2");
+    }
+
+    /// D54(c): the fake's `diff` answers what a case queued, FIFO, and `None` unscripted.
+    #[tokio::test]
+    async fn the_fake_diff_is_scripted_and_none_by_default() {
+        let isolator = FakeIsolator::new();
+        assert_eq!(
+            isolator
+                .diff(&[], &[])
+                .await
+                .expect("the fake never refuses"),
+            None
+        );
+        let block = DiffBlock {
+            range: "a..b".to_owned(),
+            stat: " f | 1 +\n".to_owned(),
+            diff: "diff --git a/f b/f\n".to_owned(),
+        };
+        isolator.script_diff(Some(block.clone()));
+        isolator.script_diff(None);
+        assert_eq!(
+            isolator.diff(&[], &[]).await.expect("scripted"),
+            Some(block)
+        );
+        assert_eq!(isolator.diff(&[], &[]).await.expect("scripted"), None);
+        assert_eq!(isolator.diff(&[], &[]).await.expect("unscripted"), None);
     }
 
     /// `impl GraphSource for MemStore` delegates to the four inherent reads of the same names.
