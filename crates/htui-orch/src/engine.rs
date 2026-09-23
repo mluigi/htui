@@ -19,6 +19,8 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 
+use futures::future::Either;
+
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
 use htui_agent::event::DoneEvent;
@@ -49,7 +51,7 @@ use crate::fanout::{
 use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{Clock, FanoutSlot, Isolator};
-use crate::recover::LeaseTimes;
+use crate::recover::{Heartbeat, LeaseTimes};
 use crate::select::{self, SelectInput, Skipped, Walk};
 use crate::status::{
     Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt, winner_at,
@@ -442,21 +444,7 @@ where
             })
             .await?;
 
-        let lease = now + self.lease_times().ttl;
-        // Anything but `Admitted` is ANA-2 §4.7's admission refusing: the box is at
-        // `max_concurrent_items` or the scope overlaps a live run (plan D83). Nothing is written
-        // and the run stays `queued`.
-        let claim = self
-            .parts
-            .store
-            .claim_run(id, self.parts.box_id, self.parts.owner, now, lease)
-            .await?;
-        if !claim.is_admitted() {
-            return Err(EngineError::ClaimRefused { run: id, claim });
-        }
-
-        let rest = self.run_to_rest(id).await?;
-        Ok(CommandOutcome::Started { run: id, rest })
+        self.claim(id).await
     }
 
     /// Plan D84: `claim_run`, then the leased walk — `start_run`'s tail, factored out so a run a
@@ -468,8 +456,22 @@ where
     /// which then stays `queued` with nothing written; [`EngineError::LeaseLost`] when another
     /// orchestrator takes the lease mid-walk; every other [`EngineError`] the walk raises.
     pub async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
-        let _ = run;
-        todo!("T6 commit c: claim_run, then walk_leased(run_to_rest)")
+        let now = self.now();
+        let lease = now + self.lease_times().ttl;
+        // Anything but `Admitted` is ANA-2 §4.7's admission refusing: the box is at
+        // `max_concurrent_items` or the scope overlaps a live run (plan D83). Nothing is written
+        // and the run stays `queued`.
+        let claim = self
+            .parts
+            .store
+            .claim_run(run, self.parts.box_id, self.parts.owner, now, lease)
+            .await?;
+        if !claim.is_admitted() {
+            return Err(EngineError::ClaimRefused { run, claim });
+        }
+
+        let rest = self.walk_leased(run, self.run_to_rest(run)).await?;
+        Ok(CommandOutcome::Started { run, rest })
     }
 
     /// Plan D62's rung 4 at `StartRun`: no run row exists, so the refusal is written to the item —
@@ -510,6 +512,9 @@ where
 
         let has_output = self.output_of(item, &phase, step.id).await?.is_some();
         crate::command::answer_gate_enabled(&step, &phase, has_output, &answer)?;
+        // Plan D108: after the pure guard and before the first write, so a live lease elsewhere
+        // refuses with the gate still unanswered (blueprint F-N).
+        self.take_lease(run.id).await?;
 
         let now = self.now();
         let (outcome, note) = match &answer {
@@ -528,19 +533,24 @@ where
         // would earn `StoreError::Constraint`.
         self.unpark(&run, now).await?;
 
-        let rest = if matches!(answer, GateAnswer::Rejected { .. }) {
-            self.after_rejection(&run, &snapshot, &step, &phase, now)
-                .await?
-        } else {
+        // Blueprint F-M: everything after the unpark writes to a `running` run, so all of it —
+        // the review loop or the reconcile, not only `run_to_rest` — runs under the heartbeat.
+        let tail = async {
+            if matches!(answer, GateAnswer::Rejected { .. }) {
+                return self
+                    .after_rejection(&run, &snapshot, &step, &phase, now)
+                    .await;
+            }
             // `answer_gate` moved the step `awaiting_approval -> done`
             // (`store/traits.rs:788-791`), so this is the human's half of plan D25's "after a step
             // reaches `done`". A refusal parks the run again, with the reason on the item.
             let step = self.step(run.id, step.id).await?;
             match self.reconcile_done_step(&run, &step, &[]).await? {
-                Some(rest) => rest,
-                None => self.run_to_rest(run.id).await?,
+                Some(rest) => Ok(rest),
+                None => self.run_to_rest(run.id).await,
             }
         };
+        let rest = self.walk_leased(run.id, tail).await?;
         Ok(CommandOutcome::Answered { rest })
     }
 
@@ -638,6 +648,7 @@ where
             return self.retry_group(&run, &snapshot, &row, &phase).await;
         }
         crate::command::retry_enabled(&row, &phase)?;
+        self.take_lease(run.id).await?;
 
         let now = self.now();
         match row.status {
@@ -664,13 +675,16 @@ where
         // Admitted rather than created outright, so the next attempt passes through the capability
         // interlock like any other — a phase whose only candidate lost its inline-approval
         // capability since the last attempt must not be retried onto it.
-        let run = self.run(run.id).await?;
-        let steps = self.parts.store.run_steps(run.id).await?;
-        let attempt = next_attempt(&steps, row.position);
-        if let Some(rest) = self.admit(&run, &snapshot, &phase, attempt).await? {
-            return Ok(CommandOutcome::Retried { step: row.id, rest });
-        }
-        let rest = self.run_to_rest(run.id).await?;
+        let tail = async {
+            let run = self.run(run.id).await?;
+            let steps = self.parts.store.run_steps(run.id).await?;
+            let attempt = next_attempt(&steps, row.position);
+            match self.admit(&run, &snapshot, &phase, attempt).await? {
+                Some(rest) => Ok(rest),
+                None => self.run_to_rest(run.id).await,
+            }
+        };
+        let rest = self.walk_leased(run.id, tail).await?;
         Ok(CommandOutcome::Retried { step: row.id, rest })
     }
 
@@ -703,16 +717,20 @@ where
         let slot = group_at(&steps, row.position, row.attempt);
         crate::command::retry_group_enabled(run, &slot, phase)?;
         let attempt = row.attempt;
+        self.take_lease(run.id).await?;
 
         let now = self.now();
         gate::retire_slot(&self.gate_context(run, snapshot), &steps, row.position, now).await?;
         self.unpark(run, now).await?;
 
-        let run = self.run(run.id).await?;
-        if let Some(rest) = self.admit(&run, snapshot, phase, attempt + 1).await? {
-            return Ok(CommandOutcome::Retried { step: row.id, rest });
-        }
-        let rest = self.run_to_rest(run.id).await?;
+        let tail = async {
+            let run = self.run(run.id).await?;
+            match self.admit(&run, snapshot, phase, attempt + 1).await? {
+                Some(rest) => Ok(rest),
+                None => self.run_to_rest(run.id).await,
+            }
+        };
+        let rest = self.walk_leased(run.id, tail).await?;
         Ok(CommandOutcome::Retried { step: row.id, rest })
     }
 
@@ -737,6 +755,7 @@ where
         let slot = group_at(&steps, position, attempt);
         crate::command::select_enabled(&run, &slot, winner, position, attempt)?;
         let siblings = Self::siblings(&slot, winner);
+        self.take_lease(run.id).await?;
 
         self.parts
             .store
@@ -765,12 +784,15 @@ where
         .await?;
         self.unpark(&run, now).await?;
 
-        let run = self.run(run.id).await?;
-        let winner = self.step(run.id, winner).await?;
-        if let Some(rest) = self.reconcile_done_step(&run, &winner, &siblings).await? {
-            return Ok(CommandOutcome::Selected { rest });
-        }
-        let rest = self.run_to_rest(run.id).await?;
+        let tail = async {
+            let run = self.run(run.id).await?;
+            let winner = self.step(run.id, winner).await?;
+            match self.reconcile_done_step(&run, &winner, &siblings).await? {
+                Some(rest) => Ok(rest),
+                None => self.run_to_rest(run.id).await,
+            }
+        };
+        let rest = self.walk_leased(run.id, tail).await?;
         Ok(CommandOutcome::Selected { rest })
     }
 
@@ -860,22 +882,73 @@ where
     where
         F: Future<Output = Result<T, EngineError>>,
     {
-        let _ = (run, walk);
-        todo!("T6 commit c: select(walk, heartbeat)")
+        let times = self.lease_times();
+        let (store, owner) = (self.parts.store, self.parts.owner);
+        let beat = crate::recover::heartbeat(
+            |until| store.refresh_lease(run, owner, until),
+            self.parts.clock,
+            times,
+        );
+        // Both boxed: `select` needs `Unpin`, and dropping `select`'s output does not drop a
+        // stack-pinned walk (blueprint H-11). A boxed one goes when its box does.
+        match futures::future::select(Box::pin(walk), Box::pin(beat)).await {
+            Either::Left((out, beat)) => {
+                drop(beat);
+                // An `Err` writes nothing more: the store may be what failed.
+                let out = out?;
+                if self.run(run).await?.status != RunStatus::Running {
+                    self.release_lease(run).await;
+                }
+                Ok(out)
+            }
+            Either::Right((Heartbeat::Abandoned, walk)) => {
+                // Before anything else (plan D86): the walk must not write once the lease is gone.
+                drop(walk);
+                if let Err(err) = self.parts.isolator.release(run).await {
+                    tracing::warn!(%run, %err, "releasing the run's guards after an abandon failed");
+                }
+                Err(EngineError::LeaseLost { run })
+            }
+        }
     }
 
     /// Plan D87/D108: `take_lease(run, box, owner, now, now + ttl)`, after a command's pure guard
     /// and before its first write.
     async fn take_lease(&self, run: RunId) -> Result<(), EngineError> {
-        let _ = run;
-        todo!("T6 commit c: take_lease")
+        let now = self.now();
+        let taken = self
+            .parts
+            .store
+            .take_lease(
+                run,
+                self.parts.box_id,
+                self.parts.owner,
+                now,
+                now + self.lease_times().ttl,
+            )
+            .await?;
+        if taken {
+            Ok(())
+        } else {
+            Err(EngineError::LeaseHeld { run })
+        }
     }
 
     /// Plan D87: `refresh_lease(run, owner, now)`, so the lease reads as expired at once. A
     /// zero-row answer is ignored and an error is warned; neither is raised.
     async fn release_lease(&self, run: RunId) {
-        let _ = run;
-        todo!("T6 commit c: release_lease")
+        match self
+            .parts
+            .store
+            .refresh_lease(run, self.parts.owner, self.now())
+            .await
+        {
+            // `false`: the lease is no longer ours, so there is nothing of ours to give back.
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(%run, %err, "releasing the lease failed; it expires at its TTL")
+            }
+        }
     }
 
     // -- the walk ------------------------------------------------------------------------------
@@ -971,17 +1044,22 @@ where
     ///
     /// A live graph that **refuses to resolve** for a reason that is a rule about starting a run —
     /// a cap an app setting lowered since (plan D63), a phase fanned out where it may not (D64,
-    /// ANA-2 §4.6), a phase left with no candidate (§4.1 rung 4) — has no topology to compare.
+    /// ANA-2 §4.6), a phase left with no candidate (§4.1 rung 4), a `touched_paths` entry naming a
+    /// repo the project does not carry (plan D81) — has no topology to compare.
     /// That is not this run's business: invariant 2 says it walks its snapshot, so an `item_note`
     /// says the live graph could not be compared and the walk runs. Every other resolution error
     /// is raised.
     ///
-    /// Cut here because criterion 3 needs it; the rest of milestone 5's sweep — `adopt_runs`, the
-    /// lease, the unfinished-step rule — is not.
+    /// **The lease is taken first** (blueprint A-1): for a run the sweep adopted it is a renewal,
+    /// for a released parked run it is harmless, and for a run a live stranger holds it is
+    /// [`EngineError::LeaseHeld`] with nothing resolved or walked. The walk itself runs under the
+    /// heartbeat. Milestone 5's sweep adopts and adjudicates but does not walk; this is the walk
+    /// it hands a `Walk` run off to, and milestone 6's `run_worker` is the caller that does.
     ///
     /// # Errors
-    /// Every [`EngineError`].
+    /// [`EngineError::LeaseHeld`], [`EngineError::LeaseLost`], and every other [`EngineError`].
     pub async fn resume(&self, run: RunId) -> Result<Resume, EngineError> {
+        self.take_lease(run).await?;
         let row = self.run(run).await?;
         let snapshot = Self::snapshot_of(&row)?;
         let item = self.item(Self::item_of(&row)?).await?;
@@ -1002,7 +1080,8 @@ where
                 | ResolveError::AgentCap { .. }
                 | ResolveError::ReviewFanOut { .. }
                 | ResolveError::LocalFanOut { .. }
-                | ResolveError::NoCandidate { .. }),
+                | ResolveError::NoCandidate { .. }
+                | ResolveError::UnknownTouchedRepo { .. }),
             ) => {
                 let body = format!(
                     "live graph not comparable: run {run} walks its snapshot `{}` \
@@ -1010,7 +1089,8 @@ where
                     snapshot.topology
                 );
                 self.note(item.id, body, None, self.now()).await?;
-                return Ok(Resume::Walked(self.run_to_rest(run).await?));
+                let rest = self.walk_leased(run, self.run_to_rest(run)).await?;
+                return Ok(Resume::Walked(rest));
             }
             Err(err) => return Err(err.into()),
         };
@@ -1033,13 +1113,19 @@ where
                     created_at: now,
                 })
                 .await?;
+            let rest = self.resting(&row).await?;
+            // Nothing walks, so the lease just taken is given back unless the run is live.
+            if row.status != RunStatus::Running {
+                self.release_lease(run).await;
+            }
             return Ok(Resume::TopologyChanged {
                 snapshot: snapshot.topology,
                 live: live.snapshot.topology,
-                rest: self.resting(&row).await?,
+                rest,
             });
         }
-        Ok(Resume::Walked(self.run_to_rest(run).await?))
+        let rest = self.walk_leased(run, self.run_to_rest(run)).await?;
+        Ok(Resume::Walked(rest))
     }
 
     // -- stage 1 -------------------------------------------------------------------------------
@@ -1293,8 +1379,9 @@ where
     /// exactly one orchestrator-owned exit for "driver error, cap breach, deadline elapsed, spawn
     /// failure": `failed` (`docs/ANA-2.md:639`). A `?` that escaped instead would leave the step
     /// `running` and the run `running` with nothing able to move either — `cursor` rests on a
-    /// `running` step, both §6.2 guards refuse one, and the lease sweep that would adopt it is
-    /// milestone 5's. So [`Self::fail_hard`] settles first and the error is re-raised after.
+    /// `running` step, both §6.2 guards refuse one, and no sweep adopts a run whose lease this
+    /// process still holds (plan D88). So [`Self::fail_hard`] settles first and the error is
+    /// re-raised after.
     async fn walk_step(
         &self,
         run: &Run,
@@ -1631,12 +1718,13 @@ where
     /// can raise: [`run_candidate`](Self::run_candidate) owns every other failure, so a failed
     /// sibling never fails the others (plan D48).
     ///
-    /// **Not cancel-safe.** Dropping this future mid-`join_all` — a caller's timeout, a worker
-    /// shutting down — drops every candidate future where it stands: their rows stay `running`, and
-    /// a `shared_serialized` guard taken at `prepare` stays held because `capture` never ran, so
-    /// neither [`release_trees`](Self::release_trees) nor anything else in this frame gives it
-    /// back. Only [`cleanup_run`](Self::cleanup_run) — reached through `cancel_run` or the run's
-    /// own terminal write — or milestone 5's sweep releases them.
+    /// **Dropping this future is the intended abandon** (plan D86). A walk whose lease another
+    /// orchestrator took is dropped mid-`join_all`, and every candidate future stops where it
+    /// stands: their rows stay `running`, and a `shared_serialized` guard taken at `prepare` stays
+    /// held because `capture` never ran. Neither is this frame's to repair. The leased walk drops
+    /// this process's guards for the run through `Isolator::release` (plan D99), and the adopting
+    /// process's sweep adjudicates the rows the drop left (plan D95). A drop for any other reason
+    /// is the same state; [`cleanup_run`](Self::cleanup_run) also releases the guards.
     async fn drive_group(
         &self,
         run: &Run,
@@ -2892,8 +2980,8 @@ where
     /// prepared it.
     ///
     /// **A parked run has no resume verb this milestone** (blueprint F-G, R-7): `AnswerGate` needs
-    /// a step at `awaiting_approval` and every step here is `done`. Milestone 5's sweep or
-    /// milestone 6's `Unblock`-shaped verb is where a retry of `reconcile` belongs.
+    /// a step at `awaiting_approval` and every step here is `done`. Milestone 6's `Unblock`-shaped
+    /// verb is where a retry of `reconcile` belongs.
     ///
     /// `siblings` are the other candidates of a fan-out winner's slot, handed to the isolator so a
     /// `shared_serialized` checkout left at a sibling's commit may be moved to the winner's (plan
@@ -2983,7 +3071,8 @@ where
     /// stage 5 entirely — is holding one nobody else will give back (T5, blueprint A-1, H-15).
     ///
     /// Cleanup failures are `warn`ed and never raised (plan D36): the run is already terminal when
-    /// this runs, a failed `rm` must not un-terminate it, and milestone 5's sweep is the retry.
+    /// this runs, and a failed `rm` must not un-terminate it. No sweep retries a terminal run's
+    /// cleanup, because the sweep adopts only `running` runs: milestone 6 owns that retry (R-25).
     ///
     /// `pub` because milestone 6's Runs tab calls it directly for a run the worker did not end.
     ///
@@ -2996,7 +3085,11 @@ where
             trees.extend(self.parts.store.step_trees(step.id).await?);
         }
         if let Err(err) = self.parts.isolator.cleanup(run, &trees).await {
-            tracing::warn!(%run, %err, "run-terminal cleanup failed; milestone 5's sweep is the retry");
+            tracing::warn!(
+                %run,
+                %err,
+                "run-terminal cleanup failed; no sweep retries a terminal run's cleanup (milestone 6)"
+            );
         }
         Ok(())
     }
@@ -5750,8 +5843,8 @@ mod tests {
     ///
     /// Without it every `?` in stages 2 to 6 leaves the step `running` and the run `running`
     /// forever: `cursor` rests on a `running` step (`status.rs:144-152`), both §6.2 guards refuse
-    /// one (`command.rs:241-247`, `:274-283`), and the lease sweep that would adopt it is
-    /// milestone 5's. Stage 2 is the shortest of the ten such sites to drive.
+    /// one (`command.rs:241-247`, `:274-283`), and no sweep adopts a run whose lease this process
+    /// still holds (plan D88). Stage 2 is the shortest of the ten such sites to drive.
     #[tokio::test]
     async fn an_error_after_the_running_move_fails_the_step_and_the_run() {
         let harness = Harness::new().await;
