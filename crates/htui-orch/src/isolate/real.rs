@@ -1497,7 +1497,7 @@ impl Isolator for GixIsolator {
         })
     }
 
-    /// D99: [`release_run`](GixIsolator::release_run) alone — no tree is touched.
+    /// D99: `release_run` alone — no tree is touched.
     fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()> {
         Box::pin(async move {
             self.release_run(run);
