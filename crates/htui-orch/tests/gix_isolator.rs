@@ -1146,6 +1146,10 @@ async fn a_dirty_shared_checkout_fails_every_sibling_and_parks() {
         htui_branches(&git, &fix.core.path).await.is_empty(),
         "no sibling got as far as a label"
     );
+    assert!(
+        park.ends_with("; no sibling moved the shared checkout"),
+        "the note names no label `git` does not have, and no commit the checkout is not at: {park}"
+    );
 }
 
 /// Plan D78 (blueprint A-7): sibling 0 fails after its `prepare` took the checkout; the
@@ -1203,8 +1207,20 @@ async fn a_failed_shared_sibling_releases_the_checkout_for_the_next() {
         head_of(&git, &fix.core.path).await,
         label_of(&git, &fix.core.path, &slot[2]).await
     );
+    assert_eq!(
+        htui_branches(&git, &fix.core.path).await,
+        labels(&slot[1..]),
+        "sibling 0 moved nothing, so it has no label"
+    );
     let park = fix.selection_park().await;
     assert!(park.contains("0 failed"), "{park}");
+    assert!(
+        park.ends_with(&format!(
+            "; labels htui/{}, htui/{})",
+            slot[1].id, slot[2].id
+        )),
+        "only the labels `git` has are named: {park}"
+    );
 }
 
 /// Plan D57: `copy` measures once per candidate against the cap, so a tree that fits once is

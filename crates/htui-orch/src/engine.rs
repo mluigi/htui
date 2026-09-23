@@ -2099,21 +2099,31 @@ where
 
     /// The park note's `shared_serialized` sentence: the checkout stays at the last sibling's
     /// commit, and the base and each sibling's `htui/<step>` label are where a human finds them.
+    ///
+    /// Only a sibling whose `capture` moved the checkout has a label (M3 D26 labels at capture, and
+    /// only a moved `HEAD`), so only those are named. When none did — every sibling refused at
+    /// `prepare`, say, on a dirty checkout (plan D72) — the checkout is where the group found it
+    /// and the sentence says so instead of naming commits and branches `git` does not have.
     async fn shared_checkout_note(&self, slot: &[RunStep]) -> Result<String, EngineError> {
         let mut bases: Vec<String> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
         for step in slot {
+            let mut moved = false;
             for commit in self.parts.store.step_commits(step.id).await? {
                 let base = format!("{}@{}", commit.repo_id, commit.before_hash);
                 if !bases.contains(&base) {
                     bases.push(base);
                 }
+                moved |= commit.after_hash.is_some();
+            }
+            if moved {
+                labels.push(format!("htui/{}", step.id));
             }
         }
-        let labels = slot
-            .iter()
-            .map(|step| format!("htui/{}", step.id))
-            .collect::<Vec<_>>()
-            .join(", ");
+        if labels.is_empty() {
+            return Ok("; no sibling moved the shared checkout".to_owned());
+        }
+        let labels = labels.join(", ");
         Ok(format!(
             "; the shared checkout stays at the last sibling's commit (base {}; labels {labels})",
             bases.join(", ")
