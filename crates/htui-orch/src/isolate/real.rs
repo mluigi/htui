@@ -491,7 +491,7 @@ impl GixIsolator {
     }
 
     /// Drops every guard `step` is holding; a step that holds none is not an error.
-    fn release(&self, step: StepId) {
+    fn release_step(&self, step: StepId) {
         let mut held = self
             .held
             .lock()
@@ -1231,7 +1231,7 @@ impl Isolator for GixIsolator {
                         // A refusal after the guard was taken has no `run_step_tree` row to its
                         // name, so no `cleanup` would ever be handed it (blueprint A-1 releases
                         // by row): the guard goes back here or it never goes back at all.
-                        self.release(step);
+                        self.release_step(step);
                     }
                     prepared
                 }
@@ -1255,7 +1255,7 @@ impl Isolator for GixIsolator {
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
             let captured = self.capture_rows(step, trees).await;
-            self.release(step);
+            self.release_step(step);
             captured
         })
     }

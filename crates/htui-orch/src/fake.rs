@@ -238,7 +238,7 @@ impl FakeIsolator {
     }
 
     /// Take `step`'s `shared_serialized` guard, if it holds one; dropping it frees the lock.
-    fn release(&self, step: StepId) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    fn release_step(&self, step: StepId) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         self.held
             .lock()
             .expect("no panic holds the fake isolator's lock")
@@ -307,7 +307,7 @@ impl Isolator for FakeIsolator {
                 // is charged for.
                 tokio::task::yield_now().await;
                 // A step prepared again (a resume) must not wait on its own guard.
-                drop(self.release(step));
+                drop(self.release_step(step));
                 let guard = Arc::clone(&self.serial).lock_owned().await;
                 self.held
                     .lock()
@@ -357,7 +357,7 @@ impl Isolator for FakeIsolator {
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
-            drop(self.release(step));
+            drop(self.release_step(step));
             let commits = self.commits(step, trees);
             self.captured
                 .lock()
