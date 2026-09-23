@@ -5099,3 +5099,188 @@ mod fanout_paths {
         }
     }
 }
+
+/// Recovery paths no [`CASES`] entry reaches: an isolator that refuses the reset of a clean tree
+/// (plan D93, D99, blueprint A-6) and a candidate whose artefacts all landed (plan D95, M4 D48).
+///
+/// Unit tests rather than cases: each seeds rows or scripts the fake isolator's answer, which no
+/// transport-neutral binding promises.
+#[cfg(test)]
+mod recovery_paths {
+    use htui_core::fixtures::ids;
+    use htui_core::model::{
+        CommandRunId, CommandRunStatus, Gate, Isolation, NewCommandRun, RunStatus, RunStepCommit,
+        StepStatus, VerifyOutcome,
+    };
+    use htui_core::store::{ReadStore as _, WriteStore as _};
+
+    use super::{
+        Adopted, FakeOrchestrator, Next, Orchestrate, Rest, RunFailure, candidate, crash,
+        fan_research, free_feat_3, judge_both, notes_of, primary_repo, repoint,
+        research_candidates, set_judge, slot_of, step_at, steps_of, tree_text,
+    };
+    use crate::isolate::Clock as _;
+    use crate::verify::VERIFY_CLASS;
+
+    /// §9.3's `refused` row: a clean `local` tree classifies resettable, but the isolator refuses
+    /// the reset, so the step takes D93's path with the refusal as its reason — failed
+    /// `interrupted, tree not reset` and the run parked, never retried on the unreset tree.
+    #[tokio::test]
+    async fn a_refused_reset_is_never_reset_with_the_refusal_as_its_reason() {
+        let orch = FakeOrchestrator::demo();
+        primary_repo(&orch).await;
+        free_feat_3(&orch).await;
+        repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+            if phase.name == "prd" {
+                phase.isolation = Some(Isolation::Local);
+            }
+        })
+        .await;
+        let stalled = orch.stall_after_done("prd", 1, None, false);
+        let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+        let prd = step_at(&orch, run, 0, 1).await;
+        let trees = orch
+            .store()
+            .step_trees(prd.id)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !trees.is_empty() && trees.iter().all(|tree| !tree.dirty),
+            "stage 2 recorded a clean tree, so D92 would reset it"
+        );
+        let listed = tree_text(&orch, prd.id).await;
+
+        let other = orch.restarted();
+        let refusal = format!("local_moved: {} moved since step start", trees[0].path);
+        other.isolator().script_reset_refusal(&refusal);
+        let adopted = other.sweep().await.expect("the sweep adopts");
+        assert_eq!(
+            adopted,
+            [Adopted {
+                run,
+                next: Next::Parked(Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(0),
+                    failure: Some(RunFailure::Interrupted {
+                        phase: "prd".to_owned(),
+                        reset: false,
+                    }),
+                }),
+            }]
+        );
+        assert_eq!(other.isolator().resets(), 1, "the isolator was asked, once");
+        let steps = steps_of(&other, run).await;
+        let prd = super::at(&steps, 0, 1);
+        assert_eq!(
+            (prd.status, prd.gate_note.as_deref()),
+            (StepStatus::Failed, Some("interrupted, tree not reset"))
+        );
+        assert!(
+            steps.iter().all(|step| step.attempt == 1),
+            "no attempt 2 on a tree the isolator refused to reset"
+        );
+        let n2 = format!(
+            "interrupted, tree not reset: step {} (`prd` attempt 1); trees: {listed}; reason: \
+             {refusal}; the run is parked for a human",
+            prd.id
+        );
+        let notes = notes_of(&other, ids::HTUI_FEAT_3).await;
+        assert!(notes.contains(&n2), "{n2}\n{notes:?}");
+    }
+
+    /// Plan D95 with M4 D48's settle: a `running` candidate whose document and every repo's
+    /// `after_hash` landed is finished with the verify [`crate::recover::verify_of`] derived
+    /// from its `command_run`, and moved `done` — not failed `interrupted`.
+    #[tokio::test]
+    async fn a_finished_candidate_is_settled_done() {
+        let orch = FakeOrchestrator::demo();
+        let repo = primary_repo(&orch).await;
+        fan_research(&orch, Gate::Never, true).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        judge_both(&orch, "research", 1, 0, "complete");
+        let stalled = orch.stall_after_done("research", 1, Some((1, 0)), true);
+        let run = crash(&orch, ids::HTUI_ANA_2, &stalled).await;
+        let steps = steps_of(&orch, run).await;
+        let stuck = candidate(&steps, 0, 1, 1).clone();
+        assert_eq!(stuck.status, StepStatus::Running, "the crash left it live");
+        assert_eq!(stuck.finished_at, None, "the crash beat `finish_step`");
+        let before = orch
+            .store()
+            .step_commits(stuck.id)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|row| row.repo_id == repo)
+            .expect("stage 2 recorded the base")
+            .before_hash;
+        orch.store()
+            .record_commits(
+                stuck.id,
+                &[RunStepCommit {
+                    run_step_id: stuck.id,
+                    repo_id: repo,
+                    before_hash: before,
+                    after_hash: Some("fake:after:candidate".to_owned()),
+                }],
+            )
+            .await
+            .expect("MemStore records the capture that landed");
+        let now = orch.clock().now();
+        orch.store()
+            .record_command_run(NewCommandRun {
+                id: CommandRunId::new(),
+                run_step_id: stuck.id,
+                box_id: ids::BOX,
+                class: VERIFY_CLASS.to_owned(),
+                command: "true".to_owned(),
+                cwd: "/fake".to_owned(),
+                status: CommandRunStatus::Done,
+                exit_code: Some(0),
+                output: Some(String::new()),
+                queued_at: now,
+                started_at: Some(now),
+                finished_at: Some(now),
+            })
+            .await
+            .expect("MemStore records the verify that ran");
+
+        let other = orch.restarted();
+        let adopted = other.sweep().await.expect("the sweep adopts");
+        assert_eq!(
+            adopted,
+            [Adopted {
+                run,
+                next: Next::Walk
+            }]
+        );
+        let steps = steps_of(&other, run).await;
+        assert_eq!(
+            slot_of(&steps, 0, 1)
+                .into_iter()
+                .map(|(index, status, _)| (index, status))
+                .collect::<Vec<_>>(),
+            [
+                (0, StepStatus::Done),
+                (1, StepStatus::Done),
+                (2, StepStatus::Done),
+            ]
+        );
+        let settled = candidate(&steps, 0, 1, 1);
+        assert_eq!(
+            (
+                settled.verify_outcome,
+                settled.verify_exit_code,
+                settled.gate_note.as_deref()
+            ),
+            (Some(VerifyOutcome::Pass), Some(0), None),
+            "M4 D48: the derived verify is recorded, and nothing interrupted it"
+        );
+        assert!(settled.finished_at.is_some(), "plan D90's `finish_step`");
+        assert_eq!(
+            other.isolator().resets(),
+            0,
+            "D95: no reset for a candidate"
+        );
+    }
+}
