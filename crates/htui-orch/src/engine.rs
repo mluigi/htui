@@ -453,7 +453,7 @@ where
             .claim_run(id, self.parts.box_id, self.parts.owner, now, lease)
             .await?;
         if !claim.is_admitted() {
-            return Err(EngineError::ClaimRefused { run: id });
+            return Err(EngineError::ClaimRefused { run: id, claim });
         }
 
         let rest = self.run_to_rest(id).await?;

@@ -14,7 +14,8 @@
 //! milestone 6's Runs tab speaks it without ever constructing an `Engine`. T4 uses both from here.
 
 use htui_core::model::{
-    ItemId, RepoId, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, StepId, StepStatus,
+    Claim, ItemId, RepoId, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, StepId,
+    StepStatus,
 };
 use htui_core::prompt::AssembleError;
 use htui_core::store::StoreError;
@@ -232,12 +233,31 @@ pub enum EngineError {
         /// The item holding the walk.
         item: ItemId,
     },
-    /// `claim_run` answered `Ok(false)`: the box is at `max_concurrent_items` or the run's scope
-    /// overlaps a live one (ANA-2 §4.7). The run stays `queued` and the caller may retry later —
-    /// the predicate itself is milestone 5's (plan D6, R-2).
+    /// Plan D83: why `claim_run` refused — the box is at `max_concurrent_items`, or the run's
+    /// scope overlaps a live one under ANA-2 §4.7's rules L, I or P. The run stays `queued`, and
+    /// `Engine::claim` re-attempts it (plan D84).
     #[error("claim refused: the box is full or the scope overlaps (ANA-2 §4.7)")]
     ClaimRefused {
         /// The run that stayed queued.
+        run: RunId,
+        /// What `claim_run` answered; never [`Claim::Admitted`].
+        claim: Claim,
+    },
+    /// Plan D86: a heartbeat's refresh touched zero rows, so another orchestrator took the lease
+    /// and the walk was dropped where it stood, writing nothing further (ANA-2 `:1280-1282`).
+    #[error(
+        "run {run}: its lease was taken by another orchestrator; this walk was abandoned (ANA-2 §4.9)"
+    )]
+    LeaseLost {
+        /// The run whose walk was abandoned.
+        run: RunId,
+    },
+    /// Plan D87 (and blueprint A-1's resume): the run's lease is live and this process does not
+    /// hold it, so nothing was written. A lease this process took before a write that then failed
+    /// stays live until its TTL (blueprint H-7), and reads the same way meanwhile.
+    #[error("run {run}: another orchestrator holds a live lease (ANA-2 §4.9)")]
+    LeaseHeld {
+        /// The run whose lease is held elsewhere.
         run: RunId,
     },
     /// The run carries a `graph_snapshot` at a version this engine does not read.
@@ -567,7 +587,7 @@ pub fn cancel_enabled(run: &Run) -> Result<(), EngineError> {
 #[cfg(test)]
 mod tests {
     use htui_core::fixtures::{demo_data, ids};
-    use htui_core::model::{GraphSnapshot, RunStep, SnapshotPhase, StepStatus};
+    use htui_core::model::{Claim, GraphSnapshot, OverlapRule, RunStep, SnapshotPhase, StepStatus};
 
     use htui_core::model::StepId;
 
@@ -691,6 +711,43 @@ mod tests {
         assert!(matches!(
             retry_enabled(&step, &phase).expect_err("a done step is not retryable"),
             EngineError::NotGated { .. }
+        ));
+    }
+
+    /// Blueprint A-8: a human's retry of a step the sweep failed as `interrupted` is not an
+    /// automatic retry, so the budget does not bind it — while an agent's own failure at the same
+    /// attempt still reads `RetryExhausted`.
+    #[test]
+    fn an_interrupted_step_is_retryable_past_its_budget() {
+        let (mut step, mut phase) = review();
+        phase.retry_limit = 0;
+        step.status = StepStatus::Failed;
+        step.attempt = 1;
+
+        for note in ["interrupted", "interrupted, tree not reset"] {
+            step.gate_note = Some(note.to_owned());
+            assert!(
+                retry_enabled(&step, &phase).is_ok(),
+                "`{note}` is a crash, not the agent's failed settle"
+            );
+        }
+
+        step.gate_note = None;
+        assert!(matches!(
+            retry_enabled(&step, &phase).expect_err("an agent's failure spends the budget"),
+            EngineError::RetryExhausted {
+                attempt: 1,
+                retry_limit: 0,
+                ..
+            }
+        ));
+
+        // The exemption is `failed`'s only: a parked step carrying the same note is budgeted.
+        step.status = StepStatus::AwaitingApproval;
+        step.gate_note = Some("interrupted".to_owned());
+        assert!(matches!(
+            retry_enabled(&step, &phase).expect_err("a parked step is budgeted"),
+            EngineError::RetryExhausted { .. }
         ));
     }
 
@@ -898,8 +955,41 @@ mod tests {
             )
         );
         assert_eq!(
-            EngineError::ClaimRefused { run: ids::RUN_2 }.to_string(),
-            "claim refused: the box is full or the scope overlaps (ANA-2 §4.7)"
+            EngineError::ClaimRefused {
+                run: ids::RUN_2,
+                claim: Claim::SlotFull {
+                    running: 2,
+                    limit: 2,
+                },
+            }
+            .to_string(),
+            "claim refused: box full (2 of 2 running)"
+        );
+        assert_eq!(
+            EngineError::ClaimRefused {
+                run: ids::RUN_2,
+                claim: Claim::Overlaps {
+                    with: ids::RUN_1,
+                    rule: OverlapRule::Paths,
+                },
+            }
+            .to_string(),
+            format!("claim refused: overlaps run {} (paths)", ids::RUN_1)
+        );
+        assert_eq!(
+            EngineError::LeaseLost { run: ids::RUN_2 }.to_string(),
+            format!(
+                "run {}: its lease was taken by another orchestrator; this walk was abandoned \
+                 (ANA-2 §4.9)",
+                ids::RUN_2
+            )
+        );
+        assert_eq!(
+            EngineError::LeaseHeld { run: ids::RUN_2 }.to_string(),
+            format!(
+                "run {}: another orchestrator holds a live lease (ANA-2 §4.9)",
+                ids::RUN_2
+            )
         );
         assert_eq!(
             EngineError::SnapshotVersion {
