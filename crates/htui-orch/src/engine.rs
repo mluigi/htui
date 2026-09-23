@@ -6702,7 +6702,7 @@ mod tests {
         harness.free_feat_3().await;
         harness
             .repoint(ids::HTUI_FEAT_3, |phase| {
-                phase.gate = htui_core::model::Gate::Never;
+                phase.gate = Gate::Never;
             })
             .await;
         let graphs = harness.orch.graphs();
