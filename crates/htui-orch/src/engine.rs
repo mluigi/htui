@@ -7652,6 +7652,49 @@ mod tests {
         assert_stale_start(&harness, run, step, &refused).await;
     }
 
+    /// Plan D144 (review L-c): stage 3's missing input fails the step `running -> failed`, and
+    /// that answering `Ok(false)` means another writer moved the step this walk moved to
+    /// `running`. The walk stops with `StaleWrite` rather than re-deriving: the run is neither
+    /// failed nor cleaned up. The stale read is the parked `prd` row, held at `awaiting_approval`.
+    #[tokio::test]
+    async fn a_stale_missing_input_failure_is_a_stale_write() {
+        let harness = Harness::new().await;
+        let (run, step) = started(&harness).await;
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let mut stale = stale_pending(&harness, run, step).await;
+        stale.status = StepStatus::Running;
+        let cleanups = harness.orch.isolator.cleanups();
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .fail_before_a_token(&row, &stale, &snapshot.phases[0], "spec".to_owned())
+            .await
+            .expect_err("the failure's compare-and-set found the row moved");
+        let EngineError::StaleWrite {
+            run: stopped,
+            row: named,
+            from,
+            to,
+        } = &refused
+        else {
+            panic!("a stale failure is a `StaleWrite`, not {refused}");
+        };
+        assert_eq!(*stopped, run);
+        assert_eq!(
+            (named.as_str(), from.as_str(), to.as_str()),
+            (format!("step {step}").as_str(), "running", "failed")
+        );
+        let after = harness.orch.run(run).await;
+        assert_eq!(
+            after.status,
+            RunStatus::AwaitingApproval,
+            "the run is not failed"
+        );
+        assert_eq!(after.failure, None);
+        assert_eq!(harness.orch.isolator.cleanups(), cleanups, "nor cleaned up");
+    }
+
     /// Plan D125 (review H1), end to end: after the session, and before the settle, a stranger's
     /// sweep fails `prd` attempt 1 (`interrupt_step`), as it may once this walk's lease lapsed.
     /// The stale walk reaches the gate's `running -> done`, reads `Ok(false)`, and stops with
