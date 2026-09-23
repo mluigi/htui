@@ -1657,6 +1657,18 @@ impl Fixture {
             .find(|row| row.repo_id == self.core.id)
             .expect("the step recorded the primary")
     }
+
+    /// The `docs` repo's `run_step_commit` row of `step`.
+    async fn docs_commit(&self, step: &RunStep) -> RunStepCommit {
+        self.orch
+            .store
+            .step_commits(step.id)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|row| row.repo_id == self.docs.id)
+            .expect("the step recorded `docs`")
+    }
 }
 
 /// A `review` rejection, as a human gives it.
@@ -1842,7 +1854,10 @@ impl SessionSink for StallingSink<'_> {
 
 /// An [`Isolator`] that is [`GixIsolator`] in every verb except that its `nth` `reconcile` call
 /// (1-based) runs the real merge, raises `stalled` and never returns (blueprint F-A): "the merge
-/// happened, `record_commits` did not".
+/// happened, `record_commits` did not". With `nth = u32::MAX` it never stalls and only counts the
+/// `reconcile` calls, which is how a sweep is shown to reconcile a recovered winner exactly once
+/// (blueprint A-3): over real git a repeated reconcile writes no second merge, so the merges alone
+/// cannot tell one call from two.
 #[derive(Debug)]
 struct StallAfterReconcile<'g> {
     inner: &'g GixIsolator,
@@ -1859,6 +1874,19 @@ impl<'g> StallAfterReconcile<'g> {
             calls: Mutex::new(0),
             stalled: Arc::new(Notify::new()),
         }
+    }
+
+    /// A delegate that never stalls and only counts `reconcile` calls.
+    fn counting(inner: &'g GixIsolator) -> Self {
+        Self::new(inner, u32::MAX)
+    }
+
+    /// How many `reconcile` calls reached [`GixIsolator`] so far.
+    fn reconciles(&self) -> u32 {
+        *self
+            .calls
+            .lock()
+            .expect("no panic holds the reconcile counter")
     }
 }
 
@@ -2270,12 +2298,24 @@ async fn criterion_18_a_finished_worktree_step_is_adopted_and_merged() {
         .await
         .after_hash
         .expect("the agent committed on `core`");
+    let docs_after = fix
+        .docs_commit(&prd)
+        .await
+        .after_hash
+        .expect("the agent committed on `docs`");
     assert!(merges(&git, &fix.core.path).await.is_empty());
+    assert!(merges(&git, &fix.docs.path).await.is_empty());
 
-    let adopted = engine_as!(&fix, &isolator, &clock, owner, &fix.orch, |engine| engine
+    let counting = StallAfterReconcile::counting(&isolator);
+    let adopted = engine_as!(&fix, &counting, &clock, owner, &fix.orch, |engine| engine
         .sweep()
         .await)
     .expect("the sweep adopts");
+    assert_eq!(
+        counting.reconciles(),
+        1,
+        "blueprint A-3: the recovered winner is reconciled exactly once"
+    );
     assert_eq!(
         adopted,
         [Adopted {
@@ -2300,6 +2340,22 @@ async fn criterion_18_a_finished_worktree_step_is_adopted_and_merged() {
         fix.core_commit(&prd).await.after_hash.as_deref(),
         Some(merged[0][0].as_str()),
         "ANA-2 `:987-988`: the winner's `after_hash` is the merge"
+    );
+    let docs_merged = merges(&git, &fix.docs.path).await;
+    assert_eq!(
+        docs_merged.len(),
+        1,
+        "`docs` merged exactly once: {docs_merged:?}"
+    );
+    assert_eq!(
+        docs_merged[0][1..],
+        [fix.docs.head.clone(), docs_after],
+        "every repo of the scope is merged, not only the primary"
+    );
+    assert_eq!(head_of(&git, &fix.docs.path).await, docs_merged[0][0]);
+    assert_eq!(
+        fix.docs_commit(&prd).await.after_hash.as_deref(),
+        Some(docs_merged[0][0].as_str())
     );
 }
 
@@ -2471,7 +2527,8 @@ async fn a_lost_merge_is_recognised_not_repeated() {
     );
 
     let (isolator, owner, clock) = fix.second_process();
-    let adopted = engine_as!(&fix, &isolator, &clock, owner, &fix.orch, |engine| engine
+    let counting = StallAfterReconcile::counting(&isolator);
+    let adopted = engine_as!(&fix, &counting, &clock, owner, &fix.orch, |engine| engine
         .sweep()
         .await)
     .expect("the sweep adopts");
@@ -2481,6 +2538,11 @@ async fn a_lost_merge_is_recognised_not_repeated() {
             run,
             next: Next::Walk
         }]
+    );
+    assert_eq!(
+        counting.reconciles(),
+        1,
+        "blueprint A-3: the frontier reconcile runs once for the recovered winner"
     );
     assert_eq!(
         merges(&git, &fix.core.path).await,
