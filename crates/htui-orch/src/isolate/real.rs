@@ -1074,7 +1074,9 @@ impl GixIsolator {
     /// [`git::merge_conflict`]'s refusal like any other. Before that, blueprint H-3's crash
     /// between the merge and `record_commits` is looked for: a merge on `HEAD`'s first-parent
     /// history back to the base whose second parent is the tip is this step's, even under a later
-    /// run's merge, and the answer is that commit rather than a second merge.
+    /// run's merge, and the answer is that commit rather than a second merge. Everything from the
+    /// clean check to the merge's post-condition runs under the repository's admin lock (D70), so
+    /// two runs of one process reconciling one repository take turns.
     async fn reconcile_isolated(
         &self,
         step: StepId,
@@ -1100,6 +1102,13 @@ impl GixIsolator {
         };
 
         let git = self.cli()?.clone();
+        // D136 under D70's lock: from the clean check and the `HEAD` read through the merge's
+        // post-condition, so another run of this process cannot merge in between and leave this
+        // merge on top of one the post-condition does not expect. Nothing below takes the lock
+        // again — `tokio`'s mutex is not reentrant. Another *process* is not held off; its merge
+        // in between fails the post-condition, the run parks, and the next reconcile finds the
+        // landed merge through `merge_of`.
+        let _admin = self.admin_guard(tree.repo_id).await;
         let read = local.clone();
         if blocking(move || git::is_dirty(&read)).await? {
             return Err(IsolateError::Refused(dirty_primary_tree()));
