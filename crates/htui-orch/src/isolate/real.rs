@@ -1305,7 +1305,9 @@ impl Isolator for GixIsolator {
                         .collect::<Vec<_>>()
                         .join(", "),
                     stat: under_repo_headers(
-                        several.iter().map(|(name, _, stat, _)| (name.as_str(), stat.as_str())),
+                        several
+                            .iter()
+                            .map(|(name, _, stat, _)| (name.as_str(), stat.as_str())),
                     ),
                     diff: under_repo_headers(
                         several

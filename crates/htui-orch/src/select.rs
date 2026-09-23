@@ -635,7 +635,11 @@ mod tests {
         ghost_row.agent_id = ghost;
         let boxes = boxes_of([ghost_row]);
         let walked = walk(&input(&ghost_candidates, &agents, &boxes));
-        assert_eq!(first_cause(&walked), &SkipCause::NoAgentRow, "rule 1 before 2");
+        assert_eq!(
+            first_cause(&walked),
+            &SkipCause::NoAgentRow,
+            "rule 1 before 2"
+        );
 
         // Rule 2 before rule 3: a gated cli row with an exhausted quota is a quota skip.
         let cli = [candidate(ids::AGENT_CLAUDE_CLI, "claude-cli")];

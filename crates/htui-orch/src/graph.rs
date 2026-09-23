@@ -145,7 +145,9 @@ pub enum ResolveError {
     },
     /// Plan D64 (OQ-5): a `review` phase cannot fan out, because the loop's gate reads one review
     /// verdict and a group's review would need a judge of reviews nothing defines.
-    #[error("phase `{phase}` is a review with fan_out {fan_out}; a review cannot fan out (plan D64)")]
+    #[error(
+        "phase `{phase}` is a review with fan_out {fan_out}; a review cannot fan out (plan D64)"
+    )]
     ReviewFanOut {
         /// `step_graph_phase.name`.
         phase: String,
@@ -1403,7 +1405,10 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .judge
             .as_ref()
             .expect("the project names a judge");
-        assert_eq!(judge.template, None, "nothing to pin, so latest at judge time");
+        assert_eq!(
+            judge.template, None,
+            "nothing to pin, so latest at judge time"
+        );
     }
 
     /// Plan D63, first cap: `app_setting.max_fan_out`, refused before a run row exists.
@@ -1428,9 +1433,8 @@ question and not a test fix. Decide the version bump first, then paste the new d
 
         // The `app_setting` rung moves the cap, and the refusal names the resolved figure.
         let store = store_fanned(ids::GRAPH_HTUI_FEAT, "implement", 3);
-        let app: BTreeMap<String, Value> = [("max_fan_out".to_owned(), json!(2))]
-            .into_iter()
-            .collect();
+        let app: BTreeMap<String, Value> =
+            [("max_fan_out".to_owned(), json!(2))].into_iter().collect();
         let error = resolve_item(&store, ids::HTUI_FEAT_1, &app)
             .await
             .expect_err("3 is above a planted 2");
@@ -1503,7 +1507,10 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .collect();
         assert_eq!(names, ["research", "verdict"]);
         assert_eq!(snapshot.phases[0].fan_out, 3);
-        assert!(snapshot.phases[0].judge.is_some(), "the project names a judge");
+        assert!(
+            snapshot.phases[0].judge.is_some(),
+            "the project names a judge"
+        );
         assert_eq!(snapshot.settings.max_fan_out, 4);
         assert_eq!(snapshot.settings.max_agents_per_run, 6);
     }
