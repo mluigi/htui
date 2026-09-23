@@ -8,11 +8,13 @@
 //!   [`tokio::task::spawn_blocking`]; no `gix::Repository` ever crosses an `.await`, because it is
 //!   `Send` and *not* `Sync` (`gix-0.87.1/src/types.rs:148`) and `IsolatorFuture` is `Send`, and
 //!   no status walk ever runs on a runtime worker.
-//! - **The `git` half** — a `Cli` that spawns the binary for the five verbs `gix` 0.87.1 does not
-//!   implement: `worktree add`, `worktree remove`, `merge --no-ff`, `merge --abort` and
+//! - **The `git` half** — a `Cli` that spawns the binary for the six verbs `gix` 0.87.1 does not
+//!   implement: `worktree add`, `worktree remove`, `merge --no-ff`, `merge --abort`,
 //!   `reset --hard` (plan OQ-1, resolved by the maintainer on 2026-09-22; D23, D25, D47;
-//!   `docs/ANA-2.md:1777` as amended). Nothing is ever parsed from a verb's stdout: success is
-//!   exit 0 *plus* a `gix` post-condition, and failure is one line of stderr ([`Exited::message`]).
+//!   `docs/ANA-2.md:1777` as amended) and `diff` (MOD-4 milestone 4 D55). Nothing is ever parsed
+//!   from the first five verbs' stdout: success is exit 0 *plus* a `gix` post-condition, and
+//!   failure is one line of stderr ([`Exited::message`]). `diff` is the one verb whose stdout
+//!   *is* the product: it is handed on verbatim, head-capped, and never parsed either.
 //!
 //! `git worktree prune` is never spawned (plan D46): our entries are created `--lock`ed and prune
 //! refuses locked entries, so the verb's only reachable effect is on worktrees this orchestrator
@@ -30,7 +32,7 @@ use tokio::io::AsyncReadExt as _;
 
 use crate::isolate::IsolateError;
 
-/// The oldest `git` that has everything the five verbs use: `worktree add --lock --reason` and
+/// The oldest `git` that has everything the six verbs use: `worktree add --lock --reason` and
 /// `worktree remove --force --force` (plan D23, the ledger's tag walk). 2.33.0, August 2021.
 pub const MIN_GIT: (u32, u32, u32) = (2, 33, 0);
 
@@ -57,6 +59,22 @@ const PIPE_GRACE: Duration = Duration::from_secs(1);
 /// The tail, not `launch.rs`'s head cap (`crates/htui-agent/src/launch.rs:736-740`), because the
 /// line that classifies a `git` failure is the last one it wrote, not the first.
 pub const CAPTURE_TAIL: usize = 64 * 1024;
+
+/// Bytes kept of [`Cli::diff`]'s stdout: the **first** 64 KiB (MOD-4 milestone 4 D55).
+///
+/// The head, not the tail [`CAPTURE_TAIL`] keeps: a patch cut at its start loses its first
+/// `diff --git`/`---`/`+++` headers and begins mid-hunk, which no reader can place.
+pub const DIFF_CAP: usize = 64 * 1024;
+
+/// What [`HeadBuffer::into_string`] appends to a capture that overflowed its cap (D55).
+const DIFF_TRUNCATED: &str = "\n[diff truncated at 64 KiB]";
+
+/// `git diff`'s `--stat` graph width (MOD-4 milestone 4 A-4, plan D75).
+///
+/// `git diff --stat` sizes itself from an inherited `COLUMNS` even when its stdout is a pipe, so
+/// without this the judge prompt's bytes, and its digest, would depend on the terminal that
+/// launched `htui`.
+const DIFF_COLUMNS: (&str, &str) = ("COLUMNS", "80");
 
 /// `CREATE_NO_WINDOW`: a TUI must not flash a console window when it spawns a child.
 ///
@@ -153,10 +171,11 @@ fn budget_text(budget: Duration) -> String {
     }
 }
 
-/// The `git` binary this process spawns for the five verbs `gix` 0.87.1 lacks.
+/// The `git` binary this process spawns for the six verbs `gix` 0.87.1 lacks.
 ///
 /// Located once and version-checked once by [`Cli::locate`], then cloned freely: no verb
-/// re-probes. Plan OQ-1, D23, D25, D47; `docs/ANA-2.md:1777` as amended.
+/// re-probes. Plan OQ-1, D23, D25, D47; `docs/ANA-2.md:1777` as amended; `diff` is MOD-4
+/// milestone 4's D55, and the one verb whose stdout is the product.
 #[derive(Debug, Clone)]
 pub struct Cli {
     binary: PathBuf,
@@ -329,6 +348,21 @@ impl Cli {
         args: &[&OsStr],
         extra_env: &[(&str, &str)],
     ) -> Result<Exited, IsolateError> {
+        self.run_capturing(verb, cwd, args, extra_env, Capture::Tail)
+            .await
+    }
+
+    /// [`run`](Cli::run), with stdout kept as `stdout` says: the last [`CAPTURE_TAIL`] bytes for
+    /// the five verbs whose stdout is never read, the first [`DIFF_CAP`] for [`diff`](Cli::diff),
+    /// whose stdout is the product. Stderr is always tail-captured.
+    async fn run_capturing(
+        &self,
+        verb: &'static str,
+        cwd: &Path,
+        args: &[&OsStr],
+        extra_env: &[(&str, &str)],
+        stdout: Capture,
+    ) -> Result<Exited, IsolateError> {
         let build = || {
             let mut command = self.command(cwd);
             command.args(args);
@@ -340,11 +374,13 @@ impl Cli {
 
         let mut child = spawn_supervised(build)
             .map_err(|err| IsolateError::Git(cannot_spawn(verb, &self.binary, &err)))?;
+        let out = std::sync::Mutex::new(match stdout {
+            Capture::Tail => Sink::Tail(TailBuffer::new(CAPTURE_TAIL)),
+            Capture::Head => Sink::Head(HeadBuffer::new(DIFF_CAP)),
+        });
+        let err = std::sync::Mutex::new(Sink::Tail(TailBuffer::new(CAPTURE_TAIL)));
         let stdout = child.stdout().take();
         let stderr = child.stderr().take();
-
-        let out = std::sync::Mutex::new(TailBuffer::new(CAPTURE_TAIL));
-        let err = std::sync::Mutex::new(TailBuffer::new(CAPTURE_TAIL));
         // Boxed rather than pinned on the stack so that dropping it drops the pipes with it.
         let mut reading = Box::pin(async {
             tokio::join!(read_tail(stdout, &out), read_tail(stderr, &err));
@@ -383,8 +419,17 @@ impl Cli {
     }
 }
 
+/// Which end of a verb's stdout [`Cli::run_capturing`] keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capture {
+    /// The last [`CAPTURE_TAIL`] bytes: the line that classifies a failure is the last one.
+    Tail,
+    /// The first [`DIFF_CAP`] bytes: a patch is read from its first header (D55).
+    Head,
+}
+
 // ---------------------------------------------------------------------------------------------
-// The five verbs. Each classifies its own exit before building an error, because exit 1 means two
+// The six verbs. Each classifies its own exit before building an error, because exit 1 means two
 // different things to `git merge` (blueprint H-8) and exit 128 two to `worktree remove`.
 // ---------------------------------------------------------------------------------------------
 
@@ -704,6 +749,48 @@ impl Cli {
         }
         Err(exited.failure("merge --abort"))
     }
+
+    /// MOD-4 milestone 4 D55 and A-4: `git diff --no-color --no-ext-diff --no-textconv
+    /// --src-prefix=a/ --dst-prefix=b/ [--stat] <before> <after> --` in `repo`, under
+    /// `COLUMNS=80`, with stdout head-capped at [`DIFF_CAP`].
+    ///
+    /// The flags are `git diff --help`'s: `--no-color` because the text is read by an agent, not a
+    /// terminal; `--no-ext-diff` and `--no-textconv` keep `diff.external` and textconv drivers
+    /// out of an orchestrator path; the explicit `--src-prefix`/`--dst-prefix` defeat
+    /// `diff.noprefix` and `diff.mnemonicPrefix`; the trailing `--` keeps a revision from ever
+    /// being read as a path. The stdout is the product and is returned verbatim, with
+    /// `\n[diff truncated at 64 KiB]` appended when it overflowed. Not retried: a read (M3 D39).
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] for a spawn or budget failure, or for a non-zero exit (a revision the
+    /// repository does not hold, among them).
+    pub async fn diff(
+        &self,
+        repo: &Path,
+        before: &str,
+        after: &str,
+        stat: bool,
+    ) -> Result<String, IsolateError> {
+        let mut args = vec![
+            OsStr::new("diff"),
+            OsStr::new("--no-color"),
+            OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
+            OsStr::new("--src-prefix=a/"),
+            OsStr::new("--dst-prefix=b/"),
+        ];
+        if stat {
+            args.push(OsStr::new("--stat"));
+        }
+        args.extend([OsStr::new(before), OsStr::new(after), OsStr::new("--")]);
+        let exited = self
+            .run_capturing("diff", repo, &args, &[DIFF_COLUMNS], Capture::Head)
+            .await?;
+        if !exited.ok() {
+            return Err(exited.failure("diff"));
+        }
+        Ok(exited.stdout)
+    }
 }
 
 /// The sleeps between retries (plan D39): 200, 400 and 800 ms, so four attempts in all.
@@ -719,8 +806,8 @@ pub const RETRY_BACKOFF: [Duration; 3] = [
 /// Runs `op`, retrying it on [`RETRY_BACKOFF`]'s schedule while [`is_lock_error`] says the failure
 /// was somebody else holding a `.lock` file (plan D39).
 ///
-/// Every git **write** goes through this — the five verbs, [`create_branch`] and [`copy_range`];
-/// reads do not. Each failed attempt is logged at `warn` with its classification, so a `git`
+/// Every git **write** goes through this — the five writing verbs, [`create_branch`] and
+/// [`copy_range`]; reads do not, and neither does `diff`, which is one. Each failed attempt is logged at `warn` with its classification, so a `git`
 /// whose wording drifts shows up as a run of warnings rather than as silence.
 ///
 /// # Errors
@@ -786,8 +873,9 @@ fn leading_u32(text: &str) -> Option<u32> {
 pub struct Exited {
     /// `None` when the child was killed by a signal.
     pub code: Option<i32>,
-    /// The last [`CAPTURE_TAIL`] bytes of stdout, lossily decoded. Never parsed: every success has
-    /// a `gix` post-condition instead.
+    /// Stdout, lossily decoded: the last [`CAPTURE_TAIL`] bytes, or the first [`DIFF_CAP`] for
+    /// [`Cli::diff`]. Never parsed, except by [`Cli::diff`], whose stdout is the product: every
+    /// other success has a `gix` post-condition instead.
     pub stdout: String,
     /// The last [`CAPTURE_TAIL`] bytes of stderr, lossily decoded.
     pub stderr: String,
@@ -926,6 +1014,71 @@ impl TailBuffer {
     }
 }
 
+/// The first `cap` bytes pushed through it, and whether anything was dropped after them (D55).
+#[derive(Debug)]
+pub struct HeadBuffer {
+    kept: Vec<u8>,
+    cap: usize,
+    overflowed: bool,
+}
+
+impl HeadBuffer {
+    /// An empty buffer that will keep at most `cap` bytes.
+    #[must_use]
+    pub fn new(cap: usize) -> Self {
+        Self {
+            kept: Vec::new(),
+            cap,
+            overflowed: false,
+        }
+    }
+
+    /// Appends as much of `chunk` as still fits, and records an overflow for the rest.
+    pub fn push(&mut self, chunk: &[u8]) {
+        let room = self.cap - self.kept.len();
+        if chunk.len() > room {
+            self.overflowed = true;
+        }
+        self.kept.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+
+    /// The buffer as text, lossily, with `\n[diff truncated at 64 KiB]` appended when it
+    /// overflowed.
+    ///
+    /// A cap that lands mid-codepoint yields a trailing replacement character before the marker.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        let mut text = String::from_utf8_lossy(&self.kept).into_owned();
+        if self.overflowed {
+            text.push_str(DIFF_TRUNCATED);
+        }
+        text
+    }
+}
+
+/// One pipe's capture: a tail for everything but `diff`'s stdout, which keeps its head.
+#[derive(Debug)]
+enum Sink {
+    Tail(TailBuffer),
+    Head(HeadBuffer),
+}
+
+impl Sink {
+    fn push(&mut self, chunk: &[u8]) {
+        match self {
+            Self::Tail(tail) => tail.push(chunk),
+            Self::Head(head) => head.push(chunk),
+        }
+    }
+
+    fn into_string(self) -> String {
+        match self {
+            Self::Tail(tail) => tail.into_string(),
+            Self::Head(head) => head.into_string(),
+        }
+    }
+}
+
 /// Drains `reader` into `tail`, stopping at end of stream or at the first pipe error.
 ///
 /// Into a shared buffer rather than a returned one, so that a read abandoned after the verb exited
@@ -933,7 +1086,7 @@ impl TailBuffer {
 /// `push` and never across an `.await`.
 async fn read_tail(
     reader: Option<impl tokio::io::AsyncRead + Unpin>,
-    tail: &std::sync::Mutex<TailBuffer>,
+    tail: &std::sync::Mutex<Sink>,
 ) {
     let Some(mut reader) = reader else {
         return;
@@ -950,8 +1103,8 @@ async fn read_tail(
     }
 }
 
-/// The text a shared [`TailBuffer`] holds.
-fn into_string(tail: std::sync::Mutex<TailBuffer>) -> String {
+/// The text a shared capture holds.
+fn into_string(tail: std::sync::Mutex<Sink>) -> String {
     tail.into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .into_string()
@@ -1060,6 +1213,23 @@ pub fn head(path: &Path) -> Result<String, IsolateError> {
         IsolateError::Git(format!("cannot peel HEAD of {}: {err}", path.display()))
     })?;
     Ok(id.detach().to_hex().to_string())
+}
+
+/// Whether `path`'s object database holds `hex` as a commit (MOD-4 milestone 4 A-3, plan D74).
+///
+/// A `gix` read, not a verb: [`Cli::diff`] must run in a repository that holds the range's `after`,
+/// and after a `copy` reconcile that is the merge commit, which only the primary holds.
+///
+/// # Errors
+/// [`IsolateError::Git`] when the repository cannot be opened, `hex` is not a hash, or the lookup
+/// fails.
+pub fn has_commit(path: &Path, hex: &str) -> Result<bool, IsolateError> {
+    let repo = open(path)?;
+    let id = parse_oid(hex)?;
+    let object = repo
+        .try_find_object(id)
+        .map_err(|err| IsolateError::Git(format!("cannot look up {hex}: {err}")))?;
+    Ok(object.is_some_and(|object| object.kind == gix::object::Kind::Commit))
 }
 
 /// `HEAD`'s parents as hex, in order (`gix-0.87.1/src/object/commit.rs:154`).
@@ -1640,7 +1810,10 @@ mod tests {
     use std::time::Duration;
 
     use super::testkit::{commit_file, empty_repo, has_object, repo_with_one_commit};
-    use super::{CAPTURE_TAIL, Cli, Exited, MIN_GIT, SCRUBBED_ENV, TailBuffer, is_lock_error};
+    use super::{
+        CAPTURE_TAIL, Cli, DIFF_CAP, Exited, HeadBuffer, MIN_GIT, SCRUBBED_ENV, TailBuffer,
+        is_lock_error,
+    };
     use crate::isolate::IsolateError;
 
     /// A repository this crate made with `gix` alone reads back through this crate's own `head`.
@@ -2638,6 +2811,199 @@ mod tests {
             !repo.join(".git").join("MERGE_HEAD").exists(),
             "each failed attempt aborted its own half-merge"
         );
+    }
+
+    /// The oracle for D55's verb: the very argv, spawned by the test itself under the pinned
+    /// `COLUMNS` (A-4), with M3's scrubbed environment.
+    fn oracle_diff(
+        git: &Cli,
+        repo: &std::path::Path,
+        before: &str,
+        after: &str,
+        stat: bool,
+    ) -> String {
+        let mut oracle = std::process::Command::new(git.binary());
+        oracle.current_dir(repo).args([
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+        ]);
+        if stat {
+            oracle.arg("--stat");
+        }
+        oracle.args([before, after, "--"]);
+        for key in SCRUBBED_ENV {
+            oracle.env_remove(key);
+        }
+        let out = oracle
+            .env("LC_ALL", "C")
+            .env("COLUMNS", "80")
+            .output()
+            .expect("the oracle runs");
+        assert!(out.status.success(), "the oracle failed: {out:?}");
+        String::from_utf8(out.stdout).expect("the oracle's output is text")
+    }
+
+    /// D55's verb is the one whose stdout is the product, so its output is checked byte for byte
+    /// against `git`'s own, patch and stat both.
+    #[tokio::test]
+    async fn diff_and_diff_stat_of_a_range_match_git_s_own_output() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let before = repo_with_one_commit(dir.path());
+        commit_file(dir.path(), "f", "first\nsecond\n", "edit f");
+        let after = commit_file(
+            dir.path(),
+            "a-rather-long-file-name-that-a-narrow-terminal-would-cut.txt",
+            "new\n",
+            "add",
+        );
+
+        let patch = git
+            .diff(dir.path(), &before, &after, false)
+            .await
+            .expect("the patch reads");
+        let stat = git
+            .diff(dir.path(), &before, &after, true)
+            .await
+            .expect("the stat reads");
+        assert_eq!(patch, oracle_diff(&git, dir.path(), &before, &after, false));
+        assert_eq!(stat, oracle_diff(&git, dir.path(), &before, &after, true));
+        assert!(patch.starts_with("diff --git a/"), "{patch}");
+        assert!(stat.contains("2 files changed"), "{stat}");
+        assert!(
+            stat.contains("a-rather-long-file-name-that-a-narrow-terminal-would-cut.txt"),
+            "COLUMNS=80 keeps the name whole: {stat}"
+        );
+    }
+
+    /// D55: `--no-ext-diff` keeps `diff.external` out and the explicit prefixes beat
+    /// `diff.noprefix`, whatever the repository's config says.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diff_ignores_an_external_diff_driver_and_noprefix() {
+        use std::io::Write as _;
+
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("the repository directory is made");
+        let before = repo_with_one_commit(&repo);
+        let after = commit_file(&repo, "f", "edited\n", "edit f");
+
+        let driver = fake_git(dir.path(), "external-diff", "echo EXTERNAL; exit 0");
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(repo.join(".git").join("config"))
+            .expect("the config opens");
+        write!(
+            config,
+            "[diff]\n\texternal = {}\n\tnoprefix = true\n",
+            driver.display()
+        )
+        .expect("the config is written");
+        drop(config);
+
+        let patch = git
+            .diff(&repo, &before, &after, false)
+            .await
+            .expect("the patch reads");
+        assert!(!patch.contains("EXTERNAL"), "{patch}");
+        assert!(patch.starts_with("diff --git a/f b/f\n"), "{patch}");
+        assert!(patch.contains("\n--- a/f\n+++ b/f\n"), "{patch}");
+    }
+
+    /// An empty range is an empty answer, not an error.
+    #[tokio::test]
+    async fn diff_of_an_empty_range_is_empty() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let head = repo_with_one_commit(dir.path());
+        for stat in [false, true] {
+            assert_eq!(
+                git.diff(dir.path(), &head, &head, stat)
+                    .await
+                    .expect("the empty range reads"),
+                ""
+            );
+        }
+    }
+
+    /// D55: a head cap, not a tail one — a long patch keeps its first `diff --git` header and says
+    /// it was cut.
+    #[tokio::test]
+    async fn a_diff_over_the_cap_keeps_its_head_and_says_it_was_truncated() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let before = repo_with_one_commit(dir.path());
+        let body: String = (0..4_000_u32)
+            .map(|line| format!("{line:0>40}\n"))
+            .collect();
+        let after = commit_file(dir.path(), "big", &body, "big");
+
+        let patch = git
+            .diff(dir.path(), &before, &after, false)
+            .await
+            .expect("the patch reads");
+        assert!(
+            patch.starts_with("diff --git a/big b/big\n"),
+            "{}",
+            &patch[..80]
+        );
+        assert!(patch.ends_with("\n[diff truncated at 64 KiB]"));
+        assert!(patch.len() <= DIFF_CAP + "\n[diff truncated at 64 KiB]".len() + 3);
+    }
+
+    /// The head buffer keeps the first bytes and records that it overflowed.
+    #[test]
+    fn head_buffer_keeps_the_first_64_kib() {
+        let mut head = HeadBuffer::new(DIFF_CAP);
+        for index in 0..200_u32 {
+            head.push(format!("{index:0>1024}\n").as_bytes());
+        }
+        let kept = head.into_string();
+        assert!(kept.starts_with("0000"), "the start survives");
+        assert!(!kept.contains("0199\n"), "the end does not");
+        assert_eq!(kept.len(), DIFF_CAP + "\n[diff truncated at 64 KiB]".len());
+        assert!(kept.ends_with("\n[diff truncated at 64 KiB]"));
+
+        let mut head = HeadBuffer::new(8);
+        head.push(b"abcdefghijklm");
+        assert_eq!(head.into_string(), "abcdefgh\n[diff truncated at 64 KiB]");
+
+        let mut exact = HeadBuffer::new(4);
+        exact.push(b"ab");
+        exact.push(b"cd");
+        assert_eq!(
+            exact.into_string(),
+            "abcd",
+            "exactly the cap is not an overflow"
+        );
+    }
+
+    /// A-3's read: whether an object database holds a commit, with no subprocess.
+    #[test]
+    fn has_commit_answers_for_this_odb_only() {
+        let first = tempfile::tempdir().expect("a temporary directory");
+        let second = tempfile::tempdir().expect("a temporary directory");
+        let base = repo_with_one_commit(first.path());
+        let tip = commit_file(first.path(), "g", "second\n", "two");
+        repo_with_one_commit(second.path());
+        assert!(super::has_commit(first.path(), &tip).expect("the read succeeds"));
+        assert!(super::has_commit(first.path(), &base).expect("the read succeeds"));
+        assert!(!super::has_commit(second.path(), &tip).expect("the read succeeds"));
+        assert!(super::has_commit(first.path(), "not-hex").is_err());
     }
 
     /// A `sh` script that answers `--version` like `git` does, marked executable.
