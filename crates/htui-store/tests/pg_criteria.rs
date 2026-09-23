@@ -784,10 +784,10 @@ async fn two_takes_of_one_released_lease_admit_one() {
     );
     assert!(
         db.store
-            .refresh_lease(run, first_owner, at)
+            .release_lease(run, first_owner, at)
             .await
             .expect("the release must not fail"),
-        "the walk that parked it releases its lease (lease_expires_at = now)"
+        "the walk that parked it releases its lease (owner cleared, lease_expires_at = now: plan D139)"
     );
 
     let other = PgStore::connect(&db.url, &db.identity)
