@@ -12,8 +12,9 @@
 //! (`docs/ANA-2.md:508-515`), beside the real isolator. Milestone 4 adds [`select`], `R-AGT-8`'s
 //! walk over a phase's candidates (plan D60), and [`fanout`], the pure half of fan-out: the
 //! prefilter, the group's route, the judge's phase and inputs, and its verdict (plan D49, D52,
-//! D53). `overlap.rs`, `recover.rs` and `queue.rs` are named by ANA-2 §8 and belong to milestone 5
-//! and MOD-12; they are deliberately not created, not even empty (plan D1).
+//! D53). Milestone 5 adds `overlap`, ANA-2 §4.7's scope resolution, and [`recover`], §4.9's lease
+//! heartbeat and the sweep's pure half (plan D85, D86, D90, D91, D97). `queue.rs`, also named by
+//! ANA-2 §8, remains MOD-12's and is deliberately not created, not even empty (plan D1).
 #![warn(missing_docs)]
 
 pub mod command;
@@ -26,6 +27,7 @@ pub mod fanout;
 pub mod gate;
 pub mod graph;
 pub mod isolate;
+pub mod recover;
 pub mod select;
 pub mod status;
 pub mod verify;
