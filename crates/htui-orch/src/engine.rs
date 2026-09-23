@@ -2648,6 +2648,100 @@ mod tests {
         );
     }
 
+    /// Plan D67's two degradations: a failed verify with no exit code recorded anywhere, and an
+    /// isolator whose `diff` errors, each become a trim note on attempt 2's prompt — neither
+    /// section is rendered, and neither fails the step (the diff is advisory, D55).
+    #[tokio::test]
+    async fn a_forward_with_nothing_to_render_degrades_to_trim_notes() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.gate = Gate::Never;
+                    phase.retry_limit = 1;
+                    phase.verify_command = Some("cargo test".to_owned());
+                    phase.template_name = "implement".to_owned();
+                }
+            })
+            .await;
+        let mut report = crate::fake::FakeVerifier::fail(1);
+        report.exit_code = None;
+        harness.orch.verifier.script_report(report);
+        harness.orch.isolator.fail_diff("index.lock held");
+
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(1)),
+            "attempt 2 ran despite both degradations, passed, and `plan` parked"
+        );
+        let steps = harness.orch.steps(run).await;
+        let first = steps
+            .iter()
+            .find(|step| step.position == 0 && step.attempt == 1)
+            .expect("attempt 1 ran");
+        assert_eq!(
+            first.verify_exit_code, None,
+            "the premise: no code recorded"
+        );
+        let second = steps
+            .iter()
+            .find(|step| step.position == 0 && step.attempt == 2)
+            .expect("attempt 2 ran");
+        assert_eq!(second.status, StepStatus::Done);
+        let notes: Vec<String> = second
+            .trim_record
+            .as_ref()
+            .and_then(|record| record.get("notes"))
+            .and_then(serde_json::Value::as_array)
+            .expect("attempt 2's trim record carries its notes")
+            .iter()
+            .filter_map(|note| note.as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            notes.contains(&format!(
+                "verify_failure unavailable: step {} failed its verify_command and recorded no \
+                 exit code",
+                first.id
+            )),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| {
+                note.starts_with("previous_diff unavailable: ") && note.contains("index.lock held")
+            }),
+            "{notes:?}"
+        );
+        let events = harness
+            .orch
+            .store
+            .step_events(second.id)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("attempt 2 recorded its session");
+        let sections = events
+            .iter()
+            .find(|event| event.seq == 0)
+            .expect("seq 0 is the prompt")
+            .payload["sections"]
+            .to_string();
+        assert!(
+            !sections.contains("verify_failure") && !sections.contains("previous_diff"),
+            "neither section is rendered: {sections}"
+        );
+    }
+
     /// The cap half of plan D60 rule 2 through the same wiring: `prd` and `plan` each spend 600 —
     /// under the 1000 cap per session, so the recorder's own breach (plan D70) never fires — and
     /// `implement`'s stage 1 sees the run at 1200 of 1000 and refuses it with no minimum set.

@@ -2045,6 +2045,27 @@ async fn prompt_sections<O: Orchestrate>(orch: &O, step: StepId) -> Vec<String> 
         .collect()
 }
 
+/// The scrubbed text of a step's seq-0 `prompt` event.
+///
+/// # Panics
+/// When the step recorded no session, which is what the caller is asserting it did.
+async fn prompt_text<O: Orchestrate>(orch: &O, step: StepId) -> String {
+    let events = orch
+        .store()
+        .step_events(step)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the step recorded its session");
+    events
+        .iter()
+        .find(|event| event.seq == 0)
+        .expect("seq 0 is the prompt")
+        .payload["text"]
+        .as_str()
+        .expect("the prompt payload carries its text")
+        .to_owned()
+}
+
 /// Plan D61 through the walk that reads it (plan D60): PRD D3's `allowed_warning` is a quota
 /// status stage 1 **selects**, so the only candidate runs and parks at its gate with no
 /// substitution to report. `exhausted`, a full window and every other status still skip; the
@@ -2217,7 +2238,11 @@ async fn a_second_attempt_carries_verify_failure_and_previous_diff<H: CaseHarnes
         }
     })
     .await;
-    orch.verifier().script_report(FakeVerifier::fail(1));
+    // A primary repo, so attempt 1 has tree and commit rows for `previous_diff` to be taken over.
+    primary_repo(&orch).await;
+    let mut report = FakeVerifier::fail(1);
+    report.output = "test engine::walks ... FAILED".to_owned();
+    orch.verifier().script_report(report);
     orch.isolator().script_diff(Some(DiffBlock {
         range: "fake:base:1..fake:after:1".to_owned(),
         stat: " src/lib.rs | 2 +-".to_owned(),
@@ -2251,6 +2276,35 @@ async fn a_second_attempt_carries_verify_failure_and_previous_diff<H: CaseHarnes
             "attempt 2's prompt carries `{name}`: {second_sections:?}"
         );
     }
+
+    // The content, not just the names: attempt 1's exit code and `command_run.output`, and the
+    // block `Isolator::diff` answered — over attempt 1's rows and nobody else's.
+    let second = prompt_text(&orch, at(&steps, 0, 2).id).await;
+    for needle in [
+        "exit_code=\"1\"",
+        "test engine::walks ... FAILED",
+        "range=\"fake:base:1..fake:after:1\"",
+        " src/lib.rs | 2 +-",
+    ] {
+        assert!(
+            second.contains(needle),
+            "attempt 2's prompt carries `{needle}`:\n{second}"
+        );
+    }
+    let requests = orch.isolator().diff_requests();
+    assert_eq!(requests.len(), 1, "one forward, one diff: {requests:?}");
+    assert!(
+        !requests[0].trees.is_empty() && !requests[0].commits.is_empty(),
+        "attempt 1 left rows to diff: {requests:?}"
+    );
+    assert!(
+        requests[0]
+            .trees
+            .iter()
+            .chain(&requests[0].commits)
+            .all(|step| *step == first.id),
+        "`previous_diff` is taken over attempt 1's rows only: {requests:?}"
+    );
 }
 
 #[cfg(test)]

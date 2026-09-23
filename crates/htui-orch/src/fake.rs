@@ -75,8 +75,21 @@ pub struct FakeIsolator {
     /// [`reconcile`](Isolator::reconcile) echoes.
     captured: Mutex<BTreeMap<StepId, Vec<RunStepCommit>>>,
     /// Scripted [`diff`](Isolator::diff) answers, FIFO, one consumed per call; unscripted is
-    /// `None` (MOD-4 milestone 4 D54(c)).
-    diffs: Mutex<VecDeque<Option<DiffBlock>>>,
+    /// `None` (MOD-4 milestone 4 D54(c)); `Err` is a scripted [`fail_diff`](Self::fail_diff).
+    diffs: Mutex<VecDeque<std::result::Result<Option<DiffBlock>, IsolateError>>>,
+    /// The `run_step_id`s of the tree and commit rows each [`diff`](Isolator::diff) call was
+    /// handed, in call order — so a case can tell *whose* rows plan D67 diffed.
+    diff_requests: Mutex<Vec<DiffRequest>>,
+}
+
+/// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
+/// row, then of every commit row, in the order the engine passed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffRequest {
+    /// `RunStepTree::run_step_id` per tree row.
+    pub trees: Vec<StepId>,
+    /// `RunStepCommit::run_step_id` per commit row.
+    pub commits: Vec<StepId>,
 }
 
 impl FakeIsolator {
@@ -159,7 +172,25 @@ impl FakeIsolator {
         self.diffs
             .lock()
             .expect("no panic holds the fake isolator's lock")
-            .push_back(block);
+            .push_back(Ok(block));
+    }
+
+    /// Make the next [`diff`](Isolator::diff) fail with a `git` error, the shape plan D67 degrades
+    /// to a prompt note rather than a failed step (the diff is advisory, D55).
+    pub fn fail_diff(&self, reason: &str) {
+        self.diffs
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(Err(IsolateError::Git(reason.to_owned())));
+    }
+
+    /// Every [`diff`](Isolator::diff) call so far, as the rows it was handed.
+    #[must_use]
+    pub fn diff_requests(&self) -> Vec<DiffRequest> {
+        self.diff_requests
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .clone()
     }
 
     /// How many times [`prepare`](Isolator::prepare) has been called on this isolator.
@@ -340,20 +371,27 @@ impl Isolator for FakeIsolator {
         })
     }
 
-    /// The next [`script_diff`](FakeIsolator::script_diff) answer, or `None` unscripted.
+    /// The next [`script_diff`](FakeIsolator::script_diff) or
+    /// [`fail_diff`](FakeIsolator::fail_diff) answer, or `None` unscripted; the rows are recorded
+    /// for [`diff_requests`](FakeIsolator::diff_requests) either way.
     fn diff<'a>(
         &'a self,
         trees: &'a [RunStepTree],
         commits: &'a [RunStepCommit],
     ) -> IsolatorFuture<'a, Option<DiffBlock>> {
         Box::pin(async move {
-            let _ = (trees, commits);
-            Ok(self
-                .diffs
+            self.diff_requests
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .push(DiffRequest {
+                    trees: trees.iter().map(|row| row.run_step_id).collect(),
+                    commits: commits.iter().map(|row| row.run_step_id).collect(),
+                });
+            self.diffs
                 .lock()
                 .expect("no panic holds the fake isolator's lock")
                 .pop_front()
-                .flatten())
+                .unwrap_or(Ok(None))
         })
     }
 
