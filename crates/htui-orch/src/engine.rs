@@ -6473,9 +6473,26 @@ mod tests {
         );
     }
 
+    /// An `Engine` over the harness's own parts, for a test that drives `walk_leased` or `sweep`
+    /// directly.
+    macro_rules! harness_engine {
+        ($orch:expr, $engine:ident) => {
+            let graphs = $orch.graphs();
+            let driver =
+                |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| $orch.driver_for_key(key);
+            let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+            let $engine = super::Engine::new(
+                super::fake_parts(&$orch, &graphs, &driver, &scrubber)
+                    .await
+                    .expect("the harness has a box"),
+            );
+        };
+    }
+
     /// Plan D85: the claim's lease runs `app_setting.lease_ttl_seconds`, not a constant. The walk
-    /// is made to fail at `prd`'s stage 2 so it raises, and a walk that raises writes nothing more
-    /// (D107) — the lease on the row is still the one the claim wrote.
+    /// stalls after `prd`'s session and is dropped there, as a crash would leave it, so nothing
+    /// released the lease and the row still carries the one the claim wrote. (A walk that raises
+    /// releases it since plan D127.)
     #[tokio::test]
     async fn lease_times_come_from_app_settings() {
         let harness = Harness::new().await;
@@ -6484,21 +6501,20 @@ mod tests {
             .orch
             .store
             .set_app_setting("lease_ttl_seconds", serde_json::json!(300));
-        harness
-            .orch
-            .isolator
-            .refuse_prepare("no checkout for this repo on this box");
+        let stalled = harness.orch.stall_after_done("prd", 1, None, true);
         let claimed_at = harness.orch.clock.now();
 
-        let refused = harness
-            .dispatch(Command::StartRun {
-                item: ids::HTUI_FEAT_3,
-                mode: RunMode::Manual,
-                repo_scope: None,
-            })
-            .await
-            .expect_err("stage 2 refuses `prd`");
-        assert!(matches!(refused, EngineError::Isolate(_)), "{refused}");
+        let walk = harness.dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        });
+        match futures::future::select(Box::pin(walk), Box::pin(stalled.notified())).await {
+            futures::future::Either::Left((outcome, _)) => {
+                panic!("the walk finished instead of stalling: {outcome:?}")
+            }
+            futures::future::Either::Right(((), walk)) => drop(walk),
+        }
         let summary = harness
             .orch
             .store
@@ -6507,13 +6523,72 @@ mod tests {
             .expect("MemStore never fails a read")
             .into_iter()
             .find(|run| run.id != ids::RUN_2)
-            .expect("the refused walk's run exists");
+            .expect("the stalled walk's run exists");
         let run = harness.orch.run(summary.id).await;
         assert_eq!(
             run.lease_expires_at,
             Some(claimed_at + TimeDelta::seconds(300)),
             "the claim's lease is `now + lease_ttl_seconds`"
         );
+    }
+
+    /// Plan D127 (review M2): a walk that raises gives its lease back, best-effort, so any
+    /// process's sweep may adopt the run once it is seen as expired; plan D88 would otherwise keep
+    /// this process's own sweep off it for ever.
+    #[tokio::test(start_paused = true)]
+    async fn a_walk_that_raises_releases_its_lease() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        let now = harness.orch.clock.now();
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+        assert!(
+            harness
+                .orch
+                .store
+                .take_lease(run, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .await
+                .expect("MemStore takes the lease")
+        );
+        harness_engine!(harness.orch, engine);
+
+        let raised = engine
+            .walk_leased(run, async {
+                Err::<(), _>(EngineError::Stalled { run, passes: 1 })
+            })
+            .await
+            .expect_err("the walk's own error is raised");
+        assert!(matches!(raised, EngineError::Stalled { .. }), "{raised}");
+        let row = harness.orch.run(run).await;
+        assert_eq!(row.status, RunStatus::Running, "nothing else is written");
+        assert_eq!(
+            row.lease_expires_at,
+            Some(now),
+            "the lease is released: it reads as expired at once"
+        );
+    }
+
+    /// Plan D129 (review L2): the re-read after a successful walk is only there to decide the
+    /// release. When it fails, that is warned, the release is still tried, and the walk's `Ok` is
+    /// what the caller gets. The run is one the store does not hold, so the re-read is
+    /// `NotFound`.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_re_read_after_the_walk_keeps_its_answer() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let ghost = htui_core::model::RunId::new();
+        let walked = engine
+            .walk_leased(ghost, async { Ok::<_, EngineError>(7) })
+            .await
+            .expect("the walk succeeded; a failed re-read does not undo it");
+        assert_eq!(walked, 7);
     }
 
     /// Plan D86/D107: a heartbeat whose refresh touches zero rows abandons the walk. The walk is
@@ -6618,22 +6693,6 @@ mod tests {
             steps_after_steal,
             "nothing written to its steps"
         );
-    }
-
-    /// An `Engine` over the harness's own parts, for a test that drives `walk_leased` or `sweep`
-    /// directly.
-    macro_rules! harness_engine {
-        ($orch:expr, $engine:ident) => {
-            let graphs = $orch.graphs();
-            let driver =
-                |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| $orch.driver_for_key(key);
-            let scrubber = htui_core::scrub::MinimalScrubber::new([]);
-            let $engine = super::Engine::new(
-                super::fake_parts(&$orch, &graphs, &driver, &scrubber)
-                    .await
-                    .expect("the harness has a box"),
-            );
-        };
     }
 
     /// Plan D122 (review H1): a walk whose every refresh fails stops itself one `refresh` before
