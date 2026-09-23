@@ -922,6 +922,13 @@ where
     /// records both digests; invariant 2 means the run *could* keep walking its snapshot, and §4.9
     /// says the divergence is a human's decision rather than the engine's.
     ///
+    /// A live graph that **refuses to resolve** for a reason that is a rule about starting a run —
+    /// a cap an app setting lowered since (plan D63), a phase fanned out where it may not (D64,
+    /// ANA-2 §4.6), a phase left with no candidate (§4.1 rung 4) — has no topology to compare.
+    /// That is not this run's business: invariant 2 says it walks its snapshot, so an `item_note`
+    /// says the live graph could not be compared and the walk runs. Every other resolution error
+    /// is raised.
+    ///
     /// Cut here because criterion 3 needs it; the rest of milestone 5's sweep — `adopt_runs`, the
     /// lease, the unfinished-step rule — is not.
     ///
@@ -931,7 +938,7 @@ where
         let row = self.run(run).await?;
         let snapshot = Self::snapshot_of(&row)?;
         let item = self.item(Self::item_of(&row)?).await?;
-        let live = graph::resolve(
+        let live = match graph::resolve(
             self.parts.store,
             self.parts.graphs,
             &item,
@@ -940,7 +947,26 @@ where
             Some(&row.repo_scope),
             self.parts.box_id,
         )
-        .await?;
+        .await
+        {
+            Ok(live) => live,
+            Err(
+                err @ (ResolveError::FanOutCap { .. }
+                | ResolveError::AgentCap { .. }
+                | ResolveError::ReviewFanOut { .. }
+                | ResolveError::LocalFanOut { .. }
+                | ResolveError::NoCandidate { .. }),
+            ) => {
+                let body = format!(
+                    "live graph not comparable: run {run} walks its snapshot `{}` \
+                     (invariant 2); the live graph does not resolve: {err}",
+                    snapshot.topology
+                );
+                self.note(item.id, body, None, self.now()).await?;
+                return Ok(Resume::Walked(self.run_to_rest(run).await?));
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         if live.snapshot.topology != snapshot.topology {
             let now = self.now();

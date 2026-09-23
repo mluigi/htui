@@ -3913,4 +3913,29 @@ mod fanout_paths {
         let note = judge.gate_note.as_deref().unwrap_or_default();
         assert!(note.starts_with("judge_session_failed: "), "{note}");
     }
+
+    /// Invariant 2: an app setting lowered under an in-flight run makes the live graph refuse to
+    /// resolve (plan D63), which is not the run's business — it walks its snapshot. `resume`
+    /// notes that the live graph could not be compared and walks on instead of erroring.
+    #[tokio::test]
+    async fn a_lowered_cap_does_not_strand_a_run_on_resume() {
+        for (key, cap) in [("max_fan_out", 2), ("max_agents_per_run", 2)] {
+            let orch = FakeOrchestrator::demo();
+            fan_research(&orch, Gate::Always, false).await;
+            research_candidates(&orch, 1);
+            let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+            assert_eq!(rest.run, RunStatus::AwaitingApproval);
+
+            orch.store().set_app_setting(key, serde_json::json!(cap));
+            let rest = resumed(&orch, run).await;
+            assert_eq!(rest.run, RunStatus::AwaitingApproval, "{key}");
+            let notes = notes_of(&orch, ids::HTUI_ANA_2).await;
+            assert!(
+                notes.iter().any(|note| note.starts_with(&format!(
+                    "live graph not comparable: run {run} walks its snapshot"
+                ))),
+                "{key}: {notes:?}"
+            );
+        }
+    }
 }
