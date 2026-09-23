@@ -2639,3 +2639,205 @@ async fn a_lost_merge_is_recognised_not_repeated() {
         "and `record_commits` now names M"
     );
 }
+
+/// Plan D136: one `worktree` step of a run of its own over `core`, prepared from wherever `core`
+/// is now, that commits `name` in its tree and is captured — what a run holds at reconcile. The
+/// answer is the step, its tip and its rows.
+async fn committed_worktree_step(
+    fix: &Fixture,
+    name: &str,
+    body: &str,
+) -> (StepId, String, Vec<RunStepTree>) {
+    let step = StepId::new();
+    let prepared = fix
+        .isolator
+        .prepare(
+            RunId::new(),
+            step,
+            &[fix.core.id],
+            Isolation::Worktree,
+            None,
+        )
+        .await
+        .expect("the worktree mode prepares");
+    let rows: Vec<RunStepTree> = prepared
+        .trees
+        .iter()
+        .map(|tree| tree.tree.clone())
+        .collect();
+    let after = commit_file(Path::new(&rows[0].path), name, body, "the step commits");
+    fix.isolator
+        .capture(step, &rows)
+        .await
+        .expect("the step captures");
+    (step, after, rows)
+}
+
+/// Plan D136 (review H4): rule P admits two isolated runs on one repository when their paths are
+/// disjoint, so both start from the same base and the second to reconcile finds the primary
+/// already moved — by the first one's merge. The base is an ancestor of that `HEAD` and the
+/// primary is clean, so the second is merged on top: two merges on the primary, each run's file
+/// in its tree.
+#[tokio::test]
+async fn two_disjoint_isolated_runs_on_one_repo_both_reconcile() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, a_tip, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, b_tip, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    assert_eq!(a_rows[0].base_ref, fix.core.head);
+    assert_eq!(
+        b_rows[0].base_ref, fix.core.head,
+        "both runs start from one base"
+    );
+
+    let first = fix
+        .isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let m1 = head_of(&git, &fix.core.path).await;
+    let second = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles on top of the first one's merge");
+    let m2 = head_of(&git, &fix.core.path).await;
+
+    assert_eq!(first[0].after_hash.as_deref(), Some(m1.as_str()));
+    assert_eq!(second[0].after_hash.as_deref(), Some(m2.as_str()));
+    assert_eq!(
+        second[0].before_hash, fix.core.head,
+        "the row's base is unchanged"
+    );
+    assert_eq!(
+        merges(&git, &fix.core.path).await,
+        vec![
+            vec![m2.clone(), m1.clone(), b_tip],
+            vec![m1, fix.core.head.clone(), a_tip],
+        ],
+        "two merges, the second on top of the first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fix.core.path.join("a.txt")).expect("run a's file"),
+        "run a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fix.core.path.join("b.txt")).expect("run b's file"),
+        "run b\n"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+}
+
+/// Plan D136, blueprint H-3 generalised: run A merged and crashed before `record_commits`, then
+/// run B merged on top. A's recovery reconciles again; its merge is no longer `HEAD`, but it is on
+/// `HEAD`'s first-parent history with A's tip as its second parent, so it is recognised and
+/// reported — never merged a second time.
+#[tokio::test]
+async fn a_lost_merge_beneath_a_later_merge_is_recognised_not_repeated() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    let first = fix
+        .isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    fix.isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles");
+    let (head, merged) = (
+        head_of(&git, &fix.core.path).await,
+        merges(&git, &fix.core.path).await,
+    );
+
+    let again = fix
+        .isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the lost merge is recognised");
+    assert_eq!(again, first, "A's merge is reported again, not a new one");
+    assert_eq!(merges(&git, &fix.core.path).await, merged, "no third merge");
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        head,
+        "HEAD did not move"
+    );
+}
+
+/// Plan D136's boundary: a primary whose `HEAD` no longer has the step's base in its history
+/// (the branch was rewound and rebuilt) is not merged into; it still refuses `primary_moved`, and
+/// nothing is written.
+#[tokio::test]
+async fn a_primary_that_diverged_from_the_base_still_refuses() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let root = fix.core.head.clone();
+    // The step's base must have a parent to rewind to.
+    commit_file(&fix.core.path, "c.txt", "the base\n", "the base");
+    let (step, _, rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    assert_ne!(rows[0].base_ref, root);
+    git_out(&git, &fix.core.path, &["reset", "--hard", "-q", &root]).await;
+    let diverged = commit_file(
+        &fix.core.path,
+        "d.txt",
+        "elsewhere\n",
+        "a line without the base",
+    );
+
+    let err = fix
+        .isolator
+        .reconcile(step, &rows, &[])
+        .await
+        .expect_err("a diverged primary is refused");
+    assert_eq!(
+        err.to_string(),
+        format!("isolation refused: primary_moved: {diverged}")
+    );
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        diverged,
+        "nothing was merged"
+    );
+    assert!(merges(&git, &fix.core.path).await.is_empty());
+}
+
+/// Plan D136: a second isolated run whose change collides with the first one's merge takes the
+/// existing merge-conflict path — refused with the conflicted paths, the half-merge aborted, the
+/// primary left at the first run's merge and clean.
+#[tokio::test]
+async fn a_second_isolated_run_that_conflicts_takes_the_merge_conflict_path() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "f", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "f", "run b\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let m1 = head_of(&git, &fix.core.path).await;
+
+    let err = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect_err("the collision is refused");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "isolation refused: {}",
+            htui_orch::isolate::git::merge_conflict(&["f".to_owned()])
+        )
+    );
+    assert_eq!(head_of(&git, &fix.core.path).await, m1);
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+}

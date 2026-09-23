@@ -2868,24 +2868,34 @@ mod tests {
         );
     }
 
-    /// The primary moved under us and its new `HEAD` is not a merge of ours, so there is nothing
-    /// this milestone can safely do but say where it is.
+    /// Plan D136 (review H4): the primary moved *ahead* of the step's base — another run merged,
+    /// or the maintainer committed — so the base is an ancestor of `HEAD` and the step is merged
+    /// on top of it rather than refused. The merge's parents are the moved `HEAD` and the tip.
     #[tokio::test]
-    async fn reconcile_refuses_a_moved_primary() {
+    async fn reconcile_merges_on_top_of_a_primary_that_moved_ahead() {
         let Some(_git) = crate::skip_without_git!() else {
             return;
         };
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let (isolator, _core, core_path, _head, _after, step, rows) = stepped(dir.path()).await;
+        let (isolator, _core, core_path, head, after, step, rows) = stepped(dir.path()).await;
         let moved = commit_file(&core_path, "h", "somebody else\n", "the primary moves");
 
-        let err = isolator
+        let commits = isolator
             .reconcile(step, &rows, &[])
             .await
-            .expect_err("a moved primary is refused");
+            .expect("a primary ahead of the base is merged into");
+        let merge = crate::isolate::git::head(&core_path).expect("the checkout has a HEAD");
+        assert_eq!(commits[0].before_hash, head, "the row's base is unchanged");
+        assert_eq!(commits[0].after_hash.as_deref(), Some(&*merge));
         assert_eq!(
-            err.to_string(),
-            format!("isolation refused: primary_moved: {moved}")
+            crate::isolate::git::head_parents(&core_path).expect("the parents read"),
+            vec![moved, after],
+            "merged on top of the moved HEAD"
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("h")).expect("the file reads"),
+            "somebody else\n",
+            "the commit it moved to survives"
         );
     }
 

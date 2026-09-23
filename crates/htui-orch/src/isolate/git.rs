@@ -1253,6 +1253,38 @@ pub fn head_parents(path: &Path) -> Result<Vec<String>, IsolateError> {
         .collect())
 }
 
+/// Whether `ancestor` is `descendant` itself or one of its ancestors (plan D136): a walk over
+/// every parent from `descendant` meets it.
+///
+/// A `gix` read (`gix-0.87.1/src/repository/revision.rs:174`); `merge_base` would answer the
+/// same question but sits behind the `revision` feature this workspace does not enable.
+///
+/// # Errors
+/// [`IsolateError::Git`] when either hash is not a hash, or the walk cannot read a commit.
+pub fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<bool, IsolateError> {
+    let _ = (path, ancestor, descendant);
+    todo!("plan D136")
+}
+
+/// The merge on `head`'s first-parent history whose second parent is `after`, walking from
+/// `head` back to `base` (which is not itself read), or `None` when there is none (plan D136).
+///
+/// That is what "this step is already merged" means once the primary may move past a merge:
+/// another run's later merge sits on top of it, so `HEAD`'s own parents no longer name it. The
+/// walk stops at a root commit when `base` is not on the first-parent line.
+///
+/// # Errors
+/// [`IsolateError::Git`] when a hash is not a hash or a commit on the walk cannot be read.
+pub fn merge_of(
+    path: &Path,
+    head: &str,
+    base: &str,
+    after: &str,
+) -> Result<Option<String>, IsolateError> {
+    let _ = (path, head, base, after);
+    todo!("plan D136")
+}
+
 /// `Repository::is_dirty()` (`gix-0.87.1/src/status/mod.rs:168`), which is plan D24's predicate.
 ///
 /// A change in the index against `HEAD` or in the working tree against the index, submodules
@@ -1939,6 +1971,26 @@ mod tests {
             vec![first],
             "one parent, the commit before it"
         );
+    }
+
+    /// Plan D136's ancestor read: a commit is its own ancestor, a parent is one, and a child is
+    /// not; neither is a commit on a line that never met this one.
+    #[test]
+    fn is_ancestor_follows_the_parents_only() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let first = repo_with_one_commit(dir.path());
+        let second = commit_file(dir.path(), "g", "second\n", "two");
+        let other = tempfile::tempdir().expect("a temporary directory");
+        empty_repo(other.path());
+        let unrelated = commit_file(other.path(), "x", "elsewhere\n", "a line of its own");
+
+        let ancestor = |a: &str, d: &str| super::is_ancestor(dir.path(), a, d).expect("the walk");
+        assert!(ancestor(&first, &second));
+        assert!(ancestor(&second, &second));
+        assert!(ancestor(&first, &first));
+        assert!(!ancestor(&second, &first));
+        // `unrelated` is not an object of this repository; the walk from `second` never meets it.
+        assert!(!ancestor(&unrelated, &second));
     }
 
     /// `gix::init` alone makes a repository with an unborn `HEAD`, and `before_hash` is `NOT NULL`
