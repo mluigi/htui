@@ -1226,6 +1226,75 @@ async fn a_failed_shared_sibling_releases_the_checkout_for_the_next() {
     );
 }
 
+/// The park note's `shared_serialized` sentence names the commit the checkout is at. When the
+/// last sibling fails after its `prepare` reset the checkout to the base, it commits nothing, so
+/// the checkout is at the base — not at the earlier siblings' labels, which the note still names.
+#[tokio::test]
+async fn a_failed_last_shared_sibling_leaves_the_checkout_at_the_base() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Always).await;
+    fix.orch.script_candidate(
+        "research",
+        1,
+        2,
+        0,
+        ScriptedStep::refusing_to_start("no agent binary here"),
+    );
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        fix.start_item(&sink, ids::HTUI_ANA_2),
+    )
+    .await
+    .expect("the group settles");
+    let slot = fix.research_slot(run).await;
+    assert_eq!(
+        slot.iter().map(|step| step.status).collect::<Vec<_>>(),
+        [StepStatus::Done, StepStatus::Done, StepStatus::Failed]
+    );
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        fix.core.head,
+        "sibling 2's prepare reset the checkout to the base and it committed nothing"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+    assert_eq!(
+        htui_branches(&git, &fix.core.path).await,
+        labels(&slot[..2]),
+        "sibling 2 moved nothing, so it has no label"
+    );
+
+    let park = fix.selection_park().await;
+    assert!(park.contains("2 failed"), "{park}");
+    assert!(
+        !park.contains("the last sibling's commit"),
+        "the checkout is not at any sibling's commit: {park}"
+    );
+    assert!(
+        park.contains("; the shared checkout is back at the base (base "),
+        "{park}"
+    );
+    assert!(
+        park.contains(&format!("{}@{}", fix.core.id, fix.core.head)),
+        "{park}"
+    );
+    assert!(
+        park.ends_with(&format!(
+            "; labels htui/{}, htui/{})",
+            slot[0].id, slot[1].id
+        )),
+        "the labels `git` has are still named: {park}"
+    );
+}
+
 /// Plan D57: `copy` measures once per candidate against the cap, so a tree that fits once is
 /// refused three times over, and the refusal names both figures.
 #[tokio::test]

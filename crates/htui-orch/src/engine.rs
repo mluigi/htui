@@ -2097,19 +2097,31 @@ where
         })
     }
 
-    /// The park note's `shared_serialized` sentence: the checkout stays at the last sibling's
-    /// commit, and the base and each sibling's `htui/<step>` label are where a human finds them.
+    /// The park note's `shared_serialized` sentence: where the checkout was left, and the base and
+    /// each sibling's `htui/<step>` label, which are where a human finds the candidates.
     ///
     /// Only a sibling whose `capture` moved the checkout has a label (M3 D26 labels at capture, and
     /// only a moved `HEAD`), so only those are named. When none did — every sibling refused at
     /// `prepare`, say, on a dirty checkout (plan D72) — the checkout is where the group found it
     /// and the sentence says so instead of naming commits and branches `git` does not have.
+    ///
+    /// The checkout is at the last sibling's commit only when that sibling moved it. The last
+    /// sibling that got past `prepare` (the one with `step_commit` rows) had it reset to the base
+    /// (D56); if it then committed nothing — it failed before committing, say — the checkout is
+    /// back at the base, and the sentence says that while still naming the earlier labels.
     async fn shared_checkout_note(&self, slot: &[RunStep]) -> Result<String, EngineError> {
+        let mut ordered: Vec<&RunStep> = slot.iter().collect();
+        ordered.sort_by_key(|step| step.fanout_index);
         let mut bases: Vec<String> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
-        for step in slot {
+        let mut last_moved = false;
+        for step in ordered {
+            let commits = self.parts.store.step_commits(step.id).await?;
+            if commits.is_empty() {
+                continue;
+            }
             let mut moved = false;
-            for commit in self.parts.store.step_commits(step.id).await? {
+            for commit in commits {
                 let base = format!("{}@{}", commit.repo_id, commit.before_hash);
                 if !bases.contains(&base) {
                     bases.push(base);
@@ -2119,13 +2131,19 @@ where
             if moved {
                 labels.push(format!("htui/{}", step.id));
             }
+            last_moved = moved;
         }
         if labels.is_empty() {
             return Ok("; no sibling moved the shared checkout".to_owned());
         }
+        let at = if last_moved {
+            "stays at the last sibling's commit"
+        } else {
+            "is back at the base"
+        };
         let labels = labels.join(", ");
         Ok(format!(
-            "; the shared checkout stays at the last sibling's commit (base {}; labels {labels})",
+            "; the shared checkout {at} (base {}; labels {labels})",
             bases.join(", ")
         ))
     }
