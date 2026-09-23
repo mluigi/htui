@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Isolation, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, RepoBoxPath, RepoId, RunId,
+    Gate, Isolation, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, RepoBoxPath, RepoId, RunId,
     RunMode, RunStatus, RunStep, SnapshotCandidate, SnapshotPhase, StepGraphId, StepGraphPhase,
     StepStatus, VerifyOutcome,
 };
@@ -30,13 +30,16 @@ use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
 use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer};
 use htui_orch::engine::{Engine, EngineParts, FirstCandidate, SessionKey, SessionSink};
-use htui_orch::fake::FakeOrchestrator;
+use htui_orch::fake::{FakeOrchestrator, ScriptedStep};
 use htui_orch::isolate::Clock as _;
+use htui_orch::isolate::copy;
 use htui_orch::isolate::git::Cli;
 use htui_orch::isolate::git::testkit::{commit_file, repo_with_one_commit, worktree_list};
+use htui_orch::isolate::real::dirty_tree_not_reset;
 use htui_orch::isolate::{GixIsolator, IsolatorConfig, RepoCheckout};
 use htui_orch::skip_without_git;
 use htui_orch::verify::{ShellVerifier, VERIFY_CLASS};
+use serde_json::json;
 
 /// Everything one case drives: the store and the doubles a `FakeOrchestrator` already owns, plus
 /// the two production pieces this binary exists to exercise.
@@ -47,6 +50,8 @@ struct Fixture {
     root: PathBuf,
     core: Checkout,
     docs: Checkout,
+    /// The mode every phase this fixture repoints runs in.
+    isolation: Isolation,
     isolator: GixIsolator,
     verifier: ShellVerifier,
 }
@@ -68,6 +73,11 @@ impl Fixture {
     /// reachable through a writer, and `phase.isolation` is the rung above it anyway
     /// (`graph.rs`'s `phase.isolation.unwrap_or(settings.default_isolation)`).
     async fn new(isolation: Isolation, verify: Option<&str>) -> Self {
+        Self::with_copy_cap(isolation, verify, 1 << 30).await
+    }
+
+    /// [`new`](Self::new) with `copy_max_total_bytes` set to `cap` (plan D57).
+    async fn with_copy_cap(isolation: Isolation, verify: Option<&str>, cap: u64) -> Self {
         let orch = FakeOrchestrator::demo();
         orch.store
             .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock.now())
@@ -107,7 +117,7 @@ impl Fixture {
             ]),
             scratch_root: root.clone(),
             copy_exclude: Vec::new(),
-            copy_max_total_bytes: 1 << 30,
+            copy_max_total_bytes: cap,
             box_id: orch.box_id(),
         })
         .expect("the scratch root is outside both checkouts");
@@ -124,6 +134,7 @@ impl Fixture {
             root,
             core,
             docs,
+            isolation,
             isolator,
             verifier,
         }
@@ -176,13 +187,18 @@ impl Fixture {
         engine.dispatch(command).await
     }
 
-    /// `StartRun` over both repositories, in `core, docs` order.
+    /// `StartRun` on `FEAT-3` over both repositories, in `core, docs` order.
     async fn start<K: SessionSink>(&self, sink: &K) -> RunId {
+        self.start_item(sink, ids::HTUI_FEAT_3).await
+    }
+
+    /// `StartRun` on `item` over both repositories, in `core, docs` order.
+    async fn start_item<K: SessionSink>(&self, sink: &K, item: ItemId) -> RunId {
         let outcome = self
             .dispatch(
                 sink,
                 Command::StartRun {
-                    item: ids::HTUI_FEAT_3,
+                    item,
                     mode: RunMode::Manual,
                     repo_scope: Some(vec![self.core.id, self.docs.id]),
                 },
@@ -352,6 +368,9 @@ struct CommittingSink<'a> {
     /// The repository directory names to commit in; a tree not named here is left clean, which is
     /// what D27 removes at `capture`.
     repos: &'a [&'a str],
+    /// The phases that commit; empty means every phase. A phase not named here leaves its trees
+    /// clean, so a fan-out case can park on a later phase without that phase's tree in the way.
+    phases: &'a [&'a str],
 }
 
 impl SessionSink for CommittingSink<'_> {
@@ -363,8 +382,9 @@ impl SessionSink for CommittingSink<'_> {
         key: &SessionKey<'_>,
         _done: &htui_agent::event::DoneEvent,
     ) -> Result<(), StoreError> {
+        let commits = self.phases.is_empty() || self.phases.contains(&phase.name.as_str());
         let trees = self.orch.store.step_trees(step.id).await?;
-        for tree in &trees {
+        for tree in trees.iter().filter(|_| commits) {
             if !self
                 .repos
                 .iter()
@@ -374,8 +394,13 @@ impl SessionSink for CommittingSink<'_> {
             }
             commit_file(
                 Path::new(&tree.path),
-                "agent.txt",
-                &format!("{} attempt {}\n", phase.name, step.attempt),
+                // One file per candidate (plan T8): siblings of a group commit different trees,
+                // so a merge or a reset that picked the wrong one shows in the checkout.
+                &format!("agent-{}.txt", key.fanout_index),
+                &format!(
+                    "{} attempt {} candidate {}\n",
+                    phase.name, step.attempt, key.fanout_index
+                ),
                 &format!("htui test: {}", phase.name),
             );
         }
@@ -399,6 +424,7 @@ async fn criterion_11_a_worktree_step_on_two_repos() {
     let sink = CommittingSink {
         orch: &fix.orch,
         repos: &["core", "docs"],
+        phases: &[],
     };
     let run = fix.start(&sink).await;
     let step = fix.parked(run).await;
@@ -559,6 +585,7 @@ async fn criterion_13_cancel_removes_every_tree() {
     let sink = CommittingSink {
         orch: &fix.orch,
         repos: &["core"],
+        phases: &[],
     };
 
     let run = fix.start(&sink).await;
@@ -676,4 +703,559 @@ async fn a_verify_command_runs_in_the_primary_tree() {
         (VERIFY_CLASS, primary.path.as_str(), Some(0)),
         "ANA-2 `:491-493`: the step's own tree for the project's primary repo"
     );
+}
+
+// -- milestone 4: fan-out over real git (plan D54-D57, D72, D78) -------------------------------
+
+impl Fixture {
+    /// `ANA-2` on the `analysis` graph with `research` fanned out three ways under `gate`, running
+    /// `verify_command = "true"` through the real verifier, and `verdict` gated `always`: the walk
+    /// parks on `verdict` once the group is decided, with every tree the group left still in place
+    /// for the oracle. Both phases run in this fixture's isolation.
+    ///
+    /// `analysis` rather than `feature` because D63 counts agents at resolution: a judged 3-way
+    /// `prd` plans seven on `feature` and is refused against `max_agents_per_run = 6`.
+    async fn fan_research(&self, gate: Gate) {
+        let isolation = self.isolation;
+        repoint(&self.orch.store, ids::HTUI_ANA_2, |phase| {
+            phase.isolation = Some(isolation);
+            if phase.name == "research" {
+                phase.fan_out = 3;
+                phase.gate = gate;
+                phase.verify_command = Some("true".to_owned());
+            } else {
+                phase.gate = Gate::Always;
+            }
+        })
+        .await;
+    }
+
+    /// Plan D69: `agy` is the project's judge (the seeded agent with a model to run), and both of
+    /// its ordering calls at attempt 1 answer `winner`.
+    async fn judge_research(&self, winner: i32) {
+        let project = self
+            .orch
+            .store
+            .item(ids::HTUI_ANA_2)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture holds the item")
+            .project_id;
+        self.orch
+            .store
+            .set_project_settings(project, json!({ "judge_agent_id": ids::AGENT_AGY }));
+        for call in 0..2 {
+            self.orch.script_candidate(
+                "research:judge",
+                1,
+                -1,
+                call,
+                ScriptedStep::judge(winner, &[(winner, "the change the task asked for")]),
+            );
+        }
+    }
+
+    /// The candidates of `research`'s attempt 1, in `fanout_index` order.
+    async fn research_slot(&self, run: RunId) -> Vec<RunStep> {
+        let mut slot: Vec<RunStep> = self
+            .steps(run)
+            .await
+            .into_iter()
+            .filter(|step| step.position == 0 && step.attempt == 1 && step.fanout_index >= 0)
+            .collect();
+        slot.sort_by_key(|step| step.fanout_index);
+        assert_eq!(slot.len(), 3, "a 3-way group: {slot:?}");
+        slot
+    }
+
+    /// Every `item_note` body on `ANA-2`, oldest first.
+    async fn notes(&self) -> Vec<String> {
+        self.orch
+            .store
+            .notes(ids::HTUI_ANA_2)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .map(|note| note.body)
+            .collect()
+    }
+
+    /// The one D50 park note the group wrote.
+    async fn selection_park(&self) -> String {
+        let parks: Vec<String> = self
+            .notes()
+            .await
+            .into_iter()
+            .filter(|body| body.starts_with("fan-out `research` attempt 1 awaits selection: "))
+            .collect();
+        assert_eq!(parks.len(), 1, "one park, one note: {parks:?}");
+        parks.into_iter().next().expect("checked above")
+    }
+}
+
+/// `git <args>` in `repo`, its stdout trimmed; a non-zero exit fails the case.
+async fn git_out(git: &Cli, repo: &Path, args: &[&str]) -> String {
+    let argv: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let exited = git.run("oracle", repo, &argv, &[]).await.expect("git runs");
+    assert!(exited.ok(), "git {args:?} failed: {}", exited.stderr);
+    exited.stdout.trim().to_owned()
+}
+
+/// The commit `htui/<step>` names in `repo`.
+async fn label_of(git: &Cli, repo: &Path, step: &RunStep) -> String {
+    git_out(git, repo, &["rev-parse", &format!("htui/{}", step.id)]).await
+}
+
+/// Every `htui/` branch of `repo`, short names, sorted.
+async fn htui_branches(git: &Cli, repo: &Path) -> Vec<String> {
+    let listed = git_out(
+        git,
+        repo,
+        &["branch", "--list", "--format=%(refname:short)", "htui/*"],
+    )
+    .await;
+    let mut branches: Vec<String> = listed.lines().map(str::to_owned).collect();
+    branches.sort();
+    branches
+}
+
+/// The `htui/<step>` names of `steps`, sorted.
+fn labels(steps: &[RunStep]) -> Vec<String> {
+    let mut labels: Vec<String> = steps
+        .iter()
+        .map(|step| format!("htui/{}", step.id))
+        .collect();
+    labels.sort();
+    labels
+}
+
+/// Plan D54, D55 and D57 end to end: three `worktree` candidates from one base, a judge that reads
+/// their real `git diff`s, and a reconcile that merges only the winner. `CancelRun` then removes
+/// every tree and leaves every label.
+#[tokio::test]
+async fn a_three_way_worktree_fan_out_merges_only_the_winner() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.fan_research(Gate::Never).await;
+    fix.judge_research(1).await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let verdict = fix.parked(run).await;
+    assert_eq!(
+        verdict.position, 1,
+        "the group was decided and the walk went on"
+    );
+
+    let slot = fix.research_slot(run).await;
+    assert_eq!(
+        slot.iter()
+            .map(|step| (step.status, step.selected))
+            .collect::<Vec<_>>(),
+        [
+            (StepStatus::Superseded, Some(false)),
+            (StepStatus::Done, Some(true)),
+            (StepStatus::Superseded, Some(false)),
+        ],
+        "the judge picked candidate 1"
+    );
+    let steps = fix.steps(run).await;
+    let judge = steps
+        .iter()
+        .find(|step| step.fanout_index == -1)
+        .expect("two passing candidates, so the judge ran");
+    assert_eq!(judge.status, StepStatus::Done);
+
+    // D55 over real git: the judge's prompt carries each candidate's own patch.
+    let events = fix
+        .orch
+        .store
+        .step_events(judge.id)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the judge recorded its session");
+    let prompt = events
+        .iter()
+        .find(|event| event.seq == 0)
+        .and_then(|event| event.payload["text"].as_str())
+        .expect("seq 0 is the judge's prompt");
+    for index in 0..3 {
+        assert!(
+            prompt.contains(&format!(
+                "diff --git a/agent-{index}.txt b/agent-{index}.txt"
+            )),
+            "candidate {index}'s patch reached the judge: {prompt}"
+        );
+    }
+
+    // D54(a): one base. Every label is one commit on top of the fixture's `HEAD`.
+    let mut tips = Vec::new();
+    for step in &slot {
+        let commits = fix
+            .orch
+            .store
+            .step_commits(step.id)
+            .await
+            .expect("MemStore never fails a read");
+        let core = commits
+            .iter()
+            .find(|row| row.repo_id == fix.core.id)
+            .expect("the candidate recorded the primary");
+        assert_eq!(
+            core.before_hash, fix.core.head,
+            "every candidate starts from the base"
+        );
+        let tip = label_of(&git, &fix.core.path, step).await;
+        assert_eq!(
+            git_out(&git, &fix.core.path, &["rev-parse", &format!("{tip}^")]).await,
+            fix.core.head,
+            "candidate {}'s commit sits on the base",
+            step.fanout_index
+        );
+        tips.push(tip);
+    }
+    tips.dedup();
+    assert_eq!(tips.len(), 3, "three different commits: {tips:?}");
+
+    // `git` itself: three candidate trees under the scratch root, plus the primary.
+    let listed = worktree_list(&git, &fix.core.path).await;
+    assert_eq!(listed.len(), 4, "three trees plus the primary: {listed:?}");
+    let mut listed_branches: Vec<String> = listed
+        .iter()
+        .filter(|entry| entry.path.starts_with(fix.canonical_root()))
+        .filter_map(|entry| entry.branch.clone())
+        .collect();
+    listed_branches.sort();
+    assert_eq!(
+        listed_branches,
+        labels(&slot)
+            .iter()
+            .map(|label| format!("refs/heads/{label}"))
+            .collect::<Vec<_>>()
+    );
+
+    // D25 over a group: the primary gains one two-parent merge whose second parent is the winner.
+    let parents = git_out(
+        &git,
+        &fix.core.path,
+        &["rev-list", "--parents", "-n", "1", "HEAD"],
+    )
+    .await;
+    let parents: Vec<&str> = parents.split_whitespace().collect();
+    assert_eq!(
+        parents[1..],
+        [fix.core.head.as_str(), tips[1].as_str()],
+        "a --no-ff merge of the winner's label onto the base"
+    );
+    assert!(fix.core.path.join("agent-1.txt").exists());
+    assert!(
+        !fix.core.path.join("agent-0.txt").exists() && !fix.core.path.join("agent-2.txt").exists(),
+        "no loser's change reached the primary"
+    );
+    assert_eq!(head_of(&git, &fix.docs.path).await, fix.docs.head);
+
+    let outcome = fix
+        .dispatch(&sink, Command::CancelRun { run })
+        .await
+        .expect("a parked run is cancellable");
+    assert!(
+        matches!(outcome, CommandOutcome::Cancelled { .. }),
+        "{outcome:?}"
+    );
+    for checkout in [&fix.core, &fix.docs] {
+        let listed = worktree_list(&git, &checkout.path).await;
+        assert_eq!(
+            listed.len(),
+            1,
+            "only the checkout itself is left: {listed:?}"
+        );
+    }
+    // `verdict`'s own clean tree was removed at its capture (D27) and its label stays too, so the
+    // candidates' labels are looked for rather than being the whole list.
+    let left = htui_branches(&git, &fix.core.path).await;
+    for label in labels(&slot) {
+        assert!(
+            left.contains(&label),
+            "cleanup removes trees, never labels: the losers stay reachable: {left:?}"
+        );
+    }
+}
+
+/// Plan D56 and the Risks row: `shared_serialized` siblings take the checkout one after another,
+/// each from the base; the park note says where the checkout was left and names every label; a
+/// human's pick moves the checked-out branch to the winner's label.
+#[tokio::test]
+async fn shared_serialized_siblings_run_in_turn_and_the_branch_ends_on_the_winner() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Always).await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let slot = fix.research_slot(run).await;
+    assert!(
+        slot.iter().all(|step| step.status == StepStatus::Done),
+        "{slot:?}"
+    );
+
+    // Siblings 1 and 2 found the checkout at the previous sibling's commit and reset it to the
+    // base first: every label is one commit on the base, and none contains another's file.
+    let mut tips = Vec::new();
+    for step in &slot {
+        let tip = label_of(&git, &fix.core.path, step).await;
+        assert_eq!(
+            git_out(&git, &fix.core.path, &["rev-parse", &format!("{tip}^")]).await,
+            fix.core.head,
+            "sibling {} started from the base",
+            step.fanout_index
+        );
+        tips.push(tip);
+    }
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        tips[2],
+        "an undecided group leaves the checkout at the last sibling's commit"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+
+    let park = fix.selection_park().await;
+    assert!(
+        park.contains("; the shared checkout stays at the last sibling's commit (base "),
+        "{park}"
+    );
+    for checkout in [&fix.core, &fix.docs] {
+        assert!(
+            park.contains(&format!("{}@{}", checkout.id, checkout.head)),
+            "the base of every repo is named: {park}"
+        );
+    }
+    let named = slot
+        .iter()
+        .map(|step| format!("htui/{}", step.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(park.ends_with(&format!("; labels {named})")), "{park}");
+    assert_eq!(fix.orch.run(run).await.status, RunStatus::AwaitingApproval);
+
+    let outcome = fix
+        .dispatch(
+            &sink,
+            Command::SelectFanout {
+                run,
+                position: 0,
+                attempt: 1,
+                winner: slot[1].id,
+            },
+        )
+        .await
+        .expect("a parked group takes a human's pick");
+    assert!(
+        matches!(outcome, CommandOutcome::Selected { .. }),
+        "{outcome:?}"
+    );
+
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        tips[1],
+        "D56: the checked-out branch moved to the winner's label"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+    assert!(fix.core.path.join("agent-1.txt").exists());
+    assert!(!fix.core.path.join("agent-2.txt").exists());
+    let after = fix
+        .orch
+        .store
+        .step_commits(slot[1].id)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|row| row.repo_id == fix.core.id)
+        .and_then(|row| row.after_hash);
+    assert_eq!(after.as_deref(), Some(tips[1].as_str()));
+    assert_eq!(
+        htui_branches(&git, &fix.core.path).await,
+        labels(&slot),
+        "the losers' labels stay"
+    );
+    assert_eq!(fix.parked(run).await.position, 1, "and the walk went on");
+}
+
+/// Plan D72 (blueprint A-1): with a slot, a dirty shared checkout is refused for **every**
+/// sibling, including sibling 0 at `HEAD == base`. Nothing is reset and the dirt survives.
+#[tokio::test]
+async fn a_dirty_shared_checkout_fails_every_sibling_and_parks() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Always).await;
+    std::fs::write(fix.core.path.join("f"), "edited by a human\n")
+        .expect("the tracked file is writable");
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let slot = fix.research_slot(run).await;
+    assert!(
+        slot.iter().all(|step| step.status == StepStatus::Failed),
+        "{slot:?}"
+    );
+    let notes = fix.notes().await;
+    let refusal = dirty_tree_not_reset(&fix.core.path);
+    for index in 0..3 {
+        assert!(
+            notes.iter().any(|body| {
+                body.starts_with(&format!(
+                    "fan-out candidate {index} of `research` attempt 1: "
+                )) && body.contains(&refusal)
+            }),
+            "candidate {index} failed on the dirty checkout: {notes:?}"
+        );
+    }
+    assert_eq!(fix.orch.run(run).await.status, RunStatus::AwaitingApproval);
+    let park = fix.selection_park().await;
+    assert!(park.contains("0 failed"), "{park}");
+
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        fix.core.head,
+        "no reset"
+    );
+    assert_eq!(porcelain_status(&git, &fix.core.path).await, " M f\n");
+    assert_eq!(
+        std::fs::read_to_string(fix.core.path.join("f")).expect("the file is there"),
+        "edited by a human\n",
+        "the maintainer's work survives"
+    );
+    assert!(
+        htui_branches(&git, &fix.core.path).await.is_empty(),
+        "no sibling got as far as a label"
+    );
+}
+
+/// Plan D78 (blueprint A-7): sibling 0 fails after its `prepare` took the checkout; the
+/// best-effort capture on its failure path releases the guard, so siblings 1 and 2 still run
+/// instead of waiting on it inside `join_all` forever.
+#[tokio::test]
+async fn a_failed_shared_sibling_releases_the_checkout_for_the_next() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Always).await;
+    fix.orch.script_candidate(
+        "research",
+        1,
+        0,
+        0,
+        ScriptedStep::refusing_to_start("no agent binary here"),
+    );
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        fix.start_item(&sink, ids::HTUI_ANA_2),
+    )
+    .await
+    .expect("a leaked guard would hang the group here");
+    let slot = fix.research_slot(run).await;
+    assert_eq!(
+        slot.iter().map(|step| step.status).collect::<Vec<_>>(),
+        [StepStatus::Failed, StepStatus::Done, StepStatus::Done]
+    );
+    let notes = fix.notes().await;
+    assert!(
+        notes.iter().any(|body| {
+            body.starts_with("fan-out candidate 0 of `research` attempt 1: ")
+                && body.contains("no agent binary here")
+        }),
+        "{notes:?}"
+    );
+    for step in &slot[1..] {
+        let tip = label_of(&git, &fix.core.path, step).await;
+        assert_eq!(
+            git_out(&git, &fix.core.path, &["rev-parse", &format!("{tip}^")]).await,
+            fix.core.head,
+            "sibling {} ran from the base",
+            step.fanout_index
+        );
+    }
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        label_of(&git, &fix.core.path, &slot[2]).await
+    );
+    let park = fix.selection_park().await;
+    assert!(park.contains("0 failed"), "{park}");
+}
+
+/// Plan D57: `copy` measures once per candidate against the cap, so a tree that fits once is
+/// refused three times over, and the refusal names both figures.
+#[tokio::test]
+async fn copy_refuses_n_copies_above_the_cap() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    // A throwaway fixture only to learn the checkouts' sizes, which the real one's cap is set by.
+    let probe = Fixture::new(Isolation::Copy, None).await;
+    let need = |path: &Path| copy::measure(path, &copy::excludes(&[])).expect("the tree is walked");
+    let largest = need(&probe.core.path).max(need(&probe.docs.path));
+    drop(probe);
+
+    let cap = largest * 2;
+    let fix = Fixture::with_copy_cap(Isolation::Copy, None, cap).await;
+    fix.fan_research(Gate::Always).await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let slot = fix.research_slot(run).await;
+    assert!(
+        slot.iter().all(|step| step.status == StepStatus::Failed),
+        "{slot:?}"
+    );
+    let refusal = copy::copy_over_cap_copies(need(&fix.core.path), 3, cap);
+    let notes = fix.notes().await;
+    for index in 0..3 {
+        assert!(
+            notes.iter().any(|body| {
+                body.starts_with(&format!(
+                    "fan-out candidate {index} of `research` attempt 1: "
+                )) && body.contains(&refusal)
+            }),
+            "candidate {index} was refused with `{refusal}`: {notes:?}"
+        );
+    }
+    for step in &slot {
+        assert!(
+            !fix.root
+                .join(run.to_string())
+                .join(step.id.to_string())
+                .join("core")
+                .exists(),
+            "no copy was made"
+        );
+    }
+    fix.selection_park().await;
 }
