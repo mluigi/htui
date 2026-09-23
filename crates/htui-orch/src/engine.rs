@@ -29,8 +29,8 @@ use htui_core::model::{
     BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, EventKind, Gate, GateOutcome,
     GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId,
     Project, ProjectSettings, PromptScope, RepoId, Run, RunId, RunStatus, RunStep, RunStepCommit,
-    SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    RunStepTree, SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome,
+    StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
 };
 use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet};
 use htui_core::prompt::{
@@ -51,7 +51,7 @@ use crate::fanout::{
 use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{Clock, FanoutSlot, Isolator};
-use crate::recover::{Heartbeat, LeaseTimes};
+use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
 use crate::select::{self, SelectInput, Skipped, Walk};
 use crate::status::{
     Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt, winner_at,
@@ -76,6 +76,16 @@ const JUDGE_FANOUT_INDEX: i32 = -1;
 /// A failed judge's park reason when its row carries no `gate_note` — a crash between D51's two
 /// failure writes left it `awaiting_approval`, or another writer failed it.
 const JUDGE_FAILED: &str = "judge failed";
+
+/// `run_step.gate_note` of a step the sweep failed after resetting its trees, or of a fan-out row
+/// it failed without a reset (ANA-2 `:1298`, plan D115).
+const INTERRUPTED: &str = "interrupted";
+
+/// `run_step.gate_note` of a step whose trees the sweep must not reset (ANA-2 `:1299`, D93).
+const NOT_RESET: &str = "interrupted, tree not reset";
+
+/// N2's reason for a tree stage 2 recorded dirty (plan D115).
+const DIRTY_AT_START: &str = "dirty at step start";
 
 /// The `app_setting` key of stage 1's budget rule (plan D60 rule 5, OQ-6). Unseeded: absent is `0`.
 const MIN_BUDGET_KEY: &str = "min_budget_for_new_attempt";
@@ -924,7 +934,7 @@ where
     {
         let times = self.lease_times();
         let (store, owner) = (self.parts.store, self.parts.owner);
-        let beat = crate::recover::heartbeat(
+        let beat = recover::heartbeat(
             |until| store.refresh_lease(run, owner, until),
             self.parts.clock,
             times,
@@ -1009,7 +1019,399 @@ where
     /// # Errors
     /// Only `adopt_runs`' own store error: nothing was adopted then.
     pub async fn sweep(&self) -> Result<Vec<Adopted>, EngineError> {
-        todo!("plan D98")
+        let now = self.now();
+        let times = self.lease_times();
+        let adopted = self
+            .parts
+            .store
+            .adopt_runs(self.parts.box_id, self.parts.owner, now, now + times.ttl)
+            .await?;
+        let mut swept = Vec::with_capacity(adopted.len());
+        for run in adopted {
+            // Blueprint A-7: under the heartbeat, so a stranger taking the lease mid-recovery
+            // abandons it like any walk. `walk_leased` releases the lease of a run it leaves
+            // anywhere but `running`, which is every `Parked` and `Finished`.
+            let next = match self.walk_leased(run.id, self.recover_run(&run)).await {
+                Ok(next) => next,
+                Err(err) => self.unrecovered(&run, &err).await,
+            };
+            swept.push(Adopted { run: run.id, next });
+        }
+        Ok(swept)
+    }
+
+    /// Blueprint A-4: one run's recovery failed. Warned, noted on the item, and the lease given
+    /// back so any **other** process adopts the run at once (plan D88 keeps this one from doing
+    /// so); the sweep goes on. Nothing here raises: a note or a release that fails is warned too.
+    async fn unrecovered(&self, run: &Run, err: &EngineError) -> Next {
+        let error = err.to_string();
+        tracing::warn!(run = %run.id, %err, "the sweep could not recover an adopted run");
+        if let Some(item) = run.item_id {
+            let body = format!("sweep could not recover run {}: {error}", run.id);
+            if let Err(err) = self.note(item, body, None, self.now()).await {
+                tracing::warn!(run = %run.id, %err, "the sweep's note on an unrecovered run failed");
+            }
+        }
+        self.release_lease(run.id).await;
+        Next::Error(error)
+    }
+
+    /// Plan D117: one adopted run's adjudication, in blueprint A-3's order.
+    ///
+    /// 1. **The frontier first** (D97, A-3), over the rows as adopted and only when no step is
+    ///    `running`: a live row after the winner already makes it `None`, so the frontier exists
+    ///    exactly when there is nothing to adjudicate, and a re-settled winner is never merged
+    ///    twice.
+    /// 2. Every `running` step in `(position, attempt, fanout_index)` order (D90-D95).
+    /// 3. The run's status re-derived from its steps (D96): a waiting step under a `running` run
+    ///    completes the park.
+    ///
+    /// An `interrupt_step` that answers `Ok(false)` found the step moved by another writer; that
+    /// step is skipped and step 3 re-derives.
+    async fn recover_run(&self, run: &Run) -> Result<Next, EngineError> {
+        let snapshot = Self::snapshot_of(run)?;
+        let item = Self::item_of(run)?;
+        let steps = self.parts.store.run_steps(run.id).await?;
+
+        if !steps.iter().any(|step| step.status == StepStatus::Running)
+            && let Some(winner) = recover::frontier(&snapshot, &steps)
+            && let Some(row) = steps.iter().find(|step| step.id == winner)
+        {
+            let siblings = Self::siblings(&group_at(&steps, row.position, row.attempt), winner);
+            if let Some(rest) = self.reconcile_done_step(run, row, &siblings).await? {
+                return Ok(Next::Parked(rest));
+            }
+        }
+
+        for step in steps
+            .iter()
+            .filter(|step| step.status == StepStatus::Running)
+        {
+            let phase = Self::phase_at(run.id, &snapshot, step.position)?;
+            if let Some(next) = self
+                .recover_step(run, &snapshot, &phase, item, step)
+                .await?
+            {
+                return Ok(next);
+            }
+        }
+
+        let row = self.run(run.id).await?;
+        let steps = self.parts.store.run_steps(run.id).await?;
+        if row.status == RunStatus::Running
+            && !steps.iter().any(|step| step.status == StepStatus::Running)
+            && steps
+                .iter()
+                .any(|step| step.status == StepStatus::AwaitingApproval)
+        {
+            // D96: `gate::park`'s run and item writes, the step's having landed before the crash.
+            let now = self.now();
+            self.parts
+                .store
+                .transition_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
+                .await?;
+            self.parts
+                .store
+                .transition(item, Status::InProgress, Status::AwaitingApproval)
+                .await?;
+            let row = self.run(run.id).await?;
+            return Ok(Next::Parked(self.resting(&row).await?));
+        }
+        Ok(Next::Walk)
+    }
+
+    /// D90-D95 for one `running` step. `Some(next)` ends the run's recovery; `None` goes on.
+    async fn recover_step(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+        item: ItemId,
+        step: &RunStep,
+    ) -> Result<Option<Next>, EngineError> {
+        let now = self.now();
+        let kind = StepKind::of(step, phase);
+        if kind == StepKind::Judge {
+            // D95: never re-judged; the walk's `Select` arm re-parks the slot for a human with
+            // this `gate_note` as the reason (M4 D59).
+            self.parts
+                .store
+                .interrupt_step(step.id, INTERRUPTED, now)
+                .await?;
+            return Ok(None);
+        }
+        let trees = self.parts.store.step_trees(step.id).await?;
+        let commits = self.parts.store.step_commits(step.id).await?;
+        let output = self.output_of(item, phase, step.id).await?;
+        let command_runs = self.parts.store.command_runs(step.id).await?;
+        let (_, adjudication) = recover::classify(
+            step,
+            phase,
+            &run.repo_scope,
+            &trees,
+            &commits,
+            output.is_some(),
+            &command_runs,
+        );
+        match (kind, adjudication) {
+            (
+                StepKind::Candidate,
+                Adjudication::Finished {
+                    verify,
+                    verify_exit_code,
+                },
+            ) => {
+                // M4 D48's candidate settle: the verify is recorded, not applied.
+                self.finish_recovered(step, verify, verify_exit_code, now)
+                    .await?;
+                self.parts
+                    .store
+                    .transition_step(step.id, StepStatus::Running, StepStatus::Done, now)
+                    .await?;
+                Ok(None)
+            }
+            (StepKind::Candidate, Adjudication::Reset | Adjudication::NeverReset { .. }) => {
+                // D95: no reset and no park; the group routes over its survivors.
+                self.parts
+                    .store
+                    .interrupt_step(step.id, INTERRUPTED, now)
+                    .await?;
+                Ok(None)
+            }
+            (
+                _,
+                Adjudication::Finished {
+                    verify,
+                    verify_exit_code,
+                },
+            ) => {
+                self.finish_recovered(step, verify, verify_exit_code, now)
+                    .await?;
+                let settled = recover::resettle(
+                    output.as_ref(),
+                    verify,
+                    phase.name == REVIEW_PHASE,
+                    step.started_at.unwrap_or(now),
+                    now,
+                );
+                self.land_recovered(run, snapshot, phase, step, settled)
+                    .await
+            }
+            (_, Adjudication::Reset) => {
+                self.reset_interrupted(run, snapshot, phase, step, &trees)
+                    .await
+            }
+            (_, Adjudication::NeverReset { .. }) => self
+                .never_reset(run, phase, step, &trees, &[], DIRTY_AT_START)
+                .await
+                .map(Some),
+        }
+    }
+
+    /// D90: a finished step's settle columns, written only when the crash beat `finish_step`.
+    async fn finish_recovered(
+        &self,
+        step: &RunStep,
+        verify: Option<VerifyOutcome>,
+        verify_exit_code: Option<i32>,
+        now: DateTime<Utc>,
+    ) -> Result<(), EngineError> {
+        if step.finished_at.is_some() {
+            return Ok(());
+        }
+        self.parts
+            .store
+            .finish_step(
+                step.id,
+                StepOutcome {
+                    exit_code: None,
+                    usage: None,
+                    trim_record: None,
+                    verify_outcome: verify,
+                    verify_exit_code,
+                    finished_at: now,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// D91: the re-settled step through the gate table, exactly the tail of `walk_live_step`.
+    async fn land_recovered(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+        step: &RunStep,
+        settled: Settle,
+    ) -> Result<Option<Next>, EngineError> {
+        let row = self.run(run.id).await?;
+        let ctx = self.gate_context(&row, snapshot);
+        match gate::apply(&ctx, step, phase, settled).await? {
+            Landing::Advance => {
+                let step = self.step(run.id, step.id).await?;
+                Ok(self
+                    .reconcile_done_step(&row, &step, &[])
+                    .await?
+                    .map(Next::Parked))
+            }
+            Landing::Retry { position, attempt } => {
+                let phase = Self::phase_at(run.id, snapshot, position)?;
+                Ok(self
+                    .admit(&row, snapshot, &phase, attempt)
+                    .await?
+                    .map(Self::landed))
+            }
+            Landing::Rest(rest) => {
+                if rest.run.is_terminal() {
+                    self.cleanup_run(run.id).await?;
+                }
+                Ok(Some(Self::landed(rest)))
+            }
+        }
+    }
+
+    /// A rest the sweep reached: [`Next::Finished`] when terminal, else [`Next::Parked`].
+    fn landed(rest: Rest) -> Next {
+        if rest.run.is_terminal() {
+            Next::Finished(rest)
+        } else {
+            Next::Parked(rest)
+        }
+    }
+
+    /// D92: an unfinished step whose trees are resettable. The isolator resets them (all or
+    /// nothing, D99), the step fails `interrupted`, and the next attempt is admitted while the
+    /// budget holds — else the run parks (D94). A refusal or an error from the reset is D93's
+    /// path with its text as the reason.
+    async fn reset_interrupted(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+        step: &RunStep,
+        trees: &[RunStepTree],
+    ) -> Result<Option<Next>, EngineError> {
+        let report = match self.parts.isolator.reset(step.id, trees).await {
+            Ok(report) if report.refused.is_empty() => report,
+            Ok(report) => {
+                let reason = report
+                    .refused
+                    .iter()
+                    .map(|(_, refusal)| refusal.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return self
+                    .never_reset(run, phase, step, trees, &report.labelled, &reason)
+                    .await
+                    .map(Some);
+            }
+            Err(err) => {
+                return self
+                    .never_reset(run, phase, step, trees, &[], &err.to_string())
+                    .await
+                    .map(Some);
+            }
+        };
+        let now = self.now();
+        if !self
+            .parts
+            .store
+            .interrupt_step(step.id, INTERRUPTED, now)
+            .await?
+        {
+            return Ok(None);
+        }
+        let listed = trees_text(step.id, trees, &report.labelled);
+        let (name, attempt) = (&phase.name, step.attempt);
+        if may_attempt(attempt + 1, phase.retry_limit) {
+            if let Some(item) = run.item_id {
+                let body = format!(
+                    "{INTERRUPTED}: step {} (`{name}` attempt {attempt}) did not finish; trees: \
+                     {listed}; retrying as attempt {}",
+                    step.id,
+                    attempt + 1
+                );
+                self.note(item, body, Some(step.id), now).await?;
+            }
+            let row = self.run(run.id).await?;
+            return Ok(self
+                .admit(&row, snapshot, phase, attempt + 1)
+                .await?
+                .map(Self::landed));
+        }
+        let body = format!(
+            "{INTERRUPTED}: retry budget spent: step {} (`{name}` attempt {attempt}); trees: \
+             {listed}; the run is parked",
+            step.id
+        );
+        let rest = self.park_interrupted(run, step, phase, true, body).await?;
+        Ok(Some(Next::Parked(rest)))
+    }
+
+    /// D93: a tree that must not be reset is never touched. The step fails `interrupted, tree not
+    /// reset`, and the run parks with every tree's path and `before_hash` in the note.
+    async fn never_reset(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        step: &RunStep,
+        trees: &[RunStepTree],
+        labelled: &[(RepoId, String)],
+        reason: &str,
+    ) -> Result<Next, EngineError> {
+        if !self
+            .parts
+            .store
+            .interrupt_step(step.id, NOT_RESET, self.now())
+            .await?
+        {
+            // Another writer moved the step; D96's re-derivation owns what is left.
+            return Ok(Next::Walk);
+        }
+        let body = format!(
+            "{NOT_RESET}: step {} (`{}` attempt {}); trees: {}; reason: {reason}; the run is \
+             parked for a human",
+            step.id,
+            phase.name,
+            step.attempt,
+            trees_text(step.id, trees, labelled)
+        );
+        let rest = self.park_interrupted(run, step, phase, false, body).await?;
+        Ok(Next::Parked(rest))
+    }
+
+    /// Plan D94: park a run whose `step` the sweep already failed — `park_run`'s order: the run
+    /// `running -> awaiting_approval`, the item `in_progress -> awaiting_approval`, then the note.
+    /// `run.failure` stays NULL (R-3); the typed reason is the [`Rest`]'s.
+    async fn park_interrupted(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        reset: bool,
+        note: String,
+    ) -> Result<Rest, EngineError> {
+        let now = self.now();
+        self.parts
+            .store
+            .transition_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, now)
+            .await?;
+        if let Some(item) = run.item_id {
+            self.parts
+                .store
+                .transition(item, Status::InProgress, Status::AwaitingApproval)
+                .await?;
+            self.note(item, note, Some(step.id), now).await?;
+        }
+        Ok(Rest {
+            run: RunStatus::AwaitingApproval,
+            position: Some(step.position),
+            failure: Some(RunFailure::Interrupted {
+                phase: phase.name.clone(),
+                reset,
+            }),
+        })
     }
 
     // -- the walk ------------------------------------------------------------------------------
@@ -2010,7 +2412,7 @@ where
 
     /// Plan D78's best-effort capture: its commits are recorded when it answers, and every failure
     /// — the isolator's or the write's — is logged, because the candidate is failing already.
-    async fn release_trees(&self, step: &RunStep, trees: &[htui_core::model::RunStepTree]) {
+    async fn release_trees(&self, step: &RunStep, trees: &[RunStepTree]) {
         match self.parts.isolator.capture(step.id, trees).await {
             Ok(after) => {
                 if let Err(err) = self.parts.store.record_commits(step.id, &after).await {
@@ -2028,7 +2430,7 @@ where
     async fn candidate_live(
         &self,
         stage: &CandidateStage<'_>,
-        trees: &mut Option<Vec<htui_core::model::RunStepTree>>,
+        trees: &mut Option<Vec<RunStepTree>>,
         captured: &mut bool,
     ) -> Result<(), EngineError> {
         let CandidateStage {
@@ -3840,7 +4242,7 @@ struct VerifyStage<'a> {
     /// The phase, for `verify_command` and `deadline_seconds`.
     phase: &'a SnapshotPhase,
     /// Stage 2's rows, in scope order.
-    trees: &'a [htui_core::model::RunStepTree],
+    trees: &'a [RunStepTree],
     /// Where the deadline's remainder is measured from: `run_step.started_at` for a `fan_out = 1`
     /// step, the moment `prepare` answered for a fan-out candidate (plan D48), so a
     /// `shared_serialized` sibling is not charged for the per-repo lock wait.
@@ -3931,6 +4333,31 @@ fn skipped_above<'w>(
         }
     }
     above
+}
+
+/// Blueprint §9.3's `{tree}, …`: `{repo} {path} before_hash {base_ref}` per row, plus
+/// ` labelled htui/{step} at {head}` when the reset named a label in that repo. A step with no
+/// tree row (a crash before `upsert_step_tree`) reads `none`.
+fn trees_text(step: StepId, trees: &[RunStepTree], labelled: &[(RepoId, String)]) -> String {
+    if trees.is_empty() {
+        return "none".to_owned();
+    }
+    trees
+        .iter()
+        .map(|tree| {
+            let label = labelled
+                .iter()
+                .find(|(repo, _)| *repo == tree.repo_id)
+                .map_or_else(String::new, |(_, head)| {
+                    format!(" labelled htui/{step} at {head}")
+                });
+            format!(
+                "{} {} before_hash {}{label}",
+                tree.repo_id, tree.path, tree.base_ref
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether a run has a live step at `position` this walk would have to wait on.
@@ -6131,6 +6558,105 @@ mod tests {
             harness.orch.steps(run).await,
             steps_after_steal,
             "nothing written to its steps"
+        );
+    }
+
+    /// Blueprint A-4: one adopted run whose recovery fails is [`super::Next::Error`] with the
+    /// error's text, a note on its item and its lease released, and the sweep still recovers the
+    /// run after it. The failure is a `running` step at a position the snapshot does not name.
+    #[tokio::test]
+    async fn a_run_the_sweep_cannot_recover_is_an_error_and_the_sweep_goes_on() {
+        let harness = Harness::new().await;
+        let (broken, _) = started(&harness).await;
+        harness.orch.clock.advance(TimeDelta::seconds(1));
+        let CommandOutcome::Started { run: parked, .. } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_ANA_2,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("no repo, so nothing overlaps")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        let now = harness.orch.clock.now();
+        for run in [broken, parked] {
+            assert!(
+                harness
+                    .orch
+                    .store
+                    .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                    .await
+                    .expect("MemStore takes the move"),
+                "a crash between `gate::park`'s writes, by hand"
+            );
+        }
+        let ghost = harness
+            .orch
+            .store
+            .create_step(NewRunStep {
+                id: StepId::new(),
+                run_id: broken,
+                position: 99,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "ghost".to_owned(),
+                agent_id: None,
+                model: None,
+            })
+            .await
+            .expect("MemStore creates the step");
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_step(ghost.id, StepStatus::Pending, StepStatus::Running, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+
+        let other = Harness {
+            orch: harness.orch.restarted(),
+        };
+        let adopted = super::sweep_fake(&other.orch)
+            .await
+            .expect("the adoption itself succeeds");
+        assert_eq!(
+            adopted.iter().map(|row| row.run).collect::<Vec<_>>(),
+            [broken, parked],
+            "`queued_at` order, and the failure did not stop the sweep"
+        );
+        let super::Next::Error(error) = &adopted[0].next else {
+            panic!("the broken run is an error, not {:?}", adopted[0].next);
+        };
+        assert!(error.contains("no phase at position 99"), "{error}");
+        assert!(
+            matches!(
+                adopted[1].next,
+                super::Next::Parked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    ..
+                })
+            ),
+            "plan D96 completed the second run's park: {:?}",
+            adopted[1].next
+        );
+        let notes = other
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        let expected = format!("sweep could not recover run {broken}: {error}");
+        assert!(
+            notes.iter().any(|note| note.body == expected),
+            "{expected}\n{notes:?}"
+        );
+        assert_eq!(
+            other.orch.run(broken).await.lease_expires_at,
+            Some(other.orch.clock.now()),
+            "the lease is released, so another process adopts the run at once"
         );
     }
 
