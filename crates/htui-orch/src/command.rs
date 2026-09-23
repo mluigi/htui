@@ -311,6 +311,21 @@ pub enum EngineError {
         /// The slot's attempt.
         attempt: i32,
     },
+    /// ANA-2 `:754-758`: a retried group starts from the base its retired slot started from, and
+    /// that slot's `before_hash` rows do not name one — two bases for a repository, or a
+    /// repository of the scope with none. Starting from `HEAD` instead would start the group
+    /// from wherever a retired `shared_serialized` sibling left the checkout.
+    #[error("run {run} position {position} attempt {attempt}: no base to start from: {reason}")]
+    GroupBase {
+        /// The run named.
+        run: RunId,
+        /// The group's position.
+        position: i32,
+        /// The attempt that would have started.
+        attempt: i32,
+        /// What the retired rows say, in a readable sentence.
+        reason: String,
+    },
     /// Stage 2 or stage 5's isolation verb refused. **Not in the blueprint's §5.1 list**, which
     /// leaves the engine no way to carry an `Isolator`'s own failure; added here.
     #[error(transparent)]

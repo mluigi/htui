@@ -1545,8 +1545,8 @@ where
     /// spent (plan D76, [`fail_group_before_a_token`](Self::fail_group_before_a_token)).
     ///
     /// The group's base is read before any candidate is prepared — from the slot's own
-    /// `run_step_commit` rows once one has them (M2 D16), else `Isolator::base` — and an error
-    /// reading it propagates with the run still `running` at `Fan` (blueprint H-22): nothing is
+    /// `run_step_commit` rows once one has them (M2 D16), else a retired attempt's, else
+    /// `Isolator::base` ([`group_base`](Self::group_base)) — and an error reading it propagates with the run still `running` at `Fan` (blueprint H-22): nothing is
     /// live yet, and the next call re-derives it.
     ///
     /// `join_all` rather than a `JoinSet` because every candidate's future borrows `&self` and this
@@ -1587,7 +1587,9 @@ where
         let Some(first) = pending.first() else {
             return Ok(None);
         };
-        let base = self.group_base(run, &slot).await?;
+        let base = self
+            .group_base(run, &steps, phase.position, attempt)
+            .await?;
         let item = Self::item_of(run)?;
         let prompt = match self
             .assemble_prompt(run, snapshot, first, phase, item)
@@ -1619,13 +1621,28 @@ where
     }
 
     /// The group's base per repo (plan D54(b)): the `before_hash`es a candidate of the slot already
-    /// recorded, else the repositories' `HEAD`s read once through `Isolator::base`.
+    /// recorded, else the base the latest retired attempt at the position started from, else the
+    /// repositories' `HEAD`s read once through `Isolator::base`.
+    ///
+    /// A retried group — plan D65's `retry` or D49(1)'s `never` × `failed` cell — starts where its
+    /// retired slot started, because ANA-2 `:754-758` supersedes that slot's winner and losers
+    /// alike: a `shared_serialized` slot leaves the checkout at its last sibling's commit, and
+    /// `HEAD` there is a loser. A retired attempt no candidate got past `prepare` in recorded no
+    /// row and moved nothing, so the one before it is read. A retired slot with a `selected`
+    /// winner was reconciled, and the checkout is where that reconcile put it (the review loop,
+    /// plan D66), so the search stops there at `HEAD`.
+    ///
+    /// # Errors
+    /// [`EngineError::GroupBase`] when the retired rows name two bases for a repository or none for
+    /// one of the scope; every store and isolator error.
     async fn group_base(
         &self,
         run: &Run,
-        slot: &[&RunStep],
+        steps: &[RunStep],
+        position: i32,
+        attempt: i32,
     ) -> Result<BTreeMap<RepoId, String>, EngineError> {
-        for step in slot {
+        for step in group_at(steps, position, attempt) {
             let commits = self.parts.store.step_commits(step.id).await?;
             if !commits.is_empty() {
                 return Ok(commits
@@ -1633,6 +1650,46 @@ where
                     .map(|commit| (commit.repo_id, commit.before_hash))
                     .collect());
             }
+        }
+        for retired in (1..attempt).rev() {
+            let slot = group_at(steps, position, retired);
+            if slot.iter().any(|step| step.selected == Some(true)) {
+                break;
+            }
+            let mut bases: BTreeMap<RepoId, String> = BTreeMap::new();
+            for step in &slot {
+                for commit in self.parts.store.step_commits(step.id).await? {
+                    match bases.get(&commit.repo_id) {
+                        Some(base) if *base != commit.before_hash => {
+                            return Err(EngineError::GroupBase {
+                                run: run.id,
+                                position,
+                                attempt,
+                                reason: format!(
+                                    "attempt {retired} started repo {} from both {base} and {}",
+                                    commit.repo_id, commit.before_hash
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            bases.insert(commit.repo_id, commit.before_hash);
+                        }
+                    }
+                }
+            }
+            if bases.is_empty() {
+                continue;
+            }
+            if let Some(repo) = run.repo_scope.iter().find(|repo| !bases.contains_key(repo)) {
+                return Err(EngineError::GroupBase {
+                    run: run.id,
+                    position,
+                    attempt,
+                    reason: format!("attempt {retired} recorded no base for repo {repo}"),
+                });
+            }
+            return Ok(bases);
         }
         Ok(self.parts.isolator.base(&run.repo_scope).await?)
     }
@@ -4237,6 +4294,90 @@ mod tests {
             harness.orch.steps(run).await,
             before,
             "and nothing was written"
+        );
+    }
+
+    /// ANA-2 `:754-758`: a retried group starts from the base its retired slot started from, read
+    /// off that slot's `before_hash` rows. Rows that disagree name no one base, so the group is
+    /// refused rather than started from the checkout's `HEAD`, and no candidate is prepared.
+    #[tokio::test]
+    async fn a_retried_group_whose_retired_bases_disagree_is_refused() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        // A base is a row per repo in scope, and the demo fixture holds no repo.
+        harness
+            .orch
+            .store
+            .create_repo(NewRepo {
+                id: RepoId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "htui".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect("the project has no repo yet");
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.fan_out = 2;
+                    phase.retry_limit = 1;
+                }
+            })
+            .await;
+        let CommandOutcome::Started { run, .. } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        let slot: Vec<_> = harness
+            .orch
+            .steps(run)
+            .await
+            .into_iter()
+            .filter(|step| step.position == 0 && step.fanout_index >= 0)
+            .collect();
+        let mut moved = harness
+            .orch
+            .store
+            .step_commits(slot[1].id)
+            .await
+            .expect("MemStore never fails a read");
+        moved[0].before_hash = "fake:elsewhere".to_owned();
+        harness
+            .orch
+            .store
+            .record_commits(slot[1].id, &moved[..1])
+            .await
+            .expect("the row is the step's own");
+        let prepares = harness.orch.isolator.prepares();
+
+        let refused = harness
+            .dispatch(Command::RetryStep {
+                run,
+                step: slot[0].id,
+            })
+            .await
+            .expect_err("two bases for one repo name no base to retry from");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::GroupBase { position: 0, attempt: 2, reason, .. }
+                    if reason.contains("fake:elsewhere")
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            harness.orch.isolator.prepares(),
+            prepares,
+            "no candidate of attempt 2 was prepared"
         );
     }
 

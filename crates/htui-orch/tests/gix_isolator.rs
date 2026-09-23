@@ -760,11 +760,16 @@ impl Fixture {
 
     /// The candidates of `research`'s attempt 1, in `fanout_index` order.
     async fn research_slot(&self, run: RunId) -> Vec<RunStep> {
+        self.research_attempt(run, 1).await
+    }
+
+    /// The candidates of `research`'s `attempt`, in `fanout_index` order.
+    async fn research_attempt(&self, run: RunId, attempt: i32) -> Vec<RunStep> {
         let mut slot: Vec<RunStep> = self
             .steps(run)
             .await
             .into_iter()
-            .filter(|step| step.position == 0 && step.attempt == 1 && step.fanout_index >= 0)
+            .filter(|step| step.position == 0 && step.attempt == attempt && step.fanout_index >= 0)
             .collect();
         slot.sort_by_key(|step| step.fanout_index);
         assert_eq!(slot.len(), 3, "a 3-way group: {slot:?}");
@@ -1293,6 +1298,136 @@ async fn a_failed_last_shared_sibling_leaves_the_checkout_at_the_base() {
         )),
         "the labels `git` has are still named: {park}"
     );
+}
+
+impl Fixture {
+    /// Every `research` candidate of `attempt` recorded both repositories at the fixture's `HEAD`
+    /// — the base the group of attempt 1 started from — and its label sits on it.
+    async fn assert_attempt_started_from_the_base(&self, git: &Cli, run: RunId, attempt: i32) {
+        for step in self.research_attempt(run, attempt).await {
+            let commits = self
+                .orch
+                .store
+                .step_commits(step.id)
+                .await
+                .expect("MemStore never fails a read");
+            let bases: BTreeMap<RepoId, String> = commits
+                .into_iter()
+                .map(|row| (row.repo_id, row.before_hash))
+                .collect();
+            assert_eq!(
+                bases,
+                BTreeMap::from([
+                    (self.core.id, self.core.head.clone()),
+                    (self.docs.id, self.docs.head.clone()),
+                ]),
+                "attempt {attempt} candidate {} starts from the retired attempt's base, not from \
+                 the commit a retired sibling left the checkout at",
+                step.fanout_index
+            );
+            let tip = label_of(git, &self.core.path, &step).await;
+            assert_eq!(
+                git_out(git, &self.core.path, &["rev-parse", &format!("{tip}^")]).await,
+                self.core.head,
+                "attempt {attempt} candidate {}'s commit sits on the base",
+                step.fanout_index
+            );
+        }
+    }
+}
+
+/// ANA-2 `:754-758` under plan D65's group retry: the retired slot's winner and losers are all
+/// superseded, so attempt 2 starts from the base attempt 1 started from — not from the last
+/// retired sibling's commit, which is where `shared_serialized` left the checkout.
+#[tokio::test]
+async fn a_group_retry_after_a_shared_fan_out_starts_from_the_original_base() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Always).await;
+    repoint(&fix.orch.store, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "research" {
+            phase.retry_limit = 1;
+        }
+    })
+    .await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let slot = fix.research_slot(run).await;
+    let last = label_of(&git, &fix.core.path, &slot[2]).await;
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        last,
+        "the parked group left the checkout at the last sibling's commit"
+    );
+    assert_ne!(last, fix.core.head);
+
+    let outcome = fix
+        .dispatch(
+            &sink,
+            Command::RetryStep {
+                run,
+                step: slot[0].id,
+            },
+        )
+        .await
+        .expect("a parked group retries as a whole");
+    assert!(
+        matches!(outcome, CommandOutcome::Retried { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        fix.research_attempt(run, 2)
+            .await
+            .iter()
+            .all(|step| step.status == StepStatus::Done),
+        "attempt 2's group ran"
+    );
+    fix.assert_attempt_started_from_the_base(&git, run, 2).await;
+}
+
+/// Plan D49(1)'s `never` × `failed` cell over `shared_serialized`: every sibling committed and
+/// failed its verification, the group is retired by the walk itself, and attempt 2 starts from
+/// the base attempt 1 started from.
+#[tokio::test]
+async fn a_failed_shared_group_retries_from_the_original_base() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::SharedSerialized, None).await;
+    fix.fan_research(Gate::Never).await;
+    repoint(&fix.orch.store, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "research" {
+            phase.retry_limit = 1;
+            phase.verify_command = Some("false".to_owned());
+        }
+    })
+    .await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["research"],
+    };
+
+    let run = fix.start_item(&sink, ids::HTUI_ANA_2).await;
+    let slot = fix.research_slot(run).await;
+    assert!(
+        slot.iter()
+            .all(|step| step.verify_outcome == Some(VerifyOutcome::Fail)),
+        "{slot:?}"
+    );
+    assert_eq!(
+        fix.orch.run(run).await.status,
+        RunStatus::Failed,
+        "attempt 2 failed the same way and the budget is spent"
+    );
+    fix.assert_attempt_started_from_the_base(&git, run, 2).await;
 }
 
 /// Plan D57: `copy` measures once per candidate against the cap, so a tree that fits once is
