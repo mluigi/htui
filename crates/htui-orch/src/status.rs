@@ -99,10 +99,11 @@ impl fmt::Display for RunFailure {
                 write!(f, "no_candidate_agent: phase `{phase}`; {detail}")
             }
             Self::NoSurvivingCandidate { phase } => write!(f, "no_surviving_candidate: {phase}"),
-            Self::Interrupted { phase, reset } => {
-                let _ = (phase, reset);
-                todo!("plan D94's two rows")
-            }
+            Self::Interrupted { phase, reset: true } => write!(f, "interrupted: {phase}"),
+            Self::Interrupted {
+                phase,
+                reset: false,
+            } => write!(f, "interrupted, tree not reset: {phase}"),
         }
     }
 }
