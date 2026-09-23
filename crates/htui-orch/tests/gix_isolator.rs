@@ -2809,6 +2809,42 @@ async fn a_primary_that_diverged_from_the_base_still_refuses() {
     assert!(merges(&git, &fix.core.path).await.is_empty());
 }
 
+/// Plan D136's other boundary (review finding D136-already-contained): the maintainer
+/// fast-forwarded the primary onto the step's branch, so `after` is already in `HEAD`'s history
+/// but no merge names it. `merge --no-ff` would answer "Already up to date." and make no commit;
+/// the reconcile refuses `primary_moved` as before D136 instead of failing a post-condition.
+#[tokio::test]
+async fn a_primary_fast_forwarded_onto_the_step_still_refuses() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (step, after, rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    git_out(
+        &git,
+        &fix.core.path,
+        &["merge", "--ff-only", "-q", &format!("htui/{step}")],
+    )
+    .await;
+    assert_eq!(head_of(&git, &fix.core.path).await, after);
+
+    let err = fix
+        .isolator
+        .reconcile(step, &rows, &[])
+        .await
+        .expect_err("a primary that already holds the step is refused");
+    assert_eq!(
+        err.to_string(),
+        format!("isolation refused: primary_moved: {after}")
+    );
+    assert_eq!(
+        head_of(&git, &fix.core.path).await,
+        after,
+        "nothing was merged"
+    );
+    assert!(merges(&git, &fix.core.path).await.is_empty());
+}
+
 /// Plan D136: a second isolated run whose change collides with the first one's merge takes the
 /// existing merge-conflict path — refused with the conflicted paths, the half-merge aborted, the
 /// primary left at the first run's merge and clean.
