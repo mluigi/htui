@@ -1572,8 +1572,11 @@ where
     ///
     /// The group's base is read before any candidate is prepared — from the slot's own
     /// `run_step_commit` rows once one has them (M2 D16), else a retired attempt's, else
-    /// `Isolator::base` ([`group_base`](Self::group_base)) — and an error reading it propagates with the run still `running` at `Fan` (blueprint H-22): nothing is
-    /// live yet, and the next call re-derives it.
+    /// `Isolator::base` ([`group_base`](Self::group_base)) — and an error reading it propagates
+    /// with the run still `running` at `Fan` (blueprint H-22): nothing is live yet. A store or
+    /// isolator error may clear when the next call reads the base again. An
+    /// [`EngineError::GroupBase`] refusal does not: it comes from the persisted retired rows alone,
+    /// so every later call repeats it until those rows are fixed or the run is cancelled.
     ///
     /// `join_all` rather than a `JoinSet` because every candidate's future borrows `&self` and this
     /// frame's `prompt`, `base` and rows, and `join_all` is awaited here, so no `'static` bound
