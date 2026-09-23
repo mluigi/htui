@@ -8007,6 +8007,61 @@ mod tests {
         assert_eq!(harness.orch.steps(run).await.len(), 2, "no attempt 2");
     }
 
+    /// Plan D135 (review K2): the automatic path's `request-changes` retires the review through
+    /// the loop, and the walk goes on **without** reconciling it — the retired review is never
+    /// handed to the isolator; only the approving review of attempt 2 is.
+    #[tokio::test]
+    async fn a_rejected_review_is_never_reconciled() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                phase.gate = Gate::Never;
+            })
+            .await;
+        harness.orch.script(
+            "review",
+            1,
+            ScriptedStep::review("request-changes", "no tests"),
+        );
+        harness
+            .orch
+            .script("review", 2, ScriptedStep::review("approve", "tests added"));
+
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk runs to the end")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(rest.run, RunStatus::Done);
+        let steps = harness.orch.steps(run).await;
+        let review = |attempt: i32| {
+            steps
+                .iter()
+                .find(|step| step.phase_name == "review" && step.attempt == attempt)
+                .unwrap_or_else(|| panic!("review attempt {attempt} ran"))
+                .id
+        };
+        let reconciled: Vec<StepId> = harness
+            .orch
+            .isolator
+            .reconciles()
+            .into_iter()
+            .map(|(step, _)| step)
+            .collect();
+        assert!(
+            !reconciled.contains(&review(1)),
+            "the retired review was reconciled: {reconciled:?}"
+        );
+        assert!(reconciled.contains(&review(2)));
+    }
+
     /// Plan D83 through `start_run`: a real refusal's `Display` names the holding run and the
     /// rule, and the refused run stays `queued`.
     #[tokio::test]

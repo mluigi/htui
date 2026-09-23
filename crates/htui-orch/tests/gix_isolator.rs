@@ -1793,6 +1793,89 @@ async fn two_committing_implement_attempts_never_look_identical_in_worktree_mode
     );
 }
 
+/// Plan D135 (review K2) over real git: a `review` under a `never` gate that commits and then
+/// says `request-changes` is retired by the loop, and its commit never reaches the primary. The
+/// review's branch keeps its label at that commit; only the approving review is merged.
+#[tokio::test]
+async fn a_rejected_reviews_commits_never_reach_the_primary() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let isolation = fix.isolation;
+    repoint(&fix.orch.store, ids::HTUI_FEAT_3, |phase| {
+        phase.isolation = Some(isolation);
+        phase.gate = Gate::Never;
+    })
+    .await;
+    fix.orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "no tests"),
+    );
+    fix.orch
+        .script("review", 2, ScriptedStep::review("approve", "tests added"));
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["review"],
+    };
+
+    let run = fix.start(&sink).await;
+    assert_eq!(fix.orch.run(run).await.status, RunStatus::Done);
+    let steps = fix.steps(run).await;
+    let review = |attempt: i32| {
+        steps
+            .iter()
+            .find(|step| step.phase_name == "review" && step.attempt == attempt)
+            .unwrap_or_else(|| panic!("review attempt {attempt} ran"))
+    };
+    assert_eq!(
+        review(1).status,
+        StepStatus::Cancelled,
+        "the loop retired it"
+    );
+    let rejected = fix
+        .core_commit(review(1))
+        .await
+        .after_hash
+        .expect("review attempt 1 committed on the primary's tree");
+    let head = head_of(&git, &fix.core.path).await;
+    let exited = git
+        .run(
+            "oracle",
+            &fix.core.path,
+            &[
+                OsStr::new("merge-base"),
+                OsStr::new("--is-ancestor"),
+                OsStr::new(&rejected),
+                OsStr::new(&head),
+            ],
+            &[],
+        )
+        .await
+        .expect("git runs");
+    assert!(
+        !exited.ok(),
+        "the rejected review's commit {rejected} reached the primary at {head}"
+    );
+    assert_eq!(
+        label_of(&git, &fix.core.path, review(1)).await,
+        rejected,
+        "the rejected review's branch stays labelled at its own commit"
+    );
+    assert_eq!(review(2).status, StepStatus::Done);
+    let approved = fix
+        .core_commit(review(2))
+        .await
+        .after_hash
+        .expect("review attempt 2 committed and was merged");
+    assert_eq!(
+        approved, head,
+        "the approving review is the primary's merge"
+    );
+}
+
 // -- milestone 5: the recovery sweep over real git (plan D89-D98, blueprint §10) --------------
 
 /// A [`CommittingSink`] whose session of `key` = `(phase, attempt)` commits as usual and then
