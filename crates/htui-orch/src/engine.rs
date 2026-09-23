@@ -456,7 +456,8 @@ pub enum Next {
     /// Blueprint A-4: this run's recovery failed with the error's `Display`. The failure is a
     /// `warn`, an `item_note` and a released lease, so another process may adopt the run at once,
     /// and the sweep went on with the next run. A lease lost mid-recovery is a `warn` only, with
-    /// no note and no release (plan D128): the run is another process's by then.
+    /// no note and no release (plan D128): the run is another process's by then. So is a
+    /// `StaleWrite` mid-recovery (plan D145): another writer moved one of the run's rows.
     Error(String),
 }
 
@@ -1264,9 +1265,11 @@ where
     /// Runs are recovered one at a time in `queued_at` order, each inside the leased walk
     /// (blueprint A-7), so another orchestrator taking the lease mid-recovery abandons it like any
     /// walk: that run is [`Next::Error`] with the `LeaseLost` text and a `warn`, and nothing else
-    /// (plan D128). Each run's lease is taken again just before its recovery (plan D126), because
-    /// the adoption leased them all at once; a run whose lease another process took meanwhile is
-    /// skipped and absent from the answer. A run left parked or finished has its lease released.
+    /// (plan D128). A recovery that finds a row moved by another writer is the same (plan D145):
+    /// [`Next::Error`] with the `StaleWrite` text and a `warn`, no `item_note` and no release.
+    /// Each run's lease is taken again just before its recovery (plan D126), because the adoption
+    /// leased them all at once; a run whose lease another process took meanwhile is skipped and
+    /// absent from the answer. A run left parked or finished has its lease released.
     /// Any other failure of one run does not stop the sweep (blueprint A-4): it is
     /// [`Next::Error`], a `warn`, an `item_note` and a released lease, and the next run is
     /// recovered.
@@ -1322,6 +1325,12 @@ where
                 // note and no release; the warn is all.
                 Err(err @ EngineError::LeaseLost { .. }) => {
                     tracing::warn!(run = %run.id, %err, "the sweep lost an adopted run's lease");
+                    Next::Error(err.to_string())
+                }
+                // Plan D145: another writer moved a row the recovery read, so the run is being
+                // written by someone else. As D128: no note and no release, the warn is all.
+                Err(err @ EngineError::StaleWrite { .. }) => {
+                    tracing::warn!(run = %run.id, %err, "the sweep's recovery found a row moved");
                     Next::Error(err.to_string())
                 }
                 Err(err) => self.unrecovered(&run, &err).await,
