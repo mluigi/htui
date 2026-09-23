@@ -19,20 +19,19 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use htui_agent::driver::{AgentDriver, DriverCaps, PermissionPolicy, SessionSpec, ToolExposure};
+use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
 use htui_agent::event::DoneEvent;
 use htui_agent::record::{Recorder, RunCap, pump};
-use htui_agent::registry::caps_for;
 use htui_core::model::{
-    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, Gate, GateOutcome, GraphSnapshot,
-    Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectSettings,
+    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, GateOutcome, GraphSnapshot, Item,
+    ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectSettings,
     PromptScope, Run, RunId, RunStatus, RunStep, RunStepCommit, SnapshotCandidate, SnapshotPhase,
     Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
 };
 use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet};
 use htui_core::prompt::{
-    AssembledPrompt, InputDocument, PromptSpec, TemplateRef, TemplateRole, TokenEstimator,
-    assemble, settings,
+    AssembledPrompt, DiffBlock, InputDocument, PromptSpec, TemplateRef, TemplateRole,
+    TokenEstimator, VerifyFailure, assemble, settings,
 };
 use htui_core::scrub::Scrubber;
 use htui_core::store::{StoreError, WriteStore};
@@ -43,7 +42,8 @@ use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 use crate::gate::{self, GateContext, Landing, LoopOutcome, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{Clock, Isolator};
-use crate::status::{Cursor, RunFailure, cursor, latest_at, next_attempt};
+use crate::select::{self, SelectInput, Skipped, Walk};
+use crate::status::{Cursor, RunFailure, cursor, latest_at, next_attempt, winner_at};
 use crate::verify::{Verifier, VerifyReport, VerifyRequest};
 
 /// The only `run_step.fanout_index` milestone 2 walks; fan-out's others are milestone 4's.
@@ -56,6 +56,13 @@ const WALKED_FANOUT_INDEX: i32 = 0;
 /// (`crates/htui-core/src/seed.rs:88-160`). The `bug` graph's implement-shaped phase is `fix` and
 /// its review phase is still `review`, which is the case that shows the name is the rule.
 const REVIEW_PHASE: &str = "review";
+
+/// The `app_setting` key of stage 1's budget rule (plan D60 rule 5, OQ-6). Unseeded: absent is `0`.
+const MIN_BUDGET_KEY: &str = "min_budget_for_new_attempt";
+
+/// `no_candidate_agent`'s detail when the walk skipped nothing and the selector still declined
+/// every eligible candidate (plan D62).
+const SELECTOR_DECLINED: &str = "the selector declined every eligible candidate";
 
 /// How long a claim's lease runs before ANA-2 §4.9's sweep may adopt the run (`:1408`).
 const LEASE_SECONDS: i64 = 120;
@@ -370,7 +377,7 @@ where
         repo_scope: Option<Vec<htui_core::model::RepoId>>,
     ) -> Result<CommandOutcome, EngineError> {
         let item = self.item(item).await?;
-        let resolved = graph::resolve(
+        let resolved = match graph::resolve(
             self.parts.store,
             self.parts.graphs,
             &item,
@@ -379,7 +386,14 @@ where
             repo_scope.as_deref(),
             self.parts.box_id,
         )
-        .await?;
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(ResolveError::NoCandidate { phase }) => {
+                return Err(self.refuse_rung_four(&item, phase).await?.into());
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         let now = self.now();
         let id = RunId::new();
@@ -416,6 +430,29 @@ where
 
         let rest = self.run_to_rest(id).await?;
         Ok(CommandOutcome::Started { run: id, rest })
+    }
+
+    /// Plan D62's rung 4 at `StartRun`: no run row exists, so the refusal is written to the item —
+    /// `open -> blocked`, then `no_candidate_agent: phase `<p>`` as a note — and handed back for
+    /// the caller to raise. A `failed` item has no `blocked` edge (`model/item.rs:56`) and the
+    /// compare-and-set answers `Ok(false)`, which leaves it where it is with the note still
+    /// written: a refusal nobody can read is what invariant 7 forbids.
+    async fn refuse_rung_four(
+        &self,
+        item: &Item,
+        phase: String,
+    ) -> Result<ResolveError, EngineError> {
+        self.parts
+            .store
+            .transition(item.id, Status::Open, Status::Blocked)
+            .await?;
+        let failure = RunFailure::NoCandidateAgent {
+            phase: phase.clone(),
+            detail: String::new(),
+        };
+        self.note(item.id, failure.to_string(), None, self.now())
+            .await?;
+        Ok(ResolveError::NoCandidate { phase })
     }
 
     /// §6.2's `approve` / `reject with note` / `accept artifact`.
@@ -585,7 +622,7 @@ where
         let run = self.run(run.id).await?;
         let steps = self.parts.store.run_steps(run.id).await?;
         let attempt = next_attempt(&steps, row.position);
-        if let Some(rest) = self.admit(&run, &phase, attempt).await? {
+        if let Some(rest) = self.admit(&run, &snapshot, &phase, attempt).await? {
             return Ok(CommandOutcome::Retried { step: row.id, rest });
         }
         let rest = self.run_to_rest(run.id).await?;
@@ -692,7 +729,7 @@ where
                 Cursor::Rest { .. } => return self.resting(&row).await,
                 Cursor::Create { position, attempt } => {
                     let phase = Self::phase_at(run, &snapshot, position)?;
-                    if let Some(rest) = self.admit(&row, &phase, attempt).await? {
+                    if let Some(rest) = self.admit(&row, &snapshot, &phase, attempt).await? {
                         return Ok(rest);
                     }
                 }
@@ -770,44 +807,32 @@ where
 
     // -- stage 1 -------------------------------------------------------------------------------
 
-    /// **Stage 1 — admit.** The capability interlock, the selection, and the step row.
+    /// **Stage 1 — admit.** `R-AGT-8`'s walk, the selection, the substitution note, the step row.
     ///
-    /// `Some(rest)` is the refusal: no candidate survives the inline-approval interlock, the item
-    /// goes to `blocked` **before** the run is failed (blueprint H-16 — the reverse order leaves
-    /// the item `failed`, because `finish_run` mirrors `in_progress -> failed`), and an `item_note`
-    /// records the reason. `None` means a `pending` step exists and the walk may run it.
+    /// `Some(rest)` is the refusal: the walk left nothing the selector would take, the item goes
+    /// to `blocked` **before** the run is failed (blueprint H-16 — the reverse order leaves the
+    /// item `failed`, because `finish_run` mirrors `in_progress -> failed`), and an `item_note`
+    /// records the reason (plan D62). `None` means a `pending` step exists and the walk may run it.
+    ///
+    /// The selector is asked with `fanout_index 0` (plan D71); a fan-out group asks once per index.
     async fn admit(
         &self,
         run: &Run,
+        snapshot: &GraphSnapshot,
         phase: &SnapshotPhase,
         attempt: i32,
     ) -> Result<Option<Rest>, EngineError> {
-        let mut eligible = Vec::with_capacity(phase.candidates.len());
-        for candidate in &phase.candidates {
-            // ANA-4 `:554`, verbatim: "`R-ORCH` gates that require an inline approval must not be
-            // scheduled onto a CLI-only agent". Read from the **agent row** through
-            // `registry::caps_for` (`registry.rs:152`) and never from a built driver — stage 1
-            // refuses before a driver exists to ask (plan D6, fact-check F9).
-            let Some(agent) = self.parts.graphs.agent(candidate.agent_id).await? else {
-                continue;
-            };
-            let caps: DriverCaps = caps_for(&agent);
-            if phase.gate_effective != Gate::Never
-                && !(caps.permission_requests || caps.edit_proposals)
-            {
-                continue;
-            }
-            eligible.push(candidate.clone());
-        }
-
+        let walk = self.stage_one(run, snapshot, phase).await?;
         let Some(chosen) = self
             .parts
             .selector
-            .select(phase, &eligible, WALKED_FANOUT_INDEX)
+            .select(phase, &walk.eligible, WALKED_FANOUT_INDEX)
             .cloned()
         else {
-            return self.refuse_capability(run, phase).await.map(Some);
+            return self.refuse_no_candidate(run, phase, &walk).await.map(Some);
         };
+        self.note_substitution(run, phase, attempt, WALKED_FANOUT_INDEX, &chosen, &walk)
+            .await?;
 
         self.parts
             .store
@@ -825,31 +850,88 @@ where
         Ok(None)
     }
 
-    /// `missing_capability: inline_approval` (`docs/ANA-2.md:482`), in blueprint H-16's order.
-    async fn refuse_capability(
+    /// Plan D60: `select::walk` over the phase's candidates, with its inputs read **fresh on every
+    /// call** — the recorder latches quota mid-run (`crates/htui-core/src/model/agent.rs:79-85`),
+    /// so a listing taken when the run started would be stale by its second step.
+    ///
+    /// The `agent` rows come from [`GraphSource::agent`] and the `agent_box` rows from
+    /// [`GraphSource::agent_boxes`] for this engine's box; the spend is the run's own
+    /// (`select::run_spend`), the cap the snapshot's `per_token_cap_run`, and the minimum
+    /// `app_setting.min_budget_for_new_attempt`. The inline-approval interlock is rule 3 of the
+    /// walk and still reads `registry::caps_for` from the **agent row**, never from a built driver
+    /// (ANA-4 `:554`, plan D6).
+    async fn stage_one(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+    ) -> Result<Walk, EngineError> {
+        let mut agents = BTreeMap::new();
+        for candidate in &phase.candidates {
+            if agents.contains_key(&candidate.agent_id) {
+                continue;
+            }
+            if let Some(agent) = self.parts.graphs.agent(candidate.agent_id).await? {
+                agents.insert(candidate.agent_id, agent);
+            }
+        }
+        let boxes: BTreeMap<_, _> = self
+            .parts
+            .graphs
+            .agent_boxes(self.parts.box_id)
+            .await?
+            .into_iter()
+            .map(|row| (row.agent_id, row))
+            .collect();
+        let steps = self.parts.store.run_steps(run.id).await?;
+        Ok(select::walk(&SelectInput {
+            candidates: &phase.candidates,
+            agents: &agents,
+            boxes: &boxes,
+            gate_effective: phase.gate_effective,
+            spent_micros: select::run_spend(&steps),
+            cap_micros: snapshot.settings.per_token_cap_run,
+            min_budget_micros: min_budget(&self.parts.app),
+        }))
+    }
+
+    /// Plan D62's stage-1 refusal, in blueprint H-16's order: the item `in_progress -> blocked`,
+    /// the note, then `finish_run(Failed)` and plan D36's cleanup.
+    ///
+    /// Two sentences. A walk whose every skip was the inline-approval interlock keeps the shipped
+    /// `missing_capability: inline_approval` (`docs/ANA-2.md:482`), noted with its phase exactly as
+    /// before. Anything else is `no_candidate_agent: phase `<p>`; <agent> (<reason>), …`, or, when
+    /// the walk skipped nothing and the selector itself declined, that sentence.
+    async fn refuse_no_candidate(
         &self,
         run: &Run,
         phase: &SnapshotPhase,
+        walk: &Walk,
     ) -> Result<Rest, EngineError> {
         let now = self.now();
-        let failure = RunFailure::MissingCapability;
+        let (failure, note) = if walk.only_inline_approval() {
+            let failure = RunFailure::MissingCapability;
+            let note = format!("{failure} (phase `{}`)", phase.name);
+            (failure, note)
+        } else {
+            let summary = walk.summary();
+            let failure = RunFailure::NoCandidateAgent {
+                phase: phase.name.clone(),
+                detail: if summary.is_empty() {
+                    SELECTOR_DECLINED.to_owned()
+                } else {
+                    summary
+                },
+            };
+            let note = failure.to_string();
+            (failure, note)
+        };
         if let Some(item) = run.item_id {
             self.parts
                 .store
                 .transition(item, Status::InProgress, Status::Blocked)
                 .await?;
-            self.parts
-                .store
-                .add_note(NewNote {
-                    id: NoteId::new(),
-                    item_id: item,
-                    body: format!("{failure} (phase `{}`)", phase.name),
-                    created_by: self.parts.user,
-                    box_id: Some(self.parts.box_id),
-                    via_step_id: None,
-                    created_at: now,
-                })
-                .await?;
+            self.note(item, note, None, now).await?;
         }
         // The item is already `blocked`, so `finish_run`'s item mirror finds no legal move and
         // leaves it — which is the `_ =>` arm of its own table, and the reason the order matters.
@@ -863,6 +945,64 @@ where
             position: Some(phase.position),
             failure: Some(failure),
         })
+    }
+
+    /// Plan D60's "never substitute silently" (`R-ORCH-10`): when the selector's choice ranks below
+    /// candidates the walk skipped, one `item_note` names each of them with its reason, and the row
+    /// that ran instead. Nothing is written when no skipped row outranked the choice.
+    ///
+    /// Written per candidate of a group (plan D71, blueprint H-23), so `fanout_index` is in the
+    /// sentence.
+    async fn note_substitution(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        attempt: i32,
+        fanout_index: i32,
+        chosen: &SnapshotCandidate,
+        walk: &Walk,
+    ) -> Result<(), EngineError> {
+        let Some(item) = run.item_id else {
+            return Ok(());
+        };
+        let passed_over = skipped_above(phase, walk, chosen);
+        if passed_over.is_empty() {
+            return Ok(());
+        }
+        let skipped = passed_over
+            .iter()
+            .map(|skipped| format!("{} ({})", skipped.agent_name, skipped.cause))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "stage 1 at `{}` attempt {attempt} (candidate {fanout_index}): skipped {skipped}; \
+             chose {}/{}",
+            phase.name, chosen.agent_name, chosen.model
+        );
+        self.note(item, body, None, self.now()).await
+    }
+
+    /// One `item_note` by this engine's user on this engine's box.
+    async fn note(
+        &self,
+        item: ItemId,
+        body: String,
+        via_step_id: Option<StepId>,
+        now: DateTime<Utc>,
+    ) -> Result<(), EngineError> {
+        self.parts
+            .store
+            .add_note(NewNote {
+                id: NoteId::new(),
+                item_id: item,
+                body,
+                created_by: self.parts.user,
+                box_id: Some(self.parts.box_id),
+                via_step_id,
+                created_at: now,
+            })
+            .await?;
+        Ok(())
     }
 
     // -- stages 2 to 6 -------------------------------------------------------------------------
@@ -1037,7 +1177,7 @@ where
             }
             Landing::Retry { position, attempt } => {
                 let phase = Self::phase_at(run.id, snapshot, position)?;
-                self.admit(&row, &phase, attempt).await
+                self.admit(&row, snapshot, &phase, attempt).await
             }
             Landing::Rest(rest) => {
                 // `gate.rs` writes its own terminal `finish_run` — `retry_or_fail`'s exhausted
@@ -1398,8 +1538,16 @@ where
             .await?;
         let (caps, _scan, _deadline) = settings::resolve_excerpt_caps(&self.parts.app);
 
+        let role = TemplateRole::of_name(&template.name);
+        let (verify_failure, previous_diff) =
+            if matches!(role, TemplateRole::Phase) && step.attempt > 1 {
+                self.forwarded(run, step, &mut notes).await?
+            } else {
+                (None, None)
+            };
+
         let spec = PromptSpec {
-            role: TemplateRole::of_name(&template.name),
+            role,
             template: TemplateRef {
                 name: template.name.clone(),
                 version: template.version,
@@ -1434,11 +1582,10 @@ where
                 notes: Vec::new(),
             },
             command_queue: phase.command_queue != htui_core::model::CommandQueue::Off,
-            // `verify_failure` and `previous_diff` are milestone 4's prompt sections (MOD-4 M3
-            // plan OQ-4/D32); their inputs — `command_run.output` and `before_hash..after_hash` —
-            // are durable since milestone 3.
-            verify_failure: None,
-            previous_diff: None,
+            // Plan D67: what the previous attempt's winner left — its failed verify and its diff —
+            // forwarded to a phase step's next attempt; `None` on attempt 1 and for a judge.
+            verify_failure,
+            previous_diff,
             judge: None,
             handoff: None,
             budget: settings::resolve_budget(
@@ -1451,6 +1598,65 @@ where
             notes,
         };
         Ok(Ok(assemble(&spec, self.parts.scrubber)?))
+    }
+
+    /// Plan D67 (M3 D32's forward): the loop's two sections for a phase step at `attempt > 1`,
+    /// read off the previous attempt's winner (`status::winner_at`, plan D66) at the same position.
+    ///
+    /// `verify_failure` is `Some` only when that winner's `verify_outcome` is `fail`, built from its
+    /// last `command_run` row; an exit code recorded nowhere cannot be rendered, so it becomes a
+    /// trim note instead. `previous_diff` is `Isolator::diff` over the winner's tree and commit rows;
+    /// an isolator error degrades the prompt with a note rather than failing the step, because the
+    /// diff is advisory (D55).
+    async fn forwarded(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        notes: &mut Vec<String>,
+    ) -> Result<(Option<VerifyFailure>, Option<DiffBlock>), EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let Some(previous) = winner_at(&steps, step.position, step.attempt - 1) else {
+            notes.push(format!(
+                "no attempt {} at position {} to forward from (plan D67)",
+                step.attempt - 1,
+                step.position
+            ));
+            return Ok((None, None));
+        };
+
+        let verify_failure = if previous.verify_outcome == Some(VerifyOutcome::Fail) {
+            let row = self.parts.store.command_runs(previous.id).await?.pop();
+            match previous
+                .verify_exit_code
+                .or_else(|| row.as_ref().and_then(|row| row.exit_code))
+            {
+                Some(exit_code) => Some(VerifyFailure {
+                    exit_code,
+                    output: row.and_then(|row| row.output).unwrap_or_default(),
+                }),
+                None => {
+                    notes.push(format!(
+                        "verify_failure unavailable: step {} failed its verify_command and \
+                         recorded no exit code",
+                        previous.id
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let trees = self.parts.store.step_trees(previous.id).await?;
+        let commits = self.parts.store.step_commits(previous.id).await?;
+        let previous_diff = match self.parts.isolator.diff(&trees, &commits).await {
+            Ok(diff) => diff,
+            Err(err) => {
+                notes.push(format!("previous_diff unavailable: {err}"));
+                None
+            }
+        };
+        Ok((verify_failure, previous_diff))
     }
 
     /// **Stage 4 — session.** One driver, one session, one turn, one recorder.
@@ -1832,6 +2038,42 @@ pub fn required_inputs(phase: &SnapshotPhase, phases: &[SnapshotPhase]) -> Vec<S
         })
         .cloned()
         .collect()
+}
+
+/// `app_setting.min_budget_for_new_attempt` in USD micros (OQ-6), else `0`.
+///
+/// The key is unseeded, so a stray `0`, a negative, a string or a float all read as `0` —
+/// `graph.rs`'s "positive or the rung is silent" rule for the same table (blueprint H-19).
+fn min_budget(app: &BTreeMap<String, Value>) -> i64 {
+    app.get(MIN_BUDGET_KEY)
+        .and_then(Value::as_i64)
+        .filter(|micros| *micros > 0)
+        .unwrap_or(0)
+}
+
+/// The rows `walk` skipped that rank above `chosen` in `phase.candidates` (plan D60).
+///
+/// The walk partitions the candidates in order, so pairing each candidate with the next eligible
+/// row or else the next skipped one recovers every skipped row's rank exactly — even when one
+/// agent is a candidate twice under two models.
+fn skipped_above<'w>(
+    phase: &SnapshotPhase,
+    walk: &'w Walk,
+    chosen: &SnapshotCandidate,
+) -> Vec<&'w Skipped> {
+    let mut eligible = walk.eligible.iter().peekable();
+    let mut skipped = walk.skipped.iter();
+    let mut above = Vec::new();
+    for candidate in &phase.candidates {
+        if eligible.next_if(|row| *row == candidate).is_some() {
+            if candidate == chosen {
+                break;
+            }
+        } else if let Some(row) = skipped.next() {
+            above.push(row);
+        }
+    }
+    above
 }
 
 /// Whether a run has a live step at `position` this walk would have to wait on.
@@ -2294,6 +2536,95 @@ mod tests {
             [0],
             "a `fan_out = 1` phase asks once, for index 0"
         );
+    }
+
+    /// Blueprint H-19: `min_budget_for_new_attempt` is unseeded, so only a positive integer is a
+    /// minimum; `0`, a negative, a string and a float are all silence.
+    #[test]
+    fn min_budget_reads_only_a_positive_integer() {
+        let app = |value: serde_json::Value| {
+            BTreeMap::from([("min_budget_for_new_attempt".to_owned(), value)])
+        };
+        assert_eq!(super::min_budget(&BTreeMap::new()), 0);
+        assert_eq!(super::min_budget(&app(serde_json::json!(250_000))), 250_000);
+        for silent in [
+            serde_json::json!(0),
+            serde_json::json!(-5),
+            serde_json::json!("250000"),
+            serde_json::json!(2.5),
+        ] {
+            assert_eq!(super::min_budget(&app(silent.clone())), 0, "{silent}");
+        }
+    }
+
+    /// Plan D60's note names only the skipped rows that **outrank** the choice, by position — so a
+    /// skipped row below it is not a substitution, and one agent listed twice under two models is
+    /// ranked by its row and not by its id.
+    #[test]
+    fn only_skipped_rows_above_the_choice_are_substitutions() {
+        use crate::select::{SkipCause, Skipped, Walk};
+        let candidate = |agent_id, agent_name: &str, model: &str| SnapshotCandidate {
+            agent_id,
+            agent_name: agent_name.to_owned(),
+            model: model.to_owned(),
+        };
+        let skipped = |agent_id, agent_name: &str| Skipped {
+            agent_id,
+            agent_name: agent_name.to_owned(),
+            cause: SkipCause::InlineApproval,
+        };
+        let mut phase = phase_fixture();
+        phase.candidates = vec![
+            candidate(ids::AGENT_CLAUDE, "claude", "opus"),
+            candidate(ids::AGENT_AGY, "agy", "gemini-3.7-flash-high"),
+            candidate(ids::AGENT_CLAUDE, "claude", "sonnet"),
+            candidate(ids::AGENT_CLAUDE_CLI, "claude-cli", "default"),
+        ];
+        let walk = Walk {
+            eligible: vec![phase.candidates[1].clone(), phase.candidates[2].clone()],
+            skipped: vec![
+                skipped(ids::AGENT_CLAUDE, "claude"),
+                skipped(ids::AGENT_CLAUDE_CLI, "claude-cli"),
+            ],
+        };
+        let names = |chosen: &SnapshotCandidate| {
+            super::skipped_above(&phase, &walk, chosen)
+                .iter()
+                .map(|row| row.agent_name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&phase.candidates[1]), ["claude"]);
+        assert_eq!(
+            names(&phase.candidates[2]),
+            ["claude"],
+            "`claude`/`sonnet` is eligible even though `claude`/`opus` was skipped"
+        );
+    }
+
+    /// A gated `prd` phase with no candidates, for tests that fill in only what they read.
+    fn phase_fixture() -> SnapshotPhase {
+        SnapshotPhase {
+            position: 0,
+            name: "prd".to_owned(),
+            fan_out: 1,
+            gate: Gate::Always,
+            gate_effective: Gate::Always,
+            gate_hard: true,
+            retry_limit: 1,
+            input_kinds: Vec::new(),
+            output_kind: "prd".to_owned(),
+            isolation: htui_core::model::Isolation::Worktree,
+            command_queue: htui_core::model::CommandQueue::Off,
+            verify_command: None,
+            deadline_seconds: Some(7200),
+            template: htui_core::model::SnapshotTemplate {
+                name: "prd".to_owned(),
+                version: 1,
+            },
+            token_budget: None,
+            candidates: Vec::new(),
+            judge: None,
+        }
     }
 
     /// The whole walk, once: `FEAT-3` reaches its first gate, four approvals finish it, and the
