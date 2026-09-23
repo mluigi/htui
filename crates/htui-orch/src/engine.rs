@@ -456,8 +456,9 @@ pub enum Next {
     /// Blueprint A-4: this run's recovery failed with the error's `Display`. The failure is a
     /// `warn`, an `item_note` and a released lease, so another process may adopt the run at once,
     /// and the sweep went on with the next run. A lease lost mid-recovery is a `warn` only, with
-    /// no note and no release (plan D128): the run is another process's by then. So is a
-    /// `StaleWrite` mid-recovery (plan D145): another writer moved one of the run's rows.
+    /// no note and no release (plan D128): the run is another process's by then. A `StaleWrite`
+    /// mid-recovery (plan D145), where another writer moved one of the run's rows, has no note
+    /// either, and its lease was given back by the leased walk's own `Err` release (plan D139).
     Error(String),
 }
 
@@ -1265,8 +1266,10 @@ where
     /// Runs are recovered one at a time in `queued_at` order, each inside the leased walk
     /// (blueprint A-7), so another orchestrator taking the lease mid-recovery abandons it like any
     /// walk: that run is [`Next::Error`] with the `LeaseLost` text and a `warn`, and nothing else
-    /// (plan D128). A recovery that finds a row moved by another writer is the same (plan D145):
-    /// [`Next::Error`] with the `StaleWrite` text and a `warn`, no `item_note` and no release.
+    /// (plan D128). A recovery that finds a row moved by another writer is the same for the note
+    /// (plan D145): [`Next::Error`] with the `StaleWrite` text and a `warn`, and no `item_note`.
+    /// Unlike D128 its lease is still given back, once, by `walk_leased`'s `Err` arm (plan D127,
+    /// D139): the release is owner-guarded, so it clears only a lease this process still holds.
     /// Each run's lease is taken again just before its recovery (plan D126), because the adoption
     /// leased them all at once; a run whose lease another process took meanwhile is skipped and
     /// absent from the answer. A run left parked or finished has its lease released.
@@ -1328,7 +1331,8 @@ where
                     Next::Error(err.to_string())
                 }
                 // Plan D145: another writer moved a row the recovery read, so the run is being
-                // written by someone else. As D128: no note and no release, the warn is all.
+                // written by someone else. As D128, no note; `walk_leased` already gave the lease
+                // back (D139), so nothing is released twice. The warn is all.
                 Err(err @ EngineError::StaleWrite { .. }) => {
                     tracing::warn!(run = %run.id, %err, "the sweep's recovery found a row moved");
                     Next::Error(err.to_string())
@@ -7993,7 +7997,8 @@ mod tests {
     /// the sweep treats it as D128 treats a lost lease: `Next::Error` with the text and a `warn`,
     /// and no `item_note`. The run crashed mid-command with `prd` approved and never merged; the
     /// sweep's frontier reconcile refuses, and while it is inside the reconcile another writer
-    /// parks the run, so the sweep's own park finds it moved.
+    /// parks the run, so the sweep's own park finds it moved. The lease is given back once, by
+    /// `walk_leased`'s `Err` arm (plan D139), not by the sweep.
     #[tokio::test(start_paused = true)]
     async fn a_stale_write_mid_sweep_writes_no_note() {
         let harness = Harness::new().await;
@@ -8051,6 +8056,11 @@ mod tests {
                 .iter()
                 .any(|note| note.body.starts_with("sweep could not recover run")),
             "no note for a stale write: {notes:?}"
+        );
+        assert_eq!(
+            other.orch.run(run).await.lease_expires_at,
+            Some(other.orch.clock.now()),
+            "the leased walk's own release gave the lease back"
         );
     }
 
