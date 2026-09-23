@@ -486,6 +486,7 @@ async fn snapshot_phase<G: GraphSource>(
                 agent_id: id,
                 agent_name: agent_name(source, &phase.name, id).await?,
                 model: None,
+                template: None,
             }),
         },
     })

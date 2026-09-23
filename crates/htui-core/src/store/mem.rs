@@ -442,6 +442,22 @@ impl MemStore {
         self.write(|state| state.app_settings.insert(key.to_owned(), (value, now)));
     }
 
+    /// Replaces one project's `settings` blob without validation. **Tests only** — same reason as
+    /// [`set_app_setting`](Self::set_app_setting): no seam writer reaches `project.settings`
+    /// (`update_project` never touches the column), and a harness built on a finished store
+    /// cannot rebuild it to plant, say, a `judge_agent_id` (plan D69).
+    ///
+    /// A project that is not there is left alone, as a no-op.
+    pub fn set_project_settings(&self, project: ProjectId, settings: Value) {
+        let now = Utc::now();
+        self.write(|state| {
+            if let Some(row) = state.projects.get_mut(&project) {
+                row.settings = settings;
+                row.updated_at = now;
+            }
+        });
+    }
+
     /// One `item_kind` row, or `None` when no row has that id.
     ///
     /// The prompt's `{{item}}` section names the kind, and `item` carries only `kind_id`; `§6.1`
@@ -4605,6 +4621,41 @@ mod tests {
     use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    /// Plan D69: the tests-only writer reaches `project.settings`, the column no seam writer
+    /// touches, and both readers see it: the trait's `project` and the inherent
+    /// `project_settings`. `updated_at` moves with it, as `set_app_setting`'s does.
+    #[tokio::test]
+    async fn set_project_settings_is_read_back_by_project() {
+        let store = MemStore::demo();
+        let before = store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture project");
+        let settings = json!({ "judge_agent_id": ids::AGENT_AGY, "token_budget": 42 });
+
+        store.set_project_settings(ids::PROJECT_HTUI, settings.clone());
+
+        let after = store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture project");
+        assert_eq!(after.settings, settings, "the blob is replaced whole");
+        assert!(
+            after.updated_at >= before.updated_at,
+            "the write stamps `updated_at`"
+        );
+        assert_eq!(
+            store
+                .project_settings(ids::PROJECT_HTUI)
+                .await
+                .expect("MemStore never fails a read"),
+            Some(settings),
+            "the inherent reader sees the same blob"
+        );
+    }
 
     /// The columns `store::conformance` cannot see, because §6.1 returns neither `run_step.usage`
     /// nor `run_step.prompt_digest` (plan D15(a)). Read straight out of `State`, which is what a

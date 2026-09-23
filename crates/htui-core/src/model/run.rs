@@ -550,6 +550,11 @@ pub struct SnapshotJudge {
     /// `step_graph_phase.judge_model`.
     #[serde(default)]
     pub model: Option<String>,
+    /// The `judge` prompt template, resolved to a concrete version. `graph::resolve` pins the
+    /// latest `judge` template at run creation (plan D53); `None` in a snapshot written before
+    /// milestone 4 means the latest at judge time. [`GraphSnapshot::V`] is not bumped for it.
+    #[serde(default)]
+    pub template: Option<SnapshotTemplate>,
 }
 
 /// The `project.settings` a [`GraphSnapshot`] resolved against (ANA-2 §5.1).
@@ -817,7 +822,7 @@ pub struct RunSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunStatus, StepStatus, prompt_summary};
+    use super::{RunStatus, SnapshotJudge, SnapshotTemplate, StepStatus, prompt_summary};
     use serde_json::json;
 
     /// Every row of ANA-2 §4.3's `run` transition table (`docs/ANA-2.md:600-616`), transcribed
@@ -979,5 +984,39 @@ mod tests {
             (None, false),
             "a value outside i32 is no figure rather than a truncated one"
         );
+    }
+
+    /// Plan D53: a snapshot written before milestone 4 has no `template` on its judge, and it
+    /// still decodes, as `None`, which means "the latest `judge` template at judge time".
+    /// `GraphSnapshot::V` is not bumped for this field.
+    #[test]
+    fn a_snapshot_judge_without_a_template_still_decodes() {
+        let old: SnapshotJudge = serde_json::from_value(json!({
+            "agent_id": "00000000-0000-0000-0000-000000000001",
+            "agent_name": "claude",
+            "model": null,
+        }))
+        .expect("a pre-M4 judge decodes");
+        assert_eq!(old.template, None, "an absent template decodes as `None`");
+
+        let pinned: SnapshotJudge = serde_json::from_value(json!({
+            "agent_id": "00000000-0000-0000-0000-000000000001",
+            "agent_name": "claude",
+            "model": "opus",
+            "template": { "name": "judge", "version": 3 },
+        }))
+        .expect("a pinned judge decodes");
+        assert_eq!(
+            pinned.template,
+            Some(SnapshotTemplate {
+                name: "judge".to_owned(),
+                version: 3
+            }),
+            "a pinned template survives the round trip"
+        );
+        let again: SnapshotJudge =
+            serde_json::from_value(serde_json::to_value(&pinned).expect("encodes"))
+                .expect("decodes");
+        assert_eq!(again, pinned, "encode then decode is the identity");
     }
 }
