@@ -7198,6 +7198,45 @@ mod tests {
         );
     }
 
+    /// Plan D130 (review L3): a lease that cannot be taken is `LeaseHeld` only when another
+    /// orchestrator's lease is live. A `queued` run (never claimed) and a finished one are not
+    /// held by anyone; `resume` names their status instead, as every other status refusal does.
+    #[tokio::test]
+    async fn resume_on_a_run_no_lease_is_taken_for_names_its_status() {
+        let harness = Harness::new().await;
+        let refused = harness
+            .resume(ids::RUN_2)
+            .await
+            .expect_err("a queued run has no lease to take");
+        assert!(
+            matches!(
+                refused,
+                EngineError::RunStatus {
+                    run,
+                    status: RunStatus::Queued,
+                    expected: "running | awaiting_approval",
+                } if run == ids::RUN_2
+            ),
+            "{refused}"
+        );
+
+        let refused = harness
+            .resume(ids::RUN_3)
+            .await
+            .expect_err("a finished run has no lease to take");
+        assert!(
+            matches!(
+                refused,
+                EngineError::RunStatus {
+                    run,
+                    status: RunStatus::Done,
+                    expected: "running | awaiting_approval",
+                } if run == ids::RUN_3
+            ),
+            "{refused}"
+        );
+    }
+
     /// Blueprint A-1: `resume` takes the lease before it resolves or walks, so a run a live
     /// stranger holds is refused and nothing is advanced.
     #[tokio::test]
