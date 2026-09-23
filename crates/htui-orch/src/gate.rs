@@ -633,7 +633,9 @@ pub enum LoopOutcome {
 /// `awaiting_approval` and `done` are superseded; a `running` step is **cancelled**, because
 /// `running -> superseded` is illegal and earns `StoreError::Constraint`
 /// (`crates/htui-core/src/model/run.rs:114-117`); a `failed` step — the rejecting review itself —
-/// is left alone so its verdict survives; `superseded` and `cancelled` are already retired.
+/// is cancelled too, since `failed -> superseded` is illegal as well, and `transition_step` moves
+/// only `status`, so its `gate_outcome` and `gate_note` survive ([`retire_slot`] explains why
+/// plan D5's "left alone" cannot work); `superseded` and `cancelled` are already retired.
 ///
 /// The successor step is **not** created here, unlike the blueprint's §5.6 step 6: retiring
 /// `p_impl` makes the cursor answer `Create { p_impl, next_attempt }` on its own

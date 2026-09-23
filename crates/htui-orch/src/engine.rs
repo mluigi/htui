@@ -1580,6 +1580,13 @@ where
     /// applies. No `std` guard is held across its `.await`. Only a candidate's own failure write
     /// can raise: [`run_candidate`](Self::run_candidate) owns every other failure, so a failed
     /// sibling never fails the others (plan D48).
+    ///
+    /// **Not cancel-safe.** Dropping this future mid-`join_all` — a caller's timeout, a worker
+    /// shutting down — drops every candidate future where it stands: their rows stay `running`, and
+    /// a `shared_serialized` guard taken at `prepare` stays held because `capture` never ran, so
+    /// neither [`release_trees`](Self::release_trees) nor anything else in this frame gives it
+    /// back. Only [`cleanup_run`](Self::cleanup_run) — reached through `cancel_run` or the run's
+    /// own terminal write — or milestone 5's sweep releases them.
     async fn drive_group(
         &self,
         run: &Run,
@@ -2705,7 +2712,7 @@ where
     /// Call 0 and call 1 of [`judge_sessions`](Self::judge_sessions): each drives a fresh session
     /// keyed `(<phase>:judge, attempt, -1, call)`, hands its `done` to the sink, and reads the
     /// newest `judge` document the judge step wrote — which must be **new** after each call.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "the judge's row and phase, its two prompts, its tree and the recorder both calls \
                   share; bundling them would name a struct used here only"
