@@ -2343,7 +2343,12 @@ where
             .await?
         {
             Ok(prompt) => prompt,
-            Err(missing) => return self.fail_before_a_token(run, step, phase, missing).await,
+            Err(missing) => {
+                return self
+                    .fail_before_a_token(run, step, phase, missing)
+                    .await
+                    .map(Some);
+            }
         };
         // `unwrap_or(Value::Null)` here wrote a **null** `trim_record` and said nothing: the row
         // that records which sections were dropped and why would silently become "there was no
@@ -3972,24 +3977,32 @@ where
 
     /// Stage 3's hard failure: a required input resolved to no document, before a token was spent
     /// (`docs/ANA-2.md:412-414`).
+    ///
+    /// Plan D144: the walk moved the step to `running` itself, so [`Self::fail_hard`] answering
+    /// `false` means another writer moved it since. That is plan D125's
+    /// [`EngineError::StaleWrite`], not a re-derivation: the walk stops, and the run is neither
+    /// failed nor cleaned up.
     async fn fail_before_a_token(
         &self,
         run: &Run,
         step: &RunStep,
         phase: &SnapshotPhase,
         kind: String,
-    ) -> Result<Option<Rest>, EngineError> {
+    ) -> Result<Rest, EngineError> {
         let failure = RunFailure::MissingInput(kind);
         if !self.fail_hard(run, step, &failure.to_string()).await? {
-            // Another process moved the step out of `running`; the next pass re-derives from rows
-            // rather than reporting a rest this call did not write (plan D16, D17).
-            return Ok(None);
+            return Err(stale_step(
+                run.id,
+                step.id,
+                StepStatus::Running,
+                StepStatus::Failed,
+            ));
         }
-        Ok(Some(Rest {
+        Ok(Rest {
             run: RunStatus::Failed,
             position: Some(phase.position),
             failure: Some(failure),
-        }))
+        })
     }
 
     /// Stage 3: the inputs, the pinned template and `assemble`.
@@ -4361,10 +4374,17 @@ where
     ///
     /// Plan D144: every `pending -> running` of the walk (a step, a candidate, a judge) goes
     /// through here, and the automatic rejection's `answer_gate` through [`gate::reject_step`].
-    /// Two `running -> failed` writes are exempt: [`Self::fail_hard`] and
-    /// [`Self::fail_candidate`] run on a walk that is already failing, and on their `Ok(false)`
-    /// (the step was settled by another writer) they write nothing further themselves (plan D17).
-    /// Raising `StaleWrite` there would only replace the error that brought the walk there.
+    /// Stage 3's missing input raises `StaleWrite` on [`Self::fail_hard`]'s `false` too
+    /// ([`Self::fail_before_a_token`]).
+    ///
+    /// Exempt are the writes below; on `Ok(false)` each writes nothing further (plan D17).
+    /// - [`Self::fail_hard`] after an error escaped a live step, and [`Self::fail_candidate`]:
+    ///   the walk is already failing, and raising `StaleWrite` would only replace the error that
+    ///   brought it there.
+    /// - The sweep's `interrupt_step` in `recover_step` (a judge, a candidate), in
+    ///   `reset_interrupted` and in `never_reset`: the recovery is D96's re-derivation from rows,
+    ///   so a step another writer moved is read again rather than raised. `recover_step`'s two
+    ///   discard the answer, the other two answer `None`.
     async fn move_step(
         &self,
         run: RunId,

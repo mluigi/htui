@@ -272,7 +272,8 @@ pub enum EngineError {
     /// the status this walk last read, because another writer moved it (typically another box's
     /// sweep, after this walk's lease lapsed). The walk stops at once and writes nothing further,
     /// in particular no reconcile. This supersedes ANA-2's offline narrative ("the live session
-    /// keeps running"): a walk that cannot prove its lease stops.
+    /// keeps running"): a walk that cannot prove its lease stops. A few failure and recovery
+    /// writes are exempt, and the engine's `move_step` names them and why (plan D144).
     ///
     /// Built by [`stale_step`] and [`stale_run`], so the two row shapes read alike.
     #[error(
