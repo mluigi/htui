@@ -27,11 +27,16 @@ pub const LEASE_TTL_KEY: &str = "lease_ttl_seconds";
 /// `app_setting` key of the heartbeat's interval, in seconds (`0003_orchestration.sql:136`).
 pub const LEASE_REFRESH_KEY: &str = "lease_refresh_seconds";
 
-/// The TTL when [`LEASE_TTL_KEY`] is absent or not a positive integer: ANA-2 §10's 120 s (PRD D2).
+/// The TTL when [`LEASE_TTL_KEY`] is absent, not a positive integer or over a year: ANA-2 §10's
+/// 120 s (PRD D2).
 pub const DEFAULT_LEASE_TTL_SECONDS: i64 = 120;
 
 /// The interval when [`LEASE_REFRESH_KEY`] is absent or not a positive integer: §10's 60 s.
 pub const DEFAULT_LEASE_REFRESH_SECONDS: i64 = 60;
+
+/// The longest TTL [`LeaseTimes::from_app`] reads as set: one year, so `now + ttl` never
+/// overflows a `DateTime<Utc>`.
+const MAX_LEASE_TTL_SECONDS: i64 = 365 * 24 * 60 * 60;
 
 /// How long a lease lives and how often it is renewed (plan D85).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,16 +48,18 @@ pub struct LeaseTimes {
 }
 
 impl LeaseTimes {
-    /// Positive `i64` per key, else the default; then `refresh >= ttl` → `ttl / 2`, in
-    /// **milliseconds** so a 1 s TTL still beats at 500 ms.
+    /// Positive `i64` per key (a TTL at most one year), else the default; then `refresh >= ttl` →
+    /// `ttl / 2`, in **milliseconds** so a 1 s TTL still beats at 500 ms.
     ///
     /// A refresh at or above the TTL would let a live lease expire between two beats, and another
     /// box's sweep would adopt a run this process is still walking.
     #[must_use]
     pub fn from_app(app: &BTreeMap<String, Value>) -> Self {
-        // A TTL too large for a `TimeDelta` (or for its half in milliseconds) is read as silence.
+        // A TTL above a year is read as silence: a `TimeDelta` holds far more (~9.2e15 s) than
+        // `clock.now() + ttl` can carry (`DateTime<Utc>` ends near year 262143), and that addition
+        // panics on overflow.
         let ttl_seconds = app_positive(app, LEASE_TTL_KEY)
-            .filter(|seconds| TimeDelta::try_seconds(*seconds).is_some())
+            .filter(|seconds| *seconds <= MAX_LEASE_TTL_SECONDS)
             .unwrap_or(DEFAULT_LEASE_TTL_SECONDS);
         let refresh_seconds =
             app_positive(app, LEASE_REFRESH_KEY).unwrap_or(DEFAULT_LEASE_REFRESH_SECONDS);
