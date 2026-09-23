@@ -1254,11 +1254,14 @@ pub fn head_parents(path: &Path) -> Result<Vec<String>, IsolateError> {
         .collect())
 }
 
-/// Whether `ancestor` is `descendant` itself or one of its ancestors (plan D136): a walk over
-/// every parent from `descendant` meets it.
+/// Whether `ancestor` is `descendant` itself or one of its ancestors (plan D136): some commit the
+/// walk from `descendant` yields names it as a parent.
 ///
 /// A `gix` read (`gix-0.87.1/src/repository/revision.rs:174`); `merge_base` would answer the
-/// same question but sits behind the `revision` feature this workspace does not enable.
+/// same question but sits behind the `revision` feature this workspace does not enable. The
+/// walk hides `ancestor` (plan D142): it yields only the commits above it, or above the point
+/// where the two lines meet, and never the history below, because it runs under the
+/// repository's admin lock. An `ancestor` this repository does not hold is not one.
 ///
 /// # Errors
 /// [`IsolateError::Git`] when either hash is not a hash, or the walk cannot read a commit.
@@ -1276,17 +1279,25 @@ fn ancestor_walk(
     if wanted == tip {
         return Ok((true, 0));
     }
+    if !has_commit(path, ancestor)? {
+        return Ok((false, 0));
+    }
     let repo = open(path)?;
+    let fail = |err: &dyn std::fmt::Display| {
+        IsolateError::Git(format!("cannot walk from {descendant}: {err}"))
+    };
+    // D142: the hidden `ancestor` is never yielded, but the commit above it on the way down is,
+    // and that commit names it as a parent.
     let walk = repo
         .rev_walk([tip])
+        .with_hidden([wanted])
         .all()
-        .map_err(|err| IsolateError::Git(format!("cannot walk from {descendant}: {err}")))?;
+        .map_err(|err| fail(&err))?;
     let mut yielded = 0;
     for info in walk {
-        let info =
-            info.map_err(|err| IsolateError::Git(format!("cannot walk from {descendant}: {err}")))?;
+        let info = info.map_err(|err| fail(&err))?;
         yielded += 1;
-        if info.id == wanted {
+        if info.parent_ids.contains(&wanted) {
             return Ok((true, yielded));
         }
     }
@@ -1298,7 +1309,9 @@ fn ancestor_walk(
 ///
 /// That is what "this step is already merged" means once the primary may move past a merge:
 /// another run's later merge sits on top of it, so `HEAD`'s own parents no longer name it. The
-/// walk stops at a root commit when `base` is not on the first-parent line.
+/// walk hides `base` (plan D142): when `base` is not on the first-parent line it stops where the
+/// line meets `base`'s history, not at a root commit, because it runs under the repository's
+/// admin lock.
 ///
 /// # Errors
 /// [`IsolateError::Git`] when a hash is not a hash or a commit on the walk cannot be read.
@@ -1318,22 +1331,30 @@ fn merge_walk(
     base: &str,
     after: &str,
 ) -> Result<(Option<String>, usize), IsolateError> {
-    let (base, after) = (parse_oid(base)?, parse_oid(after)?);
+    let (tip, base, after) = (parse_oid(head)?, parse_oid(base)?, parse_oid(after)?);
     let repo = open(path)?;
-    let mut at = parse_oid(head)?;
+    let fail =
+        |err: &dyn std::fmt::Display| IsolateError::Git(format!("cannot walk from {head}: {err}"));
+    let walk = repo
+        .rev_walk([tip])
+        .first_parent_only()
+        .with_hidden([base])
+        .all()
+        .map_err(|err| fail(&err))?;
     let mut read = 0;
-    while at != base {
+    for info in walk {
+        let at = info.map_err(|err| fail(&err))?.id;
+        // A first-parent walk lists the first parent only; the second is read off the commit.
         let commit = repo
             .find_commit(at)
             .map_err(|err| IsolateError::Git(format!("cannot find commit {at}: {err}")))?;
         read += 1;
-        let parents: Vec<gix::ObjectId> = commit.parent_ids().map(gix::Id::detach).collect();
-        if parents.get(1) == Some(&after) {
+        if commit
+            .parent_ids()
+            .nth(1)
+            .is_some_and(|parent| parent == after)
+        {
             return Ok((Some(at.to_hex().to_string()), read));
-        }
-        match parents.first() {
-            Some(first) => at = *first,
-            None => break,
         }
     }
     Ok((None, read))
