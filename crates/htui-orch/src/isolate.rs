@@ -14,6 +14,7 @@
 //! recorded as moved rather than silently ignored.
 
 use core::fmt;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -22,6 +23,7 @@ use chrono::{DateTime, SubsecRound as _, Utc};
 use htui_core::model::{
     Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId, TIMESTAMPTZ_DIGITS,
 };
+use htui_core::prompt::DiffBlock;
 
 pub mod copy;
 pub mod git;
@@ -93,6 +95,24 @@ pub struct Prepared {
     pub extra_dirs: Vec<PathBuf>,
 }
 
+/// MOD-4 milestone 4 D54(a): the candidate of a fan-out group a [`prepare`](Isolator::prepare) is
+/// for.
+///
+/// `base` is the group's `HEAD` per repo, read once by the engine through [`Isolator::base`] before
+/// the first candidate of the group is prepared, or re-derived from the group's own
+/// `run_step_commit` rows once one has them (M2 D16). Every candidate starts from it, never from
+/// the repository's current `HEAD`: a comparison between candidates that started from different
+/// commits compares nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanoutSlot<'a> {
+    /// The candidate's `fanout_index`, `0..width`.
+    pub index: i32,
+    /// The phase's `fan_out`: how many candidates the group holds.
+    pub width: i32,
+    /// The group's base per repo of the scope.
+    pub base: &'a BTreeMap<RepoId, String>,
+}
+
 /// ANA-2 §4.6's four verbs, named there verbatim (`docs/ANA-2.md:1769`), behind plan D6's seam.
 ///
 /// **An isolator touches no store.** The engine persists what these return —
@@ -114,12 +134,18 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     /// for the same `(run, step)` finds the tree it made and reports the same `before_hash`. The
     /// trait does not promise it — the fake mints a fresh one per call — and the engine calls it
     /// once (`crates/htui-orch/src/engine.rs:1069-1073`).
+    ///
+    /// `slot` is `None` for a `fan_out = 1` phase and for the judge. A slot fixes `before_hash` to
+    /// `slot.base[repo]` rather than to the repository's `HEAD` (MOD-4 milestone 4 D54(a)); a
+    /// `shared_serialized` candidate is reset to it first, and refused on a dirty checkout (D56,
+    /// D72); `local` never sees one, because `fan_out > 1` is refused at snapshot time.
     fn prepare<'a>(
         &'a self,
         run: RunId,
         step: StepId,
         scope: &'a [RepoId],
         isolation: Isolation,
+        slot: Option<FanoutSlot<'a>>,
     ) -> IsolatorFuture<'a, Prepared>;
 
     /// Stage 5: the `after_hash` of each tree, `None` for a tree the step committed nothing to.
@@ -132,18 +158,46 @@ pub trait Isolator: Send + Sync + fmt::Debug {
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>>;
 
+    /// MOD-4 milestone 4 D54(b): the `HEAD` of every repo in `scope`, keyed by repo; an empty
+    /// scope is an empty map.
+    ///
+    /// Read once per fan-out group, before any candidate is prepared, because
+    /// `shared_serialized`'s sibling 1 cannot prepare until sibling 0 captures — so the base cannot
+    /// come from candidate 0's own `prepare`.
+    fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>>;
+
+    /// MOD-4 milestone 4 D54(c), D55: the step's work as a [`DiffBlock`], over its `run_step_tree`
+    /// rows and the `run_step_commit` rows recorded for them.
+    ///
+    /// `None` when no row committed anything, and when `git` is unusable on this box: the diff is
+    /// advisory input to the judge and to the loop's `previous_diff`, so its absence degrades a
+    /// prompt rather than failing anything. One committed repo gives its range, stat and patch;
+    /// several give `<name>:<before>..<after>` ranges joined by `, ` and the stats and patches
+    /// concatenated under a `# repo <name>` line each, in the order of `commits`.
+    fn diff<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, Option<DiffBlock>>;
+
     /// §4.6 step 4: the winning candidate's branch merged into the primary tree, one commit row
     /// per repo.
     ///
-    /// Fan-out is milestone 4's, so this milestone's only winner is the single step at
-    /// `fanout_index = 0`. What that step's reconciliation *is* depends on the mode it ran under
-    /// (plan D25): for `worktree` and `copy` it is a real `git merge --no-ff` into the primary
-    /// checkout and the returned `after_hash` is the merge commit; for `shared_serialized` and
-    /// `local` it is the identity, because the step committed into the primary tree as it went.
+    /// What a winner's reconciliation *is* depends on the mode it ran under (plan D25): for
+    /// `worktree` and `copy` it is a real `git merge --no-ff` into the primary checkout and the
+    /// returned `after_hash` is the merge commit; for `shared_serialized` and `local` it is the
+    /// identity, because the step committed into the primary tree as it went.
+    ///
+    /// `siblings` are the other candidates of the winner's fan-out group, and empty for
+    /// `fan_out = 1` (MOD-4 milestone 4 D54(d)). For a fan-out winner, `worktree` and `copy` merge
+    /// the winner alone and leave the losers' `htui/<step>` labels where they are;
+    /// `shared_serialized` moves the checked-out branch to the winner's label, which is safe only
+    /// when the checkout is clean and sits at the group's base or at a sibling's label (D56).
     fn reconcile<'a>(
         &'a self,
         winner: StepId,
         trees: &'a [RunStepTree],
+        siblings: &'a [StepId],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>>;
 
     /// Run-terminal cleanup, **never** at step end (ANA-2 invariant 6, `docs/ANA-2.md:128-131`,

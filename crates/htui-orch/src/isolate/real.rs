@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use htui_core::model::{BoxId, Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId};
+use htui_core::prompt::DiffBlock;
 use tokio::sync::OwnedMutexGuard;
 
 use super::copy;
 use super::git::{self, Cli, blocking};
-use super::{IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree};
+use super::{FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree};
 
 // One named free function per refusal sentence, the house style of `htui_core`'s store refusals
 // (`crates/htui-core/src/store/traits.rs:1053-1160`). The two `copy` refusals and the unborn-HEAD
@@ -900,8 +901,10 @@ impl Isolator for GixIsolator {
         step: StepId,
         scope: &'a [RepoId],
         isolation: Isolation,
+        slot: Option<FanoutSlot<'a>>,
     ) -> IsolatorFuture<'a, Prepared> {
         Box::pin(async move {
+            let _ = slot;
             let checkouts = self.resolve_scope(scope)?;
             match isolation {
                 Isolation::Local | Isolation::SharedSerialized => {
@@ -941,12 +944,32 @@ impl Isolator for GixIsolator {
         })
     }
 
+    fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
+        Box::pin(async move {
+            let _ = scope;
+            Ok(BTreeMap::new())
+        })
+    }
+
+    fn diff<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, Option<DiffBlock>> {
+        Box::pin(async move {
+            let _ = (trees, commits);
+            Ok(None)
+        })
+    }
+
     fn reconcile<'a>(
         &'a self,
         winner: StepId,
         trees: &'a [RunStepTree],
+        siblings: &'a [StepId],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
+            let _ = siblings;
             let mut commits = Vec::with_capacity(trees.len());
             for tree in trees {
                 let checkout = self.checkout_of(tree)?.clone();
@@ -1133,6 +1156,7 @@ mod tests {
                 StepId::new(),
                 &[RepoId::new()],
                 Isolation::Local,
+                None,
             )
             .await
             .expect_err("a repo with no checkout is refused");
@@ -1157,7 +1181,13 @@ mod tests {
         .expect("the config validates");
 
         let err = isolator
-            .prepare(RunId::new(), StepId::new(), &[one, two], Isolation::Local)
+            .prepare(
+                RunId::new(),
+                StepId::new(),
+                &[one, two],
+                Isolation::Local,
+                None,
+            )
             .await
             .expect_err("the name collision is refused");
         assert_eq!(
@@ -1179,7 +1209,7 @@ mod tests {
 
         let step = StepId::new();
         let prepared = isolator
-            .prepare(RunId::new(), step, &[id], Isolation::Local)
+            .prepare(RunId::new(), step, &[id], Isolation::Local, None)
             .await
             .expect("local prepares");
 
@@ -1217,7 +1247,13 @@ mod tests {
 
         // Scope order names `docs` first; the primary is still the `cwd` (blueprint H-13).
         let prepared = isolator
-            .prepare(RunId::new(), StepId::new(), &[docs, core], Isolation::Local)
+            .prepare(
+                RunId::new(),
+                StepId::new(),
+                &[docs, core],
+                Isolation::Local,
+                None,
+            )
             .await
             .expect("local prepares");
 
@@ -1255,7 +1291,7 @@ mod tests {
         let run = RunId::new();
         let first = StepId::new();
         let prepared = isolator
-            .prepare(run, first, &[id], Isolation::SharedSerialized)
+            .prepare(run, first, &[id], Isolation::SharedSerialized, None)
             .await
             .expect("the first step prepares");
         assert_eq!(prepared.trees[0].before_hash, head);
@@ -1265,7 +1301,13 @@ mod tests {
             let scope = vec![id];
             tokio::spawn(async move {
                 isolator
-                    .prepare(run, StepId::new(), &scope, Isolation::SharedSerialized)
+                    .prepare(
+                        run,
+                        StepId::new(),
+                        &scope,
+                        Isolation::SharedSerialized,
+                        None,
+                    )
                     .await
                     .map(|prepared| prepared.trees.len())
             })
@@ -1333,6 +1375,7 @@ mod tests {
                 StepId::new(),
                 &[core, unborn],
                 Isolation::SharedSerialized,
+                None,
             )
             .await
             .expect_err("the unborn repository is refused");
@@ -1345,6 +1388,7 @@ mod tests {
                 StepId::new(),
                 &[core],
                 Isolation::SharedSerialized,
+                None,
             ),
         )
         .await
@@ -1366,7 +1410,7 @@ mod tests {
         let run = RunId::new();
         let crashed = StepId::new();
         let prepared = isolator
-            .prepare(run, crashed, &[id], Isolation::SharedSerialized)
+            .prepare(run, crashed, &[id], Isolation::SharedSerialized, None)
             .await
             .expect("the crashed step prepared");
         let rows = prepared
@@ -1382,7 +1426,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            isolator.prepare(run, StepId::new(), &[id], Isolation::SharedSerialized),
+            isolator.prepare(run, StepId::new(), &[id], Isolation::SharedSerialized, None),
         )
         .await
         .expect("the guard was released by cleanup")
@@ -1401,7 +1445,7 @@ mod tests {
 
         let run = RunId::new();
         isolator
-            .prepare(run, StepId::new(), &[id], Isolation::SharedSerialized)
+            .prepare(run, StepId::new(), &[id], Isolation::SharedSerialized, None)
             .await
             .expect("the step prepared, and its row was never written");
 
@@ -1417,6 +1461,7 @@ mod tests {
                 StepId::new(),
                 &[id],
                 Isolation::SharedSerialized,
+                None,
             ),
         )
         .await
@@ -1442,7 +1487,7 @@ mod tests {
             .expect("the config validates");
 
         let err = isolator
-            .prepare(RunId::new(), StepId::new(), &[id], Isolation::Local)
+            .prepare(RunId::new(), StepId::new(), &[id], Isolation::Local, None)
             .await
             .expect_err("an unborn HEAD is refused");
         assert_eq!(
@@ -1465,13 +1510,19 @@ mod tests {
         .expect("the config validates");
 
         let err = isolator
-            .prepare(RunId::new(), StepId::new(), &[id], Isolation::Worktree)
+            .prepare(
+                RunId::new(),
+                StepId::new(),
+                &[id],
+                Isolation::Worktree,
+                None,
+            )
             .await
             .expect_err("the worktree mode needs git");
         assert_eq!(err.to_string(), "isolation refused: git not on PATH");
 
         isolator
-            .prepare(RunId::new(), StepId::new(), &[id], Isolation::Local)
+            .prepare(RunId::new(), StepId::new(), &[id], Isolation::Local, None)
             .await
             .expect("local needs no git at all");
     }
@@ -1487,7 +1538,7 @@ mod tests {
         let run = RunId::new();
         let step = StepId::new();
         let prepared = isolator
-            .prepare(run, step, &[], Isolation::Local)
+            .prepare(run, step, &[], Isolation::Local, None)
             .await
             .expect("an empty scope prepares");
 
@@ -1524,7 +1575,7 @@ mod tests {
         let run = RunId::new();
         let step = StepId::new();
         let prepared = isolator
-            .prepare(run, step, &[core, docs], Isolation::Worktree)
+            .prepare(run, step, &[core, docs], Isolation::Worktree, None)
             .await
             .expect("the worktree mode prepares");
 
@@ -1594,7 +1645,7 @@ mod tests {
 
         let step = StepId::new();
         let prepared = isolator
-            .prepare(RunId::new(), step, &[core, docs], Isolation::Worktree)
+            .prepare(RunId::new(), step, &[core, docs], Isolation::Worktree, None)
             .await
             .expect("the worktree mode prepares");
         // The agent commits in `core`'s tree and leaves `docs`'s alone, but dirties it so D27
@@ -1642,7 +1693,7 @@ mod tests {
 
         let step = StepId::new();
         let prepared = isolator
-            .prepare(RunId::new(), step, &[core, docs], Isolation::Worktree)
+            .prepare(RunId::new(), step, &[core, docs], Isolation::Worktree, None)
             .await
             .expect("the worktree mode prepares");
         let clean = PathBuf::from(&prepared.trees[0].tree.path);
@@ -1686,7 +1737,7 @@ mod tests {
 
         let step = StepId::new();
         let prepared = isolator
-            .prepare(RunId::new(), step, &[core], Isolation::Worktree)
+            .prepare(RunId::new(), step, &[core], Isolation::Worktree, None)
             .await
             .expect("the worktree mode prepares");
         let tree = PathBuf::from(&prepared.trees[0].tree.path);
@@ -1726,14 +1777,14 @@ mod tests {
         let run = RunId::new();
         let step = StepId::new();
         let first = isolator
-            .prepare(run, step, &[core], Isolation::Worktree)
+            .prepare(run, step, &[core], Isolation::Worktree, None)
             .await
             .expect("the first call prepares");
         // The crash window of H-1: the source moves before the retry.
         commit_file(&core_path, "h", "moved\n", "the source moves on");
 
         let second = isolator
-            .prepare(run, step, &[core], Isolation::Worktree)
+            .prepare(run, step, &[core], Isolation::Worktree, None)
             .await
             .expect("the second call reuses");
 
@@ -1772,14 +1823,14 @@ mod tests {
         let run = RunId::new();
         let step = StepId::new();
         let first = isolator
-            .prepare(run, step, &[core], Isolation::Worktree)
+            .prepare(run, step, &[core], Isolation::Worktree, None)
             .await
             .expect("the first call prepares");
         let tree = PathBuf::from(&first.trees[0].tree.path);
         std::fs::remove_file(tree.join("f")).expect("a tracked file is deleted");
 
         let second = isolator
-            .prepare(run, step, &[core], Isolation::Worktree)
+            .prepare(run, step, &[core], Isolation::Worktree, None)
             .await
             .expect("the second call repairs and reuses");
 
@@ -1816,7 +1867,7 @@ mod tests {
         let run = RunId::new();
         let step = StepId::new();
         let first = isolator
-            .prepare(run, step, &[core], Isolation::Worktree)
+            .prepare(run, step, &[core], Isolation::Worktree, None)
             .await
             .expect("the first call prepares");
         let tree = PathBuf::from(&first.trees[0].tree.path);
@@ -1833,7 +1884,7 @@ mod tests {
         assert!(crate::isolate::git::head(&tree).is_err(), "the premise");
 
         let second = isolator
-            .prepare(run, step, &[core], Isolation::Worktree)
+            .prepare(run, step, &[core], Isolation::Worktree, None)
             .await
             .expect("the second call re-makes the tree");
 
@@ -1879,7 +1930,13 @@ mod tests {
                 .expect("the config validates");
 
         let err = isolator
-            .prepare(RunId::new(), StepId::new(), &[core], Isolation::Worktree)
+            .prepare(
+                RunId::new(),
+                StepId::new(),
+                &[core],
+                Isolation::Worktree,
+                None,
+            )
             .await
             .expect_err("a repository with submodules is refused");
         assert_eq!(
@@ -1917,7 +1974,7 @@ mod tests {
         let run = RunId::new();
         let step = StepId::new();
         let prepared = isolator
-            .prepare(run, step, &[core, docs], Isolation::Worktree)
+            .prepare(run, step, &[core, docs], Isolation::Worktree, None)
             .await
             .expect("the worktree mode prepares");
         let trees: Vec<PathBuf> = prepared
@@ -2003,7 +2060,7 @@ mod tests {
 
         let run = RunId::new();
         let prepared = isolator
-            .prepare(run, StepId::new(), &[core], Isolation::Worktree)
+            .prepare(run, StepId::new(), &[core], Isolation::Worktree, None)
             .await
             .expect("the worktree mode prepares");
 
@@ -2065,7 +2122,7 @@ mod tests {
         let run = RunId::new();
         let step = StepId::new();
         let prepared = isolator
-            .prepare(run, step, &[core], Isolation::Copy)
+            .prepare(run, step, &[core], Isolation::Copy, None)
             .await
             .expect("the copy mode prepares");
 
@@ -2132,7 +2189,7 @@ mod tests {
         let isolator = GixIsolator::new(config).expect("the config validates");
 
         let err = isolator
-            .prepare(RunId::new(), StepId::new(), &[core], Isolation::Copy)
+            .prepare(RunId::new(), StepId::new(), &[core], Isolation::Copy, None)
             .await
             .expect_err("the copy is over the cap");
         let text = err.to_string();
@@ -2165,7 +2222,7 @@ mod tests {
         let isolator = GixIsolator::new(config).expect("the config validates");
 
         let err = isolator
-            .prepare(RunId::new(), StepId::new(), &[core], Isolation::Copy)
+            .prepare(RunId::new(), StepId::new(), &[core], Isolation::Copy, None)
             .await
             .expect_err("a directory that is not a checkout is refused");
         assert_eq!(err.to_string(), "isolation refused: not a git checkout");
@@ -2188,7 +2245,7 @@ mod tests {
         let run = RunId::new();
         let step = StepId::new();
         let first = isolator
-            .prepare(run, step, &[core], Isolation::Copy)
+            .prepare(run, step, &[core], Isolation::Copy, None)
             .await
             .expect("the first call prepares");
         let copy = PathBuf::from(&first.trees[0].tree.path);
@@ -2196,7 +2253,7 @@ mod tests {
         commit_file(&core_path, "h", "moved\n", "the source moves on");
 
         let second = isolator
-            .prepare(run, step, &[core], Isolation::Copy)
+            .prepare(run, step, &[core], Isolation::Copy, None)
             .await
             .expect("the second call reuses");
 
@@ -2228,7 +2285,7 @@ mod tests {
 
         let step = StepId::new();
         let prepared = isolator
-            .prepare(RunId::new(), step, &[core], Isolation::Worktree)
+            .prepare(RunId::new(), step, &[core], Isolation::Worktree, None)
             .await
             .expect("the worktree mode prepares");
         let after = commit_file(
@@ -2256,7 +2313,7 @@ mod tests {
         let (isolator, core, core_path, head, after, step, rows) = stepped(dir.path()).await;
 
         let commits = isolator
-            .reconcile(step, &rows)
+            .reconcile(step, &rows, &[])
             .await
             .expect("the winner reconciles");
 
@@ -2299,7 +2356,7 @@ mod tests {
 
         let step = StepId::new();
         let prepared = isolator
-            .prepare(RunId::new(), step, &[core], Isolation::Worktree)
+            .prepare(RunId::new(), step, &[core], Isolation::Worktree, None)
             .await
             .expect("the worktree mode prepares");
         let rows = rows(&prepared);
@@ -2309,7 +2366,7 @@ mod tests {
             .expect("the step captures");
 
         let commits = isolator
-            .reconcile(step, &rows)
+            .reconcile(step, &rows, &[])
             .await
             .expect("the identity reconciles");
         assert_eq!(commits[0].after_hash, None);
@@ -2332,7 +2389,7 @@ mod tests {
             .expect("the primary is dirtied");
 
         let err = isolator
-            .reconcile(step, &rows)
+            .reconcile(step, &rows, &[])
             .await
             .expect_err("a dirty primary is refused");
         assert_eq!(err.to_string(), "isolation refused: dirty_primary_tree");
@@ -2355,7 +2412,7 @@ mod tests {
         let moved = commit_file(&core_path, "h", "somebody else\n", "the primary moves");
 
         let err = isolator
-            .reconcile(step, &rows)
+            .reconcile(step, &rows, &[])
             .await
             .expect_err("a moved primary is refused");
         assert_eq!(
@@ -2376,11 +2433,11 @@ mod tests {
         let (isolator, _core, core_path, _head, _after, step, rows) = stepped(dir.path()).await;
 
         let first = isolator
-            .reconcile(step, &rows)
+            .reconcile(step, &rows, &[])
             .await
             .expect("the winner reconciles");
         let second = isolator
-            .reconcile(step, &rows)
+            .reconcile(step, &rows, &[])
             .await
             .expect("the second reconcile reads the merge it already made");
 
@@ -2411,7 +2468,7 @@ mod tests {
 
         let step = StepId::new();
         let prepared = isolator
-            .prepare(RunId::new(), step, &[core], Isolation::Copy)
+            .prepare(RunId::new(), step, &[core], Isolation::Copy, None)
             .await
             .expect("the copy mode prepares");
         let copy = PathBuf::from(&prepared.trees[0].tree.path);
@@ -2427,7 +2484,7 @@ mod tests {
         );
 
         let commits = isolator
-            .reconcile(step, &rows)
+            .reconcile(step, &rows, &[])
             .await
             .expect("the copy reconciles");
 

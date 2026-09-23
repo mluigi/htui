@@ -29,12 +29,15 @@ use htui_core::model::{
     PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId, RunStep, RunStepCommit,
     RunStepTree, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
 };
+use htui_core::prompt::DiffBlock;
 use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
 use uuid::Uuid;
 
 use crate::command::{Command, CommandOutcome, EngineError};
 use crate::graph::GraphSource;
-use crate::isolate::{Clock, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree};
+use crate::isolate::{
+    Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree,
+};
 use crate::verify::{Verifier, VerifierFuture, VerifyReport, VerifyRequest};
 
 /// The root every synthetic tree path hangs from. Nothing ever creates it.
@@ -209,8 +212,10 @@ impl Isolator for FakeIsolator {
         step: StepId,
         scope: &'a [RepoId],
         isolation: Isolation,
+        slot: Option<FanoutSlot<'a>>,
     ) -> IsolatorFuture<'a, Prepared> {
         Box::pin(async move {
+            let _ = slot;
             *self
                 .prepares
                 .lock()
@@ -285,9 +290,10 @@ impl Isolator for FakeIsolator {
         &'a self,
         winner: StepId,
         trees: &'a [RunStepTree],
+        siblings: &'a [StepId],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
-            let _ = trees;
+            let _ = (trees, siblings);
             if let Some(err) = self
                 .reconcile_failures
                 .lock()
@@ -303,6 +309,24 @@ impl Isolator for FakeIsolator {
                 .get(&winner)
                 .cloned()
                 .unwrap_or_default())
+        })
+    }
+
+    fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
+        Box::pin(async move {
+            let _ = scope;
+            Ok(BTreeMap::new())
+        })
+    }
+
+    fn diff<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, Option<DiffBlock>> {
+        Box::pin(async move {
+            let _ = (trees, commits);
+            Ok(None)
         })
     }
 
@@ -1162,7 +1186,7 @@ mod tests {
         let step = StepId::new();
         let scope = repos();
         let prepared = isolator
-            .prepare(ids::RUN_2, step, &scope, Isolation::Worktree)
+            .prepare(ids::RUN_2, step, &scope, Isolation::Worktree, None)
             .await
             .expect("the fake never refuses");
 
@@ -1187,7 +1211,7 @@ mod tests {
         assert!(!std::path::Path::new(&prepared.trees[1].tree.path).exists());
 
         let empty = isolator
-            .prepare(ids::RUN_2, step, &[], Isolation::Local)
+            .prepare(ids::RUN_2, step, &[], Isolation::Local, None)
             .await
             .expect("an empty scope is the demo fixture's own shape");
         assert!(empty.trees.is_empty());
@@ -1202,7 +1226,7 @@ mod tests {
         let step = StepId::new();
         let scope = repos();
         let trees: Vec<_> = isolator
-            .prepare(ids::RUN_2, step, &scope, Isolation::Copy)
+            .prepare(ids::RUN_2, step, &scope, Isolation::Copy, None)
             .await
             .expect("the fake never refuses")
             .trees

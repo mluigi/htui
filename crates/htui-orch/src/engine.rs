@@ -868,7 +868,7 @@ where
         let prepared = self
             .parts
             .isolator
-            .prepare(run.id, step.id, &run.repo_scope, phase.isolation)
+            .prepare(run.id, step.id, &run.repo_scope, phase.isolation, None)
             .await?;
         let trees: Vec<_> = prepared
             .trees
@@ -1154,7 +1154,7 @@ where
         step: &RunStep,
     ) -> Result<Option<Rest>, EngineError> {
         let trees = self.parts.store.step_trees(step.id).await?;
-        match self.parts.isolator.reconcile(step.id, &trees).await {
+        match self.parts.isolator.reconcile(step.id, &trees, &[]).await {
             Ok(after) => {
                 // ANA-2 `:987-988`: the winner's `after_hash` becomes the merge commit.
                 self.parts.store.record_commits(step.id, &after).await?;
