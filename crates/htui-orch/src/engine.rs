@@ -738,7 +738,8 @@ where
         if phase.fan_out > 1 {
             return self.retry_group(&run, &snapshot, &row, &phase).await;
         }
-        crate::command::retry_enabled(&row, &phase)?;
+        let steps = self.parts.store.run_steps(run.id).await?;
+        crate::command::retry_enabled(&steps, &row, &phase)?;
         self.retry_guarded(&run, &snapshot, &row, &phase).await
     }
 

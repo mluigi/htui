@@ -451,7 +451,11 @@ pub fn answer_gate_enabled(
 /// # Errors
 /// [`EngineError::NotGated`] for any other step status; [`EngineError::RetryExhausted`] when the
 /// budget is spent.
-pub fn retry_enabled(step: &RunStep, phase: &SnapshotPhase) -> Result<(), EngineError> {
+pub fn retry_enabled(
+    _steps: &[RunStep],
+    step: &RunStep,
+    phase: &SnapshotPhase,
+) -> Result<(), EngineError> {
     if !matches!(
         step.status,
         StepStatus::AwaitingApproval | StepStatus::Failed
@@ -753,13 +757,14 @@ mod tests {
             step.status = status;
             step.attempt = 1;
             assert!(
-                retry_enabled(&step, &phase).is_ok(),
+                retry_enabled(std::slice::from_ref(&step), &step, &phase).is_ok(),
                 "`{status}` is retryable"
             );
         }
 
         step.attempt = 2;
-        let refused = retry_enabled(&step, &phase).expect_err("a third attempt is out of budget");
+        let refused = retry_enabled(std::slice::from_ref(&step), &step, &phase)
+            .expect_err("a third attempt is out of budget");
         assert!(
             matches!(
                 refused,
@@ -775,7 +780,8 @@ mod tests {
         step.attempt = 1;
         step.status = StepStatus::Done;
         assert!(matches!(
-            retry_enabled(&step, &phase).expect_err("a done step is not retryable"),
+            retry_enabled(std::slice::from_ref(&step), &step, &phase)
+                .expect_err("a done step is not retryable"),
             EngineError::NotGated { .. }
         ));
     }
@@ -793,14 +799,15 @@ mod tests {
         for note in ["interrupted", "interrupted, tree not reset"] {
             step.gate_note = Some(note.to_owned());
             assert!(
-                retry_enabled(&step, &phase).is_ok(),
+                retry_enabled(std::slice::from_ref(&step), &step, &phase).is_ok(),
                 "`{note}` is a crash, not the agent's failed settle"
             );
         }
 
         step.gate_note = None;
         assert!(matches!(
-            retry_enabled(&step, &phase).expect_err("an agent's failure spends the budget"),
+            retry_enabled(std::slice::from_ref(&step), &step, &phase)
+                .expect_err("an agent's failure spends the budget"),
             EngineError::RetryExhausted {
                 attempt: 1,
                 retry_limit: 0,
@@ -812,9 +819,44 @@ mod tests {
         step.status = StepStatus::AwaitingApproval;
         step.gate_note = Some("interrupted".to_owned());
         assert!(matches!(
-            retry_enabled(&step, &phase).expect_err("a parked step is budgeted"),
+            retry_enabled(std::slice::from_ref(&step), &step, &phase)
+                .expect_err("a parked step is budgeted"),
             EngineError::RetryExhausted { .. }
         ));
+    }
+
+    /// Plan D134 (review M4): only the position's latest attempt is retryable, so blueprint
+    /// A-8's exemption cannot reach an interrupted attempt a later one already replaced. The
+    /// latest interrupted attempt keeps it.
+    #[test]
+    fn only_the_latest_attempt_is_retryable() {
+        let (mut step, mut phase) = review();
+        phase.retry_limit = 0;
+        step.status = StepStatus::Failed;
+        step.attempt = 1;
+        step.gate_note = Some("interrupted".to_owned());
+        let mut later = step.clone();
+        later.id = StepId::new();
+        later.attempt = 2;
+        let steps = [step.clone(), later.clone()];
+
+        let refused =
+            retry_enabled(&steps, &step, &phase).expect_err("attempt 2 replaced attempt 1");
+        assert!(
+            matches!(
+                refused,
+                EngineError::StaleSlot {
+                    step: id,
+                    attempt: 1,
+                    latest: 2,
+                } if id == step.id
+            ),
+            "{refused}"
+        );
+        assert!(
+            retry_enabled(&steps, &later, &phase).is_ok(),
+            "the latest interrupted attempt is still exempt from the budget"
+        );
     }
 
     /// `RUN_3` parked on its `research` group: both candidates settled `done`, nothing selected,
