@@ -4574,6 +4574,10 @@ impl WriteStore for MemStore {
         self.write(|state| state.take_lease(run, box_id, owner, now, until, stamp))
     }
 
+    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+        self.refresh_lease(run, owner, now).await
+    }
+
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         let now = Utc::now();
         self.write(|state| state.create_step(new, now))

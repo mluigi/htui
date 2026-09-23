@@ -774,6 +774,30 @@ pub trait WriteStore: ReadStore {
         until: DateTime<Utc>,
     ) -> Result<bool>;
 
+    /// Plan D139: gives a lease back. `UPDATE run SET lease_owner = NULL, lease_expires_at = now
+    /// WHERE id = run AND lease_owner = owner`. `Ok(false)` = zero rows = not ours, and nothing
+    /// is written.
+    ///
+    /// The owner is cleared, not only the expiry. Plan D88 keeps [`adopt_runs`] off a run whose
+    /// `lease_owner` is the sweeper, so a lease released with [`refresh_lease`] stayed out of its
+    /// own process's sweep for ever. A released run is free to every sweep, this process's
+    /// included. A heartbeat that hung and commits after the release matches no row, so it
+    /// cannot bring the lease back.
+    ///
+    /// `lease_box_id` is left as it was. [`claim_run`], [`take_lease`] and [`adopt_runs`] all
+    /// select on `executing_box_id`, never on `lease_box_id`, and each of them overwrites it.
+    /// So it only names the box that last held the lease.
+    ///
+    /// [`adopt_runs`]: WriteStore::adopt_runs
+    /// [`refresh_lease`]: WriteStore::refresh_lease
+    /// [`claim_run`]: WriteStore::claim_run
+    /// [`take_lease`]: WriteStore::take_lease
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, told
+    /// apart from "not ours" by one follow-up read.
+    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool>;
+
     /// Inserts a step at `pending`. `fanout_index = -1` is the judge and is accepted.
     ///
     /// # Errors

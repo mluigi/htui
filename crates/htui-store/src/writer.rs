@@ -719,6 +719,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.release_lease(run, owner, now).await,
+            Self::Online(pg) => pg.release_lease(run, owner, now).await,
+        }
+    }
+
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
         match self {
             Self::Memory(store) => store.create_step(new).await,

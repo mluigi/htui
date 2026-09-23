@@ -87,6 +87,7 @@ pub const CASES: &[&str] = &[
     "claim_run_applies_the_isolation_and_path_rules",
     "take_lease_moves_only_our_own_or_an_expired_lease",
     "interrupt_step_is_a_cas_on_running",
+    "release_lease_frees_the_run_for_its_own_sweep",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -176,6 +177,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             take_lease_moves_only_our_own_or_an_expired_lease(store).await;
         }
         "interrupt_step_is_a_cas_on_running" => interrupt_step_is_a_cas_on_running(store).await,
+        "release_lease_frees_the_run_for_its_own_sweep" => {
+            release_lease_frees_the_run_for_its_own_sweep(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -4762,6 +4766,85 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
     let unknown = store
         .take_lease(RunId::new(), ids::BOX, x, at, minutes(5))
         .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
+        "{CASE}: an unknown run is NotFound, got {unknown:?}"
+    );
+}
+
+/// Plan D139: `release_lease` is a compare-and-set on `lease_owner` that clears the owner. The
+/// released run is then free to its own owner's sweep, which plan D88 refused while the owner
+/// stayed on the row. A stranger's release writes nothing.
+///
+/// `lease_owner` is not a [`Run`] field, so who holds the lease is asserted through what
+/// [`WriteStore::refresh_lease`] answers, as `lease_refresh_is_a_cas_on_owner` does.
+async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S) {
+    const CASE: &str = "release_lease_frees_the_run_for_its_own_sweep";
+    let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let minutes = |n: i64| at + TimeDelta::minutes(n);
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, x, at, minutes(5))
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: X claims the run until at + 5 min"
+    );
+
+    assert!(
+        !store.release_lease(run, y, minutes(1)).await.expect(CASE),
+        "{CASE}: Y does not hold the lease, so Y's release is zero rows"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await.lease_expires_at,
+        Some(minutes(5)),
+        "{CASE}: a refused release writes nothing"
+    );
+    assert!(
+        store.refresh_lease(run, x, minutes(5)).await.expect(CASE),
+        "{CASE}: the lease is still X's"
+    );
+
+    assert!(
+        store.release_lease(run, x, minutes(1)).await.expect(CASE),
+        "{CASE}: X gives its own lease back"
+    );
+    let released = run_row(CASE, store, run).await;
+    assert_eq!(
+        (released.lease_box_id, released.lease_expires_at),
+        (Some(ids::BOX), Some(minutes(1))),
+        "{CASE}: the expiry reads `now`; the box that held the lease is kept"
+    );
+    assert!(
+        !store.refresh_lease(run, x, minutes(10)).await.expect(CASE),
+        "{CASE}: the owner is cleared, so X's late heartbeat matches no row"
+    );
+    assert!(
+        !store.release_lease(run, x, minutes(1)).await.expect(CASE),
+        "{CASE}: a second release finds nothing of X's"
+    );
+
+    let adopted = store
+        .adopt_runs(ids::BOX, x, minutes(1), minutes(10))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        adopted.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![run],
+        "{CASE}: X's own sweep adopts the released run (plan D88 no longer applies)"
+    );
+    assert!(
+        store.refresh_lease(run, x, minutes(10)).await.expect(CASE),
+        "{CASE}: the adoption made the lease X's again"
+    );
+
+    let unknown = store.release_lease(RunId::new(), x, minutes(1)).await;
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
         "{CASE}: an unknown run is NotFound, got {unknown:?}"

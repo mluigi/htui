@@ -2780,6 +2780,10 @@ impl WriteStore for PgStore {
         }
     }
 
+    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+        self.refresh_lease(run, owner, now).await
+    }
+
     /// A `run_step` at `pending` with every settle column `NULL`; `fanout_index = -1` is the judge
     /// and is accepted, because no `CHECK` on that column exists or may be added (ANA-2 risk 12).
     ///

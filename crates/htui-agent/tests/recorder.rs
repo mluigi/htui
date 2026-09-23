@@ -658,6 +658,14 @@ impl WriteStore for SpyStore {
     ) -> StoreResult<bool> {
         self.inner.take_lease(run, box_id, owner, now, until).await
     }
+    async fn release_lease(
+        &self,
+        run: RunId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.inner.release_lease(run, owner, now).await
+    }
     async fn create_step(&self, new: NewRunStep) -> StoreResult<RunStep> {
         self.inner.create_step(new).await
     }
