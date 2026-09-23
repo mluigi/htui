@@ -1,6 +1,6 @@
 # Blueprint: MOD-4 milestone 5, "two runs do not collide, and a crash is survivable"
 
-**Status**: **ACCEPTED by the maintainer 2026-09-23.** Every finding F-A..F-W is accepted with the fix in its row. Every proposed change A-1..A-8 is accepted, so wherever this document says "under A-n" or "when A-n is accepted", that branch is the one to build. Consequences: A-8 supersedes F-C's rewrite (`an_interrupted_step_out_of_budget_parks` asserts `RetryStep` → `Retried`, and R-21 is closed); A-1, A-4 and A-5 mean R-24, R-22 and R-23 are not incurred; A-3 means T7/T8 assert exactly one reconcile per recovered winner. Implementation in progress.
+**Status**: **complete** (`a1fb291`..`8dc4755`, 2026-09-23; §22.4 holds the close-out). **ACCEPTED by the maintainer 2026-09-23.** Every finding F-A..F-W is accepted with the fix in its row. Every proposed change A-1..A-8 is accepted, so wherever this document says "under A-n" or "when A-n is accepted", that branch is the one to build. Consequences: A-8 supersedes F-C's rewrite (`an_interrupted_step_out_of_budget_parks` asserts `RetryStep` → `Retried`, and R-21 is closed); A-1, A-4 and A-5 mean R-24, R-22 and R-23 are not incurred; A-3 means T7/T8 assert exactly one reconcile per recovered winner. Implementation complete.
 
 **Plan**: `.claude/plans/mod-4-orch-lease.plan.md`, confirmed by the maintainer on 2026-09-23. It covers D79–D106, and OQ-1..OQ-11 take their adopted defaults. **PRD**: `.claude/prds/mod-4-orchestrator-manual-mode.prd.md`, milestone 5 (`:309`). Where PRD D1–D8 disagree with this blueprint, D1–D8 win. **Design authority**: the ANA-2 passages cited in the plan's header, chiefly §4.7 (`docs/ANA-2.md:1009-1113`) and §4.9 (`:1242-1340`).
 
@@ -1117,3 +1117,38 @@ The second `rust-reviewer` pass over the round-1 repairs returned **request-chan
 |---|---|---|
 | **R-31** (L-e) `walk_resumed` (`engine.rs:1870`) ignores `unpark`'s `false`. It re-merges on every resume of a run parked by a refused reconcile: the merge is idempotent, but it writes a note each time. Only one of D132's four crash paths is tested. A crash right after `AnswerGate(Rejected)` stays parked on a failed step. | Low | Milestone 6: honour `unpark`'s answer, test the other three crash paths, and give the rejected crash a resume path. |
 | **R-32** (L-f) D131's not-reset park loses its labelled detail, and D138's `part_way` turns an `Io` error into a `Git` error. | Low (both are diagnostics only) | Milestone 6: keep the detail and the error kind. |
+
+### 22.4 Close-out (2026-09-23)
+
+**As landed, beyond §22.2's text.**
+- **D139**: `release_lease` leaves `lease_box_id` as it was. Every take selects on `executing_box_id` and overwrites it. The conformance case landed red-then-green rather than in one commit with its pins.
+- **D140**: `DeadWalks` is a field of `EngineParts` (`&'a DeadWalks`), because an `Engine` is built per command. `FakeOrchestrator` owns one, and `restarted()` starts empty. A run that this process takes again (`renew_lease` answers true) leaves the set.
+- **D141**: the merge is recognised by its two parents and its message `htui: reconcile <step>` (`git::reconcile_parent`, `git::reconcile_message`).
+- **D143**: `take_lease` and `renew_lease` return the `until` they wrote. The heartbeat's first beat is capped at the fence.
+- **D144**:
+  - `gate::reject_step` carries the automatic rejection's compare-and-set.
+  - The three `Pending → Running` starts and `fail_before_a_token` are converted.
+  - `fail_hard` after a live error, `fail_candidate` and the sweep's `interrupt_step` writes are the named exemptions (`Engine::move_step`'s doc).
+  - `FakeIsolator::pause_nth_reconcile` is new.
+- **D145**: the sweep writes no note, but `walk_leased`'s `Err` arm still gives the lease back once (D127/D139). So the parity with D128 is for the note only.
+- **R-25**: `gate.rs`'s "R-3 for milestone 5" sentence now names milestone 6 (`8dc4755`).
+
+**Final review** (`rust-reviewer` over `829586f..HEAD`): approve-with-fixes. It found no lease-correctness defect outside R-27. The maintainer chose to apply the two LOWs and carry the three MEDIUMs as risks.
+- **F4** applied (`ced0808`): `two_takes_of_one_released_lease_admit_one` now releases with `release_lease`, so the "owner cleared" take is raced on real Postgres.
+- **F5** applied (`8dc4755`): the D142 docs say `gix` still reads until the two histories meet.
+
+**Gate** at `8dc4755` (§15):
+- fmt and clippy `-D warnings` clean.
+- 1700 passed, 0 failed, 26 ignored (Postgres, `--test-threads=1`).
+- `sqlx prepare --check` rc=0, 227 files.
+- `htui-orch` rustdoc clean; workspace rustdoc shows only the two baseline errors.
+- C-1: `Command::new` only in `isolate/git.rs` (3) and `verify.rs` (1).
+- C-6 as corrected in §21.3.
+
+The intermediate commits that fail `clippy -D warnings` on their own are left unsquashed (`74c10b5`, `e58d508`, `135dacd`, `b5f0573`, `50b5ebb`, `7f47478`).
+
+| Risk | Likelihood | Handling |
+|---|---|---|
+| **R-33** (final F1, F2) D141 recognises htui's own reconcile merge by its parent count and exact message only. An agent can end its branch with a two-parent `htui: reconcile <step>` commit, and its earlier commits then vanish from the judge's diff and `previous_diff` while reconcile still merges them. A user `merge.log=true` or a commit-msg hook changes the message, and the diff falls back to `base..merge` (M-A again). | Low (a hostile or odd agent; a non-default gitconfig) | Milestone 6: tie the merge to the primary (`is_ancestor(before, first)` and `merge_of(head, before, second) == Some(after)`), or record the merge's first parent in the store; compare the subject only, and pass `-c merge.log=false` to `merge_no_ff`. |
+| **R-34** (final F3, predates round 2) A command that fails with `?` between `take_lease` and `walk_leased` (e.g. `unpark`'s item `transition`, `resume`'s reads and notes) leaves a `running` run with this process's live lease, outside `DeadWalks`, so this process's sweep skips it until restart (D88). `resume`'s topology-mismatch branch keeps the lease on a `running` run nothing walks. | Low (a store error in a narrow window) | Milestone 6: a guard that calls `release_lease` on `Err` between the take and the walk, and a release in the topology-mismatch branch. |
+| **R-35** (W1) A `DeadWalks` run whose release answers `NotFound` (its row is gone) is retried and warned about on every sweep until restart. | Very low | Milestone 6: drop the entry on `NotFound { entity: "run" }` once "row gone" and "store unreachable" are told apart. |

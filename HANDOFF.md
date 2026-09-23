@@ -339,6 +339,28 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   **Milestone 4 OQ-7 follow-up: MOD-36** — milestone 4 runs every fan-out candidate on one agent;
   spreading candidates across agents by weight is MOD-36's (weights from ANA-21). Milestone 4 leaves
   `AgentSelector::select` called once per candidate with its `fanout_index` so MOD-36 plugs in there.
+  **Milestone 5 landed (`a1fb291`..`8dc4755`, 2026-09-23): two runs do not collide, and a crash is
+  survivable.** Eight tasks (T1–T8), then two review rounds. Workspace green at
+  `--test-threads=1` (1700 passed, 0 failed, 26 ignored), `sqlx prepare --check` clean (227 files),
+  store conformance 53 cases, `htui-orch` case list 52. `htui-core` gains `model/overlap.rs` (the
+  scope predicate, D80); `htui-orch` gains `overlap.rs` (scope resolution at `StartRun`) and
+  `recover.rs` (the heartbeat and the sweep's adjudication). `claim_run` answers a `Claim`, and new
+  store verbs are `take_lease`, `interrupt_step` and `release_lease`. Every walk runs under a
+  leased heartbeat that fences itself before the lease lapses (D122, D143); every compare-and-set on
+  a walk path honours `Ok(false)` as `EngineError::StaleWrite` (D125, D144, exemptions named on
+  `Engine::move_step`); the sweep adopts expired runs one at a time, and a process takes back its
+  own dead walks through an in-process `DeadWalks` set (D139, D140). `reconcile_isolated` merges
+  onto a primary another run moved, under the repo's admin lock (D136). No migration.
+  **Round 1 (D122–D138) fixed four HIGH, four MEDIUM and several LOW; round 2 (D139–D145) fixed one
+  HIGH, two MEDIUM and three LOW** — blueprint §21–§22. The final reviewer approved with fixes; two
+  LOWs were applied (`ced0808`, `8dc4755`) and three MEDIUMs are carried. **Carried to milestone 6**:
+  R-26..R-35 (blueprint §21.2, §22.3), chiefly R-27 (no per-run mutex between commands in one
+  process), R-33 (D141 recognises htui's reconcile merge by its message only, spoofable by an agent
+  and missed under `merge.log=true`), R-34 (a command failing between `take_lease` and
+  `walk_leased` keeps its live lease, so its own sweep skips the run until restart) and R-25 (a
+  failed terminal cleanup is never retried). About six intermediate commits fail `clippy -D
+  warnings` on their own; HEAD is clean. Plan: `.claude/plans/mod-4-orch-lease.plan.md`;
+  blueprint: `.claude/plans/mod-4-orch-lease.blueprint.md`.
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
   per-box paths, agent autodiscovery hook. Not blocked (MOD-6 landed,

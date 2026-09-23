@@ -45,7 +45,7 @@ round; the architect and the reviewer stay plain agents.
 (`.claude/plans/mod-4-orch-fanout.plan.md:217`; blueprint A-1..A-7 were accepted as D72–D78,
 `:43`), so this plan starts at **D79**. New risks continue after **R-9** as **R-10…**.
 
-**Status**: **fact-checked (194 claims: 137 confirmed, 55 partial, 2 falsified; all resolved)
+**Status**: **complete** (`a1fb291`..`8dc4755`, 2026-09-23; blueprint §21–§22 hold the review rounds). Previously: **fact-checked (194 claims: 137 confirmed, 55 partial, 2 falsified; all resolved)
 and CONFIRMED by the maintainer 2026-09-23; OQ-1..OQ-11 take the adopted default.** The two falsified claims changed design: C10 rewrote D82 and added
 OQ-11/R-20; C129 redefined D97's frontier and added a T7 case. The independence check added
 D104–D106 and reshaped the waves. Branch `mod-4-m5`, cut from `main` at
