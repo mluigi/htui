@@ -7592,24 +7592,22 @@ mod tests {
             .expect("the adoption itself succeeds");
         assert_eq!(adopted.len(), 1, "{adopted:?}");
         assert_eq!(adopted[0].run, run);
-        assert!(
-            matches!(
-                &adopted[0].next,
-                super::Next::Finished(crate::command::Rest {
-                    run: RunStatus::Failed,
-                    position: Some(1),
-                    ..
-                })
-            ),
-            "{:?}",
-            adopted[0].next
+        let failure = RunFailure::RetryBudgetSpent {
+            phase: "plan".to_owned(),
+            attempt: 2,
+        };
+        assert_eq!(
+            adopted[0].next,
+            super::Next::Finished(crate::command::Rest {
+                run: RunStatus::Failed,
+                position: Some(1),
+                failure: Some(failure.clone()),
+            }),
+            "the rest carries the typed failure its `finish_run` wrote (plan D12)"
         );
         let row = other.orch.run(run).await;
         assert_eq!(row.status, RunStatus::Failed);
-        assert_eq!(
-            row.failure.as_deref(),
-            Some("retry budget spent: step `plan` attempt 2 failed")
-        );
+        assert_eq!(row.failure, Some(failure.to_string()));
         assert_eq!(
             other.orch.item(ids::HTUI_FEAT_3).await.status,
             Status::Failed

@@ -79,6 +79,15 @@ pub enum RunFailure {
         /// Whether the step's trees were reset (D92), or left exactly as found (D93).
         reset: bool,
     },
+    /// Plan D131: a `running` run whose latest step is `failed`, out of budget and not
+    /// interrupted, is a settle that crashed before its `finish_run`. The step's own failure is
+    /// not on any row, so the run ends on the budget that stopped it.
+    RetryBudgetSpent {
+        /// `step_graph_phase.name` of the failed step.
+        phase: String,
+        /// `run_step.attempt` of the failed step, the last the budget allowed.
+        attempt: i32,
+    },
 }
 
 impl fmt::Display for RunFailure {
@@ -104,6 +113,9 @@ impl fmt::Display for RunFailure {
                 phase,
                 reset: false,
             } => write!(f, "interrupted, tree not reset: {phase}"),
+            Self::RetryBudgetSpent { phase, attempt } => {
+                write!(f, "retry budget spent: step `{phase}` attempt {attempt} failed")
+            }
         }
     }
 }
@@ -437,6 +449,15 @@ mod tests {
             .to_string(),
             "interrupted, tree not reset: implement",
             "plan D93/D94: a tree the sweep must not reset, left as found (`:1299`)"
+        );
+        assert_eq!(
+            RunFailure::RetryBudgetSpent {
+                phase: "plan".to_owned(),
+                attempt: 2,
+            }
+            .to_string(),
+            "retry budget spent: step `plan` attempt 2 failed",
+            "plan D131: the sweep ends a run whose settle crashed before its `finish_run`"
         );
     }
 
