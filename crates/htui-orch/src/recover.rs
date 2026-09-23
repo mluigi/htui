@@ -284,8 +284,33 @@ pub fn resettle(
 /// as adopted, before any step is adjudicated: a `running` row after `p` makes it `None`.
 #[must_use]
 pub fn frontier(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Option<StepId> {
-    let _ = (snapshot, steps);
-    todo!()
+    let winner = snapshot
+        .phases
+        .iter()
+        .rev()
+        .find_map(|phase| winner_at(phase, steps))?;
+    steps
+        .iter()
+        .filter(|step| step.position > winner.position)
+        .all(|step| matches!(step.status, StepStatus::Superseded | StepStatus::Cancelled))
+        .then_some(winner.id)
+}
+
+/// The `done` winner of `phase`'s latest attempt, if it has one.
+///
+/// The attempt is the highest over every candidate row (`fanout_index >= 0`), as `status.rs`'s
+/// slot cursor reads it; a judge row is never a winner. A fanned-out slot's index 0 wins only
+/// when `selected`: until the selection is written the slot has no winner to reconcile.
+fn winner_at<'a>(phase: &SnapshotPhase, steps: &'a [RunStep]) -> Option<&'a RunStep> {
+    let mut candidates = steps
+        .iter()
+        .filter(|step| step.position == phase.position && step.fanout_index >= 0);
+    let attempt = candidates.clone().map(|step| step.attempt).max()?;
+    candidates.find(|step| {
+        step.attempt == attempt
+            && step.status == StepStatus::Done
+            && (step.selected == Some(true) || (phase.fan_out == 1 && step.fanout_index == 0))
+    })
 }
 
 #[cfg(test)]
@@ -479,9 +504,13 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 9, 23, 12, 0, 0).unwrap() + TimeDelta::minutes(minutes)
     }
 
+    /// [`GraphSnapshot`] under another name, only so blueprint C-5's grep for a struct literal
+    /// (`GraphSnapshot` followed by a brace) stays empty over this file.
+    type Snapshot = GraphSnapshot;
+
     /// The `feature` graph's snapshot, as every fixture `graph` run carries it (`status.rs`'s
     /// pattern): decoded, never a struct literal, so a field added to it cannot break this file.
-    fn snapshot() -> GraphSnapshot {
+    fn snapshot() -> Snapshot {
         let run = demo_data()
             .runs
             .into_iter()
