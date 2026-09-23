@@ -4660,9 +4660,6 @@ fn skipped_above<'w>(
     above
 }
 
-/// Blueprint §9.3's `{tree}, …`: `{repo} {path} before_hash {base_ref}` per row, plus
-/// ` labelled htui/{step} at {head}` when the reset named a label in that repo. A step with no
-/// tree row (a crash before `upsert_step_tree`) reads `none`.
 /// N3 (plan D115): an interrupted step whose trees were reset, parked with its budget spent.
 fn spent_note(step: &RunStep, phase: &SnapshotPhase, listed: &str) -> String {
     format!(
@@ -4681,6 +4678,9 @@ fn not_reset_note(step: &RunStep, phase: &SnapshotPhase, listed: &str, reason: &
     )
 }
 
+/// Blueprint §9.3's `{tree}, …`: `{repo} {path} before_hash {base_ref}` per row, plus
+/// ` labelled htui/{step} at {head}` when the reset named a label in that repo. A step with no
+/// tree row (a crash before `upsert_step_tree`) reads `none`.
 fn trees_text(step: StepId, trees: &[RunStepTree], labelled: &[(RepoId, String)]) -> String {
     if trees.is_empty() {
         return "none".to_owned();
