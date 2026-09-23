@@ -95,7 +95,8 @@ pub struct Quota {
     /// carries `spend` alone (§7).
     pub billing: Billing,
     /// The vendor's status string verbatim (`allowed`, `allowed_warning`, `rejected`, …); `None`
-    /// when the source reports none. Only a present, non-`allowed` value is a skip (plan D72).
+    /// when the source reports none. Only a present value outside `{allowed, allowed_warning}` is a
+    /// skip (plan D72, MOD-4 M4 D61).
     #[serde(default)]
     pub status: Option<String>,
     /// Derived, never reported: `status == "rejected"`, or any window at `utilization >= 1.0`.
@@ -1012,7 +1013,8 @@ mod tests {
         );
     }
 
-    /// §7's third rule over `rejected`: a present, non-`allowed` status is a skip on its own terms.
+    /// §7's third rule over `rejected`: a present status outside `{allowed, allowed_warning}` is a
+    /// skip on its own terms.
     ///
     /// The document is hand-built with `exhausted: false` so the verdict is the *status* rule and
     /// not the `exhausted` one — [`normalize`] would derive `exhausted` here, and then §7's first
