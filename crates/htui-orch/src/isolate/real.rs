@@ -121,8 +121,7 @@ pub fn dirty_tree_not_reset(path: &Path) -> String {
 /// checkout's `HEAD`, so labelling `HEAD` would move it and resetting would strand one of the two.
 #[must_use]
 pub fn label_conflict(label: &str, target: &str, head: &str) -> String {
-    let _ = (label, target, head);
-    todo!()
+    format!("label_conflict: {label} names {target}, HEAD is {head}")
 }
 
 /// Blueprint A-6: a `local` checkout is the maintainer's own tree and branch, so a `HEAD` that moved
@@ -130,8 +129,10 @@ pub fn label_conflict(label: &str, target: &str, head: &str) -> String {
 /// move their branch backwards.
 #[must_use]
 pub fn local_moved(path: &Path, head: &str, base: &str) -> String {
-    let _ = (path, head, base);
-    todo!()
+    format!(
+        "local_moved: {} at {head}, before_hash {base}",
+        path.display()
+    )
 }
 
 /// Where a tree of this repository starts: the slot's base when there is a slot (D54(a)), the
@@ -1371,7 +1372,7 @@ impl Isolator for GixIsolator {
 
     /// D36: run-terminal, never at step end, and every row is processed before the first failure
     /// is returned — a tree left behind because another one refused to go is a tree nobody
-    /// removes, since milestone 5's sweep is the only retry there is.
+    /// removes; no sweep retries a terminal run's cleanup (milestone 6).
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
         Box::pin(async move {
             let mut failures: Vec<IsolateError> = Vec::new();
@@ -1435,14 +1436,73 @@ impl Isolator for GixIsolator {
         step: StepId,
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, ResetReport> {
-        let _ = (step, trees);
-        todo!()
+        Box::pin(async move {
+            let label = format!("htui/{step}");
+            let mut report = ResetReport::default();
+            let mut planned = Vec::new();
+            // Every read first (D114): a refusal found at the last row must leave the first one
+            // exactly where it was.
+            for tree in trees {
+                if !matches!(tree.mode, Isolation::SharedSerialized | Isolation::Local) {
+                    // OQ-8: the path is not even read, so a vanished tree is not an error.
+                    continue;
+                }
+                let path = PathBuf::from(&tree.path);
+                let read = path.clone();
+                if blocking(move || git::is_dirty(&read)).await? {
+                    // OQ-7: dirty *now* may be the maintainer's own edit.
+                    report
+                        .refused
+                        .push((tree.repo_id, dirty_tree_not_reset(&path)));
+                    continue;
+                }
+                let read = path.clone();
+                let head = blocking(move || git::head(&read)).await?;
+                if head == tree.base_ref {
+                    continue;
+                }
+                if tree.mode == Isolation::Local {
+                    report
+                        .refused
+                        .push((tree.repo_id, local_moved(&path, &head, &tree.base_ref)));
+                    continue;
+                }
+                let (read, name) = (path.clone(), label.clone());
+                match blocking(move || git::branch_target(&read, &name)).await? {
+                    Some(target) if target != head => report
+                        .refused
+                        .push((tree.repo_id, label_conflict(&label, &target, &head))),
+                    found => planned.push((tree, path, head, found.is_none())),
+                }
+            }
+            if !report.refused.is_empty() || planned.is_empty() {
+                return Ok(report);
+            }
+
+            // D40: the probe's refusal answers before the first write, not between two.
+            let git = self.cli()?.clone();
+            for (tree, path, head, create) in planned {
+                if create {
+                    let (at, name, target) = (path.clone(), label.clone(), head.clone());
+                    git::with_retry("create branch", move || {
+                        let (at, name, target) = (at.clone(), name.clone(), target.clone());
+                        async move { blocking(move || git::create_branch(&at, &name, &target)).await }
+                    })
+                    .await?;
+                }
+                report.labelled.push((tree.repo_id, head));
+                git::with_retry("reset --hard", || git.reset_hard(&path, &tree.base_ref)).await?;
+            }
+            Ok(report)
+        })
     }
 
     /// D99: [`release_run`](GixIsolator::release_run) alone — no tree is touched.
     fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()> {
-        let _ = run;
-        todo!()
+        Box::pin(async move {
+            self.release_run(run);
+            Ok(())
+        })
     }
 }
 
