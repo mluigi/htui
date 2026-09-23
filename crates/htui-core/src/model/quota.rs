@@ -234,9 +234,10 @@ pub fn normalize(
 /// carried through as data like every other status.
 const REJECTED: &str = "rejected";
 
-/// The one status string §7 reads as "go ahead". Every *other* present value is a skip, including
-/// the ones that sound permissive (see [`available`] and blueprint H-7).
-const ALLOWED: &str = "allowed";
+/// The status strings that read as "go ahead": §7's `allowed`, plus `allowed_warning`, which PRD D3
+/// left for MOD-4 to decide and MOD-4 M4 D61 made selectable. Every *other* present value is a
+/// skip, including the ones that sound permissive, such as `allowed_critical` (see [`available`]).
+const SELECTABLE: [&str; 2] = ["allowed", "allowed_warning"];
 
 /// One `unifiedWindows` entry, or `None` when it carries no numeric `utilization`.
 ///
@@ -366,7 +367,8 @@ pub enum SkipReason {
         /// The full window's vendor id, e.g. `seven_day`.
         id: String,
     },
-    /// A present `status` that is not `"allowed"`, verbatim (§7's third rule).
+    /// A present `status` outside `{allowed, allowed_warning}`, verbatim (§7's third rule, as
+    /// MOD-4 M4 D61 loosened it).
     Status(String),
     /// The caller's cap is reached (§7's fourth rule).
     CapReached {
@@ -384,7 +386,8 @@ pub enum SkipReason {
 /// 1. `exhausted` is set → [`SkipReason::Exhausted`];
 /// 2. any window at `utilization >= 1.0` → [`SkipReason::WindowFull`], naming the first such
 ///    window in the document's id order;
-/// 3. a **present** `status` that is not `"allowed"` → [`SkipReason::Status`], verbatim;
+/// 3. a **present** `status` outside `{allowed, allowed_warning}` → [`SkipReason::Status`],
+///    verbatim;
 /// 4. `spend >= cap` when **both** are `Some` → [`SkipReason::CapReached`].
 ///
 /// The order is load-bearing, because rules overlap: a document [`normalize`] wrote for a
@@ -408,17 +411,17 @@ pub enum SkipReason {
 ///
 /// # `allowed_warning`
 ///
-/// `claude`'s status vocabulary includes `allowed_warning`, and rule 3 as §7 writes it **skips**
-/// it: the only permissive value is `"allowed"` exactly. That is implemented as written and pinned
-/// by `available_skips_an_allowed_warning_status` (blueprint H-7), so MOD-4 can loosen it — by
-/// treating that one reason as selectable — knowingly rather than by accident.
+/// `claude`'s status vocabulary includes `allowed_warning`. Rule 3 as §7 writes it would skip it,
+/// and MOD-2 shipped it that way so the call could be made knowingly rather than by accident (PRD
+/// D3). MOD-4 milestone 4 made that call (D61): a warned agent is still **selectable**, so rule 3's
+/// permissive set is `{allowed, allowed_warning}`. Every other present status still skips, and a
+/// warned row with a full window still skips on rule 2, which answers first. Both are pinned by
+/// `available_selects_an_allowed_warning_status` and its neighbours.
 ///
-/// # No caller yet
+/// # Caller
 ///
-/// MOD-2 has **no production caller**: MOD-4's selection loop is the consumer, and §7's rule is
-/// written for "the orchestrator", which is MOD-4's (plan D72). This milestone ships the predicate
-/// MOD-4 cannot write without the document's shape, and tests it here; inventing a use for it now
-/// would be a second orchestrator.
+/// `htui_orch::select::walk` (MOD-4 M4 D60): the orchestrator's selection walk, which §7's rule is
+/// written for, calls this once per candidate agent row.
 #[must_use]
 pub fn available(quota: Option<&Value>, spend: Option<i64>, cap: Option<i64>) -> Availability {
     // A document that does not parse is skipped over, not refused: the three rules that read one
@@ -436,9 +439,12 @@ pub fn available(quota: Option<&Value>, spend: Option<i64>, cap: Option<i64>) ->
                 id: full.id.clone(),
             });
         }
-        // Present *and* not `allowed`: an absent status is a row that says nothing, and a row that
-        // says nothing is available.
-        if let Some(status) = quota.status.filter(|status| status != ALLOWED) {
+        // Present *and* not selectable: an absent status is a row that says nothing, and a row
+        // that says nothing is available.
+        if let Some(status) = quota
+            .status
+            .filter(|status| !SELECTABLE.contains(&status.as_str()))
+        {
             return Availability::Skip(SkipReason::Status(status));
         }
     }
@@ -1019,11 +1025,11 @@ mod tests {
         );
     }
 
-    /// Blueprint H-7, pinned: `claude`'s vocabulary includes `allowed_warning`, and §7's rule as
-    /// written skips it. If MOD-4 ever decides a warned agent is still selectable, this case is
-    /// where that decision has to be made explicitly.
+    /// MOD-4 M4 D61 (PRD D3), pinned: `claude`'s vocabulary includes `allowed_warning`, and a
+    /// warned agent is still selectable. This is the inversion of MOD-2's blueprint H-7 pin, made
+    /// knowingly: the same document that used to skip is now available.
     #[test]
-    fn available_skips_an_allowed_warning_status() {
+    fn available_selects_an_allowed_warning_status() {
         assert_eq!(
             available(
                 Some(&document(
@@ -1034,8 +1040,41 @@ mod tests {
                 Some(351),
                 None,
             ),
-            Availability::Skip(SkipReason::Status("allowed_warning".to_owned())),
-            "blueprint C's worked example: a warned status skips, deliberately"
+            Availability::Available,
+            "blueprint C's worked example: a warned status is selectable (D61)"
+        );
+    }
+
+    /// D61 loosens exactly one value: every other present status that is not in
+    /// `{allowed, allowed_warning}` still skips, verbatim, including the empty string and the ones
+    /// that sound permissive.
+    #[test]
+    fn available_still_skips_every_other_non_allowed_status() {
+        for status in ["rejected", "allowed_critical", ""] {
+            assert_eq!(
+                available(Some(&document(Some(status), false, &[])), None, None),
+                Availability::Skip(SkipReason::Status(status.to_owned())),
+                "{status:?} is not selectable"
+            );
+        }
+    }
+
+    /// Rule 2 answers before rule 3: a selectable `allowed_warning` does not rescue a full window.
+    #[test]
+    fn an_allowed_warning_with_a_full_window_still_skips() {
+        assert_eq!(
+            available(
+                Some(&document(
+                    Some("allowed_warning"),
+                    false,
+                    &[("seven_day", 1.0)]
+                )),
+                None,
+                None,
+            ),
+            Availability::Skip(SkipReason::WindowFull {
+                id: "seven_day".to_owned()
+            })
         );
     }
 
