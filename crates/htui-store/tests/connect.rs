@@ -92,7 +92,7 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(3),
+        MigrationState::Pending(4),
         "the harness left the schema unapplied"
     );
     let root = tempfile::tempdir().expect("temp root");
@@ -107,8 +107,8 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
 
     match next_event(&mut started, "a bare database").await {
         ConnEvent::MigrationsPending(_, pending) => assert_eq!(
-            pending, 3,
-            "all three embedded migrations are waiting (R-STO-5: nothing is applied unasked)"
+            pending, 4,
+            "all four embedded migrations are waiting (R-STO-5: nothing is applied unasked)"
         ),
         other => panic!("expected MigrationsPending, got {other:?}"),
     }

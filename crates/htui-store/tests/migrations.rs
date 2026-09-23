@@ -71,9 +71,10 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3],
-        "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql and MOD-4 milestone 1's \
-         0003_orchestration.sql, in ordinal order"
+        vec![1, 2, 3, 4],
+        "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
+         0003_orchestration.sql and MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, in \
+         ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -478,7 +479,13 @@ async fn the_ten_ana5_defaults_land_with_their_values() {
     db.drop_db().await;
 }
 
-/// ANA-2 §5.4's twelve defaults, seeded by `0003_orchestration.sql` section 8.
+/// ANA-2 §5.4's twelve defaults, seeded by `0003_orchestration.sql` section 8, as they stand once
+/// every migration has run.
+///
+/// One of them is not 0003's literal: 0003 seeds `max_agents_per_run` = 6 and
+/// `0004_max_agents_per_run_default.sql` moves an untouched 6 to 8, so the seeded `feature` graph
+/// with a judged 3-way `implement` (seven planned agents) runs by default. The 6 itself is pinned
+/// by [`the_0004_bump_moves_only_an_untouched_six`].
 ///
 /// Written as JSON **text** rather than as `i64`, because three of the twelve are `null` and one is
 /// an object: `as_i64()` would answer `None` for all four and a value pin that cannot fail on those
@@ -490,7 +497,7 @@ const ANA2_DEFAULTS: &[(&str, &str)] = &[
     ("default_isolation", r#""worktree""#),
     ("lease_refresh_seconds", "60"),
     ("lease_ttl_seconds", "120"),
-    ("max_agents_per_run", "6"),
+    ("max_agents_per_run", "8"),
     ("max_concurrent_items", "2"),
     ("max_fan_out", "4"),
     ("per_token_cap_batch", "null"),
@@ -499,7 +506,8 @@ const ANA2_DEFAULTS: &[(&str, &str)] = &[
     ("step_deadline_seconds", "7200"),
 ];
 
-/// The twelve are pinned by value, not only by the row count `0003_orchestration.sql` moved to 24.
+/// The twelve are pinned by value, not only by the row count `0003_orchestration.sql` moved to 24
+/// (and `0004_max_agents_per_run_default.sql`, an `UPDATE`, leaves at 24).
 ///
 /// A migration is forward-only and can never be edited, so a transcription slip is permanent:
 /// `step_deadline_seconds` 7200 -> 720, `copy_max_total_bytes` losing a digit, or
@@ -534,9 +542,58 @@ async fn the_twelve_ana2_defaults_land_with_their_values() {
             serde_json::from_str(expected).expect("the const carries JSON the migration wrote");
         assert_eq!(
             *actual, expected,
-            "app_setting.{key} carries ANA-2 §5.4's value"
+            "app_setting.{key} carries ANA-2 §5.4's value, as 0004 amends it"
         );
     }
+
+    db.drop_db().await;
+}
+
+/// `0004_max_agents_per_run_default.sql` moves the 6 `0003_orchestration.sql` seeded to 8, and
+/// only that 6: a value somebody chose is theirs, and a forward-only migration cannot tell a
+/// deliberate 5 from a default, so it touches nothing but the exact seed.
+///
+/// Staged through [`MIGRATOR`] itself: `run_to(3)` stops after 0003, so the seed is observable
+/// before 0004 runs, and the plain `run` afterwards applies 0004 alone.
+#[tokio::test]
+async fn the_0004_bump_moves_only_an_untouched_six() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    let read = || async {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT value FROM app_setting WHERE key = 'max_agents_per_run'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("app_setting.max_agents_per_run exists")
+    };
+
+    MIGRATOR
+        .run_to(3, &db.pool)
+        .await
+        .expect("apply 0001 through 0003");
+    assert_eq!(
+        read().await,
+        serde_json::json!(6),
+        "0003_orchestration.sql seeds ANA-2 §5.4's 6, unedited"
+    );
+
+    sqlx::query("UPDATE app_setting SET value = '5'::jsonb WHERE key = 'max_agents_per_run'")
+        .execute(&db.pool)
+        .await
+        .expect("a user lowers the cap to 5");
+    MIGRATOR.run(&db.pool).await.expect("apply 0004");
+    let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY 1")
+        .fetch_all(&db.pool)
+        .await
+        .expect("read _sqlx_migrations");
+    assert_eq!(applied, vec![1, 2, 3, 4], "0004 ran");
+    assert_eq!(
+        read().await,
+        serde_json::json!(5),
+        "0004 leaves a value that is not the seeded 6 alone"
+    );
 
     db.drop_db().await;
 }
@@ -563,8 +620,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(3),
-        "three embedded migrations, none applied"
+        MigrationState::Pending(4),
+        "four embedded migrations, none applied"
     );
 
     db.drop_db().await;
