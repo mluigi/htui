@@ -674,7 +674,8 @@ pub enum LoopOutcome {
 /// `UNIQUE (run_id, position, attempt, fanout_index)`.
 ///
 /// # Errors
-/// Every [`EngineError`] the writes can raise.
+/// Every [`EngineError`] the writes can raise, and [`EngineError::StaleWrite`] when a retired row
+/// or, on escalation, the run was moved by another writer first (plan D125).
 pub async fn review_loop<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     review: &RunStep,
@@ -968,19 +969,9 @@ async fn escalate<S: WriteStore, C: Clock + ?Sized>(
     reason: LoopStop,
     now: DateTime<Utc>,
 ) -> Result<LoopOutcome, EngineError> {
-    // Not [`move_run`]: `tests/review_loop.rs` drives this loop over a `queued` run it never
-    // claimed and pins the escalation, so plan D125 stops short of this one move until that suite
-    // claims its run. A stale walk cannot reach it unfenced: the automatic entry's
-    // `running -> awaiting_approval` on the review step is honoured first, and the human entry
-    // runs under a lease its command took.
-    ctx.store
-        .transition_run(
-            ctx.run.id,
-            RunStatus::Running,
-            RunStatus::AwaitingApproval,
-            now,
-        )
-        .await?;
+    // Plan D125: a run another writer moved first stops the escalation, with no item move and no
+    // note after the refused move.
+    move_run(ctx, RunStatus::Running, RunStatus::AwaitingApproval, now).await?;
     ctx.move_item(Status::InProgress, Status::Blocked).await?;
     if let Some(item) = ctx.item() {
         ctx.store
