@@ -7243,6 +7243,301 @@ mod tests {
         );
     }
 
+    /// How plan D131's `plan` step came to be `failed` before the crash.
+    #[derive(Clone, Copy)]
+    enum FailedBy {
+        /// The gate's own `running -> failed` (`retry_or_fail`), with no `gate_note`.
+        Settle,
+        /// The sweep's `interrupt_step` with this `gate_note`.
+        Sweep(&'static str),
+        /// A human's rejection through `answer_gate`, `gate_note` "not like this".
+        Human,
+    }
+
+    /// Plan D131's crash (review H2): `prd` answered and `plan` attempt `attempt` `failed` as
+    /// `by` left it, then the process died before the write that follows a failure — `admit`, the
+    /// park or `finish_run` — so the run and its item are `running` / `in_progress` with nothing
+    /// live. The park at `prd` released the lease, so a restarted process's sweep adopts the run.
+    async fn failed_under_a_running_run(
+        harness: &Harness,
+        attempt: i32,
+        by: FailedBy,
+    ) -> (htui_core::model::RunId, StepId) {
+        let (run, prd) = started(harness).await;
+        let store = &harness.orch.store;
+        let now = harness.orch.clock.now();
+        assert!(
+            store
+                .answer_gate(prd, GateOutcome::Approved, None, now)
+                .await
+                .expect("MemStore takes the answer")
+        );
+        let plan = store
+            .create_step(NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: 1,
+                attempt,
+                fanout_index: 0,
+                phase_name: "plan".to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: Some("sonnet".to_owned()),
+            })
+            .await
+            .expect("`(1, attempt, 0)` is free");
+        assert!(
+            store
+                .transition_step(plan.id, StepStatus::Pending, StepStatus::Running, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+        let failed = match by {
+            FailedBy::Settle => {
+                store
+                    .transition_step(plan.id, StepStatus::Running, StepStatus::Failed, now)
+                    .await
+            }
+            FailedBy::Sweep(note) => store.interrupt_step(plan.id, note, now).await,
+            FailedBy::Human => {
+                assert!(
+                    store
+                        .transition_step(
+                            plan.id,
+                            StepStatus::Running,
+                            StepStatus::AwaitingApproval,
+                            now
+                        )
+                        .await
+                        .expect("MemStore takes the move")
+                );
+                store
+                    .answer_gate(
+                        plan.id,
+                        GateOutcome::Rejected,
+                        Some("not like this".to_owned()),
+                        now,
+                    )
+                    .await
+            }
+        };
+        assert!(failed.expect("MemStore takes the failure"));
+        assert!(
+            store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+        assert!(
+            store
+                .transition(
+                    ids::HTUI_FEAT_3,
+                    Status::AwaitingApproval,
+                    Status::InProgress
+                )
+                .await
+                .expect("MemStore takes the move")
+        );
+        (run, plan.id)
+    }
+
+    /// Plan D131 (review H2): a `running` run whose latest step is `failed` with the budget spent
+    /// and no interruption is a settle that crashed before its `finish_run`. The sweep finishes
+    /// it `failed` and cleans it up, where it used to hand back `Walk` for a walk that rests at
+    /// once and leaves the run `running` for ever.
+    #[tokio::test]
+    async fn a_crash_after_the_failed_write_is_finished_by_the_sweep() {
+        let harness = Harness::new().await;
+        let (run, _) = failed_under_a_running_run(&harness, 2, FailedBy::Settle).await;
+        let other = Harness {
+            orch: harness.orch.restarted(),
+        };
+
+        let adopted = super::sweep_fake(&other.orch)
+            .await
+            .expect("the adoption itself succeeds");
+        assert_eq!(adopted.len(), 1, "{adopted:?}");
+        assert_eq!(adopted[0].run, run);
+        assert!(
+            matches!(
+                &adopted[0].next,
+                super::Next::Finished(crate::command::Rest {
+                    run: RunStatus::Failed,
+                    position: Some(1),
+                    ..
+                })
+            ),
+            "{:?}",
+            adopted[0].next
+        );
+        let row = other.orch.run(run).await;
+        assert_eq!(row.status, RunStatus::Failed);
+        assert_eq!(
+            row.failure.as_deref(),
+            Some("retry budget spent: step `plan` attempt 2 failed")
+        );
+        assert_eq!(
+            other.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Failed
+        );
+        assert_eq!(other.orch.isolator.cleanups(), 1, "plan D36's cleanup ran");
+    }
+
+    /// Plan D131: an interrupted step with budget left is the sweep's own reset-and-retry that
+    /// crashed before its `admit`, so the sweep admits the next attempt and hands the run back to
+    /// be walked.
+    #[tokio::test]
+    async fn an_interrupted_failure_with_budget_left_is_admitted_by_the_sweep() {
+        let harness = Harness::new().await;
+        let (run, _) =
+            failed_under_a_running_run(&harness, 1, FailedBy::Sweep("interrupted")).await;
+        let other = Harness {
+            orch: harness.orch.restarted(),
+        };
+
+        let adopted = super::sweep_fake(&other.orch)
+            .await
+            .expect("the adoption itself succeeds");
+        assert_eq!(
+            adopted,
+            [super::Adopted {
+                run,
+                next: super::Next::Walk
+            }]
+        );
+        let steps = other.orch.steps(run).await;
+        assert!(
+            steps.iter().any(|step| step.position == 1
+                && step.attempt == 2
+                && step.status == StepStatus::Pending),
+            "attempt 2 was admitted: {steps:?}"
+        );
+        assert_eq!(other.orch.run(run).await.status, RunStatus::Running);
+    }
+
+    /// Plan D131: an interrupted step out of budget is the sweep's park that crashed after its
+    /// `interrupt_step`, and one whose tree was not reset parks whatever the budget says (D93).
+    /// The sweep completes the park, typed as the interruption it was.
+    #[tokio::test]
+    async fn an_interrupted_failure_the_sweep_did_not_park_is_parked() {
+        for (attempt, note, reset) in [
+            (2, "interrupted", true),
+            (1, "interrupted, tree not reset", false),
+        ] {
+            let harness = Harness::new().await;
+            let (run, plan) =
+                failed_under_a_running_run(&harness, attempt, FailedBy::Sweep(note)).await;
+            let other = Harness {
+                orch: harness.orch.restarted(),
+            };
+
+            let adopted = super::sweep_fake(&other.orch)
+                .await
+                .expect("the adoption itself succeeds");
+            assert_eq!(
+                adopted,
+                [super::Adopted {
+                    run,
+                    next: super::Next::Parked(crate::command::Rest {
+                        run: RunStatus::AwaitingApproval,
+                        position: Some(1),
+                        failure: Some(RunFailure::Interrupted {
+                            phase: "plan".to_owned(),
+                            reset,
+                        }),
+                    }),
+                }],
+                "`{note}`"
+            );
+            assert_eq!(
+                other.orch.run(run).await.status,
+                RunStatus::AwaitingApproval
+            );
+            assert_eq!(
+                other.orch.item(ids::HTUI_FEAT_3).await.status,
+                Status::AwaitingApproval
+            );
+            let notes = other
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read");
+            let prefix = if reset {
+                format!("interrupted: retry budget spent: step {plan} (`plan` attempt 2)")
+            } else {
+                format!("interrupted, tree not reset: step {plan} (`plan` attempt 1)")
+            };
+            assert!(
+                notes.iter().any(|row| row.body.starts_with(&prefix)),
+                "{prefix}\n{notes:?}"
+            );
+            assert_eq!(
+                other.orch.steps(run).await.len(),
+                2,
+                "no attempt was admitted"
+            );
+        }
+    }
+
+    /// Plan D131, the human's half: a rejection that crashed before its `finish_run` is still a
+    /// rejection. `plan` cannot loop, so the run ends `rejected: plan` rather than retrying a step
+    /// a human turned down.
+    #[tokio::test]
+    async fn a_rejection_the_crash_did_not_finish_ends_the_run() {
+        let harness = Harness::new().await;
+        let (run, _) = failed_under_a_running_run(&harness, 1, FailedBy::Human).await;
+        let other = Harness {
+            orch: harness.orch.restarted(),
+        };
+
+        let adopted = super::sweep_fake(&other.orch)
+            .await
+            .expect("the adoption itself succeeds");
+        assert_eq!(
+            adopted,
+            [super::Adopted {
+                run,
+                next: super::Next::Finished(crate::command::Rest {
+                    run: RunStatus::Failed,
+                    position: Some(1),
+                    failure: Some(RunFailure::Rejected {
+                        phase: "plan".to_owned()
+                    }),
+                }),
+            }]
+        );
+        assert_eq!(
+            other.orch.run(run).await.failure.as_deref(),
+            Some("rejected: plan")
+        );
+        assert_eq!(other.orch.steps(run).await.len(), 2, "nothing was admitted");
+    }
+
+    /// Plan D131 in `run_to_rest`: the walk meets the same crash (here through `resume`, in the
+    /// process that holds the run) and admits the next attempt, which parks at `plan`'s gate.
+    #[tokio::test]
+    async fn a_failed_step_under_a_running_run_is_retried_by_the_walk() {
+        let harness = Harness::new().await;
+        let (run, _) = failed_under_a_running_run(&harness, 1, FailedBy::Settle).await;
+
+        let resumed = harness.resume(run).await.expect("the walk resumes");
+        assert_eq!(
+            resumed,
+            Resume::Walked(crate::command::Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(1),
+                failure: None,
+            })
+        );
+        let steps = harness.orch.steps(run).await;
+        assert!(
+            steps.iter().any(|step| step.position == 1
+                && step.attempt == 2
+                && step.status == StepStatus::AwaitingApproval),
+            "attempt 2 ran and parked: {steps:?}"
+        );
+    }
+
     /// Plan D83 through `start_run`: a real refusal's `Display` names the holding run and the
     /// rule, and the refused run stays `queued`.
     #[tokio::test]
