@@ -2726,8 +2726,45 @@ impl WriteStore for PgStore {
         now: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<bool> {
-        let _ = (run, box_id, owner, now, until);
-        todo!("T2 (c): take_lease")
+        let moved = sqlx::query!(
+            "UPDATE run \
+                SET lease_owner      = $3, \
+                    lease_box_id     = $2, \
+                    lease_expires_at = $5 \
+              WHERE id = $1 \
+                AND status IN ('running','awaiting_approval') \
+                AND executing_box_id = $2 \
+                AND (lease_owner = $3 OR lease_owner IS NULL \
+                     OR lease_expires_at IS NULL OR lease_expires_at <= $4)",
+            run.as_uuid(),
+            box_id.as_uuid(),
+            owner,
+            now,
+            until,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if moved == 1 {
+            return Ok(true);
+        }
+
+        let exists = sqlx::query_scalar!("SELECT 1 FROM run WHERE id = $1", run.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .is_some();
+
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            })
+        }
     }
 
     /// A `run_step` at `pending` with every settle column `NULL`; `fanout_index = -1` is the judge

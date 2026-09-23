@@ -3359,8 +3359,25 @@ impl State {
         until: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<bool> {
-        let _ = (run, box_id, owner, at, until, now);
-        todo!("T2 (c): take_lease")
+        self.require_run(run)?;
+        let ours_or_free = match self.lease_owners.get(&run) {
+            Some(held) if *held != owner => false,
+            _ => true,
+        };
+        let Some(row) = self.runs.get_mut(&run) else {
+            return Ok(false);
+        };
+        let takeable = matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
+            && row.executing_box_id == Some(box_id)
+            && (ours_or_free || row.lease_expires_at.is_none_or(|expiry| expiry <= at));
+        if !takeable {
+            return Ok(false);
+        }
+        row.lease_box_id = Some(box_id);
+        row.lease_expires_at = Some(until);
+        row.updated_at = now;
+        self.lease_owners.insert(run, owner);
+        Ok(true)
     }
 
     /// A `run_step` at `pending` with every settle column `NULL`.
