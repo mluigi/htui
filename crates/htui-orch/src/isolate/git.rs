@@ -1306,6 +1306,23 @@ pub fn has_untracked_files(path: &Path) -> Result<bool, IsolateError> {
     Ok(false)
 }
 
+/// Every untracked, not-ignored file in `path`'s working tree that `reset --hard <base>` would
+/// overwrite or delete, as repo-relative paths in walk order (plan D121).
+///
+/// [`is_dirty`] leaves untracked files out, and most of them survive a reset. One whose path
+/// `base`'s tree tracks does not: `git reset --hard` writes the tracked blob over it without a
+/// word. So does one below a path `base` tracks as a file, because the directory holding it is
+/// replaced. Each untracked file (the walk is not collapsed, so a new directory yields its files)
+/// is looked up in `base`'s tree; a path `base` does not track is not reported.
+///
+/// # Errors
+/// [`IsolateError::Git`] when `base` is not a commit of the repository, or the status walk or a
+/// tree lookup fails.
+pub fn untracked_paths_base_tracks(path: &Path, base: &str) -> Result<Vec<String>, IsolateError> {
+    let _ = (path, base);
+    todo!("D121")
+}
+
 /// Whether the repository declares any submodule
 /// (`gix-0.87.1/src/repository/submodule.rs:93`).
 ///
@@ -1791,6 +1808,47 @@ pub mod testkit {
         commit.to_hex().to_string()
     }
 
+    /// Removes `name` from the tree of `HEAD`'s commit, commits that on whatever `HEAD` names,
+    /// deletes the working-tree file and leaves the index matching the new commit.
+    ///
+    /// # Panics
+    /// When `HEAD` has no commit, or any step of the commit fails.
+    pub fn commit_removal(repo: &Path, name: &str, message: &str) -> String {
+        let repository = gix::open(repo).expect("the repository opens");
+        let parent = repository.head_commit().expect("HEAD has a commit");
+        let entries = parent
+            .tree()
+            .expect("the parent commit has a tree")
+            .iter()
+            .map(|entry| {
+                let entry = entry.expect("the parent tree decodes");
+                gix::objs::tree::Entry {
+                    mode: entry.mode(),
+                    filename: entry.filename().to_owned(),
+                    oid: entry.oid().to_owned(),
+                }
+            })
+            .filter(|entry| entry.filename != name)
+            .collect::<Vec<_>>();
+
+        let tree = repository
+            .write_object(gix::objs::Tree { entries })
+            .expect("the tree is written")
+            .detach();
+        let commit = repository
+            .commit_as(who(), who(), "HEAD", message, tree, vec![parent.id])
+            .expect("the commit is written")
+            .detach();
+
+        std::fs::remove_file(repo.join(name)).expect("the working-tree file is deleted");
+        repository
+            .index_from_tree(&tree)
+            .expect("an index is built from the new tree")
+            .write(gix::index::write::Options::default())
+            .expect("the index is written");
+        commit.to_hex().to_string()
+    }
+
     /// Whether `repo`'s object database holds `hex`.
     ///
     /// # Panics
@@ -1809,7 +1867,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::testkit::{commit_file, empty_repo, has_object, repo_with_one_commit};
+    use super::testkit::{
+        commit_file, commit_removal, empty_repo, has_object, repo_with_one_commit,
+    };
     use super::{
         CAPTURE_TAIL, Cli, DIFF_CAP, Exited, HeadBuffer, MIN_GIT, SCRUBBED_ENV, TailBuffer,
         is_lock_error,
@@ -1898,6 +1958,75 @@ mod tests {
             "an untracked file in an untracked directory is"
         );
         assert!(!super::is_dirty(dir.path()).expect("status reads"), "D24");
+    }
+
+    /// D121: an untracked file whose path the base tracks is what `reset --hard <base>` would
+    /// overwrite, and exactly what the helper reports; `is_dirty` reads the tree as clean.
+    #[test]
+    fn untracked_paths_base_tracks_sees_a_file_at_a_path_the_base_tracks() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let base = repo_with_one_commit(dir.path());
+        commit_removal(dir.path(), "f", "the agent deletes f");
+        assert!(
+            super::untracked_paths_base_tracks(dir.path(), &base)
+                .expect("status reads")
+                .is_empty(),
+            "a deleted file is not an untracked one"
+        );
+
+        std::fs::write(dir.path().join("f"), "the maintainer's notes\n").expect("written");
+        assert_eq!(
+            super::untracked_paths_base_tracks(dir.path(), &base).expect("status reads"),
+            vec!["f".to_owned()]
+        );
+        assert!(!super::is_dirty(dir.path()).expect("status reads"), "D24");
+    }
+
+    /// D121: an untracked file the base does not track survives the reset and is not reported,
+    /// neither is an ignored one; `HEAD`'s own tree does not decide, the base's does.
+    #[test]
+    fn untracked_paths_base_tracks_ignores_a_path_the_base_does_not_track() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        repo_with_one_commit(dir.path());
+        let base = commit_file(dir.path(), ".gitignore", "target\n", "ignore target");
+        std::fs::write(dir.path().join("untracked"), "noise\n").expect("written");
+        std::fs::create_dir(dir.path().join("new")).expect("the directory is made");
+        std::fs::write(dir.path().join("new").join("notes"), "work\n").expect("written");
+        std::fs::write(dir.path().join("target"), "built\n").expect("written");
+
+        assert!(
+            super::untracked_paths_base_tracks(dir.path(), &base)
+                .expect("status reads")
+                .is_empty()
+        );
+    }
+
+    /// D121: a file inside an untracked directory whose name the base tracks as a file is lost
+    /// too, because the reset replaces the directory with the base's blob.
+    #[test]
+    fn untracked_paths_base_tracks_sees_a_file_below_a_path_the_base_tracks_as_a_file() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let base = repo_with_one_commit(dir.path());
+        commit_removal(dir.path(), "f", "the agent deletes f");
+        std::fs::create_dir(dir.path().join("f")).expect("the directory is made");
+        std::fs::write(dir.path().join("f").join("x"), "work\n").expect("written");
+
+        assert_eq!(
+            super::untracked_paths_base_tracks(dir.path(), &base).expect("status reads"),
+            vec!["f/x".to_owned()]
+        );
+    }
+
+    /// A base that is not a commit of the repository is an error, not an empty answer.
+    #[test]
+    fn untracked_paths_base_tracks_refuses_an_unknown_base() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        repo_with_one_commit(dir.path());
+        let missing = "0123456789012345678901234567890123456789";
+        assert!(matches!(
+            super::untracked_paths_base_tracks(dir.path(), missing),
+            Err(IsolateError::Git(_))
+        ));
     }
 
     /// D26's label: written once with `MustNotExist`, read back by name, `None` for one that is

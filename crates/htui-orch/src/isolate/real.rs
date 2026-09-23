@@ -1515,7 +1515,9 @@ mod tests {
 
     use htui_core::model::{BoxId, Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId};
 
-    use crate::isolate::git::testkit::{commit_file, empty_repo, repo_with_one_commit};
+    use crate::isolate::git::testkit::{
+        commit_file, commit_removal, empty_repo, repo_with_one_commit,
+    };
     use crate::isolate::{FanoutSlot, Isolator as _, Prepared, ResetReport};
 
     use super::{GixIsolator, IsolatorConfig, RepoCheckout, label_conflict, local_moved};
@@ -4134,6 +4136,112 @@ mod tests {
         assert!(
             crate::isolate::git::testkit::has_object(&core_path, &commit),
             "and the commit is still there to be read"
+        );
+        isolator.release(run).await.expect("release answers");
+    }
+
+    /// D121: the agent deleted a file `base_ref` tracks and an untracked file now sits at that
+    /// path. `is_dirty` reads the checkout as clean, but `reset --hard <base_ref>` would write the
+    /// base's blob over the untracked file — so the row is refused and nothing is written.
+    #[tokio::test]
+    async fn reset_refuses_an_untracked_file_at_a_path_base_ref_tracks() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        let trees = rows(&prepared);
+        let commit = commit_removal(&core_path, "f", "the agent deletes f");
+        std::fs::write(core_path.join("f"), "the maintainer's notes\n")
+            .expect("an untracked file is written at the deleted path");
+        assert!(
+            !crate::isolate::git::is_dirty(&core_path).expect("the status reads"),
+            "the checkout reads as clean to is_dirty"
+        );
+
+        let report = isolator.reset(step, &trees).await.expect("reset answers");
+
+        assert_eq!(
+            report,
+            ResetReport {
+                labelled: Vec::new(),
+                refused: vec![(
+                    core,
+                    format!(
+                        "dirty_tree_not_reset: {}",
+                        Path::new(&trees[0].path).display()
+                    )
+                )],
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("f")).expect("the file reads"),
+            "the maintainer's notes\n",
+            "the untracked file survives byte for byte"
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            commit,
+            "HEAD is unmoved"
+        );
+        assert!(htui_refs(&core_path).is_empty(), "no label was written");
+        isolator.release(run).await.expect("release answers");
+    }
+
+    /// D121's other half: an untracked file at a path `base_ref` does not track survives
+    /// `reset --hard`, so it refuses nothing and is still there afterwards.
+    #[tokio::test]
+    async fn reset_keeps_an_untracked_file_at_a_path_base_ref_does_not_track() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        let commit = commit_file(&core_path, "g", "agent\n", "the agent commits");
+        std::fs::write(core_path.join("notes"), "the maintainer's notes\n")
+            .expect("an untracked file is written");
+
+        let report = isolator
+            .reset(step, &rows(&prepared))
+            .await
+            .expect("reset answers");
+
+        assert_eq!(
+            report,
+            ResetReport {
+                labelled: vec![(core, commit)],
+                refused: Vec::new(),
+            }
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head,
+            "the checkout is back at base_ref"
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("notes")).expect("the file reads"),
+            "the maintainer's notes\n",
+            "the untracked file survives the reset"
         );
         isolator.release(run).await.expect("release answers");
     }
