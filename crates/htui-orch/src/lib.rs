@@ -23,6 +23,7 @@ pub mod fake;
 pub mod gate;
 pub mod graph;
 pub mod isolate;
+pub mod select;
 pub mod status;
 pub mod verify;
 
