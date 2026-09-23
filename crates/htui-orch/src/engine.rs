@@ -2408,7 +2408,9 @@ where
     /// Plan D76 (blueprint A-5): a required input missing from the group's one prompt. No
     /// candidate is live yet, so each `pending` one is moved `pending -> running -> failed` with
     /// a note — `pending -> failed` is illegal (`model/run.rs:113`) — and then the run fails
-    /// exactly as a `fan_out = 1` step's missing input fails it.
+    /// exactly as a `fan_out = 1` step's missing input fails it. A `pending -> running` that
+    /// answers `Ok(false)` is plan D125's [`EngineError::StaleWrite`]: the run is neither failed
+    /// nor cleaned up.
     async fn fail_group_before_a_token(
         &self,
         run: &Run,
@@ -2419,15 +2421,17 @@ where
         let failure = RunFailure::MissingInput(kind);
         let now = self.now();
         for step in pending {
-            if self
-                .parts
-                .store
-                .transition_step(step.id, StepStatus::Pending, StepStatus::Running, now)
-                .await?
-            {
-                self.fail_candidate(run, phase, step, &failure.to_string())
-                    .await?;
-            }
+            // Plan D125: a candidate another writer moved stops the walk before the run is failed.
+            self.move_step(
+                run.id,
+                step.id,
+                StepStatus::Pending,
+                StepStatus::Running,
+                now,
+            )
+            .await?;
+            self.fail_candidate(run, phase, step, &failure.to_string())
+                .await?;
         }
         self.parts
             .store
