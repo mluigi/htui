@@ -56,6 +56,20 @@ pub enum RunFailure {
         /// `step_graph_phase.name` of the rejected step.
         phase: String,
     },
+    /// Stage 1 left no eligible candidate (plan D62): the `R-AGT-8` walk skipped every agent for a
+    /// reason other than the inline-approval interlock, or `graph::resolve` reached rung 4. An
+    /// empty `detail` renders with no `; ` suffix, which is the `StartRun` rung-4 note.
+    NoCandidateAgent {
+        /// `step_graph_phase.name` of the phase that found nothing.
+        phase: String,
+        /// `<agent> (<reason>), …` for every skipped agent; empty when there was no walk.
+        detail: String,
+    },
+    /// Every candidate of a fan-out group failed, so there is nothing to select (plan D48).
+    NoSurvivingCandidate {
+        /// `step_graph_phase.name` of the fanned-out phase.
+        phase: String,
+    },
 }
 
 impl fmt::Display for RunFailure {
@@ -69,6 +83,13 @@ impl fmt::Display for RunFailure {
             }
             Self::NoLoopTarget => f.write_str("no_loop_target"),
             Self::Rejected { phase } => write!(f, "rejected: {phase}"),
+            Self::NoCandidateAgent { phase, detail } if detail.is_empty() => {
+                write!(f, "no_candidate_agent: phase `{phase}`")
+            }
+            Self::NoCandidateAgent { phase, detail } => {
+                write!(f, "no_candidate_agent: phase `{phase}`; {detail}")
+            }
+            Self::NoSurvivingCandidate { phase } => write!(f, "no_surviving_candidate: {phase}"),
         }
     }
 }
@@ -121,6 +142,54 @@ pub fn next_attempt(steps: &[RunStep], position: i32) -> i32 {
     latest_at(steps, position).map_or(1, |step| step.attempt + 1)
 }
 
+/// The `fanout_index` of a fan-out slot's judge row (`docs/ANA-2.md` §4.5, plan D53).
+const JUDGE_FANOUT_INDEX: i32 = -1;
+
+/// The candidates of the slot `(position, attempt)` — every row with `fanout_index >= 0` — in
+/// `fanout_index` order (plan D59).
+///
+/// A single-candidate phase's slot is its one `fanout_index 0` row; the judge is never in the
+/// group ([`judge_at`] answers it).
+#[must_use]
+pub fn group_at(steps: &[RunStep], position: i32, attempt: i32) -> Vec<&RunStep> {
+    let mut group: Vec<&RunStep> = steps
+        .iter()
+        .filter(|step| step.position == position && step.attempt == attempt)
+        .filter(|step| step.fanout_index >= 0)
+        .collect();
+    group.sort_by_key(|step| step.fanout_index);
+    group
+}
+
+/// The judge row (`fanout_index = -1`) of the slot `(position, attempt)`, if one was created.
+#[must_use]
+pub fn judge_at(steps: &[RunStep], position: i32, attempt: i32) -> Option<&RunStep> {
+    steps.iter().find(|step| {
+        step.position == position
+            && step.attempt == attempt
+            && step.fanout_index == JUDGE_FANOUT_INDEX
+    })
+}
+
+/// The slot's winner (plan D66): the candidate carrying `selected = true`, else its
+/// `fanout_index 0` when nothing in the slot is selected.
+///
+/// The fallback is what makes a `fan_out = 1` phase read exactly as it did before fan-out: its one
+/// row is never selected, and it is index 0. `None` only when the slot has no index 0 either.
+#[must_use]
+pub fn winner_at(steps: &[RunStep], position: i32, attempt: i32) -> Option<&RunStep> {
+    let group = group_at(steps, position, attempt);
+    group
+        .iter()
+        .find(|step| step.selected == Some(true))
+        .or_else(|| {
+            group
+                .iter()
+                .find(|step| step.fanout_index == WALKED_FANOUT_INDEX)
+        })
+        .copied()
+}
+
 /// Walks `snapshot.phases` in position order; the first position whose latest step is not `done`
 /// decides.
 ///
@@ -164,9 +233,12 @@ pub fn cursor(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Cursor {
 #[cfg(test)]
 mod tests {
     use htui_core::fixtures::{demo_data, ids};
-    use htui_core::model::{GraphSnapshot, RunStep, StepStatus};
+    use htui_core::model::{GraphSnapshot, RunStep, StepId, StepStatus};
 
-    use crate::status::{Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt};
+    use crate::status::{
+        Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt,
+        winner_at,
+    };
 
     /// The four `RUN_1` steps, the one `RUN_2` step, or whatever the fixture holds for a run.
     fn steps_of(run: htui_core::model::RunId) -> Vec<RunStep> {
@@ -227,6 +299,101 @@ mod tests {
             "rejected: implement",
             "`docs/ANA-2.md:578`, blueprint A-8"
         );
+        assert_eq!(
+            RunFailure::NoCandidateAgent {
+                phase: "implement".to_owned(),
+                detail: "claude (quota: status rejected)".to_owned(),
+            }
+            .to_string(),
+            "no_candidate_agent: phase `implement`; claude (quota: status rejected)",
+            "plan D62: a stage-1 walk that left nothing eligible"
+        );
+        assert_eq!(
+            RunFailure::NoCandidateAgent {
+                phase: "prd".to_owned(),
+                detail: String::new(),
+            }
+            .to_string(),
+            "no_candidate_agent: phase `prd`",
+            "plan D62's `StartRun` rung-4 note carries no detail, so no `; `"
+        );
+        assert_eq!(
+            RunFailure::NoSurvivingCandidate {
+                phase: "implement".to_owned(),
+            }
+            .to_string(),
+            "no_surviving_candidate: implement",
+            "plan D48: every candidate of the group failed"
+        );
+    }
+
+    /// `RUN_3`'s two `research` candidates with the selection moved to index 1: the winner is
+    /// whichever row carries `selected = true`, not whichever sits at index 0 (plan D66).
+    #[test]
+    fn winner_at_prefers_the_selected_candidate() {
+        let mut steps = steps_of(ids::RUN_3);
+        for step in &mut steps {
+            step.selected = Some(step.fanout_index == 1);
+        }
+        let winner = winner_at(&steps, 0, 1).expect("the slot has candidates");
+        assert_eq!(winner.id, ids::STEP_R3_RESEARCH_B);
+        assert_eq!(
+            winner_at(&steps, 0, 2),
+            None,
+            "an attempt with no rows has no winner"
+        );
+    }
+
+    /// A slot nothing has selected yet — a single-candidate phase, or a group still being driven —
+    /// answers its `fanout_index 0`, which every slot has (plan D59, D66).
+    #[test]
+    fn winner_at_falls_back_to_index_zero_when_nothing_is_selected() {
+        for selected in [None, Some(false)] {
+            let mut steps = steps_of(ids::RUN_3);
+            for step in &mut steps {
+                step.selected = selected;
+            }
+            // Index 1 first, so the fallback cannot be "the first row in the slice".
+            steps.reverse();
+            let winner = winner_at(&steps, 0, 1).expect("the slot has candidates");
+            assert_eq!(
+                winner.id,
+                ids::STEP_R3_RESEARCH_A,
+                "`selected = {selected:?}` everywhere falls back to index 0"
+            );
+        }
+    }
+
+    /// The judge shares its slot with the candidates but is not one of them: `group_at` skips
+    /// `fanout_index = -1`, orders by index, and `judge_at` answers the row it skipped.
+    #[test]
+    fn group_at_excludes_the_judge() {
+        let mut steps = steps_of(ids::RUN_3);
+        let mut judge = steps[0].clone();
+        judge.id = StepId::new();
+        judge.fanout_index = -1;
+        judge.selected = None;
+        let mut third = steps[0].clone();
+        third.id = StepId::new();
+        third.fanout_index = 2;
+        third.selected = Some(false);
+        let mut next = steps[0].clone();
+        next.id = StepId::new();
+        next.attempt = 2;
+        // Out of index order on purpose, with a row of the next attempt mixed in.
+        steps.insert(0, third.clone());
+        steps.insert(1, judge.clone());
+        steps.push(next);
+
+        let group: Vec<_> = group_at(&steps, 0, 1).iter().map(|step| step.id).collect();
+        assert_eq!(
+            group,
+            vec![ids::STEP_R3_RESEARCH_A, ids::STEP_R3_RESEARCH_B, third.id],
+            "the candidates of `(0, 1)`, in `fanout_index` order, without the judge"
+        );
+        assert_eq!(judge_at(&steps, 0, 1).map(|step| step.id), Some(judge.id));
+        assert_eq!(judge_at(&steps, 0, 2), None, "attempt 2 has no judge");
+        assert!(group_at(&steps, 1, 1).is_empty());
     }
 
     /// Plan D3: the predicate is about the attempt that is *about to be created*, so the shipped
