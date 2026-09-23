@@ -960,16 +960,7 @@ where
                         return Err(err);
                     }
                 };
-                // Plan D129: the re-read only decides the release, so its failure is warned, the
-                // release is tried anyway, and the walk's answer stands.
-                match self.run(run).await {
-                    Ok(row) if row.status == RunStatus::Running => {}
-                    Ok(_) => self.release_lease(run).await,
-                    Err(err) => {
-                        tracing::warn!(%run, %err, "re-reading the run after its walk failed");
-                        self.release_lease(run).await;
-                    }
-                }
+                self.release_after_walk(run, self.run(run).await).await;
                 Ok(out)
             }
             // Plan D122: a heartbeat that fenced itself is treated exactly as a taken lease.
@@ -980,6 +971,21 @@ where
                     tracing::warn!(%run, %err, "releasing the run's guards after an abandon failed");
                 }
                 Err(EngineError::LeaseLost { run })
+            }
+        }
+    }
+
+    /// Plan D87/D129: after a walk's `Ok`, `reread` (the run as read once the walk returned)
+    /// decides the release: a run still `running` keeps its lease, any other status gives it back.
+    /// The re-read only decides that, so its failure is warned and the release is tried anyway;
+    /// the walk's answer stands either way.
+    async fn release_after_walk(&self, run: RunId, reread: Result<Run, EngineError>) {
+        match reread {
+            Ok(row) if row.status == RunStatus::Running => {}
+            Ok(_) => self.release_lease(run).await,
+            Err(err) => {
+                tracing::warn!(%run, %err, "re-reading the run after its walk failed");
+                self.release_lease(run).await;
             }
         }
     }
@@ -6632,6 +6638,50 @@ mod tests {
             .await
             .expect("the walk succeeded; a failed re-read does not undo it");
         assert_eq!(walked, 7);
+    }
+
+    /// Plan D129's other half: a failed re-read still gives a held lease back. The run is real
+    /// and leased to this harness while `running`, and the re-read's answer is the error a store
+    /// that cannot be reached returns, so only the failure path decides the release.
+    #[tokio::test]
+    async fn a_failed_re_read_after_the_walk_still_releases_the_lease() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        let now = harness.orch.clock.now();
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+        assert!(
+            harness
+                .orch
+                .store
+                .take_lease(run, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .await
+                .expect("MemStore takes the lease")
+        );
+        harness_engine!(harness.orch, engine);
+
+        engine
+            .release_after_walk(
+                run,
+                Err(EngineError::Store(
+                    htui_core::store::StoreError::Unreachable("socket closed".to_owned()),
+                )),
+            )
+            .await;
+        let row = harness.orch.run(run).await;
+        assert_eq!(row.status, RunStatus::Running, "nothing else is written");
+        assert_eq!(
+            row.lease_expires_at,
+            Some(now),
+            "the lease is released although the re-read failed"
+        );
     }
 
     /// Plan D86/D107: a heartbeat whose refresh touches zero rows abandons the walk. The walk is
