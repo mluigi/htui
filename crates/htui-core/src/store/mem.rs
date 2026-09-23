@@ -4790,7 +4790,7 @@ mod tests {
     async fn a_switched_on_fault_answers_unreachable_until_switched_off() {
         let store = MemStore::demo();
         let clone = store.clone();
-        let ghost = crate::model::RunId::new();
+        let ghost = RunId::new();
         let now = Utc::now();
 
         store.set_fault(super::MemFault::ReleaseLease, true);
