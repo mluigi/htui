@@ -1949,6 +1949,9 @@ where
         // Plan D149: the reads, the live graph's resolve and both notes give the lease back on
         // any error. `Some` is the topology mismatch, which walks nothing.
         if let Some(changed) = self.leased_window(run, self.resume_window(run)).await? {
+            // Plan D150: so the lease just taken is given back whatever the run's status. A
+            // `running` run is then adopted again by the next sweep of any process (R-36).
+            self.release_lease(run).await;
             return Ok(changed);
         }
         let rest = self.walk_leased(run, until, self.walk_resumed(run)).await?;
@@ -2011,10 +2014,6 @@ where
                 })
                 .await?;
             let rest = self.resting(&row).await?;
-            // Nothing walks, so the lease just taken is given back unless the run is live.
-            if row.status != RunStatus::Running {
-                self.release_lease(run).await;
-            }
             return Ok(Some(Resume::TopologyChanged {
                 snapshot: snapshot.topology,
                 live: live.snapshot.topology,
