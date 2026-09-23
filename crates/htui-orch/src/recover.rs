@@ -254,8 +254,19 @@ pub fn resettle(
     started_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Settle {
-    let _ = (output, verify, is_review, started_at, now);
-    todo!()
+    let driver = Ok(DoneEvent {
+        stop_reason: StopReason::EndTurn,
+    });
+    settle(&SettleInput {
+        driver: &driver,
+        cap_breach: None,
+        started_at,
+        now,
+        deadline_seconds: None,
+        output,
+        verify_outcome: verify,
+        is_review,
+    })
 }
 
 #[cfg(test)]
