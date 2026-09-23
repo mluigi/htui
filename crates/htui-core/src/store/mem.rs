@@ -3383,6 +3383,26 @@ impl State {
         Ok(true)
     }
 
+    /// Plan D139: a compare-and-set on `lease_owner` that clears it; `false` writes nothing.
+    fn release_lease(
+        &mut self,
+        run: RunId,
+        owner: Uuid,
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.require_run(run)?;
+        if self.lease_owners.get(&run) != Some(&owner) {
+            return Ok(false);
+        }
+        self.lease_owners.remove(&run);
+        if let Some(row) = self.runs.get_mut(&run) {
+            row.lease_expires_at = Some(at);
+            row.updated_at = now;
+        }
+        Ok(true)
+    }
+
     /// A `run_step` at `pending` with every settle column `NULL`.
     fn create_step(&mut self, new: NewRunStep, now: DateTime<Utc>) -> Result<RunStep> {
         if self.steps.contains_key(&new.id) {
@@ -4575,7 +4595,8 @@ impl WriteStore for MemStore {
     }
 
     async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
-        self.refresh_lease(run, owner, now).await
+        let stamp = Utc::now();
+        self.write(|state| state.release_lease(run, owner, now, stamp))
     }
 
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {

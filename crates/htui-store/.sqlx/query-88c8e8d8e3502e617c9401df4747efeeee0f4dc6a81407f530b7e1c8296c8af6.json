@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run SET lease_owner = NULL, lease_expires_at = $3 WHERE id = $1 AND lease_owner = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "88c8e8d8e3502e617c9401df4747efeeee0f4dc6a81407f530b7e1c8296c8af6"
+}

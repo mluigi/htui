@@ -2780,8 +2780,47 @@ impl WriteStore for PgStore {
         }
     }
 
+    /// Plan D139: gives a lease back, in one compare-and-set `UPDATE` that clears the owner.
+    ///
+    /// Clearing `lease_owner` is what lets this process's own sweep adopt the run (plan D88 skips
+    /// only a row whose owner is the sweeper). A heartbeat `UPDATE` that commits after this one
+    /// filters on `lease_owner = $2` and so matches no row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
+    /// from "not ours" by the follow-up read [`WriteStore::refresh_lease`] uses.
     async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
-        self.refresh_lease(run, owner, now).await
+        let moved = sqlx::query!(
+            "UPDATE run SET lease_owner = NULL, lease_expires_at = $3 \
+              WHERE id = $1 AND lease_owner = $2",
+            run.as_uuid(),
+            owner,
+            now,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if moved == 1 {
+            return Ok(true);
+        }
+
+        let exists = sqlx::query_scalar!("SELECT 1 FROM run WHERE id = $1", run.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .is_some();
+
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            })
+        }
     }
 
     /// A `run_step` at `pending` with every settle column `NULL`; `fanout_index = -1` is the judge
