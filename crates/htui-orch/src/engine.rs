@@ -39,11 +39,12 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
+use crate::fanout::HUMAN_PICK_REASON;
 use crate::gate::{self, GateContext, Landing, LoopOutcome, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{Clock, Isolator};
 use crate::select::{self, SelectInput, Skipped, Walk};
-use crate::status::{Cursor, RunFailure, cursor, latest_at, next_attempt, winner_at};
+use crate::status::{Cursor, RunFailure, cursor, group_at, latest_at, next_attempt, winner_at};
 use crate::verify::{Verifier, VerifyReport, VerifyRequest};
 
 /// The only `run_step.fanout_index` milestone 2 walks; fan-out's others are milestone 4's.
@@ -369,6 +370,12 @@ where
             Command::AnswerGate { run, step, answer } => self.answer_gate(run, step, answer).await,
             Command::RetryStep { run, step } => self.retry_step(run, step).await,
             Command::CancelRun { run } => self.cancel_run(run).await,
+            Command::SelectFanout {
+                run,
+                position,
+                attempt,
+                winner,
+            } => self.select_fanout(run, position, attempt, winner).await,
         }
     }
 
@@ -499,7 +506,7 @@ where
             // (`store/traits.rs:788-791`), so this is the human's half of plan D25's "after a step
             // reaches `done`". A refusal parks the run again, with the reason on the item.
             let step = self.step(run.id, step.id).await?;
-            match self.reconcile_done_step(&run, &step).await? {
+            match self.reconcile_done_step(&run, &step, &[]).await? {
                 Some(rest) => rest,
                 None => self.run_to_rest(run.id).await?,
             }
@@ -595,6 +602,11 @@ where
         if item.status == Status::Blocked {
             return Err(EngineError::ItemBlocked { item: item.id });
         }
+        // Plan D65, blueprint F-D: any member of a fanned-out slot retries the whole group, and
+        // before `retry_enabled` — a parked group's candidates are `done`, which that guard refuses.
+        if phase.fan_out > 1 {
+            return self.retry_group(&run, &snapshot, &row, &phase).await;
+        }
         crate::command::retry_enabled(&row, &phase)?;
 
         let now = self.now();
@@ -630,6 +642,113 @@ where
         }
         let rest = self.run_to_rest(run.id).await?;
         Ok(CommandOutcome::Retried { step: row.id, rest })
+    }
+
+    /// Plan D65's group retry: every member of the slot `row` belongs to is retired (candidates
+    /// and judge, plan D66's `retire_slot`), the run unparks, and stage 1 admits the whole group
+    /// at `attempt + 1` before the walk resumes.
+    async fn retry_group(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        row: &RunStep,
+        phase: &SnapshotPhase,
+    ) -> Result<CommandOutcome, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let slot = group_at(&steps, row.position, row.attempt);
+        crate::command::retry_group_enabled(run, &slot, phase)?;
+        let attempt = slot.first().map_or(row.attempt, |first| first.attempt);
+
+        let now = self.now();
+        gate::retire_slot(&self.gate_context(run, snapshot), &steps, row.position, now).await?;
+        self.unpark(run, now).await?;
+
+        let run = self.run(run.id).await?;
+        if let Some(rest) = self.admit(&run, snapshot, phase, attempt + 1).await? {
+            return Ok(CommandOutcome::Retried { step: row.id, rest });
+        }
+        let rest = self.run_to_rest(run.id).await?;
+        Ok(CommandOutcome::Retried { step: row.id, rest })
+    }
+
+    /// §6.2's `select` (plan D65, criterion 10): a human's pick of a parked slot's winner.
+    ///
+    /// `select_fanout` settles the slot in one transaction — the winner `selected`, the losers
+    /// superseded, a live judge `done` — and leaves a judge that already failed alone, with its
+    /// reason (`store/traits.rs:808-813`). The reason is also an `item_note` (plan D77): with no
+    /// judge, or a failed one, `select_fanout` has nowhere to write it. Then the run unparks, the
+    /// winner is reconciled with its siblings, and the walk goes on.
+    async fn select_fanout(
+        &self,
+        run: RunId,
+        position: i32,
+        attempt: i32,
+        winner: StepId,
+    ) -> Result<CommandOutcome, EngineError> {
+        let run = self.run(run).await?;
+        let snapshot = Self::snapshot_of(&run)?;
+        let phase = Self::phase_at(run.id, &snapshot, position)?;
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let slot = group_at(&steps, position, attempt);
+        crate::command::select_enabled(&run, &slot, winner, position, attempt)?;
+        let siblings = Self::siblings(&slot, winner);
+
+        self.parts
+            .store
+            .select_fanout(
+                run.id,
+                position,
+                attempt,
+                winner,
+                Some(HUMAN_PICK_REASON.to_owned()),
+            )
+            .await?;
+        let now = self.now();
+        let index = slot
+            .iter()
+            .find(|step| step.id == winner)
+            .map_or(0, |step| step.fanout_index);
+        self.note_selection(
+            &run,
+            winner,
+            format!(
+                "fan-out `{}` attempt {attempt}: candidate {index} {HUMAN_PICK_REASON}",
+                phase.name
+            ),
+            now,
+        )
+        .await?;
+        self.unpark(&run, now).await?;
+
+        let run = self.run(run.id).await?;
+        let winner = self.step(run.id, winner).await?;
+        if let Some(rest) = self.reconcile_done_step(&run, &winner, &siblings).await? {
+            return Ok(CommandOutcome::Selected { rest });
+        }
+        let rest = self.run_to_rest(run.id).await?;
+        Ok(CommandOutcome::Selected { rest })
+    }
+
+    /// Plan D77: the reason a winner was chosen, as an `item_note` naming the winner.
+    async fn note_selection(
+        &self,
+        run: &Run,
+        winner: StepId,
+        body: String,
+        now: DateTime<Utc>,
+    ) -> Result<(), EngineError> {
+        match run.item_id {
+            Some(item) => self.note(item, body, Some(winner), now).await,
+            None => Ok(()),
+        }
+    }
+
+    /// The slot's candidates other than `winner`, for the isolator's reconcile (plan D54(d)).
+    fn siblings(slot: &[&RunStep], winner: StepId) -> Vec<StepId> {
+        slot.iter()
+            .map(|step| step.id)
+            .filter(|id| *id != winner)
+            .collect()
     }
 
     /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).
@@ -1176,7 +1295,7 @@ where
             // the walk advances. A refusal parks the run (blueprint H-2, R-7).
             Landing::Advance => {
                 let step = self.step(run.id, step.id).await?;
-                Ok(self.reconcile_done_step(&row, &step).await?)
+                Ok(self.reconcile_done_step(&row, &step, &[]).await?)
             }
             Landing::Retry { position, attempt } => {
                 let phase = Self::phase_at(run.id, snapshot, position)?;
@@ -1352,13 +1471,23 @@ where
     /// **A parked run has no resume verb this milestone** (blueprint F-G, R-7): `AnswerGate` needs
     /// a step at `awaiting_approval` and every step here is `done`. Milestone 5's sweep or
     /// milestone 6's `Unblock`-shaped verb is where a retry of `reconcile` belongs.
+    ///
+    /// `siblings` are the other candidates of a fan-out winner's slot, handed to the isolator so a
+    /// `shared_serialized` checkout left at a sibling's commit may be moved to the winner's (plan
+    /// D56); empty for a `fan_out = 1` step.
     async fn reconcile_done_step(
         &self,
         run: &Run,
         step: &RunStep,
+        siblings: &[StepId],
     ) -> Result<Option<Rest>, EngineError> {
         let trees = self.parts.store.step_trees(step.id).await?;
-        match self.parts.isolator.reconcile(step.id, &trees, &[]).await {
+        match self
+            .parts
+            .isolator
+            .reconcile(step.id, &trees, siblings)
+            .await
+        {
             Ok(after) => {
                 // ANA-2 `:987-988`: the winner's `after_hash` becomes the merge commit.
                 self.parts.store.record_commits(step.id, &after).await?;

@@ -1,5 +1,5 @@
-//! The four operator commands of ANA-2 §6.2 (`docs/ANA-2.md:1557-1572`) and their enabling
-//! guards: `StartRun`, `AnswerGate`, `RetryStep` and `CancelRun`.
+//! The five operator commands of ANA-2 §6.2 (`docs/ANA-2.md:1557-1572`) and their enabling
+//! guards: `StartRun`, `AnswerGate`, `RetryStep`, `CancelRun` and `SelectFanout`.
 //!
 //! §6.2's table has an "Enabled when" column, and the Runs tab (milestone 6) greys an action out
 //! by exactly the rule the engine refuses it by. That only stays true if there is one rule, so the
@@ -25,11 +25,12 @@ use crate::status::{RunFailure, may_attempt};
 
 /// What a human asks the orchestrator to do, in manual mode (ANA-2 §6.2, `docs/ANA-2.md:1557`).
 ///
-/// Four of §6.2's ten; `PromoteStep`, `CancelStep`, `OpenArtifact`, `SelectFanout`,
-/// `AcceptArtifact`, `Unblock` and `CloseOut` belong to milestones 4 to 6 and are deliberately not
-/// declared here — an enum arm with no dispatcher arm is a promise the walk has not made.
-/// `CancelRun` left that list in milestone 3 (plan D45): ANA-2 §12 criterion 13 is stated as
-/// "cancelling a run", and the cleanup it triggers is what the criterion is about.
+/// Five of §6.2's ten; `PromoteStep`, `CancelStep`, `OpenArtifact`, `AcceptArtifact`, `Unblock`
+/// and `CloseOut` belong to milestones 5 and 6 and are deliberately not declared here — an enum
+/// arm with no dispatcher arm is a promise the walk has not made. `CancelRun` left that list in
+/// milestone 3 (plan D45): ANA-2 §12 criterion 13 is stated as "cancelling a run", and the cleanup
+/// it triggers is what the criterion is about. `SelectFanout` left it in milestone 4 (plan D65):
+/// criterion 10's human pick after a judge failure is that command.
 ///
 /// **`AnswerGate` and `RetryStep` carry `run` as well as `step`** because there is no per-step read
 /// on the store seam: `ReadStore::run_steps` is per run
@@ -69,6 +70,18 @@ pub enum Command {
     CancelRun {
         /// The run to stop. It carries no step: every one of them goes.
         run: RunId,
+    },
+    /// §6.2's `select` (`docs/ANA-2.md:1566`, criterion 10, plan D65): a human picks the winner of
+    /// a fan-out slot the walk parked for selection (plan D50), and the walk goes on from it.
+    SelectFanout {
+        /// The parked run.
+        run: RunId,
+        /// The slot's `run_step.position`.
+        position: i32,
+        /// The slot's `run_step.attempt`.
+        attempt: i32,
+        /// The candidate that wins: a `fanout_index >= 0` step of the slot.
+        winner: StepId,
     },
 }
 
@@ -133,6 +146,11 @@ pub enum CommandOutcome {
     Retried {
         /// The step the retry replaced.
         step: StepId,
+        /// Where the walk rested.
+        rest: Rest,
+    },
+    /// [`Command::SelectFanout`]: where the walk stopped after the winner was reconciled.
+    Selected {
         /// Where the walk rested.
         rest: Rest,
     },
@@ -255,6 +273,44 @@ pub enum EngineError {
     /// The driver failed, or the session's stream closed before its `done`.
     #[error(transparent)]
     Driver(#[from] htui_agent::error::DriverError),
+    /// Plan D65: `SelectFanout` on a slot holding one candidate — a `fan_out = 1` phase, whose one
+    /// step is answered through `AnswerGate` instead.
+    #[error(
+        "run {run} position {position} attempt {attempt} holds one candidate; there is nothing to select"
+    )]
+    NotAFanout {
+        /// The run named.
+        run: RunId,
+        /// The slot's position.
+        position: i32,
+        /// The slot's attempt.
+        attempt: i32,
+    },
+    /// Plan D65: the slot already has a winner — a double click, or a judge that won the race.
+    #[error("run {run} position {position} attempt {attempt} already selected step {selected}")]
+    AlreadySelected {
+        /// The run named.
+        run: RunId,
+        /// The slot's position.
+        position: i32,
+        /// The slot's attempt.
+        attempt: i32,
+        /// The candidate carrying `selected = true`.
+        selected: StepId,
+    },
+    /// Plan D65: the named winner is not one of the slot's candidates — another slot's step, or
+    /// the judge.
+    #[error("step {step} is not a candidate of run {run} position {position} attempt {attempt}")]
+    NotACandidate {
+        /// The step named as the winner.
+        step: StepId,
+        /// The run named.
+        run: RunId,
+        /// The slot's position.
+        position: i32,
+        /// The slot's attempt.
+        attempt: i32,
+    },
     /// Stage 2 or stage 5's isolation verb refused. **Not in the blueprint's §5.1 list**, which
     /// leaves the engine no way to carry an `Isolator`'s own failure; added here.
     #[error(transparent)]
@@ -337,6 +393,123 @@ pub fn retry_enabled(step: &RunStep, phase: &SnapshotPhase) -> Result<(), Engine
     Ok(())
 }
 
+/// §6.2's "Enabled when" for `select` (`docs/ANA-2.md:1566`, plan D65).
+///
+/// `slot` is `status::group_at(steps, position, attempt)`: the slot's candidates, judge excluded.
+/// The run is `awaiting_approval` — D50's park is the only way a group reaches a human — the slot
+/// holds more than one candidate, none of them is `selected` yet, and `winner` is one of them at
+/// `done | awaiting_approval`, which is exactly what `WriteStore::select_fanout` accepts
+/// (`crates/htui-core/src/store/traits.rs:821-824`) — so a pick this guard admits is never refused
+/// by the write.
+///
+/// **A parked run has no other resume verb** (blueprint R-7): a group parked because its winner's
+/// reconcile was refused carries `selected = true` and is refused here as
+/// [`EngineError::AlreadySelected`]; milestone 5's sweep owns that retry.
+///
+/// # Errors
+/// [`EngineError::RunStatus`], [`EngineError::NotAFanout`], [`EngineError::AlreadySelected`],
+/// [`EngineError::NotACandidate`] or [`EngineError::NotGated`], in that order.
+pub fn select_enabled(
+    run: &Run,
+    slot: &[&RunStep],
+    winner: StepId,
+    position: i32,
+    attempt: i32,
+) -> Result<(), EngineError> {
+    parked(run)?;
+    if slot.len() < 2 {
+        return Err(EngineError::NotAFanout {
+            run: run.id,
+            position,
+            attempt,
+        });
+    }
+    unselected(run, slot, position, attempt)?;
+    let Some(candidate) = slot.iter().find(|step| step.id == winner) else {
+        return Err(EngineError::NotACandidate {
+            step: winner,
+            run: run.id,
+            position,
+            attempt,
+        });
+    };
+    if !matches!(
+        candidate.status,
+        StepStatus::Done | StepStatus::AwaitingApproval
+    ) {
+        return Err(EngineError::NotGated {
+            step: candidate.id,
+            status: candidate.status,
+            expected: "done | awaiting_approval",
+        });
+    }
+    Ok(())
+}
+
+/// §6.2's `retry` on a member of a parked fan-out slot (plan D65, blueprint F-D): the whole group
+/// is retired and admitted again at `attempt + 1`.
+///
+/// [`retry_enabled`] cannot answer it: a parked group's candidates are `done`, and a candidate is
+/// never `awaiting_approval` (D50). So the guard reads the run — `awaiting_approval` — the slot —
+/// nothing `selected` — and the budget, [`may_attempt`] on the slot's `attempt + 1`.
+///
+/// # Errors
+/// [`EngineError::RunStatus`], [`EngineError::NotAFanout`] for an empty slot,
+/// [`EngineError::AlreadySelected`] or [`EngineError::RetryExhausted`].
+pub fn retry_group_enabled(
+    run: &Run,
+    slot: &[&RunStep],
+    phase: &SnapshotPhase,
+) -> Result<(), EngineError> {
+    parked(run)?;
+    let Some(first) = slot.first() else {
+        return Err(EngineError::NotAFanout {
+            run: run.id,
+            position: phase.position,
+            attempt: 0,
+        });
+    };
+    unselected(run, slot, first.position, first.attempt)?;
+    if !may_attempt(first.attempt + 1, phase.retry_limit) {
+        return Err(EngineError::RetryExhausted {
+            step: first.id,
+            attempt: first.attempt,
+            retry_limit: phase.retry_limit,
+        });
+    }
+    Ok(())
+}
+
+/// Both group guards' first clause: the run is parked for a human (plan D50).
+fn parked(run: &Run) -> Result<(), EngineError> {
+    if run.status == RunStatus::AwaitingApproval {
+        return Ok(());
+    }
+    Err(EngineError::RunStatus {
+        run: run.id,
+        status: run.status,
+        expected: "awaiting_approval",
+    })
+}
+
+/// Both group guards' slot clause: no candidate carries `selected = true` yet.
+fn unselected(
+    run: &Run,
+    slot: &[&RunStep],
+    position: i32,
+    attempt: i32,
+) -> Result<(), EngineError> {
+    match slot.iter().find(|step| step.selected == Some(true)) {
+        None => Ok(()),
+        Some(selected) => Err(EngineError::AlreadySelected {
+            run: run.id,
+            position,
+            attempt,
+            selected: selected.id,
+        }),
+    }
+}
+
 /// §6.2's "Enabled when" for `cancel run` (plan D45): the run has not finished.
 ///
 /// `queued`, `running` and `awaiting_approval` are exactly the three `RunStatus::can_move_to`
@@ -370,7 +543,12 @@ mod tests {
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{GraphSnapshot, RunStep, SnapshotPhase, StepStatus};
 
-    use super::{EngineError, GateAnswer, answer_gate_enabled, retry_enabled};
+    use htui_core::model::StepId;
+
+    use super::{
+        EngineError, GateAnswer, answer_gate_enabled, retry_enabled, retry_group_enabled,
+        select_enabled,
+    };
 
     /// `RUN_1`'s `review` step, at position 3, and the snapshot phase it walked.
     fn review() -> (RunStep, SnapshotPhase) {
@@ -488,6 +666,148 @@ mod tests {
             retry_enabled(&step, &phase).expect_err("a done step is not retryable"),
             EngineError::NotGated { .. }
         ));
+    }
+
+    /// `RUN_3` parked on its `research` group: both candidates settled `done`, nothing selected,
+    /// the run `awaiting_approval` — the state D50's park leaves behind — and its snapshot phase
+    /// widened to the two candidates it holds.
+    fn parked_group() -> (htui_core::model::Run, Vec<RunStep>, SnapshotPhase) {
+        let data = demo_data();
+        let mut run = data
+            .runs
+            .iter()
+            .find(|row| row.id == ids::RUN_3)
+            .expect("the fixture holds RUN_3")
+            .clone();
+        run.status = htui_core::model::RunStatus::AwaitingApproval;
+        let mut steps: Vec<RunStep> = data
+            .steps
+            .into_iter()
+            .filter(|step| step.run_id == ids::RUN_3)
+            .collect();
+        for step in &mut steps {
+            step.status = StepStatus::Done;
+            step.selected = None;
+        }
+        let (_, mut phase) = review();
+        phase.position = 0;
+        phase.fan_out = 2;
+        phase.retry_limit = 1;
+        (run, steps, phase)
+    }
+
+    /// Plan D65's guard, one refusal per clause, each naming what it found.
+    #[test]
+    fn select_is_enabled_only_on_a_parked_unselected_group_and_a_settled_candidate() {
+        let (mut run, mut steps, _) = parked_group();
+        let slot: Vec<&RunStep> = steps.iter().collect();
+        assert!(select_enabled(&run, &slot, ids::STEP_R3_RESEARCH_B, 0, 1).is_ok());
+
+        run.status = htui_core::model::RunStatus::Running;
+        assert!(
+            matches!(
+                select_enabled(&run, &slot, ids::STEP_R3_RESEARCH_B, 0, 1),
+                Err(EngineError::RunStatus {
+                    expected: "awaiting_approval",
+                    ..
+                })
+            ),
+            "a run that is not parked has nothing to select"
+        );
+        run.status = htui_core::model::RunStatus::AwaitingApproval;
+
+        let refused = select_enabled(&run, &slot[..1], ids::STEP_R3_RESEARCH_A, 0, 1)
+            .expect_err("one candidate is not a fan-out");
+        assert!(
+            matches!(
+                refused,
+                EngineError::NotAFanout {
+                    position: 0,
+                    attempt: 1,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+
+        let stranger = StepId::new();
+        let refused = select_enabled(&run, &slot, stranger, 0, 1)
+            .expect_err("a step outside the slot is not a candidate");
+        assert!(
+            matches!(refused, EngineError::NotACandidate { step, .. } if step == stranger),
+            "{refused}"
+        );
+
+        steps[1].status = StepStatus::Failed;
+        let slot: Vec<&RunStep> = steps.iter().collect();
+        let refused = select_enabled(&run, &slot, ids::STEP_R3_RESEARCH_B, 0, 1)
+            .expect_err("a failed candidate cannot win");
+        assert!(
+            matches!(
+                refused,
+                EngineError::NotGated {
+                    status: StepStatus::Failed,
+                    expected: "done | awaiting_approval",
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+
+        steps[0].selected = Some(true);
+        let slot: Vec<&RunStep> = steps.iter().collect();
+        let refused = select_enabled(&run, &slot, ids::STEP_R3_RESEARCH_B, 0, 1)
+            .expect_err("a slot is selected once");
+        assert!(
+            matches!(
+                refused,
+                EngineError::AlreadySelected { selected, .. } if selected == ids::STEP_R3_RESEARCH_A
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "run {} position 0 attempt 1 already selected step {}",
+                ids::RUN_3,
+                ids::STEP_R3_RESEARCH_A
+            )
+        );
+    }
+
+    /// Blueprint F-D: a parked group retries as a whole, on the run's status and the slot's
+    /// budget — never on a candidate's own status, which is `done`.
+    #[test]
+    fn a_group_retry_needs_a_parked_run_an_unselected_slot_and_budget() {
+        let (run, mut steps, mut phase) = parked_group();
+        let slot: Vec<&RunStep> = steps.iter().collect();
+        assert!(retry_group_enabled(&run, &slot, &phase).is_ok());
+
+        phase.retry_limit = 0;
+        let refused =
+            retry_group_enabled(&run, &slot, &phase).expect_err("attempt 2 is out of budget");
+        assert!(
+            matches!(
+                refused,
+                EngineError::RetryExhausted {
+                    attempt: 1,
+                    retry_limit: 0,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        phase.retry_limit = 1;
+
+        steps[1].selected = Some(true);
+        let slot: Vec<&RunStep> = steps.iter().collect();
+        assert!(
+            matches!(
+                retry_group_enabled(&run, &slot, &phase),
+                Err(EngineError::AlreadySelected { selected, .. }) if selected == ids::STEP_R3_RESEARCH_B
+            ),
+            "a selected slot has a winner and is not retried as a group"
+        );
     }
 
     /// Plan D45 against §4.3's own table: the three statuses `cancelled` is reachable from are
