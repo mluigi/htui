@@ -1276,6 +1276,10 @@ impl GixIsolator {
     /// D74 (blueprint A-3) chooses the repository that holds `after`: a `copy` tree's own object
     /// database until reconcile, and the checkout after it, because the merge commit exists only
     /// there; every other mode shares the checkout's object database.
+    ///
+    /// The range is the row's `before..after`, except for a step's own reconcile merge (plan
+    /// D141, [`git::reconcile_parent`]): that is diffed from its first parent, which is the base
+    /// itself unless another run's merge moved the primary first (D136).
     async fn diff_of(
         &self,
         git: &Cli,
@@ -1311,6 +1315,11 @@ impl GixIsolator {
                 repo = copy;
             }
         }
+        // D141: a merge onto a primary another run moved is diffed against its first parent, so
+        // the range holds this step's change and never the other run's.
+        let (probe, hex, step) = (repo.clone(), after.to_owned(), commit.run_step_id);
+        let merged_onto = blocking(move || git::reconcile_parent(&probe, &hex, step)).await?;
+        let before = merged_onto.as_deref().unwrap_or(before);
         let stat = git.diff(&repo, before, after, true).await?;
         let patch = git.diff(&repo, before, after, false).await?;
         Ok(Some((

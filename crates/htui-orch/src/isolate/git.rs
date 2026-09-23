@@ -672,7 +672,7 @@ impl Cli {
         after: &str,
         read_conflicts: fn(&Path) -> Result<Vec<String>, IsolateError>,
     ) -> Result<Merged, IsolateError> {
-        let message = format!("htui: reconcile {step}");
+        let message = reconcile_message(step);
         let exited = self
             .run(
                 "merge",
@@ -1314,6 +1314,42 @@ pub fn merge_of(
         }
     }
     Ok(None)
+}
+
+/// D25's merge message for `step`: what names a merge commit as that step's reconcile.
+fn reconcile_message(step: StepId) -> String {
+    format!("htui: reconcile {step}")
+}
+
+/// The first parent of `after` when `after` is `step`'s own reconcile merge, or `None` for any
+/// other commit (plan D141).
+///
+/// D136 merges a step onto a primary that another run moved, so the row reads `(base, merge)`
+/// and `base..merge` holds the other run's work too. The step's own change is the merge against
+/// its first parent. The second parent is tied to the step by the merge itself: a commit with
+/// exactly two parents whose message is D25's `htui: reconcile <step>` is the merge
+/// [`Cli::merge_no_ff`] made for that step, and its second parent is the tip it merged. Any other
+/// commit — a step's own commit, an agent's merge, a merge for another step — answers `None`.
+///
+/// # Errors
+/// [`IsolateError::Git`] when `after` is not a hash or its commit cannot be read.
+pub fn reconcile_parent(
+    path: &Path,
+    after: &str,
+    step: StepId,
+) -> Result<Option<String>, IsolateError> {
+    let id = parse_oid(after)?;
+    let repo = open(path)?;
+    let commit = repo
+        .find_commit(id)
+        .map_err(|err| IsolateError::Git(format!("cannot find commit {after}: {err}")))?;
+    let parents: Vec<gix::ObjectId> = commit.parent_ids().map(gix::Id::detach).collect();
+    let [first, _] = parents.as_slice() else {
+        return Ok(None);
+    };
+    let message = commit.message_raw_sloppy();
+    Ok((message.trim_ascii() == reconcile_message(step).as_bytes())
+        .then(|| first.to_hex().to_string()))
 }
 
 /// `Repository::is_dirty()` (`gix-0.87.1/src/status/mod.rs:168`), which is plan D24's predicate.
