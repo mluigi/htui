@@ -293,6 +293,49 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   must provide one; **R-8** — `after_hash` becomes the merge commit after reconcile (H-19), so
   milestone 4's no-progress predicate may need the pre-merge hash. Plan:
   `.claude/plans/mod-4-orch-tree.plan.md`; blueprint: `.claude/plans/mod-4-orch-tree.blueprint.md`.
+  **Milestone 4 landed (`fa03782`..`7ee0ac6`, 2026-09-23): three candidates, one winner.** 36
+  implementation commits plus a thirteen-commit review round, 29 files; workspace green at
+  `--test-threads=1` (1554 passed, 0 failed, 26 ignored), `sqlx prepare --check` clean. `htui-orch` gains `select.rs`
+  (`R-AGT-8`'s candidate walk, D60) and `fanout.rs` (the pure half of selection); the engine drives a
+  fan-out group concurrently, prefilters on `verify_command`, runs the two-order judge as one step
+  with two sessions, and selects one winner in one transaction, with `Command::SelectFanout` for the
+  human path and `RetryStep` retrying a parked group as a whole. The `Isolator` seam widens for
+  fan-out (a slot on `prepare`, `base`, `diff`, a sibling list on `reconcile`); `git diff` is the
+  sixth CLI verb, and `worktree add`/`remove` are serialised per repository (D70) because concurrent
+  adds race on `.git/worktrees/<id>/commondir`. `htui-core`'s quota predicate treats
+  `allowed_warning` as selectable (D61). ANA-2 criteria 7 (real-tree half, via R-8), 8, 9 and 10
+  are proved; `htui-orch`'s case list is 36. **R-8 is closed with no predicate change** (D66).
+  **The review gate found one HIGH, three MEDIUM and six LOW; every finding was verified against the
+  tree and every one was applied** (`20cb2fa`, `8438406`, `86058a9`, `a40b831`, `ad60554`,
+  `375123b`, `87ec1d4`, plus doc repairs `a19e633`, `ffe86c0`, `1fa37e2`, `7ee0ac6`). The
+  behaviours a later milestone must know: (1) **a candidate's deadline and verify budget start when
+  its `prepare` answers**, not at `run_step.started_at` — in a `shared_serialized` group the later
+  siblings were being charged for the earlier ones' whole sessions; (2) **a retried group starts
+  from the base its retired attempt recorded** (`before_hash`), not from HEAD, which in
+  `shared_serialized` is the last loser's commit — a retired slot that names two bases, or none for
+  a repo in scope, is refused with `EngineError::GroupBase`; an attempt with no rows at all is
+  skipped, and a slot with a selected winner (the review loop) still starts from `Isolator::base`;
+  (3) a store error after the judge went `running` now fails the judge and parks the run instead of
+  leaving both `running`; (4) **`resume` keeps walking the snapshot when the live graph no longer
+  resolves** under lowered caps (`FanOutCap`, `AgentCap`, `ReviewFanOut`, `NoCandidate`) and writes a
+  note — invariant 2; (5) **`drive_group` is not cancel-safe**: dropping it leaves candidates
+  `running` and shared locks held until `cleanup_run`/`cancel_run` or milestone 5's sweep; (6) a
+  stale-member `RetryStep` is `EngineError::StaleSlot`.
+  **The plan's "no migration" held until the review gate, then deliberately did not**: the
+  maintainer raised `max_agents_per_run`'s default from 6 to 8 (OQ-1 revisited), because the literal
+  reading refused the seeded `feature` graph with a judged 3-way `implement` (7 agents).
+  `0004_max_agents_per_run_default.sql` moves an untouched seeded `6` to `8` and leaves any other
+  value alone (`0003` is on `main` and cannot be edited); `graph.rs`'s fallback follows (`b86b62c`,
+  `bcce4b9`). A judged
+  4-way `implement` (8) sits exactly at the cap. **`docs/ANA-2.md:871`, `:1472`, `:1516` and
+  `:1992` and `docs/decisions/ana/ana-2.md:60`, `:107` still say 6** and are not amended.
+  **Still carried**: R-3..R-7 from milestones 2 and 3; **R-9** — `LoopStop::NoProgressReview` has
+  been unreachable since milestone 2, because `reviews_are_identical` reads the latest-only
+  `documents_of_kinds` (blueprint F-B; the plan's risk row was corrected in `e2986f2`), so only the
+  `after_hash` half of the no-progress predicate can fire. Every production judge still fails until
+  MOD-11 gives an agent a way to write the `judge` document (OQ-4), so production fan-outs go to the
+  human. Plan: `.claude/plans/mod-4-orch-fanout.plan.md`; blueprint:
+  `.claude/plans/mod-4-orch-fanout.blueprint.md`.
   **Milestone 4 OQ-7 follow-up: MOD-36** — milestone 4 runs every fan-out candidate on one agent;
   spreading candidates across agents by weight is MOD-36's (weights from ANA-21). Milestone 4 leaves
   `AgentSelector::select` called once per candidate with its `fanout_index` so MOD-36 plugs in there.

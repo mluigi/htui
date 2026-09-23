@@ -37,11 +37,12 @@ agents. Reviewer: `rust-reviewer` (`.claude/workflow-config.json:2`).
 **Numbering**: the tree plan's decision table runs to **D47** (`mod-4-orch-tree.plan.md:192`; no
 higher `D` number appears in it or in its blueprint), so this plan starts at **D48**.
 
-**Status**: fact-checked, amended, **CONFIRMED by the maintainer 2026-09-23** (answers under "Open
-questions"; OQ-7 adds D71 and spawns MOD-36/ANA-21). Blueprint
+**Status**: **complete** (2026-09-23, `fa03782`..`7ee0ac6`; review round `20cb2fa`..`7ee0ac6`
+plus the cap change `b86b62c`/`bcce4b9`). Fact-checked, amended and **CONFIRMED by the maintainer
+2026-09-23** (answers under "Open questions"; OQ-7 adds D71 and spawns MOD-36/ANA-21). Blueprint
 `.claude/plans/mod-4-orch-fanout.blueprint.md`; its A-1..A-7 accepted as D72–D78, its F-A..F-K
-corrections apply as written. **Next: wave A (T1–T5).** Branch `mod-4-m4`. The independent fact-check (318 claims) and how every non-confirmed finding was
-resolved are in the last section.
+corrections apply as written. Branch `mod-4-m4`. The independent fact-check (318 claims) and how
+every non-confirmed finding was resolved are in the last section.
 
 **Graphify note**: `graphify-out/GRAPH_REPORT.md` was built from `3e34610` (2026-09-15,
 `GRAPH_REPORT.md:12`), whose `crates/` holds four members and **no `htui-orch`** (`git ls-tree -d
@@ -81,6 +82,12 @@ engine.
       `feature` graph itself at the default (`4 × 2 = 8 > 6`). Criterion 8's case uses the two-phase `analysis` graph (`3 + 1 + 1 = 5`).
       **Alternative:** cap the widest position (`max over phases of fan_out + judge`), which never
       bites at the defaults; or raise the default in `0003`'s seed (a data change, not a migration).
+      **Revisited at the review gate (maintainer, 2026-09-23): the default is raised to 8.** The
+      literal reading stays; `0004_max_agents_per_run_default.sql` moves an untouched seeded `6` to
+      `8` (a user-changed value is left alone — `0003` is on `main` and cannot be edited) and
+      `graph.rs`'s built-in fallback follows, so the judged 3-way `feature` graph (7) runs by
+      default and a judged 4-way `implement` (8) sits exactly at the cap. `docs/ANA-2.md:871`,
+      `:1472`, `:1516` and `:1992` still say 6 and are not amended here.
 - [x] **OQ-2 — A diff renderer is needed now, and `gix` 0.87.1 ships only its primitives.** The
       judge's candidate block (`docs/ANA-2.md:828`) and the loop's `previous_diff` (M3 D32 moved it
       here) both need a `--stat` plus a unified diff over `before_hash..after_hash`. `gix` has tree
@@ -613,7 +620,7 @@ without `git` ≥ 2.33.0; this box has 2.43.0 (M3 fact ledger), so the gate here
 | **Observed on git 2.43.0 by the fact-check:** concurrent `git worktree add` on one repository races on another add's half-written `.git/worktrees/<id>/commondir` — `fatal: failed to read .git/worktrees/<id>/commondir: Success`, exit 128, ≈ 0.4 % per add (2 of 720), ≈ 1 % per 3-way group. No ref-lock collision was seen. M3's classifier does not retry this wording (`isolate/git.rs:844-851`), and the failed add leaves `htui/<step>` created with no worktree, so a blind `-b` retry would fail with "already exists" | Certain without mitigation | **D70**: every `git worktree add` is serialised per repository inside `GixIsolator`, so our own adds cannot race; T3 pins non-overlap with an in-flight counter, T8 runs 50 real 3-way groups without relying on any retry. Residual: another *process's* concurrent add on the same repository; that candidate fails readably (D48), never the run |
 | D48 deviates from ANA-2 `:1318-1319`'s "only the failed index is re-attempted": milestone 4 selects over the survivors and re-attempts nothing per candidate | Medium | Recorded in D48 with D65's `UNIQUE` argument; a human's `RetryStep` retries the whole group; the per-index re-attempt belongs to milestone 5's recovery sweep, whose section the passage is in |
 | Until MOD-11, no production agent writes a `judge` document, so every production judge fails and every fan-out goes to a human (OQ-4) | Certain | Recorded; the failure is readable (`judge_missing_document: call 0`) and the human path is criterion 10's; the harness proves the judge path |
-| `max_agents_per_run = 6` refuses ordinary judged fan-outs of the seeded `feature` graph (OQ-1) | High | The refusal names both figures; the maintainer's answer to OQ-1 may change the reading or the seed value; no code outside `graph.rs` depends on the reading |
+| ~~`max_agents_per_run = 6` refuses ordinary judged fan-outs of the seeded `feature` graph (OQ-1)~~ **Resolved at the review gate**: the default is 8 (`0004`, OQ-1); a judged fan-out wider than the default still refuses naming both figures | Low | The refusal names both figures; no code outside `graph.rs` depends on the reading |
 | A `shared_serialized` fan-out left undecided (judge failed, human away) leaves the maintainer's checked-out branch at the *last* sibling's commit, not the base | Medium | The park note says so and names the base and every sibling label; D56's reconcile restores the winner; milestone 6 renders it; the alternative (reset to base after every capture) would need isolator state per step |
 | `git reset --hard` on the maintainer's own checkout between siblings (D56) | Medium | Only when the tree is clean (else refused and nothing is touched), only to a commit that is already on the branch's history, and every sibling's commits stay reachable through its `htui/<step>` label |
 | D49's reading of "zero passing" as a failed group disagrees with SWE-agent's "filter disabled, judge everything" | Low | Criterion 9 does not cover zero passing; the choice is §4.2's settle rule (`:439`) applied to the group and is named in D49 |
