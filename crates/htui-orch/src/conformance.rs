@@ -3371,7 +3371,8 @@ async fn an_undeclared_item_holds_its_whole_primary_repo<H: CaseHarness>(harness
 }
 
 /// ANA-2 §12 criterion 16 (`:2128-2129`, plan D83): a parked run holds no slot but still holds
-/// its scope, and `SlotFull` is decided before overlap.
+/// its scope, and `SlotFull` is decided before overlap — C declares `src/**`, which overlaps the
+/// running A, and is refused for the slot, not for A.
 ///
 /// **A and B stand in for two live walks by hand** — both are started, park at their first gate,
 /// and are moved `awaiting_approval -> running` with the item mirrored. A walk that stays
@@ -3388,7 +3389,7 @@ async fn a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap<H: C
     let waiting = mint_feat(&orch, "E", &["lib/**"]).await;
     let first = mint_feat(&orch, "A", &["src/**"]).await;
     let second = mint_feat(&orch, "B", &["docs/**"]).await;
-    let third = mint_feat(&orch, "C", &["web/**"]).await;
+    let third = mint_feat(&orch, "C", &["src/**"]).await;
 
     let (holder, rest) = start(&orch, parked).await;
     assert_eq!(rest.run, RunStatus::AwaitingApproval);
@@ -3433,7 +3434,7 @@ async fn a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap<H: C
             running: 2,
             limit: 2,
         },
-        "`web/**` overlaps nothing; the box is full"
+        "`src/**` overlaps the running A, and the full box is what refuses it"
     );
     assert_eq!(run_of(&orch, queued).await.status, RunStatus::Queued);
 }
