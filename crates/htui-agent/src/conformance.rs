@@ -30,15 +30,16 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, CommandRun, Document, DocumentHead,
-    DocumentId, EventKind, EventRole, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
-    Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
-    Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
+    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, Claim, CommandRun, Document,
+    DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item, ItemFilter, ItemId,
+    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun,
+    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep,
+    NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch,
+    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
@@ -931,7 +932,7 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         owner: Uuid,
         at: DateTime<Utc>,
         lease_until: DateTime<Utc>,
-    ) -> StoreResult<bool> {
+    ) -> StoreResult<Claim> {
         self.inner
             .claim_run(run, box_id, owner, at, lease_until)
             .await

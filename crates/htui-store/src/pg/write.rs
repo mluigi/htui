@@ -17,7 +17,7 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, BoxSettings, ChatRunSpec, CommandRun, CommandRunId,
+    Agent, AgentBox, AgentId, BoxId, BoxSettings, ChatRunSpec, Claim, CommandRun, CommandRunId,
     CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId,
     ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision, NewCommandRun, NewDocument,
     NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
@@ -2468,124 +2468,9 @@ impl WriteStore for PgStore {
         owner: Uuid,
         at: DateTime<Utc>,
         lease_until: DateTime<Utc>,
-    ) -> Result<bool> {
-        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-
-        let claimed = sqlx::query!(
-            r#"
-            SELECT status        AS "status: RunStatus",
-                   target_box_id AS "target_box_id: BoxId",
-                   repo_scope    AS "repo_scope: Vec<RepoId>"
-              FROM run WHERE id = $1 FOR UPDATE
-            "#,
-            run.as_uuid(),
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_sqlx)?
-        .ok_or_else(|| StoreError::NotFound {
-            entity: "run",
-            id: run.to_string(),
-        })?;
-
-        let settings = sqlx::query_scalar!(
-            "SELECT settings FROM box WHERE id = $1 FOR UPDATE",
-            box_id.as_uuid(),
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_sqlx)?
-        .ok_or_else(|| StoreError::NotFound {
-            entity: "box",
-            id: box_id.to_string(),
-        })?;
-
-        if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
-            return Ok(false);
-        }
-
-        let limit = match serde_json::from_value::<BoxSettings>(settings)
-            .ok()
-            .and_then(|settings| settings.max_concurrent_items)
-        {
-            Some(limit) => limit,
-            None => sqlx::query_scalar!(
-                "SELECT value FROM app_setting WHERE key = 'max_concurrent_items'"
-            )
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(map_sqlx)?
-            .and_then(|value| value.as_u64())
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(DEFAULT_MAX_CONCURRENT_ITEMS),
-        };
-
-        let running = sqlx::query_scalar!(
-            "SELECT COUNT(*) FROM run WHERE executing_box_id = $1 AND status = 'running'",
-            box_id.as_uuid(),
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_sqlx)?
-        .unwrap_or(0);
-        if rows(running) >= u64::from(limit) {
-            return Ok(false);
-        }
-
-        let scope: Vec<Uuid> = claimed
-            .repo_scope
-            .iter()
-            .copied()
-            .map(RepoId::as_uuid)
-            .collect();
-        let overlaps = sqlx::query_scalar!(
-            "SELECT EXISTS (SELECT 1 FROM run \
-              WHERE executing_box_id = $1 \
-                AND status IN ('running','awaiting_approval') \
-                AND repo_scope && $2::uuid[])",
-            box_id.as_uuid(),
-            &scope,
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_sqlx)?
-        .unwrap_or(false);
-        if overlaps {
-            return Ok(false);
-        }
-
-        sqlx::query!(
-            "UPDATE run \
-                SET status           = 'running', \
-                    executing_box_id = $2, \
-                    started_at       = COALESCE(started_at, $4), \
-                    lease_box_id     = $2, \
-                    lease_owner      = $3, \
-                    lease_expires_at = $5 \
-              WHERE id = $1 AND status = 'queued'",
-            run.as_uuid(),
-            box_id.as_uuid(),
-            owner,
-            at,
-            lease_until,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx)?;
-
-        // A stale item status is not a refusal: the run is what is being claimed, and zero rows
-        // here means someone else already moved the item on.
-        sqlx::query!(
-            "UPDATE item SET status = 'in_progress', closed_at = NULL \
-              WHERE id = (SELECT item_id FROM run WHERE id = $1) AND status = 'queued'",
-            run.as_uuid(),
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx)?;
-
-        tx.commit().await.map_err(map_sqlx)?;
-        Ok(true)
+    ) -> Result<Claim> {
+        let _ = (run, box_id, owner, at, lease_until);
+        todo!("T2 (b): the final overlap predicate")
     }
 
     /// ANA-2 §4.9's heartbeat: a compare-and-set on `lease_owner`, not on the expiry.

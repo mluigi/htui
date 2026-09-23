@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProfile,
-    BoxRow, BoxSettings, BoxTool, ChatRunSpec, CommandRun, CommandRunId,
+    BoxRow, BoxSettings, BoxTool, ChatRunSpec, Claim, CommandRun, CommandRunId,
     DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, GateOutcome, Item,
     ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRevision,
     ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem,
@@ -3214,69 +3214,9 @@ impl State {
         at: DateTime<Utc>,
         lease_until: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> Result<bool> {
-        let claimed = self.require_run(run)?.clone();
-        if !self.boxes.contains_key(&box_id) {
-            return Err(StoreError::NotFound {
-                entity: "box",
-                id: box_id.to_string(),
-            });
-        }
-        if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
-            return Ok(false);
-        }
-
-        // Two predicates over two sets, which §4.7 draws apart on purpose. The slot count is
-        // `status = 'running'` alone — "an `awaiting_approval` run consumes no compute and must
-        // not hold a slot" — while the overlap predicate "ranges over non-terminal runs, including
-        // `awaiting_approval` ones, because a parked run still owns its trees and its unmerged
-        // branch" (invariant 6). A `queued` run is in neither: it has no `executing_box_id` and no
-        // tree.
-        let live: Vec<&Run> = self
-            .runs
-            .values()
-            .filter(|row| {
-                row.executing_box_id == Some(box_id)
-                    && matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
-            })
-            .collect();
-        let running = live
-            .iter()
-            .filter(|row| row.status == RunStatus::Running)
-            .count();
-        if rows(running) >= u64::from(self.max_concurrent_items(box_id)) {
-            return Ok(false);
-        }
-        // An empty `repo_scope` intersects nothing, so a run that declared none is never refused
-        // for overlap — the resolver, not the seam, is what turns an empty `touched_paths` into a
-        // scope (hazard H-10).
-        if live.iter().any(|row| {
-            row.repo_scope
-                .iter()
-                .any(|repo| claimed.repo_scope.contains(repo))
-        }) {
-            return Ok(false);
-        }
-
-        if let Some(row) = self.runs.get_mut(&run) {
-            row.status = RunStatus::Running;
-            row.executing_box_id = Some(box_id);
-            row.started_at = row.started_at.or(Some(at));
-            row.lease_box_id = Some(box_id);
-            row.lease_expires_at = Some(lease_until);
-            row.updated_at = now;
-        }
-        self.lease_owners.insert(run, owner);
-        if let Some(item) = claimed.item_id
-            && self
-                .items
-                .get(&item)
-                .is_some_and(|row| row.status == Status::Queued)
-        {
-            // A stale item status is not a refusal: the run is what is being claimed.
-            self.transition(item, Status::Queued, Status::InProgress, now)?;
-        }
-        Ok(true)
+    ) -> Result<Claim> {
+        let _ = (run, box_id, owner, at, lease_until, now);
+        todo!("T2 (b): the final overlap predicate")
     }
 
     /// ANA-2 §4.9's heartbeat: a compare-and-set on `lease_owner`, not on the expiry.
@@ -4465,7 +4405,7 @@ impl WriteStore for MemStore {
         owner: Uuid,
         at: DateTime<Utc>,
         lease_until: DateTime<Utc>,
-    ) -> Result<bool> {
+    ) -> Result<Claim> {
         let now = Utc::now();
         self.write(|state| state.claim_run(run, box_id, owner, at, lease_until, now))
     }
@@ -4608,11 +4548,11 @@ mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
     use crate::model::{
-        AgentBox, AgentId, BoxId, ChatRunSpec, DocumentId, GateOutcome, GraphSnapshot, Isolation,
-        ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject, NewRepo, NewRun,
-        NewRunStep, NoteId, ProjectId, RepoId, RunId, RunKind, RunMode, RunStatus, RunStepCommit,
-        RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
-        StepStatus, UserId, VerifyOutcome,
+        AgentBox, AgentId, BoxId, ChatRunSpec, Claim, DocumentId, GateOutcome, GraphSnapshot,
+        Isolation, ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject, NewRepo,
+        NewRun, NewRunStep, NoteId, OverlapRule, ProjectId, RepoId, RunId, RunKind, RunMode,
+        RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status,
+        StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -5968,11 +5908,12 @@ mod tests {
         let third = queue(ids::AGY_FEAT_1, ids::PROJECT_AGY, Vec::new()).await;
         let fourth = queue(ids::AGY_FIX_1, ids::PROJECT_AGY, Vec::new()).await;
 
-        assert!(
+        assert_eq!(
             store
                 .claim_run(first, ids::BOX, owner, at, until)
                 .await
                 .expect("the claim is answered"),
+            Claim::Admitted,
             "the first run is admitted"
         );
         let claimed = store
@@ -5996,11 +5937,15 @@ mod tests {
             "the item moved queued -> in_progress with the claim"
         );
 
-        assert!(
-            !store
+        assert_eq!(
+            store
                 .claim_run(second, ids::BOX, owner, at, until)
                 .await
                 .expect("the claim is answered"),
+            Claim::Overlaps {
+                with: first,
+                rule: OverlapRule::NotIsolated
+            },
             "an overlapping repo_scope is refused while one slot is still free"
         );
         assert_eq!(
@@ -6014,25 +5959,31 @@ mod tests {
             "a refused claim writes nothing"
         );
 
-        assert!(
+        assert_eq!(
             store
                 .claim_run(third, ids::BOX, owner, at, until)
                 .await
                 .expect("the claim is answered"),
+            Claim::Admitted,
             "an empty scope overlaps nothing"
         );
-        assert!(
-            !store
+        assert_eq!(
+            store
                 .claim_run(fourth, ids::BOX, owner, at, until)
                 .await
                 .expect("the claim is answered"),
+            Claim::SlotFull {
+                running: 2,
+                limit: 2
+            },
             "`max_concurrent_items` is 2 on the fixture box"
         );
-        assert!(
-            !store
+        assert_eq!(
+            store
                 .claim_run(first, ids::BOX, owner, at, until)
                 .await
                 .expect("the claim is answered"),
+            Claim::NotClaimable,
             "a run that is not queued is not claimable"
         );
 
@@ -6079,11 +6030,12 @@ mod tests {
             .await
             .expect("the run is queued")
             .id;
-        assert!(
+        assert_eq!(
             store
                 .claim_run(run, ids::BOX, first_owner, at, until)
                 .await
-                .expect("the claim is answered")
+                .expect("the claim is answered"),
+            Claim::Admitted
         );
 
         let extended = until + TimeDelta::minutes(5);
@@ -7192,16 +7144,19 @@ mod tests {
             .expect("the run is queued")
             .id;
         let at = Utc::now();
-        store
-            .claim_run(
-                run,
-                ids::BOX,
-                Uuid::now_v7(),
-                at,
-                at + TimeDelta::minutes(5),
-            )
-            .await
-            .expect("the claim is answered");
+        assert_eq!(
+            store
+                .claim_run(
+                    run,
+                    ids::BOX,
+                    Uuid::now_v7(),
+                    at,
+                    at + TimeDelta::minutes(5),
+                )
+                .await
+                .expect("the claim is answered"),
+            Claim::Admitted
+        );
         assert_eq!(
             store
                 .active_runs_on_box(ids::BOX)

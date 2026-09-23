@@ -31,12 +31,12 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, CommandRun, Document, DocumentHead, DocumentId,
-    GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind,
-    NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId,
-    RepoPatch, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Claim, CommandRun, Document, DocumentHead,
+    DocumentId, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
+    ItemPatch, ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
+    Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath,
+    RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
     RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
     StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath,
     WorkspaceId, WorkspacePatch, WorkspaceProject,
@@ -688,22 +688,32 @@ pub trait WriteStore: ReadStore {
     /// on any foreign key.
     async fn create_run(&self, new: NewRun) -> Result<Run>;
 
-    /// ANA-2 §4.7's admission, one transaction: lock the box row, count its **`running`** runs
-    /// against
-    /// [`BoxSettings::max_concurrent_items`](crate::model::BoxSettings::max_concurrent_items)
-    /// (else `app_setting`, else
-    /// [`DEFAULT_MAX_CONCURRENT_ITEMS`](crate::model::DEFAULT_MAX_CONCURRENT_ITEMS)), refuse any
-    /// overlap between `run.repo_scope` and a **non-terminal** run's scope on the same box, then
-    /// move the run `queued -> running` with `executing_box_id = box_id`, `started_at = at`,
-    /// `lease_box_id = box_id`, `lease_owner = owner`, `lease_expires_at = lease_until`, and the
-    /// item `queued -> in_progress`.
+    /// ANA-2 §4.7's admission, one transaction, answered as a [`Claim`] (plan D83).
+    ///
+    /// The decision order: `NotFound` for the run, then the box; [`Claim::NotClaimable`] when the
+    /// run is not `queued` or its `target_box_id` is not `box_id`; [`Claim::SlotFull`] when the
+    /// box already runs its limit of **`running`** runs
+    /// ([`BoxSettings::max_concurrent_items`](crate::model::BoxSettings::max_concurrent_items),
+    /// else `app_setting`, else
+    /// [`DEFAULT_MAX_CONCURRENT_ITEMS`](crate::model::DEFAULT_MAX_CONCURRENT_ITEMS)); then
+    /// [`Claim::Overlaps`] naming the first **non-terminal** run on the box, in
+    /// `(queued_at, id)` order, that §4.7's predicate
+    /// [`overlaps`](crate::model::overlap::overlaps) says it collides with: rule L (either run is
+    /// `local` in a shared repo), rule I (either is not isolated there), rule P (both are
+    /// isolated but their path prefixes intersect, an empty list meaning the whole repo). Only
+    /// runs whose `repo_scope` shares a repo with this one are compared. Each side's scope is
+    /// [`scope_of`](crate::model::overlap::scope_of) over its `graph_snapshot`, so a run written
+    /// before milestone 5 (no `scope`) reads conservatively: any shared repo overlaps, as
+    /// [`OverlapRule::NotIsolated`](crate::model::OverlapRule::NotIsolated).
+    ///
+    /// On [`Claim::Admitted`] the run moves `queued -> running` with `executing_box_id = box_id`,
+    /// `started_at = at`, `lease_box_id = box_id`, `lease_owner = owner`,
+    /// `lease_expires_at = lease_until`, and the item `queued -> in_progress`. Every other answer
+    /// writes nothing.
     ///
     /// The two predicates range over two different sets, and `awaiting_approval` is where they
     /// part: a parked run consumes no compute and so holds no slot, but it still owns its trees
     /// and its unmerged branch and so still refuses an overlapping scope (§4.7, invariant 6).
-    ///
-    /// `Ok(false)` when the slot or the overlap check refuses, when the run is not `queued`, or
-    /// when its `target_box_id` is not `box_id`; nothing is written in any of those cases.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown run (`"run"`)
@@ -715,7 +725,7 @@ pub trait WriteStore: ReadStore {
         owner: Uuid,
         at: DateTime<Utc>,
         lease_until: DateTime<Utc>,
-    ) -> Result<bool>;
+    ) -> Result<Claim>;
 
     /// ANA-2 §4.9's heartbeat: `UPDATE run SET lease_expires_at = until WHERE id = run AND
     /// lease_owner = owner`. `Ok(false)` = zero rows = abandon; the run exists but is not ours.

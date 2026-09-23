@@ -18,7 +18,7 @@ use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, CommandRunId, CommandRunStatus, GraphSnapshot,
+    Agent, AgentBox, AgentId, Billing, BoxId, Claim, CommandRunId, CommandRunStatus, GraphSnapshot,
     Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, NewCommandRun, NewItem,
     NewProject, NewRepo, NewRun, NewWorkspace, ProjectId, RepoId, RunId, RunMode, RunStatus,
     RunStepTree, SnapshotGraph, SnapshotSettings, Status, StepId, TIMESTAMPTZ_DIGITS, Transport,
@@ -628,9 +628,18 @@ async fn admission_is_serialised_by_the_box_row_lock() {
     let two = two.expect("the second claim must not fail");
 
     assert_eq!(
-        usize::from(one) + usize::from(two),
+        usize::from(one.is_admitted()) + usize::from(two.is_admitted()),
         1,
         "exactly one claim may take the last slot, got ({one}, {two})"
+    );
+    let refusal = if one.is_admitted() { two } else { one };
+    assert_eq!(
+        refusal,
+        Claim::SlotFull {
+            running: 1,
+            limit: 1
+        },
+        "the loser counted the winner's run against the one slot"
     );
     assert_eq!(
         count_running_on_box(&db.pool, ids::BOX).await,
@@ -638,7 +647,7 @@ async fn admission_is_serialised_by_the_box_row_lock() {
         "the box that was allowed one concurrent run holds one"
     );
 
-    let loser = if one { second } else { first };
+    let loser = if one.is_admitted() { second } else { first };
     let refused = db
         .store
         .run(loser)
@@ -3353,11 +3362,12 @@ async fn finish_run_holds_the_item_while_another_run_is_live() {
         .expect("the second run is queued")
         .id;
     for run in [left, right] {
-        assert!(
+        assert_eq!(
             db.store
                 .claim_run(run, ids::BOX, owner, at, until)
                 .await
                 .expect("the claim must not fail"),
+            Claim::Admitted,
             "both runs fit the fixture box's two slots"
         );
     }

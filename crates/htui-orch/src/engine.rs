@@ -444,15 +444,15 @@ where
             .await?;
 
         let lease = now + TimeDelta::try_seconds(LEASE_SECONDS).unwrap_or(TimeDelta::zero());
-        // `Ok(false)` is ANA-2 §4.7's admission refusing: the box is at `max_concurrent_items` or
-        // the scope overlaps a live run. Nothing is written, the run stays `queued`, and the
-        // predicate itself stays milestone 1's (plan D6, R-2 untouched).
-        if !self
+        // Anything but `Admitted` is ANA-2 §4.7's admission refusing: the box is at
+        // `max_concurrent_items` or the scope overlaps a live run (plan D83). Nothing is written
+        // and the run stays `queued`.
+        let claim = self
             .parts
             .store
             .claim_run(id, self.parts.box_id, self.parts.owner, now, lease)
-            .await?
-        {
+            .await?;
+        if !claim.is_admitted() {
             return Err(EngineError::ClaimRefused { run: id });
         }
 

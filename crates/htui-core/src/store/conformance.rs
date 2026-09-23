@@ -14,16 +14,17 @@ use uuid::Uuid;
 
 use crate::fixtures::ids;
 use crate::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, CommandQueue, CommandRun, CommandRunId,
-    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Gate,
-    GateOutcome, GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
-    ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
-    NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, NoteId, PhaseId,
-    PhasePatch, ProjectId, ProjectPatch, PromptScope, RepoBoxPath, RepoId, RepoPatch, Run, RunId,
-    RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent,
-    SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, Claim, CommandQueue, CommandRun,
+    CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole,
+    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
+    NoteId, OverlapRule, PhaseId, PhasePatch, ProjectId, ProjectPatch, PromptScope, RepoBoxPath,
+    RepoId, RepoPatch, RepoScope, Run, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph, SnapshotSettings, Status,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -83,6 +84,7 @@ pub const CASES: &[&str] = &[
     "close_out_refuses_a_live_run",
     "illegal_transitions_are_constraint",
     "finish_run_moves_run_and_item_together",
+    "claim_run_applies_the_isolation_and_path_rules",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -164,6 +166,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "illegal_transitions_are_constraint" => illegal_transitions_are_constraint(store).await,
         "finish_run_moves_run_and_item_together" => {
             finish_run_moves_run_and_item_together(store).await;
+        }
+        "claim_run_applies_the_isolation_and_path_rules" => {
+            claim_run_applies_the_isolation_and_path_rules(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -4097,11 +4102,12 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     let at = seam_clock();
     let until = at + TimeDelta::minutes(5);
 
-    assert!(
+    assert_eq!(
         store
             .claim_run(first, ids::BOX, owner, at, until)
             .await
             .expect(CASE),
+        Claim::Admitted,
         "{CASE}: the first run is admitted"
     );
     let claimed = run_row(CASE, store, first).await;
@@ -4136,11 +4142,15 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
         "{CASE}: the item moved queued -> in_progress with the claim"
     );
 
-    assert!(
-        !store
+    assert_eq!(
+        store
             .claim_run(second, ids::BOX, owner, at, until)
             .await
             .expect(CASE),
+        Claim::Overlaps {
+            with: first,
+            rule: OverlapRule::NotIsolated
+        },
         "{CASE}: an overlapping repo_scope is refused while a slot is still free"
     );
     assert_eq!(
@@ -4154,22 +4164,27 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
         "{CASE}: nor to its item"
     );
 
-    assert!(
+    assert_eq!(
         store
             .claim_run(third, ids::BOX, owner, at, until)
             .await
             .expect(CASE),
+        Claim::Admitted,
         "{CASE}: an empty scope overlaps nothing (hazard H-10)"
     );
     assert_eq!(
         DEFAULT_MAX_CONCURRENT_ITEMS, 2,
         "{CASE}: the next leg reads as it does because the default is two"
     );
-    assert!(
-        !store
+    assert_eq!(
+        store
             .claim_run(fourth, ids::BOX, owner, at, until)
             .await
             .expect(CASE),
+        Claim::SlotFull {
+            running: 2,
+            limit: 2
+        },
         "{CASE}: the box is full at DEFAULT_MAX_CONCURRENT_ITEMS running runs"
     );
     // §4.7 draws the two predicates over two different sets, and `awaiting_approval` is where they
@@ -4184,26 +4199,32 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
             .expect(CASE),
         "{CASE}: the first run parks at a gate"
     );
-    assert!(
-        !store
+    assert_eq!(
+        store
             .claim_run(second, ids::BOX, owner, at, until)
             .await
             .expect(CASE),
+        Claim::Overlaps {
+            with: first,
+            rule: OverlapRule::NotIsolated
+        },
         "{CASE}: a parked run still holds the trees of its repo_scope"
     );
-    assert!(
+    assert_eq!(
         store
             .claim_run(fourth, ids::BOX, owner, at, until)
             .await
             .expect(CASE),
+        Claim::Admitted,
         "{CASE}: but it holds no slot, so the box that was full has one free"
     );
 
-    assert!(
-        !store
+    assert_eq!(
+        store
             .claim_run(first, ids::BOX, owner, at, until)
             .await
             .expect(CASE),
+        Claim::NotClaimable,
         "{CASE}: a run that is no longer queued is not claimable"
     );
 
@@ -4220,6 +4241,202 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     assert!(
         matches!(no_run, Err(StoreError::NotFound { entity: "run", .. })),
         "{CASE}: the run is looked up before the box, got {no_run:?}"
+    );
+}
+
+/// ANA-2 §4.7's rules L, I and P, as both stores decide them inside `claim_run` (plan D80, D83):
+/// the verdict names the first overlapping live run in `(queued_at, id)` order and the rule that
+/// fired, and a refusal writes nothing.
+///
+/// Criterion 15's parallel half is legs A and B (two isolated runs on disjoint paths of one repo
+/// both run). Criterion 16's two halves are C–F and G–H: a **parked** run still refuses an
+/// overlapping scope, and holds no slot, so two runs on another repo still fit beside it. The
+/// two admitted runs are parked before the overlap legs because the fixture box has two slots
+/// and `SlotFull` is decided before `Overlaps` (blueprint F-E); every run gets its own
+/// `queued_at` so "the first" never rests on `RunId` order.
+async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_applies_the_isolation_and_path_rules";
+    let core = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    let web = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "web", false))
+        .await
+        .expect(CASE)
+        .id;
+
+    let isolated = |prefixes: &[&str]| RepoScope {
+        isolated: true,
+        local: false,
+        prefixes: prefixes.iter().map(|prefix| (*prefix).to_owned()).collect(),
+    };
+    let legs: [(char, Vec<(RepoId, RepoScope)>); 9] = [
+        ('A', vec![(core, isolated(&["src/"]))]),
+        ('B', vec![(core, isolated(&["docs/"]))]),
+        ('C', vec![(core, isolated(&["src/lib/"]))]),
+        ('D', vec![(core, RepoScope::default())]),
+        (
+            'E',
+            vec![(
+                core,
+                RepoScope {
+                    local: true,
+                    ..RepoScope::default()
+                },
+            )],
+        ),
+        ('F', vec![(core, isolated(&[]))]),
+        ('G', vec![(web, isolated(&["src/"]))]),
+        ('H', vec![(web, isolated(&["docs/"]))]),
+        ('I', Vec::new()),
+    ];
+
+    let at = seam_clock();
+    let mut runs = Vec::new();
+    for (offset, (leg, repos)) in (0_i64..).zip(legs) {
+        let item = store
+            .mint_item(new_item(
+                ids::PROJECT_HTUI,
+                ids::KIND_HTUI_FEAT,
+                &format!("Leg {leg}"),
+            ))
+            .await
+            .expect(CASE)
+            .id;
+        let repo_scope: Vec<RepoId> = repos.iter().map(|(repo, _)| *repo).collect();
+        let scope = (!repos.is_empty()).then(|| RunScope {
+            repos: repos.into_iter().collect(),
+        });
+        let run = store
+            .create_run(NewRun {
+                graph_snapshot: GraphSnapshot {
+                    scope,
+                    ..run_snapshot()
+                },
+                queued_at: at + TimeDelta::seconds(offset),
+                ..new_run(ids::PROJECT_HTUI, item, repo_scope)
+            })
+            .await
+            .expect(CASE)
+            .id;
+        runs.push((item, run));
+    }
+    let [
+        (_, a),
+        (_, b),
+        (c_item, c),
+        (_, d),
+        (_, e),
+        (_, f),
+        (_, g),
+        (_, h),
+        (_, i),
+    ] = runs[..]
+    else {
+        panic!("{CASE}: nine runs were queued")
+    };
+
+    let owner = Uuid::now_v7();
+    let claimed_at = at + TimeDelta::minutes(1);
+    let until = claimed_at + TimeDelta::minutes(5);
+    let claim = |run: RunId| store.claim_run(run, ids::BOX, owner, claimed_at, until);
+
+    assert_eq!(
+        claim(a).await.expect(CASE),
+        Claim::Admitted,
+        "{CASE}: A, isolated on core's src/, is alone on the box"
+    );
+    assert_eq!(
+        claim(b).await.expect(CASE),
+        Claim::Admitted,
+        "{CASE}: B, isolated on core's docs/, runs beside A (criterion 15)"
+    );
+    for run in [a, b] {
+        assert!(
+            store
+                .transition_run(
+                    run,
+                    RunStatus::Running,
+                    RunStatus::AwaitingApproval,
+                    claimed_at
+                )
+                .await
+                .expect(CASE),
+            "{CASE}: the admitted run parks at a gate"
+        );
+    }
+
+    assert_eq!(
+        claim(c).await.expect(CASE),
+        Claim::Overlaps {
+            with: a,
+            rule: OverlapRule::Paths
+        },
+        "{CASE}: C's src/lib/ is inside parked A's src/ (rule P)"
+    );
+    assert_eq!(
+        run_row(CASE, store, c).await.status,
+        RunStatus::Queued,
+        "{CASE}: a refused claim writes nothing to the run"
+    );
+    assert_eq!(
+        item_row(CASE, store, c_item).await.status,
+        Status::Queued,
+        "{CASE}: nor to its item"
+    );
+    assert_eq!(
+        claim(d).await.expect(CASE),
+        Claim::Overlaps {
+            with: a,
+            rule: OverlapRule::NotIsolated
+        },
+        "{CASE}: D is not isolated on core (rule I), and A is the first live run"
+    );
+    assert_eq!(
+        claim(e).await.expect(CASE),
+        Claim::Overlaps {
+            with: a,
+            rule: OverlapRule::Local
+        },
+        "{CASE}: E is local on core (rule L)"
+    );
+    assert_eq!(
+        claim(f).await.expect(CASE),
+        Claim::Overlaps {
+            with: a,
+            rule: OverlapRule::Paths
+        },
+        "{CASE}: F declared no path, which is the whole repo"
+    );
+
+    assert_eq!(
+        claim(g).await.expect(CASE),
+        Claim::Admitted,
+        "{CASE}: G is on web alone, and the parked runs hold no slot (criterion 16)"
+    );
+    assert_eq!(
+        claim(h).await.expect(CASE),
+        Claim::Admitted,
+        "{CASE}: H is on web's docs/, disjoint from G's src/"
+    );
+    assert_eq!(
+        DEFAULT_MAX_CONCURRENT_ITEMS, 2,
+        "{CASE}: the next leg reads as it does because the default is two"
+    );
+    assert_eq!(
+        claim(i).await.expect(CASE),
+        Claim::SlotFull {
+            running: 2,
+            limit: 2
+        },
+        "{CASE}: I overlaps nothing, but G and H fill the box"
+    );
+    assert_eq!(
+        run_row(CASE, store, i).await.status,
+        RunStatus::Queued,
+        "{CASE}: a full box writes nothing either"
     );
 }
 
@@ -4240,11 +4457,12 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
         .await
         .expect(CASE)
         .id;
-    assert!(
+    assert_eq!(
         store
             .claim_run(run, ids::BOX, first_owner, at, until)
             .await
             .expect(CASE),
+        Claim::Admitted,
         "{CASE}: the run is admitted"
     );
 
@@ -5919,11 +6137,12 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
         .await
         .expect(CASE)
         .id;
-    assert!(
+    assert_eq!(
         store
             .claim_run(first, ids::BOX, owner, at, until)
             .await
             .expect(CASE),
+        Claim::Admitted,
         "{CASE}: the run is admitted, so the item is in_progress"
     );
     store
@@ -5976,11 +6195,12 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
         .expect(CASE)
         .id;
     for run in [left, right] {
-        assert!(
+        assert_eq!(
             store
                 .claim_run(run, ids::BOX, owner, at, until)
                 .await
                 .expect(CASE),
+            Claim::Admitted,
             "{CASE}: both runs fit the box's two slots"
         );
     }
@@ -6014,11 +6234,12 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
         .await
         .expect(CASE)
         .id;
-    assert!(
+    assert_eq!(
         store
             .claim_run(failing, ids::BOX, owner, at, until)
             .await
             .expect(CASE),
+        Claim::Admitted,
         "{CASE}: the box is free again"
     );
     store

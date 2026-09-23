@@ -33,14 +33,15 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, CommandRun, Document, DocumentHead, DocumentId,
-    GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
-    NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Claim, CommandRun, Document, DocumentHead,
+    DocumentId, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
+    ItemPatch, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
+    NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
+    Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch,
+    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -677,7 +678,7 @@ impl WriteStore for Writer {
         owner: Uuid,
         at: DateTime<Utc>,
         lease_until: DateTime<Utc>,
-    ) -> Result<bool> {
+    ) -> Result<Claim> {
         match self {
             Self::Memory(store) => store.claim_run(run, box_id, owner, at, lease_until).await,
             Self::Online(pg) => pg.claim_run(run, box_id, owner, at, lease_until).await,
