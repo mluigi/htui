@@ -984,6 +984,7 @@ cargo doc -p htui-core --no-deps --all-features # no new error beyond MIRRORED_T
 | **D118** | `restarted()` shares the store, clones scripts and candidates, gets a fresh isolator, verifier and owner, advances the clock by `RESTART_GAP = 10 min`, and never carries stalls. |
 | **D119** | `overlap::resolve`'s rules (§7.1): `UnknownTouchedRepo` fires with or without a requested scope; a requested scope keeps its order and filters prefixes; with no primary, a bare glob is dropped. |
 | **D120** | `EngineError::{ClaimRefused { run, claim }, LeaseLost, LeaseHeld}` bytes (§8.1). |
+| **D121** | (Maintainer, 2026-09-23, from T3's verifier finding T3-V2.) `GixIsolator::reset` also refuses a `shared_serialized` row that it would reset when the working tree holds an untracked, not-ignored path that is tracked at `base_ref`. It refuses with `dirty_tree_not_reset: <path>`, writes nothing, and the engine takes D93's path. Reason: `git::is_dirty` excludes untracked files, and `reset --hard <base_ref>` silently overwrites an untracked file whose path `base_ref` tracks (reproduced with plain git). An untracked path that `base_ref` does not track survives the reset, so it does not refuse. The claim at `git.rs:1259` that "a reset never deletes an untracked file" is corrected. |
 
 ---
 
