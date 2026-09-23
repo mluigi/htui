@@ -3161,6 +3161,20 @@ mod tests {
         String,
         [(StepId, String, Vec<RunStepTree>); 2],
     ) {
+        shared_siblings(dir, [true, true]).await
+    }
+
+    /// Two `shared_serialized` siblings of one group, prepared, worked and captured in turn;
+    /// sibling `i` commits only when `commits[i]`, and its tip is the base when it does not.
+    async fn shared_siblings(
+        dir: &Path,
+        commits: [bool; 2],
+    ) -> (
+        GixIsolator,
+        PathBuf,
+        String,
+        [(StepId, String, Vec<RunStepTree>); 2],
+    ) {
         let (core, core_checkout, head) = repo(dir, "core", true);
         let core_path = core_checkout.local_path.clone();
         let isolator = GixIsolator::new(config(&dir.join("trees"), &[(core, core_checkout)]))
@@ -3180,12 +3194,16 @@ mod tests {
                 )
                 .await
                 .expect("the sibling prepares");
-            let tip = commit_file(
-                &core_path,
-                "g",
-                &format!("sibling {index}\n"),
-                "the sibling commits",
-            );
+            let tip = if commits[usize::try_from(index).expect("a small index")] {
+                commit_file(
+                    &core_path,
+                    "g",
+                    &format!("sibling {index}\n"),
+                    "the sibling commits",
+                )
+            } else {
+                head.clone()
+            };
             let rows = rows(&prepared);
             isolator
                 .capture(step, &rows)
@@ -3233,6 +3251,75 @@ mod tests {
             .await
             .expect("a second reconcile is the identity");
         assert_eq!(again, commits);
+    }
+
+    /// D56: the last sibling committed nothing, so `HEAD` is the group base — which no sibling
+    /// label names — and the move to an earlier winner's label is still taken.
+    #[tokio::test]
+    async fn shared_serialized_reconcile_moves_from_the_base_to_an_earlier_winner() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core_path, head, [zero, one]) =
+            shared_siblings(dir.path(), [true, false]).await;
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head,
+            "the last sibling left the checkout at the base"
+        );
+
+        let commits = isolator
+            .reconcile(zero.0, &zero.2, &[one.0])
+            .await
+            .expect("the winner reconciles");
+        assert_eq!(commits[0].before_hash, head);
+        assert_eq!(commits[0].after_hash.as_deref(), Some(&*zero.1));
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            zero.1,
+            "the checked-out branch moved to the winner's label"
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("g")).expect("the file reads"),
+            "sibling 0\n"
+        );
+    }
+
+    /// D56: a winner that committed nothing has no label, so the checkout a later sibling moved
+    /// goes back to the group base and the winner's answer is `None`.
+    #[tokio::test]
+    async fn shared_serialized_reconcile_of_an_empty_winner_resets_to_the_base() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core_path, head, [zero, one]) =
+            shared_siblings(dir.path(), [false, true]).await;
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            one.1,
+            "the last sibling left the checkout at its own tip"
+        );
+
+        let commits = isolator
+            .reconcile(zero.0, &zero.2, &[one.0])
+            .await
+            .expect("the winner reconciles");
+        assert_eq!(commits[0].before_hash, head);
+        assert_eq!(commits[0].after_hash, None);
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head,
+            "the checked-out branch went back to the base"
+        );
+        assert!(!core_path.join("g").exists(), "sibling 1's file is gone");
+        assert_eq!(
+            crate::isolate::git::branch_target(&core_path, &format!("htui/{}", one.0))
+                .expect("the ref store reads"),
+            Some(one.1),
+            "and the loser's work survives under its label"
+        );
     }
 
     /// D56: a `HEAD` that is neither the base nor any sibling's label was moved by somebody else,
