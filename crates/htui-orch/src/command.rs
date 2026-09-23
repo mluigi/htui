@@ -22,7 +22,7 @@ use htui_core::store::StoreError;
 
 use crate::graph::ResolveError;
 use crate::isolate::IsolateError;
-use crate::status::{RunFailure, may_attempt};
+use crate::status::{RunFailure, latest_at, may_attempt};
 
 /// What a human asks the orchestrator to do, in manual mode (ANA-2 §6.2, `docs/ANA-2.md:1557`).
 ///
@@ -198,6 +198,7 @@ pub enum EngineError {
     },
     /// Plan D65: a fan-out retry named a member of a slot a later attempt already replaced, so
     /// there is nothing for it to retry — the position's latest slot is the only one admitted.
+    /// Plan D134 applies the same rule to a single step's retry.
     #[error("step {step} is in attempt {attempt}; retry names a member of the latest, {latest}")]
     StaleSlot {
         /// The step named.
@@ -444,15 +445,18 @@ pub fn answer_gate_enabled(
 /// plan D92 says "is not the agent's failed settle". The budget bounds automatic retries, and a
 /// human choosing to retry after a crash is not one.
 ///
+/// `steps` are the run's rows: only the position's latest attempt ([`latest_at`]) is retryable
+/// (plan D134), as a fan-out retry names only a member of the latest slot.
+///
 /// Two things this guard deliberately does **not** check, because they need rows it is not given:
 /// that the run is non-terminal, and that the item is not `blocked`
 /// ([`EngineError::ItemBlocked`], blueprint F-J). Both are the engine's, at dispatch.
 ///
 /// # Errors
-/// [`EngineError::NotGated`] for any other step status; [`EngineError::RetryExhausted`] when the
-/// budget is spent.
+/// [`EngineError::NotGated`] for any other step status; [`EngineError::StaleSlot`] for an attempt
+/// a later one replaced; [`EngineError::RetryExhausted`] when the budget is spent.
 pub fn retry_enabled(
-    _steps: &[RunStep],
+    steps: &[RunStep],
     step: &RunStep,
     phase: &SnapshotPhase,
 ) -> Result<(), EngineError> {
@@ -464,6 +468,17 @@ pub fn retry_enabled(
             step: step.id,
             status: step.status,
             expected: "awaiting_approval | failed",
+        });
+    }
+    // Plan D134: a later attempt already replaced this one, so there is nothing for a retry to
+    // replace — and A-8's exemption below must not reach an older interrupted row.
+    if let Some(latest) = latest_at(steps, step.position)
+        && latest.attempt != step.attempt
+    {
+        return Err(EngineError::StaleSlot {
+            step: step.id,
+            attempt: step.attempt,
+            latest: latest.attempt,
         });
     }
     if !may_attempt(step.attempt + 1, phase.retry_limit) && !interrupted(step) {
