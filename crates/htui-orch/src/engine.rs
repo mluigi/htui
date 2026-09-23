@@ -338,7 +338,10 @@ where
 /// go looking for. The note is still written — it is what an operator reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resume {
-    /// The live graph still hashes to the run's own `topology`; the walk ran.
+    /// The snapshot was walked. Either the live graph still hashes to the run's own `topology`,
+    /// or the live graph no longer resolves under a start-time rule (a fan-out or agent cap, a
+    /// review or local fan-out, no candidate) and so was not compared at all: the item's
+    /// `live graph not comparable` note says which rule refused it.
     Walked(Rest),
     /// The live graph moved. **Nothing was advanced**: invariant 2 says a run walks its snapshot,
     /// and §4.9's resume says a mismatch is a human's decision, not the engine's.
