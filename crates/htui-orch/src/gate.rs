@@ -20,10 +20,7 @@ use htui_core::store::{StoreError, WriteStore};
 
 use crate::command::{EngineError, Rest};
 use crate::isolate::Clock;
-use crate::status::{RunFailure, latest_at, may_attempt};
-
-/// The `fanout_index` the walk creates and retires; fan-out's other indices are milestone 4's.
-const WALKED_FANOUT_INDEX: i32 = 0;
+use crate::status::{RunFailure, latest_at, may_attempt, winner_at};
 
 /// The phase name §4.4 step 1 looks for when it picks a loop target (`docs/ANA-2.md:713-715`).
 ///
@@ -764,10 +761,22 @@ async fn no_progress<S: WriteStore, C: Clock + ?Sized>(
     Ok(None)
 }
 
-/// The `after_hash` of every repo in scope, identical across attempts `a` and `a - 1`.
+/// The `after_hash` of every repo in scope, identical across the winners of attempts `a` and
+/// `a - 1`.
 ///
 /// An empty `repo_scope` — the demo fixture's own shape, since it holds no repos — cannot decide
 /// anything, so it answers `false` and leaves the verdict to the review-body half.
+///
+/// Each attempt is read through [`winner_at`] (plan D66): the `selected` candidate of a fanned-out
+/// slot, else its `fanout_index 0`, which is the one row a `fan_out = 1` slot holds. Reading index
+/// 0 regardless would compare a loser whenever the judge picked another index.
+///
+/// **R-8 is closed with no predicate change** (plan D66). The winner's `after_hash` is its
+/// post-reconcile hash, and two consecutive attempts can only agree on it when both are `NULL`:
+/// attempt `a + 1` branches from a primary `HEAD` that already contains attempt `a`'s merge, so any
+/// commit it makes is a descendant of both of attempt `a`'s hashes, pre- and post-merge, and
+/// differs from each. Keeping the pre-merge hash as well would therefore change no answer, and
+/// reconcile keeps a `NULL` `after_hash` `NULL`.
 async fn commits_are_identical<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
@@ -777,10 +786,10 @@ async fn commits_are_identical<S: WriteStore, C: Clock + ?Sized>(
     if ctx.run.repo_scope.is_empty() {
         return Ok(false);
     }
-    let Some(this) = at(steps, target, attempt) else {
+    let Some(this) = winner_at(steps, target, attempt).map(|step| step.id) else {
         return Ok(false);
     };
-    let Some(previous) = at(steps, target, attempt - 1) else {
+    let Some(previous) = winner_at(steps, target, attempt - 1).map(|step| step.id) else {
         return Ok(false);
     };
     let this = ctx.store.step_commits(this).await?;
@@ -838,19 +847,8 @@ async fn reviews_are_identical<S: WriteStore, C: Clock + ?Sized>(
     Ok(sha256_hex(&canonical(&newest.body)) == sha256_hex(&canonical(&previous.body)))
 }
 
-/// The step at exactly `(position, attempt, 0)`.
-fn at(steps: &[RunStep], position: i32, attempt: i32) -> Option<htui_core::model::StepId> {
-    steps
-        .iter()
-        .find(|step| {
-            step.position == position
-                && step.attempt == attempt
-                && step.fanout_index == WALKED_FANOUT_INDEX
-        })
-        .map(|step| step.id)
-}
-
-/// §4.4 step 3, widened to the whole chain by plan D5 and split by status by fact-check F14b.
+/// §4.4 step 3, widened to the whole chain by plan D5 and split by status by fact-check F14b: every
+/// position of `from..=to` is retired through [`retire_slot`].
 async fn retire<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
@@ -859,9 +857,44 @@ async fn retire<S: WriteStore, C: Clock + ?Sized>(
     now: DateTime<Utc>,
 ) -> Result<(), EngineError> {
     for position in from..=to {
-        let Some(step) = latest_at(steps, position) else {
-            continue;
-        };
+        retire_slot(ctx, steps, position, now).await?;
+    }
+    Ok(())
+}
+
+/// Retires the latest slot at `position` (plan D66, blueprint F-C): every row at
+/// `(position, max attempt over every row at position)`, candidates and judge alike.
+///
+/// A `fan_out = 1` slot is its one `fanout_index 0` row, so this is exactly the retirement the
+/// loop has done since milestone 2. A fanned-out slot is retired whole — ANA-2 `:754-758`, "the
+/// previous attempt's winner and losers are all `superseded`" — and its judge with it, so the
+/// next attempt judges again. The attempt is the maximum over *all* rows rather than
+/// [`latest_at`]'s index-0 reading, so a slot is never split across two attempts.
+///
+/// By M2 D5's status split: `pending`, `awaiting_approval` and `done` are superseded; `running`
+/// and `failed` are cancelled; `superseded` and `cancelled` are already retired and left alone.
+/// A position with no rows is skipped.
+///
+/// # Errors
+/// Every [`EngineError`] `supersede_step` and `transition_step` can raise.
+pub(crate) async fn retire_slot<S: WriteStore, C: Clock + ?Sized>(
+    ctx: &GateContext<'_, S, C>,
+    steps: &[RunStep],
+    position: i32,
+    now: DateTime<Utc>,
+) -> Result<(), EngineError> {
+    let Some(attempt) = steps
+        .iter()
+        .filter(|step| step.position == position)
+        .map(|step| step.attempt)
+        .max()
+    else {
+        return Ok(());
+    };
+    let slot = steps
+        .iter()
+        .filter(|step| step.position == position && step.attempt == attempt);
+    for step in slot {
         match step.status {
             StepStatus::Pending | StepStatus::AwaitingApproval | StepStatus::Done => {
                 ctx.store.supersede_step(step.id).await?;
@@ -870,7 +903,8 @@ async fn retire<S: WriteStore, C: Clock + ?Sized>(
             // (`crates/htui-core/src/model/run.rs:111-130`), and `cancelled` is the one legal
             // retirement either of them has. `transition_step` moves `status` and nothing else, so
             // the rejecting review keeps its `gate_outcome = 'rejected'` and its `gate_note` —
-            // which is the half of ANA-2 §4.4 step 3 that matters (`:719`).
+            // which is the half of ANA-2 §4.4 step 3 that matters (`:719`). A failed judge keeps
+            // its `gate_note` the same way.
             //
             // **Plan D5 says a `failed` step is "left alone", and that reading cannot work**:
             // `cursor` reads a `failed` latest attempt as a rest, so the rejecting review at
@@ -942,9 +976,14 @@ mod tests {
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{Document, GraphSnapshot, VerifyOutcome};
 
+    use htui_core::model::{NewRepo, NewRunStep, RepoId, Run, RunStep, RunStepCommit, StepStatus};
+    use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+
     use super::{
-        LoopStop, Settle, SettleInput, StepFailure, Verdict, loop_target, parse_verdict, settle,
+        GateContext, LoopStop, Settle, SettleInput, StepFailure, Verdict, loop_target, no_progress,
+        parse_verdict, retire_slot, settle,
     };
+    use crate::isolate::SystemClock;
 
     /// A `review` document body, since `settle` reads the front matter off one.
     fn document(body: &str) -> Document {
@@ -1272,5 +1311,204 @@ mod tests {
         assert_eq!(LoopStop::Exhausted.to_string(), "exhausted");
         assert_eq!(LoopStop::NoProgressHash.to_string(), "no_progress_hash");
         assert_eq!(LoopStop::NoProgressReview.to_string(), "no_progress_review");
+    }
+
+    /// `RUN_3` as the demo fixture holds it, and its decoded snapshot.
+    fn run_3() -> (Run, GraphSnapshot) {
+        let run = demo_data()
+            .runs
+            .into_iter()
+            .find(|row| row.id == ids::RUN_3)
+            .expect("the fixture holds RUN_3");
+        let snapshot = serde_json::from_value(run.graph_snapshot.clone().expect("a graph run"))
+            .expect("the fixture snapshot is a `GraphSnapshot`");
+        (run, snapshot)
+    }
+
+    /// Inserts a `research` row of `RUN_3` at `(0, attempt, fanout_index)` and walks it through
+    /// `path` with legal compare-and-sets, starting from `pending`.
+    async fn step(
+        store: &MemStore,
+        attempt: i32,
+        fanout_index: i32,
+        path: &[StepStatus],
+    ) -> RunStep {
+        let row = store
+            .create_step(NewRunStep {
+                id: htui_core::model::StepId::new(),
+                run_id: ids::RUN_3,
+                position: 0,
+                attempt,
+                fanout_index,
+                phase_name: "research".to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: Some("opus".to_owned()),
+            })
+            .await
+            .expect("the slot has room for this row");
+        let mut from = StepStatus::Pending;
+        for &to in path {
+            assert!(
+                store
+                    .transition_step(row.id, from, to, epoch())
+                    .await
+                    .expect("a legal move"),
+                "`{from} -> {to}` applied"
+            );
+            from = to;
+        }
+        row
+    }
+
+    /// The status of every `RUN_3` row, by id.
+    async fn status_of(store: &MemStore, id: htui_core::model::StepId) -> StepStatus {
+        store
+            .run_steps(ids::RUN_3)
+            .await
+            .expect("RUN_3 exists")
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the row exists")
+            .status
+    }
+
+    /// Plan D66: `RUN_3`'s slot `(0, 1)` retires whole — the `done` winner, a third candidate
+    /// still `pending`, and the `done` judge are superseded; the loser that is already
+    /// `superseded` is left as it is.
+    #[tokio::test]
+    async fn retire_supersedes_every_candidate_and_the_judge_of_the_slot() {
+        let store = MemStore::demo();
+        let (run, snapshot) = run_3();
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+        };
+        let third = step(&store, 1, 2, &[]).await;
+        let judge = step(&store, 1, -1, &[StepStatus::Running, StepStatus::Done]).await;
+
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        retire_slot(&ctx, &steps, 0, epoch())
+            .await
+            .expect("every move is legal");
+
+        for id in [
+            ids::STEP_R3_RESEARCH_A,
+            ids::STEP_R3_RESEARCH_B,
+            third.id,
+            judge.id,
+        ] {
+            assert_eq!(status_of(&store, id).await, StepStatus::Superseded);
+        }
+        retire_slot(&ctx, &steps, 7, epoch())
+            .await
+            .expect("a position with no rows is nothing to retire");
+    }
+
+    /// M2 D5's split, applied to a group: `running` and `failed` rows — candidates and the judge —
+    /// are cancelled, and only the latest attempt's slot is touched.
+    #[tokio::test]
+    async fn retire_cancels_a_failed_candidate_and_a_failed_judge() {
+        let store = MemStore::demo();
+        let (run, snapshot) = run_3();
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+        };
+        let live = step(&store, 2, 0, &[StepStatus::Running]).await;
+        let failed = step(&store, 2, 1, &[StepStatus::Running, StepStatus::Failed]).await;
+        let judge = step(&store, 2, -1, &[StepStatus::Running, StepStatus::Failed]).await;
+
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        retire_slot(&ctx, &steps, 0, epoch())
+            .await
+            .expect("every move is legal");
+
+        for id in [live.id, failed.id, judge.id] {
+            assert_eq!(status_of(&store, id).await, StepStatus::Cancelled);
+        }
+        assert_eq!(
+            status_of(&store, ids::STEP_R3_RESEARCH_A).await,
+            StepStatus::Done,
+            "attempt 1 is not the latest slot and is left alone"
+        );
+        assert_eq!(
+            status_of(&store, ids::STEP_R3_RESEARCH_B).await,
+            StepStatus::Superseded
+        );
+    }
+
+    /// Plan D66: the hash half compares the winners of attempts 1 and 2. Attempt 2's winner sits
+    /// at index 1, so reading index 0 — the pre-fan-out `at()` — would answer the opposite in both
+    /// halves of this case.
+    #[tokio::test]
+    async fn no_progress_compares_the_two_winners_not_index_zero() {
+        let store = MemStore::demo();
+        let (mut run, snapshot) = run_3();
+        let repo = RepoId::new();
+        store
+            .create_repo(NewRepo {
+                id: repo,
+                project_id: run.project_id,
+                name: "htui".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect("the demo project has no repo yet");
+        run.repo_scope = vec![repo];
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+        };
+        let settled = [StepStatus::Running, StepStatus::Done];
+        let loser = step(&store, 2, 0, &settled).await;
+        let winner = step(&store, 2, 1, &settled).await;
+        store
+            .select_fanout(ids::RUN_3, 0, 2, winner.id, None)
+            .await
+            .expect("index 1 is a settled candidate of (0, 2)");
+        let record = |step, after: &str| {
+            let rows = [RunStepCommit {
+                run_step_id: step,
+                repo_id: repo,
+                before_hash: "base".to_owned(),
+                after_hash: Some(after.to_owned()),
+            }];
+            let store = &store;
+            async move { store.record_commits(step, &rows).await.expect("recorded") }
+        };
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+
+        // Attempt 1's winner (index 0, `selected`) and attempt 2's loser agree; the winner moved.
+        record(ids::STEP_R3_RESEARCH_A, "same").await;
+        record(loser.id, "same").await;
+        record(winner.id, "moved").await;
+        assert_eq!(
+            no_progress(&ctx, &steps, 0, 1, 2).await.expect("reads"),
+            None,
+            "the winner made progress, whatever index 0 did"
+        );
+
+        // And the other way round: the winner repeats attempt 1, index 0 does not.
+        record(loser.id, "moved").await;
+        record(winner.id, "same").await;
+        assert_eq!(
+            no_progress(&ctx, &steps, 0, 1, 2).await.expect("reads"),
+            Some(LoopStop::NoProgressHash),
+            "the winner repeated attempt 1's winner"
+        );
     }
 }
