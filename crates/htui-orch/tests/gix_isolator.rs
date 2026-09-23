@@ -2773,6 +2773,84 @@ async fn a_merge_onto_a_moved_primary_diffs_only_its_own_paths() {
     );
 }
 
+/// Plan D146 (R-33): an agent's branch that ends in a two-parent commit it made itself, with D25's
+/// `htui: reconcile <step>` message, is not htui's merge: it is not on the primary's first-parent
+/// line. Its row still diffs `before..after`, so the agent's earlier commit stays in the diff.
+#[tokio::test]
+async fn an_agent_branch_ending_in_a_spoofed_reconcile_merge_still_diffs_from_its_base() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let step = StepId::new();
+    let prepared = fix
+        .isolator
+        .prepare(
+            RunId::new(),
+            step,
+            &[fix.core.id],
+            Isolation::Worktree,
+            None,
+        )
+        .await
+        .expect("the worktree mode prepares");
+    let rows: Vec<RunStepTree> = prepared
+        .trees
+        .iter()
+        .map(|tree| tree.tree.clone())
+        .collect();
+    let tree = Path::new(&rows[0].path);
+    commit_file(tree, "agent.txt", "the agent's work\n", "the agent commits");
+    let message = format!("htui: reconcile {step}");
+    let spoof = git_out(
+        &git,
+        tree,
+        &[
+            "-c",
+            "user.name=agent",
+            "-c",
+            "user.email=agent@example.invalid",
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-p",
+            &fix.core.head,
+            "-m",
+            &message,
+        ],
+    )
+    .await;
+    git_out(&git, tree, &["update-ref", "HEAD", &spoof]).await;
+    let commits = fix
+        .isolator
+        .capture(step, &rows)
+        .await
+        .expect("the step captures");
+    assert_eq!(
+        commits[0].after_hash.as_deref(),
+        Some(spoof.as_str()),
+        "the branch ends in the spoofed merge"
+    );
+
+    let diff = fix
+        .isolator
+        .diff(&rows, &commits)
+        .await
+        .expect("the diff reads")
+        .expect("the step committed");
+    assert_eq!(
+        diff.range,
+        format!("{}..{spoof}", fix.core.head),
+        "the row's own range, not the spoof's first parent"
+    );
+    assert!(
+        diff.stat.contains("agent.txt"),
+        "the agent's earlier commit stays in the diff: {}",
+        diff.stat
+    );
+}
+
 /// Plan D147/D148 (R-33): a primary whose own config sets `merge.log=true` would have `git merge`
 /// append a shortlog body to D25's message. `merge_no_ff` turns it off, so the merge's message is
 /// exactly `htui: reconcile <step>`, and the second run's merge still diffs from its first parent.
