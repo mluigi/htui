@@ -12,6 +12,7 @@
 //! `finished_at` — and never merely that the walk did not error.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use chrono::TimeDelta;
@@ -30,7 +31,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
-use crate::engine::{Adopted, Resume};
+use crate::engine::{Adopted, Next, Resume};
 use crate::fake::{FakeIsolator, FakeOrchestrator, FakeVerifier, ScriptedStep, TestClock};
 use crate::isolate::Clock as _;
 use crate::status::RunFailure;
@@ -250,11 +251,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Forty-two, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_forty_two` and out of crate by `tests/fake_conformance.rs` — because
-/// a binding that silently ran forty-one of them would still be green.
+/// Fifty-two, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_fifty_two` and out of crate by `tests/fake_conformance.rs` — because
+/// a binding that silently ran fifty-one of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -280,6 +281,14 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// criterion 16, where overlap and the slot reach the walk; and the lease's two cross-process
 /// answers — a park releases it for another process's answer, and a live one refuses that answer
 /// before anything is written (plan D87, D108).
+///
+/// **Ten for milestone 5's recovery sweep**, every one a crash the stall harness makes (blueprint
+/// A-2) and a second process's sweep: criterion 18's two halves, a finished step through its gate
+/// and an unfinished one reset and retried (plan D90-D92); the out-of-budget park a human may
+/// still retry (D92, blueprint A-8); criterion 12's dirty tree, never reset (D93); two lost
+/// merges re-reconciled once, the second after a review rejection (D97, C129); an interrupted
+/// candidate and an interrupted judge (D95); a half-written park (D96); and the runs no sweep
+/// adopts — a parked one, a live lease, and this process's own (D88).
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -376,6 +385,27 @@ pub const CASES: &[&str] = &[
     "a_parked_run_releases_its_lease_and_an_answer_takes_it",
     // Plan D87, D108: a live lease refuses another process's answer before its first write.
     "a_live_lease_blocks_an_answer_from_another_process",
+    // Milestone 5, criterion 18 (`:2135-2136`, plan D90, D91): a finished step is adopted through
+    // the gate it would have met.
+    "a_finished_step_is_adopted_through_its_gate",
+    // Criterion 18 (`:2136-2137`, plan D92): an unfinished step is reset and retried.
+    "an_unfinished_step_is_reset_and_retried",
+    // Plan D92 out of budget and blueprint A-8: the run parks, and `RetryStep` still admits.
+    "an_interrupted_step_out_of_budget_parks",
+    // Criterion 12 (`:2118-2119`, plan D93), the fake's half: a dirty tree is never reset.
+    "a_dirty_tree_is_never_reset",
+    // Plan D97 (blueprint F-A, A-3): a winner whose merge was lost is reconciled once.
+    "a_crash_before_reconcile_is_reconciled_on_adoption",
+    // Plan D97 as redefined (C129): the frontier ignores a review rejection's retired rows.
+    "a_crash_between_done_and_reconcile_after_a_review_rejection_is_reconciled",
+    // Plan D95: an interrupted candidate fails alone.
+    "an_interrupted_candidate_fails_alone",
+    // Plan D95: an interrupted judge parks the slot for a human.
+    "an_interrupted_judge_parks_for_selection",
+    // Plan D96: a half-written park is completed.
+    "a_half_written_park_is_completed",
+    // `:1306` and plan D88: a parked run, a live lease and this process's own are never adopted.
+    "the_sweep_never_touches_a_parked_run_or_a_live_lease",
 ];
 
 /// Run one case by name.
@@ -384,103 +414,151 @@ pub const CASES: &[&str] = &[
 /// On a name [`CASES`] holds and this `match` does not — the drift `every_case_name_dispatches`
 /// exists to catch — and on any assertion the case itself makes.
 pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
+    case(name, harness).await;
+}
+
+/// The named case's future, boxed.
+///
+/// A plain function rather than a `match` inside [`run_case`]'s own body, and that is about the
+/// stack, not style: an unoptimised build gives every arm's case future its own stack slot, so a
+/// fifty-two-arm `match` in an `async fn` puts all fifty-two in the one frame every case is then
+/// polled beneath, and the recovery cases' walks overflowed a test thread's 2 MiB. Here the slots
+/// are gone before the first poll.
+///
+/// # Panics
+/// On a name [`CASES`] holds and this `match` does not.
+fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
     match name {
-        "feat_walks_end_to_end" => feat_walks_end_to_end(harness).await,
-        "live_run_ignores_a_gate_edit" => live_run_ignores_a_gate_edit(harness).await,
-        "topology_mismatch_parks_on_resume" => topology_mismatch_parks_on_resume(harness).await,
-        "approve_needs_the_output_document" => approve_needs_the_output_document(harness).await,
+        "feat_walks_end_to_end" => Box::pin(feat_walks_end_to_end(harness)),
+        "live_run_ignores_a_gate_edit" => Box::pin(live_run_ignores_a_gate_edit(harness)),
+        "topology_mismatch_parks_on_resume" => Box::pin(topology_mismatch_parks_on_resume(harness)),
+        "approve_needs_the_output_document" => Box::pin(approve_needs_the_output_document(harness)),
         "review_rejection_loops_then_escalates" => {
-            review_rejection_loops_then_escalates(harness).await;
+            Box::pin(review_rejection_loops_then_escalates(harness))
         }
-        "identical_after_hash_stops_the_loop" => identical_after_hash_stops_the_loop(harness).await,
-        "missing_input_fails_before_a_token" => missing_input_fails_before_a_token(harness).await,
-        "missing_output_settles_failed" => missing_output_settles_failed(harness).await,
+        "identical_after_hash_stops_the_loop" => {
+            Box::pin(identical_after_hash_stops_the_loop(harness))
+        }
+        "missing_input_fails_before_a_token" => {
+            Box::pin(missing_input_fails_before_a_token(harness))
+        }
+        "missing_output_settles_failed" => Box::pin(missing_output_settles_failed(harness)),
         "cli_agent_is_refused_at_a_gated_phase" => {
-            cli_agent_is_refused_at_a_gated_phase(harness).await;
+            Box::pin(cli_agent_is_refused_at_a_gated_phase(harness))
         }
-        "step_deadline_settles_failed" => step_deadline_settles_failed(harness).await,
-        "finish_run_is_the_last_write" => finish_run_is_the_last_write(harness).await,
+        "step_deadline_settles_failed" => Box::pin(step_deadline_settles_failed(harness)),
+        "finish_run_is_the_last_write" => Box::pin(finish_run_is_the_last_write(harness)),
         "a_never_gate_rejection_loops_the_review" => {
-            a_never_gate_rejection_loops_the_review(harness).await;
+            Box::pin(a_never_gate_rejection_loops_the_review(harness))
         }
-        "a_never_gate_rejection_escalates_when_the_budget_is_out" => {
-            a_never_gate_rejection_escalates_when_the_budget_is_out(harness).await;
-        }
+        "a_never_gate_rejection_escalates_when_the_budget_is_out" => Box::pin(
+            a_never_gate_rejection_escalates_when_the_budget_is_out(harness),
+        ),
         "on_failure_passes_ok_and_parks_failed" => {
-            on_failure_passes_ok_and_parks_failed(harness).await;
+            Box::pin(on_failure_passes_ok_and_parks_failed(harness))
         }
         "an_intermediate_position_is_retired_by_the_loop" => {
-            an_intermediate_position_is_retired_by_the_loop(harness).await;
+            Box::pin(an_intermediate_position_is_retired_by_the_loop(harness))
         }
-        "verify_fail_settles_failed" => verify_fail_settles_failed(harness).await,
-        "verify_unavailable_never_fails" => verify_unavailable_never_fails(harness).await,
-        "cancel_cleans_up_once" => cancel_cleans_up_once(harness).await,
+        "verify_fail_settles_failed" => Box::pin(verify_fail_settles_failed(harness)),
+        "verify_unavailable_never_fails" => Box::pin(verify_unavailable_never_fails(harness)),
+        "cancel_cleans_up_once" => Box::pin(cancel_cleans_up_once(harness)),
         "allowed_warning_candidate_is_selected" => {
-            allowed_warning_candidate_is_selected(harness).await;
+            Box::pin(allowed_warning_candidate_is_selected(harness))
         }
         "a_skipped_candidate_falls_through_to_the_next" => {
-            a_skipped_candidate_falls_through_to_the_next(harness).await;
+            Box::pin(a_skipped_candidate_falls_through_to_the_next(harness))
         }
-        "no_candidate_agent_blocks_the_item" => no_candidate_agent_blocks_the_item(harness).await,
+        "no_candidate_agent_blocks_the_item" => {
+            Box::pin(no_candidate_agent_blocks_the_item(harness))
+        }
         "every_candidate_skipped_refuses_the_run" => {
-            every_candidate_skipped_refuses_the_run(harness).await;
+            Box::pin(every_candidate_skipped_refuses_the_run(harness))
         }
-        "a_second_attempt_carries_verify_failure_and_previous_diff" => {
-            a_second_attempt_carries_verify_failure_and_previous_diff(harness).await;
-        }
+        "a_second_attempt_carries_verify_failure_and_previous_diff" => Box::pin(
+            a_second_attempt_carries_verify_failure_and_previous_diff(harness),
+        ),
         "fan_out_three_with_a_judge_selects_one_winner" => {
-            fan_out_three_with_a_judge_selects_one_winner(harness).await;
+            Box::pin(fan_out_three_with_a_judge_selects_one_winner(harness))
         }
         "a_failing_verify_is_eliminated_before_the_judge" => {
-            a_failing_verify_is_eliminated_before_the_judge(harness).await;
+            Box::pin(a_failing_verify_is_eliminated_before_the_judge(harness))
         }
         "one_passing_candidate_wins_without_a_judge" => {
-            one_passing_candidate_wins_without_a_judge(harness).await;
+            Box::pin(one_passing_candidate_wins_without_a_judge(harness))
         }
         "judge_orderings_that_disagree_park_for_selection" => {
-            judge_orderings_that_disagree_park_for_selection(harness).await;
+            Box::pin(judge_orderings_that_disagree_park_for_selection(harness))
         }
-        "an_unparseable_verdict_parks_and_select_fanout_completes" => {
-            an_unparseable_verdict_parks_and_select_fanout_completes(harness).await;
-        }
+        "an_unparseable_verdict_parks_and_select_fanout_completes" => Box::pin(
+            an_unparseable_verdict_parks_and_select_fanout_completes(harness),
+        ),
         "a_gated_fan_out_parks_for_human_selection" => {
-            a_gated_fan_out_parks_for_human_selection(harness).await;
+            Box::pin(a_gated_fan_out_parks_for_human_selection(harness))
         }
-        "no_judge_means_human_selection" => no_judge_means_human_selection(harness).await,
+        "no_judge_means_human_selection" => Box::pin(no_judge_means_human_selection(harness)),
         "a_failed_candidate_does_not_fail_its_siblings" => {
-            a_failed_candidate_does_not_fail_its_siblings(harness).await;
+            Box::pin(a_failed_candidate_does_not_fail_its_siblings(harness))
         }
         "a_group_with_no_survivor_retries_then_fails" => {
-            a_group_with_no_survivor_retries_then_fails(harness).await;
+            Box::pin(a_group_with_no_survivor_retries_then_fails(harness))
         }
         "the_review_loop_reruns_a_fanned_out_implement" => {
-            the_review_loop_reruns_a_fanned_out_implement(harness).await;
+            Box::pin(the_review_loop_reruns_a_fanned_out_implement(harness))
         }
         "fan_out_above_max_fan_out_is_refused_at_start" => {
-            fan_out_above_max_fan_out_is_refused_at_start(harness).await;
+            Box::pin(fan_out_above_max_fan_out_is_refused_at_start(harness))
         }
         "max_agents_per_run_is_refused_at_start" => {
-            max_agents_per_run_is_refused_at_start(harness).await;
+            Box::pin(max_agents_per_run_is_refused_at_start(harness))
         }
-        "a_serialized_sibling_is_not_charged_for_the_ones_before_it" => {
-            a_serialized_sibling_is_not_charged_for_the_ones_before_it(harness).await;
+        "a_serialized_sibling_is_not_charged_for_the_ones_before_it" => Box::pin(
+            a_serialized_sibling_is_not_charged_for_the_ones_before_it(harness),
+        ),
+        "overlapping_touched_paths_serialise" => {
+            Box::pin(overlapping_touched_paths_serialise(harness))
         }
-        "overlapping_touched_paths_serialise" => overlapping_touched_paths_serialise(harness).await,
         "the_same_paths_in_two_repos_run_concurrently" => {
-            the_same_paths_in_two_repos_run_concurrently(harness).await;
+            Box::pin(the_same_paths_in_two_repos_run_concurrently(harness))
         }
         "an_undeclared_item_holds_its_whole_primary_repo" => {
-            an_undeclared_item_holds_its_whole_primary_repo(harness).await;
+            Box::pin(an_undeclared_item_holds_its_whole_primary_repo(harness))
         }
         "a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap" => {
-            a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap(harness).await;
+            Box::pin(a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap(harness))
         }
-        "a_parked_run_releases_its_lease_and_an_answer_takes_it" => {
-            a_parked_run_releases_its_lease_and_an_answer_takes_it(harness).await;
-        }
+        "a_parked_run_releases_its_lease_and_an_answer_takes_it" => Box::pin(
+            a_parked_run_releases_its_lease_and_an_answer_takes_it(harness),
+        ),
         "a_live_lease_blocks_an_answer_from_another_process" => {
-            a_live_lease_blocks_an_answer_from_another_process(harness).await;
+            Box::pin(a_live_lease_blocks_an_answer_from_another_process(harness))
         }
+        "a_finished_step_is_adopted_through_its_gate" => {
+            Box::pin(a_finished_step_is_adopted_through_its_gate(harness))
+        }
+        "an_unfinished_step_is_reset_and_retried" => {
+            Box::pin(an_unfinished_step_is_reset_and_retried(harness))
+        }
+        "an_interrupted_step_out_of_budget_parks" => {
+            Box::pin(an_interrupted_step_out_of_budget_parks(harness))
+        }
+        "a_dirty_tree_is_never_reset" => Box::pin(a_dirty_tree_is_never_reset(harness)),
+        "a_crash_before_reconcile_is_reconciled_on_adoption" => {
+            Box::pin(a_crash_before_reconcile_is_reconciled_on_adoption(harness))
+        }
+        "a_crash_between_done_and_reconcile_after_a_review_rejection_is_reconciled" => Box::pin(
+            a_crash_between_done_and_reconcile_after_a_review_rejection_is_reconciled(harness),
+        ),
+        "an_interrupted_candidate_fails_alone" => {
+            Box::pin(an_interrupted_candidate_fails_alone(harness))
+        }
+        "an_interrupted_judge_parks_for_selection" => {
+            Box::pin(an_interrupted_judge_parks_for_selection(harness))
+        }
+        "a_half_written_park_is_completed" => Box::pin(a_half_written_park_is_completed(harness)),
+        "the_sweep_never_touches_a_parked_run_or_a_live_lease" => Box::pin(
+            the_sweep_never_touches_a_parked_run_or_a_live_lease(harness),
+        ),
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -3582,6 +3660,623 @@ async fn a_live_lease_blocks_an_answer_from_another_process<H: CaseHarness>(harn
     assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
 }
 
+// -- MOD-4 milestone 5: the recovery sweep (plan D89-D98, blueprint A-2, A-3) -----------------------
+
+/// A process killed mid-walk (plan D100, blueprint A-2): `StartRun` on `item` is polled until
+/// `stalled` fires and then dropped, and the run it left `running` is handed back.
+///
+/// # Panics
+/// When the walk finishes instead of stalling, or leaves no `running` run on the item.
+async fn crash<O: Orchestrate>(orch: &O, item: ItemId, stalled: &Notify) -> RunId {
+    until_stalled(
+        orch.dispatch(Command::StartRun {
+            item,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        }),
+        stalled,
+    )
+    .await;
+    orch.store()
+        .runs(item)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|run| run.status == RunStatus::Running)
+        .expect("the crash left the run `running`")
+        .id
+}
+
+/// Every phase of `FEAT-3` at `gate`, `mutate` applied after, and both review attempts scripted
+/// to approve so an ungated walk reaches `done` (blueprint F-S: every seeded phase is `always`).
+async fn feat_3_gated<O: Orchestrate>(orch: &O, gate: Gate, mutate: impl Fn(&mut StepGraphPhase)) {
+    free_feat_3(orch).await;
+    repoint(orch, ids::HTUI_FEAT_3, |phase| {
+        phase.gate = gate;
+        mutate(phase);
+    })
+    .await;
+    for attempt in [1, 2] {
+        orch.script("review", attempt, ScriptedStep::review("approve", "fine"));
+    }
+}
+
+/// The step at `(position, attempt)` as the store has it now.
+async fn step_at<O: Orchestrate>(orch: &O, run: RunId, position: i32, attempt: i32) -> RunStep {
+    at(&steps_of(orch, run).await, position, attempt).clone()
+}
+
+/// `{repo} {path} before_hash {base_ref}`, blueprint §9.3's `{tree}` for a tree with no label.
+async fn tree_text<O: Orchestrate>(orch: &O, step: StepId) -> String {
+    orch.store()
+        .step_trees(step)
+        .await
+        .expect("MemStore never fails a read")
+        .iter()
+        .map(|tree| {
+            format!(
+                "{} {} before_hash {}",
+                tree.repo_id, tree.path, tree.base_ref
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The run's row and its steps, for "the sweep touched nothing".
+async fn rows_of<O: Orchestrate>(orch: &O, run: RunId) -> (Run, Vec<RunStep>) {
+    (run_of(orch, run).await, steps_of(orch, run).await)
+}
+
+/// ANA-2 §12 criterion 18, first half (`docs/ANA-2.md:2135-2136`, plan D90, D91): a step whose
+/// session finished and whose artefacts both landed — the document and every repo's
+/// `after_hash` — is adopted through the gate table it would have met. Ungated it is `done` and
+/// the run walks on; gated it parks, and is not `done`.
+async fn a_finished_step_is_adopted_through_its_gate<H: CaseHarness>(harness: &H) {
+    for gate in [Gate::Never, Gate::Always] {
+        let orch = harness.fresh();
+        let repo = primary_repo(&orch).await;
+        feat_3_gated(&orch, Gate::Never, |phase| {
+            if phase.name == "prd" {
+                phase.gate = gate;
+            }
+        })
+        .await;
+        let stalled = orch.stall_after_done("prd", 1, None, true);
+        let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+        let prd = step_at(&orch, run, 0, 1).await;
+        assert_eq!(prd.status, StepStatus::Running, "the crash left `prd` live");
+        let before = orch
+            .store()
+            .step_commits(prd.id)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|row| row.repo_id == repo)
+            .expect("stage 2 recorded the base")
+            .before_hash;
+        orch.store()
+            .record_commits(
+                prd.id,
+                &[htui_core::model::RunStepCommit {
+                    run_step_id: prd.id,
+                    repo_id: repo,
+                    before_hash: before,
+                    after_hash: Some("fake:after:x".to_owned()),
+                }],
+            )
+            .await
+            .expect("MemStore records the capture that landed");
+
+        let other = orch.restarted();
+        let adopted = other.sweep().await.expect("the sweep adopts");
+        let prd = step_at(&other, run, 0, 1).await;
+        if gate == Gate::Never {
+            assert_eq!(
+                adopted,
+                [Adopted {
+                    run,
+                    next: Next::Walk
+                }]
+            );
+            assert_eq!(prd.status, StepStatus::Done, "D91: re-settled and passed");
+            let resumed = other.resume(run).await.expect("the adopter walks it");
+            assert!(
+                matches!(
+                    resumed,
+                    Resume::Walked(Rest {
+                        run: RunStatus::Done,
+                        ..
+                    })
+                ),
+                "{resumed:?}"
+            );
+        } else {
+            assert_eq!(adopted.len(), 1);
+            assert!(
+                matches!(
+                    &adopted[0].next,
+                    Next::Parked(Rest {
+                        run: RunStatus::AwaitingApproval,
+                        ..
+                    })
+                ),
+                "{adopted:?}"
+            );
+            assert_eq!(
+                prd.status,
+                StepStatus::AwaitingApproval,
+                "gated, so not `done`"
+            );
+            assert_eq!(
+                run_of(&other, run).await.status,
+                RunStatus::AwaitingApproval
+            );
+        }
+    }
+}
+
+/// Criterion 18, second half (`:2136-2137`, plan D92): a step with no document is unfinished.
+/// Its `worktree` tree is resettable (the reset touches nothing, OQ-8), so the step is failed
+/// `interrupted`, a note names it and its tree, attempt 2 is admitted, and the walk finishes.
+/// Base equality between the attempts is real git's to assert (blueprint F-D).
+async fn an_unfinished_step_is_reset_and_retried<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    let stalled = orch.stall_after_done("prd", 1, None, false);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    let trees = tree_text(&orch, prd.id).await;
+
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert_eq!(
+        adopted,
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    let steps = steps_of(&other, run).await;
+    let first = at(&steps, 0, 1);
+    assert_eq!(
+        (first.status, first.gate_note.as_deref(), first.gate_outcome),
+        (StepStatus::Failed, Some("interrupted"), None),
+        "plan D89: a crash is not a gate answer"
+    );
+    assert_eq!(at(&steps, 0, 2).status, StepStatus::Pending);
+    assert_eq!(other.isolator().resets(), 1);
+    let notes = notes_of(&other, ids::HTUI_FEAT_3).await;
+    let n1 = format!(
+        "interrupted: step {} (`prd` attempt 1) did not finish; trees: {trees}; retrying as \
+         attempt 2",
+        prd.id
+    );
+    assert!(notes.contains(&n1), "{n1}\n{notes:?}");
+
+    let resumed = other.resume(run).await.expect("the adopter walks it");
+    assert!(
+        matches!(
+            resumed,
+            Resume::Walked(Rest {
+                run: RunStatus::Done,
+                ..
+            })
+        ),
+        "{resumed:?}"
+    );
+}
+
+/// Plan D92's out-of-budget branch and blueprint A-8: with `retry_limit = 0` the interrupted
+/// step parks the run `interrupted: prd` rather than failing it, and a human's `RetryStep`
+/// admits attempt 2 anyway — the budget bounds automatic retries, and a crash is not one.
+async fn an_interrupted_step_out_of_budget_parks<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| phase.retry_limit = 0).await;
+    let stalled = orch.stall_after_done("prd", 1, None, false);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    let trees = tree_text(&orch, prd.id).await;
+
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert_eq!(
+        adopted,
+        [Adopted {
+            run,
+            next: Next::Parked(Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(0),
+                failure: Some(RunFailure::Interrupted {
+                    phase: "prd".to_owned(),
+                    reset: true,
+                }),
+            }),
+        }]
+    );
+    assert_eq!(
+        run_of(&other, run).await.status,
+        RunStatus::AwaitingApproval
+    );
+    assert_eq!(
+        run_of(&other, run).await.failure,
+        None,
+        "R-3: parked, not failed"
+    );
+    assert_eq!(
+        item_of(&other, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+    let n3 = format!(
+        "interrupted: retry budget spent: step {} (`prd` attempt 1); trees: {trees}; the run is \
+         parked",
+        prd.id
+    );
+    let notes = notes_of(&other, ids::HTUI_FEAT_3).await;
+    assert!(notes.contains(&n3), "{n3}\n{notes:?}");
+
+    let outcome = other
+        .dispatch(Command::RetryStep { run, step: prd.id })
+        .await
+        .expect("A-8: an interrupted step is retryable past its budget");
+    assert!(
+        matches!(outcome, CommandOutcome::Retried { step, .. } if step == prd.id),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        step_at(&other, run, 0, 2).await.status,
+        StepStatus::AwaitingApproval,
+        "attempt 2 was admitted and walked to its `always` gate"
+    );
+}
+
+/// ANA-2 §12 criterion 12, the fake's half (`:2118-2119`, plan D93): a `local` tree recorded
+/// dirty at step start is never reset. The step fails `interrupted, tree not reset`, the run
+/// parks, the isolator is never asked, and the note names the tree's path and `before_hash`.
+async fn a_dirty_tree_is_never_reset<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.isolation = Some(Isolation::Local);
+        }
+    })
+    .await;
+    let stalled = orch.stall_after_done("prd", 1, None, false);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    let mut trees = orch
+        .store()
+        .step_trees(prd.id)
+        .await
+        .expect("MemStore never fails a read");
+    assert!(!trees.is_empty(), "stage 2 recorded the tree");
+    for tree in &mut trees {
+        tree.dirty = true;
+    }
+    orch.store()
+        .upsert_step_tree(prd.id, &trees)
+        .await
+        .expect("MemStore rewrites the rows");
+    let listed = tree_text(&orch, prd.id).await;
+
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert_eq!(adopted.len(), 1);
+    assert!(
+        matches!(
+            &adopted[0].next,
+            Next::Parked(Rest {
+                run: RunStatus::AwaitingApproval,
+                failure: Some(RunFailure::Interrupted { reset: false, .. }),
+                ..
+            })
+        ),
+        "{adopted:?}"
+    );
+    let prd = step_at(&other, run, 0, 1).await;
+    assert_eq!(
+        (prd.status, prd.gate_note.as_deref()),
+        (StepStatus::Failed, Some("interrupted, tree not reset"))
+    );
+    assert_eq!(other.isolator().resets(), 0, "no `git` write on this path");
+    let n2 = format!(
+        "interrupted, tree not reset: step {} (`prd` attempt 1); trees: {listed}; reason: dirty \
+         at step start; the run is parked for a human",
+        prd.id
+    );
+    let notes = notes_of(&other, ids::HTUI_FEAT_3).await;
+    assert!(notes.contains(&n2), "{n2}\n{notes:?}");
+    assert!(n2.contains(&trees[0].path) && n2.contains(&trees[0].base_ref));
+}
+
+/// Plan D97 (blueprint F-A, A-3): a crash between stage 6's `done` and the merge leaves an
+/// unmerged winner the cursor would walk past. The adopter reconciles it exactly once before
+/// the walk goes on.
+async fn a_crash_before_reconcile_is_reconciled_on_adoption<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::Never;
+        }
+    })
+    .await;
+    let stalled = orch.isolator().stall_nth_reconcile(1);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    assert_eq!(prd.status, StepStatus::Done, "stage 6 moved it `done`");
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::Running);
+
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert_eq!(
+        adopted,
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    assert_eq!(
+        other.isolator().reconciles(),
+        [(prd.id, Vec::new())],
+        "exactly one reconcile of the winner (blueprint A-3)"
+    );
+}
+
+/// Plan D97 as redefined (C129): after a review rejection the retired review of attempt 1 sits
+/// at the next position, and the frontier is still implement attempt 2. The adopter reconciles
+/// it once, and the walk runs review attempt 2 over it.
+async fn a_crash_between_done_and_reconcile_after_a_review_rejection_is_reconciled<
+    H: CaseHarness,
+>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "first"),
+    );
+    // prd, plan and implement 1 each reconcile once, and so does review 1: stage 6's automatic
+    // rejection resumes the loop and lands `Advance` on the retired review (`walk_live_step`), an
+    // identity merge. Implement 2's is the fifth.
+    let stalled = orch.isolator().stall_nth_reconcile(5);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let steps = steps_of(&orch, run).await;
+    let implement = at(&steps, 2, 2).clone();
+    assert_eq!(implement.status, StepStatus::Done);
+    assert_eq!(at(&steps, 3, 1).status, StepStatus::Cancelled);
+    assert_eq!(
+        orch.isolator().reconciles().last(),
+        Some(&(implement.id, Vec::new())),
+        "the stalled reconcile is implement attempt 2's"
+    );
+
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert_eq!(
+        adopted,
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    assert_eq!(other.isolator().reconciles(), [(implement.id, Vec::new())]);
+
+    let resumed = other.resume(run).await.expect("the adopter walks it");
+    assert!(
+        matches!(
+            resumed,
+            Resume::Walked(Rest {
+                run: RunStatus::Done,
+                ..
+            })
+        ),
+        "{resumed:?}"
+    );
+    assert_eq!(step_at(&other, run, 3, 2).await.status, StepStatus::Done);
+}
+
+/// Plan D95: a `running` candidate with no document fails alone, `interrupted`, with no reset
+/// and no park, and the judge then compares the two survivors.
+async fn an_interrupted_candidate_fails_alone<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    fan_research(&orch, Gate::Never, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    judge_both(&orch, "research", 1, 0, "complete");
+    let stalled = orch.stall_after_done("research", 1, Some((1, 0)), false);
+    let run = crash(&orch, ids::HTUI_ANA_2, &stalled).await;
+
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert_eq!(
+        adopted,
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    let steps = steps_of(&other, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1)
+            .into_iter()
+            .map(|(index, status, _)| (index, status))
+            .collect::<Vec<_>>(),
+        [
+            (0, StepStatus::Done),
+            (1, StepStatus::Failed),
+            (2, StepStatus::Done),
+        ]
+    );
+    assert_eq!(
+        candidate(&steps, 0, 1, 1).gate_note.as_deref(),
+        Some("interrupted")
+    );
+    assert_eq!(
+        other.isolator().resets(),
+        0,
+        "D95: no reset for a candidate"
+    );
+
+    other.resume(run).await.expect("the adopter walks it");
+    let steps = steps_of(&other, run).await;
+    let judge = judge_of(&steps, 0, 1).expect("two survived, so the judge ran");
+    let sections = prompt_sections(&other, judge.id).await;
+    for (index, expected) in [(0, true), (1, false), (2, true)] {
+        assert_eq!(
+            sections
+                .iter()
+                .any(|section| *section == format!("judge_candidate:{index}")),
+            expected,
+            "candidate {index}: {sections:?}"
+        );
+    }
+}
+
+/// Plan D95 for the judge: a `running` judge is failed `interrupted`, never re-judged, and the
+/// walk's `Select` arm parks the slot for a human with that reason (M4 D59).
+async fn an_interrupted_judge_parks_for_selection<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    fan_research(&orch, Gate::Never, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    judge_both(&orch, "research", 1, 0, "complete");
+    let stalled = orch.stall_after_done("research:judge", 1, Some((-1, 0)), false);
+    let run = crash(&orch, ids::HTUI_ANA_2, &stalled).await;
+
+    let other = orch.restarted();
+    other.sweep().await.expect("the sweep adopts");
+    let steps = steps_of(&other, run).await;
+    let judge = judge_of(&steps, 0, 1).expect("the judge is a step");
+    assert_eq!(
+        (judge.status, judge.gate_note.as_deref()),
+        (StepStatus::Failed, Some("interrupted"))
+    );
+
+    let resumed = other.resume(run).await.expect("the adopter walks it");
+    assert!(
+        matches!(
+            resumed,
+            Resume::Walked(Rest {
+                run: RunStatus::AwaitingApproval,
+                ..
+            })
+        ),
+        "{resumed:?}"
+    );
+    assert_eq!(
+        run_of(&other, run).await.status,
+        RunStatus::AwaitingApproval
+    );
+    let parks = selection_parks(&other, ids::HTUI_ANA_2).await;
+    assert!(
+        parks
+            .iter()
+            .any(|body| body.contains(" awaits selection: interrupted; ")),
+        "{parks:?}"
+    );
+}
+
+/// Plan D96: a crash inside `gate::park`'s three writes leaves a waiting step under a `running`
+/// run. The sweep completes the park — run, then item — and moves no step.
+async fn a_half_written_park_is_completed<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    let stalled = orch.stall_after_done("prd", 1, None, true);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    assert!(
+        orch.store()
+            .transition_step(
+                prd.id,
+                StepStatus::Running,
+                StepStatus::AwaitingApproval,
+                orch.clock().now()
+            )
+            .await
+            .expect("MemStore takes the move"),
+        "the park's first write landed"
+    );
+    let before = steps_of(&orch, run).await;
+
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert_eq!(adopted.len(), 1);
+    assert!(
+        matches!(
+            &adopted[0].next,
+            Next::Parked(Rest {
+                run: RunStatus::AwaitingApproval,
+                ..
+            })
+        ),
+        "{adopted:?}"
+    );
+    assert_eq!(
+        run_of(&other, run).await.status,
+        RunStatus::AwaitingApproval
+    );
+    assert_eq!(
+        item_of(&other, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+    assert_eq!(steps_of(&other, run).await, before, "no step moved");
+}
+
+/// ANA-2 §4.9 `:1306` and plan D88: the sweep adopts only an expired lease on a `running` run.
+/// A parked run and a live lease are untouched, row for row — and a process never adopts its
+/// own lease, however stale.
+async fn the_sweep_never_touches_a_parked_run_or_a_live_lease<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    touch(&orch, ids::HTUI_FEAT_3, &["src/**"]).await;
+    touch(&orch, ids::HTUI_ANA_2, &["docs/**"]).await;
+    let (parked, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    let stalled = orch.stall_after_done("research", 1, None, false);
+    let live = crash(&orch, ids::HTUI_ANA_2, &stalled).await;
+
+    let other = orch.restarted();
+    assert!(
+        orch.store()
+            .refresh_lease(live, orch.owner(), other.clock().now() + TimeDelta::days(1))
+            .await
+            .expect("MemStore refreshes"),
+        "the first process's heartbeat is still beating"
+    );
+    let before = (rows_of(&orch, parked).await, rows_of(&orch, live).await);
+
+    assert_eq!(other.sweep().await.expect("the sweep runs"), []);
+    assert_eq!(
+        (rows_of(&orch, parked).await, rows_of(&orch, live).await),
+        before
+    );
+
+    orch.clock().advance(TimeDelta::days(2));
+    assert_eq!(
+        orch.sweep().await.expect("the sweep runs"),
+        [],
+        "plan D88: never this process's own lease"
+    );
+    assert_eq!(
+        (rows_of(&orch, parked).await, rows_of(&orch, live).await),
+        before
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -3599,15 +4294,15 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_forty_two() {
+    fn cases_are_unique_and_fifty_two() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            42,
-            "18 + 5 + 13 + 6: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            52,
+            "18 + 5 + 13 + 6 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -3619,7 +4314,10 @@ mod tests {
              caps, and a `shared_serialized` sibling's own deadline), and milestone 5's six \
              (criterion 15's serialised overlap, its two repos and its undeclared item, \
              criterion 16's slot and parked overlap, a park's released lease taken by another \
-             process's answer, and a live lease refusing that answer)"
+             process's answer, and a live lease refusing that answer), and milestone 5's ten \
+             recovery cases (criterion 18's finished and unfinished steps, the out-of-budget \
+             park, criterion 12's dirty tree, two lost merges, an interrupted candidate and \
+             judge, a half-written park, and the runs no sweep adopts)"
         );
     }
 
