@@ -7293,13 +7293,104 @@ mod tests {
         );
     }
 
+    /// Plan D140 with D88: a run in the dead-walk set that this process takes again leaves the
+    /// set, so the sweep neither gives back nor adopts the live walk's lease.
+    ///
+    /// The outage and the store's return are the Expired test's. The take happens while the lease
+    /// the claim wrote is still live, as a resume would take it.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_walk_taken_again_leaves_the_set_and_keeps_its_lease() {
+        let harness = Harness::new().await;
+        let (parked, _) = started(&harness).await;
+        let snapshot = snapshot_of(&harness, parked).await;
+        harness_engine!(harness.orch, engine);
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        let dead = htui_core::model::RunId::new();
+
+        let clock = &harness.orch.clock;
+        let walk = async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                clock.advance(TimeDelta::seconds(1));
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), EngineError>(())
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_millis(600_500),
+            engine.walk_leased(dead, walk),
+        )
+        .await
+        .expect("the walk stops itself instead of writing past its lease")
+        .expect_err("no refresh ever succeeded");
+        assert!(
+            harness.orch.dead_walks.contains(dead),
+            "the fenced walk's run waits for its lease to be given back"
+        );
+
+        let now = harness.orch.clock.now();
+        harness
+            .orch
+            .store
+            .create_run(htui_core::model::NewRun {
+                id: dead,
+                project_id: ids::PROJECT_HTUI,
+                item_id: ids::HTUI_ANA_2,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                started_by: harness.orch.user(),
+                graph_snapshot: snapshot,
+                repo_scope: Vec::new(),
+                queued_at: now,
+            })
+            .await
+            .expect("MemStore creates the run");
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .claim_run(dead, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .await
+                .expect("MemStore claims"),
+            htui_core::model::Claim::Admitted,
+            "the dead walk's lease is this process's"
+        );
+
+        engine
+            .take_lease(dead)
+            .await
+            .expect("this process renews its own lease");
+        assert!(
+            !harness.orch.dead_walks.contains(dead),
+            "a run taken again is a live walk's, so it leaves the set"
+        );
+        let taken = harness.orch.run(dead).await;
+        // A second later, so a lease given back and adopted again would carry a later expiry.
+        harness.orch.clock.advance(TimeDelta::seconds(1));
+
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert!(
+            swept.iter().all(|adopted| adopted.run != dead),
+            "plan D88: the sweep does not adopt a live walk's run"
+        );
+        assert_eq!(
+            harness.orch.run(dead).await.lease_expires_at,
+            taken.lease_expires_at,
+            "the sweep neither gave the lease back nor took it again"
+        );
+    }
+
     /// Plan D140: a release that fails puts the run in the dead-walk set, and the sweep retries
-    /// it until the store answers. The run does not exist, so the release is `Err(NotFound)`,
-    /// which stands for a store that cannot answer, as in the D122 test.
+    /// it until the store answers. The run does not exist at first, so the release is
+    /// `Err(NotFound)`, which stands for a store that cannot answer, as in the D122 test. Once the
+    /// row exists, the next sweep's retry answers and the run leaves the set.
     #[tokio::test(start_paused = true)]
     async fn a_failed_release_is_retried_by_the_sweep() {
         let harness = Harness::new().await;
+        let (parked, _) = started(&harness).await;
+        let snapshot = snapshot_of(&harness, parked).await;
         harness_engine!(harness.orch, engine);
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
         let ghost = htui_core::model::RunId::new();
 
         engine.release_lease(ghost).await;
@@ -7313,6 +7404,45 @@ mod tests {
             harness.orch.dead_walks.runs(),
             [ghost],
             "the sweep retried it, and it failed again"
+        );
+
+        let now = harness.orch.clock.now();
+        harness
+            .orch
+            .store
+            .create_run(htui_core::model::NewRun {
+                id: ghost,
+                project_id: ids::PROJECT_HTUI,
+                item_id: ids::HTUI_ANA_2,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                started_by: harness.orch.user(),
+                graph_snapshot: snapshot,
+                repo_scope: Vec::new(),
+                queued_at: now,
+            })
+            .await
+            .expect("MemStore creates the run");
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .claim_run(ghost, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .await
+                .expect("MemStore claims"),
+            htui_core::model::Claim::Admitted,
+            "the lease the failed release left is this process's"
+        );
+
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert!(
+            harness.orch.dead_walks.runs().is_empty(),
+            "the sweep's retry answered, so the run left the set"
+        );
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [ghost],
+            "the lease was given back before adopt_runs, so this process adopts the run"
         );
     }
 
