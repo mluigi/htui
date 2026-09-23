@@ -201,25 +201,32 @@ impl Orchestrate for FakeOrchestrator {
 /// `cases_are_unique_and_forty_two` and out of crate by `tests/fake_conformance.rs` — because
 /// a binding that silently ran forty-one of them would still be green.
 ///
-/// Seven are `docs/ANA-2.md` §12's validation criteria (1, 2, 3, 5, 6, 7 and 13's command half);
-/// four are contract lines
-/// §12 does not number but §4.2 states outright; one is the `finish_run` seam T1 shipped for this
-/// walk to use; three are the cells of §4.2's gate table nothing else reaches — plan D4's automatic
-/// loop entry and both halves of `on_failure` — which D4 predicted would go unexecuted in a
-/// manual-mode milestone and did; one is plan D5's intermediate position, which had a topology
-/// digest pinning it and no walk executing it; the last three are milestone 3's — the settle's two
-/// readings of a `verify_command` that ran (`fail`) and one that could not (`unavailable`), and
-/// `CancelRun`, which criterion 13 is stated in terms of (plan D45). Milestone 4 adds five: stage 1
-/// as `R-AGT-8`'s walk selecting an `allowed_warning` row and falling through a skipped one (plan
-/// D60, D61), both halves of the empty-candidate refusal (plan D62), and the loop's forwarded
-/// `verify_failure` and `previous_diff` (plan D67) — and then twelve for fan-out: criteria 8, 9
-/// and 10 (plan D49-D53, D65), the gated and judgeless routes to a human (D49, D50), a failed
-/// candidate (D48), a group with no survivor (D49(1)), the review loop over a group (D66), and
-/// the two caps refused at `StartRun` (D63) — and one more for a `shared_serialized` sibling's
-/// deadline, which counts from its own `prepare` (D48). Milestone 5 adds six: criterion 15's
-/// three halves (plan D83, D84) and criterion 16, where overlap and the slot reach the walk, and
-/// the lease's two cross-process answers — a park releases it for another process's answer, and
-/// a live one refuses that answer before anything is written (plan D87, D108).
+/// Recounted, not appended: 18 + 5 + 13 + 6.
+///
+/// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
+/// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
+/// `finish_run` seam T1 shipped for this walk to use; three are the cells of §4.2's gate table
+/// nothing else reaches — plan D4's automatic loop entry and both halves of `on_failure` — which
+/// D4 predicted would go unexecuted in a manual-mode milestone and did; one is plan D5's
+/// intermediate position, which had a topology digest pinning it and no walk executing it; and
+/// three are milestone 3's — the settle's two readings of a `verify_command` that ran (`fail`) and
+/// one that could not (`unavailable`), and `CancelRun`, which is criterion 13's command half
+/// (plan D45).
+///
+/// **Five for milestone 4's stage 1**: `R-AGT-8`'s walk selecting an `allowed_warning` row and
+/// falling through a skipped one (plan D60, D61), both halves of the empty-candidate refusal (plan
+/// D62), and the loop's forwarded `verify_failure` and `previous_diff` (plan D67).
+///
+/// **Thirteen for milestone 4's fan-out**: criterion 8 once, 9 twice and 10 twice (plan D49-D53,
+/// D65); the gated and judgeless routes to a human (D49, D50); a failed candidate (D48); a group
+/// with no survivor (D49(1)); the review loop over a group (D66); the two caps refused at
+/// `StartRun` (D63); and a `shared_serialized` sibling's deadline, which counts from its own
+/// `prepare` (D48).
+///
+/// **Six for milestone 5's lease and overlap**: criterion 15's three halves (plan D83, D84);
+/// criterion 16, where overlap and the slot reach the walk; and the lease's two cross-process
+/// answers — a park releases it for another process's answer, and a live one refuses that answer
+/// before anything is written (plan D87, D108).
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -3547,18 +3554,19 @@ mod tests {
         assert_eq!(
             CASES.len(),
             42,
-            "seven ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam, the three \
-             gate-table cells only an edited gate reaches, plan D5's intermediate position, \
-             milestone 3's two verify outcomes and `CancelRun`, milestone 4's five stage-1 cases \
-             — the `allowed_warning` selection, the fall-through to the next candidate, the \
-             rung-4 refusal at `StartRun`, the stage-1 walk that skips every candidate, and the \
-             second attempt's forwarded `verify_failure` and `previous_diff` — and its twelve \
-             fan-out cases: criteria 8, 9 (twice) and 10 (twice), the gated and judgeless human \
-             selections, a failed candidate, a group with no survivor, the review loop over a \
-             group, the two caps, and a `shared_serialized` sibling's own deadline — and \
-             milestone 5's six: criterion 15's serialised overlap, its two repos and its \
-             undeclared item, criterion 16's slot and parked overlap, a park's released lease \
-             taken by another process's answer, and a live lease refusing that answer"
+            "18 + 5 + 13 + 6: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+             contract lines, the `finish_run` seam, the three gate-table cells only an edited \
+             gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
+             and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
+             selection, the fall-through to the next candidate, the rung-4 refusal at \
+             `StartRun`, the stage-1 walk that skips every candidate, and the second attempt's \
+             forwarded `verify_failure` and `previous_diff`), its thirteen fan-out cases \
+             (criteria 8, 9 twice and 10 twice, the gated and judgeless human selections, a \
+             failed candidate, a group with no survivor, the review loop over a group, the two \
+             caps, and a `shared_serialized` sibling's own deadline), and milestone 5's six \
+             (criterion 15's serialised overlap, its two repos and its undeclared item, \
+             criterion 16's slot and parked overlap, a park's released lease taken by another \
+             process's answer, and a live lease refusing that answer)"
         );
     }
 
