@@ -70,6 +70,15 @@ pub enum RunFailure {
         /// `step_graph_phase.name` of the fanned-out phase.
         phase: String,
     },
+    /// Plan D94: the sweep failed a step it found `running` after the lease expired, and parked
+    /// the run (ANA-2 §4.9 `:1298-1299`). `run.failure` stays NULL (R-3): this is the typed
+    /// reason of the sweep's park, not a column.
+    Interrupted {
+        /// `step_graph_phase.name` of the interrupted step.
+        phase: String,
+        /// Whether the step's trees were reset (D92), or left exactly as found (D93).
+        reset: bool,
+    },
 }
 
 impl fmt::Display for RunFailure {
@@ -90,6 +99,10 @@ impl fmt::Display for RunFailure {
                 write!(f, "no_candidate_agent: phase `{phase}`; {detail}")
             }
             Self::NoSurvivingCandidate { phase } => write!(f, "no_surviving_candidate: {phase}"),
+            Self::Interrupted { phase, reset } => {
+                let _ = (phase, reset);
+                todo!("plan D94's two rows")
+            }
         }
     }
 }
@@ -405,6 +418,24 @@ mod tests {
             .to_string(),
             "no_surviving_candidate: implement",
             "plan D48: every candidate of the group failed"
+        );
+        assert_eq!(
+            RunFailure::Interrupted {
+                phase: "implement".to_owned(),
+                reset: true,
+            }
+            .to_string(),
+            "interrupted: implement",
+            "plan D94: the sweep reset the step's trees and parked it out of budget"
+        );
+        assert_eq!(
+            RunFailure::Interrupted {
+                phase: "implement".to_owned(),
+                reset: false,
+            }
+            .to_string(),
+            "interrupted, tree not reset: implement",
+            "plan D93/D94: a tree the sweep must not reset, left as found (`:1299`)"
         );
     }
 
