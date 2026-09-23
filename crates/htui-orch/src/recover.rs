@@ -390,6 +390,24 @@ mod tests {
         assert_eq!(above.refresh, Duration::from_millis(500));
     }
 
+    #[test]
+    fn a_ttl_no_timestamp_can_carry_reads_as_silence() {
+        // Fits a `TimeDelta` (up to ~9.2e15 s) but not `now + ttl` (`DateTime<Utc>` ends near
+        // year 262143), so the heartbeat's addition would panic.
+        for huge in [10_000_000_000_000_i64, i64::MAX] {
+            let times = LeaseTimes::from_app(&app(&[("lease_ttl_seconds", json!(huge))]));
+            assert_eq!(times.ttl, TimeDelta::seconds(120), "{huge}");
+            assert_eq!(times.refresh, Duration::from_secs(60), "{huge}");
+        }
+
+        // One year is the longest TTL read as set.
+        let year = 365 * 24 * 60 * 60;
+        let times = LeaseTimes::from_app(&app(&[("lease_ttl_seconds", json!(year))]));
+        assert_eq!(times.ttl, TimeDelta::seconds(year));
+        let over = LeaseTimes::from_app(&app(&[("lease_ttl_seconds", json!(year + 1))]));
+        assert_eq!(over.ttl, TimeDelta::seconds(120));
+    }
+
     // -----------------------------------------------------------------------------------------
     // Heartbeat
     // -----------------------------------------------------------------------------------------
@@ -879,13 +897,28 @@ mod tests {
         assert_eq!(verify_of(&step, &runs), (None, None));
 
         // The last `verify` row decides, whatever order the slice is in.
-        let runs = [
+        let mut runs = [
             command_run(&step, "verify", CommandRunStatus::Done, Some(2), at(7)),
             command_run(&step, "verify", CommandRunStatus::Done, Some(0), at(3)),
         ];
         assert_eq!(
             verify_of(&step, &runs),
             (Some(VerifyOutcome::Fail), Some(2))
+        );
+        runs.reverse();
+        assert_eq!(
+            verify_of(&step, &runs),
+            (Some(VerifyOutcome::Fail), Some(2))
+        );
+
+        // On a `queued_at` tie, the later row in the slice decides.
+        let runs = [
+            command_run(&step, "verify", CommandRunStatus::Done, Some(0), at(7)),
+            command_run(&step, "verify", CommandRunStatus::Done, Some(3), at(7)),
+        ];
+        assert_eq!(
+            verify_of(&step, &runs),
+            (Some(VerifyOutcome::Fail), Some(3))
         );
 
         // `finished_at` wins: the row's own columns, even `NULL`, over any `command_run`.
