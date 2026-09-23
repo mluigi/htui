@@ -20,7 +20,9 @@ use tokio::sync::OwnedMutexGuard;
 
 use super::copy;
 use super::git::{self, Cli, blocking};
-use super::{FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree};
+use super::{
+    FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree, ResetReport,
+};
 
 // One named free function per refusal sentence, the house style of `htui_core`'s store refusals
 // (`crates/htui-core/src/store/traits.rs:1053-1160`). The two `copy` refusals and the unborn-HEAD
@@ -113,6 +115,23 @@ pub fn local_cannot_fan_out() -> String {
 #[must_use]
 pub fn dirty_tree_not_reset(path: &Path) -> String {
     format!("dirty_tree_not_reset: {}", path.display())
+}
+
+/// D114 (blueprint F-T): the step's `htui/<step>` label already names a commit other than the
+/// checkout's `HEAD`, so labelling `HEAD` would move it and resetting would strand one of the two.
+#[must_use]
+pub fn label_conflict(label: &str, target: &str, head: &str) -> String {
+    let _ = (label, target, head);
+    todo!()
+}
+
+/// Blueprint A-6: a `local` checkout is the maintainer's own tree and branch, so a `HEAD` that moved
+/// during the run is not reset under them — even with the commits labelled, `reset --hard` would
+/// move their branch backwards.
+#[must_use]
+pub fn local_moved(path: &Path, head: &str, base: &str) -> String {
+    let _ = (path, head, base);
+    todo!()
 }
 
 /// Where a tree of this repository starts: the slot's base when there is a slot (D54(a)), the
@@ -1408,6 +1427,23 @@ impl Isolator for GixIsolator {
             Err(first)
         })
     }
+
+    /// D92, D114: every in-place row checked before any is written; `worktree`/`copy` rows are
+    /// skipped without their path being read.
+    fn reset<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ResetReport> {
+        let _ = (step, trees);
+        todo!()
+    }
+
+    /// D99: [`release_run`](GixIsolator::release_run) alone — no tree is touched.
+    fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()> {
+        let _ = run;
+        todo!()
+    }
 }
 
 #[cfg(test)]
@@ -1420,9 +1456,9 @@ mod tests {
     use htui_core::model::{BoxId, Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId};
 
     use crate::isolate::git::testkit::{commit_file, empty_repo, repo_with_one_commit};
-    use crate::isolate::{FanoutSlot, Isolator as _, Prepared};
+    use crate::isolate::{FanoutSlot, Isolator as _, Prepared, ResetReport};
 
-    use super::{GixIsolator, IsolatorConfig, RepoCheckout};
+    use super::{GixIsolator, IsolatorConfig, RepoCheckout, label_conflict, local_moved};
 
     /// A repository at `<dir>/<name>` with one commit, and the pieces a config map wants.
     fn repo(dir: &Path, name: &str, is_primary: bool) -> (RepoId, RepoCheckout, String) {
@@ -3883,5 +3919,549 @@ mod tests {
             .expect("the task did not panic")
             .expect("the run cleans up");
         assert!(!tree.exists(), "the tree was removed");
+    }
+
+    /// Every `refs/heads/htui/*` of the repository at `path`, with its target, in name order.
+    fn htui_refs(path: &Path) -> Vec<(String, String)> {
+        let repository = gix::open(path).expect("the repository opens");
+        let platform = repository.references().expect("the ref store reads");
+        let mut refs = platform
+            .local_branches()
+            .expect("the branches list")
+            .map(|reference| {
+                let mut reference = reference.expect("a branch reads");
+                let name = reference.name().as_bstr().to_string();
+                let target = reference
+                    .peel_to_id()
+                    .expect("a branch peels")
+                    .detach()
+                    .to_hex()
+                    .to_string();
+                (name, target)
+            })
+            .filter(|(name, _)| name.starts_with("refs/heads/htui/"))
+            .collect::<Vec<_>>();
+        refs.sort();
+        refs
+    }
+
+    /// An isolator that could never spawn `git`: what a git-free case runs against, so a pass
+    /// proves the path it took needs no binary.
+    fn without_git(root: &Path, checkouts: &[(RepoId, RepoCheckout)]) -> GixIsolator {
+        GixIsolator::with_git(
+            config(root, checkouts),
+            Err("no git on this box".to_owned()),
+        )
+        .expect("the config validates")
+    }
+
+    /// OQ-8: a `worktree` or `copy` retry prepares a tree of its own, so `reset` touches neither —
+    /// not the agent's commit, not the branch, not a file, not a ref.
+    #[tokio::test]
+    async fn reset_leaves_worktree_and_copy_trees_untouched() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let core_path = core_checkout.local_path.clone();
+        let docs_path = docs_checkout.local_path.clone();
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let worktree = isolator
+            .prepare(run, step, &[core], Isolation::Worktree, None)
+            .await
+            .expect("the worktree mode prepares");
+        let copy = isolator
+            .prepare(run, step, &[docs], Isolation::Copy, None)
+            .await
+            .expect("the copy mode prepares");
+        let mut trees = rows(&worktree);
+        trees.extend(rows(&copy));
+        let worktree_path = PathBuf::from(&trees[0].path);
+        let copy_path = PathBuf::from(&trees[1].path);
+        let worktree_tip = commit_file(&worktree_path, "g", "agent\n", "the agent commits");
+        let copy_tip = commit_file(&copy_path, "g", "agent\n", "the agent commits");
+        std::fs::write(worktree_path.join("f"), "unfinished\n").expect("the tree is edited");
+
+        let before = [
+            htui_refs(&core_path),
+            htui_refs(&docs_path),
+            htui_refs(&copy_path),
+        ];
+        let report = isolator.reset(step, &trees).await.expect("reset answers");
+
+        assert_eq!(report, ResetReport::default());
+        assert_eq!(
+            crate::isolate::git::head(&worktree_path).expect("the worktree has a HEAD"),
+            worktree_tip
+        );
+        assert_eq!(
+            crate::isolate::git::head(&copy_path).expect("the copy has a HEAD"),
+            copy_tip
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree_path.join("f")).expect("the file reads"),
+            "unfinished\n",
+            "the agent's edit survives"
+        );
+        assert_eq!(
+            std::fs::read_to_string(copy_path.join("g")).expect("the file reads"),
+            "agent\n"
+        );
+        assert_eq!(
+            [
+                htui_refs(&core_path),
+                htui_refs(&docs_path),
+                htui_refs(&copy_path),
+            ],
+            before,
+            "no `htui/` ref was added or moved"
+        );
+    }
+
+    /// D92: a clean `shared_serialized` checkout the agent committed on is labelled at its `HEAD`
+    /// first and only then reset to the step's `base_ref`, so the commit stays reachable.
+    #[tokio::test]
+    async fn reset_labels_then_resets_a_clean_shared_checkout() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        let commit = commit_file(&core_path, "g", "agent\n", "the agent commits");
+
+        let report = isolator
+            .reset(step, &rows(&prepared))
+            .await
+            .expect("reset answers");
+
+        assert_eq!(
+            report,
+            ResetReport {
+                labelled: vec![(core, commit.clone())],
+                refused: Vec::new(),
+            }
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head,
+            "the checkout is back at base_ref"
+        );
+        assert!(!core_path.join("g").exists(), "the agent's file is gone");
+        assert_eq!(
+            crate::isolate::git::branch_target(&core_path, &format!("htui/{step}"))
+                .expect("the ref store reads"),
+            Some(commit.clone()),
+            "the label names the agent's commit"
+        );
+        assert!(
+            crate::isolate::git::testkit::has_object(&core_path, &commit),
+            "and the commit is still there to be read"
+        );
+        isolator.release(run).await.expect("release answers");
+    }
+
+    /// Blueprint F-T: `capture` already wrote `htui/<step>` at `HEAD` (D26), and `create_branch` is
+    /// `MustNotExist` — `reset` finds the label rather than failing on it.
+    #[tokio::test]
+    async fn reset_finds_a_label_capture_already_wrote() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        let commit = commit_file(&core_path, "g", "agent\n", "the agent commits");
+        let trees = rows(&prepared);
+        isolator
+            .capture(step, &trees)
+            .await
+            .expect("the step captures, writing the label");
+
+        let report = isolator.reset(step, &trees).await.expect("reset answers");
+
+        assert_eq!(report.labelled, vec![(core, commit.clone())]);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head
+        );
+        assert_eq!(
+            crate::isolate::git::branch_target(&core_path, &format!("htui/{step}"))
+                .expect("the ref store reads"),
+            Some(commit)
+        );
+    }
+
+    /// D114: a label that already names some other commit is a refusal, and nothing is written —
+    /// not the label, not the reset.
+    #[tokio::test]
+    async fn reset_refuses_a_label_that_names_another_commit() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        let label = format!("htui/{step}");
+        crate::isolate::git::create_branch(&core_path, &label, &head)
+            .expect("the label is pre-created at base_ref");
+        let commit = commit_file(&core_path, "g", "agent\n", "the agent commits");
+
+        let report = isolator
+            .reset(step, &rows(&prepared))
+            .await
+            .expect("reset answers");
+
+        assert_eq!(
+            report,
+            ResetReport {
+                labelled: Vec::new(),
+                refused: vec![(core, label_conflict(&label, &head, &commit))],
+            }
+        );
+        assert_eq!(
+            label_conflict(&label, &head, &commit),
+            format!("label_conflict: {label} names {head}, HEAD is {commit}")
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            commit,
+            "HEAD is unmoved"
+        );
+        assert_eq!(
+            crate::isolate::git::branch_target(&core_path, &label).expect("the ref store reads"),
+            Some(head),
+            "and the label is where it was"
+        );
+        isolator.release(run).await.expect("release answers");
+    }
+
+    /// D92: a checkout still at its `base_ref` has nothing to put back and nothing to label.
+    #[tokio::test]
+    async fn reset_of_a_shared_checkout_at_before_hash_writes_no_label() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+
+        let report = isolator
+            .reset(step, &rows(&prepared))
+            .await
+            .expect("reset answers");
+
+        assert_eq!(report, ResetReport::default());
+        assert!(
+            htui_refs(&core_path).is_empty(),
+            "no `htui/` ref was written"
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head
+        );
+        isolator.release(run).await.expect("release answers");
+    }
+
+    /// OQ-7: a `local` checkout that is dirty **now** may hold the maintainer's edits, and is
+    /// refused before anything is read further — no `git` binary needed to say so.
+    #[tokio::test]
+    async fn reset_refuses_a_live_dirty_local_checkout_and_touches_nothing() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator = without_git(&dir.path().join("trees"), &[(core, core_checkout)]);
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core], Isolation::Local, None)
+            .await
+            .expect("local prepares");
+        let trees = rows(&prepared);
+        let commit = commit_file(&core_path, "g", "agent\n", "the agent commits");
+        std::fs::write(core_path.join("f"), "the maintainer is mid-edit\n")
+            .expect("the checkout is dirtied");
+
+        let report = isolator.reset(step, &trees).await.expect("reset answers");
+
+        assert_eq!(
+            report,
+            ResetReport {
+                labelled: Vec::new(),
+                refused: vec![(
+                    core,
+                    format!(
+                        "dirty_tree_not_reset: {}",
+                        Path::new(&trees[0].path).display()
+                    )
+                )],
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("f")).expect("the file reads"),
+            "the maintainer is mid-edit\n",
+            "the edit survives byte for byte"
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            commit,
+            "HEAD is unmoved"
+        );
+        assert!(htui_refs(&core_path).is_empty(), "no label was written");
+    }
+
+    /// Blueprint A-6: a clean `local` checkout whose `HEAD` moved is the maintainer's own branch,
+    /// and `reset --hard` would move it backwards under them — refused, and nothing written.
+    #[tokio::test]
+    async fn reset_refuses_a_local_checkout_whose_head_moved() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator = without_git(&dir.path().join("trees"), &[(core, core_checkout)]);
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core], Isolation::Local, None)
+            .await
+            .expect("local prepares");
+        let trees = rows(&prepared);
+        let commit = commit_file(&core_path, "g", "agent\n", "the agent commits");
+
+        let report = isolator.reset(step, &trees).await.expect("reset answers");
+
+        let path = PathBuf::from(&trees[0].path);
+        assert_eq!(
+            report,
+            ResetReport {
+                labelled: Vec::new(),
+                refused: vec![(core, local_moved(&path, &commit, &head))],
+            }
+        );
+        assert_eq!(
+            local_moved(&path, &commit, &head),
+            format!(
+                "local_moved: {} at {commit}, before_hash {head}",
+                path.display()
+            )
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            commit,
+            "HEAD is unmoved"
+        );
+        assert!(htui_refs(&core_path).is_empty(), "no label was written");
+    }
+
+    /// A clean `local` checkout still at its `base_ref` is vacuously reset: nothing to do, and no
+    /// binary needed to find that out.
+    #[tokio::test]
+    async fn reset_of_a_local_checkout_at_before_hash_is_empty() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator = without_git(&dir.path().join("trees"), &[(core, core_checkout)]);
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core], Isolation::Local, None)
+            .await
+            .expect("local prepares");
+
+        let report = isolator
+            .reset(step, &rows(&prepared))
+            .await
+            .expect("reset answers");
+
+        assert_eq!(report, ResetReport::default());
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head
+        );
+    }
+
+    /// D92's all-or-nothing: one dirty repository refuses the whole reset, so the clean, moved one
+    /// beside it is neither labelled nor reset.
+    #[tokio::test]
+    async fn reset_is_all_or_nothing_across_repos() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let core_path = core_checkout.local_path.clone();
+        let docs_path = docs_checkout.local_path.clone();
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core, docs], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        let trees = rows(&prepared);
+        let commit = commit_file(&core_path, "g", "agent\n", "the agent commits");
+        std::fs::write(docs_path.join("f"), "uncommitted\n").expect("docs is dirtied");
+
+        let report = isolator.reset(step, &trees).await.expect("reset answers");
+
+        let docs_row = trees
+            .iter()
+            .find(|row| row.repo_id == docs)
+            .expect("docs has a row");
+        assert_eq!(
+            report,
+            ResetReport {
+                labelled: Vec::new(),
+                refused: vec![(
+                    docs,
+                    format!(
+                        "dirty_tree_not_reset: {}",
+                        Path::new(&docs_row.path).display()
+                    )
+                )],
+            }
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            commit,
+            "the clean repository was not reset"
+        );
+        assert!(htui_refs(&core_path).is_empty(), "nor labelled");
+        assert_eq!(
+            std::fs::read_to_string(docs_path.join("f")).expect("the file reads"),
+            "uncommitted\n"
+        );
+        isolator.release(run).await.expect("release answers");
+    }
+
+    /// OQ-8, scoped: `reset` never reads a `worktree`/`copy` row's path, so a tree that vanished —
+    /// or a repository this box has no checkout of — is not an error.
+    #[tokio::test]
+    async fn reset_never_reads_a_worktree_or_copy_path() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let isolator = without_git(&dir.path().join("trees"), &[]);
+        let step = StepId::new();
+        let trees = [Isolation::Worktree, Isolation::Copy].map(|mode| RunStepTree {
+            run_step_id: step,
+            repo_id: RepoId::new(),
+            mode,
+            path: dir
+                .path()
+                .join("vanished")
+                .join(format!("{mode:?}"))
+                .to_string_lossy()
+                .into_owned(),
+            base_ref: "0".repeat(40),
+            dirty: false,
+        });
+
+        let report = isolator.reset(step, &trees).await.expect("reset answers");
+
+        assert_eq!(report, ResetReport::default());
+    }
+
+    /// D99: `release(run)` gives back every guard the run's steps hold and removes nothing — the
+    /// adopter reads those trees.
+    #[tokio::test]
+    async fn release_frees_a_shared_guard_without_removing_a_tree() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let core_path = core_checkout.local_path.clone();
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let first = RunId::new();
+        isolator
+            .prepare(
+                first,
+                StepId::new(),
+                &[core],
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("the shared step prepares");
+        let worktree = isolator
+            .prepare(first, StepId::new(), &[docs], Isolation::Worktree, None)
+            .await
+            .expect("the worktree step prepares");
+        let worktree_path = PathBuf::from(&worktree.trees[0].tree.path);
+
+        isolator.release(first).await.expect("release answers");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            isolator.prepare(
+                RunId::new(),
+                StepId::new(),
+                &[core],
+                Isolation::SharedSerialized,
+                None,
+            ),
+        )
+        .await
+        .expect("the released guard admits the next run")
+        .expect("the next run prepares");
+        assert!(core_path.join("f").exists(), "the checkout is untouched");
+        assert!(
+            worktree_path.join(".git").exists(),
+            "the worktree tree is still there"
+        );
     }
 }

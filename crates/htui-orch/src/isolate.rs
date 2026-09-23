@@ -113,7 +113,22 @@ pub struct FanoutSlot<'a> {
     pub base: &'a BTreeMap<RepoId, String>,
 }
 
-/// ANA-2 §4.6's four verbs, named there verbatim (`docs/ANA-2.md:1769`), behind plan D6's seam.
+/// Plan D92/D99: what [`Isolator::reset`] did. **`refused` non-empty ⇒ nothing was reset.**
+///
+/// A refusal is not an [`IsolateError`]: the sweep reads it as "this tree must not be touched" and
+/// takes D93's park, which names every refused tree, rather than failing the adjudication of the
+/// run it was recovering.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResetReport {
+    /// `(repo, head)`: `htui/<step>` names `head` after the call, written now or found there.
+    pub labelled: Vec<(RepoId, String)>,
+    /// `(repo, reason)`: `dirty_tree_not_reset: <path>`, `label_conflict: …` (D114) or
+    /// `local_moved: …` (blueprint A-6).
+    pub refused: Vec<(RepoId, String)>,
+}
+
+/// ANA-2 §4.6's four verbs plus milestone 4's two reads and milestone 5's two recovery verbs; the
+/// four are named there verbatim (`docs/ANA-2.md:1769`), and all eight sit behind plan D6's seam.
 ///
 /// **An isolator touches no store.** The engine persists what these return —
 /// `upsert_step_tree` after [`prepare`](Isolator::prepare), `record_commits` after
@@ -204,6 +219,26 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     /// and §4.6's own cleanup rule, `:994-996`): the next attempt of a superseded step reads the
     /// tree the last one left.
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()>;
+
+    /// ANA-2 §4.9 `:1298` as plan D92 reads it: an unfinished step's trees put back at their
+    /// `base_ref` so the retry starts where the step did. `worktree`/`copy` rows are never touched
+    /// (OQ-8): the retry prepares a tree of its own.
+    ///
+    /// `shared_serialized`/`local` rows are checked **all first** (OQ-7: live dirt refuses), then
+    /// labelled `htui/<step>` when `HEAD` moved, then `reset --hard <base_ref>`. The check is
+    /// all-or-nothing across rows: a [`ResetReport`] with a refusal in it reset nothing anywhere.
+    fn reset<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ResetReport>;
+
+    /// D99: drop every guard any step of `run` holds and touch no tree; an abandoning walk's
+    /// release.
+    ///
+    /// [`cleanup`](Isolator::cleanup) also releases them, but it removes trees, which would
+    /// destroy what the process that adopts the run has to read.
+    fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()>;
 }
 
 /// The one place an instant enters the walk (plan D8).

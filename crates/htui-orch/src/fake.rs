@@ -37,7 +37,7 @@ use crate::command::{Command, CommandOutcome, EngineError};
 use crate::engine::SessionKey;
 use crate::graph::GraphSource;
 use crate::isolate::{
-    Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree,
+    Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree, ResetReport,
 };
 use crate::verify::{Verifier, VerifierFuture, VerifyReport, VerifyRequest};
 
@@ -235,6 +235,25 @@ impl FakeIsolator {
             .cleanups
             .lock()
             .expect("no panic holds the fake isolator's lock")
+    }
+
+    /// Make the next [`reset`](Isolator::reset) refuse with `reason`, reported against the first
+    /// row's repository — the shape D93's park reads from a real isolator's `dirty_tree_not_reset`.
+    pub fn script_reset_refusal(&self, reason: &str) {
+        let _ = reason;
+        todo!()
+    }
+
+    /// How many times [`reset`](Isolator::reset) has been called, refusals included.
+    #[must_use]
+    pub fn resets(&self) -> u32 {
+        todo!()
+    }
+
+    /// How many times [`release`](Isolator::release) has been called.
+    #[must_use]
+    pub fn releases(&self) -> u32 {
+        todo!()
     }
 
     /// Take `step`'s `shared_serialized` guard, if it holds one; dropping it frees the lock.
@@ -462,6 +481,23 @@ impl Isolator for FakeIsolator {
                 .expect("no panic holds the fake isolator's lock") += 1;
             Ok::<(), IsolateError>(())
         })
+    }
+
+    /// Nothing was created, so nothing is put back: an empty [`ResetReport`] unless a case
+    /// scripted a refusal with [`script_reset_refusal`](FakeIsolator::script_reset_refusal).
+    fn reset<'a>(
+        &'a self,
+        step: StepId,
+        trees: &'a [RunStepTree],
+    ) -> IsolatorFuture<'a, ResetReport> {
+        let _ = (step, trees);
+        todo!()
+    }
+
+    /// D99: every `shared_serialized` guard a step of `run` holds, dropped; counted.
+    fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()> {
+        let _ = run;
+        todo!()
     }
 }
 
@@ -1370,7 +1406,7 @@ mod tests {
     };
     use crate::engine::SessionKey;
     use crate::graph::{ResolveError, Resolved, resolve};
-    use crate::isolate::{Clock as _, FanoutSlot, Isolator as _};
+    use crate::isolate::{Clock as _, FanoutSlot, Isolator as _, ResetReport};
 
     /// `graph::resolve` of `HTUI_FEAT-1`, manual, no `app_setting`, no requested scope.
     async fn resolve_feat<G: GraphSource>(
@@ -1607,6 +1643,108 @@ mod tests {
         );
         assert_eq!(isolator.diff(&[], &[]).await.expect("scripted"), None);
         assert_eq!(isolator.diff(&[], &[]).await.expect("unscripted"), None);
+    }
+
+    /// D92/D99: the fake's `reset` is empty unless scripted, a scripted refusal is consumed once
+    /// and names the first row's repository, and every call is counted.
+    #[tokio::test]
+    async fn the_fake_reset_is_scripted_and_empty_by_default() {
+        let isolator = FakeIsolator::new();
+        let step = StepId::new();
+        let scope = repos();
+        let trees: Vec<_> = isolator
+            .prepare(ids::RUN_2, step, &scope, Isolation::SharedSerialized, None)
+            .await
+            .expect("the fake never refuses")
+            .trees
+            .into_iter()
+            .map(|prepared| prepared.tree)
+            .collect();
+        assert_eq!(isolator.resets(), 0);
+
+        assert_eq!(
+            isolator.reset(step, &trees).await.expect("unscripted"),
+            ResetReport::default()
+        );
+        isolator.script_reset_refusal("dirty_tree_not_reset: /fake/trees/x");
+        assert_eq!(
+            isolator.reset(step, &trees).await.expect("scripted"),
+            ResetReport {
+                labelled: Vec::new(),
+                refused: vec![(
+                    trees[0].repo_id,
+                    "dirty_tree_not_reset: /fake/trees/x".to_owned()
+                )],
+            }
+        );
+        assert_eq!(
+            isolator.reset(step, &trees).await.expect("consumed"),
+            ResetReport::default(),
+            "a scripted refusal answers once"
+        );
+        assert_eq!(isolator.resets(), 3, "every call is counted");
+    }
+
+    /// D99 over F-I's re-key: `release(run)` drops the guard a step of that run holds, and only
+    /// that run's, so a second run's shared `prepare` is admitted.
+    #[tokio::test]
+    async fn the_fake_release_frees_its_serial_lock() {
+        let isolator = std::sync::Arc::new(FakeIsolator::new());
+        let scope = repos();
+        isolator
+            .prepare(
+                ids::RUN_1,
+                StepId::new(),
+                &scope,
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("the first run's step prepares");
+
+        let mut waiting = {
+            let isolator = std::sync::Arc::clone(&isolator);
+            let scope = scope.clone();
+            tokio::spawn(async move {
+                isolator
+                    .prepare(
+                        ids::RUN_2,
+                        StepId::new(),
+                        &scope,
+                        Isolation::SharedSerialized,
+                        None,
+                    )
+                    .await
+                    .map(|prepared| prepared.trees.len())
+            })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "the second run waits on the serial lock"
+        );
+        assert_eq!(isolator.releases(), 0);
+
+        isolator
+            .release(ids::RUN_2)
+            .await
+            .expect("releasing a run that holds nothing answers");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "another run's release frees nothing"
+        );
+
+        isolator.release(ids::RUN_1).await.expect("release answers");
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the released lock admits the second run")
+            .expect("the task did not panic")
+            .expect("the second run prepares");
+        assert_eq!(admitted, 2);
+        assert_eq!(isolator.releases(), 2, "every call is counted");
     }
 
     /// `impl GraphSource for MemStore` delegates to the five inherent reads of the same names.
