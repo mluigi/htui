@@ -245,6 +245,10 @@ pub enum EngineError {
     },
     /// Plan D86: a heartbeat's refresh touched zero rows, so another orchestrator took the lease
     /// and the walk was dropped where it stood, writing nothing further (ANA-2 `:1280-1282`).
+    ///
+    /// Plan D122 raises it too when refreshes kept failing until the lease was one interval from
+    /// lapsing: past that point another box's sweep may take the lease at any moment, so the walk
+    /// is treated as though it already had.
     #[error(
         "run {run}: its lease was taken by another orchestrator; this walk was abandoned (ANA-2 §4.9)"
     )]

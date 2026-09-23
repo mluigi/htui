@@ -43,16 +43,18 @@ const MAX_LEASE_TTL_SECONDS: i64 = 365 * 24 * 60 * 60;
 pub struct LeaseTimes {
     /// Added to the clock's instant for every `lease_expires_at` this process writes.
     pub ttl: TimeDelta,
-    /// How long the heartbeat sleeps between two refreshes; always shorter than `ttl`.
+    /// How long the heartbeat sleeps between two refreshes; at most a third of `ttl` (D124).
     pub refresh: Duration,
 }
 
 impl LeaseTimes {
-    /// Positive `i64` per key (a TTL at most one year), else the default; then `refresh >= ttl` →
-    /// `ttl / 2`, in **milliseconds** so a 1 s TTL still beats at 500 ms.
+    /// Positive `i64` per key (a TTL at most one year), else the default; then `refresh` is
+    /// clamped to at most `ttl / 3` (plan D124), in **milliseconds** so a 1 s TTL still beats at
+    /// 333 ms. The defaults therefore beat every 40 s, not §10's 60 s.
     ///
-    /// A refresh at or above the TTL would let a live lease expire between two beats, and another
-    /// box's sweep would adopt a run this process is still walking.
+    /// The heartbeat fences itself one `refresh` before its last written lease lapses (D122), so
+    /// a third leaves one whole interval of fast retries (D123) between the first failed beat and
+    /// the fence, and one more between the fence and the lapse.
     #[must_use]
     pub fn from_app(app: &BTreeMap<String, Value>) -> Self {
         // A TTL above a year is read as silence: a `TimeDelta` holds far more (~9.2e15 s) than
@@ -64,11 +66,8 @@ impl LeaseTimes {
         let refresh_seconds =
             app_positive(app, LEASE_REFRESH_KEY).unwrap_or(DEFAULT_LEASE_REFRESH_SECONDS);
         let ttl = TimeDelta::seconds(ttl_seconds);
-        let refresh = if refresh_seconds >= ttl_seconds {
-            Duration::from_millis(ttl.num_milliseconds().unsigned_abs() / 2)
-        } else {
-            Duration::from_secs(refresh_seconds.unsigned_abs())
-        };
+        let third = Duration::from_millis(ttl.num_milliseconds().unsigned_abs() / 3);
+        let refresh = Duration::from_secs(refresh_seconds.unsigned_abs()).min(third);
         Self { ttl, refresh }
     }
 }
@@ -92,25 +91,51 @@ pub enum Heartbeat {
     Expired,
 }
 
-/// Sleep `times.refresh` (`tokio::time::sleep`), then `refresh(clock.now() + times.ttl)`:
-/// `Ok(true)` → loop; `Ok(false)` → `Abandoned`; `Err(e)` → `tracing::warn!` and loop (D86, D103).
-/// Never returns otherwise.
+/// Plan D123's floor on the sooner retry after a failed refresh.
+const MIN_RETRY: Duration = Duration::from_secs(1);
+
+/// Sleep, then `refresh(clock.now() + times.ttl)`: `Ok(true)` → the lease runs to that `until`,
+/// sleep `times.refresh`, loop; `Ok(false)` → `Abandoned`; `Err(e)` → `tracing::warn!`, sleep
+/// `times.refresh / 4` (at least 1 s, D123) and loop (D86, D103). Never returns otherwise.
 ///
-/// A store error is not a taken lease: offline, the lease is left to expire and the reconnect
-/// sweep adjudicates (`docs/ANA-2.md:1325-1336`). Needs a runtime with the time driver (H-3).
+/// **The self-fence (plan D122).** The heartbeat tracks the last `until` it wrote successfully,
+/// starting from `clock.now() + times.ttl` at its call, which is the lease its caller has just
+/// written (`claim_run`, `take_lease`). Once refreshes have failed until
+/// `clock.now() >= last_until - times.refresh`, it returns `Expired`: the walk cannot prove its
+/// lease, and one `refresh` before it lapses is where it stops, so no other box's sweep adopts a
+/// run this walk still writes to. A retry never sleeps past that fence.
+///
+/// A single store error is not a taken lease: offline, the lease is left to expire and the
+/// reconnect sweep adjudicates (`docs/ANA-2.md:1325-1336`). Needs a runtime with the time driver
+/// (H-3).
 pub async fn heartbeat<F, Fut, C>(mut refresh: F, clock: &C, times: LeaseTimes) -> Heartbeat
 where
     F: FnMut(DateTime<Utc>) -> Fut,
     Fut: Future<Output = Result<bool, StoreError>>,
     C: Clock + ?Sized,
 {
+    let retry = (times.refresh / 4).max(MIN_RETRY);
+    let margin = TimeDelta::from_std(times.refresh).unwrap_or(times.ttl);
+    let mut fence = clock.now() + times.ttl - margin;
+    let mut interval = times.refresh;
     loop {
-        tokio::time::sleep(times.refresh).await;
-        match refresh(clock.now() + times.ttl).await {
-            Ok(true) => {}
+        tokio::time::sleep(interval).await;
+        let until = clock.now() + times.ttl;
+        match refresh(until).await {
+            Ok(true) => {
+                fence = until - margin;
+                interval = times.refresh;
+            }
             Ok(false) => return Heartbeat::Abandoned,
             Err(error) => {
-                tracing::warn!(%error, "lease refresh failed; beating again at the next interval");
+                let now = clock.now();
+                if now >= fence {
+                    tracing::warn!(%error, "lease refresh failed at the fence; the walk stops");
+                    return Heartbeat::Expired;
+                }
+                tracing::warn!(%error, "lease refresh failed; retrying sooner");
+                let left = (fence - now).to_std().unwrap_or(Duration::ZERO);
+                interval = retry.min(left);
             }
         }
     }

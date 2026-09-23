@@ -918,7 +918,9 @@ where
     ///
     /// On the walk's answer, the lease is released when the run rests anywhere but `running`
     /// (D87); an `Err` writes nothing more, because the store may be what failed. On
-    /// [`crate::recover::Heartbeat::Abandoned`] the walk is dropped where it stands, **before** anything else, then
+    /// [`crate::recover::Heartbeat::Abandoned`], and on [`crate::recover::Heartbeat::Expired`]
+    /// (plan D122: refreshes kept failing until the lease was one interval from lapsing), the
+    /// walk is dropped where it stands, **before** anything else, then
     /// `Isolator::release` drops this process's guards for the run (D99), and the caller gets
     /// [`EngineError::LeaseLost`]. Generic over the walk's output, so one wrapper serves every
     /// command's post-unpark tail (blueprint F-M).
@@ -951,7 +953,8 @@ where
                 }
                 Ok(out)
             }
-            Either::Right((Heartbeat::Abandoned, walk)) => {
+            // Plan D122: a heartbeat that fenced itself is treated exactly as a taken lease.
+            Either::Right((Heartbeat::Abandoned | Heartbeat::Expired, walk)) => {
                 // Before anything else (plan D86): the walk must not write once the lease is gone.
                 drop(walk);
                 if let Err(err) = self.parts.isolator.release(run).await {
@@ -959,7 +962,6 @@ where
                 }
                 Err(EngineError::LeaseLost { run })
             }
-            Either::Right((Heartbeat::Expired, _walk)) => todo!("plan D122"),
         }
     }
 
