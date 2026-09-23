@@ -1,5 +1,5 @@
 //! `GixIsolator`: the production [`Isolator`], four modes over `gix` reads and
-//! five `git` verbs (plan D22–D47).
+//! six `git` verbs (plan D22–D47; MOD-4 milestone 4 D54–D57 for fan-out).
 //!
 //! This is the first place ANA-2 §4.6's four isolation modes exist as *behaviour* rather than as
 //! pieces: `isolate/git.rs` knows what a worktree is, `isolate/copy.rs` knows what a copy is, and
@@ -93,6 +93,43 @@ pub fn copy_tree_vanished(path: &Path) -> String {
     format!("the copy at {} is gone", path.display())
 }
 
+/// MOD-4 milestone 4 D54(a): the slot's base names no entry for a repository of the scope, so
+/// there is no commit the candidate could start from.
+#[must_use]
+pub fn no_slot_base(name: &str) -> String {
+    format!("no fan-out base for {name}")
+}
+
+/// `local` works in the user's own checkout with no guard, so its candidates could not be
+/// compared; `fan_out > 1` is refused at snapshot time for it (`graph.rs`), and this is the
+/// isolator's own answer should a slot reach it anyway.
+#[must_use]
+pub fn local_cannot_fan_out() -> String {
+    "local isolation cannot fan out".to_owned()
+}
+
+/// D56, D72: a `shared_serialized` candidate would have to reset a checkout that holds
+/// uncommitted work, which is either the user's or a sibling's (ANA-2 `:916`).
+#[must_use]
+pub fn dirty_tree_not_reset(path: &Path) -> String {
+    format!("dirty_tree_not_reset: {}", path.display())
+}
+
+/// Where a tree of this repository starts: the slot's base when there is a slot (D54(a)), the
+/// checkout's `HEAD` otherwise.
+fn slot_base(
+    slot: Option<FanoutSlot<'_>>,
+    repo: RepoId,
+    checkout: &RepoCheckout,
+) -> Option<Result<String, IsolateError>> {
+    slot.map(|slot| {
+        slot.base
+            .get(&repo)
+            .cloned()
+            .ok_or_else(|| IsolateError::Refused(no_slot_base(&checkout.name)))
+    })
+}
+
 /// `<root>/<run_id>/<step_id>/`: the common parent of a step's trees and the `cwd` of its session
 /// under the two isolating modes (plan D28).
 fn session_dir(root: &Path, run: RunId, step: StepId) -> PathBuf {
@@ -146,7 +183,7 @@ type Guards = Mutex<BTreeMap<(BoxId, RepoId), Arc<tokio::sync::Mutex<()>>>>;
 /// keyed by the run too so the run's `cleanup` can reach a guard no row names.
 type Held = Mutex<BTreeMap<(RunId, StepId), Vec<OwnedMutexGuard<()>>>>;
 
-/// The production [`Isolator`]: four modes over `gix` reads and five `git` verbs (plan D22–D47).
+/// The production [`Isolator`]: four modes over `gix` reads and six `git` verbs (plan D22–D47).
 #[derive(Debug)]
 pub struct GixIsolator {
     /// Validated and canonicalised once by [`GixIsolator::new`].
@@ -289,6 +326,53 @@ impl GixIsolator {
         }
     }
 
+    /// The commit a tree of `repo` starts from: `slot.base[repo]`, or the checkout's `HEAD` when
+    /// there is no slot.
+    async fn start_of(
+        &self,
+        slot: Option<FanoutSlot<'_>>,
+        repo: RepoId,
+        checkout: &RepoCheckout,
+    ) -> Result<String, IsolateError> {
+        match slot_base(slot, repo, checkout) {
+            Some(base) => base,
+            None => self.head_of(checkout).await,
+        }
+    }
+
+    /// D56 and D72: a `shared_serialized` candidate's checkouts, each put at the group base.
+    ///
+    /// Every checkout's dirtiness is read **before** anything is reset, so a refusal leaves the
+    /// whole scope where it was: a dirty checkout is the user's work or a sibling's, and neither
+    /// may be destroyed. A clean checkout off the base — where the previous sibling left it — is
+    /// `reset --hard` to it (M3 D47's verb).
+    async fn reset_to_slot_base(
+        &self,
+        checkouts: &[(RepoId, RepoCheckout)],
+        slot: FanoutSlot<'_>,
+    ) -> Result<(), IsolateError> {
+        let mut targets = Vec::with_capacity(checkouts.len());
+        for (repo, checkout) in checkouts {
+            let base =
+                slot_base(Some(slot), *repo, checkout).expect("a slot always yields an answer")?;
+            let path = checkout.local_path.clone();
+            if blocking(move || git::is_dirty(&path)).await? {
+                return Err(IsolateError::Refused(dirty_tree_not_reset(
+                    &checkout.local_path,
+                )));
+            }
+            targets.push((checkout, base));
+        }
+        for (checkout, base) in targets {
+            if self.head_of(checkout).await? != base {
+                let git = self.cli()?.clone();
+                let local = checkout.local_path.clone();
+                git::with_retry("reset --hard", || git.reset_hard(&local, &base)).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// D43's guard for every repository of the scope, taken **before** the mode's reads (A-1).
     ///
     /// The `std` lock is released before the `tokio` one is awaited: an `.await` under a `std`
@@ -359,20 +443,31 @@ impl GixIsolator {
     ///
     /// The two modes differ by exactly one thing at `prepare` — the guard — so they share a body
     /// rather than a copy of it.
+    ///
+    /// A fan-out slot changes the `shared_serialized` half only (D56, D72): after the guard, every
+    /// checkout is refused if dirty and otherwise reset to the group base, so the body below
+    /// records `before = base` and `dirty = false`. `local` refuses a slot outright.
     async fn prepare_in_place(
         &self,
         run: RunId,
         step: StepId,
         checkouts: &[(RepoId, RepoCheckout)],
         mode: Isolation,
+        slot: Option<FanoutSlot<'_>>,
     ) -> Result<Prepared, IsolateError> {
         if mode == Isolation::SharedSerialized {
             self.acquire(run, step, checkouts).await;
         }
+        if let Some(slot) = slot {
+            if mode == Isolation::Local {
+                return Err(IsolateError::Refused(local_cannot_fan_out()));
+            }
+            self.reset_to_slot_base(checkouts, slot).await?;
+        }
 
         let mut trees = Vec::with_capacity(checkouts.len());
         for (repo, checkout) in checkouts {
-            let before = self.head_of(checkout).await?;
+            let before = self.start_of(slot, *repo, checkout).await?;
             let path = checkout.local_path.clone();
             let dirty = blocking(move || git::is_dirty(&path)).await?;
             trees.push(PreparedTree {
@@ -415,12 +510,14 @@ impl GixIsolator {
     }
 
     /// `worktree` (plan D23, D38): one locked linked worktree per repository under
-    /// `<root>/<run>/<step>/`, each on its own `htui/<step>` branch at the source's `HEAD`.
+    /// `<root>/<run>/<step>/`, each on its own `htui/<step>` branch at the source's `HEAD` — or at
+    /// the slot's base for a fan-out candidate (D54(a)).
     async fn prepare_worktree(
         &self,
         run: RunId,
         step: StepId,
         checkouts: &[(RepoId, RepoCheckout)],
+        slot: Option<FanoutSlot<'_>>,
     ) -> Result<Prepared, IsolateError> {
         let git = self.cli()?.clone();
         let cwd = session_dir(&self.config.scratch_root, run, step);
@@ -433,7 +530,7 @@ impl GixIsolator {
             if blocking(move || git::has_submodules(&local)).await? {
                 return Err(IsolateError::Refused(submodules_refused()));
             }
-            let source_head = self.head_of(checkout).await?;
+            let source_head = self.start_of(slot, *repo, checkout).await?;
             let path = cwd.join(&checkout.name);
             let before = self
                 .worktree_at(&git, checkout, &path, &branch, &source_head, step, run)
@@ -530,12 +627,14 @@ impl GixIsolator {
     }
 
     /// `copy` (plan D35, D47; blueprint A-2): a whole filesystem copy of the checkout per
-    /// repository, reset to the source's `HEAD` and labelled with the base it was taken from.
+    /// repository, reset to the source's `HEAD` — or to the slot's base for a fan-out candidate
+    /// (D54(a), D57) — and labelled with the base it was taken from.
     async fn prepare_copy(
         &self,
         run: RunId,
         step: StepId,
         checkouts: &[(RepoId, RepoCheckout)],
+        slot: Option<FanoutSlot<'_>>,
     ) -> Result<Prepared, IsolateError> {
         let git = self.cli()?.clone();
         let cwd = session_dir(&self.config.scratch_root, run, step);
@@ -549,10 +648,20 @@ impl GixIsolator {
             // measured and before the reuse branch is even consulted.
             let source = checkout.local_path.clone();
             blocking(move || copy::check_source(&source)).await?;
-            let source_head = self.head_of(checkout).await?;
+            let source_head = self.start_of(slot, *repo, checkout).await?;
             let path = cwd.join(&checkout.name);
+            // D57: every candidate of the group makes its own copy of this tree.
+            let copies = slot.map_or(1, |slot| u64::try_from(slot.width).unwrap_or(1).max(1));
             let before = self
-                .copy_at(&git, checkout, &path, &branch, &source_head, &excludes)
+                .copy_at(
+                    &git,
+                    checkout,
+                    &path,
+                    &branch,
+                    &source_head,
+                    &excludes,
+                    copies,
+                )
                 .await?;
             trees.push(PreparedTree {
                 tree: RunStepTree {
@@ -584,6 +693,11 @@ impl GixIsolator {
     /// renamed. An interruption anywhere before the rename leaves nothing the reuse branch above
     /// will look at, so the next `prepare` starts the copy again rather than handing an agent a
     /// tree that was never reset.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every one of them is a fact of the copy being made; a struct for them would be \
+                  named once and read once"
+    )]
     async fn copy_at(
         &self,
         git: &Cli,
@@ -592,6 +706,7 @@ impl GixIsolator {
         branch: &str,
         source_head: &str,
         excludes: &[copy::Exclude],
+        copies: u64,
     ) -> Result<String, IsolateError> {
         if path.exists() {
             let (tree, name) = (path.to_path_buf(), branch.to_owned());
@@ -607,7 +722,7 @@ impl GixIsolator {
 
         let (source, owned) = (checkout.local_path.clone(), excludes.to_vec());
         let cap = self.config.copy_max_total_bytes;
-        blocking(move || copy::measure_within_cap(&source, &owned, cap, 1)).await?;
+        blocking(move || copy::measure_within_cap(&source, &owned, cap, copies)).await?;
 
         let (source, owned, destination) = (
             checkout.local_path.clone(),
@@ -836,11 +951,18 @@ impl GixIsolator {
 
     /// `reconcile` for a tree that is the checkout itself: nothing to merge, because the step
     /// committed into the primary tree as it went.
+    ///
+    /// For a fan-out winner under `shared_serialized` (D56) the checkout is wherever the *last*
+    /// sibling left it, so the checked-out branch is moved to the winner's label — or to the base,
+    /// for a winner that committed nothing — with `reset --hard`. That move is taken only when it
+    /// destroys nothing: the checkout is clean, and its `HEAD` is the group base or a sibling's
+    /// label. With no siblings (`fan_out = 1`) the M3 rule stands unchanged.
     async fn reconcile_in_place(
         &self,
         step: StepId,
         tree: &RunStepTree,
         checkout: &RepoCheckout,
+        siblings: &[StepId],
     ) -> Result<Option<String>, IsolateError> {
         let head = self.head_of(checkout).await?;
         if tree.mode == Isolation::Local {
@@ -848,16 +970,98 @@ impl GixIsolator {
         }
 
         // `shared_serialized`: the label D26 wrote at capture is what says the checkout is still
-        // where this step left it. Anything else moved it, and this milestone has no verb that
-        // could put it back.
+        // where this step left it.
+        let label = self.label_of(checkout, step).await?;
+        let target = label.clone().unwrap_or_else(|| tree.base_ref.clone());
+        if head == target {
+            return Ok((head != tree.base_ref).then_some(head));
+        }
+        if siblings.is_empty() {
+            // M3: anything else moved it, and a `fan_out = 1` step has no sibling whose work the
+            // checkout could be holding.
+            return Err(IsolateError::Refused(primary_moved(&head)));
+        }
+
+        let read = checkout.local_path.clone();
+        if blocking(move || git::is_dirty(&read)).await? {
+            return Err(IsolateError::Refused(dirty_primary_tree()));
+        }
+        let mut left_by_us = head == tree.base_ref;
+        for sibling in siblings {
+            if left_by_us {
+                break;
+            }
+            left_by_us = self.label_of(checkout, *sibling).await?.as_deref() == Some(&*head);
+        }
+        if !left_by_us {
+            return Err(IsolateError::Refused(primary_moved(&head)));
+        }
+        let git = self.cli()?.clone();
+        let local = checkout.local_path.clone();
+        git::with_retry("reset --hard", || git.reset_hard(&local, &target)).await?;
+        Ok(label.filter(|label| *label != tree.base_ref))
+    }
+
+    /// Where `htui/<step>` points in `checkout`, or `None` when the step never labelled it.
+    async fn label_of(
+        &self,
+        checkout: &RepoCheckout,
+        step: StepId,
+    ) -> Result<Option<String>, IsolateError> {
         let path = checkout.local_path.clone();
         let name = format!("htui/{step}");
-        let label = blocking(move || git::branch_target(&path, &name)).await?;
-        match label {
-            Some(target) if target == head => Ok((head != tree.base_ref).then_some(head)),
-            None if head == tree.base_ref => Ok(None),
-            _ => Err(IsolateError::Refused(primary_moved(&head))),
+        blocking(move || git::branch_target(&path, &name)).await
+    }
+
+    /// One repository's slice of [`Isolator::diff`]: its name, its range and both texts, or `None`
+    /// when the row committed nothing.
+    ///
+    /// D74 (blueprint A-3) chooses the repository that holds `after`: a `copy` tree's own object
+    /// database until reconcile, and the checkout after it, because the merge commit exists only
+    /// there; every other mode shares the checkout's object database.
+    async fn diff_of(
+        &self,
+        git: &Cli,
+        trees: &[RunStepTree],
+        commit: &RunStepCommit,
+    ) -> Result<Option<(String, String, String, String)>, IsolateError> {
+        let before = commit.before_hash.as_str();
+        let Some(after) = commit
+            .after_hash
+            .as_deref()
+            .filter(|after| *after != before)
+        else {
+            return Ok(None);
+        };
+        let checkout = self
+            .config
+            .repos
+            .get(&commit.repo_id)
+            .ok_or_else(|| IsolateError::Refused(no_checkout_for_repo()))?;
+        let mut repo = checkout.local_path.clone();
+        if let Some(tree) = trees
+            .iter()
+            .find(|tree| tree.repo_id == commit.repo_id && tree.mode == Isolation::Copy)
+        {
+            let copy = PathBuf::from(&tree.path);
+            // A copy that is gone, or does not hold the commit, falls back to the checkout; a
+            // commit neither holds is `git diff`'s own readable failure.
+            let (probe, hex) = (copy.clone(), after.to_owned());
+            if blocking(move || git::has_commit(&probe, &hex))
+                .await
+                .unwrap_or(false)
+            {
+                repo = copy;
+            }
         }
+        let stat = git.diff(&repo, before, after, true).await?;
+        let patch = git.diff(&repo, before, after, false).await?;
+        Ok(Some((
+            checkout.name.clone(),
+            format!("{before}..{after}"),
+            stat,
+            patch,
+        )))
     }
 }
 
@@ -904,12 +1108,11 @@ impl Isolator for GixIsolator {
         slot: Option<FanoutSlot<'a>>,
     ) -> IsolatorFuture<'a, Prepared> {
         Box::pin(async move {
-            let _ = slot;
             let checkouts = self.resolve_scope(scope)?;
             match isolation {
                 Isolation::Local | Isolation::SharedSerialized => {
                     let prepared = self
-                        .prepare_in_place(run, step, &checkouts, isolation)
+                        .prepare_in_place(run, step, &checkouts, isolation, slot)
                         .await;
                     if prepared.is_err() {
                         // A refusal after the guard was taken has no `run_step_tree` row to its
@@ -921,8 +1124,8 @@ impl Isolator for GixIsolator {
                 }
                 // D40: the two modes that shell out answer with the probe's own sentence before
                 // they touch a filesystem.
-                Isolation::Worktree => self.prepare_worktree(run, step, &checkouts).await,
-                Isolation::Copy => self.prepare_copy(run, step, &checkouts).await,
+                Isolation::Worktree => self.prepare_worktree(run, step, &checkouts, slot).await,
+                Isolation::Copy => self.prepare_copy(run, step, &checkouts, slot).await,
             }
         })
     }
@@ -944,21 +1147,60 @@ impl Isolator for GixIsolator {
         })
     }
 
+    /// D54(b): [`resolve_scope`](GixIsolator::resolve_scope)'s refusals, then each checkout's
+    /// `HEAD`. A read: no guard, no `git` child.
     fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
         Box::pin(async move {
-            let _ = scope;
-            Ok(BTreeMap::new())
+            let mut base = BTreeMap::new();
+            for (repo, checkout) in self.resolve_scope(scope)? {
+                base.insert(repo, self.head_of(&checkout).await?);
+            }
+            Ok(base)
         })
     }
 
+    /// D55: two `git diff`s per committed row (stat, then patch), in the order of `commits`
+    /// (blueprint F-J: `repo_id` order, which is what the engine hands). No usable `git` is
+    /// `Ok(None)`: the diff is advisory, and its absence degrades a prompt rather than failing it.
     fn diff<'a>(
         &'a self,
         trees: &'a [RunStepTree],
         commits: &'a [RunStepCommit],
     ) -> IsolatorFuture<'a, Option<DiffBlock>> {
         Box::pin(async move {
-            let _ = (trees, commits);
-            Ok(None)
+            let Ok(git) = self.cli() else {
+                return Ok(None);
+            };
+            let git = git.clone();
+            let mut parts = Vec::new();
+            for commit in commits {
+                if let Some(part) = self.diff_of(&git, trees, commit).await? {
+                    parts.push(part);
+                }
+            }
+            Ok(match parts.as_slice() {
+                [] => None,
+                [(_, range, stat, patch)] => Some(DiffBlock {
+                    range: range.clone(),
+                    stat: stat.clone(),
+                    diff: patch.clone(),
+                }),
+                several => Some(DiffBlock {
+                    range: several
+                        .iter()
+                        .map(|(name, range, _, _)| format!("{name}:{range}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    stat: several
+                        .iter()
+                        .map(|(name, _, stat, _)| format!("# repo {name}\n{stat}"))
+                        .collect(),
+                    diff: several
+                        .iter()
+                        .map(|(name, _, _, patch)| format!("# repo {name}\n{patch}"))
+                        .collect(),
+                }),
+            })
         })
     }
 
@@ -969,14 +1211,15 @@ impl Isolator for GixIsolator {
         siblings: &'a [StepId],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
-            let _ = siblings;
             let mut commits = Vec::with_capacity(trees.len());
             for tree in trees {
                 let checkout = self.checkout_of(tree)?.clone();
                 let after = match tree.mode {
                     Isolation::Local | Isolation::SharedSerialized => {
-                        self.reconcile_in_place(winner, tree, &checkout).await?
+                        self.reconcile_in_place(winner, tree, &checkout, siblings)
+                            .await?
                     }
+                    // D54(d): a fan-out winner is merged alone; the losers' labels stay.
                     Isolation::Worktree | Isolation::Copy => {
                         self.reconcile_isolated(winner, tree, &checkout).await?
                     }
@@ -1059,10 +1302,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use htui_core::model::{BoxId, Isolation, RepoId, RunId, RunStepTree, StepId};
+    use htui_core::model::{BoxId, Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId};
 
     use crate::isolate::git::testkit::{commit_file, empty_repo, repo_with_one_commit};
-    use crate::isolate::{Isolator as _, Prepared};
+    use crate::isolate::{FanoutSlot, Isolator as _, Prepared};
 
     use super::{GixIsolator, IsolatorConfig, RepoCheckout};
 
@@ -2507,6 +2750,654 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(core_path.join("g")).expect("the merged file reads"),
             "the step's work\n"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MOD-4 milestone 4: the fan-out seam (D54, D55, D56, D57, D72, D74).
+    // ---------------------------------------------------------------------------------------------
+
+    /// A slot for candidate `index` of a `width`-wide group over `base`.
+    fn slot(index: i32, width: i32, base: &BTreeMap<RepoId, String>) -> FanoutSlot<'_> {
+        FanoutSlot { index, width, base }
+    }
+
+    /// D54(b): the group's base is each repository's `HEAD`, read once, and an empty scope reads
+    /// nothing.
+    #[tokio::test]
+    async fn base_reads_each_repo_s_head() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, core_head) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let docs_head = commit_file(&docs_checkout.local_path, "g", "second\n", "two");
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let base = isolator.base(&[docs, core]).await.expect("both heads read");
+        assert_eq!(
+            base,
+            BTreeMap::from([(core, core_head), (docs, docs_head)]),
+            "one entry per repo of the scope, keyed by repo"
+        );
+        assert!(
+            isolator
+                .base(&[])
+                .await
+                .expect("an empty scope reads nothing")
+                .is_empty()
+        );
+        let err = isolator
+            .base(&[RepoId::new()])
+            .await
+            .expect_err("a repo with no checkout is refused");
+        assert_eq!(
+            err.to_string(),
+            "isolation refused: no checkout for this repo on this box"
+        );
+    }
+
+    /// D54(a): every `worktree` candidate starts from the group's base, even when the primary
+    /// moved between the base read and the candidate's `prepare`; a scope repo the base does not
+    /// name is refused rather than guessed.
+    #[tokio::test]
+    async fn worktree_candidates_all_start_from_the_slot_base_even_after_the_primary_moved() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let base = isolator.base(&[core]).await.expect("the base reads");
+        let moved = commit_file(&core_path, "h", "meanwhile\n", "the primary moves");
+        assert_ne!(moved, head);
+
+        let run = RunId::new();
+        for index in 0..3 {
+            let prepared = isolator
+                .prepare(
+                    run,
+                    StepId::new(),
+                    &[core],
+                    Isolation::Worktree,
+                    Some(slot(index, 3, &base)),
+                )
+                .await
+                .expect("the candidate prepares");
+            let tree = PathBuf::from(&prepared.trees[0].tree.path);
+            assert_eq!(prepared.trees[0].before_hash, head, "candidate {index}");
+            assert_eq!(prepared.trees[0].tree.base_ref, head);
+            assert_eq!(
+                crate::isolate::git::head(&tree).expect("the tree has a HEAD"),
+                head,
+                "candidate {index} checked out the base, not the moved primary"
+            );
+        }
+
+        let empty = BTreeMap::new();
+        let err = isolator
+            .prepare(
+                run,
+                StepId::new(),
+                &[core],
+                Isolation::Worktree,
+                Some(slot(0, 3, &empty)),
+            )
+            .await
+            .expect_err("a base with no entry for the repo is refused");
+        assert_eq!(
+            err.to_string(),
+            "isolation refused: no fan-out base for core"
+        );
+    }
+
+    /// D57: each `copy` candidate is its own copy, reset to the group base; the cap counts the
+    /// size once per candidate.
+    #[tokio::test]
+    async fn copy_candidates_reset_to_the_slot_base() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let base = isolator.base(&[core]).await.expect("the base reads");
+        commit_file(&core_path, "h", "meanwhile\n", "the primary moves");
+
+        let run = RunId::new();
+        let mut paths = Vec::new();
+        for index in 0..2 {
+            let prepared = isolator
+                .prepare(
+                    run,
+                    StepId::new(),
+                    &[core],
+                    Isolation::Copy,
+                    Some(slot(index, 2, &base)),
+                )
+                .await
+                .expect("the candidate prepares");
+            let copy = PathBuf::from(&prepared.trees[0].tree.path);
+            assert_eq!(prepared.trees[0].before_hash, head);
+            assert_eq!(
+                crate::isolate::git::head(&copy).expect("the copy has a HEAD"),
+                head,
+                "candidate {index} was reset to the base"
+            );
+            assert!(
+                !copy.join("h").exists(),
+                "the moved primary's file is not in it"
+            );
+            paths.push(copy);
+        }
+        assert_ne!(paths[0], paths[1], "every candidate has its own copy");
+
+        // One copy fits the cap, `width` of them do not.
+        let need = crate::isolate::copy::measure(&core_path, &crate::isolate::copy::excludes(&[]))
+            .expect("the source measures");
+        let mut tight = config(&dir.path().join("trees"), &[]);
+        tight.repos = isolator.config.repos.clone();
+        tight.copy_max_total_bytes = need * 2;
+        let tight = GixIsolator::new(tight).expect("the config validates");
+        let err = tight
+            .prepare(
+                RunId::new(),
+                StepId::new(),
+                &[core],
+                Isolation::Copy,
+                Some(slot(0, 3, &base)),
+            )
+            .await
+            .expect_err("three copies are over the cap");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "isolation refused: copy would need {need} bytes × 3 copies = {}; cap is {}",
+                need * 3,
+                need * 2
+            )
+        );
+    }
+
+    /// D56: siblings run one after another in the checkout, and each one after the first finds
+    /// the previous sibling's commit and is reset to the group base before it starts.
+    #[tokio::test]
+    async fn shared_serialized_siblings_reset_a_clean_checkout_to_base() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+        let base = isolator.base(&[core]).await.expect("the base reads");
+        let run = RunId::new();
+
+        let first = StepId::new();
+        let prepared = isolator
+            .prepare(
+                run,
+                first,
+                &[core],
+                Isolation::SharedSerialized,
+                Some(slot(0, 2, &base)),
+            )
+            .await
+            .expect("sibling 0 prepares");
+        assert_eq!(prepared.trees[0].before_hash, head);
+        let first_tip = commit_file(&core_path, "g", "sibling 0\n", "sibling 0 commits");
+        isolator
+            .capture(first, &rows(&prepared))
+            .await
+            .expect("sibling 0 captures");
+
+        let second = StepId::new();
+        let prepared = isolator
+            .prepare(
+                run,
+                second,
+                &[core],
+                Isolation::SharedSerialized,
+                Some(slot(1, 2, &base)),
+            )
+            .await
+            .expect("sibling 1 prepares");
+        assert_eq!(prepared.trees[0].before_hash, head);
+        assert_eq!(prepared.trees[0].tree.base_ref, head);
+        assert!(!prepared.trees[0].tree.dirty);
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head,
+            "the checkout was reset to the base"
+        );
+        assert!(!core_path.join("g").exists(), "sibling 0's file is gone");
+        assert_eq!(
+            crate::isolate::git::branch_target(&core_path, &format!("htui/{first}"))
+                .expect("the ref store reads"),
+            Some(first_tip),
+            "and sibling 0's work survives under its label"
+        );
+        isolator
+            .capture(second, &rows(&prepared))
+            .await
+            .expect("sibling 1 captures");
+    }
+
+    /// D72 (blueprint A-1): with a slot, a dirty checkout is refused for **every** sibling — the
+    /// first one too, at `HEAD == base` — and the refusal gives the guard back.
+    #[tokio::test]
+    async fn shared_serialized_refuses_a_dirty_checkout_with_a_slot() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+        let base = isolator.base(&[core]).await.expect("the base reads");
+        std::fs::write(core_path.join("f"), "the maintainer is mid-edit\n")
+            .expect("the checkout is dirtied");
+
+        for index in 0..2 {
+            let err = tokio::time::timeout(
+                Duration::from_secs(5),
+                isolator.prepare(
+                    RunId::new(),
+                    StepId::new(),
+                    &[core],
+                    Isolation::SharedSerialized,
+                    Some(slot(index, 2, &base)),
+                ),
+            )
+            .await
+            .expect("the refused sibling before it held nothing")
+            .expect_err("a dirty checkout is refused");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "isolation refused: dirty_tree_not_reset: {}",
+                    core_path.display()
+                )
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("f")).expect("the file reads"),
+            "the maintainer is mid-edit\n",
+            "nothing was reset"
+        );
+    }
+
+    /// Two siblings that both committed, and a winner that is not the last one: the checked-out
+    /// branch moves to the winner's label, and that label is the winner's `after_hash`.
+    async fn two_shared_siblings(
+        dir: &Path,
+    ) -> (
+        GixIsolator,
+        PathBuf,
+        String,
+        [(StepId, String, Vec<RunStepTree>); 2],
+    ) {
+        let (core, core_checkout, head) = repo(dir, "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator = GixIsolator::new(config(&dir.join("trees"), &[(core, core_checkout)]))
+            .expect("the config validates");
+        let base = isolator.base(&[core]).await.expect("the base reads");
+        let run = RunId::new();
+        let mut done = Vec::new();
+        for index in 0..2 {
+            let step = StepId::new();
+            let prepared = isolator
+                .prepare(
+                    run,
+                    step,
+                    &[core],
+                    Isolation::SharedSerialized,
+                    Some(slot(index, 2, &base)),
+                )
+                .await
+                .expect("the sibling prepares");
+            let tip = commit_file(
+                &core_path,
+                "g",
+                &format!("sibling {index}\n"),
+                "the sibling commits",
+            );
+            let rows = rows(&prepared);
+            isolator
+                .capture(step, &rows)
+                .await
+                .expect("the sibling captures");
+            done.push((step, tip, rows));
+        }
+        let [zero, one]: [_; 2] = done.try_into().expect("two siblings");
+        (isolator, core_path, head, [zero, one])
+    }
+
+    /// D56: `HEAD` at the last sibling's label → reset to the winner's label.
+    #[tokio::test]
+    async fn shared_serialized_reconcile_moves_the_branch_to_the_winner() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core_path, head, [zero, one]) = two_shared_siblings(dir.path()).await;
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            one.1,
+            "the last sibling left the checkout at its own tip"
+        );
+
+        let commits = isolator
+            .reconcile(zero.0, &zero.2, &[one.0])
+            .await
+            .expect("the winner reconciles");
+        assert_eq!(commits[0].before_hash, head);
+        assert_eq!(commits[0].after_hash.as_deref(), Some(&*zero.1));
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            zero.1,
+            "the checked-out branch moved to the winner's label"
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("g")).expect("the file reads"),
+            "sibling 0\n"
+        );
+
+        // Idempotent: the checkout is now at the winner's label, which is M3's identity case.
+        let again = isolator
+            .reconcile(zero.0, &zero.2, &[one.0])
+            .await
+            .expect("a second reconcile is the identity");
+        assert_eq!(again, commits);
+    }
+
+    /// D56: a `HEAD` that is neither the base nor any sibling's label was moved by somebody else,
+    /// and a dirty checkout is not reset either.
+    #[tokio::test]
+    async fn shared_serialized_reconcile_refuses_a_head_no_sibling_left() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core_path, _head, [zero, one]) = two_shared_siblings(dir.path()).await;
+
+        std::fs::write(core_path.join("g"), "mid-edit\n").expect("the checkout is dirtied");
+        let err = isolator
+            .reconcile(zero.0, &zero.2, &[one.0])
+            .await
+            .expect_err("a dirty checkout is not reset");
+        assert_eq!(err.to_string(), "isolation refused: dirty_primary_tree");
+        std::fs::write(core_path.join("g"), "sibling 1\n").expect("the edit is undone");
+
+        let moved = commit_file(&core_path, "h", "somebody else\n", "the checkout moves");
+        let err = isolator
+            .reconcile(zero.0, &zero.2, &[one.0])
+            .await
+            .expect_err("a head no sibling left is refused");
+        assert_eq!(
+            err.to_string(),
+            format!("isolation refused: primary_moved: {moved}")
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            moved,
+            "and nothing was reset"
+        );
+    }
+
+    /// D54(c): several committed repos give one range per repo, `<name>:<before>..<after>`, and
+    /// their stats and patches under a `# repo <name>` line each, in the order of the rows.
+    #[tokio::test]
+    async fn diff_spans_every_repo_under_a_header_line() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let paths = BTreeMap::from([
+            (core, core_checkout.local_path.clone()),
+            (docs, docs_checkout.local_path.clone()),
+        ]);
+        let names = BTreeMap::from([(core, "core"), (docs, "docs")]);
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core, docs], Isolation::Worktree, None)
+            .await
+            .expect("the worktree mode prepares");
+        for tree in &prepared.trees {
+            commit_file(Path::new(&tree.tree.path), "g", "the step's work\n", "work");
+        }
+        let rows = rows(&prepared);
+        let commits = isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+
+        let block = isolator
+            .diff(&rows, &commits)
+            .await
+            .expect("the diff reads")
+            .expect("both repos committed");
+        let mut range = Vec::new();
+        let (mut stat, mut patch) = (String::new(), String::new());
+        for commit in &commits {
+            let name = names[&commit.repo_id];
+            let after = commit.after_hash.as_deref().expect("committed");
+            let repo = &paths[&commit.repo_id];
+            range.push(format!("{name}:{}..{after}", commit.before_hash));
+            stat.push_str(&format!(
+                "# repo {name}\n{}",
+                git.diff(repo, &commit.before_hash, after, true)
+                    .await
+                    .expect("the stat reads")
+            ));
+            patch.push_str(&format!(
+                "# repo {name}\n{}",
+                git.diff(repo, &commit.before_hash, after, false)
+                    .await
+                    .expect("the patch reads")
+            ));
+        }
+        assert_eq!(block.range, range.join(", "));
+        assert_eq!(block.stat, stat);
+        assert_eq!(block.diff, patch);
+        assert!(block.diff.starts_with("# repo "), "{}", block.diff);
+
+        // One committed repo is its bare range, with no header.
+        let one = &commits[..1];
+        let single = isolator
+            .diff(&rows, one)
+            .await
+            .expect("the diff reads")
+            .expect("one repo committed");
+        assert_eq!(
+            single.range,
+            format!(
+                "{}..{}",
+                one[0].before_hash,
+                one[0].after_hash.as_deref().expect("committed")
+            )
+        );
+        assert!(
+            single.diff.starts_with("diff --git a/g b/g\n"),
+            "{}",
+            single.diff
+        );
+    }
+
+    /// D55: no committed row, or no usable `git`, is `None` — the diff is advisory.
+    #[tokio::test]
+    async fn diff_is_none_without_git() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let rows = vec![RunStepTree {
+            run_step_id: StepId::new(),
+            repo_id: core,
+            mode: Isolation::Worktree,
+            path: dir.path().join("nowhere").to_string_lossy().into_owned(),
+            base_ref: head.clone(),
+            dirty: false,
+        }];
+        let committed = vec![RunStepCommit {
+            run_step_id: rows[0].run_step_id,
+            repo_id: core,
+            before_hash: head.clone(),
+            after_hash: Some(commit_file(&core_checkout.local_path, "g", "x\n", "x")),
+        }];
+        let without = GixIsolator::with_git(
+            config(&dir.path().join("trees"), &[(core, core_checkout.clone())]),
+            Err("git not on PATH".to_owned()),
+        )
+        .expect("the config validates");
+        assert_eq!(
+            without
+                .diff(&rows, &committed)
+                .await
+                .expect("no git is not an error"),
+            None
+        );
+
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let with = GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+            .expect("the config validates");
+        let nothing = vec![RunStepCommit {
+            after_hash: None,
+            ..committed[0].clone()
+        }];
+        assert_eq!(with.diff(&rows, &nothing).await.expect("reads"), None);
+        assert_eq!(with.diff(&rows, &[]).await.expect("reads"), None);
+        let unmoved = vec![RunStepCommit {
+            after_hash: Some(head),
+            ..committed[0].clone()
+        }];
+        assert_eq!(with.diff(&rows, &unmoved).await.expect("reads"), None);
+    }
+
+    /// D74 (blueprint A-3): a `copy` winner's post-reconcile `after_hash` is the merge commit,
+    /// which only the primary holds — the diff reads the copy before reconcile and the checkout
+    /// after.
+    #[tokio::test]
+    async fn copy_diff_after_reconcile_reads_the_checkout() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core], Isolation::Copy, None)
+            .await
+            .expect("the copy mode prepares");
+        let copy = PathBuf::from(&prepared.trees[0].tree.path);
+        let after = commit_file(&copy, "g", "the step's work\n", "the step commits");
+        let rows = rows(&prepared);
+        let captured = isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+
+        let before_merge = isolator
+            .diff(&rows, &captured)
+            .await
+            .expect("the copy holds the range")
+            .expect("the step committed");
+        assert_eq!(before_merge.range, format!("{head}..{after}"));
+        assert_eq!(
+            before_merge.diff,
+            git.diff(&copy, &head, &after, false)
+                .await
+                .expect("the patch reads")
+        );
+
+        let reconciled = isolator
+            .reconcile(step, &rows, &[])
+            .await
+            .expect("the copy reconciles");
+        let merge = reconciled[0].after_hash.clone().expect("a merge commit");
+        assert!(!crate::isolate::git::has_commit(&copy, &merge).expect("reads"));
+        assert!(crate::isolate::git::has_commit(&core_path, &merge).expect("reads"));
+        let after_merge = isolator
+            .diff(&rows, &reconciled)
+            .await
+            .expect("the checkout holds the merge")
+            .expect("the step committed");
+        assert_eq!(after_merge.range, format!("{head}..{merge}"));
+        assert_eq!(
+            after_merge.diff, before_merge.diff,
+            "before..merge carries the same patch as before..after"
+        );
+    }
+
+    /// Every M3 path is what `None` reaches: a no-slot `shared_serialized` prepare still records a
+    /// dirty checkout at its `HEAD` rather than refusing it, and `local` refuses a slot outright.
+    #[tokio::test]
+    async fn a_no_slot_prepare_is_unchanged() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let core_path = core_checkout.local_path.clone();
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+        let base = isolator.base(&[core]).await.expect("the base reads");
+        let moved = commit_file(&core_path, "g", "second\n", "two");
+        std::fs::write(core_path.join("f"), "mid-edit\n").expect("the checkout is dirtied");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(
+                RunId::new(),
+                step,
+                &[core],
+                Isolation::SharedSerialized,
+                None,
+            )
+            .await
+            .expect("M3 records a dirty checkout rather than refusing it");
+        assert_eq!(prepared.trees[0].before_hash, moved, "the HEAD, not a base");
+        assert!(prepared.trees[0].tree.dirty);
+        isolator
+            .capture(step, &rows(&prepared))
+            .await
+            .expect("the step captures");
+
+        let err = isolator
+            .prepare(
+                RunId::new(),
+                StepId::new(),
+                &[core],
+                Isolation::Local,
+                Some(slot(0, 2, &base)),
+            )
+            .await
+            .expect_err("local never fans out");
+        assert_eq!(
+            err.to_string(),
+            "isolation refused: local isolation cannot fan out"
         );
     }
 }
