@@ -2730,6 +2730,118 @@ async fn two_disjoint_isolated_runs_on_one_repo_both_reconcile() {
     assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
 }
 
+/// Plan D136's in-process race: rule P admits two isolated runs on one repository, and one
+/// process may reconcile both at once. Without D70's admin lock held from the `HEAD` read to the
+/// merge's post-condition, B can read `HEAD` at the base, A merge, and B's merge land on A's — B's
+/// `[HEAD read, after]` post-condition then fails and B parks although its merge is on the
+/// primary. Driven concurrently many times, both reconciles answer, and every round adds exactly
+/// two merges, one on top of the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_disjoint_isolated_runs_reconciled_concurrently_both_merge() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    for round in 0..20 {
+        let base = head_of(&git, &fix.core.path).await;
+        let (a, a_tip, a_rows) =
+            committed_worktree_step(&fix, &format!("a{round}.txt"), "run a\n").await;
+        let (b, b_tip, b_rows) =
+            committed_worktree_step(&fix, &format!("b{round}.txt"), "run b\n").await;
+        let before = merges(&git, &fix.core.path).await;
+
+        let (first, second) = tokio::join!(
+            fix.isolator.reconcile(a, &a_rows, &[]),
+            fix.isolator.reconcile(b, &b_rows, &[]),
+        );
+        let first = first.unwrap_or_else(|err| panic!("round {round}: run a reconciles: {err}"));
+        let second = second.unwrap_or_else(|err| panic!("round {round}: run b reconciles: {err}"));
+
+        let merged = merges(&git, &fix.core.path).await;
+        assert_eq!(merged.len(), before.len() + 2, "round {round}: two merges");
+        assert_eq!(merged[2..], before[..], "round {round}: on top of the last");
+        let (top, under) = (&merged[0], &merged[1]);
+        assert_eq!(
+            top[1], under[0],
+            "round {round}: one merge on top of the other"
+        );
+        assert_eq!(under[1], base, "round {round}: the lower one on the base");
+        let mut tips = vec![top[2].clone(), under[2].clone()];
+        tips.sort();
+        let mut expected = vec![a_tip, b_tip];
+        expected.sort();
+        assert_eq!(tips, expected, "round {round}: one merge per run");
+        let mut answered = vec![
+            first[0].after_hash.clone().expect("run a merged"),
+            second[0].after_hash.clone().expect("run b merged"),
+        ];
+        answered.sort();
+        let mut made = vec![top[0].clone(), under[0].clone()];
+        made.sort();
+        assert_eq!(
+            answered, made,
+            "round {round}: each run answers its own merge"
+        );
+        assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
+    }
+}
+
+/// Plan D136 across processes, where D70's lock does not reach: a second process merged run A
+/// between this process's `HEAD` read and its merge of run B, so B's merge landed on A's and its
+/// post-condition failed — B parked with its merge on the primary. That landed merge is built
+/// here by hand (the interleaving has no deterministic seam across processes); B's later
+/// reconcile, in a process of its own as a sweep's would be, finds it through `merge_of` as
+/// `HEAD`'s merge of B's tip and answers it instead of merging again.
+#[tokio::test]
+async fn a_merge_that_landed_on_another_process_merge_is_recognised_later() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, b_tip, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the other process merges run a");
+    let m1 = head_of(&git, &fix.core.path).await;
+    git_out(
+        &git,
+        &fix.core.path,
+        &[
+            "-c",
+            "user.name=htui",
+            "-c",
+            "user.email=htui@localhost",
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "-q",
+            "-m",
+            &format!("htui: reconcile {b}"),
+            &format!("htui/{b}"),
+        ],
+    )
+    .await;
+    let m2 = head_of(&git, &fix.core.path).await;
+    let merged = merges(&git, &fix.core.path).await;
+    assert_eq!(
+        merged[0],
+        [m2.clone(), m1, b_tip],
+        "run b's merge landed on a's"
+    );
+
+    let (isolator, _, _) = fix.second_process();
+    let again = isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the landed merge is recognised");
+    assert_eq!(again[0].after_hash.as_deref(), Some(m2.as_str()));
+    assert_eq!(again[0].before_hash, fix.core.head);
+    assert_eq!(merges(&git, &fix.core.path).await, merged, "no third merge");
+    assert_eq!(head_of(&git, &fix.core.path).await, m2, "HEAD did not move");
+}
+
 /// Plan D136, blueprint H-3 generalised: run A merged and crashed before `record_commits`, then
 /// run B merged on top. A's recovery reconciles again; its merge is no longer `HEAD`, but it is on
 /// `HEAD`'s first-parent history with A's tip as its second parent, so it is recognised and

@@ -4170,6 +4170,47 @@ mod tests {
         assert!(!tree.exists(), "the tree was removed");
     }
 
+    /// Plan D136: an isolated `reconcile` holds the repository's admin lock from its `HEAD` read
+    /// through the merge and its post-condition, so two runs of one process reconciling the same
+    /// repository cannot interleave a merge between the other's read and its merge.
+    #[tokio::test]
+    async fn an_isolated_reconcile_waits_for_the_admin_lock() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (isolator, core, core_path, head, _, step, rows) = stepped(dir.path()).await;
+        let isolator = Arc::new(isolator);
+
+        let guard = isolator.admin_guard(core).await;
+        let mut reconcile = {
+            let isolator = Arc::clone(&isolator);
+            tokio::spawn(async move { isolator.reconcile(step, &rows, &[]).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut reconcile)
+                .await
+                .is_err(),
+            "the reconcile waits for the lock"
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            head,
+            "and nothing was merged"
+        );
+        drop(guard);
+        let commits = tokio::time::timeout(Duration::from_secs(10), reconcile)
+            .await
+            .expect("the reconcile proceeds once the lock is free")
+            .expect("the task did not panic")
+            .expect("the winner reconciles");
+        assert_eq!(
+            commits[0].after_hash,
+            Some(crate::isolate::git::head(&core_path).expect("the checkout has a HEAD")),
+            "the merge landed"
+        );
+    }
+
     /// Every `refs/heads/htui/*` of the repository at `path`, with its target, in name order.
     fn htui_refs(path: &Path) -> Vec<(String, String)> {
         let repository = gix::open(path).expect("the repository opens");
