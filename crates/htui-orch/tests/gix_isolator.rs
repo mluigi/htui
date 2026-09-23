@@ -24,7 +24,7 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     Gate, Isolation, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, RepoBoxPath, RepoId, RunId,
     RunMode, RunStatus, RunStep, SnapshotCandidate, SnapshotPhase, StepGraphId, StepGraphPhase,
-    StepStatus, VerifyOutcome,
+    StepId, StepStatus, VerifyOutcome,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
@@ -36,7 +36,7 @@ use htui_orch::isolate::copy;
 use htui_orch::isolate::git::Cli;
 use htui_orch::isolate::git::testkit::{commit_file, repo_with_one_commit, worktree_list};
 use htui_orch::isolate::real::dirty_tree_not_reset;
-use htui_orch::isolate::{GixIsolator, IsolatorConfig, RepoCheckout};
+use htui_orch::isolate::{FanoutSlot, GixIsolator, Isolator as _, IsolatorConfig, RepoCheckout};
 use htui_orch::skip_without_git;
 use htui_orch::verify::{ShellVerifier, VERIFY_CLASS};
 use serde_json::json;
@@ -288,11 +288,14 @@ async fn repoint(store: &MemStore, item: ItemId, mutate: impl Fn(&mut StepGraphP
         .await
         .expect("MemStore never fails a read")
         .expect("the item resolves to a graph");
+    // The id is in the name so a case can repoint one item twice: a graph name is unique per
+    // project.
+    let id = StepGraphId::new();
     let clone = store
         .create_step_graph(NewStepGraph {
-            id: StepGraphId::new(),
+            id,
             project_id: row.project_id,
-            name: format!("{}-isolated", row.key),
+            name: format!("{}-isolated-{id}", row.key),
             description: "a gix_isolator case's edit of the live graph".to_owned(),
         })
         .await
@@ -1274,4 +1277,248 @@ async fn copy_refuses_n_copies_above_the_cap() {
         );
     }
     fix.selection_park().await;
+}
+
+/// Plan D70: `git worktree add` is serialised per repository, so a 3-way `worktree` group
+/// prepares without a failure, round after round, on nothing but the lock.
+///
+/// The fact-check's probe saw ≈ 1 % of unserialised 3-way groups fail with `failed to read
+/// .git/worktrees/<id>/commondir`, which `with_retry` does not classify as retryable; fifty
+/// rounds would then fail about 40 % of the time. Each round is a fresh repository, so no round
+/// inherits an administrative entry from another, and every round is torn down through
+/// `cleanup` like a run's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_three_way_worktree_fan_out_is_deterministic_over_many_rounds() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    for round in 0..50 {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("core");
+        std::fs::create_dir_all(&path).expect("the repository directory is made");
+        let head = repo_with_one_commit(&path);
+        let path = std::fs::canonicalize(&path).expect("the repository directory exists");
+        let repo = RepoId::new();
+        let isolator = GixIsolator::new(IsolatorConfig {
+            repos: BTreeMap::from([(
+                repo,
+                RepoCheckout {
+                    name: "core".to_owned(),
+                    local_path: path.clone(),
+                    is_primary: true,
+                },
+            )]),
+            scratch_root: dir.path().join("trees"),
+            copy_exclude: Vec::new(),
+            copy_max_total_bytes: 1 << 30,
+            box_id: ids::BOX,
+        })
+        .expect("the scratch root is outside the checkout");
+
+        let scope = [repo];
+        let base = isolator.base(&scope).await.expect("the base is read");
+        assert_eq!(base, BTreeMap::from([(repo, head.clone())]));
+        let run = RunId::new();
+        let steps = [StepId::new(), StepId::new(), StepId::new()];
+        let prepared = futures::future::join_all(steps.iter().zip(0..).map(|(step, index)| {
+            isolator.prepare(
+                run,
+                *step,
+                &scope,
+                Isolation::Worktree,
+                Some(FanoutSlot {
+                    index,
+                    width: 3,
+                    base: &base,
+                }),
+            )
+        }))
+        .await;
+
+        let mut trees = Vec::new();
+        for (index, result) in prepared.into_iter().enumerate() {
+            let prepared = result
+                .unwrap_or_else(|err| panic!("round {round}: candidate {index} failed: {err}"));
+            for tree in prepared.trees {
+                assert_eq!(tree.before_hash, head, "round {round}: one base");
+                trees.push(tree.tree);
+            }
+        }
+        let listed = worktree_list(&git, &path).await;
+        assert_eq!(
+            listed.len(),
+            4,
+            "round {round}: three trees plus the primary: {listed:?}"
+        );
+        isolator
+            .cleanup(run, &trees)
+            .await
+            .unwrap_or_else(|err| panic!("round {round}: cleanup failed: {err}"));
+        assert_eq!(worktree_list(&git, &path).await.len(), 1, "round {round}");
+    }
+}
+
+impl Fixture {
+    /// Answers the gate the walk parked at.
+    async fn answer<K: SessionSink>(&self, sink: &K, run: RunId, answer: GateAnswer) -> RunStep {
+        let step = self.parked(run).await;
+        self.dispatch(
+            sink,
+            Command::AnswerGate {
+                run,
+                step: step.id,
+                answer,
+            },
+        )
+        .await
+        .expect("the parked step takes an answer");
+        step
+    }
+
+    /// `FEAT-3`'s `implement` given `retry_limit = 3`, so the budget alone would allow a third
+    /// attempt and only the no-progress predicate can stop the loop after two.
+    async fn three_implement_attempts(&self) {
+        let isolation = self.isolation;
+        repoint(&self.orch.store, ids::HTUI_FEAT_3, |phase| {
+            phase.isolation = Some(isolation);
+            if phase.name == "implement" {
+                phase.retry_limit = 3;
+            }
+        })
+        .await;
+    }
+
+    /// The primary repo's `run_step_commit` row of `step`.
+    async fn core_commit(&self, step: &RunStep) -> htui_core::model::RunStepCommit {
+        self.orch
+            .store
+            .step_commits(step.id)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|row| row.repo_id == self.core.id)
+            .expect("the step recorded the primary")
+    }
+}
+
+/// A `review` rejection, as a human gives it.
+fn rejected(note: &str) -> GateAnswer {
+    GateAnswer::Rejected {
+        note: note.to_owned(),
+    }
+}
+
+/// ANA-2 §12 criterion 7 (`docs/ANA-2.md:2103`) over real git (plan D66, R-8): two `implement`
+/// attempts that commit nothing leave two `NULL` `after_hash`es, and the loop stops on
+/// `no_progress_hash` although `retry_limit = 3` would allow a third.
+#[tokio::test]
+async fn two_no_commit_implement_attempts_stop_the_loop_in_worktree_mode() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.three_implement_attempts().await;
+    // `prd` and `plan` commit, so the primary moves before the loop starts; `implement` does not.
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["prd", "plan"],
+    };
+
+    let run = fix.start(&sink).await;
+    fix.answer(&sink, run, GateAnswer::Approved).await; // prd
+    fix.answer(&sink, run, GateAnswer::Approved).await; // plan
+    let implement_1 = fix.answer(&sink, run, GateAnswer::Approved).await;
+    let merged = head_of(&git, &fix.core.path).await;
+    assert_ne!(merged, fix.core.head, "prd and plan reached the primary");
+    fix.answer(&sink, run, rejected("attempt 1 is no better"))
+        .await;
+    let implement_2 = fix.answer(&sink, run, GateAnswer::Approved).await;
+    assert_eq!(
+        (implement_2.phase_name.as_str(), implement_2.attempt),
+        ("implement", 2)
+    );
+    fix.answer(&sink, run, rejected("attempt 2 is no better"))
+        .await;
+
+    for step in [&implement_1, &implement_2] {
+        let row = fix.core_commit(step).await;
+        assert_eq!(
+            (row.before_hash.as_str(), row.after_hash),
+            (merged.as_str(), None),
+            "attempt {} committed nothing on the primary",
+            step.attempt
+        );
+    }
+    let notes = fix
+        .orch
+        .store
+        .notes(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read");
+    assert!(
+        notes.iter().any(|note| {
+            note.body.contains("review loop exhausted after 2 attempts")
+                && note.body.contains("stop reason `no_progress_hash`")
+        }),
+        "the predicate stopped the loop, not the budget: {notes:?}"
+    );
+    assert!(
+        !fix.steps(run).await.iter().any(|step| step.attempt == 3),
+        "no third attempt"
+    );
+    assert_eq!(fix.orch.run(run).await.status, RunStatus::AwaitingApproval);
+    assert_eq!(head_of(&git, &fix.core.path).await, merged);
+}
+
+/// Plan D66's other half, which is what closes R-8: two `implement` attempts that **do** commit
+/// can never agree on `after_hash` in `worktree` mode, because attempt 2 branches from a primary
+/// that already holds attempt 1's merge. The loop goes on to a third attempt.
+#[tokio::test]
+async fn two_committing_implement_attempts_never_look_identical_in_worktree_mode() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    fix.three_implement_attempts().await;
+    let sink = CommittingSink {
+        orch: &fix.orch,
+        repos: &["core"],
+        phases: &["prd", "plan", "implement"],
+    };
+
+    let run = fix.start(&sink).await;
+    fix.answer(&sink, run, GateAnswer::Approved).await; // prd
+    fix.answer(&sink, run, GateAnswer::Approved).await; // plan
+    let implement_1 = fix.answer(&sink, run, GateAnswer::Approved).await;
+    let merged_1 = head_of(&git, &fix.core.path).await;
+    fix.answer(&sink, run, rejected("attempt 1 is no better"))
+        .await;
+    let implement_2 = fix.answer(&sink, run, GateAnswer::Approved).await;
+    fix.answer(&sink, run, rejected("attempt 2 is no better"))
+        .await;
+
+    let first = fix.core_commit(&implement_1).await;
+    let second = fix.core_commit(&implement_2).await;
+    assert_eq!(
+        second.before_hash, merged_1,
+        "attempt 2 starts from the primary that holds attempt 1's merge"
+    );
+    let (Some(first_after), Some(second_after)) = (&first.after_hash, &second.after_hash) else {
+        panic!("both attempts committed: {first:?} {second:?}");
+    };
+    assert_ne!(first_after, second_after);
+    git_out(
+        &git,
+        &fix.core.path,
+        &["merge-base", "--is-ancestor", first_after, second_after],
+    )
+    .await;
+
+    let parked = fix.parked(run).await;
+    assert_eq!(
+        (parked.phase_name.as_str(), parked.attempt),
+        ("implement", 3),
+        "the hash predicate did not fire, so the budget's third attempt ran"
+    );
 }
