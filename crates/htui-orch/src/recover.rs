@@ -99,8 +99,9 @@ const MIN_RETRY: Duration = Duration::from_secs(1);
 /// `times.refresh / 4` (at least 1 s, D123) and loop (D86, D103). Never returns otherwise.
 ///
 /// **The self-fence (plan D122).** The heartbeat tracks the last `until` it wrote successfully,
-/// starting from `clock.now() + times.ttl` at its call, which is the lease its caller has just
-/// written (`claim_run`, `take_lease`). Once refreshes have failed until
+/// starting from `written`: the `until` its caller's `claim_run`, `take_lease` or `adopt_runs`
+/// actually wrote (plan D143), which may lie before `clock.now() + times.ttl` at this call when the
+/// caller wrote other rows in between. Once refreshes have failed until
 /// `clock.now() >= last_until - times.refresh`, it returns `Expired`: the walk cannot prove its
 /// lease, and one `refresh` before it lapses is where it stops, so no other box's sweep adopts a
 /// run this walk still writes to. A retry never sleeps past that fence, and a refresh still
@@ -111,7 +112,7 @@ const MIN_RETRY: Duration = Duration::from_secs(1);
 /// (H-3).
 pub async fn heartbeat<F, Fut, C>(
     mut refresh: F,
-    _written: DateTime<Utc>,
+    written: DateTime<Utc>,
     clock: &C,
     times: LeaseTimes,
 ) -> Heartbeat
@@ -122,7 +123,7 @@ where
 {
     let retry = (times.refresh / 4).max(MIN_RETRY);
     let margin = TimeDelta::from_std(times.refresh).unwrap_or(times.ttl);
-    let mut fence = clock.now() + times.ttl - margin;
+    let mut fence = written - margin;
     let mut interval = times.refresh;
     loop {
         tokio::time::sleep(interval).await;

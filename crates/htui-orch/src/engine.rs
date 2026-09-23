@@ -580,7 +580,7 @@ where
             return Err(EngineError::ClaimRefused { run, claim });
         }
 
-        let rest = self.walk_leased(run, self.run_to_rest(run)).await?;
+        let rest = self.walk_leased(run, lease, self.run_to_rest(run)).await?;
         Ok(CommandOutcome::Started { run, rest })
     }
 
@@ -638,7 +638,7 @@ where
     ) -> Result<CommandOutcome, EngineError> {
         // Plan D108: after the pure guard and before the first write, so a live lease elsewhere
         // refuses with the gate still unanswered (blueprint F-N).
-        self.take_lease(run.id).await?;
+        let until = self.take_lease(run.id).await?;
 
         let now = self.now();
         let (outcome, note, to) = match &answer {
@@ -683,7 +683,7 @@ where
                 None => self.run_to_rest(run.id).await,
             }
         };
-        let rest = self.walk_leased(run.id, tail).await?;
+        let rest = self.walk_leased(run.id, until, tail).await?;
         Ok(CommandOutcome::Answered { rest })
     }
 
@@ -811,7 +811,7 @@ where
         row: &RunStep,
         phase: &SnapshotPhase,
     ) -> Result<CommandOutcome, EngineError> {
-        self.take_lease(run.id).await?;
+        let until = self.take_lease(run.id).await?;
 
         let now = self.now();
         match row.status {
@@ -863,7 +863,7 @@ where
                 None => self.run_to_rest(run.id).await,
             }
         };
-        let rest = self.walk_leased(run.id, tail).await?;
+        let rest = self.walk_leased(run.id, until, tail).await?;
         Ok(CommandOutcome::Retried { step: row.id, rest })
     }
 
@@ -910,7 +910,7 @@ where
         steps: &[RunStep],
     ) -> Result<CommandOutcome, EngineError> {
         let attempt = row.attempt;
-        self.take_lease(run.id).await?;
+        let until = self.take_lease(run.id).await?;
 
         let now = self.now();
         // Plan D133: a member moved between the guard and its retirement stops the retry, and
@@ -932,7 +932,7 @@ where
                 None => self.run_to_rest(run.id).await,
             }
         };
-        let rest = self.walk_leased(run.id, tail).await?;
+        let rest = self.walk_leased(run.id, until, tail).await?;
         Ok(CommandOutcome::Retried { step: row.id, rest })
     }
 
@@ -957,7 +957,7 @@ where
         let slot = group_at(&steps, position, attempt);
         crate::command::select_enabled(&run, &slot, winner, position, attempt)?;
         let siblings = Self::siblings(&slot, winner);
-        self.take_lease(run.id).await?;
+        let until = self.take_lease(run.id).await?;
 
         self.parts
             .store
@@ -994,7 +994,7 @@ where
                 None => self.run_to_rest(run.id).await,
             }
         };
-        let rest = self.walk_leased(run.id, tail).await?;
+        let rest = self.walk_leased(run.id, until, tail).await?;
         Ok(CommandOutcome::Selected { rest })
     }
 
@@ -1074,6 +1074,10 @@ where
 
     /// Plan D86/D107: `walk` raced against [`crate::recover::heartbeat`] in this task.
     ///
+    /// `until` is the `lease_expires_at` the caller's lease take wrote (`claim_run`, `take_lease`
+    /// or the sweep's renewal). The heartbeat's first fence is that `until` less one refresh (plan
+    /// D143), not a lease the heartbeat assumes from its own start.
+    ///
     /// On the walk's answer, the lease is released when the run rests anywhere but `running`
     /// (D87), and also when the re-read that decides it fails (D129: warned, and the walk's `Ok`
     /// stands). An `Err` writes nothing more, because the store may be what failed, except the
@@ -1092,7 +1096,12 @@ where
     /// [`Self::claim`] and [`Self::resume`] — panics outside a Tokio runtime built with the time
     /// driver enabled. Every shipped harness is `#[tokio::test]`; milestone 6's caller must build
     /// its runtime with `enable_time` (or `enable_all`).
-    async fn walk_leased<T, F>(&self, run: RunId, walk: F) -> Result<T, EngineError>
+    async fn walk_leased<T, F>(
+        &self,
+        run: RunId,
+        until: DateTime<Utc>,
+        walk: F,
+    ) -> Result<T, EngineError>
     where
         F: Future<Output = Result<T, EngineError>>,
     {
@@ -1100,7 +1109,7 @@ where
         let (store, owner) = (self.parts.store, self.parts.owner);
         let beat = recover::heartbeat(
             |until| store.refresh_lease(run, owner, until),
-            self.now() + times.ttl,
+            until,
             self.parts.clock,
             times,
         );
@@ -1157,15 +1166,17 @@ where
 
     /// Plan D87/D108: `take_lease(run, box, owner, now, now + ttl)`, after a command's pure guard
     /// and before its first write.
+    /// Answers the `until` it wrote, which the command's [`Self::walk_leased`] fences from (plan
+    /// D143).
     ///
     /// Plan D130: a zero-row answer re-reads the run to say why. Not `running` or
     /// `awaiting_approval` → [`EngineError::RunStatus`] naming the status; a live lease (never
     /// this process's, which the take would have renewed) → [`EngineError::LeaseHeld`]; neither
     /// (the run executes on another box with its lease lapsed) → [`EngineError::RunStatus`] saying
     /// so.
-    async fn take_lease(&self, run: RunId) -> Result<(), EngineError> {
-        if self.renew_lease(run).await? {
-            return Ok(());
+    async fn take_lease(&self, run: RunId) -> Result<DateTime<Utc>, EngineError> {
+        if let Some(until) = self.renew_lease(run).await? {
+            return Ok(until);
         }
         let row = self.run(run).await?;
         if !matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval) {
@@ -1185,28 +1196,24 @@ where
         })
     }
 
-    /// The store's `take_lease(run, box, owner, now, now + ttl)` and its bare answer: `false` is
-    /// "not takeable here", which [`Self::take_lease`] words and the sweep skips (plan D126).
+    /// The store's `take_lease(run, box, owner, now, now + ttl)` and its bare answer: the `until`
+    /// written when the lease was taken (plan D143), `None` for "not takeable here", which
+    /// [`Self::take_lease`] words and the sweep skips (plan D126).
     ///
     /// Plan D140: a run taken here is about to be walked, so it leaves [`DeadWalks`]. The sweep
     /// must not give back the lease of a live walk.
-    async fn renew_lease(&self, run: RunId) -> Result<bool, EngineError> {
+    async fn renew_lease(&self, run: RunId) -> Result<Option<DateTime<Utc>>, EngineError> {
         let now = self.now();
+        let until = now + self.lease_times().ttl;
         let taken = self
             .parts
             .store
-            .take_lease(
-                run,
-                self.parts.box_id,
-                self.parts.owner,
-                now,
-                now + self.lease_times().ttl,
-            )
+            .take_lease(run, self.parts.box_id, self.parts.owner, now, until)
             .await?;
         if taken {
             self.parts.dead_walks.remove(run);
         }
-        Ok(taken)
+        Ok(taken.then_some(until))
     }
 
     /// Plan D133: a command whose first compare-and-set answered `Ok(false)` gives back the lease
@@ -1214,6 +1221,13 @@ where
     async fn stale_first_write(&self, run: RunId, stale: EngineError) -> EngineError {
         self.release_lease(run).await;
         stale
+    }
+
+    /// The `until` a lease taken at this instant runs to: what a test hands
+    /// [`Self::walk_leased`] as the lease its caller has just written.
+    #[cfg(test)]
+    fn fresh_until(&self) -> DateTime<Utc> {
+        self.now() + self.lease_times().ttl
     }
 
     /// Plan D87/D139: the store's `release_lease(run, owner, now)`. The lease reads as expired at
@@ -1282,9 +1296,9 @@ where
             // Plan D126: `adopt_runs` leased every run at once, and only the one being recovered
             // is heartbeaten, so a later run's lease may have lapsed and been taken meanwhile.
             // Renew it first; a run that is no longer ours is skipped, with nothing written.
-            match self.renew_lease(run.id).await {
-                Ok(true) => {}
-                Ok(false) => {
+            let until = match self.renew_lease(run.id).await {
+                Ok(Some(until)) => until,
+                Ok(None) => {
                     tracing::warn!(run = %run.id, "the sweep's lease was taken before recovery; skipped");
                     continue;
                 }
@@ -1295,11 +1309,14 @@ where
                     });
                     continue;
                 }
-            }
+            };
             // Blueprint A-7: under the heartbeat, so a stranger taking the lease mid-recovery
             // abandons it like any walk. `walk_leased` releases the lease of a run it leaves
             // anywhere but `running`, which is every `Parked` and `Finished`.
-            let next = match self.walk_leased(run.id, self.recover_run(&run)).await {
+            let next = match self
+                .walk_leased(run.id, until, self.recover_run(&run))
+                .await
+            {
                 Ok(next) => next,
                 // Plan D128: the lease is gone, so nothing more is this process's to write — no
                 // note and no release; the warn is all.
@@ -1881,7 +1898,7 @@ where
     /// no lease can be taken on otherwise (plan D130), [`EngineError::LeaseLost`], and every other
     /// [`EngineError`].
     pub async fn resume(&self, run: RunId) -> Result<Resume, EngineError> {
-        self.take_lease(run).await?;
+        let until = self.take_lease(run).await?;
         let row = self.run(run).await?;
         let snapshot = Self::snapshot_of(&row)?;
         let item = self.item(Self::item_of(&row)?).await?;
@@ -1911,7 +1928,7 @@ where
                     snapshot.topology
                 );
                 self.note(item.id, body, None, self.now()).await?;
-                let rest = self.walk_leased(run, self.walk_resumed(run)).await?;
+                let rest = self.walk_leased(run, until, self.walk_resumed(run)).await?;
                 return Ok(Resume::Walked(rest));
             }
             Err(err) => return Err(err.into()),
@@ -1946,7 +1963,7 @@ where
                 rest,
             });
         }
-        let rest = self.walk_leased(run, self.walk_resumed(run)).await?;
+        let rest = self.walk_leased(run, until, self.walk_resumed(run)).await?;
         Ok(Resume::Walked(rest))
     }
 
@@ -6952,7 +6969,7 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let raised = engine
-            .walk_leased(run, async {
+            .walk_leased(run, engine.fresh_until(), async {
                 Err::<(), _>(EngineError::Stalled { run, passes: 1 })
             })
             .await
@@ -6986,7 +7003,9 @@ mod tests {
         harness_engine!(harness.orch, engine);
         let ghost = htui_core::model::RunId::new();
         let walked = engine
-            .walk_leased(ghost, async { Ok::<_, EngineError>(7) })
+            .walk_leased(ghost, engine.fresh_until(), async {
+                Ok::<_, EngineError>(7)
+            })
             .await
             .expect("the walk succeeded; a failed re-read does not undo it");
         assert_eq!(walked, 7);
@@ -7112,7 +7131,7 @@ mod tests {
             (harness.orch.run(run).await, harness.orch.steps(run).await)
         };
         let (walked, (run_after_steal, steps_after_steal)) =
-            tokio::join!(engine.walk_leased(run, walk), steal);
+            tokio::join!(engine.walk_leased(run, engine.fresh_until(), walk), steal);
 
         let refused = walked.expect_err("the heartbeat's refresh touched zero rows");
         assert!(
@@ -7183,7 +7202,7 @@ mod tests {
         };
         let walked = tokio::time::timeout(
             std::time::Duration::from_millis(600_500),
-            engine.walk_leased(ghost, walk),
+            engine.walk_leased(ghost, engine.fresh_until(), walk),
         )
         .await
         .expect("the walk stops itself instead of writing past its lease");
@@ -7239,7 +7258,7 @@ mod tests {
         };
         let walked = tokio::time::timeout(
             std::time::Duration::from_millis(600_500),
-            engine.walk_leased(dead, walk),
+            engine.walk_leased(dead, engine.fresh_until(), walk),
         )
         .await
         .expect("the walk stops itself instead of writing past its lease");
@@ -7319,7 +7338,7 @@ mod tests {
         };
         tokio::time::timeout(
             std::time::Duration::from_millis(600_500),
-            engine.walk_leased(dead, walk),
+            engine.walk_leased(dead, engine.fresh_until(), walk),
         )
         .await
         .expect("the walk stops itself instead of writing past its lease")
