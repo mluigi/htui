@@ -9,10 +9,15 @@ use std::future::Future;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use htui_core::model::{
+    CommandRun, CommandRunStatus, Isolation, RepoId, RunStep, RunStepCommit, RunStepTree,
+    SnapshotPhase, VerifyOutcome,
+};
 use htui_core::store::StoreError;
 use serde_json::Value;
 
 use crate::isolate::Clock;
+use crate::verify::VERIFY_CLASS;
 
 /// `app_setting` key of the lease's time to live, in seconds (`0003_orchestration.sql:135`).
 pub const LEASE_TTL_KEY: &str = "lease_ttl_seconds";
@@ -98,6 +103,94 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Adjudicating one `running` step (plan D90, D92, D93)
+// ---------------------------------------------------------------------------------------------
+
+/// Which of a slot's rows a step is, which decides what the sweep does with its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    /// The one row of a `fan_out = 1` phase.
+    Plain,
+    /// One candidate of a fanned-out slot (`fanout_index >= 0`, `fan_out > 1`).
+    Candidate,
+    /// The slot's judge (`fanout_index = -1`).
+    Judge,
+}
+
+impl StepKind {
+    /// `fanout_index == -1` → Judge; `phase.fan_out > 1` → Candidate; else Plain.
+    #[must_use]
+    pub const fn of(step: &RunStep, phase: &SnapshotPhase) -> Self {
+        let _ = (step, phase);
+        todo!()
+    }
+}
+
+/// What a `running` step's rows say happened to it before the crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Adjudication {
+    /// D90. `verify*` are what `finish_step` must write when `finished_at` is `NULL`.
+    Finished {
+        /// [`verify_of`]'s outcome.
+        verify: Option<VerifyOutcome>,
+        /// [`verify_of`]'s exit code.
+        verify_exit_code: Option<i32>,
+    },
+    /// D92: every row is resettable (vacuously, with no rows).
+    Reset,
+    /// D93: `(repo, path, base_ref)` of every row, for the note.
+    NeverReset {
+        /// Every `run_step_tree` row of the step, not only the dirty ones.
+        trees: Vec<(RepoId, String, String)>,
+    },
+}
+
+/// D90/D92/D93 over one `running` step. Seven arguments, which is clippy's limit.
+///
+/// Finished when the output document exists **and** either `finished_at` is set or every repo of
+/// `run_scope` has a `run_step_commit` row with an `after_hash` (vacuous for an empty scope, the
+/// demo fixture's). Otherwise resettable when every tree row is `worktree | copy`, or
+/// `shared_serialized | local` with `dirty = false`. The rows passed are the step's own. A judge
+/// is classified as well; the engine ignores the answer (D95).
+#[must_use]
+pub fn classify(
+    step: &RunStep,
+    phase: &SnapshotPhase,
+    run_scope: &[RepoId],
+    trees: &[RunStepTree],
+    commits: &[RunStepCommit],
+    output_present: bool,
+    command_runs: &[CommandRun],
+) -> (StepKind, Adjudication) {
+    let _ = (
+        step,
+        phase,
+        run_scope,
+        trees,
+        commits,
+        output_present,
+        command_runs,
+    );
+    todo!()
+}
+
+/// D91: the step's verify from rows. `finished_at` set → the row's own columns. Otherwise the last
+/// `command_run` whose `class == VERIFY_CLASS`: `Done` + `Some(0)` → `Pass`; `Done` + other →
+/// `Fail`; `Failed` → `Unavailable`; `Queued`/`Running` or none → `None`.
+///
+/// "Last" is the latest `queued_at`, the later row on a tie. The class filter is D116's: MOD-11's
+/// queue writes other classes against the same step. A `cancelled` row never finished and reads
+/// as `None`, like `running`. `Unavailable` carries no exit code, as the live walk writes it.
+#[must_use]
+pub fn verify_of(
+    step: &RunStep,
+    command_runs: &[CommandRun],
+) -> (Option<VerifyOutcome>, Option<i32>) {
+    let _ = (step, command_runs);
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -108,8 +201,16 @@ mod tests {
     use htui_core::store::StoreError;
     use serde_json::{Value, json};
 
+    use htui_core::fixtures::{demo_data, ids};
+    use htui_core::model::{
+        BoxId, CommandRun, CommandRunId, CommandRunStatus, GraphSnapshot, Isolation, RepoId, RunId,
+        RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, StepStatus, VerifyOutcome,
+    };
+
     use crate::isolate::Clock;
-    use crate::recover::{Heartbeat, LeaseTimes, heartbeat};
+    use crate::recover::{
+        Adjudication, Heartbeat, LeaseTimes, StepKind, classify, heartbeat, verify_of,
+    };
 
     // -----------------------------------------------------------------------------------------
     // Lease times
@@ -267,5 +368,406 @@ mod tests {
             "abandoned on the third beat"
         );
         assert_eq!(clock.elapsed(), Duration::from_secs(180));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Rows, hand-built; the snapshot decoded from the fixture's JSON (plan D106)
+    // -----------------------------------------------------------------------------------------
+
+    /// A fixed instant `minutes` after noon.
+    fn at(minutes: i64) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 23, 12, 0, 0).unwrap() + TimeDelta::minutes(minutes)
+    }
+
+    /// The `feature` graph's snapshot, as every fixture `graph` run carries it (`status.rs`'s
+    /// pattern): decoded, never a struct literal, so a field added to it cannot break this file.
+    fn snapshot() -> GraphSnapshot {
+        let run = demo_data()
+            .runs
+            .into_iter()
+            .find(|row| row.id == ids::RUN_1)
+            .expect("the fixture holds RUN_1");
+        serde_json::from_value(run.graph_snapshot.expect("RUN_1 carries a snapshot"))
+            .expect("the fixture snapshot is a `GraphSnapshot`")
+    }
+
+    /// The snapshot's phase at `position`.
+    fn phase(position: i32) -> SnapshotPhase {
+        snapshot()
+            .phases
+            .into_iter()
+            .find(|phase| phase.position == position)
+            .expect("the feature graph has four phases")
+    }
+
+    /// The `implement` phase: position 2, `fan_out = 1`.
+    fn implement() -> SnapshotPhase {
+        let phase = phase(2);
+        assert_eq!(phase.name, "implement");
+        assert_eq!(phase.fan_out, 1);
+        phase
+    }
+
+    fn step(position: i32, attempt: i32, fanout_index: i32, status: StepStatus) -> RunStep {
+        RunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_1,
+            position,
+            attempt,
+            fanout_index,
+            phase_name: snapshot().phases[usize::try_from(position).unwrap()]
+                .name
+                .clone(),
+            agent_id: None,
+            model: None,
+            status,
+            gate_outcome: None,
+            gate_note: None,
+            selected: None,
+            exit_code: None,
+            prompt_digest: None,
+            trim_record: None,
+            usage: None,
+            isolation_path: None,
+            started_at: Some(at(0)),
+            finished_at: None,
+            verify_outcome: None,
+            verify_exit_code: None,
+            promoted_at: None,
+            updated_at: at(0),
+        }
+    }
+
+    /// A `running` implement step, unfinished by its own columns.
+    fn running() -> RunStep {
+        step(2, 1, 0, StepStatus::Running)
+    }
+
+    fn tree(step: &RunStep, repo: RepoId, mode: Isolation, dirty: bool) -> RunStepTree {
+        RunStepTree {
+            run_step_id: step.id,
+            repo_id: repo,
+            mode,
+            path: format!("/work/{repo}"),
+            base_ref: format!("base-of-{repo}"),
+            dirty,
+        }
+    }
+
+    fn commit(step: &RunStep, repo: RepoId, after: Option<&str>) -> RunStepCommit {
+        RunStepCommit {
+            run_step_id: step.id,
+            repo_id: repo,
+            before_hash: "before".to_owned(),
+            after_hash: after.map(str::to_owned),
+        }
+    }
+
+    fn command_run(
+        step: &RunStep,
+        class: &str,
+        status: CommandRunStatus,
+        exit_code: Option<i32>,
+        queued_at: DateTime<Utc>,
+    ) -> CommandRun {
+        CommandRun {
+            id: CommandRunId::new(),
+            run_step_id: step.id,
+            box_id: BoxId::new(),
+            class: class.to_owned(),
+            command: "cargo test".to_owned(),
+            cwd: "/work".to_owned(),
+            status,
+            exit_code,
+            output: None,
+            queued_at,
+            started_at: Some(queued_at),
+            finished_at: None,
+        }
+    }
+
+    fn verify_run(step: &RunStep, status: CommandRunStatus, exit_code: Option<i32>) -> CommandRun {
+        command_run(step, "verify", status, exit_code, at(1))
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // classify
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn classify_finished_by_finished_at() {
+        let mut step = running();
+        step.finished_at = Some(at(5));
+        step.verify_outcome = Some(VerifyOutcome::Pass);
+        step.verify_exit_code = Some(0);
+        let repo = RepoId::new();
+        let trees = [tree(&step, repo, Isolation::Worktree, false)];
+        // No `after_hash` at all: `finished_at` alone completes the second half.
+        let commits = [commit(&step, repo, None)];
+        let answer = classify(&step, &implement(), &[repo], &trees, &commits, true, &[]);
+        assert_eq!(
+            answer,
+            (
+                StepKind::Plain,
+                Adjudication::Finished {
+                    verify: Some(VerifyOutcome::Pass),
+                    verify_exit_code: Some(0),
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn classify_finished_by_every_after_hash() {
+        let step = running();
+        let (first, second) = (RepoId::new(), RepoId::new());
+        let trees = [
+            tree(&step, first, Isolation::Worktree, false),
+            tree(&step, second, Isolation::Worktree, false),
+        ];
+        let commits = [
+            commit(&step, first, Some("after-1")),
+            commit(&step, second, Some("after-2")),
+        ];
+        let runs = [verify_run(&step, CommandRunStatus::Done, Some(3))];
+        let answer = classify(
+            &step,
+            &implement(),
+            &[first, second],
+            &trees,
+            &commits,
+            true,
+            &runs,
+        );
+        assert_eq!(
+            answer.1,
+            Adjudication::Finished {
+                verify: Some(VerifyOutcome::Fail),
+                verify_exit_code: Some(3),
+            },
+            "`finished_at` is `NULL`, so the verify comes from the `command_run` row"
+        );
+
+        // An empty scope makes the commit half vacuous (the demo fixture's shape).
+        let answer = classify(&step, &implement(), &[], &[], &[], true, &[]);
+        assert_eq!(
+            answer.1,
+            Adjudication::Finished {
+                verify: None,
+                verify_exit_code: None,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_not_finished_without_the_document() {
+        let mut step = running();
+        step.finished_at = Some(at(5));
+        let repo = RepoId::new();
+        let trees = [tree(&step, repo, Isolation::Worktree, false)];
+        let commits = [commit(&step, repo, Some("after"))];
+        let answer = classify(&step, &implement(), &[repo], &trees, &commits, false, &[]);
+        assert_eq!(answer, (StepKind::Plain, Adjudication::Reset));
+    }
+
+    #[test]
+    fn classify_not_finished_with_one_repo_missing() {
+        let step = running();
+        let (first, second) = (RepoId::new(), RepoId::new());
+        let trees = [
+            tree(&step, first, Isolation::Worktree, false),
+            tree(&step, second, Isolation::Worktree, false),
+        ];
+        // The second repo's row exists with no `after_hash` (capture died between them) …
+        let half = [
+            commit(&step, first, Some("after-1")),
+            commit(&step, second, None),
+        ];
+        let answer = classify(
+            &step,
+            &implement(),
+            &[first, second],
+            &trees,
+            &half,
+            true,
+            &[],
+        );
+        assert_eq!(answer.1, Adjudication::Reset);
+        // … or has no row at all.
+        let one = [commit(&step, first, Some("after-1"))];
+        let answer = classify(
+            &step,
+            &implement(),
+            &[first, second],
+            &trees,
+            &one,
+            true,
+            &[],
+        );
+        assert_eq!(answer.1, Adjudication::Reset);
+        // An `after_hash` for a repo outside the scope completes nothing.
+        let stranger = [
+            commit(&step, first, Some("after-1")),
+            commit(&step, RepoId::new(), Some("after-x")),
+        ];
+        let answer = classify(
+            &step,
+            &implement(),
+            &[first, second],
+            &trees,
+            &stranger,
+            true,
+            &[],
+        );
+        assert_eq!(answer.1, Adjudication::Reset);
+    }
+
+    #[test]
+    fn classify_resettable_and_not_per_mode_and_dirty() {
+        let step = running();
+        let repo = RepoId::new();
+        let table = [
+            (Isolation::Worktree, false, true),
+            (Isolation::Worktree, true, true),
+            (Isolation::Copy, false, true),
+            (Isolation::Copy, true, true),
+            (Isolation::SharedSerialized, false, true),
+            (Isolation::SharedSerialized, true, false),
+            (Isolation::Local, false, true),
+            (Isolation::Local, true, false),
+        ];
+        for (mode, dirty, resettable) in table {
+            let trees = [tree(&step, repo, mode, dirty)];
+            let (_, answer) = classify(&step, &implement(), &[repo], &trees, &[], true, &[]);
+            let expected = if resettable {
+                Adjudication::Reset
+            } else {
+                Adjudication::NeverReset {
+                    trees: vec![(repo, format!("/work/{repo}"), format!("base-of-{repo}"))],
+                }
+            };
+            assert_eq!(answer, expected, "{mode} dirty={dirty}");
+        }
+
+        // One dirty in-place row is enough, and the note names every row, clean ones included.
+        let clean = RepoId::new();
+        let trees = [
+            tree(&step, clean, Isolation::Worktree, false),
+            tree(&step, repo, Isolation::Local, true),
+        ];
+        let (_, answer) = classify(&step, &implement(), &[clean, repo], &trees, &[], true, &[]);
+        assert_eq!(
+            answer,
+            Adjudication::NeverReset {
+                trees: vec![
+                    (clean, format!("/work/{clean}"), format!("base-of-{clean}")),
+                    (repo, format!("/work/{repo}"), format!("base-of-{repo}")),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn classify_a_candidate() {
+        let mut fanned = implement();
+        fanned.fan_out = 3;
+        let candidate = step(2, 1, 1, StepStatus::Running);
+        assert_eq!(StepKind::of(&candidate, &fanned), StepKind::Candidate);
+        let answer = classify(&candidate, &fanned, &[], &[], &[], false, &[]);
+        assert_eq!(answer, (StepKind::Candidate, Adjudication::Reset));
+        // Index 0 of a fanned-out slot is a candidate too, and the plain row of a `fan_out = 1`.
+        let first = step(2, 1, 0, StepStatus::Running);
+        assert_eq!(StepKind::of(&first, &fanned), StepKind::Candidate);
+        assert_eq!(StepKind::of(&first, &implement()), StepKind::Plain);
+    }
+
+    #[test]
+    fn classify_a_judge() {
+        let mut fanned = implement();
+        fanned.fan_out = 3;
+        let judge = step(2, 1, -1, StepStatus::Running);
+        let answer = classify(&judge, &fanned, &[], &[], &[], true, &[]);
+        assert_eq!(
+            answer,
+            (
+                StepKind::Judge,
+                Adjudication::Finished {
+                    verify: None,
+                    verify_exit_code: None,
+                },
+            ),
+            "a judge is classified as well; the engine ignores the answer (D95)"
+        );
+    }
+
+    #[test]
+    fn classify_a_step_with_no_tree_is_vacuously_resettable() {
+        let step = running();
+        let answer = classify(&step, &implement(), &[RepoId::new()], &[], &[], true, &[]);
+        assert_eq!(answer, (StepKind::Plain, Adjudication::Reset));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // verify_of
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn verify_of_maps_command_runs_to_outcomes() {
+        let step = running();
+        let one = |status, exit_code| verify_of(&step, &[verify_run(&step, status, exit_code)]);
+        assert_eq!(
+            one(CommandRunStatus::Done, Some(0)),
+            (Some(VerifyOutcome::Pass), Some(0))
+        );
+        assert_eq!(
+            one(CommandRunStatus::Done, Some(101)),
+            (Some(VerifyOutcome::Fail), Some(101))
+        );
+        assert_eq!(
+            one(CommandRunStatus::Failed, None),
+            (Some(VerifyOutcome::Unavailable), None)
+        );
+        assert_eq!(one(CommandRunStatus::Queued, None), (None, None));
+        assert_eq!(one(CommandRunStatus::Running, None), (None, None));
+        assert_eq!(verify_of(&step, &[]), (None, None));
+
+        // A non-`verify` class is ignored, however late it was queued.
+        let runs = [
+            verify_run(&step, CommandRunStatus::Done, Some(0)),
+            command_run(&step, "build", CommandRunStatus::Done, Some(1), at(9)),
+        ];
+        assert_eq!(
+            verify_of(&step, &runs),
+            (Some(VerifyOutcome::Pass), Some(0))
+        );
+        let runs = [command_run(
+            &step,
+            "build",
+            CommandRunStatus::Done,
+            Some(1),
+            at(9),
+        )];
+        assert_eq!(verify_of(&step, &runs), (None, None));
+
+        // The last `verify` row decides, whatever order the slice is in.
+        let runs = [
+            command_run(&step, "verify", CommandRunStatus::Done, Some(2), at(7)),
+            command_run(&step, "verify", CommandRunStatus::Done, Some(0), at(3)),
+        ];
+        assert_eq!(
+            verify_of(&step, &runs),
+            (Some(VerifyOutcome::Fail), Some(2))
+        );
+
+        // `finished_at` wins: the row's own columns, even `NULL`, over any `command_run`.
+        let mut finished = running();
+        finished.finished_at = Some(at(5));
+        let runs = [verify_run(&finished, CommandRunStatus::Done, Some(1))];
+        assert_eq!(verify_of(&finished, &runs), (None, None));
+        finished.verify_outcome = Some(VerifyOutcome::Unavailable);
+        assert_eq!(
+            verify_of(&finished, &runs),
+            (Some(VerifyOutcome::Unavailable), None)
+        );
     }
 }
