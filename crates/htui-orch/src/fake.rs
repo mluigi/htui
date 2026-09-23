@@ -1229,7 +1229,8 @@ impl FakeOrchestrator {
     /// are fresh, because neither survives a process. The clock starts [`RESTART_GAP`] past this
     /// one's, the scripts, candidates, default script and capabilities are cloned, the box and user
     /// are the same, and the `owner` is **new** — which is what makes the lease this process wrote
-    /// someone else's. The dead-walk set is new and empty too (plan D140). An `advance_after_done` is not carried, and neither is a
+    /// someone else's. The dead-walk set is new and empty too (plan D140). An
+    /// `advance_after_done` is not carried, and neither is a
     /// [`stall_after_done`](Self::stall_after_done): the crash was the first process's.
     ///
     /// # Panics

@@ -266,9 +266,11 @@ pub type DriverFor<'a> =
 /// first retries the release of every run in it and drops each one the store answers, so
 /// `adopt_runs` then sees the run as free. Plan D88 still keeps the sweep off every lease a live
 /// walk of this process holds, and a run this process takes again leaves the set. Commands in one
-/// process are not fenced against each other yet (R-27): a sweep that races a resume of the same
-/// run may give back the resumed walk's lease. That walk's next refresh then matches no row, and
-/// the walk is abandoned before it writes again.
+/// process are not fenced against each other yet (R-27). A sweep that reads the set, and then
+/// races a resume of the same run, may give back the resumed walk's lease. The same sweep's
+/// `adopt_runs` then takes that lease for this process again, so the resumed walk's refresh
+/// still matches. The run is then walked twice at once, which plan D88 exists to prevent. That
+/// race is part of R-27; nothing reaches it until commands run concurrently.
 ///
 /// It belongs to the process, not to an [`Engine`]: an engine is built per command (plan D16)
 /// and only borrows it. A restarted process starts with an empty set, and its old owner's leases
@@ -6921,8 +6923,9 @@ mod tests {
     }
 
     /// Plan D127 (review M2): a walk that raises gives its lease back, best-effort, so any
-    /// process's sweep may adopt the run once it is seen as expired; plan D88 would otherwise keep
-    /// this process's own sweep off it for ever.
+    /// process's sweep may adopt the run once it is seen as expired. Since plan D139 the release
+    /// also clears the owner, so this process's own sweep adopts the run as well. Plan D88 would
+    /// otherwise keep it off the run for ever.
     #[tokio::test(start_paused = true)]
     async fn a_walk_that_raises_releases_its_lease() {
         let harness = Harness::new().await;
