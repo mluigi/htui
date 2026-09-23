@@ -225,7 +225,9 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     /// (OQ-8): the retry prepares a tree of its own.
     ///
     /// `shared_serialized`/`local` rows are checked **all first** (OQ-7: live dirt refuses), then
-    /// labelled `htui/<step>` when `HEAD` moved, then `reset --hard <base_ref>`. The check is
+    /// a `shared_serialized` row whose `HEAD` moved is labelled `htui/<step>` and
+    /// `reset --hard <base_ref>`; a `local` row whose `HEAD` moved is refused (`local_moved`,
+    /// blueprint A-6) and never labelled or reset. The check is
     /// all-or-nothing across rows: a [`ResetReport`] with a refusal in it reset nothing anywhere.
     fn reset<'a>(
         &'a self,
