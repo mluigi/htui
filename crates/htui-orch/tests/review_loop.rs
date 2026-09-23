@@ -10,6 +10,9 @@
 //! The loop is driven directly rather than through the walk on purpose: `Engine` mints its snapshot
 //! through `graph::resolve` and therefore cannot produce one of these shapes, which is exactly why
 //! the hazard was invisible to the conformance suite.
+//!
+//! Every run here is claimed first, as the walk's is: the loop's moves are compare-and-sets that
+//! stop on a row another writer moved (plan D125), which the last case pins for the escalation.
 
 use chrono::Utc;
 use htui_core::fixtures::{demo_data, ids};
@@ -18,6 +21,7 @@ use htui_core::model::{
     StepStatus,
 };
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use htui_orch::command::EngineError;
 use htui_orch::fake::TestClock;
 use htui_orch::gate::{GateContext, LoopOutcome, LoopStop, review_loop};
 
@@ -67,6 +71,30 @@ async fn run_with(store: &MemStore, snapshot: GraphSnapshot) -> Run {
         })
         .await
         .expect("the item is `open`, so it queues")
+}
+
+/// [`run_with`], claimed: `queued -> running` through `claim_run`, as `Engine::claim` does, and
+/// re-read. The loop's run and step moves are compare-and-sets that honour `Ok(false)` (plan
+/// D125), so a run the loop drives must be `running`.
+async fn claimed_with(store: &MemStore, snapshot: GraphSnapshot) -> Run {
+    let run = run_with(store, snapshot).await;
+    let now = Utc::now();
+    let claim = store
+        .claim_run(
+            run.id,
+            ids::BOX,
+            uuid::Uuid::now_v7(),
+            now,
+            now + chrono::TimeDelta::hours(1),
+        )
+        .await
+        .expect("MemStore never fails a claim");
+    assert!(claim.is_admitted(), "the box has a slot: {claim}");
+    store
+        .run(run.id)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the case created it")
 }
 
 /// A step at `(position, attempt 1, 0)` moved to `status` through the legal path.
@@ -131,7 +159,7 @@ async fn a_sparse_snapshot_does_not_index_past_the_phase_array() {
     snapshot.phases[2].position = 4;
     snapshot.phases[3].position = 5;
 
-    let run = run_with(&store, snapshot.clone()).await;
+    let run = claimed_with(&store, snapshot.clone()).await;
     let implement = step_at(&store, run.id, 4, "implement", StepStatus::Done).await;
     let review = step_at(&store, run.id, 5, "review", StepStatus::Failed).await;
 
@@ -189,7 +217,7 @@ async fn an_unsorted_snapshot_picks_the_phase_whose_position_matches() {
         phase(&snapshot, "prd"),
     ];
 
-    let run = run_with(&store, snapshot.clone()).await;
+    let run = claimed_with(&store, snapshot.clone()).await;
     step_at(&store, run.id, 2, "implement", StepStatus::Done).await;
     let review = step_at(&store, run.id, 3, "review", StepStatus::Failed).await;
 
@@ -242,7 +270,7 @@ async fn a_sparse_snapshot_with_no_predecessor_refuses_by_name() {
     review.position = 2;
     snapshot.phases = vec![phase(&snapshot, "prd"), review];
 
-    let run = run_with(&store, snapshot.clone()).await;
+    let run = claimed_with(&store, snapshot.clone()).await;
     let step = step_at(&store, run.id, 2, "review", StepStatus::Failed).await;
 
     let ctx = GateContext {
@@ -268,5 +296,56 @@ async fn a_sparse_snapshot_with_no_predecessor_refuses_by_name() {
             .as_deref(),
         Some("no_loop_target"),
         "plan D5's terminal review, on a snapshot with a hole in it"
+    );
+}
+
+/// Plan D125, carried to the escalation: `escalate`'s `running -> awaiting_approval` honours
+/// `Ok(false)`. A run the loop read as `running` that another writer moved first — here one never
+/// claimed, still `queued` — stops the escalation with `StaleWrite`, and no note is written.
+#[tokio::test]
+async fn an_escalation_on_a_run_another_writer_moved_is_a_stale_write() {
+    let store = MemStore::demo();
+    let clock = TestClock::new();
+    let mut snapshot = feature_snapshot();
+    snapshot
+        .phases
+        .iter_mut()
+        .filter(|phase| phase.name == "implement")
+        .for_each(|phase| phase.retry_limit = 0);
+
+    let run = run_with(&store, snapshot.clone()).await;
+    step_at(&store, run.id, 2, "implement", StepStatus::Done).await;
+    let review = step_at(&store, run.id, 3, "review", StepStatus::Failed).await;
+
+    let ctx = GateContext {
+        store: &store,
+        clock: &clock,
+        run: &run,
+        snapshot: &snapshot,
+        user: store.this_user().expect("the fixture seeds one `app_user`"),
+        box_id: ids::BOX,
+    };
+    let refused = review_loop(&ctx, &row(&store, run.id, review).await)
+        .await
+        .expect_err("the run is not `running`, so the escalation's move is refused");
+    assert!(
+        matches!(
+            &refused,
+            EngineError::StaleWrite { run: stopped, row, from, to }
+                if *stopped == run.id
+                    && row == "the run"
+                    && from == "running"
+                    && to == "awaiting_approval"
+        ),
+        "{refused}"
+    );
+    assert!(
+        store
+            .notes(ITEM)
+            .await
+            .expect("MemStore never fails a read")
+            .iter()
+            .all(|note| !note.body.contains("review loop exhausted")),
+        "nothing past the refused move is written"
     );
 }
