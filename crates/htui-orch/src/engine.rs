@@ -2252,7 +2252,8 @@ where
     /// `running` and the run `running` with nothing able to move either — `cursor` rests on a
     /// `running` step, both §6.2 guards refuse one, and no sweep adopts a run whose lease this
     /// process still holds (plan D88). So [`Self::fail_hard`] settles first and the error is
-    /// re-raised after.
+    /// re-raised after. The move itself answering `Ok(false)` is plan D144's
+    /// [`EngineError::StaleWrite`]: the step never went live, so nothing needs settling.
     async fn walk_step(
         &self,
         run: &Run,
@@ -2263,15 +2264,15 @@ where
         let now = self.now();
 
         // -- stage 2: prepare, beginning with the move that makes the step live ---------------
-        if !self
-            .parts
-            .store
-            .transition_step(step.id, StepStatus::Pending, StepStatus::Running, now)
-            .await?
-        {
-            // Another process moved it; the next pass re-derives from rows (plan D16, D17).
-            return Ok(None);
-        }
+        // Plan D144: another writer moved the row this walk read, so the walk stops (D125).
+        self.move_step(
+            run.id,
+            step.id,
+            StepStatus::Pending,
+            StepStatus::Running,
+            now,
+        )
+        .await?;
 
         // `transition_step` stamps `started_at = COALESCE(started_at, at)`, so this instant *is*
         // the step's start. Read from the row the walk holds, it would still be `NULL` — the row
@@ -2788,7 +2789,8 @@ where
 
     /// One candidate's stages 2 to 5 (plan D48): it lands `done` or `failed` on its own and never
     /// parks, and an error once it is live fails **that candidate** — never the run, and never its
-    /// siblings. The only error raised is a failure write that itself failed.
+    /// siblings. The errors raised are a failure write that itself failed, and plan D144's
+    /// [`EngineError::StaleWrite`] when the `pending -> running` move finds the row moved.
     ///
     /// A candidate that fails after `prepare` succeeded and before its `capture` ran is captured
     /// best-effort on the way out (plan D78, blueprint A-7): a `shared_serialized` guard is released
@@ -2796,19 +2798,16 @@ where
     /// it, so without this the siblings in the same `join_all` would wait on it forever.
     async fn run_candidate(&self, stage: CandidateStage<'_>) -> Result<(), EngineError> {
         let started_at = self.now();
-        if !self
-            .parts
-            .store
-            .transition_step(
-                stage.step.id,
-                StepStatus::Pending,
-                StepStatus::Running,
-                started_at,
-            )
-            .await?
-        {
-            return Ok(());
-        }
+        // Plan D144: a candidate another writer moved is `StaleWrite` (D125), raised once the
+        // group's `join_all` has settled every sibling.
+        self.move_step(
+            stage.run.id,
+            stage.step.id,
+            StepStatus::Pending,
+            StepStatus::Running,
+            started_at,
+        )
+        .await?;
         let mut trees = None;
         let mut captured = false;
         match self.candidate_live(&stage, &mut trees, &mut captured).await {
@@ -3309,14 +3308,15 @@ where
             .judge_row(run, snapshot, phase, attempt, existing)
             .await?;
         let now = self.now();
-        if !self
-            .parts
-            .store
-            .transition_step(judge.id, StepStatus::Pending, StepStatus::Running, now)
-            .await?
-        {
-            return Ok(None);
-        }
+        // Plan D144: a judge another writer moved is `StaleWrite` (D125).
+        self.move_step(
+            run.id,
+            judge.id,
+            StepStatus::Pending,
+            StepStatus::Running,
+            now,
+        )
+        .await?;
         let prompts = match prompts {
             Ok(prompts) => prompts,
             Err(failure) => {
@@ -4345,6 +4345,13 @@ where
 
     /// One step compare-and-set on the walk's path; `Ok(false)` is plan D125's
     /// [`EngineError::StaleWrite`], and the walk writes nothing further.
+    ///
+    /// Plan D144: every `pending -> running` of the walk (a step, a candidate, a judge) goes
+    /// through here, and the automatic rejection's `answer_gate` through [`gate::reject_step`].
+    /// Two `running -> failed` writes are exempt: [`Self::fail_hard`] and
+    /// [`Self::fail_candidate`] run on a walk that is already failing, and on their `Ok(false)`
+    /// (the step was settled by another writer) they write nothing further themselves (plan D17).
+    /// Raising `StaleWrite` there would only replace the error that brought the walk there.
     async fn move_step(
         &self,
         run: RunId,

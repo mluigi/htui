@@ -567,17 +567,30 @@ async fn move_step<S: WriteStore, C: Clock + ?Sized>(
 /// An automatic rejection's `answer_gate(Rejected, note)` on a step the walk has just parked:
 /// `awaiting_approval -> failed`, with `note` as its `gate_note`. The gate's review rejection and
 /// the engine's judge failure (plan D51) both write it.
+///
+/// Plan D144: `answer_gate` is a compare-and-set on `awaiting_approval`, so `Ok(false)` is plan
+/// D125's [`EngineError::StaleWrite`]. Another writer answered or moved the step between the park
+/// and this write, and the walk writes nothing further.
 pub(crate) async fn reject_step<S: WriteStore + ?Sized>(
     store: &S,
-    _run: RunId,
+    run: RunId,
     step: StepId,
     note: String,
     now: DateTime<Utc>,
 ) -> Result<(), EngineError> {
-    store
+    if store
         .answer_gate(step, GateOutcome::Rejected, Some(note), now)
-        .await?;
-    Ok(())
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(stale_step(
+            run,
+            step,
+            StepStatus::AwaitingApproval,
+            StepStatus::Failed,
+        ))
+    }
 }
 
 /// [`move_step`] for the run row.
