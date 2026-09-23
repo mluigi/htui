@@ -672,6 +672,157 @@ async fn admission_is_serialised_by_the_box_row_lock() {
     db.drop_db().await;
 }
 
+/// ANA-2 §4.9's sweep, raced: two processes sweeping one box at once adopt every expired run
+/// exactly once between them.
+///
+/// `adopt_runs` locks its candidates in `(queued_at, id)` order with `FOR UPDATE SKIP LOCKED`
+/// (blueprint A-5), so neither sweep waits on the other's row locks, and a row the other already
+/// took is re-checked against its new, live lease rather than adopted a second time. Two pools, as
+/// in [`admission_is_serialised_by_the_box_row_lock`].
+#[tokio::test(flavor = "multi_thread")]
+async fn two_sweeps_adopt_each_expired_run_once() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let crashed = uuid::Uuid::now_v7();
+    let mut expired = Vec::new();
+    for item in [ids::HTUI_ANA_2, ids::HTUI_CLEAN_1] {
+        let run = db
+            .store
+            .create_run(race_run(item))
+            .await
+            .expect("queue a graph run")
+            .id;
+        assert_eq!(
+            db.store
+                .claim_run(run, ids::BOX, crashed, at, at - TimeDelta::minutes(1))
+                .await
+                .expect("the claim must not fail"),
+            Claim::Admitted,
+            "both runs fit the fixture box's two slots, under a lease already expired"
+        );
+        expired.push(run);
+    }
+
+    let other = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let until = at + TimeDelta::minutes(5);
+    let (a, b) = tokio::join!(
+        db.store
+            .adopt_runs(ids::BOX, uuid::Uuid::now_v7(), at, until),
+        other.adopt_runs(ids::BOX, uuid::Uuid::now_v7(), at, until),
+    );
+    let a: Vec<RunId> = a
+        .expect("the first sweep must not fail")
+        .iter()
+        .map(|row| row.id)
+        .collect();
+    let b: Vec<RunId> = b
+        .expect("the second sweep must not fail")
+        .iter()
+        .map(|row| row.id)
+        .collect();
+
+    assert_eq!(
+        a.len() + b.len(),
+        2,
+        "two expired runs are adopted twice in all, got {a:?} and {b:?}"
+    );
+    assert!(
+        a.iter().all(|run| !b.contains(run)),
+        "no run is adopted by both sweeps, got {a:?} and {b:?}"
+    );
+    let mut union: Vec<RunId> = a.into_iter().chain(b).collect();
+    union.sort_unstable();
+    expired.sort_unstable();
+    assert_eq!(
+        union, expired,
+        "and between them every expired run is adopted"
+    );
+
+    db.drop_db().await;
+}
+
+/// Plan D87's take, raced (blueprint F-F): two processes answering one parked run whose lease was
+/// released both try to take it, and exactly one does.
+///
+/// `take_lease` is one compare-and-set `UPDATE`. The loser blocks on the winner's row lock, and
+/// READ COMMITTED re-checks its `WHERE` against the committed row, which by then carries the
+/// winner's live lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_takes_of_one_released_lease_admit_one() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let first_owner = uuid::Uuid::now_v7();
+    let run = db
+        .store
+        .create_run(race_run(ids::HTUI_ANA_2))
+        .await
+        .expect("queue a graph run")
+        .id;
+    assert_eq!(
+        db.store
+            .claim_run(run, ids::BOX, first_owner, at, at + TimeDelta::minutes(5))
+            .await
+            .expect("the claim must not fail"),
+        Claim::Admitted,
+        "the run is admitted"
+    );
+    assert!(
+        db.store
+            .transition_run(run, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect("the park must not fail"),
+        "the run parks at a gate"
+    );
+    assert!(
+        db.store
+            .refresh_lease(run, first_owner, at)
+            .await
+            .expect("the release must not fail"),
+        "the walk that parked it releases its lease (lease_expires_at = now)"
+    );
+
+    let other = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let (one_until, two_until) = (at + TimeDelta::minutes(10), at + TimeDelta::minutes(20));
+    let (one, two) = tokio::join!(
+        db.store
+            .take_lease(run, ids::BOX, uuid::Uuid::now_v7(), at, one_until),
+        other.take_lease(run, ids::BOX, uuid::Uuid::now_v7(), at, two_until),
+    );
+    let one = one.expect("the first take must not fail");
+    let two = two.expect("the second take must not fail");
+
+    assert_eq!(
+        usize::from(one) + usize::from(two),
+        1,
+        "exactly one take may win a released lease, got ({one}, {two})"
+    );
+    let winner = if one { one_until } else { two_until };
+    assert_eq!(
+        db.store
+            .run(run)
+            .await
+            .expect("read must not fail")
+            .expect("the run exists")
+            .lease_expires_at,
+        Some(winner),
+        "the stored expiry is the winner's"
+    );
+
+    db.drop_db().await;
+}
+
 /// The `running` runs of one box, counted straight from the table so the assertion does not rest
 /// on the reader under test.
 async fn count_running_on_box(pool: &PgPool, box_id: BoxId) -> i64 {
