@@ -27,6 +27,7 @@ pub mod fanout;
 pub mod gate;
 pub mod graph;
 pub mod isolate;
+pub mod overlap;
 pub mod recover;
 pub mod select;
 pub mod status;

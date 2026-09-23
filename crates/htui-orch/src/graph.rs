@@ -195,6 +195,18 @@ pub enum ResolveError {
         /// The project's `is_primary` repo.
         repo: RepoId,
     },
+    /// Plan D119: a `touched_paths` entry is qualified with a repo slug the project holds no
+    /// `repo` row for (ANA-2 §4.7 `:1025`'s `repo:glob`). Refused whether or not the caller also
+    /// requested a scope, because the name is wrong either way.
+    #[error(
+        "item {item} touches repo `{name}`, which the project does not carry (ANA-2 §4.7 `:1025`)"
+    )]
+    UnknownTouchedRepo {
+        /// The item being queued.
+        item: ItemId,
+        /// The qualifier, as written before the `:`.
+        name: String,
+    },
     /// The store said no.
     #[error(transparent)]
     Store(#[from] StoreError),
