@@ -6644,6 +6644,104 @@ mod tests {
         );
     }
 
+    /// Plan D125 (review H1), end to end: after the session, and before the settle, a stranger's
+    /// sweep fails `prd` attempt 1 (`interrupt_step`), as it may once this walk's lease lapsed.
+    /// The stale walk reaches the gate's `running -> done`, reads `Ok(false)`, and stops with
+    /// `StaleWrite`: no reconcile of attempt 1, no attempt 2 of its own, and the run is not failed
+    /// by this walk.
+    #[tokio::test]
+    async fn a_stale_walk_stops_at_the_gate_and_never_reconciles() {
+        /// The harness's own sink, then the stranger's interruption of the step just finished.
+        struct Stranger<'o>(&'o FakeOrchestrator);
+        impl super::SessionSink for Stranger<'_> {
+            async fn after_done(
+                &self,
+                item: htui_core::model::ItemId,
+                step: &htui_core::model::RunStep,
+                phase: &SnapshotPhase,
+                key: &SessionKey<'_>,
+                done: &htui_agent::event::DoneEvent,
+            ) -> Result<(), htui_core::store::StoreError> {
+                super::SessionSink::after_done(self.0, item, step, phase, key, done).await?;
+                assert!(
+                    self.0
+                        .store
+                        .interrupt_step(step.id, "interrupted", self.0.clock.now())
+                        .await?,
+                    "the stranger fails the running step"
+                );
+                Ok(())
+            }
+        }
+
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                phase.gate = htui_core::model::Gate::Never;
+            })
+            .await;
+        let graphs = harness.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        let stranger = Stranger(&harness.orch);
+        let engine = super::Engine::new(super::EngineParts {
+            store: parts.store,
+            graphs: parts.graphs,
+            isolator: parts.isolator,
+            verifier: parts.verifier,
+            clock: parts.clock,
+            selector: parts.selector,
+            sink: &stranger,
+            driver: parts.driver,
+            scrubber: parts.scrubber,
+            app: parts.app,
+            box_profile: parts.box_profile,
+            box_id: parts.box_id,
+            owner: parts.owner,
+            user: parts.user,
+        });
+
+        let refused = engine
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect_err("the gate's compare-and-set found the step moved");
+        let EngineError::StaleWrite { run, row, from, to } = &refused else {
+            panic!("a stale walk is a `StaleWrite`, not {refused}");
+        };
+        let steps = harness.orch.steps(*run).await;
+        assert_eq!(
+            steps.len(),
+            1,
+            "no attempt 2 of the stale walk's own: {steps:?}"
+        );
+        let prd = &steps[0];
+        assert_eq!(
+            (row.as_str(), from.as_str(), to.as_str()),
+            (format!("step {}", prd.id).as_str(), "running", "done")
+        );
+        assert_eq!(
+            prd.status,
+            StepStatus::Failed,
+            "the stranger's `failed` stands"
+        );
+        assert!(
+            harness.orch.isolator.reconciles().is_empty(),
+            "attempt 1 is never merged"
+        );
+        let row = harness.orch.run(*run).await;
+        assert_eq!(row.status, RunStatus::Running, "not this walk's run to end");
+        assert_eq!(row.failure, None);
+    }
+
     /// Blueprint A-4: one adopted run whose recovery fails is [`super::Next::Error`] with the
     /// error's text, a note on its item and its lease released, and the sweep still recovers the
     /// run after it. The failure is a `running` step at a position the snapshot does not name.

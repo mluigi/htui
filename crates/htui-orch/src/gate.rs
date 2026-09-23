@@ -1515,4 +1515,122 @@ mod tests {
             "the winner repeated attempt 1's winner"
         );
     }
+
+    /// Plan D125 (review H1): every compare-and-set of the gate honours `Ok(false)`. A row another
+    /// writer moved first — the stranger's sweep failing attempt 1 after this walk's lease lapsed —
+    /// is a `StaleWrite`, and the gate writes nothing past the refused move: no `done`, no park,
+    /// no `finish_run`.
+    #[tokio::test]
+    async fn a_stale_compare_and_set_in_the_gate_is_a_stale_write() {
+        use crate::command::EngineError;
+        use htui_core::model::{Gate, RunStatus};
+
+        let (run, snapshot) = run_3();
+        let phase_with = |gate: Gate| {
+            let mut phase = snapshot.phases[0].clone();
+            phase.gate_effective = gate;
+            phase.retry_limit = 0;
+            phase
+        };
+        let stale = |refused: &EngineError, row: &str, from: &str, to: &str| {
+            assert!(
+                matches!(
+                    refused,
+                    EngineError::StaleWrite { run: stale, row: got, from: f, to: t }
+                        if *stale == ids::RUN_3 && got == row && f == from && t == to
+                ),
+                "{refused}"
+            );
+        };
+
+        // `never` + ok on a step another writer failed: `running -> done` is refused.
+        let store = MemStore::demo();
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+        };
+        let failed = step(&store, 2, 0, &[StepStatus::Running, StepStatus::Failed]).await;
+        let refused = super::apply(
+            &ctx,
+            &failed,
+            &phase_with(Gate::Never),
+            Settle::Ok { note: None },
+        )
+        .await
+        .expect_err("the step is not `running`");
+        stale(&refused, &format!("step {}", failed.id), "running", "done");
+        assert_eq!(status_of(&store, failed.id).await, StepStatus::Failed);
+
+        // `always` on the same step: the park's first move is refused.
+        let refused = super::apply(
+            &ctx,
+            &failed,
+            &phase_with(Gate::Always),
+            Settle::Ok { note: None },
+        )
+        .await
+        .expect_err("the step is not `running`");
+        stale(
+            &refused,
+            &format!("step {}", failed.id),
+            "running",
+            "awaiting_approval",
+        );
+        assert_eq!(status_of(&store, failed.id).await, StepStatus::Failed);
+
+        // `never` + a verdict: the automatic rejection's park is refused, and nothing is answered.
+        let refused = super::apply(
+            &ctx,
+            &failed,
+            &phase_with(Gate::Never),
+            Settle::Rejected {
+                verdict_line: "verdict: request-changes".to_owned(),
+            },
+        )
+        .await
+        .expect_err("the step is not `running`");
+        stale(
+            &refused,
+            &format!("step {}", failed.id),
+            "running",
+            "awaiting_approval",
+        );
+
+        // `never` + failed out of budget on a step another writer finished: no `finish_run`.
+        let done = step(&store, 3, 0, &[StepStatus::Running, StepStatus::Done]).await;
+        let refused = super::apply(
+            &ctx,
+            &done,
+            &phase_with(Gate::Never),
+            Settle::Failed(StepFailure::MissingOutput),
+        )
+        .await
+        .expect_err("the step is not `running`");
+        stale(&refused, &format!("step {}", done.id), "running", "failed");
+        assert_eq!(status_of(&store, done.id).await, StepStatus::Done);
+        let row = store
+            .run(ids::RUN_3)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("RUN_3 exists");
+        assert_eq!(row.status, RunStatus::Done, "no `finish_run` was written");
+        assert_eq!(row.failure, None);
+
+        // A park whose step move lands but whose run move does not: `RUN_3` is `done`, not
+        // `running`, so the run's compare-and-set is the one refused.
+        let live = step(&store, 4, 0, &[StepStatus::Running]).await;
+        let refused = super::apply(
+            &ctx,
+            &live,
+            &phase_with(Gate::Always),
+            Settle::Ok { note: None },
+        )
+        .await
+        .expect_err("the run is not `running`");
+        stale(&refused, "the run", "running", "awaiting_approval");
+    }
 }

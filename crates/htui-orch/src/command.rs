@@ -264,6 +264,27 @@ pub enum EngineError {
         /// The run whose lease is held elsewhere.
         run: RunId,
     },
+    /// Plan D125: a compare-and-set on the walk's path answered `Ok(false)`: the row was not in
+    /// the status this walk last read, because another writer moved it (typically another box's
+    /// sweep, after this walk's lease lapsed). The walk stops at once and writes nothing further,
+    /// in particular no reconcile. This supersedes ANA-2's offline narrative ("the live session
+    /// keeps running"): a walk that cannot prove its lease stops.
+    ///
+    /// Built by [`stale_step`] and [`stale_run`], so the two row shapes read alike.
+    #[error(
+        "run {run}: {row} was not `{from}` when this walk moved it to `{to}`; another writer moved \
+         it first, so the walk stopped (ANA-2 §4.9)"
+    )]
+    StaleWrite {
+        /// The run the walk was driving.
+        run: RunId,
+        /// The row the compare-and-set named: `step <id>` or `the run`.
+        row: String,
+        /// The status the walk expected the row to hold.
+        from: String,
+        /// The status the walk tried to move it to.
+        to: String,
+    },
     /// The run carries a `graph_snapshot` at a version this engine does not read.
     #[error("run {run} snapshot v{v} is not readable by this engine")]
     SnapshotVersion {
@@ -544,6 +565,28 @@ pub fn retry_group_enabled(
         });
     }
     Ok(())
+}
+
+/// Plan D125's refusal for a `transition_step` that answered `Ok(false)` on the walk's path.
+#[must_use]
+pub fn stale_step(run: RunId, step: StepId, from: StepStatus, to: StepStatus) -> EngineError {
+    EngineError::StaleWrite {
+        run,
+        row: format!("step {step}"),
+        from: from.to_string(),
+        to: to.to_string(),
+    }
+}
+
+/// Plan D125's refusal for a `transition_run` that answered `Ok(false)` on the walk's path.
+#[must_use]
+pub fn stale_run(run: RunId, from: RunStatus, to: RunStatus) -> EngineError {
+    EngineError::StaleWrite {
+        run,
+        row: "the run".to_owned(),
+        from: from.to_string(),
+        to: to.to_string(),
+    }
 }
 
 /// Both group guards' first clause: the run is parked for a human (plan D50).
@@ -1008,6 +1051,35 @@ mod tests {
             EngineError::LeaseHeld { run: ids::RUN_2 }.to_string(),
             format!(
                 "run {}: another orchestrator holds a live lease (ANA-2 §4.9)",
+                ids::RUN_2
+            )
+        );
+        assert_eq!(
+            super::stale_step(
+                ids::RUN_2,
+                ids::STEP_R3_RESEARCH_A,
+                StepStatus::Running,
+                StepStatus::Done
+            )
+            .to_string(),
+            format!(
+                "run {}: step {} was not `running` when this walk moved it to `done`; another \
+                 writer moved it first, so the walk stopped (ANA-2 §4.9)",
+                ids::RUN_2,
+                ids::STEP_R3_RESEARCH_A
+            )
+        );
+        assert_eq!(
+            super::stale_run(
+                ids::RUN_2,
+                htui_core::model::RunStatus::Running,
+                htui_core::model::RunStatus::AwaitingApproval
+            )
+            .to_string(),
+            format!(
+                "run {}: the run was not `running` when this walk moved it to \
+                 `awaiting_approval`; another writer moved it first, so the walk stopped \
+                 (ANA-2 §4.9)",
                 ids::RUN_2
             )
         );
