@@ -99,13 +99,14 @@ const MIN_RETRY: Duration = Duration::from_secs(1);
 /// `times.refresh / 4` (at least 1 s, D123) and loop (D86, D103). Never returns otherwise.
 ///
 /// **The self-fence (plan D122).** The heartbeat tracks the last `until` it wrote successfully,
-/// starting from `written`: the `until` its caller's `claim_run`, `take_lease` or `adopt_runs`
-/// actually wrote (plan D143), which may lie before `clock.now() + times.ttl` at this call when the
-/// caller wrote other rows in between. Once refreshes have failed until
+/// starting from `written`: the `until` its caller's `claim_run`, `take_lease` or the sweep's
+/// `renew_lease` actually wrote (plan D143), which may lie before `clock.now() + times.ttl` at
+/// this call when the caller wrote other rows in between. Once refreshes have failed until
 /// `clock.now() >= last_until - times.refresh`, it returns `Expired`: the walk cannot prove its
 /// lease, and one `refresh` before it lapses is where it stops, so no other box's sweep adopts a
-/// run this walk still writes to. A retry never sleeps past that fence, and a refresh still
-/// pending at the fence (a stuck connection) is dropped there and read as `Expired` too.
+/// run this walk still writes to. Neither the first beat nor a retry sleeps past that fence, and
+/// a refresh still pending at the fence (a stuck connection) is dropped there and read as
+/// `Expired` too.
 ///
 /// A single store error is not a taken lease: offline, the lease is left to expire and the
 /// reconnect sweep adjudicates (`docs/ANA-2.md:1325-1336`). Needs a runtime with the time driver
@@ -124,7 +125,11 @@ where
     let retry = (times.refresh / 4).max(MIN_RETRY);
     let margin = TimeDelta::from_std(times.refresh).unwrap_or(times.ttl);
     let mut fence = written - margin;
-    let mut interval = times.refresh;
+    // Plan D143: a lease written well before this call fences sooner than one `refresh` away, and
+    // the first beat must not sleep past it.
+    let mut interval = times
+        .refresh
+        .min((fence - clock.now()).to_std().unwrap_or(Duration::ZERO));
     loop {
         tokio::time::sleep(interval).await;
         let now = clock.now();
