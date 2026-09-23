@@ -114,7 +114,10 @@ impl fmt::Display for RunFailure {
                 reset: false,
             } => write!(f, "interrupted, tree not reset: {phase}"),
             Self::RetryBudgetSpent { phase, attempt } => {
-                write!(f, "retry budget spent: step `{phase}` attempt {attempt} failed")
+                write!(
+                    f,
+                    "retry budget spent: step `{phase}` attempt {attempt} failed"
+                )
             }
         }
     }

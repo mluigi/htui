@@ -1603,19 +1603,19 @@ where
                 .await
                 .map(Some);
         }
-        let failure = format!(
-            "retry budget spent: step `{}` attempt {} failed",
-            phase.name, step.attempt
-        );
+        let failure = RunFailure::RetryBudgetSpent {
+            phase: phase.name.clone(),
+            attempt: step.attempt,
+        };
         self.parts
             .store
-            .finish_run(run.id, RunStatus::Failed, Some(&failure), now)
+            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
             .await?;
         self.cleanup_run(run.id).await?;
         Ok(Some(Rest {
             run: RunStatus::Failed,
             position: Some(step.position),
-            failure: None,
+            failure: Some(failure),
         }))
     }
 
