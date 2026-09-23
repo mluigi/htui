@@ -6871,6 +6871,15 @@ mod tests {
             Some(now),
             "the lease is released: it reads as expired at once"
         );
+
+        // Plan D139 (review H-A): the release clears the owner, so this same process's sweep
+        // adopts the run. Plan D88 would skip it while the owner stayed on the row.
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [run],
+            "the process whose walk raised adopts the run again"
+        );
     }
 
     /// Plan D129 (review L2): the re-read after a successful walk is only there to decide the
