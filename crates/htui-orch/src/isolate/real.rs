@@ -135,6 +135,15 @@ pub fn local_moved(path: &Path, head: &str, base: &str) -> String {
     )
 }
 
+/// Plan D138 (review L1): `reset` failed on a later row after these rows were already labelled and
+/// `reset --hard`, as `(repo, path, head, base)`. Appended to that failure, so the sweep's
+/// `never_reset` reason says which trees *were* moved and where their work is.
+#[must_use]
+pub fn already_reset(rows: &[(RepoId, &Path, &str, &str)]) -> String {
+    let _ = rows;
+    todo!("plan D138")
+}
+
 /// Where a tree of this repository starts: the slot's base when there is a slot (D54(a)), the
 /// checkout's `HEAD` otherwise.
 fn slot_base(
@@ -1566,7 +1575,9 @@ mod tests {
     };
     use crate::isolate::{FanoutSlot, Isolator as _, Prepared, ResetReport};
 
-    use super::{GixIsolator, IsolatorConfig, RepoCheckout, label_conflict, local_moved};
+    use super::{
+        GixIsolator, IsolatorConfig, RepoCheckout, already_reset, label_conflict, local_moved,
+    };
 
     /// A repository at `<dir>/<name>` with one commit, and the pieces a config map wants.
     fn repo(dir: &Path, name: &str, is_primary: bool) -> (RepoId, RepoCheckout, String) {
@@ -4690,6 +4701,80 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(docs_path.join("f")).expect("the file reads"),
             "uncommitted\n"
+        );
+        isolator.release(run).await.expect("release answers");
+    }
+
+    /// Plan D138's sentence, byte for byte: one `(repo, path, head, base)` per row already reset.
+    #[test]
+    fn already_reset_names_every_row_and_where_it_was() {
+        let (a, b) = (RepoId::new(), RepoId::new());
+        assert_eq!(
+            already_reset(&[
+                (a, Path::new("/src/core"), "h1", "b1"),
+                (b, Path::new("/src/docs"), "h2", "b2"),
+            ]),
+            format!("already reset: {a} /src/core from h1 to b1, {b} /src/docs from h2 to b2")
+        );
+    }
+
+    /// Plan D138 (review L1): `core` is labelled and reset, then `docs`'s `reset --hard` fails on
+    /// a held `index.lock`. The error still fails the call — the engine takes D93's path with its
+    /// text — but it now names `core` as already reset, from its commit to its base, rather than
+    /// letting the note say no tree was touched.
+    #[tokio::test]
+    async fn a_reset_that_fails_part_way_names_the_rows_already_reset() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let core_path = core_checkout.local_path.clone();
+        let docs_path = docs_checkout.local_path.clone();
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let (run, step) = (RunId::new(), StepId::new());
+        let prepared = isolator
+            .prepare(run, step, &[core, docs], Isolation::SharedSerialized, None)
+            .await
+            .expect("the step prepares");
+        let trees = rows(&prepared);
+        let core_commit = commit_file(&core_path, "g", "agent\n", "the agent commits");
+        let docs_commit = commit_file(&docs_path, "g", "agent\n", "the agent commits");
+        assert_eq!(trees[0].repo_id, core, "core's row is reset first");
+        let lock = docs_path.join(".git").join("index.lock");
+        std::fs::write(&lock, "").expect("docs's index is held");
+
+        let err = isolator
+            .reset(step, &trees)
+            .await
+            .expect_err("docs's reset --hard fails");
+        std::fs::remove_file(&lock).expect("the index is let go");
+
+        let text = err.to_string();
+        let named = already_reset(&[(
+            core,
+            Path::new(&trees[0].path),
+            &core_commit,
+            &trees[0].base_ref,
+        )]);
+        assert!(text.starts_with("git: "), "still a git failure: {text}");
+        assert!(text.contains("index.lock"), "the cause is kept: {text}");
+        assert!(text.ends_with(&format!("; {named}")), "{text}");
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            trees[0].base_ref,
+            "core was reset"
+        );
+        assert_eq!(
+            crate::isolate::git::head(&docs_path).expect("the checkout has a HEAD"),
+            docs_commit,
+            "docs was not"
         );
         isolator.release(run).await.expect("release answers");
     }
