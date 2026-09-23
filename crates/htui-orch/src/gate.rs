@@ -205,7 +205,9 @@ pub struct SettleInput<'a> {
     pub driver: &'a Result<DoneEvent, DriverError>,
     /// `RecorderSummary::cap_breach` (`R-AGT-7`).
     pub cap_breach: Option<CapBreach>,
-    /// `run_step.started_at`: when stage 2 moved the step to `running`.
+    /// When the step's own clock started: `run_step.started_at`, the `running` move, for a
+    /// `fan_out = 1` step; the moment `prepare` answered for a fan-out candidate (plan D48), so a
+    /// `shared_serialized` sibling is not charged for the per-repo lock wait.
     pub started_at: DateTime<Utc>,
     /// The clock's instant at stage 5.
     pub now: DateTime<Utc>,

@@ -3630,7 +3630,9 @@ struct VerifyStage<'a> {
     phase: &'a SnapshotPhase,
     /// Stage 2's rows, in scope order.
     trees: &'a [htui_core::model::RunStepTree],
-    /// `run_step.started_at`, which is where the deadline's remainder is measured from.
+    /// Where the deadline's remainder is measured from: `run_step.started_at` for a `fan_out = 1`
+    /// step, the moment `prepare` answered for a fan-out candidate (plan D48), so a
+    /// `shared_serialized` sibling is not charged for the per-repo lock wait.
     started_at: DateTime<Utc>,
     /// Stage 2's `cwd`, the `command_run.cwd` fallback when there is no primary tree (H-23).
     session_cwd: &'a std::path::Path,
