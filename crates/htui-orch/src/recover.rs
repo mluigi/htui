@@ -666,6 +666,26 @@ mod tests {
         assert_eq!(beats(&calls, clock.origin), [40, 50]);
     }
 
+    /// Plan D143: a lease written long before the heartbeat began has its fence sooner than one
+    /// `refresh` away, so the first beat lands at the fence rather than past it. The lease runs to
+    /// 50 s, the fence stands at 10 s, and a first refresh that fails there stops the walk.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_first_beat_never_sleeps_past_the_fence() {
+        let clock = PausedClock::new();
+        let times = default_times();
+        let written = clock.now() + TimeDelta::seconds(50);
+        let (calls, refresh) = scripted(&clock, unreachable(100));
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(600_500),
+            heartbeat(refresh, written, &clock, times),
+        )
+        .await
+        .expect("the heartbeat fences itself instead of beating for ever");
+        assert_eq!(outcome, Heartbeat::Expired);
+        assert_eq!(clock.elapsed(), Duration::from_secs(10));
+        assert_eq!(beats(&calls, clock.origin), [10]);
+    }
+
     /// Plan D122: a refresh that neither answers nor fails (a stuck connection) is raced against
     /// the fence, so the heartbeat still returns `Expired` there rather than waiting inside it
     /// while the lease lapses. The lease the caller wrote runs to 120 s: the one refresh starts at
