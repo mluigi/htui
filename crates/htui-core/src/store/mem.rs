@@ -3360,10 +3360,10 @@ impl State {
         now: DateTime<Utc>,
     ) -> Result<bool> {
         self.require_run(run)?;
-        let ours_or_free = match self.lease_owners.get(&run) {
-            Some(held) if *held != owner => false,
-            _ => true,
-        };
+        let ours_or_free = self
+            .lease_owners
+            .get(&run)
+            .is_none_or(|held| *held == owner);
         let Some(row) = self.runs.get_mut(&run) else {
             return Ok(false);
         };
