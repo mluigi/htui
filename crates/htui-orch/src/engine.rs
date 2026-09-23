@@ -959,6 +959,7 @@ where
                 }
                 Err(EngineError::LeaseLost { run })
             }
+            Either::Right((Heartbeat::Expired, _walk)) => todo!("plan D122"),
         }
     }
 
@@ -6556,6 +6557,88 @@ mod tests {
             harness.orch.steps(run).await,
             steps_after_steal,
             "nothing written to its steps"
+        );
+    }
+
+    /// An `Engine` over the harness's own parts, for a test that drives `walk_leased` or `sweep`
+    /// directly.
+    macro_rules! harness_engine {
+        ($orch:expr, $engine:ident) => {
+            let graphs = $orch.graphs();
+            let driver =
+                |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| $orch.driver_for_key(key);
+            let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+            let $engine = super::Engine::new(
+                super::fake_parts(&$orch, &graphs, &driver, &scrubber)
+                    .await
+                    .expect("the harness has a box"),
+            );
+        };
+    }
+
+    /// Plan D122 (review H1): a walk whose every refresh fails stops itself one `refresh` before
+    /// the lease it holds lapses, so no other box's sweep can adopt a run this walk still writes
+    /// to. The run is one the store does not hold, so every refresh is `Err(NotFound)`, which is
+    /// what a store that cannot answer looks like to the heartbeat; the walk mirrors tokio's
+    /// paused time onto the harness clock. The walk is dropped, the isolator releases the run's
+    /// guards once, and the caller reads `LeaseLost`.
+    #[tokio::test(start_paused = true)]
+    async fn a_walk_whose_refresh_keeps_failing_stops_before_the_lease_lapses() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Flags its own drop, so the test can tell the walk future really went away.
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let times = crate::recover::LeaseTimes::from_app(&BTreeMap::new());
+        let leased_at = harness.orch.clock.now();
+        let ghost = htui_core::model::RunId::new();
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = Dropped(Arc::clone(&dropped));
+        let clock = &harness.orch.clock;
+        let walk = async move {
+            let _probe = probe;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                clock.advance(TimeDelta::seconds(1));
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), EngineError>(())
+        };
+        let walked = tokio::time::timeout(
+            std::time::Duration::from_millis(600_500),
+            engine.walk_leased(ghost, walk),
+        )
+        .await
+        .expect("the walk stops itself instead of writing past its lease");
+
+        let refused = walked.expect_err("no refresh ever succeeded");
+        assert!(
+            matches!(refused, EngineError::LeaseLost { run } if run == ghost),
+            "{refused}"
+        );
+        assert!(
+            harness.orch.clock.now() < leased_at + times.ttl,
+            "stopped at {}, before the lease lapsed at {}",
+            harness.orch.clock.now(),
+            leased_at + times.ttl
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the walk future was dropped"
+        );
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            1,
+            "plan D99's release, once"
         );
     }
 

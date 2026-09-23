@@ -80,12 +80,16 @@ fn app_positive(app: &BTreeMap<String, Value>, key: &str) -> Option<i64> {
     app.get(key).and_then(Value::as_i64).filter(|n| *n > 0)
 }
 
-/// Why [`heartbeat`] returned. It has one answer, because it never returns otherwise.
+/// Why [`heartbeat`] returned. It never returns otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Heartbeat {
     /// A refresh touched zero rows: another orchestrator took the lease, and ANA-2 `:1280-1282`
     /// has this one abandon the run without writing further.
     Abandoned,
+    /// Plan D122: refreshes kept failing until the last lease this process wrote was within one
+    /// `refresh` of lapsing. The walk cannot prove it still holds the run, so it stops before
+    /// another box's sweep may adopt it.
+    Expired,
 }
 
 /// Sleep `times.refresh` (`tokio::time::sleep`), then `refresh(clock.now() + times.ttl)`:
@@ -365,8 +369,10 @@ mod tests {
         assert_eq!(times.refresh, Duration::from_secs(90));
     }
 
+    /// §10's 120 s and 60 s, and then D124's clamp: 60 s is above a third of 120 s, so the
+    /// heartbeat beats every 40 s.
     #[test]
-    fn lease_times_fall_back_to_120_and_60() {
+    fn lease_times_fall_back_to_120_and_60_clamped_to_40() {
         for silent in [None, Some(json!(0)), Some(json!(-5)), Some(json!("120"))] {
             let settings = silent.map_or_else(BTreeMap::new, |value| {
                 app(&[
@@ -376,25 +382,43 @@ mod tests {
             });
             let times = LeaseTimes::from_app(&settings);
             assert_eq!(times.ttl, TimeDelta::seconds(120), "{settings:?}");
-            assert_eq!(times.refresh, Duration::from_secs(60), "{settings:?}");
+            assert_eq!(times.refresh, Duration::from_secs(40), "{settings:?}");
         }
     }
 
+    /// Plan D124: a refresh above a third of the TTL is clamped to that third, in milliseconds,
+    /// so the self-fence (D122) always has two retry windows before the lease lapses.
     #[test]
-    fn a_refresh_at_or_above_the_ttl_reads_as_half() {
+    fn a_refresh_above_a_third_of_the_ttl_is_clamped() {
         let equal = LeaseTimes::from_app(&app(&[
             ("lease_ttl_seconds", json!(60)),
             ("lease_refresh_seconds", json!(60)),
         ]));
         assert_eq!(equal.ttl, TimeDelta::seconds(60));
-        assert_eq!(equal.refresh, Duration::from_secs(30));
+        assert_eq!(equal.refresh, Duration::from_secs(20));
+
+        let half = LeaseTimes::from_app(&app(&[
+            ("lease_ttl_seconds", json!(90)),
+            ("lease_refresh_seconds", json!(45)),
+        ]));
+        assert_eq!(
+            half.refresh,
+            Duration::from_secs(30),
+            "half is above a third"
+        );
+
+        let third = LeaseTimes::from_app(&app(&[
+            ("lease_ttl_seconds", json!(90)),
+            ("lease_refresh_seconds", json!(30)),
+        ]));
+        assert_eq!(third.refresh, Duration::from_secs(30), "a third is kept");
 
         let above = LeaseTimes::from_app(&app(&[
             ("lease_ttl_seconds", json!(1)),
             ("lease_refresh_seconds", json!(5)),
         ]));
         assert_eq!(above.ttl, TimeDelta::seconds(1));
-        assert_eq!(above.refresh, Duration::from_millis(500));
+        assert_eq!(above.refresh, Duration::from_millis(333));
     }
 
     #[test]
@@ -404,7 +428,7 @@ mod tests {
         for huge in [10_000_000_000_000_i64, i64::MAX] {
             let times = LeaseTimes::from_app(&app(&[("lease_ttl_seconds", json!(huge))]));
             assert_eq!(times.ttl, TimeDelta::seconds(120), "{huge}");
-            assert_eq!(times.refresh, Duration::from_secs(60), "{huge}");
+            assert_eq!(times.refresh, Duration::from_secs(40), "{huge}");
         }
 
         // One year is the longest TTL read as set.
@@ -445,7 +469,7 @@ mod tests {
         }
     }
 
-    /// The default 120 s / 60 s.
+    /// The default 120 s TTL, and its refresh clamped to 40 s (D124).
     fn default_times() -> LeaseTimes {
         LeaseTimes::from_app(&BTreeMap::new())
     }
@@ -470,21 +494,41 @@ mod tests {
         (calls, refresh)
     }
 
+    /// `n` store errors in a row.
+    fn unreachable(n: usize) -> Vec<Result<bool, StoreError>> {
+        (0..n)
+            .map(|_| Err(StoreError::Unreachable("socket closed".to_owned())))
+            .collect()
+    }
+
+    /// The seconds after the clock's origin of every recorded call.
+    fn beats(
+        calls: &Mutex<Vec<(DateTime<Utc>, DateTime<Utc>)>>,
+        origin: DateTime<Utc>,
+    ) -> Vec<i64> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(now, _)| (*now - origin).num_seconds())
+            .collect()
+    }
+
     #[tokio::test(start_paused = true)]
     async fn heartbeat_refreshes_every_interval() {
         let clock = PausedClock::new();
         let times = default_times();
         let (calls, refresh) = scripted(&clock, vec![Ok(true), Ok(true), Ok(true)]);
         let outcome =
-            tokio::time::timeout(Duration::from_secs(185), heartbeat(refresh, &clock, times)).await;
+            tokio::time::timeout(Duration::from_secs(125), heartbeat(refresh, &clock, times)).await;
         assert!(
             outcome.is_err(),
             "the heartbeat never returns on `Ok(true)`"
         );
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 3, "a beat at 60 s, 120 s and 180 s");
+        assert_eq!(calls.len(), 3, "a beat at 40 s, 80 s and 120 s");
         for (beat, (now, until)) in (1..).zip(calls.iter()) {
-            assert_eq!(*now, clock.origin + TimeDelta::seconds(60 * beat));
+            assert_eq!(*now, clock.origin + TimeDelta::seconds(40 * beat));
             assert_eq!(*until, *now + times.ttl, "beat {beat}");
         }
     }
@@ -495,10 +539,12 @@ mod tests {
         let (calls, refresh) = scripted(&clock, vec![Ok(true), Ok(false)]);
         let outcome = heartbeat(refresh, &clock, default_times()).await;
         assert_eq!(outcome, Heartbeat::Abandoned);
-        assert_eq!(clock.elapsed(), Duration::from_secs(120));
+        assert_eq!(clock.elapsed(), Duration::from_secs(80));
         assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
+    /// A store error is not a taken lease: the heartbeat retries (sooner, D123) and a zero-row
+    /// answer inside the fence is still `Abandoned`.
     #[tokio::test(start_paused = true)]
     async fn heartbeat_survives_a_store_error() {
         let clock = PausedClock::new();
@@ -513,11 +559,91 @@ mod tests {
         let outcome = heartbeat(refresh, &clock, default_times()).await;
         assert_eq!(outcome, Heartbeat::Abandoned);
         assert_eq!(
-            calls.lock().unwrap().len(),
-            3,
+            beats(&calls, clock.origin),
+            [40, 50, 60],
             "abandoned on the third beat"
         );
-        assert_eq!(clock.elapsed(), Duration::from_secs(180));
+    }
+
+    /// Plan D122: refreshes that keep failing stop the heartbeat one `refresh` before the last
+    /// lease it wrote lapses. The lease the caller wrote runs to 120 s, so the fence is at 80 s,
+    /// and the TTL is never reached.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_expires_before_the_lease_lapses_when_every_refresh_fails() {
+        let clock = PausedClock::new();
+        let times = default_times();
+        let (calls, refresh) = scripted(&clock, unreachable(100));
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(600_500),
+            heartbeat(refresh, &clock, times),
+        )
+        .await
+        .expect("the heartbeat fences itself instead of beating for ever");
+        assert_eq!(outcome, Heartbeat::Expired);
+        assert_eq!(clock.elapsed(), Duration::from_secs(80));
+        assert!(
+            clock.now() < clock.origin + times.ttl,
+            "stopped before the lease lapsed"
+        );
+        assert_eq!(beats(&calls, clock.origin), [40, 50, 60, 70, 80]);
+    }
+
+    /// Plan D122: the fence follows the last `until` written **successfully**. A success at 50 s
+    /// writes 170 s, so the next run of failures fences at 130 s.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_a_successful_refresh_moves_the_fence() {
+        let clock = PausedClock::new();
+        let mut script = unreachable(1);
+        script.push(Ok(true));
+        script.extend(unreachable(100));
+        let (calls, refresh) = scripted(&clock, script);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(600_500),
+            heartbeat(refresh, &clock, default_times()),
+        )
+        .await
+        .expect("the heartbeat fences itself instead of beating for ever");
+        assert_eq!(outcome, Heartbeat::Expired);
+        assert_eq!(clock.elapsed(), Duration::from_secs(130));
+        assert_eq!(
+            beats(&calls, clock.origin),
+            [40, 50, 90, 100, 110, 120, 130]
+        );
+    }
+
+    /// Plan D123: after an error the next beat comes `refresh / 4` later (10 s of 40 s), and after
+    /// a success the interval is the full `refresh` again.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_retries_sooner_after_a_store_error() {
+        let clock = PausedClock::new();
+        let mut script = unreachable(1);
+        script.push(Ok(true));
+        let (calls, refresh) = scripted(&clock, script);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(95),
+            heartbeat(refresh, &clock, default_times()),
+        )
+        .await;
+        assert!(outcome.is_err(), "the lease is held again");
+        assert_eq!(beats(&calls, clock.origin), [40, 50, 90]);
+    }
+
+    /// Plan D123's floor: a refresh whose quarter is under a second retries after one second.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_retries_after_at_least_a_second() {
+        let clock = PausedClock::new();
+        let times = LeaseTimes::from_app(&app(&[
+            ("lease_ttl_seconds", json!(9)),
+            ("lease_refresh_seconds", json!(2)),
+        ]));
+        assert_eq!(times.refresh, Duration::from_secs(2));
+        let mut script = unreachable(1);
+        script.push(Ok(true));
+        let (calls, refresh) = scripted(&clock, script);
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(4), heartbeat(refresh, &clock, times)).await;
+        assert!(outcome.is_err(), "the lease is held again");
+        assert_eq!(beats(&calls, clock.origin), [2, 3]);
     }
 
     // -----------------------------------------------------------------------------------------
