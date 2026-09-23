@@ -48,6 +48,7 @@ use crate::fanout::{
 use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{Clock, FanoutSlot, Isolator};
+use crate::recover::LeaseTimes;
 use crate::select::{self, SelectInput, Skipped, Walk};
 use crate::status::{
     Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt, winner_at,
@@ -79,9 +80,6 @@ const MIN_BUDGET_KEY: &str = "min_budget_for_new_attempt";
 /// `no_candidate_agent`'s detail when the walk skipped nothing and the selector still declined
 /// every eligible candidate (plan D62).
 const SELECTOR_DECLINED: &str = "the selector declined every eligible candidate";
-
-/// How long a claim's lease runs before ANA-2 §4.9's sweep may adopt the run (`:1408`).
-const LEASE_SECONDS: i64 = 120;
 
 /// A ceiling on iterations of one [`Engine::run_to_rest`] call.
 ///
@@ -443,7 +441,7 @@ where
             })
             .await?;
 
-        let lease = now + TimeDelta::try_seconds(LEASE_SECONDS).unwrap_or(TimeDelta::zero());
+        let lease = now + self.lease_times().ttl;
         // Anything but `Admitted` is ANA-2 §4.7's admission refusing: the box is at
         // `max_concurrent_items` or the scope overlaps a live run (plan D83). Nothing is written
         // and the run stays `queued`.
@@ -3304,6 +3302,11 @@ where
         self.parts.clock.now()
     }
 
+    /// Plan D85: the lease's TTL and heartbeat interval, from `app_setting` with §10's defaults.
+    fn lease_times(&self) -> LeaseTimes {
+        LeaseTimes::from_app(&self.parts.app)
+    }
+
     /// The `GateContext` stage 6 and the review loop share.
     const fn gate_context<'r>(
         &'r self,
@@ -5771,7 +5774,7 @@ mod tests {
         let run = harness.orch.run(summary.id).await;
         assert_eq!(
             run.lease_expires_at,
-            Some(claimed_at + chrono::TimeDelta::seconds(300)),
+            Some(claimed_at + TimeDelta::seconds(300)),
             "the claim's lease is `now + lease_ttl_seconds`"
         );
     }
