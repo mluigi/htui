@@ -561,6 +561,20 @@ where
 
         let has_output = self.output_of(item, &phase, step.id).await?.is_some();
         crate::command::answer_gate_enabled(&step, &phase, has_output, &answer)?;
+        self.answer_guarded(&run, &snapshot, &step, &phase, answer)
+            .await
+    }
+
+    /// [`Self::answer_gate`] past its guard, over the rows the guard read: the lease, the answer,
+    /// the unpark and the leased walk.
+    async fn answer_guarded(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        answer: GateAnswer,
+    ) -> Result<CommandOutcome, EngineError> {
         // Plan D108: after the pure guard and before the first write, so a live lease elsewhere
         // refuses with the gate still unanswered (blueprint F-N).
         self.take_lease(run.id).await?;
@@ -580,21 +594,19 @@ where
         // order and it is not cosmetic: `awaiting_approval -> blocked` is **illegal** for an item
         // (`model/item.rs:54`), so an escalation that did not pass through `in_progress` first
         // would earn `StoreError::Constraint`.
-        self.unpark(&run, now).await?;
+        self.unpark(run, now).await?;
 
         // Blueprint F-M: everything after the unpark writes to a `running` run, so all of it —
         // the review loop or the reconcile, not only `run_to_rest` — runs under the heartbeat.
         let tail = async {
             if matches!(answer, GateAnswer::Rejected { .. }) {
-                return self
-                    .after_rejection(&run, &snapshot, &step, &phase, now)
-                    .await;
+                return self.after_rejection(run, snapshot, step, phase, now).await;
             }
             // `answer_gate` moved the step `awaiting_approval -> done`
             // (`store/traits.rs:788-791`), so this is the human's half of plan D25's "after a step
             // reaches `done`". A refusal parks the run again, with the reason on the item.
             let step = self.step(run.id, step.id).await?;
-            match self.reconcile_done_step(&run, &step, &[]).await? {
+            match self.reconcile_done_step(run, &step, &[]).await? {
                 Some(rest) => Ok(rest),
                 None => self.run_to_rest(run.id).await,
             }
@@ -714,6 +726,18 @@ where
             return self.retry_group(&run, &snapshot, &row, &phase).await;
         }
         crate::command::retry_enabled(&row, &phase)?;
+        self.retry_guarded(&run, &snapshot, &row, &phase).await
+    }
+
+    /// [`Self::retry_step`] past its guards, over the rows they read: the lease, the answer, the
+    /// unpark and the leased walk.
+    async fn retry_guarded(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        row: &RunStep,
+        phase: &SnapshotPhase,
+    ) -> Result<CommandOutcome, EngineError> {
         self.take_lease(run.id).await?;
 
         let now = self.now();
@@ -736,7 +760,7 @@ where
                 });
             }
         }
-        self.unpark(&run, now).await?;
+        self.unpark(run, now).await?;
 
         // Admitted rather than created outright, so the next attempt passes through the capability
         // interlock like any other — a phase whose only candidate lost its inline-approval
@@ -745,7 +769,7 @@ where
             let run = self.run(run.id).await?;
             let steps = self.parts.store.run_steps(run.id).await?;
             let attempt = next_attempt(&steps, row.position);
-            match self.admit(&run, &snapshot, &phase, attempt).await? {
+            match self.admit(&run, snapshot, phase, attempt).await? {
                 Some(rest) => Ok(rest),
                 None => self.run_to_rest(run.id).await,
             }
@@ -7757,6 +7781,181 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].id, prd);
         assert_eq!(steps[0].status, StepStatus::AwaitingApproval);
+    }
+
+    /// Plan D133's shared tail: the command stopped with `StaleWrite` on `row`'s `from -> to`,
+    /// gave back the lease it took, and unparked nothing.
+    async fn assert_stale_and_released(
+        harness: &Harness,
+        run: htui_core::model::RunId,
+        refused: &EngineError,
+        (row, from, to): (&str, &str, &str),
+    ) {
+        let EngineError::StaleWrite {
+            run: stopped,
+            row: named,
+            from: got_from,
+            to: got_to,
+        } = refused
+        else {
+            panic!("a stale first write is a `StaleWrite`, not {refused}");
+        };
+        assert_eq!(*stopped, run);
+        assert_eq!(
+            (named.as_str(), got_from.as_str(), got_to.as_str()),
+            (row, from, to)
+        );
+        let after = harness.orch.run(run).await;
+        assert_eq!(
+            after.status,
+            RunStatus::AwaitingApproval,
+            "nothing was unparked"
+        );
+        assert_eq!(
+            after.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "the lease the command took is given back"
+        );
+        assert!(
+            harness.orch.isolator.reconciles().is_empty(),
+            "nothing was merged"
+        );
+    }
+
+    /// Plan D133 (review M3): an answer whose compare-and-set finds the step already answered —
+    /// another command got there between the guard and the write — stops with `StaleWrite`. It
+    /// used to be discarded, and the run was unparked and walked on a gate this answer never
+    /// settled.
+    #[tokio::test]
+    async fn a_stale_answer_stops_and_gives_the_lease_back() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let stale = harness.orch.steps(run).await.remove(0);
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(prd, GateOutcome::Skipped, None, harness.orch.clock.now())
+                .await
+                .expect("MemStore takes the answer"),
+            "another command answered first"
+        );
+        harness.orch.clock.advance(TimeDelta::seconds(1));
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .answer_guarded(
+                &row,
+                &snapshot,
+                &stale,
+                &snapshot.phases[0],
+                GateAnswer::Approved,
+            )
+            .await
+            .expect_err("the answer's compare-and-set found the step answered");
+        assert_stale_and_released(
+            &harness,
+            run,
+            &refused,
+            (&format!("step {prd}"), "awaiting_approval", "done"),
+        )
+        .await;
+        assert_eq!(harness.orch.steps(run).await.len(), 1, "nothing admitted");
+    }
+
+    /// Plan D133 for `RetryStep`: the `retried` answer's compare-and-set is its first write, and
+    /// the parked step was answered first. No attempt 2 is admitted.
+    #[tokio::test]
+    async fn a_stale_retry_stops_and_gives_the_lease_back() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let stale = harness.orch.steps(run).await.remove(0);
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(prd, GateOutcome::Approved, None, harness.orch.clock.now())
+                .await
+                .expect("MemStore takes the answer"),
+            "another command answered first"
+        );
+        harness.orch.clock.advance(TimeDelta::seconds(1));
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .retry_guarded(&row, &snapshot, &stale, &snapshot.phases[0])
+            .await
+            .expect_err("the retry's compare-and-set found the step answered");
+        assert_stale_and_released(
+            &harness,
+            run,
+            &refused,
+            (&format!("step {prd}"), "awaiting_approval", "superseded"),
+        )
+        .await;
+        assert_eq!(harness.orch.steps(run).await.len(), 1, "no attempt 2");
+    }
+
+    /// Plan D133 for `RetryStep` on a `failed` step, which writes nothing to the step: the
+    /// unpark's `awaiting_approval -> running` is its first compare-and-set, and another process
+    /// moved the run first. Nothing is admitted.
+    #[tokio::test]
+    async fn a_stale_retry_of_a_failed_step_stops_at_the_unpark() {
+        let harness = Harness::new().await;
+        let (run, plan) =
+            failed_under_a_running_run(&harness, 1, FailedBy::Sweep("interrupted")).await;
+        let now = harness.orch.clock.now();
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_run(run, RunStatus::Running, RunStatus::AwaitingApproval, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let failed = harness
+            .orch
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|step| step.id == plan)
+            .expect("the case created it");
+        // Another command unparked the run first: the row read above is stale.
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move")
+        );
+        harness.orch.clock.advance(TimeDelta::seconds(1));
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .retry_guarded(&row, &snapshot, &failed, &snapshot.phases[1])
+            .await
+            .expect_err("the unpark's compare-and-set found the run moved");
+        let EngineError::StaleWrite {
+            row: named,
+            from,
+            to,
+            ..
+        } = &refused
+        else {
+            panic!("a stale unpark is a `StaleWrite`, not {refused}");
+        };
+        assert_eq!(
+            (named.as_str(), from.as_str(), to.as_str()),
+            ("the run", "awaiting_approval", "running")
+        );
+        assert_eq!(harness.orch.steps(run).await.len(), 2, "no attempt 2");
     }
 
     /// Plan D83 through `start_run`: a real refusal's `Display` names the holding run and the
