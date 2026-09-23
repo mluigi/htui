@@ -3579,7 +3579,8 @@ async fn a_third_run_waits_for_a_slot_and_a_parked_run_still_blocks_overlap<H: C
 
 /// Plan D87: a walk that parks releases its lease (`lease_expires_at = now`), so a process
 /// started after this one takes it at once with its answer, and the lease is then the new
-/// owner's: its refresh lands and the old owner's touches nothing.
+/// owner's. Its own park releases it again, which only the owner can (plan D139), and the old
+/// owner's refresh touches nothing.
 async fn a_parked_run_releases_its_lease_and_an_answer_takes_it<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     free_feat_3(&orch).await;
@@ -3601,12 +3602,10 @@ async fn a_parked_run_releases_its_lease_and_an_answer_takes_it<H: CaseHarness>(
     );
 
     let later = other.clock().now() + TimeDelta::minutes(1);
-    assert!(
-        orch.store()
-            .refresh_lease(run, other.owner(), later)
-            .await
-            .expect("MemStore refreshes"),
-        "the lease is the second process's"
+    assert_eq!(
+        run_of(&orch, run).await.lease_expires_at,
+        Some(other.clock().now()),
+        "the lease was the second process's: its park released it"
     );
     assert!(
         !orch
@@ -3627,10 +3626,16 @@ async fn a_live_lease_blocks_an_answer_from_another_process<H: CaseHarness>(harn
     let other = orch.restarted();
     assert!(
         orch.store()
-            .refresh_lease(run, orch.owner(), other.clock().now() + TimeDelta::days(1))
+            .take_lease(
+                run,
+                ids::BOX,
+                orch.owner(),
+                orch.clock().now(),
+                other.clock().now() + TimeDelta::days(1)
+            )
             .await
-            .expect("MemStore refreshes"),
-        "the first process still owns the released lease, and renews it"
+            .expect("MemStore takes the lease"),
+        "the first process takes its released lease back, for a day"
     );
     let parked = steps_of(&orch, run)
         .await

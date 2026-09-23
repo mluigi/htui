@@ -1018,8 +1018,8 @@ where
     /// On the walk's answer, the lease is released when the run rests anywhere but `running`
     /// (D87), and also when the re-read that decides it fails (D129: warned, and the walk's `Ok`
     /// stands). An `Err` writes nothing more, because the store may be what failed, except the
-    /// best-effort release of the lease (D127), so a run whose walk raised is adoptable by any
-    /// process's sweep once it reads as expired. On
+    /// best-effort release of the lease (D127, D139), so a run whose walk raised is adoptable by
+    /// any process's sweep, this one's included. On
     /// [`crate::recover::Heartbeat::Abandoned`], and on [`crate::recover::Heartbeat::Expired`]
     /// (plan D122: refreshes kept failing until the lease was one interval from lapsing), the
     /// walk is dropped where it stands, **before** anything else, then
@@ -1051,9 +1051,9 @@ where
                 let out = match out {
                     Ok(out) => out,
                     Err(err) => {
-                        // Plan D127: nothing else is written, but the lease is given back,
-                        // best-effort, so any process's sweep adopts the run (plan D88 keeps this
-                        // one's off it). A release that fails is warned and the lease lapses.
+                        // Plan D127/D139: nothing else is written, but the lease is given back,
+                        // best-effort, so any process's sweep adopts the run, this one's too. A
+                        // release that fails is warned and the lease lapses.
                         self.release_lease(run).await;
                         return Err(err);
                     }
@@ -1142,13 +1142,16 @@ where
         stale
     }
 
-    /// Plan D87: `refresh_lease(run, owner, now)`, so the lease reads as expired at once. A
-    /// zero-row answer is ignored and an error is warned; neither is raised.
+    /// Plan D87/D139: the store's `release_lease(run, owner, now)`. The lease reads as expired at
+    /// once and has no owner, so every process's sweep may adopt the run, this one's included
+    /// (plan D88 skips only a row this process still owns). A heartbeat refresh that hung and
+    /// commits after the release matches no row, so it cannot take the lease back. A zero-row
+    /// answer is ignored and an error is warned; neither is raised.
     async fn release_lease(&self, run: RunId) {
         match self
             .parts
             .store
-            .refresh_lease(run, self.parts.owner, self.now())
+            .release_lease(run, self.parts.owner, self.now())
             .await
         {
             // `false`: the lease is no longer ours, so there is nothing of ours to give back.
@@ -1162,7 +1165,8 @@ where
     // -- the recovery sweep (ANA-2 §4.9, plan D89-D98, blueprint A-3, A-4, A-7) -----------------
 
     /// ANA-2 §4.9 `:1284-1307`, plan D98: adopt every `running` run on this box whose lease
-    /// expired (never this process's own, D88), adjudicate each one's rows, and **walk nothing**:
+    /// expired (never one this process still owns, D88; a released lease has no owner, D139),
+    /// adjudicate each one's rows, and **walk nothing**:
     /// the caller walks each [`Next::Walk`] run through [`Self::resume`].
     ///
     /// Runs are recovered one at a time in `queued_at` order, each inside the leased walk
@@ -1226,8 +1230,9 @@ where
     }
 
     /// Blueprint A-4: one run's recovery failed. Warned, noted on the item, and the lease given
-    /// back so any **other** process adopts the run at once (plan D88 keeps this one from doing
-    /// so); the sweep goes on. Nothing here raises: a note or a release that fails is warned too.
+    /// back so any process adopts the run at once. Since plan D139 the release clears the owner,
+    /// so that includes this process's next sweep. The sweep goes on. Nothing here raises: a note
+    /// or a release that fails is warned too.
     async fn unrecovered(&self, run: &Run, err: &EngineError) -> Next {
         let error = err.to_string();
         tracing::warn!(run = %run.id, %err, "the sweep could not recover an adopted run");
@@ -8464,21 +8469,23 @@ mod tests {
         (run, [member(0), member(1)])
     }
 
-    /// The parked run's released lease, renewed by this harness's owner for a day, and a second
+    /// The parked run's released lease, taken back by this harness's owner for a day, and a second
     /// process over the same store (plan D118) to meet it — a live lease it does not hold.
     async fn a_live_stranger(harness: &Harness, run: htui_core::model::RunId) -> Harness {
         assert!(
             harness
                 .orch
                 .store
-                .refresh_lease(
+                .take_lease(
                     run,
+                    ids::BOX,
                     harness.orch.owner(),
+                    harness.orch.clock.now(),
                     harness.orch.clock.now() + TimeDelta::days(1)
                 )
                 .await
-                .expect("MemStore refreshes"),
-            "the first process still owns the released lease, and renews it"
+                .expect("MemStore takes the lease"),
+            "the first process takes its released lease back, for a day"
         );
         Harness {
             orch: harness.orch.restarted(),
