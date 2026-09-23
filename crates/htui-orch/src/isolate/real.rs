@@ -130,6 +130,24 @@ fn slot_base(
     })
 }
 
+/// D54(c): each repository's text under a `# repo <name>` line of its own.
+///
+/// A part that does not end in a newline — a patch D55 cut at its cap ends in the truncation
+/// marker — is given one, or the next header would share its line.
+fn under_repo_headers<'a>(parts: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    let mut joined = String::new();
+    for (name, text) in parts {
+        if !joined.is_empty() && !joined.ends_with('\n') {
+            joined.push('\n');
+        }
+        joined.push_str("# repo ");
+        joined.push_str(name);
+        joined.push('\n');
+        joined.push_str(text);
+    }
+    joined
+}
+
 /// `<root>/<run_id>/<step_id>/`: the common parent of a step's trees and the `cwd` of its session
 /// under the two isolating modes (plan D28).
 fn session_dir(root: &Path, run: RunId, step: StepId) -> PathBuf {
@@ -1286,14 +1304,14 @@ impl Isolator for GixIsolator {
                         .map(|(name, range, _, _)| format!("{name}:{range}"))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    stat: several
-                        .iter()
-                        .map(|(name, _, stat, _)| format!("# repo {name}\n{stat}"))
-                        .collect(),
-                    diff: several
-                        .iter()
-                        .map(|(name, _, _, patch)| format!("# repo {name}\n{patch}"))
-                        .collect(),
+                    stat: under_repo_headers(
+                        several.iter().map(|(name, _, stat, _)| (name.as_str(), stat.as_str())),
+                    ),
+                    diff: under_repo_headers(
+                        several
+                            .iter()
+                            .map(|(name, _, _, patch)| (name.as_str(), patch.as_str())),
+                    ),
                 }),
             })
         })
@@ -3336,6 +3354,62 @@ mod tests {
             "{}",
             single.diff
         );
+    }
+
+    /// D54(c) with D55's cap: a patch cut at 64 KiB ends in the truncation marker with no newline,
+    /// and the next repository's `# repo <name>` header still starts a line of its own.
+    #[tokio::test]
+    async fn a_truncated_patch_leaves_the_next_repo_header_on_its_own_line() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core, docs], Isolation::Worktree, None)
+            .await
+            .expect("the worktree mode prepares");
+        let big: String = (0..4096)
+            .map(|line| format!("line {line} of a patch well past the cap\n"))
+            .collect();
+        assert!(big.len() > crate::isolate::git::DIFF_CAP);
+        for tree in &prepared.trees {
+            commit_file(Path::new(&tree.tree.path), "g", &big, "work");
+        }
+        let rows = rows(&prepared);
+        let commits = isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+
+        let block = isolator
+            .diff(&rows, &commits)
+            .await
+            .expect("the diff reads")
+            .expect("both repos committed");
+        assert!(
+            block.diff.contains("[diff truncated at 64 KiB]"),
+            "the first patch overflowed the cap"
+        );
+        for text in [&block.stat, &block.diff] {
+            let headers: Vec<usize> = text.match_indices("# repo ").map(|(at, _)| at).collect();
+            assert_eq!(headers.len(), 2, "one header per repo");
+            for at in headers {
+                assert!(
+                    at == 0 || text.as_bytes()[at - 1] == b'\n',
+                    "a header shares a line with what precedes it: {:?}",
+                    &text[at.saturating_sub(40)..at + 12]
+                );
+            }
+        }
     }
 
     /// D55: no committed row, or no usable `git`, is `None` — the diff is advisory.
