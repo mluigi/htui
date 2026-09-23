@@ -1438,6 +1438,8 @@ where
                     .await?
                     .map(Next::Parked))
             }
+            // Plan D135: the retired review is not merged; the sweep hands the run to the walk.
+            Landing::Retired => Ok(None),
             Landing::Retry { position, attempt } => {
                 let phase = Self::phase_at(run.id, snapshot, position)?;
                 Ok(self
@@ -2289,6 +2291,9 @@ where
                 let step = self.step(run.id, step.id).await?;
                 Ok(self.reconcile_done_step(&row, &step, &[]).await?)
             }
+            // Plan D135: the loop retired the review, so there is no winner to merge; the next
+            // pass creates the loop's next attempt.
+            Landing::Retired => Ok(None),
             Landing::Retry { position, attempt } => {
                 let phase = Self::phase_at(run.id, snapshot, position)?;
                 self.admit(&row, snapshot, &phase, attempt).await

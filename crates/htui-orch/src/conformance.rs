@@ -4050,10 +4050,10 @@ async fn a_crash_between_done_and_reconcile_after_a_review_rejection_is_reconcil
         1,
         ScriptedStep::review("request-changes", "first"),
     );
-    // prd, plan and implement 1 each reconcile once, and so does review 1: stage 6's automatic
-    // rejection resumes the loop and lands `Advance` on the retired review (`walk_live_step`), an
-    // identity merge. Implement 2's is the fifth.
-    let stalled = orch.isolator().stall_nth_reconcile(5);
+    // prd, plan and implement 1 each reconcile once; review 1 does not, because stage 6's
+    // automatic rejection retires it through the loop and lands `Retired` (plan D135), which
+    // merges nothing. Implement 2's is the fourth.
+    let stalled = orch.isolator().stall_nth_reconcile(4);
     let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
     let steps = steps_of(&orch, run).await;
     let implement = at(&steps, 2, 2).clone();

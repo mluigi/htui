@@ -342,6 +342,10 @@ impl<S: WriteStore, C: Clock + ?Sized> GateContext<'_, S, C> {
 pub enum Landing {
     /// The step is `done`; the walk moves on.
     Advance,
+    /// The review loop retired the chain (plan D5) and the walk re-derives from the rows, where
+    /// the cursor creates the loop's next attempt. **Nothing is reconciled** (plan D135): the
+    /// retired review's commits stay on its labelled branch and never reach the primary.
+    Retired,
     /// The step is `failed` and the budget holds: stage 1 admits `(position, attempt)`.
     Retry {
         /// The step's own position.
@@ -424,7 +428,7 @@ pub async fn apply<S: WriteStore, C: Clock + ?Sized>(
                 .await?;
             let step = reread(ctx, step).await?;
             match review_loop(ctx, &step).await? {
-                LoopOutcome::Resumed { .. } => Ok(Landing::Advance),
+                LoopOutcome::Resumed { .. } => Ok(Landing::Retired),
                 LoopOutcome::Escalated { attempts, .. } => Ok(Landing::Rest(Rest {
                     run: RunStatus::AwaitingApproval,
                     position: Some(step.position),
