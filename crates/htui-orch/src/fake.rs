@@ -85,10 +85,18 @@ pub struct FakeIsolator {
     reconciles: Mutex<Vec<(StepId, Vec<StepId>)>>,
     /// Plan D28's per-repo lock, one for the whole fake: a `shared_serialized`
     /// [`prepare`](Isolator::prepare) waits on it, and holds it until that step's
-    /// [`capture`](Isolator::capture) or the run's [`cleanup`](Isolator::cleanup).
+    /// [`capture`](Isolator::capture), the run's [`cleanup`](Isolator::cleanup) or its
+    /// [`release`](Isolator::release).
     serial: Arc<tokio::sync::Mutex<()>>,
-    /// The `shared_serialized` guard per step that holds [`serial`](Self::serial).
-    held: Mutex<BTreeMap<StepId, tokio::sync::OwnedMutexGuard<()>>>,
+    /// The `shared_serialized` guard per step that holds [`serial`](Self::serial), keyed by the
+    /// run too (blueprint F-I) so [`release`](Isolator::release) can find a run's steps.
+    held: Mutex<BTreeMap<(RunId, StepId), tokio::sync::OwnedMutexGuard<()>>>,
+    /// Scripted [`reset`](Isolator::reset) refusals, FIFO, one consumed per call.
+    reset_refusals: Mutex<VecDeque<String>>,
+    /// How many times [`reset`](Isolator::reset) has been called, refusals included.
+    resets: Mutex<u32>,
+    /// How many times [`release`](Isolator::release) has been called.
+    releases: Mutex<u32>,
 }
 
 /// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
@@ -240,28 +248,43 @@ impl FakeIsolator {
     /// Make the next [`reset`](Isolator::reset) refuse with `reason`, reported against the first
     /// row's repository — the shape D93's park reads from a real isolator's `dirty_tree_not_reset`.
     pub fn script_reset_refusal(&self, reason: &str) {
-        let _ = reason;
-        todo!()
+        self.reset_refusals
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(reason.to_owned());
     }
 
     /// How many times [`reset`](Isolator::reset) has been called, refusals included.
     #[must_use]
     pub fn resets(&self) -> u32 {
-        todo!()
+        *self
+            .resets
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
     }
 
     /// How many times [`release`](Isolator::release) has been called.
     #[must_use]
     pub fn releases(&self) -> u32 {
-        todo!()
+        *self
+            .releases
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
     }
 
     /// Take `step`'s `shared_serialized` guard, if it holds one; dropping it frees the lock.
+    ///
+    /// Keyed by the step half alone (blueprint F-I): a step id names one run's step.
     fn release_step(&self, step: StepId) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        self.held
+        let mut held = self
+            .held
             .lock()
-            .expect("no panic holds the fake isolator's lock")
-            .remove(&step)
+            .expect("no panic holds the fake isolator's lock");
+        let key = held
+            .keys()
+            .find(|(_, held_step)| *held_step == step)
+            .copied();
+        key.and_then(|key| held.remove(&key))
     }
 
     /// The next synthetic-hash ordinal.
@@ -331,7 +354,7 @@ impl Isolator for FakeIsolator {
                 self.held
                     .lock()
                     .expect("no panic holds the fake isolator's lock")
-                    .insert(step, guard);
+                    .insert((run, step), guard);
             }
             let cwd = format!("{FAKE_TREE_ROOT}/{run}/{step}");
             let trees = scope
@@ -490,14 +513,49 @@ impl Isolator for FakeIsolator {
         step: StepId,
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, ResetReport> {
-        let _ = (step, trees);
-        todo!()
+        Box::pin(async move {
+            let _ = step;
+            *self
+                .resets
+                .lock()
+                .expect("no panic holds the fake isolator's lock") += 1;
+            let refusal = self
+                .reset_refusals
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front();
+            Ok(match (refusal, trees.first()) {
+                (Some(reason), Some(first)) => ResetReport {
+                    labelled: Vec::new(),
+                    refused: vec![(first.repo_id, reason)],
+                },
+                _ => ResetReport::default(),
+            })
+        })
     }
 
     /// D99: every `shared_serialized` guard a step of `run` holds, dropped; counted.
     fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()> {
-        let _ = run;
-        todo!()
+        Box::pin(async move {
+            *self
+                .releases
+                .lock()
+                .expect("no panic holds the fake isolator's lock") += 1;
+            let released = {
+                let mut held = self
+                    .held
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock");
+                let (released, kept) = std::mem::take(&mut *held)
+                    .into_iter()
+                    .partition::<BTreeMap<_, _>, _>(|((held_run, _), _)| *held_run == run);
+                *held = kept;
+                released
+            };
+            // Dropped outside the `std` lock: dropping a guard wakes a waiter.
+            drop(released);
+            Ok(())
+        })
     }
 }
 
