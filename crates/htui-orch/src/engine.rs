@@ -1698,10 +1698,7 @@ where
         }
         let mut trees = None;
         let mut captured = false;
-        match self
-            .candidate_live(&stage, started_at, &mut trees, &mut captured)
-            .await
-        {
+        match self.candidate_live(&stage, &mut trees, &mut captured).await {
             Ok(()) => Ok(()),
             Err(err) => {
                 if let (Some(trees), false) = (&trees, captured) {
@@ -1733,7 +1730,6 @@ where
     async fn candidate_live(
         &self,
         stage: &CandidateStage<'_>,
-        started_at: DateTime<Utc>,
         trees: &mut Option<Vec<htui_core::model::RunStepTree>>,
         captured: &mut bool,
     ) -> Result<(), EngineError> {
@@ -1762,6 +1758,11 @@ where
                 }),
             )
             .await?;
+        // The candidate's own clock starts here, not at its `running` move: a `shared_serialized`
+        // `prepare` waits on the per-repo lock until the sibling before it is captured, and a
+        // deadline that counted that wait would charge the last sibling for every session ahead
+        // of it. `run_step.started_at` keeps the `running` instant.
+        let started_at = self.now();
         let rows: Vec<_> = prepared
             .trees
             .iter()

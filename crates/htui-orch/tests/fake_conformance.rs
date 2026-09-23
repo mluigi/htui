@@ -12,8 +12,8 @@ impl CaseHarness for Demo {
 }
 
 #[test]
-fn cases_len_is_thirty_five() {
-    assert_eq!(CASES.len(), 35);
+fn cases_len_is_thirty_six() {
+    assert_eq!(CASES.len(), 36);
 }
 
 #[test]

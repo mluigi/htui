@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 use htui_agent::conformance::{Script, ScriptEvent, epoch};
@@ -83,6 +83,12 @@ pub struct FakeIsolator {
     /// Every [`reconcile`](Isolator::reconcile) call, as `(winner, siblings)`, in call order — so a
     /// case can tell which siblings plan D54(d) handed the isolator.
     reconciles: Mutex<Vec<(StepId, Vec<StepId>)>>,
+    /// Plan D28's per-repo lock, one for the whole fake: a `shared_serialized`
+    /// [`prepare`](Isolator::prepare) waits on it, and holds it until that step's
+    /// [`capture`](Isolator::capture) or the run's [`cleanup`](Isolator::cleanup).
+    serial: Arc<tokio::sync::Mutex<()>>,
+    /// The `shared_serialized` guard per step that holds [`serial`](Self::serial).
+    held: Mutex<BTreeMap<StepId, tokio::sync::OwnedMutexGuard<()>>>,
 }
 
 /// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
@@ -231,6 +237,14 @@ impl FakeIsolator {
             .expect("no panic holds the fake isolator's lock")
     }
 
+    /// Take `step`'s `shared_serialized` guard, if it holds one; dropping it frees the lock.
+    fn release(&self, step: StepId) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.held
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .remove(&step)
+    }
+
     /// The next synthetic-hash ordinal.
     fn tick(&self) -> u32 {
         let mut calls = self
@@ -285,6 +299,21 @@ impl Isolator for FakeIsolator {
             {
                 return Err(IsolateError::Refused(reason));
             }
+            if isolation == Isolation::SharedSerialized {
+                // The real `prepare` suspends before it takes the lock (its git work is
+                // `spawn_blocking`), so every sibling of a `join_all` has gone `running` before the
+                // first of them starts its session. Without this await the fake would run each
+                // candidate to completion in turn and hide what a sibling queued behind another
+                // is charged for.
+                tokio::task::yield_now().await;
+                // A step prepared again (a resume) must not wait on its own guard.
+                drop(self.release(step));
+                let guard = Arc::clone(&self.serial).lock_owned().await;
+                self.held
+                    .lock()
+                    .expect("no panic holds the fake isolator's lock")
+                    .insert(step, guard);
+            }
             let cwd = format!("{FAKE_TREE_ROOT}/{run}/{step}");
             let trees = scope
                 .iter()
@@ -328,6 +357,7 @@ impl Isolator for FakeIsolator {
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
         Box::pin(async move {
+            drop(self.release(step));
             let commits = self.commits(step, trees);
             self.captured
                 .lock()
@@ -421,6 +451,11 @@ impl Isolator for FakeIsolator {
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
         Box::pin(async move {
             let _ = (run, trees);
+            // One run per fake in every case, so the run's guards are all of them.
+            self.held
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .clear();
             *self
                 .cleanups
                 .lock()
@@ -448,6 +483,8 @@ pub struct FakeVerifier {
     reports: Mutex<VecDeque<VerifyReport>>,
     /// How many times [`run`](Verifier::run) has been called, unscripted calls included.
     runs: Mutex<u32>,
+    /// Every request's step and deadline remainder, in call order.
+    remaining: Mutex<Vec<(StepId, Option<std::time::Duration>)>>,
 }
 
 impl FakeVerifier {
@@ -477,6 +514,16 @@ impl FakeVerifier {
             .runs
             .lock()
             .expect("no panic holds the fake verifier's lock")
+    }
+
+    /// What was left of each asked step's deadline when its verify started (plan D30), as
+    /// `(step, remaining)` in call order: the budget the real verifier would have run under.
+    #[must_use]
+    pub fn remaining(&self) -> Vec<(StepId, Option<std::time::Duration>)> {
+        self.remaining
+            .lock()
+            .expect("no panic holds the fake verifier's lock")
+            .clone()
     }
 
     /// A `pass` at exit `0`, stamped at the fake driver's own origin so a report and a session row
@@ -513,7 +560,10 @@ impl FakeVerifier {
 impl Verifier for FakeVerifier {
     fn run<'a>(&'a self, request: VerifyRequest) -> VerifierFuture<'a, Option<VerifyReport>> {
         Box::pin(async move {
-            drop(request);
+            self.remaining
+                .lock()
+                .expect("no panic holds the fake verifier's lock")
+                .push((request.step, request.remaining));
             *self
                 .runs
                 .lock()

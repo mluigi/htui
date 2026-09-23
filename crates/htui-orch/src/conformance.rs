@@ -14,9 +14,10 @@
 use chrono::TimeDelta;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, EventKind, Gate, GateOutcome, Item,
-    ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Run, RunId, RunMode,
-    RunStatus, RunStep, Status, StepGraphId, StepGraphPhase, StepId, StepStatus, VerifyOutcome,
+    AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, EventKind, Gate, GateOutcome,
+    Isolation, Item, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Run,
+    RunId, RunMode, RunStatus, RunStep, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
+    VerifyOutcome,
 };
 use htui_core::model::{Quota, QuotaSource, Spend};
 use htui_core::prompt::DiffBlock;
@@ -162,9 +163,9 @@ impl Orchestrate for FakeOrchestrator {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Thirty-five, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_thirty_five` and out of crate by `tests/fake_conformance.rs` — because
-/// a binding that silently ran thirty-four of them would still be green.
+/// Thirty-six, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_thirty_six` and out of crate by `tests/fake_conformance.rs` — because
+/// a binding that silently ran thirty-five of them would still be green.
 ///
 /// Seven are `docs/ANA-2.md` §12's validation criteria (1, 2, 3, 5, 6, 7 and 13's command half);
 /// four are contract lines
@@ -180,7 +181,8 @@ impl Orchestrate for FakeOrchestrator {
 /// `verify_failure` and `previous_diff` (plan D67) — and then twelve for fan-out: criteria 8, 9
 /// and 10 (plan D49-D53, D65), the gated and judgeless routes to a human (D49, D50), a failed
 /// candidate (D48), a group with no survivor (D49(1)), the review loop over a group (D66), and
-/// the two caps refused at `StartRun` (D63).
+/// the two caps refused at `StartRun` (D63) — and one more for a `shared_serialized` sibling's
+/// deadline, which counts from its own `prepare` (D48).
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -260,6 +262,9 @@ pub const CASES: &[&str] = &[
     "fan_out_above_max_fan_out_is_refused_at_start",
     // Plan D63 (OQ-1): `max_agents_per_run` is refused at `StartRun`.
     "max_agents_per_run_is_refused_at_start",
+    // Plan D48 under `shared_serialized`: a candidate's deadline counts from its own `prepare`,
+    // not from the siblings it queued behind.
+    "a_serialized_sibling_is_not_charged_for_the_ones_before_it",
 ];
 
 /// Run one case by name.
@@ -345,6 +350,9 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
         }
         "max_agents_per_run_is_refused_at_start" => {
             max_agents_per_run_is_refused_at_start(harness).await;
+        }
+        "a_serialized_sibling_is_not_charged_for_the_ones_before_it" => {
+            a_serialized_sibling_is_not_charged_for_the_ones_before_it(harness).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -3063,6 +3071,64 @@ async fn max_agents_per_run_is_refused_at_start<H: CaseHarness>(harness: &H) {
     );
 }
 
+/// Plan D48 under `shared_serialized`: every candidate goes `running` when the group starts, but
+/// its `prepare` waits on the per-repo lock until the sibling before it is captured. Its deadline
+/// and its verify budget (plan D30) are its own session's, so they count from the moment `prepare`
+/// answered — otherwise the last of three 3000 s sessions under a 7200 s deadline would be charged
+/// 9000 s, fail `deadline elapsed` or verify `unavailable`, and skew selection towards index 0.
+async fn a_serialized_sibling_is_not_charged_for_the_ones_before_it<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    repoint(&orch, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "research" {
+            phase.fan_out = 3;
+            phase.isolation = Some(Isolation::SharedSerialized);
+            phase.verify_command = Some("true".to_owned());
+        }
+        phase.gate = Gate::Never;
+    })
+    .await;
+    orch.store()
+        .set_app_setting("step_deadline_seconds", serde_json::json!(7200));
+    orch.advance_after_done(TimeDelta::seconds(3000));
+    research_candidates(&orch, 1);
+    for _ in 0..3 {
+        orch.verifier().script_report(FakeVerifier::pass());
+    }
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        rest.run,
+        RunStatus::AwaitingApproval,
+        "no judge, so a human selects"
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1)
+            .into_iter()
+            .map(|(index, status, _)| (index, status))
+            .collect::<Vec<_>>(),
+        [
+            (0, StepStatus::Done),
+            (1, StepStatus::Done),
+            (2, StepStatus::Done),
+        ],
+        "no sibling pays for the sessions queued ahead of it"
+    );
+    let notes = notes_of(&orch, ids::HTUI_ANA_2).await;
+    assert!(
+        !notes.iter().any(|body| body.contains("deadline elapsed")),
+        "{notes:?}"
+    );
+    let budget = Some(std::time::Duration::from_secs(7200 - 3000));
+    assert_eq!(
+        orch.verifier().remaining(),
+        (0..3)
+            .map(|index| (candidate(&steps, 0, 1, index).id, budget))
+            .collect::<Vec<_>>(),
+        "each verify runs under what its own session left of the deadline"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -3080,14 +3146,14 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_thirty_five() {
+    fn cases_are_unique_and_thirty_six() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            35,
+            36,
             "seven ANA-2 §12 criteria, four §4.2 contract lines, the `finish_run` seam, the three \
              gate-table cells only an edited gate reaches, plan D5's intermediate position, \
              milestone 3's two verify outcomes and `CancelRun`, milestone 4's five stage-1 cases \
@@ -3096,7 +3162,7 @@ mod tests {
              second attempt's forwarded `verify_failure` and `previous_diff` — and its twelve \
              fan-out cases: criteria 8, 9 (twice) and 10 (twice), the gated and judgeless human \
              selections, a failed candidate, a group with no survivor, the review loop over a \
-             group, and the two caps"
+             group, the two caps, and a `shared_serialized` sibling's own deadline"
         );
     }
 
