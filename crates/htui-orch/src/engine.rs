@@ -7457,6 +7457,49 @@ mod tests {
         );
     }
 
+    /// Plan D151: a release that answers `NotFound { entity: "run" }` names a row that is gone,
+    /// so no lease is left to give back and the run leaves the dead-walk set (or never enters
+    /// it). A release the store cannot answer (`Unreachable`, plan D152) keeps it there.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_of_a_gone_run_leaves_the_set_and_an_unreachable_one_stays() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let run = leased_run(&harness).await;
+        let gone = htui_core::model::RunId::new();
+
+        harness.orch.store.set_fault(MemFault::ReleaseLease, true);
+        engine.release_lease(run).await;
+        engine.release_lease(gone).await;
+        assert_eq!(
+            harness.orch.dead_walks.runs(),
+            {
+                let mut both = vec![run, gone];
+                both.sort();
+                both
+            },
+            "both releases failed while the store could not answer"
+        );
+
+        harness.orch.store.set_fault(MemFault::ReleaseLease, false);
+        engine.release_lease(gone).await;
+        assert!(
+            !harness.orch.dead_walks.contains(gone),
+            "the gone run's release answered NotFound, so it left the set"
+        );
+        assert!(
+            harness.orch.dead_walks.contains(run),
+            "the unreachable run's release has not been retried, so it stays"
+        );
+
+        harness.orch.store.set_fault(MemFault::ReleaseLease, true);
+        engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            harness.orch.dead_walks.runs(),
+            [run],
+            "the sweep's retry was Unreachable again, so the run stays"
+        );
+    }
+
     /// Plan D125: failing a group before a token spends a `pending -> running` per candidate, and
     /// one that answers `Ok(false)` means another writer moved that row. The walk stops there with
     /// `StaleWrite`: it neither fails the run nor cleans it up. The walk's stale read is the
