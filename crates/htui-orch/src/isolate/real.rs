@@ -3151,6 +3151,58 @@ mod tests {
         );
     }
 
+    /// D72: every checkout of the scope is read for dirtiness before any is reset, so a dirty
+    /// second repository leaves the first — clean, but off the base — exactly where it was.
+    #[tokio::test]
+    async fn a_dirty_repo_refuses_the_slot_before_any_repo_is_reset() {
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, _) = repo(dir.path(), "core", true);
+        let (docs, docs_checkout, _) = repo(dir.path(), "docs", false);
+        let (core_path, docs_path) = (
+            core_checkout.local_path.clone(),
+            docs_checkout.local_path.clone(),
+        );
+        let isolator = GixIsolator::new(config(
+            &dir.path().join("trees"),
+            &[(core, core_checkout), (docs, docs_checkout)],
+        ))
+        .expect("the config validates");
+        let base = isolator.base(&[core, docs]).await.expect("the base reads");
+        let moved = commit_file(&core_path, "g", "a sibling's work\n", "moved off the base");
+        std::fs::write(docs_path.join("f"), "the maintainer is mid-edit\n")
+            .expect("the checkout is dirtied");
+
+        let err = isolator
+            .prepare(
+                RunId::new(),
+                StepId::new(),
+                &[core, docs],
+                Isolation::SharedSerialized,
+                Some(slot(1, 2, &base)),
+            )
+            .await
+            .expect_err("a dirty checkout is refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "isolation refused: dirty_tree_not_reset: {}",
+                docs_path.display()
+            )
+        );
+        assert_eq!(
+            crate::isolate::git::head(&core_path).expect("the checkout has a HEAD"),
+            moved,
+            "the clean repository ahead of the dirty one was not reset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(core_path.join("g")).expect("the file reads"),
+            "a sibling's work\n"
+        );
+    }
+
     /// Two siblings that both committed, and a winner that is not the last one: the checked-out
     /// branch moves to the winner's label, and that label is the winner's `after_hash`.
     async fn two_shared_siblings(
