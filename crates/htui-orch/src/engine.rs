@@ -9528,24 +9528,43 @@ mod tests {
         }
     }
 
-    /// ANA-2 §12 criterion 3 (`:2090`): the graph moved under a parked run.
+    /// Plan D150 (R-34): the graph moved under a `running` run, so `resume` walks nothing and
+    /// gives back the lease it took whatever the run's status. The same process's next sweep then
+    /// adopts the run, which plan D88 would keep it off while the lease named this process.
     #[tokio::test]
-    async fn a_topology_mismatch_parks_on_resume() {
+    async fn a_topology_mismatch_on_a_running_run_leaves_it_adoptable_by_the_same_process() {
+        let (harness, run) = parked_run_with_a_moved_graph().await;
+        let now = harness.orch.clock.now();
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore moves the run"),
+            "the run is `running` again, as a crash between an unpark and a walk leaves it"
+        );
+
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(resumed, Resume::TopologyChanged { .. }),
+            "{resumed:?}"
+        );
+
+        harness_engine!(harness.orch, engine);
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [run],
+            "the lease was given back, so this process's sweep adopts the run"
+        );
+    }
+
+    /// `FEAT-3` started and parked at `prd`, then `prd`'s `input_kinds` edited, so the live
+    /// graph's topology digest no longer matches the run's snapshot (ANA-2 §12 criterion 3).
+    async fn parked_run_with_a_moved_graph() -> (Harness, htui_core::model::RunId) {
         let harness = Harness::new().await;
-        harness.free_feat_3().await;
-
-        let CommandOutcome::Started { run, .. } = harness
-            .dispatch(Command::StartRun {
-                item: ids::HTUI_FEAT_3,
-                mode: RunMode::Manual,
-                repo_scope: None,
-            })
-            .await
-            .expect("the walk starts")
-        else {
-            panic!("`StartRun` answers `Started`");
-        };
-
+        let (run, _) = started(&harness).await;
         // `input_kinds` is one of `PhasePatch`'s five, and it is a `SnapshotPhase` field, so
         // editing it moves the topology digest — which is the whole content of criterion 3.
         let graph = harness
@@ -9569,6 +9588,13 @@ mod tests {
             )
             .await
             .expect("the phase exists");
+        (harness, run)
+    }
+
+    /// ANA-2 §12 criterion 3 (`:2090`): the graph moved under a parked run.
+    #[tokio::test]
+    async fn a_topology_mismatch_parks_on_resume() {
+        let (harness, run) = parked_run_with_a_moved_graph().await;
 
         let before = harness.orch.steps(run).await;
         let resumed = harness.resume(run).await.expect("the run is readable");
