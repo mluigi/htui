@@ -11,8 +11,8 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_core::model::{
-    CommandRun, CommandRunStatus, Document, Isolation, RepoId, RunStep, RunStepCommit, RunStepTree,
-    SnapshotPhase, VerifyOutcome,
+    CommandRun, CommandRunStatus, Document, GraphSnapshot, Isolation, RepoId, RunStep,
+    RunStepCommit, RunStepTree, SnapshotPhase, StepId, StepStatus, VerifyOutcome,
 };
 use htui_core::store::StoreError;
 use serde_json::Value;
@@ -269,6 +269,25 @@ pub fn resettle(
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// The frontier (plan D97, blueprint A-3)
+// ---------------------------------------------------------------------------------------------
+
+/// D97 as redefined (C129): the latest-attempt `done` winner at the highest position `p` having one
+/// (`selected == Some(true)`, or the one `fanout_index = 0` row of a `fan_out = 1` phase),
+/// provided every row at a position > `p` is `Superseded | Cancelled`.
+///
+/// Retired rows are ignored because a review rejection retires `target..=review` before the walk
+/// creates the next implement attempt, so the rejected review already sits after that attempt's
+/// winner. Every **live** row after `p` was created after `p`'s reconcile returned, so a live one
+/// means there is nothing to re-reconcile. Under blueprint A-3 the sweep reads this over the rows
+/// as adopted, before any step is adjudicated: a `running` row after `p` makes it `None`.
+#[must_use]
+pub fn frontier(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Option<StepId> {
+    let _ = (snapshot, steps);
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -289,7 +308,8 @@ mod tests {
     use crate::gate::{Settle, StepFailure};
     use crate::isolate::Clock;
     use crate::recover::{
-        Adjudication, Heartbeat, LeaseTimes, StepKind, classify, heartbeat, resettle, verify_of,
+        Adjudication, Heartbeat, LeaseTimes, StepKind, classify, frontier, heartbeat, resettle,
+        verify_of,
     };
 
     // -----------------------------------------------------------------------------------------
@@ -923,5 +943,103 @@ mod tests {
             resettle(Some(&approving), None, true, at(0), at(5)),
             Settle::Ok { note: None }
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // frontier
+    // -----------------------------------------------------------------------------------------
+
+    fn done(position: i32, attempt: i32) -> RunStep {
+        step(position, attempt, 0, StepStatus::Done)
+    }
+
+    #[test]
+    fn frontier_is_the_highest_done_winner_without_a_successor() {
+        let snapshot = snapshot();
+        let mut steps = vec![done(0, 1), done(1, 1), done(2, 1)];
+        assert_eq!(
+            frontier(&snapshot, &steps),
+            Some(steps[2].id),
+            "a crash between implement's `done` and its reconcile"
+        );
+        // An earlier attempt at the same position is not the winner.
+        steps[1].status = StepStatus::Superseded;
+        steps.push(done(1, 2));
+        assert_eq!(frontier(&snapshot, &steps), Some(steps[2].id));
+        // The last position: `Cursor::Finished` would `finish_run` over an unmerged primary.
+        steps.push(done(3, 1));
+        assert_eq!(frontier(&snapshot, &steps), Some(steps[4].id));
+        // Nothing `done` at all.
+        assert_eq!(
+            frontier(&snapshot, &[step(0, 1, 0, StepStatus::Running)]),
+            None
+        );
+        assert_eq!(frontier(&snapshot, &[]), None);
+    }
+
+    #[test]
+    fn frontier_is_none_mid_position() {
+        let snapshot = snapshot();
+        for status in [
+            StepStatus::Pending,
+            StepStatus::Running,
+            StepStatus::AwaitingApproval,
+            StepStatus::Failed,
+            StepStatus::Done,
+        ] {
+            let steps = [done(0, 1), done(1, 1), done(2, 1), step(3, 1, 0, status)];
+            let expected = (status == StepStatus::Done).then_some(steps[3].id);
+            assert_eq!(frontier(&snapshot, &steps), expected, "{status} at p + 1");
+        }
+        // The latest attempt at `p` is live: `p - 1`'s winner has a live successor.
+        let retried = [
+            done(0, 1),
+            done(1, 1),
+            step(2, 1, 0, StepStatus::Superseded),
+            step(2, 2, 0, StepStatus::Pending),
+        ];
+        assert_eq!(frontier(&snapshot, &retried), None);
+    }
+
+    #[test]
+    fn frontier_ignores_retired_rows_after_a_review_rejection() {
+        let snapshot = snapshot();
+        let steps = [
+            done(0, 1),
+            done(1, 1),
+            step(2, 1, 0, StepStatus::Superseded),
+            // The rejected review of attempt 1, retired by `review_loop`.
+            step(3, 1, 0, StepStatus::Cancelled),
+            done(2, 2),
+        ];
+        assert_eq!(
+            frontier(&snapshot, &steps),
+            Some(steps[4].id),
+            "implement attempt 2 (C129)"
+        );
+    }
+
+    #[test]
+    fn frontier_of_a_fan_out_is_the_selected_winner() {
+        let mut snapshot = snapshot();
+        snapshot.phases[2].fan_out = 3;
+        let mut steps = vec![done(0, 1), done(1, 1)];
+        for index in 0..3 {
+            let mut candidate = step(2, 1, index, StepStatus::Done);
+            candidate.selected = Some(index == 1);
+            steps.push(candidate);
+        }
+        steps.push(step(2, 1, -1, StepStatus::Done));
+        assert_eq!(
+            frontier(&snapshot, &steps),
+            Some(steps[3].id),
+            "the selected candidate, not index 0 and not the judge"
+        );
+        // Nothing selected yet: index 0 of a fanned-out slot is not a winner, and the done
+        // candidates are live rows after `plan`, so there is no frontier at all.
+        for candidate in &mut steps[2..5] {
+            candidate.selected = Some(false);
+        }
+        assert_eq!(frontier(&snapshot, &steps), None);
     }
 }
