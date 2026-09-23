@@ -6218,6 +6218,199 @@ mod tests {
         );
     }
 
+    /// `FEAT-3` with `prd` fanned out to two under its `always` gate: the group parks for a human
+    /// at position 0 (plan D49(2)). Hands back the run and the slot's two candidates, by index.
+    async fn parked_group(harness: &Harness) -> (htui_core::model::RunId, [StepId; 2]) {
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.fan_out = 2;
+                    phase.retry_limit = 1;
+                }
+            })
+            .await;
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(0)),
+            "an `always` group parks for a human"
+        );
+        let steps = harness.orch.steps(run).await;
+        let member = |index: i32| {
+            steps
+                .iter()
+                .find(|step| step.fanout_index == index)
+                .expect("the group has both indices")
+                .id
+        };
+        (run, [member(0), member(1)])
+    }
+
+    /// The parked run's released lease, renewed by this harness's owner for a day, and a second
+    /// process over the same store (plan D118) to meet it — a live lease it does not hold.
+    async fn a_live_stranger(harness: &Harness, run: htui_core::model::RunId) -> Harness {
+        assert!(
+            harness
+                .orch
+                .store
+                .refresh_lease(
+                    run,
+                    harness.orch.owner(),
+                    harness.orch.clock.now() + TimeDelta::days(1)
+                )
+                .await
+                .expect("MemStore refreshes"),
+            "the first process still owns the released lease, and renews it"
+        );
+        Harness {
+            orch: harness.orch.restarted(),
+        }
+    }
+
+    /// Plan D108 on the three unpark commands `AnswerGate`'s case does not reach: `RetryStep` on
+    /// one step, `RetryStep` on a group member (plan D65's `retry_group`) and `SelectFanout` all
+    /// meet a live lease another process holds after their pure guard and **before** their first
+    /// write — `LeaseHeld`, and no row moved.
+    #[tokio::test]
+    async fn retry_and_select_meet_a_live_lease_before_their_first_write() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        let other = a_live_stranger(&harness, run).await;
+        let before = harness.orch.steps(run).await;
+        let refused = other
+            .dispatch(Command::RetryStep { run, step: prd })
+            .await
+            .expect_err("a live lease elsewhere");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { run: held } if held == run),
+            "{refused}"
+        );
+        assert_eq!(
+            harness.orch.steps(run).await,
+            before,
+            "retry_step: no `answer_gate(Retried)`, no new attempt"
+        );
+        assert_eq!(
+            harness.orch.run(run).await.status,
+            RunStatus::AwaitingApproval
+        );
+
+        let harness = Harness::new().await;
+        let (run, [first, second]) = parked_group(&harness).await;
+        let other = a_live_stranger(&harness, run).await;
+        let before = harness.orch.steps(run).await;
+        let refused = other
+            .dispatch(Command::RetryStep { run, step: second })
+            .await
+            .expect_err("a live lease elsewhere");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { run: held } if held == run),
+            "{refused}"
+        );
+        assert_eq!(
+            harness.orch.steps(run).await,
+            before,
+            "retry_group: the slot is not retired and no group is admitted"
+        );
+
+        let refused = other
+            .dispatch(Command::SelectFanout {
+                run,
+                position: 0,
+                attempt: 1,
+                winner: first,
+            })
+            .await
+            .expect_err("a live lease elsewhere");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { run: held } if held == run),
+            "{refused}"
+        );
+        assert_eq!(
+            harness.orch.steps(run).await,
+            before,
+            "select_fanout: no winner `selected`, no loser superseded"
+        );
+        assert_eq!(
+            harness.orch.run(run).await.status,
+            RunStatus::AwaitingApproval,
+            "and the run was not unparked"
+        );
+    }
+
+    /// Plan D87 on the same three commands: each takes the lease (`now + ttl`), walks its tail
+    /// under it, and gives it back (`lease_expires_at = now`) when the tail parks again.
+    #[tokio::test]
+    async fn a_retry_or_a_select_that_parks_releases_its_lease() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        let CommandOutcome::Retried { rest, .. } = harness
+            .dispatch(Command::RetryStep { run, step: prd })
+            .await
+            .expect("`retry_limit = 1` permits a second attempt")
+        else {
+            panic!("`RetryStep` answers `Retried`");
+        };
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        assert_eq!(
+            harness.orch.run(run).await.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "retry_step: released at the park"
+        );
+
+        let harness = Harness::new().await;
+        let (run, [_, second]) = parked_group(&harness).await;
+        let CommandOutcome::Retried { rest, .. } = harness
+            .dispatch(Command::RetryStep { run, step: second })
+            .await
+            .expect("a parked group retries as a whole")
+        else {
+            panic!("`RetryStep` answers `Retried`");
+        };
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        assert_eq!(
+            harness.orch.run(run).await.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "retry_group: released at the park"
+        );
+
+        let harness = Harness::new().await;
+        let (run, [first, _]) = parked_group(&harness).await;
+        let CommandOutcome::Selected { rest } = harness
+            .dispatch(Command::SelectFanout {
+                run,
+                position: 0,
+                attempt: 1,
+                winner: first,
+            })
+            .await
+            .expect("a human selects the parked group's winner")
+        else {
+            panic!("`SelectFanout` answers `Selected`");
+        };
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(1)),
+            "the walk went on to `plan` and parked at its gate"
+        );
+        assert_eq!(
+            harness.orch.run(run).await.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "select_fanout: released at the park"
+        );
+    }
+
     /// ANA-2 `:639` lists "spawn failure" beside driver error and deadline, with **no cell in
     /// §4.2's gate table** — so a session that never opened is not a settle outcome and must not
     /// be parked for a human by `always`. There is no artefact to approve and no session to read.
@@ -6462,6 +6655,11 @@ mod tests {
             harness.orch.steps(run).await.len(),
             before.len(),
             "the walk is not advanced"
+        );
+        assert_eq!(
+            harness.orch.run(run).await.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "blueprint A-1: the lease `resume` took is given back, since nothing walks"
         );
         let notes = harness
             .orch
