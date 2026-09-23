@@ -5733,6 +5733,49 @@ mod tests {
         );
     }
 
+    /// Plan D85: the claim's lease runs `app_setting.lease_ttl_seconds`, not a constant. The walk
+    /// is made to fail at `prd`'s stage 2 so it raises, and a walk that raises writes nothing more
+    /// (D107) — the lease on the row is still the one the claim wrote.
+    #[tokio::test]
+    async fn lease_times_come_from_app_settings() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .orch
+            .store
+            .set_app_setting("lease_ttl_seconds", serde_json::json!(300));
+        harness
+            .orch
+            .isolator
+            .refuse_prepare("no checkout for this repo on this box");
+        let claimed_at = harness.orch.clock.now();
+
+        let refused = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect_err("stage 2 refuses `prd`");
+        assert!(matches!(refused, EngineError::Isolate(_)), "{refused}");
+        let summary = harness
+            .orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|run| run.id != ids::RUN_2)
+            .expect("the refused walk's run exists");
+        let run = harness.orch.run(summary.id).await;
+        assert_eq!(
+            run.lease_expires_at,
+            Some(claimed_at + chrono::TimeDelta::seconds(300)),
+            "the claim's lease is `now + lease_ttl_seconds`"
+        );
+    }
+
     /// ANA-2 `:639` lists "spawn failure" beside driver error and deadline, with **no cell in
     /// §4.2's gate table** — so a session that never opened is not a settle outcome and must not
     /// be parked for a human by `always`. There is no artefact to approve and no session to read.
