@@ -1260,7 +1260,7 @@ impl Isolator for GixIsolator {
         })
     }
 
-    /// D54(b): [`resolve_scope`](GixIsolator::resolve_scope)'s refusals, then each checkout's
+    /// D54(b): `resolve_scope`'s refusals, then each checkout's
     /// `HEAD`. A read: no guard, no `git` child.
     fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
         Box::pin(async move {
