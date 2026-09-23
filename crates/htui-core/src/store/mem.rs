@@ -3315,7 +3315,8 @@ impl State {
         Ok(true)
     }
 
-    /// ANA-2 §4.9's sweep: every abandoned lease on the box becomes `owner`'s.
+    /// ANA-2 §4.9's sweep: every abandoned lease on the box that is not already `owner`'s becomes
+    /// `owner`'s (plan D88).
     fn adopt_runs(
         &mut self,
         box_id: BoxId,
@@ -3331,6 +3332,8 @@ impl State {
                 row.status == RunStatus::Running
                     && row.executing_box_id == Some(box_id)
                     && row.lease_expires_at.is_none_or(|until| until <= at)
+                    // Plan D88: never this process's own lease, even an expired one.
+                    && self.lease_owners.get(&row.id) != Some(&owner)
             })
             .map(|row| (row.queued_at, row.id))
             .collect();
@@ -3543,8 +3546,21 @@ impl State {
         at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<bool> {
-        let _ = (step, note, at, now);
-        todo!("T2 (d): interrupt_step")
+        let row = self
+            .steps
+            .get_mut(&step)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })?;
+        if row.status != StepStatus::Running {
+            return Ok(false);
+        }
+        row.status = StepStatus::Failed;
+        row.gate_note = Some(note.to_owned());
+        row.finished_at = row.finished_at.or(Some(at));
+        row.updated_at = now;
+        Ok(true)
     }
 
     /// `R-ORCH-2`'s four answers, a compare-and-set on `awaiting_approval`.

@@ -2652,7 +2652,11 @@ impl WriteStore for PgStore {
     }
 
     /// ANA-2 §4.9's sweep: every `running` run on the box whose lease is `NULL` or expired at
-    /// `now` becomes `owner`'s, in one statement.
+    /// `now`, and is not already `owner`'s (plan D88), becomes `owner`'s, in one statement.
+    ///
+    /// The candidates are locked in `(queued_at, id)` order with `FOR UPDATE SKIP LOCKED`
+    /// (blueprint A-5): two concurrent sweeps never wait on each other's row locks and cannot
+    /// deadlock, and a row one sweep holds is simply not the other's to adopt.
     ///
     /// `RETURNING` cannot carry an `ORDER BY`, so the update is a CTE and the ordering is the
     /// `SELECT` over it — `queued_at`, as the contract says. A box that does not exist matches
@@ -2671,15 +2675,24 @@ impl WriteStore for PgStore {
         sqlx::query_as!(
             Run,
             r#"
-            WITH swept AS (
-                UPDATE run
-                   SET lease_owner      = $2,
-                       lease_box_id     = $1,
-                       lease_expires_at = $4
+            WITH candidates AS (
+                SELECT id
+                  FROM run
                  WHERE executing_box_id = $1
                    AND status = 'running'
                    AND (lease_expires_at IS NULL OR lease_expires_at <= $3)
-             RETURNING *
+                   AND lease_owner IS DISTINCT FROM $2
+                 ORDER BY queued_at, id
+                   FOR UPDATE SKIP LOCKED
+            ),
+            swept AS (
+                UPDATE run r
+                   SET lease_owner      = $2,
+                       lease_box_id     = $1,
+                       lease_expires_at = $4
+                  FROM candidates c
+                 WHERE r.id = c.id
+             RETURNING r.*
             )
             SELECT id               AS "id: RunId",
                    project_id       AS "project_id: ProjectId",
@@ -3002,8 +3015,25 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] `{ entity: "run_step" }` when there is no such step, told apart
     /// from "not running" by `step_exists`' follow-up read.
     async fn interrupt_step(&self, step: StepId, note: &str, at: DateTime<Utc>) -> Result<bool> {
-        let _ = (step, note, at);
-        todo!("T2 (d): interrupt_step")
+        let moved = sqlx::query!(
+            "UPDATE run_step \
+                SET status = 'failed', gate_note = $2, finished_at = COALESCE(finished_at, $3) \
+              WHERE id = $1 AND status = 'running'",
+            step.as_uuid(),
+            note,
+            at,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if moved == 1 {
+            return Ok(true);
+        }
+        let mut conn = self.pool.acquire().await.map_err(map_sqlx)?;
+        step_exists(&mut conn, step).await?;
+        Ok(false)
     }
 
     /// `R-ORCH-2`'s four answers, a compare-and-set on `awaiting_approval` rather than on the
