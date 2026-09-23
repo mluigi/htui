@@ -1871,8 +1871,7 @@ impl Isolator for StallAfterReconcile<'_> {
         isolation: Isolation,
         slot: Option<FanoutSlot<'a>>,
     ) -> IsolatorFuture<'a, Prepared> {
-        let _ = (run, step, scope, isolation, slot);
-        todo!("T8: delegate")
+        self.inner.prepare(run, step, scope, isolation, slot)
     }
 
     fn capture<'a>(
@@ -1880,13 +1879,11 @@ impl Isolator for StallAfterReconcile<'_> {
         step: StepId,
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
-        let _ = (step, trees);
-        todo!("T8: delegate")
+        self.inner.capture(step, trees)
     }
 
     fn base<'a>(&'a self, scope: &'a [RepoId]) -> IsolatorFuture<'a, BTreeMap<RepoId, String>> {
-        let _ = scope;
-        todo!("T8: delegate")
+        self.inner.base(scope)
     }
 
     fn diff<'a>(
@@ -1894,8 +1891,7 @@ impl Isolator for StallAfterReconcile<'_> {
         trees: &'a [RunStepTree],
         commits: &'a [RunStepCommit],
     ) -> IsolatorFuture<'a, Option<DiffBlock>> {
-        let _ = (trees, commits);
-        todo!("T8: delegate")
+        self.inner.diff(trees, commits)
     }
 
     fn reconcile<'a>(
@@ -1904,13 +1900,26 @@ impl Isolator for StallAfterReconcile<'_> {
         trees: &'a [RunStepTree],
         siblings: &'a [StepId],
     ) -> IsolatorFuture<'a, Vec<RunStepCommit>> {
-        let _ = (winner, trees, siblings, self.inner, self.nth, &self.calls);
-        todo!("T8: the real merge, then the stall on the nth call")
+        Box::pin(async move {
+            let merged = self.inner.reconcile(winner, trees, siblings).await?;
+            let call = {
+                let mut calls = self
+                    .calls
+                    .lock()
+                    .expect("no panic holds the reconcile counter");
+                *calls += 1;
+                *calls
+            };
+            if call == self.nth {
+                self.stalled.notify_one();
+                return std::future::pending().await;
+            }
+            Ok(merged)
+        })
     }
 
     fn cleanup<'a>(&'a self, run: RunId, trees: &'a [RunStepTree]) -> IsolatorFuture<'a, ()> {
-        let _ = (run, trees);
-        todo!("T8: delegate")
+        self.inner.cleanup(run, trees)
     }
 
     fn reset<'a>(
@@ -1918,13 +1927,11 @@ impl Isolator for StallAfterReconcile<'_> {
         step: StepId,
         trees: &'a [RunStepTree],
     ) -> IsolatorFuture<'a, ResetReport> {
-        let _ = (step, trees);
-        todo!("T8: delegate")
+        self.inner.reset(step, trees)
     }
 
     fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()> {
-        let _ = run;
-        todo!("T8: delegate")
+        self.inner.release(run)
     }
 }
 
