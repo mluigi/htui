@@ -5043,6 +5043,7 @@ mod fanout_paths {
             box_profile: parts.box_profile,
             box_id: parts.box_id,
             owner: parts.owner,
+            dead_walks: parts.dead_walks,
             user: parts.user,
         });
 

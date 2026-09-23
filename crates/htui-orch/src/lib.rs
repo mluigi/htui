@@ -35,8 +35,8 @@ pub mod verify;
 
 pub use command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 pub use engine::{
-    Adopted, AgentSelector, DriverFor, Engine, EngineParts, FirstCandidate, Next, NoSink, Resume,
-    SessionKey, SessionSink, live_step_at, required_inputs,
+    Adopted, AgentSelector, DeadWalks, DriverFor, Engine, EngineParts, FirstCandidate, Next,
+    NoSink, Resume, SessionKey, SessionSink, live_step_at, required_inputs,
 };
 #[cfg(feature = "test-support")]
 pub use engine::{claim_fake, dispatch_fake, resume_fake, sweep_fake};

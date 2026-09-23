@@ -16,7 +16,7 @@
 //! harness answers with a scripted document. Nothing here will have to be removed when MOD-11
 //! lands.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
 use futures::future::Either;
@@ -257,9 +257,61 @@ pub type DriverFor<'a> =
 // The engine
 // ---------------------------------------------------------------------------------------------
 
+/// Plan D140: the runs whose walk died in this process while its lease may still name this
+/// process.
+///
+/// A run enters it when its walk ended on [`Heartbeat::Expired`] (plan D122: the store stopped
+/// answering, so the lease could not be given back), or when a release of its lease failed.
+/// [`Heartbeat::Abandoned`] never enters it: another process holds that lease. [`Engine::sweep`]
+/// first retries the release of every run in it and drops each one the store answers, so
+/// `adopt_runs` then sees the run as free. Plan D88 still keeps the sweep off every lease a live
+/// walk of this process holds, and a run this process takes again leaves the set.
+///
+/// It belongs to the process, not to an [`Engine`]: an engine is built per command (plan D16)
+/// and only borrows it. A restarted process starts with an empty set, and its old owner's leases
+/// are adopted as any stranger's once they lapse. The lock is never held across an `.await`.
+#[derive(Debug, Default)]
+pub struct DeadWalks(std::sync::Mutex<BTreeSet<RunId>>);
+
+impl DeadWalks {
+    /// An empty set, for a process that has just started.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `run` is waiting for its lease to be given back.
+    #[must_use]
+    pub fn contains(&self, run: RunId) -> bool {
+        self.lock().contains(&run)
+    }
+
+    /// The runs waiting for a release, in id order.
+    #[must_use]
+    pub fn runs(&self) -> Vec<RunId> {
+        self.lock().iter().copied().collect()
+    }
+
+    fn insert(&self, run: RunId) {
+        self.lock().insert(run);
+    }
+
+    fn remove(&self, run: RunId) {
+        self.lock().remove(&run);
+    }
+
+    /// A poisoned lock is recovered: every change is one set operation, so a panic elsewhere
+    /// cannot leave the set half-written.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<RunId>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Everything [`Engine::new`] borrows, as a struct literal rather than a builder.
 ///
-/// A builder would let a caller forget one of fourteen fields and find out at run time; a literal
+/// A builder would let a caller forget one of fifteen fields and find out at run time; a literal
 /// cannot compile until every one of them is named.
 pub struct EngineParts<'a, S, G, I, V, C, A, K>
 where
@@ -301,6 +353,8 @@ where
     pub box_id: BoxId,
     /// `claim_run`'s liveness token (ANA-2 §4.9).
     pub owner: Uuid,
+    /// Plan D140: the process's [`DeadWalks`], shared by every engine built with this `owner`.
+    pub dead_walks: &'a DeadWalks,
     /// `run.started_by` and `item_note.created_by`.
     pub user: UserId,
 }
@@ -4749,7 +4803,7 @@ pub fn truncated(now: DateTime<Utc>) -> DateTime<Utc> {
 /// rather than in `fake.rs` for the reason the file itself gives: every part is already public on
 /// the orchestrator, and what was missing was `engine.rs`. Putting it beside the `Engine` keeps
 /// `fake.rs` exactly as T3 shipped it, and lets `conformance.rs`'s `impl Orchestrate for
-/// FakeOrchestrator` call one function instead of re-deciding fourteen fields per case.
+/// FakeOrchestrator` call one function instead of re-deciding fifteen fields per case.
 ///
 /// A fresh `Engine` per command is not a concession to the test: the engine holds nothing across a
 /// call (plan D16), so this is the shape milestone 6's Runs tab has too.
@@ -4814,7 +4868,7 @@ pub async fn sweep_fake(orch: &crate::fake::FakeOrchestrator) -> Result<Vec<Adop
     engine.sweep().await
 }
 
-/// The fourteen fields, filled from the harness.
+/// The fifteen fields, filled from the harness.
 ///
 /// `app` is read here rather than cached because `MemStore::set_app_setting` (`mem.rs:430`) is the
 /// only writer a case can reach for `step_deadline_seconds` — `SettingKey` is a closed enum of ten
@@ -4862,6 +4916,7 @@ pub(crate) async fn fake_parts<'a>(
         box_profile,
         box_id: orch.box_id(),
         owner: orch.owner(),
+        dead_walks: &orch.dead_walks,
         user: orch.user(),
     })
 }
@@ -5198,6 +5253,7 @@ mod tests {
                 .expect("the demo fixture seeds this box"),
             box_id: orch.box_id(),
             owner: orch.owner(),
+            dead_walks: &orch.dead_walks,
             user: orch.user(),
         });
 
@@ -5284,6 +5340,7 @@ mod tests {
                 .expect("the demo fixture seeds this box"),
             box_id: orch.box_id(),
             owner: orch.owner(),
+            dead_walks: &orch.dead_walks,
             user: orch.user(),
         });
 
@@ -7049,6 +7106,10 @@ mod tests {
             steps_after_steal,
             "nothing written to its steps"
         );
+        assert!(
+            !harness.orch.dead_walks.contains(run),
+            "plan D140: an abandoned walk's lease is the stranger's, so it is never a dead walk"
+        );
     }
 
     /// Plan D122 (review H1): a walk whose every refresh fails stops itself one `refresh` before
@@ -7114,6 +7175,113 @@ mod tests {
             harness.orch.isolator.releases(),
             1,
             "plan D99's release, once"
+        );
+    }
+
+    /// Plan D140 (review H-A): a walk that fenced itself (D122) could not give its lease back,
+    /// because the store is what failed. The run enters this process's dead-walk set. Once the
+    /// store answers again, this same process's sweep gives the lease back first and then adopts
+    /// the run, although plan D88 keeps it off every lease it still owns.
+    ///
+    /// The outage is the D122 test's: the run does not exist yet, so every refresh is
+    /// `Err(NotFound)`, which is what a store that cannot answer looks like to the heartbeat. The
+    /// store comes back as the row that dead walk left behind: `running`, leased to this process,
+    /// and expired.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_walk_is_adopted_by_its_own_process_once_the_store_is_back() {
+        let harness = Harness::new().await;
+        let (parked, _) = started(&harness).await;
+        let snapshot = snapshot_of(&harness, parked).await;
+        harness_engine!(harness.orch, engine);
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        let dead = htui_core::model::RunId::new();
+
+        let clock = &harness.orch.clock;
+        let walk = async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                clock.advance(TimeDelta::seconds(1));
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), EngineError>(())
+        };
+        let walked = tokio::time::timeout(
+            std::time::Duration::from_millis(600_500),
+            engine.walk_leased(dead, walk),
+        )
+        .await
+        .expect("the walk stops itself instead of writing past its lease");
+        let refused = walked.expect_err("no refresh ever succeeded");
+        assert!(
+            matches!(refused, EngineError::LeaseLost { run } if run == dead),
+            "{refused}"
+        );
+        assert!(
+            harness.orch.dead_walks.contains(dead),
+            "the fenced walk's run waits for its lease to be given back"
+        );
+
+        let now = harness.orch.clock.now();
+        harness
+            .orch
+            .store
+            .create_run(htui_core::model::NewRun {
+                id: dead,
+                project_id: ids::PROJECT_HTUI,
+                item_id: ids::HTUI_ANA_2,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                started_by: harness.orch.user(),
+                graph_snapshot: snapshot,
+                repo_scope: Vec::new(),
+                queued_at: now,
+            })
+            .await
+            .expect("MemStore creates the run");
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .claim_run(dead, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .await
+                .expect("MemStore claims"),
+            htui_core::model::Claim::Admitted,
+            "the dead walk's lease is this process's"
+        );
+        harness.orch.clock.advance(ttl + TimeDelta::seconds(1));
+
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [dead],
+            "the process whose walk died adopts its run"
+        );
+        assert!(
+            !harness.orch.dead_walks.contains(dead),
+            "the release answered, so the run left the set"
+        );
+    }
+
+    /// Plan D140: a release that fails puts the run in the dead-walk set, and the sweep retries
+    /// it until the store answers. The run does not exist, so the release is `Err(NotFound)`,
+    /// which stands for a store that cannot answer, as in the D122 test.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_release_is_retried_by_the_sweep() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let ghost = htui_core::model::RunId::new();
+
+        engine.release_lease(ghost).await;
+        assert_eq!(
+            harness.orch.dead_walks.runs(),
+            [ghost],
+            "the failed release is remembered"
+        );
+        engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            harness.orch.dead_walks.runs(),
+            [ghost],
+            "the sweep retried it, and it failed again"
         );
     }
 
@@ -7225,6 +7393,7 @@ mod tests {
             box_profile: parts.box_profile,
             box_id: parts.box_id,
             owner: parts.owner,
+            dead_walks: parts.dead_walks,
             user: parts.user,
         });
 

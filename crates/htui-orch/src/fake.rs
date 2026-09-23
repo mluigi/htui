@@ -35,7 +35,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::command::{Command, CommandOutcome, EngineError};
-use crate::engine::SessionKey;
+use crate::engine::{DeadWalks, SessionKey};
 use crate::graph::GraphSource;
 use crate::isolate::{
     Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree, ResetReport,
@@ -1170,6 +1170,9 @@ pub struct FakeOrchestrator {
     pub verifier: FakeVerifier,
     /// The clock, so a case can elapse a step deadline without sleeping.
     pub clock: TestClock,
+    /// Plan D140: this process's dead walks, borrowed by every engine built over it. A
+    /// [`restarted`](Self::restarted) process starts with an empty set.
+    pub dead_walks: DeadWalks,
     /// Keyed `(phase, attempt, None)` for a `(phase, attempt)` script and
     /// `(phase, attempt, Some((fanout_index, call)))` for one session's (plan D68).
     scripts: Mutex<BTreeMap<ScriptKey, ScriptedStep>>,
@@ -1206,6 +1209,7 @@ impl FakeOrchestrator {
             isolator: FakeIsolator::new(),
             verifier: FakeVerifier::new(),
             clock: TestClock::new(),
+            dead_walks: DeadWalks::new(),
             scripts: Mutex::new(BTreeMap::new()),
             candidates: Mutex::new(BTreeMap::new()),
             after_done_advance: Mutex::new(None),
@@ -1225,7 +1229,7 @@ impl FakeOrchestrator {
     /// are fresh, because neither survives a process. The clock starts [`RESTART_GAP`] past this
     /// one's, the scripts, candidates, default script and capabilities are cloned, the box and user
     /// are the same, and the `owner` is **new** — which is what makes the lease this process wrote
-    /// someone else's. An `advance_after_done` is not carried, and neither is a
+    /// someone else's. The dead-walk set is new and empty too (plan D140). An `advance_after_done` is not carried, and neither is a
     /// [`stall_after_done`](Self::stall_after_done): the crash was the first process's.
     ///
     /// # Panics
@@ -1247,6 +1251,7 @@ impl FakeOrchestrator {
             isolator: FakeIsolator::new(),
             verifier: FakeVerifier::new(),
             clock: TestClock::at(self.clock.now() + RESTART_GAP),
+            dead_walks: DeadWalks::new(),
             scripts: Mutex::new(scripts),
             candidates: Mutex::new(candidates),
             after_done_advance: Mutex::new(None),

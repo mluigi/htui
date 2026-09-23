@@ -33,7 +33,7 @@ use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
 use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 use htui_orch::conformance::until_stalled;
 use htui_orch::engine::{
-    Adopted, Engine, EngineParts, FirstCandidate, Next, Resume, SessionKey, SessionSink,
+    Adopted, DeadWalks, Engine, EngineParts, FirstCandidate, Next, Resume, SessionKey, SessionSink,
 };
 use htui_orch::fake::{FakeOrchestrator, RESTART_GAP, ScriptedStep, TestClock};
 use htui_orch::isolate::Clock as _;
@@ -61,6 +61,9 @@ use uuid::Uuid;
 /// are built here and must outlive the `Engine`, and the driver is a closure whose type no helper
 /// can name. [`Fixture::dispatch`] is this with the fixture's own process; blueprint §10's
 /// `engine_as` is this with a [`Fixture::second_process`]'s, or with a wrapping isolator.
+///
+/// Each engine gets an empty [`DeadWalks`] of its own (plan D140). No case here needs a dead walk
+/// to outlive the engine that saw it die.
 macro_rules! engine_as {
     ($fix:expr, $isolator:expr, $clock:expr, $owner:expr, $sink:expr, |$engine:ident| $body:expr) => {{
         let fix: &Fixture = $fix;
@@ -68,6 +71,7 @@ macro_rules! engine_as {
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| fix.orch.driver_for_key(key);
         let scrubber = MinimalScrubber::new([]);
+        let dead_walks = DeadWalks::new();
         let app = fix
             .orch
             .store
@@ -95,6 +99,7 @@ macro_rules! engine_as {
             box_profile,
             box_id: fix.orch.box_id(),
             owner: $owner,
+            dead_walks: &dead_walks,
             user: fix.orch.user(),
         });
         $body
