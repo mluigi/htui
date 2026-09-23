@@ -1201,10 +1201,10 @@ where
                 self.reset_interrupted(run, snapshot, phase, step, &trees)
                     .await
             }
-            (_, Adjudication::NeverReset { .. }) => self
-                .never_reset(run, phase, step, &trees, &[], DIRTY_AT_START)
-                .await
-                .map(Some),
+            (_, Adjudication::NeverReset { .. }) => {
+                self.never_reset(run, phase, step, &trees, &[], DIRTY_AT_START)
+                    .await
+            }
         }
     }
 
@@ -1303,14 +1303,12 @@ where
                     .join(", ");
                 return self
                     .never_reset(run, phase, step, trees, &report.labelled, &reason)
-                    .await
-                    .map(Some);
+                    .await;
             }
             Err(err) => {
                 return self
                     .never_reset(run, phase, step, trees, &[], &err.to_string())
-                    .await
-                    .map(Some);
+                    .await;
             }
         };
         let now = self.now();
@@ -1359,7 +1357,7 @@ where
         trees: &[RunStepTree],
         labelled: &[(RepoId, String)],
         reason: &str,
-    ) -> Result<Next, EngineError> {
+    ) -> Result<Option<Next>, EngineError> {
         if !self
             .parts
             .store
@@ -1367,7 +1365,7 @@ where
             .await?
         {
             // Another writer moved the step; D96's re-derivation owns what is left.
-            return Ok(Next::Walk);
+            return Ok(None);
         }
         let body = format!(
             "{NOT_RESET}: step {} (`{}` attempt {}); trees: {}; reason: {reason}; the run is \
@@ -1378,7 +1376,7 @@ where
             trees_text(step.id, trees, labelled)
         );
         let rest = self.park_interrupted(run, step, phase, false, body).await?;
-        Ok(Next::Parked(rest))
+        Ok(Some(Next::Parked(rest)))
     }
 
     /// Plan D94: park a run whose `step` the sweep already failed — `park_run`'s order: the run
