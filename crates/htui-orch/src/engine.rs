@@ -679,10 +679,10 @@ where
             .max()
             .unwrap_or(row.attempt);
         if row.attempt != latest {
-            return Err(EngineError::NotGated {
+            return Err(EngineError::StaleSlot {
                 step: row.id,
-                status: row.status,
-                expected: "a member of the position's latest slot",
+                attempt: row.attempt,
+                latest,
             });
         }
         let slot = group_at(&steps, row.position, row.attempt);
@@ -4352,7 +4352,10 @@ mod tests {
             .await
             .expect_err("a member of the retired slot names nothing to retry");
         assert!(
-            matches!(stale, EngineError::NotGated { step, .. } if step == member),
+            matches!(
+                stale,
+                EngineError::StaleSlot { step, attempt: 1, latest: 2 } if step == member
+            ),
             "{stale}"
         );
         let current = before

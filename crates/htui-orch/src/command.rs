@@ -195,6 +195,17 @@ pub enum EngineError {
         /// The statuses the command is enabled at.
         expected: &'static str,
     },
+    /// Plan D65: a fan-out retry named a member of a slot a later attempt already replaced, so
+    /// there is nothing for it to retry — the position's latest slot is the only one admitted.
+    #[error("step {step} is in attempt {attempt}; retry names a member of the latest, {latest}")]
+    StaleSlot {
+        /// The step named.
+        step: StepId,
+        /// Its `attempt`.
+        attempt: i32,
+        /// The position's latest attempt, whose members a retry may name.
+        latest: i32,
+    },
     /// ANA-2 §12 criterion 5 (`docs/ANA-2.md:2096`): approving a step that produced no artefact.
     #[error("step {step} has no `{kind}` document; approve needs one (ANA-2 §6.2)")]
     MissingOutputForApproval {
