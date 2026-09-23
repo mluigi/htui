@@ -1,8 +1,9 @@
 //! Resolution: a live `step_graph` becomes the typed `GraphSnapshot` a run is decided by.
 //!
 //! ANA-2 §4.1's field chains (`docs/ANA-2.md:278-288`), the `topology` digest the snapshot row
-//! reserves for this milestone (`crates/htui-core/src/model/run.rs:453`), the scope resolution
-//! that refuses an empty scope for an item with a primary repo (plan D14), and the override clone
+//! reserves for this milestone (`crates/htui-core/src/model/run.rs:453`), the call into
+//! [`crate::overlap::resolve`] that writes §4.7's scope into the snapshot (plan D79, D81) and
+//! refuses an empty scope for an item with a primary repo (plan D14), and the override clone
 //! that is deep over `step_graph_phase` and never over `skill_binding` (`docs/ANA-2.md:290-295`).
 //!
 //! Resolution is the **only** place that reads `step_graph_phase`. Once a run exists, the walk
@@ -13,8 +14,8 @@ use std::collections::BTreeMap;
 
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, GraphSnapshot, Isolation, Item, ItemId, ItemPatch,
-    NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId, ProjectSettings, PromptTemplate, Repo,
-    RepoId, ResolvedGraph, RunMode, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase,
+    NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId, ProjectSettings, PromptTemplate, RepoId,
+    ResolvedGraph, RunMode, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase,
     SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
 };
 use htui_core::store::{ReadStore, Result, StoreError, UpdateOutcome, WriteStore};
@@ -106,7 +107,7 @@ pub trait GraphSource: Sync {
 pub struct Resolved {
     /// `run.graph_snapshot`, with [`topology`] already computed.
     pub snapshot: GraphSnapshot,
-    /// `run.repo_scope` (ANA-2 §4.7), from [`resolve_scope`].
+    /// `run.repo_scope` (ANA-2 §4.7), from [`crate::overlap::resolve`].
     pub repo_scope: Vec<RepoId>,
 }
 
@@ -244,33 +245,6 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
     ))
 }
 
-/// `run.repo_scope` for an item (ANA-2 §4.7, plan D14).
-///
-/// `requested` `Some(scope)` is honoured as given — the caller has already resolved
-/// `item.touched_paths` to repos — except that an empty one is refused when the project has a
-/// primary repo. `None` resolves to the primary repo alone, or to nothing when the project has no
-/// repository at all, which is the only case an empty scope is legitimate in.
-///
-/// # Errors
-/// [`ResolveError::EmptyScopeWithPrimary`] for an explicitly empty scope on an item whose project
-/// has an `is_primary` repo.
-pub fn resolve_scope(
-    item: &Item,
-    repos: &[Repo],
-    requested: Option<&[RepoId]>,
-) -> std::result::Result<Vec<RepoId>, ResolveError> {
-    let primary = repos.iter().find(|repo| repo.is_primary);
-    match (requested, primary) {
-        (Some([]), Some(repo)) => Err(ResolveError::EmptyScopeWithPrimary {
-            item: item.id,
-            repo: repo.id,
-        }),
-        (Some(scope), _) => Ok(scope.to_vec()),
-        (None, Some(repo)) => Ok(vec![repo.id]),
-        (None, None) => Ok(Vec::new()),
-    }
-}
-
 /// Builds ANA-2 §5.1's snapshot from the live graph, walking §4.1's chains once per field.
 ///
 /// `app` is the resolved `app_setting` map — `MemStore::app_settings()` in a harness,
@@ -347,6 +321,11 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
     };
     check_fan_out_caps(&phases, &settings)?;
 
+    // Read before the literal: §4.7's scope is written into the snapshot (plan D79), and it is
+    // resolved from the same `touched_paths` as `repo_scope`, so the two cannot disagree.
+    let repos = store.repos(item.project_id).await?;
+    let (repo_scope, scope) = crate::overlap::resolve(item, &repos, &phases, requested_scope)?;
+
     let snapshot = GraphSnapshot {
         v: GraphSnapshot::V,
         graph: SnapshotGraph {
@@ -358,11 +337,9 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
         mode,
         phases,
         settings,
-        scope: None,
+        scope: Some(scope),
     };
 
-    let repos = store.repos(item.project_id).await?;
-    let repo_scope = resolve_scope(item, &repos, requested_scope)?;
     Ok(Resolved {
         snapshot,
         repo_scope,
