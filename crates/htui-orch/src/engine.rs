@@ -7506,6 +7506,50 @@ mod tests {
         );
     }
 
+    /// Plan D149 (R-34): a command that raises between its lease take and its walk gives the
+    /// lease back. `unpark`'s item `transition` fails inside a gate answer, after the run is
+    /// already `running` again (`MemFault::ItemTransition`, plan D152). Without the release, plan
+    /// D88 would keep this process's sweep off a run nothing walks.
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_answer_whose_unpark_fails_is_adopted_by_the_same_process() {
+        let harness = Harness::new().await;
+        let (run, step) = started(&harness).await;
+        harness.orch.store.set_fault(MemFault::ItemTransition, true);
+
+        let refused = harness
+            .dispatch(Command::AnswerGate {
+                run,
+                step,
+                answer: GateAnswer::Approved,
+            })
+            .await
+            .expect_err("the item's unpark could not be written");
+        assert!(
+            matches!(
+                refused,
+                EngineError::Store(htui_core::store::StoreError::Unreachable(_))
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            harness.orch.run(run).await.status,
+            RunStatus::Running,
+            "the run's unpark landed before the item's failed"
+        );
+
+        harness
+            .orch
+            .store
+            .set_fault(MemFault::ItemTransition, false);
+        harness_engine!(harness.orch, engine);
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [run],
+            "the lease was given back, so this process's sweep adopts the run"
+        );
+    }
+
     /// Plan D125: failing a group before a token spends a `pending -> running` per candidate, and
     /// one that answers `Ok(false)` means another writer moved that row. The walk stops there with
     /// `StaleWrite`: it neither fails the run nor cleans it up. The walk's stale read is the
