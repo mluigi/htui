@@ -601,7 +601,8 @@ impl Cli {
     /// checkout over a populated directory.
     ///
     /// Post-condition: the tree's `HEAD` is `target` and [`is_dirty`] is false. Untracked files
-    /// survive, which is exactly why D24 does not count them.
+    /// survive unless `target` tracks their path, which is written over them without a word; a
+    /// caller that must not lose one asks [`untracked_paths_base_tracks`] first (plan D121).
     ///
     /// # Errors
     /// [`IsolateError::Git`] for a non-zero exit — a held `index.lock` among them, which
@@ -1255,8 +1256,9 @@ pub fn head_parents(path: &Path) -> Result<Vec<String>, IsolateError> {
 /// `Repository::is_dirty()` (`gix-0.87.1/src/status/mod.rs:168`), which is plan D24's predicate.
 ///
 /// A change in the index against `HEAD` or in the working tree against the index, submodules
-/// included, **untracked files excluded** — because the only consumer of `dirty` is milestone 5's
-/// reset to `before_hash`, and a reset never deletes an untracked file anyway.
+/// included, **untracked files excluded**. A reset leaves most untracked files alone, but not one
+/// whose path the target tracks: `reset --hard` writes the tracked blob over it. So milestone 5's
+/// reset to `before_hash` asks [`untracked_paths_base_tracks`] as well (plan D121).
 ///
 /// # Errors
 /// [`IsolateError::Git`] when the status walk fails.
@@ -1319,8 +1321,53 @@ pub fn has_untracked_files(path: &Path) -> Result<bool, IsolateError> {
 /// [`IsolateError::Git`] when `base` is not a commit of the repository, or the status walk or a
 /// tree lookup fails.
 pub fn untracked_paths_base_tracks(path: &Path, base: &str) -> Result<Vec<String>, IsolateError> {
-    let _ = (path, base);
-    todo!("D121")
+    let fail = |err: &dyn std::fmt::Display| {
+        IsolateError::Git(format!(
+            "cannot read untracked files of {}: {err}",
+            path.display()
+        ))
+    };
+    let repo = open(path)?;
+    let tree = repo
+        .find_commit(parse_oid(base)?)
+        .map_err(|err| IsolateError::Git(format!("cannot find commit {base}: {err}")))?
+        .tree()
+        .map_err(|err| IsolateError::Git(format!("cannot read the tree of {base}: {err}")))?;
+    let items = repo
+        .status(gix::progress::Discard)
+        .map_err(|err| fail(&err))?
+        // Every file, not one entry per new directory: the lookup below is per path.
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .index_worktree_rewrites(None)
+        .index_worktree_submodules(None)
+        .into_index_worktree_iter(Vec::new())
+        .map_err(|err| fail(&err))?;
+    let mut found = Vec::new();
+    for item in items {
+        let gix::status::index_worktree::Item::DirectoryContents { entry, .. } =
+            item.map_err(|err| fail(&err))?
+        else {
+            continue;
+        };
+        if entry.status != gix::dir::entry::Status::Untracked {
+            continue;
+        }
+        let parts: Vec<&[u8]> = entry.rela_path.split(|byte| *byte == b'/').collect();
+        // The full path tracked as anything, or a leading directory tracked as a file.
+        for depth in 1..=parts.len() {
+            let Some(tracked) = tree
+                .lookup_entry(parts[..depth].iter().copied())
+                .map_err(|err| fail(&err))?
+            else {
+                break;
+            };
+            if depth == parts.len() || !tracked.mode().is_tree() {
+                found.push(entry.rela_path.to_string());
+                break;
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Whether the repository declares any submodule
@@ -1912,7 +1959,7 @@ mod tests {
     }
 
     /// Plan D24: the index against `HEAD` and the working tree against the index — untracked files
-    /// are not a change, because milestone 5's reset would not have deleted them anyway.
+    /// are not a change; the one a reset would overwrite is D121's question, not this one.
     #[test]
     fn is_dirty_ignores_untracked_and_sees_a_modified_tracked_file() {
         let dir = tempfile::tempdir().expect("a temporary directory");

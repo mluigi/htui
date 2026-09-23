@@ -1429,8 +1429,8 @@ impl Isolator for GixIsolator {
         })
     }
 
-    /// D92, D114: every in-place row checked before any is written; `worktree`/`copy` rows are
-    /// skipped without their path being read.
+    /// D92, D114, D121: every in-place row checked before any is written; `worktree`/`copy` rows
+    /// are skipped without their path being read.
     fn reset<'a>(
         &'a self,
         step: StepId,
@@ -1465,6 +1465,18 @@ impl Isolator for GixIsolator {
                     report
                         .refused
                         .push((tree.repo_id, local_moved(&path, &head, &tree.base_ref)));
+                    continue;
+                }
+                // D121: `is_dirty` leaves untracked files out, and `reset --hard` writes the
+                // base's blob over one whose path `base_ref` tracks.
+                let (read, base) = (path.clone(), tree.base_ref.clone());
+                if !blocking(move || git::untracked_paths_base_tracks(&read, &base))
+                    .await?
+                    .is_empty()
+                {
+                    report
+                        .refused
+                        .push((tree.repo_id, dirty_tree_not_reset(&path)));
                     continue;
                 }
                 let (read, name) = (path.clone(), label.clone());
