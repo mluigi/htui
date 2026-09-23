@@ -1694,8 +1694,9 @@ where
     /// **The lease is taken first** (blueprint A-1): for a run the sweep adopted it is a renewal,
     /// for a released parked run it is harmless, and for a run a live stranger holds it is
     /// [`EngineError::LeaseHeld`] with nothing resolved or walked. The walk itself runs under the
-    /// heartbeat. Milestone 5's sweep adopts and adjudicates but does not walk; this is the walk
-    /// it hands a `Walk` run off to, and milestone 6's `run_worker` is the caller that does.
+    /// heartbeat, and first unparks a run a command left parked over an answered step (plan D132,
+    /// `walk_resumed`). Milestone 5's sweep adopts and adjudicates but does not walk; this is the
+    /// walk it hands a `Walk` run off to, and milestone 6's `run_worker` is the caller that does.
     /// That heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
     /// driver enabled (blueprint H-3).
     ///
@@ -1734,7 +1735,7 @@ where
                     snapshot.topology
                 );
                 self.note(item.id, body, None, self.now()).await?;
-                let rest = self.walk_leased(run, self.run_to_rest(run)).await?;
+                let rest = self.walk_leased(run, self.walk_resumed(run)).await?;
                 return Ok(Resume::Walked(rest));
             }
             Err(err) => return Err(err.into()),
@@ -1769,8 +1770,40 @@ where
                 rest,
             });
         }
-        let rest = self.walk_leased(run, self.run_to_rest(run)).await?;
+        let rest = self.walk_leased(run, self.walk_resumed(run)).await?;
         Ok(Resume::Walked(rest))
+    }
+
+    /// [`Self::resume`]'s walk. Plan D132 (review H3): an `awaiting_approval` run whose cursor
+    /// is not a rest — `Create`, `Run` or `Finished`, which is a `done`, `superseded` or
+    /// `selected` parked step — is a command that crashed between its first write and its
+    /// `unpark`. Every guard refuses it, so the run is unparked here, the frontier that command
+    /// would have reconciled is reconciled (plan D97; a refusal parks the run again), and the walk
+    /// goes on. A run parked at a real rest (`Rest`), or at a fan-out slot a human has to route
+    /// (`Fan`, `Select`), is left where it is.
+    async fn walk_resumed(&self, run: RunId) -> Result<Rest, EngineError> {
+        let row = self.run(run).await?;
+        if row.status == RunStatus::AwaitingApproval {
+            let snapshot = Self::snapshot_of(&row)?;
+            let steps = self.parts.store.run_steps(run).await?;
+            if matches!(
+                cursor(&snapshot, &steps),
+                Cursor::Create { .. } | Cursor::Run(_) | Cursor::Finished
+            ) {
+                self.unpark(&row, self.now()).await?;
+                if let Some(winner) = recover::frontier(&snapshot, &steps)
+                    && let Some(done) = steps.iter().find(|step| step.id == winner)
+                {
+                    let siblings =
+                        Self::siblings(&group_at(&steps, done.position, done.attempt), winner);
+                    let row = self.run(run).await?;
+                    if let Some(rest) = self.reconcile_done_step(&row, done, &siblings).await? {
+                        return Ok(rest);
+                    }
+                }
+            }
+        }
+        self.run_to_rest(run).await
     }
 
     // -- stage 1 -------------------------------------------------------------------------------
