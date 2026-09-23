@@ -634,8 +634,10 @@ impl Cli {
         Ok(())
     }
 
-    /// D25: `git merge --no-ff --no-edit -m "htui: reconcile <step>" <after>` in the primary
-    /// checkout, under the four identity variables.
+    /// D25: `git -c merge.log=false merge --no-ff --no-edit -m "htui: reconcile <step>" <after>`
+    /// in the primary checkout, under the four identity variables. Plan D148: `merge.log` is off
+    /// so a primary that sets it still gets D25's exact message; `--no-verify` is not passed, so
+    /// the user's hooks stay their policy (plan D147 reads past a body they add).
     ///
     /// Exit 0 is checked against `gix`: the new `HEAD`'s parents must be exactly
     /// `[before, after]`, `before` being the primary's `HEAD` at the call — the step's base, or a
@@ -678,6 +680,8 @@ impl Cli {
                 "merge",
                 primary,
                 &[
+                    OsStr::new("-c"),
+                    OsStr::new("merge.log=false"),
                     OsStr::new("merge"),
                     OsStr::new("--no-ff"),
                     OsStr::new("--no-edit"),
