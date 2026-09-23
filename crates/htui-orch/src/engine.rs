@@ -265,7 +265,10 @@ pub type DriverFor<'a> =
 /// [`Heartbeat::Abandoned`] never enters it: another process holds that lease. [`Engine::sweep`]
 /// first retries the release of every run in it and drops each one the store answers, so
 /// `adopt_runs` then sees the run as free. Plan D88 still keeps the sweep off every lease a live
-/// walk of this process holds, and a run this process takes again leaves the set.
+/// walk of this process holds, and a run this process takes again leaves the set. Commands in one
+/// process are not fenced against each other yet (R-27): a sweep that races a resume of the same
+/// run may give back the resumed walk's lease. That walk's next refresh then matches no row, and
+/// the walk is abandoned before it writes again.
 ///
 /// It belongs to the process, not to an [`Engine`]: an engine is built per command (plan D16)
 /// and only borrows it. A restarted process starts with an empty set, and its old owner's leases
@@ -1076,7 +1079,8 @@ where
     /// any process's sweep, this one's included. On
     /// [`crate::recover::Heartbeat::Abandoned`], and on [`crate::recover::Heartbeat::Expired`]
     /// (plan D122: refreshes kept failing until the lease was one interval from lapsing), the
-    /// walk is dropped where it stands, **before** anything else, then
+    /// walk is dropped where it stands, **before** anything else. An expired run then enters
+    /// [`DeadWalks`] (plan D140), so the next sweep gives its lease back. Then
     /// `Isolator::release` drops this process's guards for the run (D99), and the caller gets
     /// [`EngineError::LeaseLost`]. Generic over the walk's output, so one wrapper serves every
     /// command's post-unpark tail (blueprint F-M).
@@ -1116,9 +1120,15 @@ where
                 Ok(out)
             }
             // Plan D122: a heartbeat that fenced itself is treated exactly as a taken lease.
-            Either::Right((Heartbeat::Abandoned | Heartbeat::Expired, walk)) => {
+            Either::Right((beat @ (Heartbeat::Abandoned | Heartbeat::Expired), walk)) => {
                 // Before anything else (plan D86): the walk must not write once the lease is gone.
                 drop(walk);
+                // Plan D140: an expired lease may still name this process, and the store that
+                // failed the refreshes would fail a release too, so the sweep gives it back. An
+                // abandoned lease is a stranger's and is never ours to release.
+                if beat == Heartbeat::Expired {
+                    self.parts.dead_walks.insert(run);
+                }
                 if let Err(err) = self.parts.isolator.release(run).await {
                     tracing::warn!(%run, %err, "releasing the run's guards after an abandon failed");
                 }
@@ -1174,9 +1184,12 @@ where
 
     /// The store's `take_lease(run, box, owner, now, now + ttl)` and its bare answer: `false` is
     /// "not takeable here", which [`Self::take_lease`] words and the sweep skips (plan D126).
+    ///
+    /// Plan D140: a run taken here is about to be walked, so it leaves [`DeadWalks`]. The sweep
+    /// must not give back the lease of a live walk.
     async fn renew_lease(&self, run: RunId) -> Result<bool, EngineError> {
         let now = self.now();
-        Ok(self
+        let taken = self
             .parts
             .store
             .take_lease(
@@ -1186,7 +1199,11 @@ where
                 now,
                 now + self.lease_times().ttl,
             )
-            .await?)
+            .await?;
+        if taken {
+            self.parts.dead_walks.remove(run);
+        }
+        Ok(taken)
     }
 
     /// Plan D133: a command whose first compare-and-set answered `Ok(false)` gives back the lease
@@ -1201,6 +1218,9 @@ where
     /// (plan D88 skips only a row this process still owns). A heartbeat refresh that hung and
     /// commits after the release matches no row, so it cannot take the lease back. A zero-row
     /// answer is ignored and an error is warned; neither is raised.
+    ///
+    /// Plan D140: a release that fails puts the run in [`DeadWalks`], and the next
+    /// [`Self::sweep`] tries again. Any answer from the store takes the run out.
     async fn release_lease(&self, run: RunId) {
         match self
             .parts
@@ -1209,9 +1229,10 @@ where
             .await
         {
             // `false`: the lease is no longer ours, so there is nothing of ours to give back.
-            Ok(_) => {}
+            Ok(_) => self.parts.dead_walks.remove(run),
             Err(err) => {
-                tracing::warn!(%run, %err, "releasing the lease failed; it expires at its TTL")
+                tracing::warn!(%run, %err, "releasing the lease failed; the next sweep retries it");
+                self.parts.dead_walks.insert(run);
             }
         }
     }
@@ -1233,12 +1254,19 @@ where
     /// [`Next::Error`], a `warn`, an `item_note` and a released lease, and the next run is
     /// recovered.
     ///
+    /// Plan D140: before adopting, the sweep gives back the lease of every run in [`DeadWalks`].
+    /// Those runs' walks died in this process, and the release clears the owner, so
+    /// `adopt_runs` sees them as free. A release that fails again leaves the run in the set.
+    ///
     /// The heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
     /// driver enabled (blueprint H-3).
     ///
     /// # Errors
     /// Only `adopt_runs`' own store error: nothing was adopted then.
     pub async fn sweep(&self) -> Result<Vec<Adopted>, EngineError> {
+        for run in self.parts.dead_walks.runs() {
+            self.release_lease(run).await;
+        }
         let now = self.now();
         let times = self.lease_times();
         let adopted = self
