@@ -11376,6 +11376,140 @@ mod tests {
         );
     }
 
+    /// How long a case waits on a walk or a `prepare` that must not queue behind a stale
+    /// `shared_serialized` guard; nothing it waits on sleeps, so reaching it is the hang.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// `FEAT-3` on `shared_serialized` isolation, started, and its walk dropped inside `prd`'s
+    /// session: after `prepare` took the phase's guard and before `capture` would free it. A
+    /// panicked walk task leaves exactly this — the guard lives in the isolator's map, not on the
+    /// walk's stack, so no unwind drops it — and neither of `walk_leased`'s release arms nor
+    /// [`super::Engine::abandoned`] runs. `prd` wrote no document, so its recovery walks it
+    /// again. Answers the `running` run.
+    async fn dead_serialized_walk(harness: &Harness) -> htui_core::model::RunId {
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                phase.isolation = Some(htui_core::model::Isolation::SharedSerialized);
+            })
+            .await;
+        let stalled = harness.orch.stall_after_done("prd", 1, None, false);
+        let walk = harness.dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        });
+        match futures::future::select(Box::pin(walk), Box::pin(stalled.notified())).await {
+            futures::future::Either::Left((outcome, _)) => {
+                panic!("the walk finished instead of stalling: {outcome:?}")
+            }
+            futures::future::Either::Right(((), walk)) => drop(walk),
+        }
+        let run = harness
+            .orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|run| run.id != ids::RUN_2)
+            .expect("the dead walk's run exists")
+            .id;
+        assert_eq!(harness.orch.run(run).await.status, RunStatus::Running);
+        assert_eq!(harness.orch.isolator.releases(), 0, "nothing freed the guard");
+        run
+    }
+
+    /// MOD-4 plan D210 (review H1): the sweep's dead-walk pre-pass releases the dead walk's
+    /// `shared_serialized` guards (`Isolator::release`, as plan D188's `abandoned` does) before it
+    /// gives the lease back, so the adopted run walks on instead of queueing behind its own
+    /// stale guard for as long as the process lives.
+    #[tokio::test]
+    async fn a_dead_shared_serialized_walk_is_adopted_and_walks_on() {
+        let harness = Harness::new().await;
+        let run = dead_serialized_walk(&harness).await;
+        harness.orch.dead_walks.mark(run);
+        harness_engine!(harness.orch, engine);
+
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [run],
+            "the dead walk's lease was given back, so this process adopts the run"
+        );
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            1,
+            "the pre-pass released the dead walk's guards"
+        );
+        let resumed = tokio::time::timeout(PATIENCE, harness.resume(run))
+            .await
+            .expect("the resumed walk does not queue behind the dead walk's guard")
+            .expect("the walk resumes");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(0),
+                    ..
+                })
+            ),
+            "`prd` was walked again and parked at its gate: {resumed:?}"
+        );
+    }
+
+    /// MOD-4 plan D210 (review H1), the window before the sweep: a command that takes a dead
+    /// walk's lease first — `Resume`'s `take_lease` — takes the run out of the dead-walk set, so
+    /// no pre-pass would ever release its guards. The take releases them itself, and another
+    /// run's `shared_serialized` step on the repository no longer queues behind them.
+    #[tokio::test]
+    async fn a_resume_before_the_sweep_releases_a_dead_walks_guards() {
+        use crate::isolate::Isolator as _;
+
+        let harness = Harness::new().await;
+        let run = dead_serialized_walk(&harness).await;
+        harness.orch.dead_walks.mark(run);
+        harness_engine!(harness.orch, engine);
+
+        engine
+            .take_lease(run)
+            .await
+            .expect("the dead walk's lease is this process's");
+        assert!(!harness.orch.dead_walks.contains(run));
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            1,
+            "the take released the dead walk's guards"
+        );
+
+        let other = htui_core::model::RunId::new();
+        tokio::time::timeout(
+            PATIENCE,
+            harness.orch.isolator.prepare(
+                other,
+                StepId::new(),
+                &[],
+                htui_core::model::Isolation::SharedSerialized,
+                None,
+            ),
+        )
+        .await
+        .expect("another run's step does not queue behind the dead walk's guard")
+        .expect("the fake prepares");
+        harness
+            .orch
+            .isolator
+            .release(other)
+            .await
+            .expect("the fake releases");
+
+        tokio::time::timeout(PATIENCE, harness.resume(run))
+            .await
+            .expect("the resumed walk does not queue behind the dead walk's guard")
+            .expect("the walk resumes");
+    }
+
     /// Blueprint D204 (R-52, H-3): milestone 6 spawns engine futures onto tokio tasks, so the
     /// entries a task awaits are `Send` over the worker's own part shapes — `dyn Isolator`,
     /// `dyn Verifier` and `dyn Clock`. A compile-time check: nothing is polled.
