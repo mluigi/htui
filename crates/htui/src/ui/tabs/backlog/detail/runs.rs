@@ -1099,43 +1099,18 @@ impl DetailTab for RunsTab {
         }
     }
 
+    /// The footer a modal asks in is drawn whatever the list holds, so the close-out of an item
+    /// with no run is on screen too: `C` needs no run (`close_out_enabled`).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
             message(frame, area, "No item selected.", ctx.theme);
             return;
         }
-        if self.runs.is_empty() {
-            message(frame, area, "No runs for this item.", ctx.theme);
-            return;
-        }
-
         if let Mode::Artifact { doc, scroll, .. } = &self.mode {
             render_artifact(frame, area, doc.as_deref(), *scroll, ctx.theme);
             return;
         }
 
-        let cursor = self.entry();
-        let step_cursor = self.selected_step();
-        let mut lines: Vec<Line<'static>> = header_lines(ctx.theme).into();
-        for (at, run) in self.runs.iter().enumerate().skip(self.first_visible()) {
-            let mut header = run_lines(run, ctx.theme);
-            if cursor == Some(Entry::Run { run: at }) {
-                // A run with no step is its own entry (D198); the run grid has no cursor column,
-                // so its kind cell takes the accent instead.
-                if let Some(kind) = header.first_mut().and_then(|line| line.spans.first_mut()) {
-                    kind.style = ctx.theme.accent;
-                }
-            }
-            lines.extend(header);
-            for step in &run.steps {
-                lines.extend(step_lines(
-                    step,
-                    &run.steps,
-                    step_cursor == Some(step.id),
-                    ctx.theme,
-                ));
-            }
-        }
         let footer = self.footer(area.width, ctx.theme);
         let height = footer
             .iter()
@@ -1146,12 +1121,57 @@ impl DetailTab for RunsTab {
             Constraint::Length(u16::try_from(height).unwrap_or(u16::MAX)),
         ])
         .areas(area);
-        frame.render_widget(Paragraph::new(lines), list);
         frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), prompt);
+        if self.runs.is_empty() {
+            message(frame, list, "No runs for this item.", ctx.theme);
+            return;
+        }
+
+        // The header stays on top, and the runs under it scroll so the cursor's lines are always
+        // in the rows the footer leaves: D197 made every step two lines, and one long run can be
+        // more than a pane.
+        let [head, body] =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(list);
+        frame.render_widget(Paragraph::new(Vec::from(header_lines(ctx.theme))), head);
+        let (lines, cursor_end) = self.list_lines(ctx.theme);
+        let skip = cursor_end.saturating_sub(usize::from(body.height));
+        frame.render_widget(
+            Paragraph::new(lines).scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0)),
+            body,
+        );
     }
 }
 
 impl RunsTab {
+    /// The runs from the first visible one, each with its steps, and the line index just past the
+    /// cursor's entry (0 with no cursor): what the list has to show to keep the cursor in view.
+    fn list_lines(&self, theme: &Theme) -> (Vec<Line<'static>>, usize) {
+        let cursor = self.entry();
+        let step_cursor = self.selected_step();
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut cursor_end = 0;
+        for (at, run) in self.runs.iter().enumerate().skip(self.first_visible()) {
+            let mut header = run_lines(run, theme);
+            if cursor == Some(Entry::Run { run: at }) {
+                // A run with no step is its own entry (D198); the run grid has no cursor column,
+                // so its kind cell takes the accent instead.
+                if let Some(kind) = header.first_mut().and_then(|line| line.spans.first_mut()) {
+                    kind.style = theme.accent;
+                }
+                cursor_end = lines.len() + header.len();
+            }
+            lines.extend(header);
+            for step in &run.steps {
+                let on_cursor = step_cursor == Some(step.id);
+                lines.extend(step_lines(step, &run.steps, on_cursor, theme));
+                if on_cursor {
+                    cursor_end = lines.len();
+                }
+            }
+        }
+        (lines, cursor_end)
+    }
+
     /// What a capturing mode asks, drawn under the run list; nothing while browsing.
     fn footer(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         let hint = |text: &str| Line::styled(text.to_owned(), theme.dim);
@@ -2858,7 +2878,9 @@ mod tests {
         );
         let drawn = lines(&pane, &shell);
         assert!(
-            drawn.iter().any(|line| line.starts_with("close FEAT-1 \u{b7}")),
+            drawn
+                .iter()
+                .any(|line| line.starts_with("close FEAT-1 \u{b7}")),
             "the warning is on screen: {drawn:#?}"
         );
         pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
