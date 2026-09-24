@@ -178,6 +178,19 @@ pub enum StoreRequest {
         /// The step the chat records against.
         step_id: StepId,
     },
+    /// Stream a live chat's frames to this request's address from now on (MOD-4 plan D165,
+    /// blueprint D185).
+    ///
+    /// The Chat tab sends it when a promoted chat is accepted. A promotion's address is an `Orch`
+    /// request's, and any later `Orch` request from the tab — a second promotion the run runtime
+    /// refuses included — supersedes it in the shell's staleness index (`App::is_fresh`), which
+    /// would drop every frame after it. Nothing else from the tab supersedes this one while the
+    /// chat is live. Answered by the stream itself: no reply of its own, and none for a chat that
+    /// is already over.
+    ChatFollow {
+        /// The step the chat records against.
+        step_id: StepId,
+    },
     /// Probe every enabled registry row on this box and write `agent_box` (MOD-2 D53, `R-AGT-6`).
     ///
     /// Served by the agent runtime's own task, never inside the loop: a probe spawns processes and
@@ -542,6 +555,7 @@ impl StoreRequest {
             Self::ChatSend { .. } => "chat_send",
             Self::ChatAnswer { .. } => "chat_answer",
             Self::ChatCancel { .. } => "chat_cancel",
+            Self::ChatFollow { .. } => "chat_follow",
             Self::ProbeAgents => "probe_agents",
             Self::InstallPlan { .. } => "install_plan",
             Self::InstallConfirm { .. } => "install_confirm",
@@ -967,9 +981,9 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             step_id: *step,
             events: backend.step_events(*step).await?,
         },
-        // The four chat requests need the worker loop's own state (the live sessions), and the
+        // The five chat requests need the worker loop's own state (the live sessions), and the
         // probe, the preview, the three install requests and MOD-21's four login ones need the
-        // runtime that owns their tasks, so all thirteen are served ahead of this function, exactly
+        // runtime that owns their tasks, so all fourteen are served ahead of this function, exactly
         // as `ApplyMigrations` is. One of them that reaches here at all belongs to a caller with no
         // runtime — the test harness without one — and saying so is more use than a panic.
         StoreRequest::PromptPreview { .. }
@@ -977,6 +991,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::ChatSend { .. }
         | StoreRequest::ChatAnswer { .. }
         | StoreRequest::ChatCancel { .. }
+        | StoreRequest::ChatFollow { .. }
         | StoreRequest::ProbeAgents
         | StoreRequest::InstallPlan { .. }
         | StoreRequest::InstallConfirm { .. }
@@ -1469,6 +1484,7 @@ pub fn spawn_with_runtimes(
                         | StoreRequest::ChatSend { .. }
                         | StoreRequest::ChatAnswer { .. }
                         | StoreRequest::ChatCancel { .. }
+                        | StoreRequest::ChatFollow { .. }
                         | StoreRequest::ProbeAgents
                         | StoreRequest::InstallPlan { .. }
                         | StoreRequest::InstallConfirm { .. }
@@ -2524,6 +2540,13 @@ mod tests {
             "auth_open"
         );
         assert_eq!(StoreRequest::AuthCancel.name(), "auth_cancel");
+        assert_eq!(
+            StoreRequest::ChatFollow {
+                step_id: StepId::new()
+            }
+            .name(),
+            "chat_follow"
+        );
     }
 
     /// A shell with no agent runtime answers each of the four by name, exactly once, rather than

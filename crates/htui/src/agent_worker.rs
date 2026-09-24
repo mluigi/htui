@@ -129,6 +129,10 @@ pub struct LiveChat {
     caps: DriverCaps,
     /// The spawned task, when production spawned one.
     task: Option<JoinHandle<()>>,
+    /// Where the chat's frames go, for [`StoreRequest::ChatFollow`] and a refused promotion to
+    /// move (blueprint D185). The address alone, not a sender: a runtime holding a reply sender
+    /// per chat would keep the reply channel open after every session had ended.
+    stream: Stream,
 }
 
 impl core::fmt::Debug for LiveChat {
@@ -534,7 +538,9 @@ impl AgentRuntime {
     /// started this agent here.
     ///
     /// Answers [`Served::Start`], whose session answers `addr` with `ChatAccepted` and every frame
-    /// after it, or a `Failed` for `promote_step`.
+    /// after it, or a `Failed` for `promote_step`. While a chat is live it answers
+    /// [`Served::Deferred`], having refused at `addr` itself and moved the live chat's stream there
+    /// (blueprint D185).
     pub async fn attach_promoted(
         &mut self,
         backend: &Backend,
@@ -558,6 +564,27 @@ impl AgentRuntime {
     ) -> Result<Served, StoreError> {
         // A chat that ended on this step before must not make the new one a second entry.
         self.live.retain(|_, chat| !chat.commands.is_closed());
+        // Blueprint D185, for the race the run runtime's guard cannot see: two promotions served
+        // before either was bound both found no chat live, so both passed `chat_open`. A chat this
+        // runtime already holds is the only one — a second session on the same step would be two
+        // agents writing one log, and on another step a chat the tab cannot hold — so this one is
+        // refused with `ChatLive(None)`'s sentence.
+        //
+        // The tab reset its view when it read this promotion's `Promoted`, and this address is now
+        // the newest `Orch` one from it, which leaves the live chat's own address stale. So the
+        // live chat's stream moves here and its acceptance is sent again, after the refusal: the
+        // tab is left driving the one session rather than beside a chat it can neither see nor end.
+        if let Some(chat) = self.live.values().find(|chat| !chat.commands.is_closed()) {
+            chat.stream.hand_over(
+                replies,
+                addr,
+                StoreReply::Failed {
+                    request: PROMOTE_STEP,
+                    message: htui_orch::EngineError::ChatLive { step: None }.to_string(),
+                },
+            );
+            return Ok(Served::Deferred);
+        }
         let crate::run_worker::Promoted {
             step: step_id,
             project: project_id,
@@ -627,12 +654,14 @@ impl AgentRuntime {
 
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let caps = driver.caps();
+        let frames = Frames::new(replies.clone(), addr);
         self.live.insert(
             step_id,
             LiveChat {
                 commands: commands_tx,
                 caps,
                 task: None,
+                stream: frames.stream.clone(),
             },
         );
         self.started.push(step_id);
@@ -647,10 +676,7 @@ impl AgentRuntime {
             policy: settings.permission,
             caps,
             commands: commands_rx,
-            frames: Frames {
-                tx: replies.clone(),
-                addr,
-            },
+            frames,
             grace: self.grace,
             reprobe: None,
             project_caps,
@@ -746,6 +772,10 @@ impl AgentRuntime {
                 "chat_cancel",
                 ChatCommand::Cancel { reply: Some(addr) },
             ),
+            StoreRequest::ChatFollow { step_id } => {
+                self.follow(*step_id, addr);
+                Served::Deferred
+            }
             StoreRequest::ProbeAgents => match self.probe(backend, replies, addr).await {
                 Ok(served) => served,
                 Err(err) => Served::Reply(failed("probe_agents", &err)),
@@ -917,10 +947,7 @@ impl AgentRuntime {
             box_id,
             agents,
             cwd,
-            frames: Frames {
-                tx: replies.clone(),
-                addr,
-            },
+            frames: Frames::new(replies.clone(), addr),
         })));
         Ok(Served::Deferred)
     }
@@ -1019,10 +1046,7 @@ impl AgentRuntime {
                 config,
                 agent,
                 cwd,
-                frames: Frames {
-                    tx: replies.clone(),
-                    addr,
-                },
+                frames: Frames::new(replies.clone(), addr),
             },
             cancel.clone(),
         ));
@@ -1069,10 +1093,7 @@ impl AgentRuntime {
             existing: summary.on_box,
             cwd,
             cancel: cancel.clone(),
-            frames: Frames {
-                tx: replies.clone(),
-                addr,
-            },
+            frames: Frames::new(replies.clone(), addr),
         }));
         self.install = Some(LiveInstall {
             agent_id,
@@ -1177,10 +1198,7 @@ impl AgentRuntime {
             cancel: cancel.clone(),
             commands: commands_rx,
             opener: self.opener.clone(),
-            frames: Frames {
-                tx: replies.clone(),
-                addr,
-            },
+            frames: Frames::new(replies.clone(), addr),
         }));
         self.auth = Some(LiveAuth {
             agent_id,
@@ -1274,6 +1292,21 @@ impl AgentRuntime {
             ));
         }
         Ok(())
+    }
+
+    /// [`StoreRequest::ChatFollow`]: the live chat on `step_id` streams at `addr` from now on
+    /// (blueprint D185).
+    ///
+    /// Nothing is answered: the stream is the answer, and a chat that is already over has sent its
+    /// last frame to the address it had.
+    fn follow(&self, step_id: StepId, addr: ReplyAddr) {
+        if let Some(chat) = self
+            .live
+            .get(&step_id)
+            .filter(|chat| !chat.commands.is_closed())
+        {
+            chat.stream.follow(addr);
+        }
     }
 
     /// Forwards a command to a live chat.
@@ -1419,12 +1452,14 @@ impl AgentRuntime {
 
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let caps = driver.caps();
+        let frames = Frames::new(replies.clone(), addr);
         self.live.insert(
             chat.step_id,
             LiveChat {
                 commands: commands_tx,
                 caps,
                 task: None,
+                stream: frames.stream.clone(),
             },
         );
         self.started.push(chat.step_id);
@@ -1476,10 +1511,7 @@ impl AgentRuntime {
             policy: settings.permission,
             caps,
             commands: commands_rx,
-            frames: Frames {
-                tx: replies.clone(),
-                addr,
-            },
+            frames,
             grace: self.grace,
             reprobe,
             project_caps,
@@ -1714,7 +1746,7 @@ async fn run_probe(args: ProbeArgs) {
             ProbeOutcome::Row(row) => {
                 if let Err(err) = writer.upsert_agent_box(&row).await {
                     frames.reply(
-                        &frames.addr,
+                        &frames.addr(),
                         StoreReply::Failed {
                             request: "probe_agents",
                             message: err.to_string(),
@@ -1732,7 +1764,7 @@ async fn run_probe(args: ProbeArgs) {
         }
     }
 
-    frames.reply(&frames.addr, StoreReply::Agents(agents));
+    frames.reply(&frames.addr(), StoreReply::Agents(agents));
 }
 
 /// Whether this box's row for an agent is worth re-probing (plan D55).
@@ -2048,7 +2080,7 @@ async fn run_plan(args: PlanArgs, cancel: CancellationToken) {
         cwd,
         frames,
     } = args;
-    let addr = frames.addr.clone();
+    let addr = frames.addr();
 
     // Here and not on the loop: `Client::build` can fail, and a failure inside a `select!` arm
     // would be a panic that takes the worker with it (blueprint P-13).
@@ -2117,7 +2149,7 @@ async fn run_install(args: InstallArgs) {
         cancel,
         frames,
     } = args;
-    let addr = frames.addr.clone();
+    let addr = frames.addr();
 
     let installer = match Installer::new(config.clone()) {
         Ok(installer) => installer,
@@ -2259,7 +2291,7 @@ async fn run_auth(args: AuthArgs) {
         frames,
     } = args;
     // The `AuthStart`'s address until the choice arrives, and the `AuthChoose`'s afterwards.
-    let mut addr = frames.addr.clone();
+    let mut addr = frames.addr();
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (choice_tx, choice_rx) = oneshot::channel();
@@ -2431,19 +2463,106 @@ fn auth_frame(event: AuthEvent) -> AuthFrame {
     }
 }
 
+/// Where a task's frames go: the address of the request that opened it, until a chat's is moved.
+///
+/// A chat is the one task whose address can move (MOD-4 plan D165, blueprint D185). A promoted
+/// chat opens at an `Orch` request's address, and the shell's staleness index is keyed by request
+/// kind (`App::is_fresh`), so any later `Orch` request from the Chat tab — a second promotion the
+/// run runtime refuses included — would supersede it, and every frame after it would be dropped
+/// as stale while the store went on recording. [`StoreRequest::ChatFollow`] moves the stream to a
+/// chat request's address that nothing else from the tab supersedes, and a promotion refused at
+/// the bind moves it to that promotion's (`AgentRuntime::attach_promoted`).
+///
+/// Shared, because the mover is the runtime and the sender is the session task. One lock around
+/// both the address and the send, so no frame is sent to an address a move has already left, and
+/// the acceptance a move re-sends reaches the new address before any frame that follows it.
+#[derive(Debug, Clone)]
+struct Stream(Arc<Mutex<StreamState>>);
+
+/// [`Stream`]'s state.
+#[derive(Debug)]
+struct StreamState {
+    /// Where the next frame goes.
+    addr: ReplyAddr,
+    /// The chat's `ChatAccepted`, once sent: what a move re-sends to an asker that has not seen it.
+    accepted: Option<StoreReply>,
+}
+
+impl Stream {
+    fn lock(&self) -> std::sync::MutexGuard<'_, StreamState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// [`StoreRequest::ChatFollow`]: every frame from now on goes to `addr`.
+    fn follow(&self, addr: ReplyAddr) {
+        self.lock().addr = addr;
+    }
+
+    /// A refused promotion (blueprint D185): `refusal` answers `addr`, then the stream moves there
+    /// and the acceptance, once there is one, is sent again, because the asker's view of the chat
+    /// was reset since it was first sent. One lock for all three, so no frame lands between them.
+    fn hand_over(
+        &self,
+        tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        refusal: StoreReply,
+    ) {
+        let send = |reply: StoreReply| {
+            // A UI that has gone away is not an error, as in `Frames::send`.
+            let _ = tx.send(ReplyEnvelope {
+                seq: addr.seq,
+                origin: addr.origin.clone(),
+                reply,
+            });
+        };
+        let mut state = self.lock();
+        send(refusal);
+        if let Some(accepted) = state.accepted.clone() {
+            send(accepted);
+        }
+        state.addr = addr.clone();
+    }
+}
+
 /// The reply-channel side of one chat: one address, one sender, one place frames are shaped.
 struct Frames {
     tx: mpsc::UnboundedSender<ReplyEnvelope>,
-    addr: ReplyAddr,
+    stream: Stream,
 }
 
 impl Frames {
+    /// Frames answering at `addr`, the address of the request that opened the task.
+    fn new(tx: mpsc::UnboundedSender<ReplyEnvelope>, addr: ReplyAddr) -> Self {
+        Self {
+            tx,
+            stream: Stream(Arc::new(Mutex::new(StreamState {
+                addr,
+                accepted: None,
+            }))),
+        }
+    }
+
+    /// Where the stream goes now.
+    fn addr(&self) -> ReplyAddr {
+        self.stream.lock().addr.clone()
+    }
+
+    /// Sends `reply` at the stream's address, under the lock a move takes.
+    fn to_stream(&self, reply: StoreReply) {
+        let state = self.stream.lock();
+        self.send(state.addr.clone(), reply);
+    }
+
+    /// The chat's acceptance, at the stream's address, kept for a move to re-send.
+    fn accept(&self, reply: StoreReply) {
+        let mut state = self.stream.lock();
+        state.accepted = Some(reply.clone());
+        self.send(state.addr.clone(), reply);
+    }
+
     /// One recorded, scrubbed envelope.
     fn event(&self, envelope: DriverEnvelope) {
-        self.send(
-            self.addr.clone(),
-            StoreReply::Chat(ChatFrame::Event(Box::new(envelope))),
-        );
+        self.to_stream(StoreReply::Chat(ChatFrame::Event(Box::new(envelope))));
     }
 
     /// One of the three rows `htui` authors itself, shaped as an `other` event for transport only.
@@ -2463,18 +2582,12 @@ impl Frames {
 
     /// The session is over.
     fn ended(&self, stop_reason: StopReason) {
-        self.send(
-            self.addr.clone(),
-            StoreReply::Chat(ChatFrame::Ended { stop_reason }),
-        );
+        self.to_stream(StoreReply::Chat(ChatFrame::Ended { stop_reason }));
     }
 
     /// The session died.
     fn failed(&self, message: String) {
-        self.send(
-            self.addr.clone(),
-            StoreReply::Chat(ChatFrame::Failed { message }),
-        );
+        self.to_stream(StoreReply::Chat(ChatFrame::Failed { message }));
     }
 
     /// Answers one request by its own address.
@@ -2533,19 +2646,15 @@ pub async fn run_chat(args: ChatArgs) {
 
     let scrubber = MinimalScrubber::new(spec.env.values().cloned());
     let step_id = binding.step_id();
-    let start_addr = frames.addr.clone();
 
     let mut session = match driver.start(spec, prompt.clone()).await {
         Ok(session) => session,
         Err(err) => {
             let message = err.to_string();
-            frames.reply(
-                &start_addr,
-                StoreReply::Failed {
-                    request: binding.request(),
-                    message: message.clone(),
-                },
-            );
+            frames.to_stream(StoreReply::Failed {
+                request: binding.request(),
+                message: message.clone(),
+            });
             binding.close(&writer, RunStatus::Failed).await;
             frames.failed(message);
             // Plan D60. A failure to *spawn* is a fact about this box's row, not about the
@@ -2567,15 +2676,12 @@ pub async fn run_chat(args: ChatArgs) {
         }
     };
 
-    frames.reply(
-        &start_addr,
-        StoreReply::ChatAccepted {
-            step_id,
-            session_ref: session.session_ref().cloned(),
-            caps,
-            writer_label,
-        },
-    );
+    frames.accept(StoreReply::ChatAccepted {
+        step_id,
+        session_ref: session.session_ref().cloned(),
+        caps,
+        writer_label,
+    });
 
     let (ui_tx, mut ui_rx) = mpsc::channel(UI_FRAMES);
     let retain_raw = std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1");
@@ -6995,13 +7101,13 @@ done
                 cancel: CancellationToken::new(),
                 commands: commands_rx,
                 opener: OpenerCommand::Custom(recorder(tmp.path())),
-                frames: Frames {
+                frames: Frames::new(
                     tx,
-                    addr: ReplyAddr {
+                    ReplyAddr {
                         seq: 2,
                         origin: origin.clone(),
                     },
-                },
+                ),
             })
             .await;
 

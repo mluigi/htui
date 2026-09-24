@@ -503,7 +503,7 @@ impl Tab for ChatTab {
         handled
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Agents(agents) => {
                 self.agents = agents
@@ -521,6 +521,13 @@ impl Tab for ChatTab {
             } => {
                 self.pending_start = false;
                 self.refusal = None;
+                // Blueprint D185: a promotion's chat streams at the promotion's address, an `Orch`
+                // one, and the next `Orch` request from this tab (a refused second promotion)
+                // would make every frame after it stale. Its frames follow this tab to a chat
+                // request's address instead, which nothing else it sends supersedes.
+                if self.promoted.is_some() {
+                    ctx.request(StoreRequest::ChatFollow { step_id: *step_id });
+                }
                 // A chat the tab started itself, after a promoted one has ended, is not the
                 // promoted step's: its header goes back to naming the agent picker.
                 if self
