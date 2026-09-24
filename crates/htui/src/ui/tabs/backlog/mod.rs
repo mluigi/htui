@@ -271,18 +271,18 @@ fn panes(area: Rect) -> [Rect; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::DEFAULT_SIZE;
     use crate::ui::Theme;
     use crate::ui::layout::chrome;
-    use ratatui::widgets::Block;
 
-    /// The sub-tab strip fits inside the detail pane at the harness's pinned size
-    /// (`testkit::DEFAULT_SIZE`), so a longer title, another sub-tab or a narrower pane fails here
+    /// The sub-tab strip fits inside the detail pane at the harness's pinned size, so a longer title, another sub-tab or a narrower pane fails here
     /// instead of being re-accepted as a clipped snapshot (MOD-30).
     #[test]
     fn the_detail_strip_fits_the_detail_pane() {
-        let body = chrome(Rect::new(0, 0, 100, 30)).body;
+        let (width, height) = DEFAULT_SIZE;
+        let body = chrome(Rect::new(0, 0, width, height)).body;
         let [_, right] = panes(body);
-        let inner = Block::bordered().inner(right);
+        let inner = detail::frame_block(None).inner(right);
         let tab = BacklogTab::new();
         let strip = detail::strip_line(&tab.detail, &Theme::default());
         assert!(

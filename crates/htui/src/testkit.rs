@@ -31,7 +31,7 @@ use crate::ui::tabs::Tab;
 use crate::ui::tabs::settings::{SettingsSection, SettingsTab};
 
 /// Default snapshot size (plan risk row: snapshots are flaky across terminal sizes).
-const DEFAULT_SIZE: (u16, u16) = (100, 30);
+pub(crate) const DEFAULT_SIZE: (u16, u16) = (100, 30);
 
 /// How many "serve everything queued" rounds [`Harness::settle`] may take.
 const SETTLE_ROUNDS: usize = 32;
