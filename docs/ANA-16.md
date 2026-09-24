@@ -8,13 +8,16 @@
 > `R-AGT-5`, `R-AGT-6`, `R-AGT-9`, `R-ORCH-8`, `R-ORCH-10..12`, `R-HIS-1`, `R-SEC-2`, `R-MCP-1`,
 > `R-NF-1..3`.
 >
-> **Status (2026-09-24): concluded.** Verdict: feasible; the premise is half right. Running away from
-> the TUI needs a process that outlives it, but that process is a **headless `htui` worker per
-> executing box** talking only to Postgres (`R-ORCH-12`), not a new central server. Docker is an
-> execution environment *of* a box, driven by that box's worker; a remote shell is how a remote box's
-> worker is provisioned, not the agent transport.
+> **Status (2026-09-24): concluded, amended the same day after a maintainer challenge (§10).**
+> Verdict: feasible, and phased. Running away from the TUI needs a process that outlives it: a
+> **headless `htui` worker per executing box**. Phase 1 has those workers talk only to Postgres
+> (O3), which already coordinates N concurrent writers (§6.1). Phase 2 puts a **self-hosted
+> control-plane server** (O5a) between workers and Postgres, owning dispatch, enrolment,
+> config/secret distribution, relay and version skew, while the TUI stays a direct Postgres client.
+> A full server in front of every client (O5b) is rejected. Docker is an execution environment *of*
+> a box; a remote shell is how a remote box's worker is provisioned, not the agent transport.
 
-Code citations are against HEAD `ba68682`.
+Code citations are against HEAD `ba68682`; §6-§10 were re-verified against `ac6c2bc`.
 
 ---
 
@@ -163,8 +166,8 @@ Requirement text is quoted verbatim from `docs/REQUIREMENTS.md`.
 
 | ID | Text (verbatim, abridged by ellipsis only) | Bearing |
 |---|---|---|
-| `R-ID-2` (`:38-39`) | "`htui` is not an IDE, not a code editor, not a terminal multiplexer, and not a cloud-hosted service. It is a local-first, developer-guided harness." | A central server contradicts this. A per-box worker is the amendment `R-ORCH-12` already names |
-| `R-ID-3` (`:40-42`) | "Postgres is the single source of truth." | Postgres is already the hub. A second server would be a second place state lives |
+| `R-ID-2` (`:38-39`) | "`htui` is not an IDE, not a code editor, not a terminal multiplexer, and not a cloud-hosted service. It is a local-first, developer-guided harness." | A per-box worker is the amendment `R-ORCH-12` already names. An always-on control plane needs a further amendment (§6.3) |
+| `R-ID-3` (`:40-42`) | "Postgres is the single source of truth." | Postgres is already the hub. A server holds with this only if it keeps no durable state of its own (§6.3) |
 | `R-ID-7` (`:51-52`) | "Any transcript or tool output is scrubbed of secrets on the host box before it is persisted or transmitted. Scrubbing fails closed." | The scrubber must run where the agent's output first lands, i.e. in the executing worker |
 | `R-STO-1` (`:122-125`) | "Connection string and provider identities live in the OS keyring ... never in a file" | A headless Linux host or container has no secret-service session (§2). This is a hard blocker for a headless worker |
 | `R-STO-4` (`:130-132`) | "When Postgres is unreachable ... No item creation, no runs." | The pending buffer was deleted (`docs/decisions/clean/clean-2.md:7-8`), so a worker that loses Postgres cannot keep recording a live run |
@@ -184,7 +187,7 @@ Requirement text is quoted verbatim from `docs/REQUIREMENTS.md`.
 | `R-SEC-2` (`:254-256`) | "resolved at run start into the agent subprocess environment only ... `htui`'s own credentials (R-STO-1) are never exposed to a session." | `docker exec -e` and SSH `SetEnv` must be checked for exposure. The no-`env_clear` inheritance (§2) already breaks this in spirit |
 | `R-MCP-1` (`:265-266`) | "`htui` exposes an MCP server to every session it launches." | A stdio `McpServerSpec` must be launchable where the agent runs |
 | `R-NF-1` (`:324`) | "Windows 10+, Linux, macOS." | Same-path bind mounts do not exist on Windows hosts |
-| `R-NF-2` (`:325`) | "No dependency on any external daemon other than Postgres and the agents." | `dockerd` must be opt-in per box. A central htui server is a new daemon |
+| `R-NF-2` (`:325`) | "No dependency on any external daemon other than Postgres and the agents." | `dockerd` must be opt-in per box. A control-plane server is a new daemon; Qdrant already is one without an amendment (`compose.yaml:51-53`) |
 | `R-NF-3` (`:326-327`) | "the TUI never blocks on network or subprocess I/O." | Unchanged |
 | Out of scope (`:332-335`) | "Any web or GUI front end." | Pushes against an HTTP API server whose natural second client is a web UI |
 
@@ -332,7 +335,8 @@ htui already has the durable log (`session_event`, gapless `seq`: `record.rs:14-
 | O2 | **Container environment of a box**: the box's worker starts one container per session and execs the agent inside it; trees bind-mounted at **identical absolute paths** | Worker on the same host as `dockerd` | Host scratch root, mounted | `dockerd`, opt-in per box | Only if the worker is headless (O3) | `R-NF-2` (opt-in daemon), `R-NF-1` (no same-path mounts on Windows), `R-SEC-2` (exec env exposure, to verify) | **Adopt** for Docker, local and remote |
 | O3 | **Headless worker per box** (`R-ORCH-12`): a `htui` process with no TUI claims runs whose `target_box_id` is its box, drives the engine and writes `session_event`; the TUI is a Postgres client for that box's runs | Worker on the executing box | That box's `repo_box_path` and scratch root | One `htui` process per executing box (not a daemon htui depends on) | Yes | Amends `R-ID-2` (already foreseen). `R-STO-1` keyring on headless hosts. Permission relay needed (§2 gap) | **Adopt**: the core of remote execution |
 | O4 | **Remote Docker daemon from the local worker** (`DOCKER_HOST=ssh://`, bollard `ssh`) | Local worker | Must be copied to the remote host | Remote `dockerd` | If the local worker is headless | Bind mounts are remote paths, so trees need tar or rsync each step; local `git worktree` is pointless; `before_hash`/`after_hash` and the merge must cross the network | **Reject**. O3 plus O2 on the remote box does the same thing with none of the copying |
-| O5 | **Central htui server** with its own API (REST/SSE or JSON-RPC/WebSocket), TUI as thin client, in the style of opencode or Codex | Server | Server's disk, or runners | A new always-on server, auth, TLS, schema for API clients | Yes | Contradicts `R-ID-2`, adds a daemon htui depends on (`R-NF-2`), duplicates `R-ID-3`'s hub, invites a web front end (out of scope). Still needs per-box runners for multi-machine work | **Reject** |
+| O5a | **Control-plane server** (`htui server`): workers dial out to it; it alone holds the worker-facing DSN and owns dispatch, enrolment, config/secret distribution, permission relay and event fan-out. The TUI keeps its direct DSN | Worker on the executing box (as O3) | That box's paths (as O3) | One self-hosted server, plus O3's workers | Yes | Amends `R-NF-2`, `R-ID-2`, `R-ORCH-12` ("polling Postgres"), `R-STO-1`/`R-STO-5` for workers (§6.3) | **Adopt as phase 2** (§7) |
+| O5b | **Full server**: TUI and workers both talk only to it; Postgres private behind it (opencode, Codex, Coder style) | Worker on the executing box | That box's paths | As O5a, and every TUI depends on it | Yes | O5a's amendments plus `R-STO-3/4/6`, `R-TUI-1/8`, out-of-scope "web or GUI front end" (§6.3) | **Reject** |
 | O6 | **In-container agent server** (SWE-ReX, OpenHands, E2B style: HTTP server in the image, htui connects by port and token) | In-container server | Container | A server per container, plus port exposure and tokens | Yes, while the container lives | New transport per agent (breaks `R-AGT-5`); ACP has no stable network transport (`docs/ANA-4.md:99-103`) | **Reject**. Reconsider if the ACP Streamable-HTTP RFD stabilises |
 
 ### 5.2 Why Docker is an environment, not an isolation mode
@@ -394,178 +398,451 @@ is `UNIQUE (user_id, hostname)` (`0001_init.sql:73`) and `register_box` upserts 
 - **Live text.** The recorder flushes only on variant change, message id change, `Done`, 16 KiB or
   session end, with no idle flush (`record.rs:7-12`, `:118`). Reading Postgres alone, a remote run
   shows text in bursts. Options: accept that; or add transient delta `NOTIFY`s under 8000 bytes,
-  droppable and corrected by the durable rows (OpenHands' `Delta` frames). **Do not** add a worker
-  listener socket (the Coder relay), which reintroduces a server.
+  droppable and corrected by the durable rows (OpenHands' `Delta` frames). Under O3 do not add a
+  worker listener socket; under O5a the server is the relay (the Coder shape, §4.4).
 
 ## 6. The "central server" claim, evaluated
 
 The item says remote or container execution "would require a central server with htui as just the
-interface". Against the actual architecture:
+interface". The maintainer then asked two sharper questions: whether a central server would simply
+be better, including as a **configuration manager** for workers, and what happens when several
+agents write Postgres at the same time. §6.1 answers the second, §6.2 lists the configuration a
+manager would own, §6.3 evaluates the server variants, §6.4 compares them and §6.5 draws the line.
 
-1. **The centre already exists, and it is Postgres.** `R-ID-3` puts runs, transcripts, box
-   profiles, the agent registry and settings there. Leases, claims, `target_box_id` and
-   `executing_box_id` are already in the schema (§2). Every process that executes must write
-   Postgres directly (MOD-25: no writable local life; CLEAN-2: no pending buffer). A central htui
-   server would sit *in front of* the single source of truth and duplicate it. ANA-14 already
-   rejected a second hub for the same reason (`docs/ANA-14.md:43-53`).
-2. **What is actually required is an executor that outlives the TUI.** The prior art (§4.3, §4.4)
-   uniformly puts a long-lived process next to the agent. That is `R-ORCH-12`'s "headless `htui`
-   worker per box polling Postgres", one per **executing box**, dialing out only to Postgres (the
-   Coder workspace-daemon shape). It is not central. Two workers on two boxes never talk to each
-   other.
-3. **"htui as just the interface" is true per run, not globally.** For a run whose executing box is
-   not the TUI's box, the TUI only reads and writes rows. On the TUI's own box, the TUI either keeps
-   executing in-process (MOD-4 M6's `run_worker`) or defers to a local headless worker. Both are
-   valid. The requirement is "the executor is wherever the worker is", not "the TUI never
-   executes".
-4. **Local Docker needs no remote process at all.** O2 on the TUI's own box is the in-process
-   `run_worker` plus a container launch. Only *surviving TUI exit* needs O3, and that is true
-   without Docker too.
-5. **Remote shell does not need a server either.** It needs the remote box to run its own worker.
-   SSH is how that worker is installed and started (the VS Code and Zed pattern), not a transport
-   htui keeps open.
+### 6.1 N concurrent writers on one Postgres
 
-**So the claim is refuted as stated and confirmed in a narrower form.** No central server is
-needed. A second `htui` process kind, the headless worker, is needed. It amends `R-ID-2` exactly as
-`R-ORCH-12` already says, and it makes `R-ORCH-12` a prerequisite rather than a later-tier nicety.
+**Short answer.** Concurrent writes are already handled, and a server would not make them more
+correct. Agents never write Postgres; the htui process that hosts them does (recorder, R-MCP-1's
+step-scoped tools: `docs/REQUIREMENTS.md:265-266`). The store was built for several writer
+processes, and Postgres does the coordinating. Under MVCC "reading never blocks writing and writing
+never blocks reading", and row locks "block only writers and lockers to the same row"
+(https://raw.githubusercontent.com/postgres/postgres/master/doc/src/sgml/mvcc.sgml). A server would
+run the same transactions against the same database; its only extra power, serialising in memory,
+holds for one instance only, i.e. a single point of failure.
+
+**What already guarantees it.**
+- **Isolation.** READ COMMITTED throughout; each write path is one statement, so the loser of a
+  compare-and-set race blocks on the row lock, re-evaluates and matches nothing
+  (`crates/htui-store/src/pg/write.rs:4-11`). Exceptions: the chat-run pair takes an explicit
+  transaction, and MOD-15's two deletes run at REPEATABLE READ (same comment).
+- **Status CAS** (ANA-2 inv. 1, `docs/ANA-2.md:103-108`): `transition` updates
+  `WHERE id = $1 AND status = $2` (`write.rs:595-609`); zero rows is a lost race, told apart from
+  "not found" by a re-read. `update_item` is a CAS on `version` (`write.rs:501`, R-ENT-10).
+- **Admission.** `claim_run` locks the run row, then the box row, `FOR UPDATE`
+  (`write.rs:2468-2500`); the box lock is the critical section for the slot count and overlap check
+  (`write.rs:2443-2448`, `:2527-2537`), and the final `UPDATE ... WHERE status = 'queued'`
+  (`:2579-2586`) closes it. Postgres-only pin: `admission_is_serialised_by_the_box_row_lock`
+  (`crates/htui-store/tests/pg_criteria.rs:586`). Two processes on one box cannot both take the last
+  slot; hazard 10's former "admission still races" was wrong at the store level (§9.10). There is no
+  cross-box limit, by design.
+- **Leases.** `refresh_lease` is `WHERE id = $1 AND lease_owner = $2` (`write.rs:2622-2628`);
+  `take_lease` succeeds only if the lease is ours, free or expired **and** `executing_box_id = $2`
+  (`:2734-2751`); `adopt_runs` is one CTE over `FOR UPDATE SKIP LOCKED` with
+  `lease_owner IS DISTINCT FROM $2` (`:2668-2700`), so concurrent sweeps neither deadlock nor
+  double-adopt. `lease_owner` is minted per process (`docs/ANA-2.md:1276-1282`). Defaults: TTL 120 s,
+  refresh 60 s (`crates/htui-orch/src/recover.rs:25-35`). The heartbeat self-fences one refresh
+  before the lease lapses (`recover.rs:97-108`; used at `crates/htui-orch/src/engine.rs:1117-1152`).
+- **Transcript.** One recorder per step; `seq` is gapless with one writer, so
+  `PRIMARY KEY (run_step_id, seq)` is a backstop, not the allocator
+  (`crates/htui-agent/src/record.rs:14-20`), applied as `ON CONFLICT (run_step_id, seq) DO NOTHING`
+  in one statement per batch (`write.rs:657-685`). Different steps never collide.
+- **Settings** are a CAS on `updated_at`; an insert that conflicts is `Stale`, never an overwrite
+  (`write.rs:1960-1975` and the rungs below it).
+- **Seeding** takes `LOCK TABLE app_user IN SHARE ROW EXCLUSIVE MODE` first
+  (`crates/htui-store/src/pg/mod.rs:257-262`) and runs on every connect (`pg/mod.rs:418-424`).
+- **Migrations.** sqlx `Migrator::run` takes `pg_advisory_lock` by default, so concurrent migrators
+  serialise (https://raw.githubusercontent.com/launchbadge/sqlx/main/sqlx-postgres/src/migrate.rs;
+  sqlx 0.9 at `Cargo.toml:42`). htui itself takes no advisory lock.
+- The conformance suite already pins cross-process cases: "a_live_lease_blocks_an_answer_from_another_process"
+  and "the_sweep_never_touches_a_parked_run_or_a_live_lease"
+  (`crates/htui-orch/src/conformance.rs:386-408`).
+
+**What runs today.** No crate depends on `htui-orch` (`crates/*/Cargo.toml`), so claim, lease, sweep
+and heartbeat run only in the conformance and Postgres tests; production writers are chats, the
+recorder, the probe, settings and CRUD. The multi-writer machinery is designed and tested, not yet
+exercised by a second process.
+
+**Connections, the real ceiling.** Each process opens one pool of up to 8 connections with a 10 s
+acquire timeout (`pg/mod.rs:44`, `:137-139`). Postgres 16 `max_connections` defaults to 100 with 3
+superuser slots (https://raw.githubusercontent.com/postgres/postgres/REL_16_STABLE/doc/src/sgml/config.sgml),
+so about 12 processes (workers plus TUIs) with every pool full. Pools grow lazily, and a worker's
+write rate is small (a flush per 16 KiB or variant change, a lease refresh per run per 60 s), so the
+fix below that scale is a smaller worker pool or a higher `max_connections`, not PgBouncer.
+PgBouncer's transaction mode never supports `LISTEN`, SQL-level `PREPARE` or session advisory locks,
+and protocol-level prepared statements only with `max_prepared_statements` set
+(https://raw.githubusercontent.com/pgbouncer/pgbouncer.github.io/master/features.md), i.e. it breaks
+sqlx's migration lock and any `LISTEN`-based wake-up. A server collapses the worker side to one pool; that is its
+one concrete gain on this axis.
+
+**Spots that need work regardless of server choice.**
+
+| # | Spot | Evidence | Fix | Server removes it? |
+|---|---|---|---|---|
+| C1 | **No DB-side fence for a stale lease holder.** `append_events`, `set_step_usage` and `finish_step` write `WHERE id = $1` only | `write.rs:657-685`, `:696-705`, `:3022-3050` | A process that wakes from suspend after its lease was adopted can still append rows and overwrite `exit_code`/`usage`/`finished_at`. Add a `lease_owner` (or `status`) predicate joined through `run` to step writes | No; the server would need the same predicate |
+| C2 | **Lease times come from the worker's clock.** `SystemClock` is `Utc::now()` | `crates/htui-orch/src/isolate.rs:265-270`; `engine.rs:571-572` | Harmless while every lease check is same-box (`take_lease`'s `executing_box_id = $2`). Once another box answers or relays, use `clock_timestamp()` in SQL | Partly: a server can stamp times, but only if it computes them in SQL |
+| C3 | **Quota write is last-writer-wins.** | `UPDATE agent_box SET quota = $3, quota_at = $4` with no ordering guard, `write.rs:832` | `AND (quota_at IS NULL OR quota_at <= $4)` | No |
+| C4 | **Box identity is the hostname.** `register_box` upserts `ON CONFLICT (user_id, hostname)` | `pg/mod.rs:353-372`; `0001_init.sql:73` | A container or remote host reporting a duplicate hostname merges into another box's row: shared slots, quota and adoption sweep, which resets trees the other box cannot see. Key workers on the `box.toml` id; add a box heartbeat (`last_seen_at` is bumped only at connect) | Yes, if the server mints box ids at enrolment |
+| C5 | **Schema skew.** An older binary is refused only at its next connect | `pg/mod.rs:449-452`; `htui_version` recorded but not enforced, `pg/mod.rs:360`, `:370`; migrations applied only on a TUI confirmation, `crates/htui/src/store_worker.rs:1128-1135` | Headless rule: a worker never migrates; it refuses and reports. Open pools keep running old code against a new schema until reconnect | Yes: the server holds the only schema pin and speaks a versioned protocol to workers |
+| C6 | **Agent registry edits are last-writer-wins.** `upsert_agent` overwrites every column `ON CONFLICT (id)` | `write.rs:734-762`; only test callers (`crates/htui/src/agent_worker.rs:3233` and later) | `updated_at` CAS before the Settings tab edits agents from several TUIs. Seeding re-adds a deleted seed agent by design (`pg/mod.rs:226-233`) | Partly: a server can serialise, but the CAS is cheaper |
+| C7 | **Box settings have no write path.** No `UPDATE box` in `write.rs`; admission reads `box.settings` under the lock (`write.rs:2496-2512`) | grep of `write.rs` | Any future writer is a CAS | No |
+| C8 | **A duplicate `seq` is silently dropped.** `DO NOTHING` hides a second writer; `rows_affected` short of the batch is the only signal | `write.rs:674-684`; `record.rs:270-271` | Error when `inserted < len` outside replay, so C1 cannot lose rows silently | No |
+
+**Conclusion.** N workers writing one Postgres is a solved problem in this schema: every shared write
+is a CAS or a short row lock, and different boxes contend only on shared rows (item, key counter,
+`app_setting`) and only briefly. C1-C8 are the work, and they are the same work with or without a
+server; a server naturally absorbs C4 and C5 and the connection count, not the rest. **Concurrency
+is therefore not an argument for a server either way.** The arguments for one are §6.3's.
+
+### 6.2 Configuration a manager would own, and where it lives today
+
+| Config | Lives in | Distributed today by | Notes |
+|---|---|---|---|
+| Agent registry: launch, models, settings, install source | `agent` (`0001_init.sql:94-106`); seeds, e.g. `crates/htui-core/seeds/agent_agy.json` | Postgres read (`R-ID-3`) | Last-writer-wins (C6) |
+| Per-box enablement, version, path, probe, quota | `agent_box` (`0001_init.sql:112-124`) | Written by each box's own probe | Per-box facts; quota is C3 |
+| Box profile: tags, `settings` (`max_concurrent_items`, `command_limits`), `htui_version` | `box` (`0001_init.sql:64-68`) | Postgres | No write path for settings (C7) |
+| App / project / phase settings | `app_setting` (`0001_init.sql:557-561`), `project.settings` | Postgres, CAS | Safe with N writers |
+| Box identity | `box.toml` (`crates/htui-store/src/identity.rs:18`) | Local file | Should be the key (C4) |
+| Postgres DSN, Qdrant URL and key | OS keyring (`crates/htui-store/src/secret.rs:19-28`) | Typed per box | The `R-STO-1` headless blocker |
+| Tool overrides, agents root | env `HTUI_TOOL_<NAME>`, `HTUI_AGENTS_ROOT` (`crates/htui-agent/src/tools.rs:42`; `crates/htui-agent/src/probe.rs:191-205`) | Per-box environment | Drift surface |
+| Installed adapter binaries | Under `HTUI_AGENTS_ROOT` | `R-AGT-10` install, per box | Drift surface |
+| Agent credentials | Wherever the agent keeps them | Never, by `R-AGT-9` (`docs/REQUIREMENTS.md:166-173`) | A manager **may not** distribute these |
+| Project secrets | `SecretProvider` (`R-SEC-1`, `REQUIREMENTS.md:252-253`) | Not built (no `SecretProvider` in `crates/`) | `R-SEC-2`: into the agent's env only |
+| Planned personas | `~/.config/htui/agents.d/` (MOD-26, `HANDOFF.md:141`) | Per-box files | Works against `R-ID-3`; could be registry rows instead |
+| Container images and digests, child-box profiles | Not yet (MOD-D, §5.3) | - | New config either way |
+| The `htui` build itself | Per box | Manual | C5 |
+
+**Reading.** Everything durable a manager would distribute is already in Postgres, so under O3
+Postgres *is* the config manager for those rows; what it lacks is change push (workers poll or
+`LISTEN`), ordering guards (C3, C6, C7) and version enforcement (C5). What Postgres cannot do is
+the off-database surface: enrolment, the build and images, and targeted secrets without handing each
+box the whole database.
+
+### 6.3 Server variants
+
+**O3 - workers direct to Postgres.** Each worker holds a DSN, claims by `target_box_id` and lease,
+and writes `session_event` after scrubbing (§7). Config is read from the tables of §6.2. Costs:
+connection fan-out (§6.1); a full-database credential on every box, which an agent running as the
+same user with htui's inherited environment (`crates/htui-agent/src/launch.rs:1114-1121`, no
+`env_clear`) can plausibly reach (inference); Postgres reachable from every box, TLS optional
+(`R-STO-2`, `REQUIREMENTS.md:126`); lockstep upgrades (C5); `NOTIFY` as the only push, under 8000
+bytes and lost while disconnected (§4.4). Gain: no new daemon, and `htui-orch` already runs over any
+`S: WriteStore` (`crates/htui-orch/src/lib.rs:3-6`).
+
+**O5a - control-plane server, TUI still direct.** One `htui server` process next to Postgres,
+reusing `htui-store` unchanged, the only holder of a **worker-facing** DSN. The TUI keeps its own DSN
+and its offline cache, so `R-STO-3/4/6` and `R-TUI-8` are untouched. Responsibilities:
+1. **Enrolment and identity.** A single-use token of about 1 h mints a worker keypair or client
+   certificate; the server creates the box row, so ids are server-minted (fixes C4). Precedent:
+   GitHub runner registration token "expires after one hour"
+   (https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json)
+   and a runner-held RSA key thereafter
+   (https://raw.githubusercontent.com/actions/runner/main/src/Runner.Listener/Configuration/ConfigurationManager.cs);
+   Boundary activation tokens
+   (https://raw.githubusercontent.com/hashicorp/web-unified-docs/main/content/boundary/v0.20.x/content/docs/workers/registration.mdx);
+   kubelet bootstrap token to CSR to rotating certificate.
+2. **Authorisation.** Every RPC is scoped to the caller's box: claim only `target_box_id = self`,
+   write events only for steps it executes, read only config targeted at it. That is least privilege
+   for workers without per-worker Postgres roles; the migrations have no `GRANT`, role or RLS today.
+   `R-USR-3`'s "per-user Postgres credentials" still apply to TUIs, which keep their own DSN.
+3. **Config manager.** `GetManifest(box)` returns a versioned snapshot of §6.2's rows for that box:
+   agents, `agent_box` enablement, `box.settings`, relevant `app_setting`, repo paths, child-box and
+   image refs with digests, target `htui` version and download digest. `WatchManifest(from)` streams
+   deltas derived from the `updated_at` triggers plus server-side `PgListener`; a stale cursor gets a
+   full snapshot (the Kubernetes list-then-watch and `410 Gone` rule,
+   https://raw.githubusercontent.com/kubernetes/website/main/content/en/docs/reference/using-api/api-concepts.md).
+   The worker caches the last manifest. Precedent: Coder's agent pulls `GetManifest` with
+   `environment_variables`, `scripts` and `repeated WorkspaceSecret secrets`
+   (https://raw.githubusercontent.com/coder/coder/main/agent/proto/agent.proto); Buildkite returns
+   tunables in the registration response
+   (https://raw.githubusercontent.com/buildkite/agent/main/api/agents.go).
+4. **Secrets.** The server resolves the `SecretProvider` and sends only a run's secrets inside its
+   job message (Salt pillar "only accessible by the minion for which it is targeted",
+   https://raw.githubusercontent.com/saltstack/salt/master/doc/topics/pillar/index.rst). The worker
+   still injects them into the agent's env only and still scrubs (`R-ID-7`, `R-SEC-3`). Agent
+   credentials stay on the box (`R-AGT-9`). Alternative that avoids a `R-SEC-2` amendment: each
+   worker resolves secrets itself via `R-SEC-1`'s machine identity.
+5. **Dispatch.** One worker-initiated WebSocket (proxy-friendly, the Jenkins JEP-222 lesson,
+   https://raw.githubusercontent.com/jenkinsci/jep/master/jep/222/README.adoc) with a poll fallback.
+   The server wraps the existing `claim_run`, `refresh_lease`, `adopt_runs`; the lease stays in
+   Postgres as the only liveness marker (`docs/ANA-2.md:139-142`), and the heartbeat also bumps
+   `box.last_seen_at`.
+6. **Event ingest.** Batches idempotent on `(run_step_id, seq)`, acknowledged by highest `seq`
+   (GitLab `PatchTrace`, Buildkite ordered chunks).
+7. **Live relay and permission relay.** Transient deltas and `permission_request` go worker to
+   server to subscribed TUIs, never persisted; the answer is written as a row and pushed to the
+   worker. This is MOD-B with push instead of polling; it still needs `pump`'s parked-request fix
+   (`record.rs:1684-1713`). The TUI subscribes to the server for live views only; durable reads stay
+   on its DSN.
+8. **Versions.** The server holds the one schema pin (`R-STO-5`) and accepts protocol N-1 from
+   workers; the manifest carries the target build (GitHub runners self-update within a week,
+   https://raw.githubusercontent.com/github/docs/main/content/actions/reference/runners/self-hosted-runners.md).
+
+Server down: workers keep executing, buffer events in memory, and lose their lease after 120 s
+unless they reconnect; either keep ANA-2's reset-and-retry (the worker aborts when it cannot
+refresh), or add a Nomad-style `unknown` state with `lost_after`
+(https://raw.githubusercontent.com/hashicorp/web-unified-docs/main/content/nomad/v1.11.x/content/docs/job-specification/disconnect.mdx),
+which amends ANA-2's "lease as the only liveness marker". Any on-disk spool re-opens CLEAN-2's
+deleted pending buffer (`docs/decisions/clean/clean-2.md:5-11`) and needs a decision. TUIs are
+unaffected except for live views.
+
+Store surface. The worker needs a remote store. If that is a full `WriteStore` (66 methods,
+`crates/htui-core/src/store/traits.rs:195-1058`), it is the third implementation MOD-25 removed
+(`HANDOFF.md:155-158`, `:165-166`). It must instead be the narrow verb set the worker actually calls (claim,
+lease, adopt, step status, events, usage, finish), which is a constraint on MOD-A now (§8).
+
+**O5b - full server, Postgres private.** As O5a, and the TUI too talks only to the server. Adds:
+Postgres never leaves a private network; one pool total. Costs: an RPC mirror of `ReadStore` (16),
+`WriteStore` (66) and the TUI's 58-variant `StoreRequest` (`crates/htui/src/store_worker.rs:79`);
+the cache refresher reads through the API; offline mode fires on either of two hops in series;
+`R-STO-6`'s sub-second start is re-measured; the connection settings of `R-TUI-8` become an endpoint
+and token; chats, which run as tasks inside the TUI (`store_worker.rs:1355-1357`), record through the
+server. An HTTP API with a second client in reach pushes against "Any web or GUI front end" being
+out of scope (`REQUIREMENTS.md:333`). This is the opencode/Codex shape, and it is the version of the
+item's "htui as just the interface" claim that the requirements resist most.
+
+### 6.4 Comparison
+
+| Axis | O3 workers → Postgres | O5a control plane, TUI direct | O5b full server |
+|---|---|---|---|
+| Concurrency correctness | Postgres CAS/locks (§6.1); C1-C8 to fix | Same transactions; same C1-C3, C6-C8; C4, C5 absorbed | Same as O5a |
+| Connections | ~8 per process, ~12 processes at PG16 defaults | 1 server pool + TUIs | 1 pool |
+| Security, DB exposure | Full-DB DSN on every box; 5432 reachable from every box | Box-scoped revocable key on workers; 5432 reachable from TUIs and server only | Postgres private |
+| Headless credential (`R-STO-1`) | DSN on a headless host: hard blocker (§9.1) | Moved, not solved: a worker key in a file, but box-scoped and revocable | As O5a, plus TUI tokens |
+| Permission relay | Rows plus poll or `NOTIFY` (MOD-B) | Push through server; same `pump` fix | Same |
+| Live streaming | Flush bursts; `NOTIFY` deltas < 8000 B, lossy (MOD-F) | Native relay | Native relay |
+| Worker liveness | Lease per run; box heartbeat to add | Connection plus lease | Same |
+| Config drift, version skew | DB config shared; off-DB surface unmanaged; schema lockstep (C5) | Manifest + watch, targeted secrets, target build, N-1 protocol | Same, TUIs included |
+| Ops cost, SPOF | Postgres only | Adds one daemon; worker dispatch stops while it is down, TUIs continue | Adds a daemon in series with Postgres for everything |
+| Requirement amendments | `R-ID-2` per `R-ORCH-12`, `R-ORCH-12` to must, `R-STO-1`, `R-STO-5` (worker never migrates), `R-NF-2` (dockerd) | O3's plus `R-NF-2` (server), `R-ID-2` (self-hosted control plane), `R-ORCH-12` wording, `R-STO-1`/`R-STO-5` for workers, `R-SEC-2` if server resolves secrets | O5a's plus `R-STO-3/4/6`, `R-TUI-1/8`, out-of-scope web front end |
+| Build effort | Worker entry point, relay rows, C1-C8 | O3's worker and fixes, plus server, protocol, enrolment, CA, manifest | O5a plus the full RPC mirror and a cache refresher over it |
+| Offline behaviour | Worker without Postgres cannot record; lease lapses, reset-and-retry | Worker without server: same, unless a spool or `unknown` state is added | TUI offline when either hop fails |
+
+### 6.5 What the evidence says
+
+1. **Concurrency does not decide it.** §6.1: correctness is Postgres's, and a server would reuse it.
+2. **The worker is needed in every variant.** The executor must be next to the tree and agent
+   (§4.3, §4.4); every server design is O3's worker plus something. So O3's worker is the first
+   step whichever way phase 2 goes, and nothing built for O3 is thrown away by O5a.
+3. **O5a's gains are real and are all about workers on boxes the user does not fully trust or
+   reach**: a revocable box-scoped credential instead of the database, no inbound 5432, N-1 version
+   skew, a real live channel, and pushing the off-database config of §6.2. For one developer whose
+   boxes share a trusted network (`R-USR-1`) and whose containers are child boxes driven by the
+   host's worker (so a container never holds the DSN, §5.3 and MOD-D in §8), those gains are small next to a new
+   daemon, a protocol and an enrolment CA.
+4. **O5b buys little over O5a** (Postgres fully private, one pool) at the price of the RPC mirror,
+   a second offline hop and the most requirement friction. Rejected.
+5. **The old rejection of any server was too strong.** It rested on `R-ID-2`, `R-NF-2` and `R-ID-3`
+   alone. A self-hosted server holding no durable state keeps `R-ID-3` (it is a gateway, like
+   Temporal's Frontend, not a second store), ANA-14 rejected Redis rather than any hub
+   (`docs/ANA-14.md:43-53`), and `R-NF-2` is already bent by Qdrant. What remains is a real but
+   amendable cost, not a contradiction.
 
 ## 7. Verdict
 
-**Adopt O3 + O2.** Remote execution is `R-ORCH-12`: a headless `htui` worker on each executing
-box, claiming runs by `target_box_id` and lease from Postgres, driving the existing engine and
-writing `session_event` after scrubbing on that box. The TUI becomes a Postgres client for runs it
-does not execute.
+**Phased: O3 + O2 now, O5a as phase 2, O5b rejected.** Remote execution is `R-ORCH-12`: a headless
+`htui` worker on each executing box, claiming runs by `target_box_id` and lease, driving the existing
+engine and writing `session_event` after scrubbing on that box. In phase 1 the worker talks directly
+to Postgres (O3), which already coordinates N concurrent writers through CAS, row locks and
+`SKIP LOCKED` (§6.1); the multi-writer gaps C1-C8 are fixed first because they bind any design. The
+TUI stays a Postgres client throughout. Phase 2 adds a self-hosted **control-plane server** (O5a)
+that workers dial out to: it enrols boxes and mints their ids, holds the only worker-facing DSN, owns
+dispatch, targeted secrets, a versioned config manifest, the target build, the live and permission
+relay, and the schema pin. It holds no durable state, so `R-ID-3` stands. Phase 2 is opened when the
+first of these holds: a worker on a box outside the user's trusted network or behind NAT, team use
+(`R-USR-3`), more worker processes than the Postgres connection budget allows, or MOD-F's `NOTIFY`
+deltas proving inadequate. Phase 1 is built so phase 2 is additive: the worker talks to a narrow
+store surface, never a full `WriteStore` mirror. A full server in front of the TUI (O5b) is rejected:
+it adds a second offline hop, an RPC mirror of the whole store and the most requirement friction for
+little over O5a.
 
 Docker, local or remote, is an execution environment modelled as a **child box** of the host that
 runs `dockerd`. It is driven by that host's worker, one container per session, with trees
 bind-mounted at identical absolute paths and the agent's stdio carried over `docker exec -i`, so the
-ACP and CLI adapters are unchanged. "Docker remote" is therefore O3 on the remote host plus O2 there,
+ACP and CLI adapters are unchanged. "Docker remote" is O3 (or O5a) on the remote host plus O2 there,
 never a remote daemon driven from the TUI's machine (O4 rejected).
 
 "Remote shell" is the provisioning path for a remote box's worker, not an agent transport. A raw
 `ssh -T` or `docker exec` wrapper around the TUI's own launch (O1) is rejected because it breaks
-host-side `fs/*`, probe, git isolation and kill. A central htui server (O5) is rejected against
-`R-ID-2`, `R-NF-2` and `R-ID-3`.
+host-side `fs/*`, probe, git isolation and kill.
 
-Three things block the first remote run and have to be settled first:
+Four things block the first remote run and have to be settled first:
 - the DSN on a headless host (`R-STO-1` against a keyring that is `sync-secret-service` only);
 - a permission relay (the engine's `pump` cannot answer a parked ACP request);
-- keeping MOD-4 M6's `run_worker` out of TUI-only code, so the headless binary can reuse it.
+- keeping MOD-4 M6's `run_worker` out of TUI-only code, behind a narrow store surface;
+- the store-level multi-writer fixes C1, C4, C5 and C8 (§6.1).
 
-Requirement amendments to put to the maintainer: `R-ID-2` (per `R-ORCH-12`), `R-ORCH-12` from
-later to must, `R-NF-2` (`dockerd` as an opt-in, per-box dependency), and `R-STO-1` (headless
-credential store).
+Requirement amendments to put to the maintainer:
+- Phase 1: `R-ID-2` (per `R-ORCH-12`); `R-ORCH-12` from later to must; `R-NF-2` (`dockerd` as an
+  opt-in, per-box dependency); `R-STO-1` (headless credential store for the worker's DSN); `R-STO-5`
+  (a headless worker never migrates; it refuses and reports).
+- Phase 2: `R-NF-2` (an optional self-hosted `htui server`; Qdrant's existing status should be
+  recorded in the same amendment); `R-ID-2` (a self-hosted control plane is not a cloud-hosted
+  service); `R-ORCH-12` ("polling Postgres" becomes "polling Postgres or the control plane");
+  `R-STO-1` (a worker holds a box-scoped, revocable key in a file, not a DSN); `R-STO-5` (the server
+  owns migrations for workers); `R-SEC-2` only if the server, rather than the worker, resolves
+  project secrets. `R-USR-3` needs no amendment: its per-user Postgres credentials stay with TUIs,
+  and worker authorisation lives in the server.
+- Unchanged in every phase: `R-AGT-9` (the config manager never distributes agent credentials),
+  `R-ID-7` (scrubbing stays on the executing box), `R-ID-3`.
 
 ## 8. Phasing
 
 Placeholder IDs. Real `MOD-N` IDs are minted when the items are opened. Order is dependency order.
 
-1. **MOD-A - Headless worker (`htui worker`).** `R-ORCH-12`, `R-ID-2` (amended), `R-STO-1`,
+**Phase 1 - no server (O3 + O2).**
+
+1. **MOD-G - Multi-writer store hardening.** `R-ID-3`, `R-HIS-1`, ANA-2 inv. 1.
+   - C1: fence step writes (`append_events`, `set_step_usage`, `finish_step`) on the run's
+     `lease_owner`. C8: error on a short insert outside replay.
+   - C2: lease times from `clock_timestamp()` in SQL. C3: ordered quota write. C6: `updated_at` CAS
+     on `upsert_agent`. C7: any box-settings writer is a CAS.
+   - C4: box keyed on the `box.toml` id, not the hostname; a box heartbeat bumping `last_seen_at`.
+   - C5: a headless connect never migrates and reports "schema is newer" as a worker state;
+     `htui_version` compared against a target in `app_setting`.
+   - Depends on nothing; MOD-A depends on it.
+2. **MOD-A - Headless worker (`htui worker`).** `R-ORCH-12`, `R-ID-2` (amended), `R-STO-1`,
    `R-NF-2`, `R-NF-3`.
-   - A ratatui-free worker entry point: a subcommand, or a crate without `ratatui`/`crossterm`.
-   - It hosts MOD-4 M6's run supervision: lease refresh, sweep, one engine task per claimed run,
-     claims only `target_box_id = self`.
-   - It adds a headless DSN source compliant with an amended `R-STO-1`: keyring `linux-native`
-     (kernel keyutils), or a systemd credential. This needs a maintainer decision.
-   - It adds a liveness signal per box: a heartbeat, or a periodic refresh of the existing
-     `box.last_seen_at` (`0001_init.sql:70`), which today is bumped only by `register_box`.
-   - Includes the ask to MOD-4 M6: put `run_worker` in a library both binaries link, not in TUI-only
-     code.
-   - Depends on MOD-4 (M6) and MOD-7 (box registration and `repo_box_path`).
-2. **MOD-B - Permission and control relay through Postgres.** `R-AGT-1`, `R-HIS-1`, `R-TUI-6`.
+   - A ratatui-free worker entry point hosting MOD-4 M6's run supervision: lease refresh, sweep, one
+     engine task per claimed run, claims only `target_box_id = self`.
+   - The worker reaches the store only through a narrow worker-store trait (claim, lease, adopt,
+     step status, events, usage, finish), implemented by `PgStore` now and by an O5a client later.
+   - A headless DSN source compliant with an amended `R-STO-1` (keyring `linux-native` or a systemd
+     credential). Maintainer decision.
+   - A per-worker pool size setting (default below 8) for the connection budget (§6.1).
+   - Includes the ask to MOD-4 M6: `run_worker` in a library both binaries link.
+   - Depends on MOD-G, MOD-4 (M6) and MOD-7.
+3. **MOD-B - Permission and control relay through Postgres.** `R-AGT-1`, `R-HIS-1`, `R-TUI-6`.
    - Replaces `pump`'s silent failure on a parked ACP request: the worker records
-     `permission_request`, waits on a `permission_answer` row written by the TUI, then answers the
-     session.
-   - Cancel and follow-up become command rows the same way.
-   - Also fixes the engine's in-process path.
-   - Depends on MOD-4 (M6). MOD-A consumes it.
-3. **MOD-C - Remote dispatch in the TUI.** `R-ORCH-11`, `R-ORCH-12`, `R-TUI-1`, `R-NF-3`.
-   - Choose the target box on run start and in auto mode.
-   - A non-local target stays `queued` until that box's worker claims it (`docs/ANA-2.md:2165`).
-   - The Runs view follows `session_event` by `seq` cursor with `LISTEN`/`NOTIFY` hints and a poll
-     backstop, and shows worker liveness.
-   - Depends on MOD-A and MOD-B, and on MOD-12 for auto mode targeting.
-4. **MOD-D - Container execution environment.** `R-BOX-1..3`, `R-AGT-5`, `R-AGT-6`, `R-AGT-9`,
+     `permission_request`, waits on a `permission_answer` row, then answers the session. Cancel and
+     follow-up become command rows. Also fixes the engine's in-process path.
+   - Answers from another box go through the relay, never `take_lease` (C2).
+   - Depends on MOD-4 (M6). MOD-A consumes it. Its row protocol is the payload O5a later pushes.
+4. **MOD-C - Remote dispatch in the TUI.** `R-ORCH-11`, `R-ORCH-12`, `R-TUI-1`, `R-NF-3`.
+   - Target box on run start and in auto mode; a non-local target stays `queued` until its worker
+     claims it (`docs/ANA-2.md:2165`); the Runs view follows `session_event` by `seq` with
+     `LISTEN`/`NOTIFY` hints and a poll backstop; worker liveness from the box heartbeat.
+   - Depends on MOD-A and MOD-B, and on MOD-12 for auto mode.
+5. **MOD-D - Container execution environment.** `R-BOX-1..3`, `R-AGT-5`, `R-AGT-6`, `R-AGT-9`,
    `R-SEC-2`, `R-MCP-1`, `R-NF-1`, `R-NF-2` (amended).
-   - A child `box` of kind `container`: parent box id, image, mounts, resource limits, optional
-     egress policy.
-   - The probe, install and auth run inside the image.
-   - Per-session container, running as host UID/GID, with the scratch root and repo `local_path`
-     bind-mounted at identical paths.
-   - A launch decorator under `TransportBuilder` (`docker exec -i`, or bollard attach) that yields a
-     `ChildIo`-like pair.
-   - Cancel is a signal inside the container; kill-tree is container removal.
-   - Secrets go in through exec env, after verifying they do not surface in `docker inspect`.
-   - The agent's credentials live on a named volume that htui never reads.
-   - Linux and macOS hosts first; Windows is deferred to MOD-16.
-   - Depends on MOD-7. Works in-process without MOD-A; needs MOD-A to survive TUI exit.
-5. **MOD-E - Remote box provisioning over SSH.** `R-BOX-1`, `R-BOX-4`, `R-AGT-9`, `R-STO-1`.
-   - From the TUI: `ssh` (system binary, honouring the user's `~/.ssh/config`) to a host. Upload or
-     download the matching `htui` build, install a user service running `htui worker`, set the DSN
-     through the worker's own stdin (never argv and never a file), and let it self-register as a
-     box.
-   - Agent login on that box uses MOD-22's paste-back.
-   - SSH is not used after provisioning.
+   - A child `box` of kind `container` (parent, image and digest, mounts, limits, egress policy),
+     with its own id and a hostname distinct from its parent's (C4).
+   - Probe, install and auth inside the image; per-session container as host UID/GID; scratch root
+     and repo `local_path` bind-mounted at identical paths; launch decorator under
+     `TransportBuilder`; cancel as a signal inside the container, kill-tree as container removal;
+     secrets via exec env after checking `docker inspect`; agent credentials on a named volume htui
+     never reads. The container never holds the DSN.
+   - Linux and macOS first; Windows deferred to MOD-16. Depends on MOD-7; needs MOD-A to survive TUI
+     exit.
+6. **MOD-E - Remote box provisioning over SSH.** `R-BOX-1`, `R-BOX-4`, `R-AGT-9`, `R-STO-1`.
+   - System `ssh` to a host; install the matching `htui` build and a user service running
+     `htui worker`; set the credential through the worker's stdin (never argv or a file); the worker
+     self-registers. Agent login uses MOD-22's paste-back. SSH is not used after provisioning.
+   - Under phase 2 the credential it installs is an enrolment token, not a DSN.
    - Depends on MOD-A and MOD-22.
-6. **MOD-F - Live streaming for runs on other boxes (optional).** `R-HIS-1`, `R-NF-3`.
-   - Transient `NOTIFY` deltas under 8000 bytes for assistant text between recorder flushes. They
-     may be dropped and are superseded by the durable `session_event` rows.
-   - No worker listener socket.
-   - Depends on MOD-C. Open it only if flush-granularity bursts prove unusable.
+7. **MOD-F - Live streaming via `NOTIFY` (optional).** `R-HIS-1`, `R-NF-3`.
+   - Transient `NOTIFY` deltas under 8000 bytes between recorder flushes, droppable, superseded by
+     durable rows. Open only if flush bursts prove unusable; if phase 2 is already open, the relay
+     replaces it.
+   - Depends on MOD-C.
+
+**Phase 2 - control plane (O5a), opened on a §7 trigger.**
+
+8. **MOD-H - `htui server` control plane.** `R-NF-2`, `R-ID-2`, `R-ORCH-12`, `R-STO-1`, `R-STO-5`
+   (all as amended), `R-USR-3`, `R-SEC-1..4`, `R-ID-7`.
+   - A subcommand or binary reusing `htui-store`, the only worker-facing DSN holder; stateless
+     except in-memory subscriptions and an enrolment CA key.
+   - Enrolment (single-use token, worker keypair, server-minted box id), box-scoped authorisation,
+     a versioned worker protocol accepting N-1.
+   - Worker-initiated WebSocket: dispatch wrapping `claim_run`/`refresh_lease`/`adopt_runs`, event
+     ingest idempotent on `(run_step_id, seq)`, live and permission relay to TUI subscribers.
+   - A decision on server-down behaviour: reset-and-retry kept, or an `unknown`/`lost_after` state
+     (amends ANA-2).
+   - Depends on MOD-A (narrow store surface), MOD-B, MOD-G.
+9. **MOD-I - Config manager and secret distribution.** `R-ID-3`, `R-AGT-9`, `R-AGT-10`, `R-SEC-1`,
+   `R-SEC-2`.
+   - `GetManifest`/`WatchManifest` over §6.2's rows plus images, target build and download digest;
+     full resync on a stale cursor; worker-side cache of the last manifest.
+   - Targeted per-run secrets, or worker-side resolution if `R-SEC-2` is not amended. Never agent
+     credentials.
+   - Worker self-update to the manifest's target build.
+   - Depends on MOD-H and MOD-10 (secret provider).
 
 Existing items affected (for the maintainer, not edited here):
-- MOD-4 M6: library placement of `run_worker`.
-- MOD-11: an MCP server that the agent can reach inside a container or on a remote box; a stdio
-  `McpServerSpec` must be launchable there.
+- MOD-4 M6: library placement of `run_worker` and the narrow worker-store surface.
+- MOD-7: box registration keyed on the box id (C4); under phase 2, registration by enrolment.
+- MOD-10: where secrets resolve (worker or server).
+- MOD-11: an MCP server reachable inside a container or on a remote box; a stdio `McpServerSpec`
+  must be launchable there.
 - MOD-12: target box selection.
-- MOD-24: presupposes a daemon and re-hydration, which conflicts with ANA-2 §4.9's
-  reset-and-retry resume; O3 gives it the daemon but not the re-attach.
+- MOD-15/MOD-23: the connection section; unchanged for the TUI under O5a.
+- MOD-24: presupposes a daemon and re-hydration, which conflicts with ANA-2 §4.9's reset-and-retry
+  resume; O3 gives it the daemon but not the re-attach.
+- MOD-26: personas as registry rows rather than a per-box directory, so they are distributed like
+  the rest of §6.2.
 - MOD-33: child-box hostnames.
 
 ## 9. Risks and open questions
 
 1. **Headless DSN (`R-STO-1`).** The Linux keyring backend is `sync-secret-service` only
-   (`Cargo.toml:45-46`), and a headless server or container has no secret-service daemon. The
-   options are enabling keyring's `linux-native` backend (kernel keyutils, which does not survive a
-   reboot) or a systemd credential (a file, which `R-STO-1` forbids). This needs a maintainer
-   amendment before MOD-A.
+   (`Cargo.toml:45-46`), and a headless server or container has no secret-service daemon. Options:
+   keyring `linux-native` (kernel keyutils, lost on reboot) or a systemd credential (a file, which
+   `R-STO-1` forbids). Needs a maintainer amendment before MOD-A. Phase 2 does not remove the
+   problem; it shrinks what is stored to a revocable box-scoped key.
 2. **Permission gap is present today.** `pump` (`record.rs:1684-1703`) plus ACP parking
-   (`acp/mod.rs:507-510`) plus no policy evaluation on the engine path means engine-driven ACP steps fail on the first
-   permission request. MOD-4 M6 hits this before any remote work does.
+   (`acp/mod.rs:507-510`) plus no policy evaluation on the engine path means engine-driven ACP steps
+   fail on the first permission request. MOD-4 M6 hits this before any remote work does.
 3. **Environment inheritance.** `spawn_supervised` has no `env_clear` (`launch.rs:1114-1121`).
-   Locally the child sees htui's whole environment, which is at odds with `R-SEC-2`'s "never
-   exposed to a session". Under O2 `docker exec` passes nothing implicitly, which is better, but
-   explicit `-e` values may be visible through `docker inspect` and `/proc` inside the container.
-   Verify before MOD-D.
+   Locally the child sees htui's whole environment, at odds with `R-SEC-2`'s "never exposed to a
+   session", and under O3 a same-user agent may be able to reach the worker's DSN (inference). Under
+   O2 `docker exec` passes nothing implicitly, but explicit `-e` values may be visible through
+   `docker inspect` and `/proc`. Verify before MOD-D.
 4. **Kill semantics across a wrapper.** Killing a local `docker exec` or `ssh -T` client is not
-   known to terminate the far process (unverified). This is the main reason O1 is rejected. For O2,
-   use per-session containers so removal is the kill-tree. `docs/ANA-4.md:1365-1366` requires that
-   no agent process is left behind.
+   known to terminate the far process (unverified). For O2, per-session containers make removal the
+   kill-tree. `docs/ANA-4.md:1365-1366` requires that no agent process is left behind.
 5. **Worktree mounts.** Mounting only the tree breaks `git` inside the container (§5.2). Mounting the
-   repo's `.git` writable gives the agent the same power over the main repo as today's local
-   `worktree` mode, not more. Container mode is not a security boundary for the repo.
+   repo's `.git` writable gives the agent the same power over the main repo as local `worktree` mode.
+   Container mode is not a security boundary for the repo.
 6. **Windows (`R-NF-1`).** Same-path bind mounts from `C:\...` into a Linux container do not exist.
-   Container environments on Windows need WSL2 paths or copy mode. Deferred.
-7. **Offline executor.** With the pending buffer deleted (`docs/decisions/clean/clean-2.md:7-8`), a
-   remote worker that loses Postgres mid-run cannot record. Its lease expires and the sweep resets
-   the tree (`docs/ANA-2.md:1276-1299`). This is acceptable, but `docs/ANA-2.md:1325-1332` still
-   describes the removed buffer and is stale.
+   Deferred. Under phase 2 the server also needs a Windows story or is Linux-only.
+7. **Offline executor.** With the pending buffer deleted (`docs/decisions/clean/clean-2.md:5-11`), a
+   worker that loses Postgres (or, in phase 2, the server) mid-run cannot record. Its lease expires
+   and the sweep resets the tree (`docs/ANA-2.md:1276-1299`). Acceptable; a spool would re-open
+   CLEAN-2. `docs/ANA-2.md:1325-1332` still describes the removed buffer and is stale.
 8. **Credential placement.** Per-box login for a container means a named volume per child box.
-   Login from a remote box inherits the loopback OAuth problem (MOD-22; `ssh -L` did not work,
-   paste-back did: `HANDOFF.md:490-519`). API-key agents (`GEMINI_API_KEY`) rely on MOD-10
-   injection, which is not built.
-9. **Quota rows.** `agent_box` quota is keyed `(agent_id, box_id)`. A host and its container child
-   sharing one subscription split into two rows, both passive and both correct at reporting time.
-   Probably acceptable. Confirm with MOD-36/ANA-21's weighting.
-10. **Two executors on one box.** If the TUI's in-process `run_worker` and a headless worker run on
-    the same box, the per-process `lease_owner` keeps them from adopting each other's runs
-    (`docs/ANA-2.md:1277-1279`). Admission still races for the per-box concurrency limit. Decide
-    whether a headless worker on a box disables in-process execution there.
-11. **Live-view latency.** Recorder flush granularity (16 KiB, no idle flush) may make remote runs
-    feel frozen. MOD-F covers this if it matters.
-12. **Postgres exposure.** Every worker needs a DSN reachable from its host, and over a network
-    that should mean TLS, which `R-STO-2` supports but leaves optional. For a single developer (`R-USR-1`) that is acceptable. Team use (`R-USR-3`) needs
-    per-user roles before workers on shared hosts.
-13. **ACP network transport.** If the Streamable-HTTP/WebSocket RFD stabilises, O6 becomes
-    cheaper. It still would not remove the need for an executor that owns the tree, so the verdict
-    is unaffected.
+   Remote login inherits MOD-22's loopback problem (`HANDOFF.md:490-519`). API-key agents rely on
+   MOD-10 injection, not built.
+9. **Quota rows.** `agent_box` quota is keyed `(agent_id, box_id)`; a host and its container child
+   sharing one subscription split into two rows. Probably acceptable; confirm with MOD-36/ANA-21. The
+   write itself is last-writer-wins until C3.
+10. **Two executors on one box.** Per-process `lease_owner` keeps an in-process `run_worker` and a
+    headless worker from adopting each other's runs (`docs/ANA-2.md:1277-1279`), and admission is
+    serialised by the box-row lock (`write.rs:2443-2448`; `pg_criteria.rs:586`), so the per-box
+    limit holds. The remaining hazard is C1 (a suspended process writing after adoption). Still
+    decide whether a headless worker on a box disables in-process execution there, for clarity
+    rather than safety.
+11. **Stale lease holder (C1) and clock skew (C2).** Until MOD-G, a process resumed from suspend can
+    overwrite an adopted step; once a relay answers across boxes, worker clocks matter.
+12. **Box identity by hostname (C4).** A container or cloned VM with a duplicate hostname silently
+    merges into another box's row, sharing its sweep. Whether Docker host networking passes the host
+    hostname through is unverified. Fix before MOD-D and MOD-E.
+13. **Postgres exposure and connection budget.** Under O3 every worker needs a reachable DSN, TLS
+    optional (`R-STO-2`), and about 8 connections (§6.1). Acceptable for `R-USR-1` on a trusted
+    network; team use (`R-USR-3`), untrusted hosts or more worker processes than the connection
+    budget allows (about 12 processes at defaults, §6.1) are phase 2 triggers (§7).
+14. **Version skew (C5).** Until MOD-G, one box migrating locks out every older worker at its next
+    connect, while open pools keep running old code. Phase 2 moves the pin to the server.
+15. **Phase 2 costs.** A new daemon on the dispatch path (a second SPOF beside Postgres for workers),
+    an enrolment CA to protect, a protocol to version, and the risk of the worker-store surface
+    creeping toward a full `WriteStore` mirror (MOD-25's third store). The narrow surface in MOD-A is
+    the guard.
+16. **Server-down semantics.** Reset-and-retry after 120 s versus an `unknown`/`lost_after` state
+    that amends ANA-2's single liveness marker. Decide in MOD-H.
+17. **ACP network transport.** If the Streamable-HTTP/WebSocket RFD stabilises, O6 becomes cheaper.
+    It still would not remove the need for an executor that owns the tree.
+
+## 10. Amendment record
+
+| Date | Change |
+|---|---|
+| 2026-09-24 | Original conclusion: no central server; a headless worker per box talking only to Postgres (O3 + O2). O5 rejected on `R-ID-2`, `R-NF-2` and `R-ID-3` alone |
+| 2026-09-24 | After the maintainer's challenge ("wouldn't a central server be better? what if multiple agents write at the same time on postgres?"): added §6.1 showing concurrent writers are already coordinated by CAS, row locks and `SKIP LOCKED`, and listing eight multi-writer gaps (C1-C8) that bind any design; corrected hazard 10 (admission is serialised by the box-row lock); added §6.2's config inventory; split O5 into O5a (control plane, TUI direct) and O5b (full server) and compared them with O3 on twelve axes. Verdict revised from "no server" to **phased**: O3 + O2 first, with MOD-G (store hardening) and a narrow worker-store surface; O5a as phase 2 (MOD-H server, MOD-I config manager) on stated triggers; O5b rejected. Phase 2 requirement amendments added |
