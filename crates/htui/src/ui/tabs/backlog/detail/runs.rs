@@ -2816,4 +2816,166 @@ mod tests {
             "an item with no run has no step"
         );
     }
+
+    // -----------------------------------------------------------------------------------------
+    // What is on screen (verifier findings: the modal of an item with no run, the fold, the
+    // wrapped document).
+    // -----------------------------------------------------------------------------------------
+
+    /// `C` needs no run: an item that is done, failed or blocked with none closes out, and its
+    /// confirmation is drawn under the empty list rather than taking the keyboard unseen.
+    #[tokio::test]
+    async fn shift_c_on_an_item_with_no_run_shows_the_close_out() {
+        let shell = Shell::new();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_ANA_2));
+        pane.on_reply(&StoreReply::Runs(Vec::new()), &mut shell.ctx());
+        pane.on_reply(
+            &StoreReply::RunActions(Box::new(verdicts(
+                ids::HTUI_ANA_2,
+                &[],
+                true,
+                DocumentId::new(),
+            ))),
+            &mut shell.ctx(),
+        );
+        let _ = shell.emit.take();
+
+        pane.on_key(shift('C'), &mut shell.ctx());
+        assert!(pane.captures_input(), "the close-out is open");
+        let drawn = lines(&pane, &shell);
+        assert_eq!(drawn[0], "No runs for this item.", "{drawn:#?}");
+        assert!(
+            drawn
+                .iter()
+                .any(|line| line == "counting what the close-out writes\u{2026}"),
+            "the counting stage is on screen: {drawn:#?}"
+        );
+
+        pane.on_reply(
+            &StoreReply::Orch(OrchReply::CloseOutPreview(Box::new(preview()))),
+            &mut shell.ctx(),
+        );
+        let drawn = lines(&pane, &shell);
+        assert!(
+            drawn.iter().any(|line| line.starts_with("close FEAT-1 \u{b7}")),
+            "the warning is on screen: {drawn:#?}"
+        );
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        let drawn = lines(&pane, &shell);
+        assert!(
+            drawn
+                .iter()
+                .any(|line| line.starts_with("type FEAT-1 to close it:")),
+            "the typed stage is on screen: {drawn:#?}"
+        );
+    }
+
+    /// A run with more steps than the pane has rows: the cursor is followed below the fold, the
+    /// header stays on top, and a modal's footer does not cover the step it is about.
+    #[tokio::test]
+    async fn the_cursor_is_followed_below_the_fold() {
+        let shell = Shell::new();
+        let mut run = feat_1_runs().await.remove(0);
+        let base = run.steps[0].clone();
+        run.steps = (0..12)
+            .map(|position| RunStepSummary {
+                id: StepId::new(),
+                position,
+                attempt: 1,
+                fanout_index: 0,
+                ..base.clone()
+            })
+            .collect();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(vec![run.clone()]), &mut shell.ctx());
+        pane.on_reply(
+            &StoreReply::RunActions(Box::new(verdicts(
+                ids::HTUI_FEAT_1,
+                std::slice::from_ref(&run),
+                true,
+                DocumentId::new(),
+            ))),
+            &mut shell.ctx(),
+        );
+        let _ = shell.emit.take();
+
+        /// The drawn row the cursor is on.
+        fn cursor_row(drawn: &[String]) -> Option<&String> {
+            drawn.iter().find(|line| line.starts_with(CURSOR))
+        }
+
+        for _ in 0..11 {
+            pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        }
+        assert_eq!(pane.selected_step(), Some(run.steps[11].id));
+        let drawn = lines(&pane, &shell);
+        assert!(drawn[0].starts_with("kind"), "the header stays: {drawn:#?}");
+        assert!(
+            cursor_row(&drawn).is_some_and(|line| line.contains("11.1")),
+            "the last step is on screen with the cursor on it: {drawn:#?}"
+        );
+
+        pane.on_key(key(KeyCode::Char('x')), &mut shell.ctx());
+        let drawn = lines(&pane, &shell);
+        assert!(
+            drawn.iter().any(|line| line == "reject with a note:"),
+            "{drawn:#?}"
+        );
+        assert!(
+            cursor_row(&drawn).is_some_and(|line| line.contains("11.1")),
+            "the note's footer does not cover the step it rejects: {drawn:#?}"
+        );
+        pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+
+        for _ in 0..11 {
+            pane.on_key(key(KeyCode::Char('K')), &mut shell.ctx());
+        }
+        let drawn = lines(&pane, &shell);
+        assert!(
+            cursor_row(&drawn).is_some_and(|line| line.contains("0.1")),
+            "and back up to the first: {drawn:#?}"
+        );
+    }
+
+    /// D173: a document of long paragraphs wraps into more rows than it has lines, and its last
+    /// row is still reachable.
+    #[tokio::test]
+    async fn a_wrapped_document_scrolls_to_its_last_row() {
+        let shell = Shell::new();
+        let (mut pane, id) = driven(&shell, true).await;
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('o')), &mut shell.ctx());
+        let body = (0..10)
+            .map(|line| {
+                (0..40)
+                    .map(|word| format!("w{line}x{word}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        pane.on_reply(
+            &StoreReply::Document(Box::new(Some(document(id, &body)))),
+            &mut shell.ctx(),
+        );
+        let _ = shell.emit.take();
+        let _ = lines(&pane, &shell);
+
+        for _ in 0..50 {
+            pane.on_key(key(KeyCode::PageDown), &mut shell.ctx());
+        }
+        let drawn = lines(&pane, &shell);
+        assert!(
+            drawn[0].contains("w9x39"),
+            "`PageDown` stops with the last row on top: {drawn:#?}"
+        );
+        pane.on_key(key(KeyCode::Char('k')), &mut shell.ctx());
+        let drawn = lines(&pane, &shell);
+        assert!(
+            drawn[1].contains("w9x39"),
+            "and `k` walks back one row: {drawn:#?}"
+        );
+    }
 }
