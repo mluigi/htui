@@ -1353,8 +1353,63 @@ where
     /// beside its parked run, so the run's gate verbs reach it (R-4); [`UnblockCase::Resume`]
     /// resumes the parked run through [`Self::resume`] (R-7). Each writes a note first.
     async fn unblock(&self, item: ItemId) -> Result<CommandOutcome, EngineError> {
-        let _ = item;
-        todo!("MOD-4 plan D161: unblock")
+        let case = self.unblock_case(item).await?;
+        let now = self.now();
+        let rest = match case {
+            UnblockCase::Reopen => {
+                if !self
+                    .parts
+                    .store
+                    .transition(item, Status::Blocked, Status::Open)
+                    .await?
+                {
+                    // Another writer moved the item after it was read, so it is no longer
+                    // blocked: the refusal names where it is now.
+                    let row = self.item(item).await?;
+                    return Err(EngineError::NotBlocked {
+                        item,
+                        status: row.status,
+                        why: crate::command::nothing_is_blocked(),
+                    });
+                }
+                self.note(item, "unblocked: back to `open`".to_owned(), None, now)
+                    .await?;
+                None
+            }
+            UnblockCase::FollowRun(run) => {
+                // Plan D161's one deviation from ANA-2's item table (`blocked ->
+                // awaiting_approval`, T1): the item follows its parked run back.
+                if !self
+                    .parts
+                    .store
+                    .transition(item, Status::Blocked, Status::AwaitingApproval)
+                    .await?
+                {
+                    return Err(EngineError::StaleWrite {
+                        run,
+                        row: format!("item {item}"),
+                        from: Status::Blocked.to_string(),
+                        to: Status::AwaitingApproval.to_string(),
+                    });
+                }
+                self.note(
+                    item,
+                    format!("unblocked: follows run {run}, parked at `awaiting_approval`"),
+                    None,
+                    now,
+                )
+                .await?;
+                None
+            }
+            UnblockCase::Resume(run) => {
+                self.note(item, format!("unblocked: resuming run {run}"), None, now)
+                    .await?;
+                Some(match self.resume(run).await? {
+                    Resume::Walked(rest) | Resume::TopologyChanged { rest, .. } => rest,
+                })
+            }
+        };
+        Ok(CommandOutcome::Unblocked { item, case, rest })
     }
 
     /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).
