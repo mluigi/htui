@@ -66,8 +66,18 @@ pub trait DetailTab {
     /// The mirror of [`Tab::on_scope_change`](crate::ui::tabs::Tab::on_scope_change), one level
     /// down.
     fn on_item_change(&mut self, item: Option<ItemId>);
-    /// A key the Backlog tab did not use for navigation.
+    /// A key the Backlog tab did not use for navigation, or every key while
+    /// [`captures_input`](DetailTab::captures_input) says so.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled;
+    /// Whether this sub-tab is taking typed text or a modal answer right now, so the Backlog tab
+    /// must hand it every key before its own navigation (MOD-4 plan OQ-7). Derived from a mode,
+    /// never a flag.
+    ///
+    /// A capturing sub-tab returns `Pass` for a `CONTROL` chord, so `ctrl-c` still quits, and
+    /// `Consumed` for everything else: `q`, a digit and `Tab` cannot leave a typed field.
+    fn captures_input(&self) -> bool {
+        false
+    }
     /// A reply addressed to the Backlog tab. Sub-tabs that do not care ignore it.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws into the detail pane, below the sub-tab strip.
@@ -177,6 +187,12 @@ impl DetailRegistry {
         for tab in &mut self.tabs {
             tab.on_reply(reply, ctx);
         }
+    }
+
+    /// Whether the active sub-tab is taking every key (MOD-4 plan OQ-7, blueprint D201).
+    #[must_use]
+    pub fn captures_input(&self) -> bool {
+        self.active().is_some_and(DetailTab::captures_input)
     }
 
     /// Offers a key to the active sub-tab.

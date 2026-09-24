@@ -200,7 +200,13 @@ impl Tab for BacklogTab {
         self.detail.on_item_change(None);
     }
 
+    /// A capturing sub-tab (a typed note, a typed-back key, a `y`/`n`) gets every key first: the
+    /// guard names no action (ANA-2 `:1694-1697`), it only stops the list from eating the letters
+    /// the sub-tab is waiting for (MOD-4 plan OQ-7).
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if self.detail.captures_input() {
+            return self.detail.on_key(key, ctx);
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -270,10 +276,135 @@ fn panes(area: Rect) -> [Rect; 2] {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
     use super::*;
+    use crate::app::{Emit, TopBarState};
+    use crate::keymap::Keymap;
+    use crate::store_worker::Origin;
     use crate::testkit::DEFAULT_SIZE;
     use crate::ui::Theme;
     use crate::ui::layout::chrome;
+    use crate::ui::tabs::backlog::detail::{DetailId, DetailTab};
+    use htui_core::store::{MemStore, ReadStore as _};
+
+    /// A sub-tab that records every key it is offered and captures while `capturing` is set (the
+    /// `tests/settings.rs` probe, one level down).
+    #[derive(Debug)]
+    struct CapturingProbe {
+        capturing: Rc<Cell<bool>>,
+        seen: Rc<RefCell<Vec<KeyCode>>>,
+    }
+
+    impl DetailTab for CapturingProbe {
+        fn id(&self) -> DetailId {
+            DetailId("probe")
+        }
+        fn title(&self) -> &str {
+            "Probe"
+        }
+        fn on_item_change(&mut self, _item: Option<ItemId>) {}
+        fn on_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            self.seen.borrow_mut().push(key.code);
+            if self.capturing.get() {
+                Handled::Consumed
+            } else {
+                Handled::Pass
+            }
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn captures_input(&self) -> bool {
+            self.capturing.get()
+        }
+    }
+
+    /// MOD-4 plan OQ-7, blueprint D201: while a sub-tab captures, the list's own keys reach it
+    /// and the list cursor does not move; once it stops, they are the list's again.
+    #[tokio::test]
+    async fn a_capturing_sub_tab_gets_the_navigation_keys() {
+        let store = MemStore::demo();
+        let workspace = store
+            .workspaces()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|workspace| workspace.slug == "platform")
+            .expect("the demo holds `platform`");
+        let scope = Scope::from_workspace(&workspace);
+        let projects = store.projects(&scope).await.expect("the projects");
+        let items = store
+            .items(&scope, &ItemFilter::default())
+            .await
+            .expect("the items");
+        let rows = list::rows(&items, &projects, &[]);
+        let first = rows
+            .iter()
+            .copied()
+            .find(|row| matches!(row, Selection::Item(_)))
+            .expect("the scope has an item");
+
+        let capturing = Rc::new(Cell::new(true));
+        let seen = Rc::default();
+        let mut detail = DetailRegistry::new();
+        detail.register(Box::new(CapturingProbe {
+            capturing: Rc::clone(&capturing),
+            seen: Rc::clone(&seen),
+        }));
+        let mut tab = BacklogTab {
+            items,
+            folded: Vec::new(),
+            selected: Some(first),
+            detail,
+        };
+
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::new(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let mut ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(BacklogTab::ID),
+            &emit,
+        );
+        let keys = [
+            KeyCode::Char('j'),
+            KeyCode::Char('G'),
+            KeyCode::Char('l'),
+            KeyCode::Char('['),
+            KeyCode::Enter,
+        ];
+        for code in keys {
+            assert_eq!(
+                tab.on_key(KeyEvent::from(code), &mut ctx),
+                Handled::Consumed,
+                "{code:?} is the capturing sub-tab's"
+            );
+        }
+        assert_eq!(*seen.borrow(), keys, "every key reached the sub-tab");
+        assert_eq!(
+            tab.selected,
+            Some(first),
+            "and the list cursor did not move"
+        );
+        assert!(emit.is_empty(), "so no detail read went out");
+
+        capturing.set(false);
+        tab.on_key(KeyEvent::from(KeyCode::Char('j')), &mut ctx);
+        assert_ne!(
+            tab.selected,
+            Some(first),
+            "a sub-tab that stopped capturing gives `j` back to the list"
+        );
+        assert_eq!(seen.borrow().len(), keys.len(), "without offering it first");
+    }
 
     /// The sub-tab strip fits inside the detail pane at the harness's pinned size, so a longer title, another sub-tab or a narrower pane fails here
     /// instead of being re-accepted as a clipped snapshot (MOD-30).
