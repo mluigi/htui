@@ -361,6 +361,15 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   failed terminal cleanup is never retried). About six intermediate commits fail `clippy -D
   warnings` on their own; HEAD is clean. Plan: `.claude/plans/mod-4-orch-lease.plan.md`;
   blueprint: `.claude/plans/mod-4-orch-lease.blueprint.md`.
+  **Milestone 5 follow-up landed (`0ea3744`..`1d598f1`, branch `mod-4-m5-fixups`, 2026-09-24): R-33,
+  R-34 and R-35 closed** (blueprint §23, D146–D152). `git::reconcile_parent` accepts a reconcile
+  merge only on the primary's first-parent line, for `worktree`/`copy` rows, by subject, and
+  `merge_no_ff` runs with `merge.log=false`; every command's window between its lease take and its
+  walk gives the lease back on error (`Engine::leased_window`), as does a topology-mismatch resume;
+  a dead walk whose run is gone leaves `DeadWalks`, told apart from an outage by a `test-support`
+  `MemFault` hook on `MemStore`. Workspace green at `--test-threads=1`, pins unchanged (store 53,
+  orch 52, `.sqlx` 227). Final review approve-with-fixes, all applied but L7, carried as R-37 with
+  R-36 (a mismatched `running` run is re-adopted each sweep). `0e61f08` alone fails clippy.
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
   per-box paths, agent autodiscovery hook. Not blocked (MOD-6 landed,

@@ -1181,7 +1181,27 @@ A repair round on a branch cut from `main` at `a0da87e`, before milestone 6. It 
 
 | Risk | Likelihood | Handling |
 |---|---|---|
-| **R-33** | — | **Closed** by D146–D148. Residual: a primary whose `HEAD` a user reset below the merge, or a hook that rewrites the subject, diffs `before..after` (M-A's superset, never a lost commit). |
+| **R-33** | — | **Closed** by D146–D148. Residual: a primary whose first-parent line from `HEAD` no longer runs through the merge (a reset below it, a branch switch, a rebase, a pull merge whose first parent is upstream), or a hook that rewrites the subject, diffs `before..after` (M-A's superset, never a lost commit). |
 | **R-34** | — | **Closed** by D149–D150. |
 | **R-35** | — | **Closed** by D151–D152. |
 | **R-36** (D150) A `running` run whose live graph no longer matches its snapshot is released and re-adopted by every sweep. Once milestone 6's `run_worker` resumes each `Walk`, each pass adds another "topology mismatch" note. | Medium once milestone 6 walks `Walk` runs; none in milestone 5 (nothing resumes) | Milestone 6: park the run on a mismatch (a human's decision, §4.9), or have the worker skip a run whose last note is the same mismatch. |
+
+### 23.4 Close-out (2026-09-24)
+
+**As landed, beyond §23.1's text.**
+- **D146** applies to `worktree` and `copy` rows only (`a871d7c`). A three-way verifier found that under `local` and `shared_serialized` the agent commits onto the primary's first-parent line itself, so a spoofed two-parent commit there passed every check. `diff_of` now asks `reconcile_parent` only when the row's repo has a `worktree` or `copy` tree; the in-place modes never merge. Test: `an_in_place_spoofed_reconcile_merge_still_diffs_from_its_base` (both modes). `reconcile_parent` answers `None` early when the checkout does not hold `after`.
+- **D149**'s helper is `Engine::leased_window`; `stale_first_write` is gone. `retry_guarded`'s `NotGated` path and any non-`StaleWrite` error from `retire_slot` now also give the lease back.
+- **D152**: `MemFault`, `MemStore::set_fault` and the checks compile under `htui-core`'s `test-support` feature only (`1d598f1`), reached as `htui_core::store::mem::MemFault`. `a_dead_walk_taken_again_leaves_the_set_and_keeps_its_lease` moved to the hook as well.
+- `0e61f08` fails `clippy -D warnings` on its own (`unused_qualifications` in the new `MemStore` test); `825e8cd` fixes it. Left unsquashed.
+
+**Final review** (`rust-reviewer` over `a0da87e..a871d7c`): approve-with-fixes, no CRITICAL or HIGH. All findings except L7 were applied (`dae4adb`..`1d598f1`):
+- **M1** `subject_is_the_trimmed_first_line` pins D147 (the old whole-message compare fails it).
+- **M2** `a_merge_with_head_moved_past_it_diffs_only_its_own_paths`: three runs merged in order; the middle one diffs `m1..m2`, with `HEAD` attached and detached.
+- **L3** R-33's residual in §23.3 names every way the first-parent line can stop running through the merge.
+- **L4** `leased_window`'s doc names the shared-owner release as R-27.
+- **L5** `a_failed_release_is_retried_by_the_sweep` runs its sweep past the lease's expiry, so D88 is what skips the run.
+- **L6** as D152 above. **L8** `subject` drops a no-op `unwrap_or_default`.
+
+| Risk | Likelihood | Handling |
+|---|---|---|
+| **R-37** (final L7) `git::reconcile_parent` opens the checkout up to six times per diff row (`has_commit`, `open`, `is_ancestor` twice, `head`, `merge_of`), and `merge_of` walks the primary's first-parent history back to the step's base. `diff` holds no admin lock, so this is speed only. | Low | Milestone 6: open the repository once and pass `&gix::Repository` to private `*_in` variants. |
