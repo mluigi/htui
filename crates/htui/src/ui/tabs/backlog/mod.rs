@@ -240,11 +240,7 @@ impl Tab for BacklogTab {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let [left, right] = Layout::horizontal([
-            Constraint::Percentage(LIST_PERCENT),
-            Constraint::Percentage(DETAIL_PERCENT),
-        ])
-        .areas(area);
+        let [left, right] = panes(area);
 
         let view = ListView {
             items: &self.items,
@@ -259,6 +255,41 @@ impl Tab for BacklogTab {
             &self.detail,
             self.item().map(|item| item.key.as_str()),
             ctx,
+        );
+    }
+}
+
+/// Splits the body region into the list pane and the detail pane.
+fn panes(area: Rect) -> [Rect; 2] {
+    Layout::horizontal([
+        Constraint::Percentage(LIST_PERCENT),
+        Constraint::Percentage(DETAIL_PERCENT),
+    ])
+    .areas(area)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::Theme;
+    use crate::ui::layout::chrome;
+    use ratatui::widgets::Block;
+
+    /// The sub-tab strip fits inside the detail pane at the harness's pinned size
+    /// (`testkit::DEFAULT_SIZE`), so a longer title, another sub-tab or a narrower pane fails here
+    /// instead of being re-accepted as a clipped snapshot (MOD-30).
+    #[test]
+    fn the_detail_strip_fits_the_detail_pane() {
+        let body = chrome(Rect::new(0, 0, 100, 30)).body;
+        let [_, right] = panes(body);
+        let inner = Block::bordered().inner(right);
+        let tab = BacklogTab::new();
+        let strip = detail::strip_line(&tab.detail, &Theme::default());
+        assert!(
+            strip.width() <= usize::from(inner.width),
+            "the strip is {} columns against a {}-column pane",
+            strip.width(),
+            inner.width
         );
     }
 }

@@ -217,9 +217,15 @@ pub fn render(
     }
 }
 
-/// Draws the sub-tab strip: `Body  Runs  Graph  Documents  Notes  Prompt`, the active one
+/// Draws the sub-tab strip: ` Body  Runs  Graph  Documents  Notes  Prompt `, the active one
 /// accented.
 pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &DetailRegistry, theme: &Theme) {
+    frame.render_widget(Paragraph::new(strip_line(registry, theme)), area);
+}
+
+/// The sub-tab strip as one line, so its width can be checked against the pane (MOD-30).
+#[must_use]
+pub fn strip_line<'a>(registry: &'a DetailRegistry, theme: &Theme) -> Line<'a> {
     let active = registry.active_id();
     let spans: Vec<Span<'_>> = registry
         .titles()
@@ -233,7 +239,7 @@ pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &DetailRegistry
             Span::styled(format!(" {title} "), style)
         })
         .collect();
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    Line::from(spans)
 }
 
 /// The one line a sub-tab renders instead of a blank pane (plan D11).
