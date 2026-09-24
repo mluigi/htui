@@ -1578,11 +1578,24 @@ fn spawn_task(ctx: TaskCtx, request: OrchRequest) {
 /// next sweep releases and adopts it (R-12) — and its request answered once with
 /// [`WALK_PANICKED`]. Whatever the end, this process's refused claims are then retried when the
 /// task's run no longer walks (M5 D84).
+///
+/// Only the supervisor is tracked, and dropping a `JoinHandle` detaches its task rather than
+/// cancelling it: the supervisor therefore aborts the work when it is itself aborted, so
+/// `settle` and `shutdown` stop the walk and not only the task watching it.
 fn spawn_supervised(ctx: TaskCtx, work: impl Future<Output = ()> + Send + 'static) {
+    /// Aborts the work's task when the supervisor is dropped; a no-op once the work has ended.
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     let shared = Arc::clone(&ctx.shared);
     let tag = Arc::clone(&ctx.tag);
     let handle = tokio::spawn(async move {
         let inner = tokio::spawn(work);
+        let _abort = AbortOnDrop(inner.abort_handle());
         if let Err(err) = inner.await
             && err.is_panic()
         {
@@ -2974,6 +2987,43 @@ pub(crate) mod tests {
         );
         let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
         rests_at(&fixture, run, RunStatus::AwaitingApproval).await;
+    }
+
+    /// Blueprint §8.9: `settle` aborts a task that outlived its limit — the walk itself, not only
+    /// its supervisor — so the stuck session is dropped and the run's lock is free again.
+    #[tokio::test]
+    async fn settle_aborts_the_walk_of_a_stuck_task() {
+        let fixture = Fixture::new().await;
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: start_run(ids::HTUI_ANA_2),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred));
+        within("the session starting", stall.reached.notified()).await;
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+
+        assert_eq!(runtime.settle(Duration::from_millis(100)).await, [run]);
+        within("the stuck walk being dropped", async {
+            while !stall.dropped.load(Ordering::SeqCst)
+                || runtime.shared.locks.try_lock(run).is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
     }
 
     /// M5 D84: a run whose claim was refused waits, and is claimed again once a walk of this
