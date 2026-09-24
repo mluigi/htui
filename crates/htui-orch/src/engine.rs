@@ -1263,7 +1263,7 @@ where
     /// §4.8's `accept artifact` (MOD-4 plan D166, blueprint D194, `docs/ANA-2.md:1223-1233`).
     ///
     /// The guard ([`crate::command::accept_enabled`]), the lease, then the promoted step's stage
-    /// 5 in the lease's window: the verify, as after a session that ended `EndTurn`; the capture
+    /// 5 in the lease's window, under the heartbeat ([`Self::heartbeaten`], plan D86): the verify, as after a session that ended `EndTurn`; the capture
     /// and its commits; the settle columns. A `fail` verify refuses with
     /// [`EngineError::AcceptVerifyFailed`] — the outcome is recorded, a note says so, and the
     /// step stays promoted and parked. Otherwise the `AnswerGate(Approved)` tail: the step
@@ -1284,9 +1284,13 @@ where
         crate::command::accept_enabled(&steps, &row, &phase, has_output, chat_live)?;
 
         // Plan D108's order: after the pure guard and before the first write.
-        self.take_lease(run.id).await?;
+        let until = self.take_lease(run.id).await?;
         let now = self.now();
-        self.leased_window(run.id, async {
+        // Plan D86: the verify is unbounded when the phase has no deadline, so the window runs
+        // under the heartbeat. A lease lost mid-verify drops the window before its capture and
+        // settle writes, and the caller reads `LeaseLost`; any other `Err` of the window gives the
+        // lease back (plan D149).
+        let window = self.leased_window(run.id, async {
             let trees = self.parts.store.step_trees(row.id).await?;
             let repos = self.parts.store.repos(run.project_id).await?;
             let cwd = chat_dirs(&trees, &repos)
@@ -1342,14 +1346,26 @@ where
                 return Err(refusal);
             }
             Ok(())
-        })
-        .await?;
+        });
+        self.heartbeaten(run.id, until, window).await??;
 
-        // `AnswerGate(Approved)`'s tail: its lease take is a renewal of the one held here.
-        let rest = self
+        // `AnswerGate(Approved)`'s tail: its lease take is a renewal of the one held here. Every
+        // `Err` past that take already gave the lease back; one of the take itself (a store
+        // error) did not, so the lease this command took is released here rather than left to
+        // its TTL. The release is owner-guarded, so a second one, or one of a lease another
+        // process holds, answers `Ok(false)`. A lost lease is never ours to give back (plan D128).
+        match self
             .answer_guarded(&run, &snapshot, &row, &phase, GateAnswer::Approved)
-            .await?;
-        Ok(CommandOutcome::Accepted { rest })
+            .await
+        {
+            Ok(rest) => Ok(CommandOutcome::Accepted { rest }),
+            Err(err) => {
+                if !matches!(err, EngineError::LeaseLost { .. }) {
+                    self.release_lease(run.id).await;
+                }
+                Err(err)
+            }
+        }
     }
 
     /// §4.3 verdict 1's `unblock` (MOD-4 plan D161): one human action clears a held item.
@@ -1552,6 +1568,35 @@ where
     where
         F: Future<Output = Result<T, EngineError>>,
     {
+        let out = match self.heartbeaten(run, until, walk).await? {
+            Ok(out) => out,
+            Err(err) => {
+                // Plan D127/D139: nothing else is written, but the lease is given back,
+                // best-effort, so any process's sweep adopts the run, this one's too. A
+                // release that fails is warned and the lease lapses.
+                self.release_lease(run).await;
+                return Err(err);
+            }
+        };
+        self.release_after_walk(run, self.run(run).await).await;
+        Ok(out)
+    }
+
+    /// [`Self::walk_leased`]'s race of `walk` against the heartbeat, without its releases: the
+    /// outer `Err` is the heartbeat's [`EngineError::LeaseLost`], with the walk already dropped,
+    /// [`DeadWalks`] and the guards handled as `walk_leased` documents; the inner `Result` is the
+    /// walk's own answer, which the caller settles. `AcceptArtifact`'s window uses it directly
+    /// (plan D86): its run is parked, so a walk's release on `Ok` would give back the lease its
+    /// `AnswerGate(Approved)` tail is about to renew.
+    async fn heartbeaten<T, F>(
+        &self,
+        run: RunId,
+        until: DateTime<Utc>,
+        walk: F,
+    ) -> Result<Result<T, EngineError>, EngineError>
+    where
+        F: Future<Output = Result<T, EngineError>>,
+    {
         let times = self.lease_times();
         let (store, owner) = (self.parts.store, self.parts.owner);
         let beat = recover::heartbeat(
@@ -1565,17 +1610,6 @@ where
         match futures::future::select(Box::pin(walk), Box::pin(beat)).await {
             Either::Left((out, beat)) => {
                 drop(beat);
-                let out = match out {
-                    Ok(out) => out,
-                    Err(err) => {
-                        // Plan D127/D139: nothing else is written, but the lease is given back,
-                        // best-effort, so any process's sweep adopts the run, this one's too. A
-                        // release that fails is warned and the lease lapses.
-                        self.release_lease(run).await;
-                        return Err(err);
-                    }
-                };
-                self.release_after_walk(run, self.run(run).await).await;
                 Ok(out)
             }
             // Plan D122: a heartbeat that fenced itself is treated exactly as a taken lease.
@@ -10841,6 +10875,131 @@ mod tests {
                 .expect("MemStore never fails a read")
                 .len(),
             notes
+        );
+    }
+
+    /// Plan D86 at `AcceptArtifact`: the promoted step's verify outlasts the lease, and another
+    /// process takes it once it lapses. The accept's window runs under the heartbeat, so the
+    /// window is dropped where it stands and the caller reads `LeaseLost`: no capture, no commit
+    /// row, no settle columns, and the step stays promoted and parked for the new holder.
+    #[tokio::test(start_paused = true)]
+    async fn an_accept_whose_lease_is_taken_mid_verify_writes_nothing_after_it() {
+        /// A verify that outlasts the lease: the clock passes its expiry, a stranger takes it,
+        /// and the command runs on for another 150 s before it passes.
+        #[derive(Debug)]
+        struct Outlasting<'a> {
+            orch: &'a FakeOrchestrator,
+            run: htui_core::model::RunId,
+            stranger: uuid::Uuid,
+        }
+
+        impl crate::verify::Verifier for Outlasting<'_> {
+            fn run<'b>(
+                &'b self,
+                _request: crate::verify::VerifyRequest,
+            ) -> crate::verify::VerifierFuture<'b, Option<crate::verify::VerifyReport>>
+            {
+                Box::pin(async move {
+                    let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+                    self.orch.clock.advance(ttl + TimeDelta::seconds(1));
+                    let now = self.orch.clock.now();
+                    assert!(
+                        self.orch
+                            .store
+                            .take_lease(
+                                self.run,
+                                ids::BOX,
+                                self.stranger,
+                                now,
+                                now + TimeDelta::days(1)
+                            )
+                            .await
+                            .expect("MemStore takes the lease"),
+                        "the accept's lease lapsed, so another process takes it"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(150)).await;
+                    Some(crate::fake::FakeVerifier::pass())
+                })
+            }
+        }
+
+        let harness = Harness::new().await;
+        harness.add_primary_repo().await;
+        let (run, prd) = started(&harness).await;
+        harness
+            .dispatch(Command::PromoteStep {
+                run,
+                step: prd,
+                chat_open: false,
+            })
+            .await
+            .expect("a parked step is promotable");
+        let (step_before, commits_before) = (
+            harness.orch.steps(run).await,
+            harness
+                .orch
+                .store
+                .step_commits(prd)
+                .await
+                .expect("MemStore never fails a read"),
+        );
+
+        let verifier = Outlasting {
+            orch: &harness.orch,
+            run,
+            stranger: uuid::Uuid::now_v7(),
+        };
+        let graphs = harness.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        let engine = super::Engine::new(super::EngineParts {
+            store: parts.store,
+            graphs: parts.graphs,
+            isolator: parts.isolator,
+            verifier: &verifier,
+            clock: parts.clock,
+            selector: parts.selector,
+            sink: parts.sink,
+            driver: parts.driver,
+            scrubber: parts.scrubber,
+            app: parts.app,
+            box_profile: parts.box_profile,
+            box_id: parts.box_id,
+            owner: parts.owner,
+            dead_walks: parts.dead_walks,
+            user: parts.user,
+        });
+
+        let refused = engine
+            .dispatch(Command::AcceptArtifact {
+                run,
+                step: prd,
+                chat_live: false,
+            })
+            .await
+            .expect_err("the lease was taken mid-verify");
+        assert!(
+            matches!(refused, EngineError::LeaseLost { run: lost } if lost == run),
+            "{refused}"
+        );
+        assert_eq!(
+            harness.orch.steps(run).await,
+            step_before,
+            "no settle columns were written to the step"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .step_commits(prd)
+                .await
+                .expect("MemStore never fails a read"),
+            commits_before,
+            "no capture, so no commit row"
         );
     }
 
