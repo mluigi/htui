@@ -14,16 +14,18 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-24):** **MOD-30 was done**
+**Current status (2026-09-24):** **ANA-11 was concluded**
+(`docs/decisions/ana/ana-11.md`): requirements get dedicated tables with suspect-aware item
+citations; a decision is a closed item with a new `item.resolution` and its `summary` document.
+Spawned MOD-37 (schema, blocked on the maintainer applying `docs/ANA-11.md` §7) and MOD-38 (TUI).
+Before it, **MOD-30 was done**
 (`docs/decisions/mod/mod-30.md`): the detail sub-tab strip separates titles by one space and a test
 pins its width against the pane, so MOD-4 milestone 6 (PRD D5) is unblocked.
 Before it, **MOD-35 was done**
 (`docs/decisions/mod/mod-35.md`): Added Qdrant connection settings to mirror Postgres DSN configuration.
-Before it, **ANA-20 was done**
-(`docs/decisions/ana/ana-20.md`): Defined Qdrant feature requirements for MOD-34 (FastEmbed, Hybrid Search, single collection).
-**Live coordinates.** Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql`
-is no longer held (`docs/ANA-2.md` §9) and is **still the next migration** — MOD-2 milestone 9 and
-MOD-20 both deliberately added none. Adapters install under `HTUI_AGENTS_ROOT`, default
+**Live coordinates.** Migrations `0001`..`0004` exist (`0003_orchestration.sql` landed with MOD-4),
+so the **next migration is `0005`**, which MOD-37 claims as `0005_requirements.sql`; the next cache
+migration is `0004`. Adapters install under `HTUI_AGENTS_ROOT`, default
 `dirs::data_local_dir()/htui/agents`; `HTUI_TOOL_<NAME>` still overrides everything. Dev Postgres
 via `compose.yaml` (port 5439); tests need
 `HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres` and the
@@ -58,7 +60,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 ### Analyses
 
 
-- [ ] **ANA-11 - Models for requirements and decisions.** Evaluate database schema models to track product requirements (R-IDs) and architectural decisions (MOD/ANA items) inside `htui` itself instead of standalone markdown files.
 - [ ] **ANA-16 - Research agent execution environments (Docker, remote shell).** Research how to implement ways to run an agent in a Docker container (local and remote) and in a remote shell. Note this would require a central server with htui as just the interface.
 - [ ] **ANA-17 - Per-model calibration of the prompt's section framing** (from MOD-2, finding F-37).
   `R-PRM-1`, `R-PRM-2`. ANA-5 fixes the `<section name="...">` wrapper but never fixes what separates
@@ -83,6 +84,22 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
 
 ### Next features
+- [ ] **MOD-37 - Requirements schema, seam and close-out resolution** (from ANA-11). `R-ENT-8`,
+  `R-NF-4`, `R-STO-3`, `R-TUI-9`, proposed `R-ENT-14..15`. Migration `0005_requirements.sql`
+  (`requirement_spec`, `requirement_area`, `requirement_key_counter`, `requirement`,
+  `requirement_revision`, `item_requirement` with a version stamp for derived suspect links, and
+  `item.resolution` with the closed-iff-resolved CHECK and a `done` backfill), cache migration
+  `0004_requirements.sql`, and the `ReadStore`/`WriteStore` methods of `docs/ANA-11.md` §5.1 on
+  `MemStore`, `PgStore` and the cache. `close_out` takes a resolution and allows `open` → `closed`
+  only for `rejected`/`withdrawn`/`superseded`/`duplicate`, which amends ANA-2 §4.3. The demo fixture
+  gains requirements with one suspect citation. **Blocked on a maintainer decision:** apply or
+  amend the requirement text proposed in `docs/ANA-11.md` §7 to `docs/REQUIREMENTS.md` first.
+- [ ] **MOD-38 - Requirements tab and item traceability** (from ANA-11; blocked on MOD-37).
+  `R-TUI-1`, `R-TUI-9`, proposed `R-ENT-14..15`. Requirements tab (areas, requirements, coverage by
+  citing item with status and resolution, withdrawn rows dimmed, revision trail with the deciding
+  item); cited requirements with suspect markers and a re-confirm action in item detail; a
+  resolution picker in close-out; maintainer-only create/amend/withdraw, where amend names the
+  deciding item (`docs/ANA-11.md` §6).
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
   OQ-7; blocked on ANA-21). `R-AGT-8`, `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
   one agent the walk selects (rival sampling). This item spreads candidates across the eligible
@@ -558,7 +575,10 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 - [ ] **MOD-8 - Legacy markdown import.** `R-LATER-3`. Map old prefixes to kinds per project,
   preserve keys, build links. Later tier; MOD-6 landed (`docs/decisions/mod/mod-6.md`, importer
-  mint variant per ANA-9 §7.1 still to write).
+  mint variant per ANA-9 §7.1 still to write). Widened by ANA-11 (`docs/ANA-11.md` §6 phase 3): also import
+  `docs/REQUIREMENTS.md` into the MOD-37 requirement tables, map each `DECISIONS.md` status to
+  `item.resolution` (`shipped` → `done`), write-ups to `summary` documents and each analysis doc to the
+  `verdict` document, and scan body `R-` IDs once into `addresses` citations. Blocked on MOD-37.
 
 ### Tooling findings
 
@@ -588,7 +608,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 4 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 23 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 3 (ANA-16 execution environments, ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
+| MOD-N   | 25 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 requirements schema, MOD-38 requirements tab; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                        |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[ANA-11](docs/decisions/ana/ana-11.md)** - Models for requirements and decisions (concluded, 2026-09-24)
 - **[MOD-30](docs/decisions/mod/mod-30.md)** - The detail sub-tab strip overflows at the pinned width (done, 2026-09-24)
 - **[MOD-35](docs/decisions/mod/mod-35.md)** - Add Qdrant connection settings (done, 2026-09-20)
 - **[ANA-20](docs/decisions/ana/ana-20.md)** - Research Qdrant features (done, 2026-09-20)
