@@ -3117,9 +3117,15 @@ pub(crate) mod tests {
             assert_eq!(
                 enabled,
                 &Ok(()),
-                "{verb} stays enabled beside another run's chat"
+                "{verb} stays enabled beside a chat on a step of no run of the item"
             );
         }
+        // `select` is refused on a step that is not a fan-out candidate whatever is chatted with;
+        // what matters is that the refusal is not the chat's.
+        assert_ne!(
+            &verdict.select, &refusal,
+            "select is not greyed by a chat on a step of no run of the item"
+        );
     }
 
     /// D212 (review H3), D200: a verb on a run one of whose steps is chatted with is refused inside
