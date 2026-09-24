@@ -890,7 +890,9 @@ impl Shared {
             self.isolator_builds.fetch_add(1, Ordering::SeqCst);
         }
         if built.verifier.is_none() {
-            let limits = command_limits(backend, box_id).await;
+            let limits = command_limits(backend, box_id)
+                .await
+                .map_err(|err| err.to_string())?;
             built.verifier = Some(Arc::new(ShellVerifier::new(
                 &limits,
                 Arc::new(MinimalScrubber::new(std::iter::empty::<String>())),
@@ -1122,15 +1124,15 @@ async fn repo_map(
 }
 
 /// The box row's `settings.command_limits`, else `{"verify": 1}` (D156).
-async fn command_limits(backend: &Backend, box_id: BoxId) -> BTreeMap<String, u32> {
-    backend
+async fn command_limits(backend: &Backend, box_id: BoxId) -> StoreResult<BTreeMap<String, u32>> {
+    Ok(backend
         .box_row(box_id)
         .await
         .ok()
         .flatten()
         .and_then(|row| row.settings.get("command_limits").cloned())
         .and_then(|limits| serde_json::from_value(limits).ok())
-        .unwrap_or_else(|| BTreeMap::from([("verify".to_owned(), 1)]))
+        .unwrap_or_else(|| BTreeMap::from([("verify".to_owned(), 1)])))
 }
 
 /// The engine every task builds, per step of work, over [`Kit`]'s parts.
@@ -2344,7 +2346,7 @@ impl GraphSource for BackendGraphs {
 /// The walk fixture is shared with `store_worker`'s promotion case (blueprint §8.10).
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
@@ -3324,6 +3326,63 @@ pub(crate) mod tests {
         }
         assert!(answered >= 2, "both starts were answered");
         assert_eq!(runtime.isolator_builds(), 1);
+    }
+
+    /// D216 (review L7): a failed `box_row` read is an error — `singletons` then caches no
+    /// verifier and the next command reads again — while a box with no row, or no
+    /// `command_limits`, or one that does not parse, gets `{"verify": 1}`.
+    #[tokio::test]
+    async fn command_limits_fail_with_the_store_and_default_a_missing_value() {
+        let root = tempfile::tempdir().expect("a throwaway mirror root");
+        let cache = CacheStore::open(root.path(), "run-worker-limits", PgStore::schema_version())
+            .await
+            .expect("the mirror opens");
+        let offline = Backend::Offline {
+            cache: cache.clone(),
+            since: Some(Utc::now()),
+        };
+        assert!(
+            super::command_limits(&offline, ids::BOX).await.is_err(),
+            "a read that fails is not the default"
+        );
+        cache.close().await;
+
+        let default = BTreeMap::from([("verify".to_owned(), 1)]);
+        let limits_of = async |stored: Option<serde_json::Value>| {
+            let mut data = htui_core::fixtures::demo_data();
+            let row = data
+                .boxes
+                .iter_mut()
+                .find(|row| row.id == ids::BOX)
+                .expect("the demo box");
+            match stored {
+                Some(limits) => row.settings["command_limits"] = limits,
+                None => row.settings = json!({}),
+            }
+            let backend = Backend::memory(MemStore::from_demo(data));
+            super::command_limits(&backend, ids::BOX)
+                .await
+                .expect("the read answers")
+        };
+        let memory = Backend::memory(MemStore::demo());
+        assert_eq!(
+            super::command_limits(&memory, htui_core::model::BoxId::new())
+                .await
+                .expect("the read answers"),
+            default,
+            "no row"
+        );
+        assert_eq!(limits_of(None).await, default, "no key");
+        assert_eq!(
+            limits_of(Some(json!("many"))).await,
+            default,
+            "a value that does not parse"
+        );
+        assert_eq!(
+            limits_of(Some(json!({ "test": 4, "verify": 3 }))).await,
+            BTreeMap::from([("test".to_owned(), 4), ("verify".to_owned(), 3)]),
+            "a stored map"
+        );
     }
 
     /// A run of `item` another process claimed an hour ago and never renewed: `running`, its
