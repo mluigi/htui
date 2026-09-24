@@ -29,8 +29,8 @@ use htui_core::model::{
     BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, EventKind, Gate, GateOutcome,
     GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId,
     Project, ProjectSettings, PromptScope, RepoId, Run, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome,
-    StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId,
+    StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
 };
 use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet};
 use htui_core::prompt::{
@@ -57,7 +57,8 @@ use crate::isolate::{Clock, FanoutSlot, Isolator};
 use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
 use crate::select::{self, SelectInput, Skipped, Walk};
 use crate::status::{
-    Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt, winner_at,
+    Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt,
+    resumable_park, winner_at,
 };
 use crate::verify::{Verifier, VerifyReport, VerifyRequest};
 
@@ -262,16 +263,15 @@ pub type DriverFor<'a> =
 /// process.
 ///
 /// A run enters it when its walk ended on [`Heartbeat::Expired`] (plan D122: the store stopped
-/// answering, so the lease could not be given back), or when a release of its lease failed.
+/// answering, so the lease could not be given back), when a release of its lease failed, or when
+/// its walk task panicked ([`DeadWalks::mark`], MOD-4 plan D158).
 /// [`Heartbeat::Abandoned`] never enters it: another process holds that lease. [`Engine::sweep`]
 /// first retries the release of every run in it and drops each one the store answers, so
 /// `adopt_runs` then sees the run as free. Plan D88 still keeps the sweep off every lease a live
-/// walk of this process holds, and a run this process takes again leaves the set. Commands in one
-/// process are not fenced against each other yet (R-27). A sweep that reads the set, and then
-/// races a resume of the same run, may give back the resumed walk's lease. The same sweep's
-/// `adopt_runs` then takes that lease for this process again, so the resumed walk's refresh
-/// still matches. The run is then walked twice at once, which plan D88 exists to prevent. That
-/// race is part of R-27; nothing reaches it until commands run concurrently.
+/// walk of this process holds, and a run this process takes again leaves the set. Milestone 6's
+/// worker fences commands of one process against each other with a lock per run (MOD-4 plan
+/// D157), and [`Engine::sweep_fenced`] asks that fence before it gives a dead walk's lease back or
+/// recovers a run (plan D189), so a sweep can no longer race a resume of the same run (R-27).
 ///
 /// It belongs to the process, not to an [`Engine`]: an engine is built per command (plan D16)
 /// and only borrows it. A restarted process starts with an empty set, and its old owner's leases
@@ -302,8 +302,7 @@ impl DeadWalks {
     /// (MOD-4 plan D158, R-12). `pub` because the task's supervisor in `run_worker` is the one
     /// place that sees the `JoinError`.
     pub fn mark(&self, run: RunId) {
-        let _ = run;
-        todo!("MOD-4 plan D158: mark a dead walk")
+        self.insert(run);
     }
 
     fn insert(&self, run: RunId) {
@@ -564,17 +563,6 @@ where
         mode: htui_core::model::RunMode,
         repo_scope: Option<Vec<RepoId>>,
     ) -> Result<RunId, EngineError> {
-        let _ = (item, mode, repo_scope);
-        todo!("MOD-4 plan D186: enqueue")
-    }
-
-    /// §6.2's `run`/`queue`: resolve, create, claim, walk.
-    async fn start_run(
-        &self,
-        item: ItemId,
-        mode: htui_core::model::RunMode,
-        repo_scope: Option<Vec<RepoId>>,
-    ) -> Result<CommandOutcome, EngineError> {
         let item = self.item(item).await?;
         let resolved = match graph::resolve(
             self.parts.store,
@@ -613,7 +601,17 @@ where
                 queued_at: now,
             })
             .await?;
+        Ok(id)
+    }
 
+    /// §6.2's `run`/`queue`: [`Self::enqueue`], then [`Self::claim`] (MOD-4 plan D186).
+    async fn start_run(
+        &self,
+        item: ItemId,
+        mode: htui_core::model::RunMode,
+        repo_scope: Option<Vec<RepoId>>,
+    ) -> Result<CommandOutcome, EngineError> {
+        let id = self.enqueue(item, mode, repo_scope).await?;
         self.claim(id).await
     }
 
@@ -839,37 +837,24 @@ where
     /// attempt.
     async fn retry_step(&self, run: RunId, step: StepId) -> Result<CommandOutcome, EngineError> {
         let run = self.run(run).await?;
-        // `command::retry_enabled` is a pure function of the step row and says so: the run's own
-        // status is "the engine's, at dispatch" (`command.rs:266-268`). This is that check. On a
-        // terminal run every write below is a no-op that still creates a step — `unpark`'s two
-        // compare-and-sets find a stale `from` and answer `Ok(false)`, while `create_step` refuses
-        // no terminal run on either backend — so the run would gain an orphan `pending` step it can
-        // never walk, and the command would report success (ANA-2 §4.3's run table has no edge out
-        // of `done`, `failed` or `cancelled`, `docs/ANA-2.md:614`).
-        if !matches!(run.status, RunStatus::Running | RunStatus::AwaitingApproval) {
-            return Err(EngineError::RunStatus {
-                run: run.id,
-                status: run.status,
-                expected: "running | awaiting_approval",
-            });
-        }
         let snapshot = Self::snapshot_of(&run)?;
         let row = self.step(run.id, step).await?;
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = self.item(Self::item_of(&run)?).await?;
-
-        // Blueprint F-J / R-4: `Status::can_move_to` has no `blocked -> in_progress` edge, so a
-        // blocked item cannot be resumed until milestone 6 ships `Unblock`.
-        if item.status == Status::Blocked {
-            return Err(EngineError::ItemBlocked { item: item.id });
-        }
-        // Plan D65, blueprint F-D: any member of a fanned-out slot retries the whole group, and
-        // before `retry_enabled` — a parked group's candidates are `done`, which that guard refuses.
-        if phase.fan_out > 1 {
-            return self.retry_group(&run, &snapshot, &row, &phase).await;
-        }
         let steps = self.parts.store.run_steps(run.id).await?;
-        crate::command::retry_enabled(&steps, &row, &phase)?;
+        // Blueprint D184: the whole order — the run's status (a terminal run would gain an orphan
+        // `pending` step, `docs/ANA-2.md:614`), the blocked item (F-J, R-4), the fan-out route
+        // (plan D65) and `retry_enabled` — is `command::retry_admitted`, which the Runs tab's
+        // greying read calls over the same rows.
+        crate::command::retry_admitted(&run, item.status, &steps, &row, &phase)?;
+        // Plan D65, blueprint F-D: any member of a fanned-out slot retries the whole group: every
+        // member of the slot is retired (candidates and judge, plan D66's `retire_slot`), the run
+        // unparks, and stage 1 admits the whole group at `attempt + 1`.
+        if phase.fan_out > 1 {
+            return self
+                .retry_group_guarded(&run, &snapshot, &row, &phase, &steps)
+                .await;
+        }
         self.retry_guarded(&run, &snapshot, &row, &phase).await
     }
 
@@ -945,39 +930,7 @@ where
         Ok(CommandOutcome::Retried { step: row.id, rest })
     }
 
-    /// Plan D65's group retry: every member of the slot `row` belongs to is retired (candidates
-    /// and judge, plan D66's `retire_slot`), the run unparks, and stage 1 admits the whole group
-    /// at `attempt + 1` before the walk resumes.
-    async fn retry_group(
-        &self,
-        run: &Run,
-        snapshot: &GraphSnapshot,
-        row: &RunStep,
-        phase: &SnapshotPhase,
-    ) -> Result<CommandOutcome, EngineError> {
-        let steps = self.parts.store.run_steps(run.id).await?;
-        // A member of a slot already retired names nothing a retry could replace: `retire_slot`
-        // retires the position's **latest** slot, so only a member of that one is admitted.
-        let latest = steps
-            .iter()
-            .filter(|step| step.position == row.position)
-            .map(|step| step.attempt)
-            .max()
-            .unwrap_or(row.attempt);
-        if row.attempt != latest {
-            return Err(EngineError::StaleSlot {
-                step: row.id,
-                attempt: row.attempt,
-                latest,
-            });
-        }
-        let slot = group_at(&steps, row.position, row.attempt);
-        crate::command::retry_group_enabled(run, &slot, phase)?;
-        self.retry_group_guarded(run, snapshot, row, phase, &steps)
-            .await
-    }
-
-    /// [`Self::retry_group`] past its guards, over the `steps` they read: the lease, the slot's
+    /// [`Self::retry_step`]'s group route past its guards, over the `steps` they read: the lease, the slot's
     /// retirement, the unpark and the leased walk.
     async fn retry_group_guarded(
         &self,
@@ -1331,8 +1284,10 @@ where
     /// Best-effort, and it never raises: a failed guard release is a `warn`, and a failed lease
     /// release puts the run in [`DeadWalks`] as [`Self::release_lease`] always does.
     pub async fn abandoned(&self, run: RunId) {
-        let _ = run;
-        todo!("MOD-4 plan D188: an abandoned walk's release")
+        if let Err(err) = self.parts.isolator.release(run).await {
+            tracing::warn!(%run, %err, "releasing an abandoned walk's guards failed");
+        }
+        self.release_lease(run).await;
     }
 
     /// Plan D87/D139: the store's `release_lease(run, owner, now)`. The lease reads as expired at
@@ -1396,8 +1351,25 @@ where
     /// # Errors
     /// Only `adopt_runs`' own store error: nothing was adopted then.
     pub async fn sweep(&self) -> Result<Vec<Adopted>, EngineError> {
-        let _ = NoFence;
+        self.sweep_fenced(&NoFence).await
+    }
+
+    /// [`Self::sweep`] under a [`RunFence`] (MOD-4 plan D189, blueprint F-E): the dead-walk
+    /// pre-pass gives back no lease of a run the fence holds, and an adopted run the fence holds
+    /// is skipped with a `debug!` — the adopted lease is this owner's, and the holder's own
+    /// `take_lease` renews it. Every other run is recovered as [`Self::sweep`] does, with its
+    /// fence held through the recovery.
+    ///
+    /// # Errors
+    /// As [`Self::sweep`].
+    pub async fn sweep_fenced<F: RunFence>(&self, fence: &F) -> Result<Vec<Adopted>, EngineError> {
         for run in self.parts.dead_walks.runs() {
+            // Plan D189: a run a live command of this process holds keeps its lease; it is that
+            // command's.
+            let Some(_held) = fence.hold(run) else {
+                tracing::debug!(%run, "the sweep leaves a held dead walk's lease alone");
+                continue;
+            };
             self.release_lease(run).await;
         }
         let now = self.now();
@@ -1409,6 +1381,12 @@ where
             .await?;
         let mut swept = Vec::with_capacity(adopted.len());
         for run in adopted {
+            // Plan D189: a run a command of this process holds is that command's to walk. The
+            // lease the adoption took is this owner's, and the holder's own `take_lease` renews it.
+            let Some(_held) = fence.hold(run.id) else {
+                tracing::debug!(run = %run.id, "the sweep skips an adopted run a command holds");
+                continue;
+            };
             // Plan D126: `adopt_runs` leased every run at once, and only the one being recovered
             // is heartbeaten, so a later run's lease may have lapsed and been taken meanwhile.
             // Renew it first; a run that is no longer ours is skipped, with nothing written.
@@ -1454,27 +1432,25 @@ where
         Ok(swept)
     }
 
-    /// [`Self::sweep`] under a [`RunFence`] (MOD-4 plan D189, blueprint F-E): the dead-walk
-    /// pre-pass gives back no lease of a run the fence holds, and an adopted run the fence holds
-    /// is skipped with a `debug!` — the adopted lease is this owner's, and the holder's own
-    /// `take_lease` renews it. Every other run is recovered as [`Self::sweep`] does, with its
-    /// fence held through the recovery.
-    ///
-    /// # Errors
-    /// As [`Self::sweep`].
-    pub async fn sweep_fenced<F: RunFence>(&self, fence: &F) -> Result<Vec<Adopted>, EngineError> {
-        let _ = fence;
-        todo!("MOD-4 plan D189: the fenced sweep")
-    }
-
     /// MOD-4 plan D161: which of `Unblock`'s three cases `item` is in, read-only — the item, then
     /// each of its active runs with its cursor, handed to [`crate::command::unblock_enabled`].
     ///
     /// # Errors
     /// [`EngineError::NotBlocked`], and the store's and the snapshot's own.
     pub async fn unblock_case(&self, item: ItemId) -> Result<UnblockCase, EngineError> {
-        let _ = item;
-        todo!("MOD-4 plan D161: unblock's case")
+        let row = self.item(item).await?;
+        let mut active = Vec::new();
+        for summary in self.parts.store.runs(item).await? {
+            let run = self.run(summary.id).await?;
+            if !run.status.is_active() {
+                continue;
+            }
+            let snapshot = Self::snapshot_of(&run)?;
+            let steps = self.parts.store.run_steps(run.id).await?;
+            let at = cursor(&snapshot, &steps);
+            active.push((run, at));
+        }
+        crate::command::unblock_enabled(&row, &active)
     }
 
     /// MOD-4 plan D167's first confirmation, read-only: [`crate::command::close_out_enabled`],
@@ -1483,8 +1459,36 @@ where
     /// # Errors
     /// [`EngineError::RunStatus`] or [`EngineError::NotClosable`], and the store's own.
     pub async fn close_out_preview(&self, item: ItemId) -> Result<closeout::Preview, EngineError> {
-        let _ = item;
-        todo!("MOD-4 plan D167: the close-out preview")
+        let reads = self.close_out_reads(item).await?;
+        crate::command::close_out_enabled(&reads.item, &reads.runs)?;
+        let heads = self.parts.store.documents(item).await?;
+        Ok(closeout::preview(
+            &reads.item,
+            &reads.summaries,
+            &reads.commits,
+            &heads,
+        ))
+    }
+
+    /// Close-out's reads, shared by the preview and the command so both count the same rows: the
+    /// item, its runs as summaries and as rows, and every step's commit rows.
+    async fn close_out_reads(&self, item: ItemId) -> Result<CloseOutReads, EngineError> {
+        let row = self.item(item).await?;
+        let summaries = self.parts.store.runs(item).await?;
+        let mut runs = Vec::with_capacity(summaries.len());
+        let mut commits = Vec::new();
+        for summary in &summaries {
+            runs.push(self.run(summary.id).await?);
+            for step in &summary.steps {
+                commits.push((step.id, self.parts.store.step_commits(step.id).await?));
+            }
+        }
+        Ok(CloseOutReads {
+            item: row,
+            summaries,
+            runs,
+            commits,
+        })
     }
 
     /// Blueprint A-4: one run's recovery failed. Warned, noted on the item, and the lease given
@@ -2145,10 +2149,8 @@ where
         if row.status == RunStatus::AwaitingApproval {
             let snapshot = Self::snapshot_of(&row)?;
             let steps = self.parts.store.run_steps(run).await?;
-            if matches!(
-                cursor(&snapshot, &steps),
-                Cursor::Create { .. } | Cursor::Run(_) | Cursor::Finished
-            ) {
+            // Blueprint D196: the one predicate `Unblock`'s third case reads too.
+            if resumable_park(&cursor(&snapshot, &steps)) {
                 self.unpark(&row, self.now()).await?;
                 if let Some(winner) = recover::frontier(&snapshot, &steps)
                     && let Some(done) = steps.iter().find(|step| step.id == winner)
@@ -2496,12 +2498,13 @@ where
             .await?
         {
             Ok(prompt) => prompt,
-            Err(missing) => {
+            Err(StageThree::MissingInput(missing)) => {
                 return self
                     .fail_before_a_token(run, step, phase, missing)
                     .await
                     .map(Some);
             }
+            Err(StageThree::Refused(err)) => return Err(err.into()),
         };
         // `unwrap_or(Value::Null)` here wrote a **null** `trim_record` and said nothing: the row
         // that records which sections were dropped and why would silently become "there was no
@@ -2813,12 +2816,13 @@ where
             .await?
         {
             Ok(prompt) => prompt,
-            Err(missing) => {
+            Err(StageThree::MissingInput(missing)) => {
                 return self
                     .fail_group_before_a_token(run, phase, &pending, missing)
                     .await
                     .map(Some);
             }
+            Err(StageThree::Refused(err)) => return Err(err.into()),
         };
 
         let settled = futures::future::join_all(pending.iter().map(|step| {
@@ -4158,11 +4162,14 @@ where
         })
     }
 
-    /// Stage 3: the inputs, the pinned template and `assemble`.
+    /// Stage 3: the phase's spec ([`Self::phase_spec`]) and `assemble`.
     ///
-    /// `Err(kind)` is the missing required input, which the caller turns into the hard failure —
-    /// an inner `Result` rather than an [`EngineError`] variant because a missing input is not an
-    /// engine fault, it is the run's own outcome.
+    /// The inner `Err` is the run's own outcome rather than an engine fault (blueprint D195):
+    /// [`StageThree::MissingInput`] is a required input that resolved to no document, which the
+    /// caller turns into the hard failure, and [`StageThree::Refused`] is `assemble`'s own refusal
+    /// of the phase's prompt, which blocks the item (MOD-4 plan D162). A store error and a phase
+    /// whose pinned template is gone (`ResolveError::NoTemplate`) stay outer: they are not about
+    /// this prompt.
     async fn assemble_prompt(
         &self,
         run: &Run,
@@ -4170,7 +4177,26 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
         item: ItemId,
-    ) -> Result<Result<AssembledPrompt, String>, EngineError> {
+    ) -> Result<Result<AssembledPrompt, StageThree>, EngineError> {
+        let spec = match self.phase_spec(run, snapshot, step, phase, item).await? {
+            Ok(spec) => spec,
+            Err(missing) => return Ok(Err(StageThree::MissingInput(missing))),
+        };
+        Ok(assemble(&spec, self.parts.scrubber).map_err(StageThree::Refused))
+    }
+
+    /// The phase's [`PromptSpec`] for `step`: its resolved inputs, its pinned template, its
+    /// upstream summaries and, from attempt 2, the loop's forwarded sections (plan D67).
+    ///
+    /// `Err(kind)` is a required input that resolved to no document.
+    async fn phase_spec(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        item: ItemId,
+    ) -> Result<Result<PromptSpec, String>, EngineError> {
         let row = self.item(item).await?;
         let project = self.project(row.project_id).await?;
         let resolved = self
@@ -4276,7 +4302,7 @@ where
             estimator: TokenEstimator::DEFAULT,
             notes,
         };
-        Ok(Ok(assemble(&spec, self.parts.scrubber)?))
+        Ok(Ok(spec))
     }
 
     /// Plan D67 (M3 D32's forward): the loop's two sections for a phase step at `attempt > 1`,
@@ -4609,27 +4635,11 @@ where
     /// at all, or one whose blob does not decode, used to be reported as `v: 0` — a version the
     /// snapshot never had, with the serde error thrown away, so the operator was told the engine
     /// was too old to read a run it could in fact read nothing of.
+    ///
+    /// [`crate::command::snapshot_of`] since milestone 6 (blueprint D184), kept here for the
+    /// walk's many call sites.
     fn snapshot_of(run: &Run) -> Result<GraphSnapshot, EngineError> {
-        let value = run
-            .graph_snapshot
-            .clone()
-            .ok_or_else(|| EngineError::Snapshot {
-                run: run.id,
-                reason: "the run carries no `graph_snapshot`; a graph run is created with one"
-                    .to_owned(),
-            })?;
-        let snapshot: GraphSnapshot =
-            serde_json::from_value(value).map_err(|err| EngineError::Snapshot {
-                run: run.id,
-                reason: format!("`graph_snapshot` does not decode: {err}"),
-            })?;
-        if snapshot.v != GraphSnapshot::V {
-            return Err(EngineError::SnapshotVersion {
-                run: run.id,
-                v: snapshot.v,
-            });
-        }
-        Ok(snapshot)
+        crate::command::snapshot_of(run)
     }
 
     /// A graph run always has an item; a chat run (`item_id IS NULL`) is MOD-2's and never reaches
@@ -4652,15 +4662,7 @@ where
         snapshot: &GraphSnapshot,
         position: i32,
     ) -> Result<SnapshotPhase, EngineError> {
-        snapshot
-            .phases
-            .iter()
-            .find(|phase| phase.position == position)
-            .cloned()
-            .ok_or_else(|| EngineError::Snapshot {
-                run,
-                reason: format!("no phase at position {position}"),
-            })
+        crate::command::phase_at(run, snapshot, position)
     }
 
     /// The candidate a step was created for, denormalised back out of the row and the phase.
@@ -4789,6 +4791,28 @@ where
     fn project_settings(project: &Project) -> ProjectSettings {
         serde_json::from_value(project.settings.clone()).unwrap_or_default()
     }
+}
+
+/// What close-out reads (MOD-4 plan D167), once, for the preview and the command alike.
+#[derive(Debug)]
+struct CloseOutReads {
+    /// The item row.
+    item: Item,
+    /// `ReadStore::runs(item)`: what the summary lists.
+    summaries: Vec<RunSummary>,
+    /// The same runs as rows, for [`crate::command::close_out_enabled`].
+    runs: Vec<Run>,
+    /// Every step's `run_step_commit` rows.
+    commits: Vec<(StepId, Vec<RunStepCommit>)>,
+}
+
+/// Stage 3's two outcomes that are the run's own rather than an engine fault (blueprint D195).
+#[derive(Debug)]
+enum StageThree {
+    /// A required input resolved to no document (`docs/ANA-2.md:412-414`).
+    MissingInput(String),
+    /// `assemble` refused the phase's own prompt (MOD-4 plan D162, ANA-5 criterion 3).
+    Refused(htui_core::prompt::AssembleError),
 }
 
 /// One fan-out candidate's inputs to [`Engine::run_candidate`]: everything its stages 2 to 5 read
@@ -10355,7 +10379,17 @@ mod tests {
             "{refused}"
         );
 
-        let (run, _) = started(&harness).await;
+        let CommandOutcome::Started { run, .. } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
         let refused = engine
             .unblock_case(ids::HTUI_FEAT_3)
             .await
