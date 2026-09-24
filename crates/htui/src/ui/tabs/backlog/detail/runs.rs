@@ -296,9 +296,103 @@ impl RunsTab {
     }
 
     /// One action key in [`Mode::Browse`] (MOD-4 plan D168, blueprint §9.3).
+    ///
+    /// Each key reads its verdict first: none yet says so, a refusal puts the guard's sentence on
+    /// the status line, and only an `Ok` sends. Every request goes through `ctx.request`, so it is
+    /// stamped with the Backlog tab's origin and its reply comes back here.
     fn action(&mut self, key: char, ctx: &mut Ctx<'_>) -> Handled {
-        let _ = ctx;
-        todo!("{key} {:?}", self.actions)
+        let Some(item) = self.item else {
+            return Handled::Pass;
+        };
+        let Some(actions) = &self.actions else {
+            ctx.emit(Action::Error(NOT_LOADED.to_owned()));
+            return Handled::Consumed;
+        };
+        match key {
+            'u' => {
+                if allowed(&actions.unblock, ctx) {
+                    ctx.request(command(Command::Unblock { item }));
+                }
+            }
+            'R' => {
+                if allowed(&actions.run, ctx) {
+                    ctx.request(command(Command::StartRun {
+                        item,
+                        mode: RunMode::Manual,
+                        repo_scope: None,
+                    }));
+                }
+            }
+            'T' => {
+                let Some(run) = self.entry_run().map(|run| run.id) else {
+                    ctx.emit(Action::Error(NO_RUN.to_owned()));
+                    return Handled::Consumed;
+                };
+                let verdict = actions
+                    .runs
+                    .get(&run)
+                    .map_or_else(|| Err(NOT_LOADED.to_owned()), |run| run.cleanup.clone());
+                if allowed(&verdict, ctx) {
+                    ctx.request(StoreRequest::Orch(OrchRequest::Cleanup { run }));
+                }
+            }
+            'a' | 'r' | 'p' | 'o' | 's' | 'A' => {
+                let Some((run, step)) = self.entry_step() else {
+                    ctx.emit(Action::Error(NO_STEP.to_owned()));
+                    return Handled::Consumed;
+                };
+                let Some(verdicts) = actions.steps.get(&step.id) else {
+                    ctx.emit(Action::Error(NOT_LOADED.to_owned()));
+                    return Handled::Consumed;
+                };
+                let (id, position, attempt) = (step.id, step.position, step.attempt);
+                match key {
+                    'a' if allowed(&verdicts.approve, ctx) => {
+                        ctx.request(command(Command::AnswerGate {
+                            run,
+                            step: id,
+                            answer: GateAnswer::Approved,
+                        }));
+                    }
+                    'r' if allowed(&verdicts.retry, ctx) => {
+                        ctx.request(command(Command::RetryStep { run, step: id }));
+                    }
+                    'p' if allowed(&verdicts.promote, ctx) => {
+                        ctx.emit(Action::Promote { run, step: id });
+                    }
+                    's' if allowed(&verdicts.select, ctx) => {
+                        ctx.request(command(Command::SelectFanout {
+                            run,
+                            position,
+                            attempt,
+                            winner: id,
+                        }));
+                    }
+                    'A' if allowed(&verdicts.accept, ctx) => {
+                        // D185: only the worker knows whether a chat is live on the step.
+                        ctx.request(command(Command::AcceptArtifact {
+                            run,
+                            step: id,
+                            chat_live: false,
+                        }));
+                    }
+                    'o' => match &verdicts.open {
+                        Ok(document) => {
+                            ctx.request(StoreRequest::Document(*document));
+                            self.mode = Mode::Artifact {
+                                id: *document,
+                                doc: None,
+                                scroll: Scroll::default(),
+                            };
+                        }
+                        Err(sentence) => ctx.emit(Action::Error(sentence.clone())),
+                    },
+                    _ => {}
+                }
+            }
+            _ => return Handled::Pass,
+        }
+        Handled::Consumed
     }
 }
 
