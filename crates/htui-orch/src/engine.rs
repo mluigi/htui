@@ -1240,6 +1240,9 @@ where
     /// D140). Either way this process's next sweep may adopt the run, which plan D88 would
     /// otherwise keep it off while its lease names this process. Plan D133's `StaleWrite` on a
     /// command's first compare-and-set is one such `Err`.
+    ///
+    /// Two commands on one run in one process share the owner, so one's window error can release
+    /// the other's live lease; that is R-27 (milestone 6).
     async fn leased_window<T>(
         &self,
         run: RunId,
