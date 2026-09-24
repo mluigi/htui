@@ -1085,11 +1085,20 @@ async fn promotion_opens_the_chat_on_the_same_step() {
         )),
         "the header names the promotion: {rendered}"
     );
-    // The promoted header is wider than the fake's session id leaves room for, so the id is cut
-    // at the border wherever it ends: every visible hex digit of it is substituted.
-    let mut settings = stable();
-    settings.add_filter(r"session fake-[0-9a-f-]+", "session fake-<session>");
-    settings.bind(|| insta::assert_snapshot!("chat_promoted", rendered));
+    // The session ref is the one field of the header that exists to be read back (a later
+    // `session/load`), so it is never the one the border cuts: all 36 characters of the fake's id
+    // are on screen, and the snapshot's filter matches the whole of it.
+    let shown = rendered.split_once("fake-").map(|(_, tail)| {
+        tail.chars()
+            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+            .count()
+    });
+    assert_eq!(
+        shown,
+        Some(36),
+        "the header shows the whole session ref: {rendered}"
+    );
+    stable().bind(|| insta::assert_snapshot!("chat_promoted", rendered));
 }
 
 /// ANA-5 criterion 17: a message composed in the promoted chat is a `follow_up` on the step's own
@@ -1316,10 +1325,17 @@ async fn accept_is_refused_while_the_promoted_chat_is_live() {
 
 /// Blueprint D185: the tab holds one session, so a second promotion while a chat is open is
 /// refused with `ChatLive(None)`'s sentence.
+///
+/// The refused request is an `Orch` one from the Chat tab, like the promotion that opened the
+/// chat, so it is the newest of that kind in the shell's staleness index. The live chat's frames
+/// must go on reaching the tab regardless: the next answer renders, and `Esc Esc` still ends it.
 #[tokio::test]
 async fn a_second_promotion_is_refused_while_a_chat_is_open() {
-    let (mut harness, store) =
-        promotion_harness(Script::one_turn(vec![chunk("Here."), done()])).await;
+    let (mut harness, store) = promotion_harness(Script::turns(vec![
+        vec![chunk("Here."), done()],
+        vec![chunk("Done as asked."), done()],
+    ]))
+    .await;
     let (run, step) = parked(&mut harness, &store).await;
     promote(&mut harness, run, step.id).await;
 
@@ -1330,6 +1346,67 @@ async fn a_second_promotion_is_refused_while_a_chat_is_open() {
         Some("promote_step: end the open chat first (Chat tab, Esc Esc)")
     );
     assert_eq!(harness.chat_steps(), vec![step.id], "no second session");
+
+    compose(&mut harness, "tighten the summary");
+    harness.drive().await;
+    let rendered = harness.render();
+    assert!(
+        rendered.contains("Done as asked."),
+        "the live chat's answer still reaches the tab: {rendered}"
+    );
+
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+    let rendered = harness.render();
+    assert!(
+        rendered.contains("this chat has ended"),
+        "and its end does too: {rendered}"
+    );
+}
+
+/// Blueprint D185, for the race the run runtime's guard cannot see: two promotions sent before
+/// either is bound both find no chat live, so both pass `chat_open`. The chat runtime is the last
+/// place to refuse the second: one session is started on the step, its opening is one
+/// `follow_up`, and the tab is left driving it with the refusal on the status line.
+#[tokio::test]
+async fn two_promotions_before_a_bind_start_one_session() {
+    let (mut harness, store) = promotion_harness(Script::one_turn(vec![
+        chunk("Picking the step back up."),
+        done(),
+    ]))
+    .await;
+    let (run, step) = parked(&mut harness, &store).await;
+
+    harness.app().update(Action::Promote { run, step: step.id });
+    harness.app().update(Action::Promote { run, step: step.id });
+    harness.drive().await;
+
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("promote_step: end the open chat first (Chat tab, Esc Esc)")
+    );
+    assert_eq!(harness.chat_steps(), vec![step.id], "one session");
+    let openings = log_of(&store, step.id)
+        .await
+        .into_iter()
+        .filter(|row| row.kind == EventKind::FollowUp)
+        .count();
+    assert_eq!(openings, 1, "one session opened the step");
+    let rendered = harness.render();
+    assert!(
+        rendered.contains("Picking the step back up."),
+        "the tab drives the one session: {rendered}"
+    );
+
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+    let rendered = harness.render();
+    assert!(
+        rendered.contains("this chat has ended"),
+        "and can end it: {rendered}"
+    );
 }
 
 /// Blueprint §10.4 step 4: promoting a step whose walk is live on this process preempts the walk
