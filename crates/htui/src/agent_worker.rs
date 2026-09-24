@@ -47,10 +47,11 @@ use htui_agent::record::{
 use htui_agent::registry::{DriverFactory, caps_for};
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, ChatRunSpec, ItemId, PER_TOKEN_CAP_BATCH, ProjectCaps,
-    ProjectId, QuotaSource, RunStatus, Scope, StepId, Transport,
+    ProjectId, QuotaSource, RunStatus, Scope, SessionEvent, StepId, Transport,
 };
 use htui_core::scrub::MinimalScrubber;
-use htui_core::store::{StoreError, WriteStore};
+use htui_core::store::{ReadStore as _, StoreError, WriteStore};
+use htui_orch::OpeningPath;
 use htui_store::{Backend, Writer};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -128,6 +129,10 @@ pub struct LiveChat {
     caps: DriverCaps,
     /// The spawned task, when production spawned one.
     task: Option<JoinHandle<()>>,
+    /// Where the chat's frames go, for [`StoreRequest::ChatFollow`] and a refused promotion to
+    /// move (blueprint D185). The address alone, not a sender: a runtime holding a reply sender
+    /// per chat would keep the reply channel open after every session had ended.
+    stream: Stream,
 }
 
 impl core::fmt::Debug for LiveChat {
@@ -504,6 +509,185 @@ impl AgentRuntime {
         self.live.get(&step_id).map(|chat| chat.caps)
     }
 
+    /// Blueprint D206: the steps whose chat task is still running — its command channel is open.
+    ///
+    /// Not [`caps`](Self::caps): an ended chat keeps its entry until the next
+    /// [`serve`](Self::serve) sweeps it (F-H), and a promotion or an accept judged against that
+    /// entry would be refused over a chat that is already over. The receiver lives in
+    /// [`run_chat`], so a closed channel is exactly a session task that has returned.
+    #[must_use]
+    pub fn live_steps(&self) -> Vec<StepId> {
+        let mut steps: Vec<StepId> = self
+            .live
+            .iter()
+            .filter(|(_, chat)| !chat.commands.is_closed())
+            .map(|(step, _)| *step)
+            .collect();
+        steps.sort_unstable();
+        steps
+    }
+
+    /// MOD-4 plan D165: `RunServed::Attach`'s other half, binding a chat to a promoted graph step.
+    ///
+    /// [`start`](Self::start)'s checks minus the mint, plus the tail: the writer (refused off the
+    /// server), the box, the opening agent's row (enabled), `driver_for`, its settings, the
+    /// project's caps and the quota latch, then the step's log read **through the writer**
+    /// (blueprint H-9), whose absence is "the step's log is not on this box". The spec is the
+    /// promoted step's: its id, `cwd` and `extra_dirs` from the opening, and `resume` on
+    /// [`OpeningPath::Resume`]. No re-probe rides on it: the walk that ran the step already
+    /// started this agent here.
+    ///
+    /// Answers [`Served::Start`], whose session answers `addr` with `ChatAccepted` and every frame
+    /// after it, or a `Failed` for `promote_step`. While a chat is live it answers
+    /// [`Served::Deferred`], having refused at `addr` itself and moved the live chat's stream there
+    /// (blueprint D185).
+    pub async fn attach_promoted(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        promoted: crate::run_worker::Promoted,
+    ) -> Served {
+        match self.bind_promoted(backend, replies, addr, promoted).await {
+            Ok(served) => served,
+            Err(err) => Served::Reply(failed(PROMOTE_STEP, &err)),
+        }
+    }
+
+    /// [`attach_promoted`](Self::attach_promoted)'s body, with `?` for the store's refusals.
+    async fn bind_promoted(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        promoted: crate::run_worker::Promoted,
+    ) -> Result<Served, StoreError> {
+        // A chat that ended on this step before must not make the new one a second entry.
+        self.live.retain(|_, chat| !chat.commands.is_closed());
+        // Blueprint D185, for the race the run runtime's guard cannot see: two promotions served
+        // before either was bound both found no chat live, so both passed `chat_open`. A chat this
+        // runtime already holds is the only one — a second session on the same step would be two
+        // agents writing one log, and on another step a chat the tab cannot hold — so this one is
+        // refused with `ChatLive(None)`'s sentence.
+        //
+        // The tab reset its view when it read this promotion's `Promoted`, and this address is now
+        // the newest `Orch` one from it, which leaves the live chat's own address stale. So the
+        // live chat's stream moves here and its acceptance is sent again, after the refusal: the
+        // tab is left driving the one session rather than beside a chat it can neither see nor end.
+        if let Some(chat) = self.live.values().find(|chat| !chat.commands.is_closed()) {
+            chat.stream.hand_over(
+                replies,
+                addr,
+                StoreReply::Failed {
+                    request: PROMOTE_STEP,
+                    message: htui_orch::EngineError::ChatLive { step: None }.to_string(),
+                },
+            );
+            return Ok(Served::Deferred);
+        }
+        let crate::run_worker::Promoted {
+            step: step_id,
+            project: project_id,
+            opening,
+            ..
+        } = promoted;
+
+        let writer = backend
+            .writer()
+            .ok_or_else(|| StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned()))?;
+        let writer_label = writer.label();
+        let box_id = registered_box(backend).await?;
+        let summary = backend
+            .agents()
+            .await?
+            .into_iter()
+            .find(|summary| summary.agent.id == opening.agent_id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "agent",
+                id: opening.agent_id.to_string(),
+            })?;
+        if !summary.agent.enabled {
+            return Err(StoreError::Constraint(format!(
+                "agent `{}` is disabled",
+                summary.agent.name
+            )));
+        }
+        let driver = self
+            .factory
+            .driver_for(&summary.agent, summary.on_box.as_ref())
+            .map_err(|err| StoreError::Backend(err.to_string()))?;
+        let settings: AgentSettings =
+            serde_json::from_value(summary.agent.settings.clone()).unwrap_or_default();
+        let project_caps = project_caps_for(
+            &writer,
+            project_id,
+            backend.project_settings(project_id).await?,
+        )?;
+        let quota_latch = quota_latch_for(&writer, &summary.agent, box_id, settings.quota.source);
+        let Some(tail) = writer.step_events(step_id).await? else {
+            return Ok(Served::Reply(StoreReply::Failed {
+                request: PROMOTE_STEP,
+                message: "the step's log is not on this box".to_owned(),
+            }));
+        };
+
+        let (resume, opening_text) = match opening.path {
+            OpeningPath::Resume { session_ref, text } => (Some(session_ref), text),
+            OpeningPath::Handoff { text, .. } => (None, text),
+        };
+        let spec = SessionSpec {
+            agent_id: opening.agent_id,
+            step_id,
+            cwd: opening.cwd,
+            extra_dirs: opening.extra_dirs,
+            env: std::collections::BTreeMap::new(),
+            model: opening
+                .model
+                .or_else(|| summary.agent.default_model.clone()),
+            tools: htui_agent::driver::ToolExposure::default(),
+            mcp: Vec::new(),
+            permission: settings.permission.clone(),
+            retain_raw: std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
+            resume,
+            budget_micros: project_caps.run_micros,
+        };
+
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let caps = driver.caps();
+        let frames = Frames::new(replies.clone(), addr);
+        self.live.insert(
+            step_id,
+            LiveChat {
+                commands: commands_tx,
+                caps,
+                task: None,
+                stream: frames.stream.clone(),
+            },
+        );
+        self.started.push(step_id);
+
+        let args = ChatArgs {
+            driver,
+            writer,
+            writer_label,
+            binding: ChatBinding::Promoted { step_id, tail },
+            spec,
+            prompt: opening_text,
+            policy: settings.permission,
+            caps,
+            commands: commands_rx,
+            frames,
+            grace: self.grace,
+            reprobe: None,
+            project_caps,
+            quota_latch,
+        };
+        Ok(Served::Start {
+            step_id,
+            task: Box::pin(run_chat(args)),
+        })
+    }
+
     /// Serves one request the agent runtime owns: the four chat variants, `ProbeAgents`, and
     /// MOD-20's three install variants.
     ///
@@ -588,6 +772,10 @@ impl AgentRuntime {
                 "chat_cancel",
                 ChatCommand::Cancel { reply: Some(addr) },
             ),
+            StoreRequest::ChatFollow { step_id } => {
+                self.follow(*step_id, addr);
+                Served::Deferred
+            }
             StoreRequest::ProbeAgents => match self.probe(backend, replies, addr).await {
                 Ok(served) => served,
                 Err(err) => Served::Reply(failed("probe_agents", &err)),
@@ -759,10 +947,7 @@ impl AgentRuntime {
             box_id,
             agents,
             cwd,
-            frames: Frames {
-                tx: replies.clone(),
-                addr,
-            },
+            frames: Frames::new(replies.clone(), addr),
         })));
         Ok(Served::Deferred)
     }
@@ -861,10 +1046,7 @@ impl AgentRuntime {
                 config,
                 agent,
                 cwd,
-                frames: Frames {
-                    tx: replies.clone(),
-                    addr,
-                },
+                frames: Frames::new(replies.clone(), addr),
             },
             cancel.clone(),
         ));
@@ -911,10 +1093,7 @@ impl AgentRuntime {
             existing: summary.on_box,
             cwd,
             cancel: cancel.clone(),
-            frames: Frames {
-                tx: replies.clone(),
-                addr,
-            },
+            frames: Frames::new(replies.clone(), addr),
         }));
         self.install = Some(LiveInstall {
             agent_id,
@@ -1019,10 +1198,7 @@ impl AgentRuntime {
             cancel: cancel.clone(),
             commands: commands_rx,
             opener: self.opener.clone(),
-            frames: Frames {
-                tx: replies.clone(),
-                addr,
-            },
+            frames: Frames::new(replies.clone(), addr),
         }));
         self.auth = Some(LiveAuth {
             agent_id,
@@ -1116,6 +1292,21 @@ impl AgentRuntime {
             ));
         }
         Ok(())
+    }
+
+    /// [`StoreRequest::ChatFollow`]: the live chat on `step_id` streams at `addr` from now on
+    /// (blueprint D185).
+    ///
+    /// Nothing is answered: the stream is the answer, and a chat that is already over has sent its
+    /// last frame to the address it had.
+    fn follow(&self, step_id: StepId, addr: ReplyAddr) {
+        if let Some(chat) = self
+            .live
+            .get(&step_id)
+            .filter(|chat| !chat.commands.is_closed())
+        {
+            chat.stream.follow(addr);
+        }
     }
 
     /// Forwards a command to a live chat.
@@ -1261,12 +1452,14 @@ impl AgentRuntime {
 
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let caps = driver.caps();
+        let frames = Frames::new(replies.clone(), addr);
         self.live.insert(
             chat.step_id,
             LiveChat {
                 commands: commands_tx,
                 caps,
                 task: None,
+                stream: frames.stream.clone(),
             },
         );
         self.started.push(chat.step_id);
@@ -1312,16 +1505,13 @@ impl AgentRuntime {
             driver,
             writer,
             writer_label,
-            chat,
+            binding: ChatBinding::Fresh(chat),
             spec,
             prompt,
             policy: settings.permission,
             caps,
             commands: commands_rx,
-            frames: Frames {
-                tx: replies.clone(),
-                addr,
-            },
+            frames,
             grace: self.grace,
             reprobe,
             project_caps,
@@ -1334,6 +1524,53 @@ impl AgentRuntime {
     }
 }
 
+/// Blueprint D205: what a chat session records against.
+#[derive(Debug)]
+enum ChatBinding {
+    /// MOD-2's own chat: a `run(kind='chat')` minted at start, closed at the end.
+    Fresh(ChatRunSpec),
+    /// MOD-4 plan D165: a promoted graph step. No run is minted and none is closed: the step's
+    /// status is the engine's (`awaiting_approval`, promoted) and stays so when the session ends.
+    Promoted {
+        /// The promoted step, which keeps its id.
+        step_id: StepId,
+        /// The step's persisted rows, read through the writer (blueprint H-9): where the
+        /// continuing recorder starts (plan D164).
+        tail: Vec<SessionEvent>,
+    },
+}
+
+impl ChatBinding {
+    /// The step every row of the session is recorded against.
+    const fn step_id(&self) -> StepId {
+        match self {
+            Self::Fresh(chat) => chat.step_id,
+            Self::Promoted { step_id, .. } => *step_id,
+        }
+    }
+
+    /// The request a failed start is answered as: the one that opened the session.
+    const fn request(&self) -> &'static str {
+        match self {
+            Self::Fresh(_) => "chat_start",
+            Self::Promoted { .. } => PROMOTE_STEP,
+        }
+    }
+
+    /// Closes what the session opened when it ends with `status`. A promoted step's session
+    /// opened nothing: `finish_chat_run` is never called for a graph step.
+    async fn close(&self, writer: &Writer, status: RunStatus) {
+        match self {
+            Self::Fresh(chat) => close_run(writer, chat, status).await,
+            Self::Promoted { .. } => {}
+        }
+    }
+}
+
+/// [`StoreRequest::name`] of a promotion (blueprint D209): what a promoted chat's refusals are
+/// answered as, since the promotion is the request that opened it.
+const PROMOTE_STEP: &str = crate::run_worker::ORCH_NAMES[5];
+
 /// Everything one chat session needs.
 pub struct ChatArgs {
     driver: Box<dyn AgentDriver>,
@@ -1341,7 +1578,8 @@ pub struct ChatArgs {
     /// [`Writer::label`], taken before the writer moves: what the tab's header says about where
     /// this conversation is being kept (plan D42).
     writer_label: &'static str,
-    chat: ChatRunSpec,
+    /// What the session records against (blueprint D205).
+    binding: ChatBinding,
     spec: SessionSpec,
     prompt: String,
     policy: PermissionPolicy,
@@ -1369,7 +1607,7 @@ impl core::fmt::Debug for ChatArgs {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ChatArgs")
             .field("driver", &self.driver.name())
-            .field("step", &self.chat.step_id)
+            .field("step", &self.binding.step_id())
             .field("spec", &self.spec)
             .field("project_caps", &self.project_caps)
             // Whether this chat latches, not which row it names: `Recorder`'s own `Debug` makes
@@ -1508,7 +1746,7 @@ async fn run_probe(args: ProbeArgs) {
             ProbeOutcome::Row(row) => {
                 if let Err(err) = writer.upsert_agent_box(&row).await {
                     frames.reply(
-                        &frames.addr,
+                        &frames.addr(),
                         StoreReply::Failed {
                             request: "probe_agents",
                             message: err.to_string(),
@@ -1526,7 +1764,7 @@ async fn run_probe(args: ProbeArgs) {
         }
     }
 
-    frames.reply(&frames.addr, StoreReply::Agents(agents));
+    frames.reply(&frames.addr(), StoreReply::Agents(agents));
 }
 
 /// Whether this box's row for an agent is worth re-probing (plan D55).
@@ -1842,7 +2080,7 @@ async fn run_plan(args: PlanArgs, cancel: CancellationToken) {
         cwd,
         frames,
     } = args;
-    let addr = frames.addr.clone();
+    let addr = frames.addr();
 
     // Here and not on the loop: `Client::build` can fail, and a failure inside a `select!` arm
     // would be a panic that takes the worker with it (blueprint P-13).
@@ -1911,7 +2149,7 @@ async fn run_install(args: InstallArgs) {
         cancel,
         frames,
     } = args;
-    let addr = frames.addr.clone();
+    let addr = frames.addr();
 
     let installer = match Installer::new(config.clone()) {
         Ok(installer) => installer,
@@ -2053,7 +2291,7 @@ async fn run_auth(args: AuthArgs) {
         frames,
     } = args;
     // The `AuthStart`'s address until the choice arrives, and the `AuthChoose`'s afterwards.
-    let mut addr = frames.addr.clone();
+    let mut addr = frames.addr();
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (choice_tx, choice_rx) = oneshot::channel();
@@ -2225,19 +2463,106 @@ fn auth_frame(event: AuthEvent) -> AuthFrame {
     }
 }
 
+/// Where a task's frames go: the address of the request that opened it, until a chat's is moved.
+///
+/// A chat is the one task whose address can move (MOD-4 plan D165, blueprint D185). A promoted
+/// chat opens at an `Orch` request's address, and the shell's staleness index is keyed by request
+/// kind (`App::is_fresh`), so any later `Orch` request from the Chat tab — a second promotion the
+/// run runtime refuses included — would supersede it, and every frame after it would be dropped
+/// as stale while the store went on recording. [`StoreRequest::ChatFollow`] moves the stream to a
+/// chat request's address that nothing else from the tab supersedes, and a promotion refused at
+/// the bind moves it to that promotion's (`AgentRuntime::attach_promoted`).
+///
+/// Shared, because the mover is the runtime and the sender is the session task. One lock around
+/// both the address and the send, so no frame is sent to an address a move has already left, and
+/// the acceptance a move re-sends reaches the new address before any frame that follows it.
+#[derive(Debug, Clone)]
+struct Stream(Arc<Mutex<StreamState>>);
+
+/// [`Stream`]'s state.
+#[derive(Debug)]
+struct StreamState {
+    /// Where the next frame goes.
+    addr: ReplyAddr,
+    /// The chat's `ChatAccepted`, once sent: what a move re-sends to an asker that has not seen it.
+    accepted: Option<StoreReply>,
+}
+
+impl Stream {
+    fn lock(&self) -> std::sync::MutexGuard<'_, StreamState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// [`StoreRequest::ChatFollow`]: every frame from now on goes to `addr`.
+    fn follow(&self, addr: ReplyAddr) {
+        self.lock().addr = addr;
+    }
+
+    /// A refused promotion (blueprint D185): `refusal` answers `addr`, then the stream moves there
+    /// and the acceptance, once there is one, is sent again, because the asker's view of the chat
+    /// was reset since it was first sent. One lock for all three, so no frame lands between them.
+    fn hand_over(
+        &self,
+        tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        refusal: StoreReply,
+    ) {
+        let send = |reply: StoreReply| {
+            // A UI that has gone away is not an error, as in `Frames::send`.
+            let _ = tx.send(ReplyEnvelope {
+                seq: addr.seq,
+                origin: addr.origin.clone(),
+                reply,
+            });
+        };
+        let mut state = self.lock();
+        send(refusal);
+        if let Some(accepted) = state.accepted.clone() {
+            send(accepted);
+        }
+        state.addr = addr.clone();
+    }
+}
+
 /// The reply-channel side of one chat: one address, one sender, one place frames are shaped.
 struct Frames {
     tx: mpsc::UnboundedSender<ReplyEnvelope>,
-    addr: ReplyAddr,
+    stream: Stream,
 }
 
 impl Frames {
+    /// Frames answering at `addr`, the address of the request that opened the task.
+    fn new(tx: mpsc::UnboundedSender<ReplyEnvelope>, addr: ReplyAddr) -> Self {
+        Self {
+            tx,
+            stream: Stream(Arc::new(Mutex::new(StreamState {
+                addr,
+                accepted: None,
+            }))),
+        }
+    }
+
+    /// Where the stream goes now.
+    fn addr(&self) -> ReplyAddr {
+        self.stream.lock().addr.clone()
+    }
+
+    /// Sends `reply` at the stream's address, under the lock a move takes.
+    fn to_stream(&self, reply: StoreReply) {
+        let state = self.stream.lock();
+        self.send(state.addr.clone(), reply);
+    }
+
+    /// The chat's acceptance, at the stream's address, kept for a move to re-send.
+    fn accept(&self, reply: StoreReply) {
+        let mut state = self.stream.lock();
+        state.accepted = Some(reply.clone());
+        self.send(state.addr.clone(), reply);
+    }
+
     /// One recorded, scrubbed envelope.
     fn event(&self, envelope: DriverEnvelope) {
-        self.send(
-            self.addr.clone(),
-            StoreReply::Chat(ChatFrame::Event(Box::new(envelope))),
-        );
+        self.to_stream(StoreReply::Chat(ChatFrame::Event(Box::new(envelope))));
     }
 
     /// One of the three rows `htui` authors itself, shaped as an `other` event for transport only.
@@ -2257,18 +2582,12 @@ impl Frames {
 
     /// The session is over.
     fn ended(&self, stop_reason: StopReason) {
-        self.send(
-            self.addr.clone(),
-            StoreReply::Chat(ChatFrame::Ended { stop_reason }),
-        );
+        self.to_stream(StoreReply::Chat(ChatFrame::Ended { stop_reason }));
     }
 
     /// The session died.
     fn failed(&self, message: String) {
-        self.send(
-            self.addr.clone(),
-            StoreReply::Chat(ChatFrame::Failed { message }),
-        );
+        self.to_stream(StoreReply::Chat(ChatFrame::Failed { message }));
     }
 
     /// Answers one request by its own address.
@@ -2312,7 +2631,7 @@ pub async fn run_chat(args: ChatArgs) {
         driver,
         writer,
         writer_label,
-        chat,
+        binding,
         spec,
         prompt,
         policy,
@@ -2326,21 +2645,17 @@ pub async fn run_chat(args: ChatArgs) {
     } = args;
 
     let scrubber = MinimalScrubber::new(spec.env.values().cloned());
-    let step_id = chat.step_id;
-    let start_addr = frames.addr.clone();
+    let step_id = binding.step_id();
 
     let mut session = match driver.start(spec, prompt.clone()).await {
         Ok(session) => session,
         Err(err) => {
             let message = err.to_string();
-            frames.reply(
-                &start_addr,
-                StoreReply::Failed {
-                    request: "chat_start",
-                    message: message.clone(),
-                },
-            );
-            close_run(&writer, &chat, RunStatus::Failed).await;
+            frames.to_stream(StoreReply::Failed {
+                request: binding.request(),
+                message: message.clone(),
+            });
+            binding.close(&writer, RunStatus::Failed).await;
             frames.failed(message);
             // Plan D60. A failure to *spawn* is a fact about this box's row, not about the
             // conversation: the adapter it names is gone, moved by a self-update, or no longer
@@ -2361,24 +2676,25 @@ pub async fn run_chat(args: ChatArgs) {
         }
     };
 
-    frames.reply(
-        &start_addr,
-        StoreReply::ChatAccepted {
-            step_id,
-            session_ref: session.session_ref().cloned(),
-            caps,
-            writer_label,
-        },
-    );
+    frames.accept(StoreReply::ChatAccepted {
+        step_id,
+        session_ref: session.session_ref().cloned(),
+        caps,
+        writer_label,
+    });
 
     let (ui_tx, mut ui_rx) = mpsc::channel(UI_FRAMES);
-    let mut recorder = Recorder::new(
-        &writer,
-        &scrubber,
-        step_id,
-        std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
-        Some(ui_tx),
-    );
+    let retain_raw = std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1");
+    let mut recorder = match &binding {
+        ChatBinding::Fresh(_) => {
+            Recorder::new(&writer, &scrubber, step_id, retain_raw, Some(ui_tx))
+        }
+        // Plan D164: the step's log goes on past its last row, at its next turn, with its
+        // pre-promotion spend in the running total and its prompt digest left alone.
+        ChatBinding::Promoted { tail, .. } => {
+            Recorder::continuing(&writer, &scrubber, step_id, retain_raw, Some(ui_tx), tail)
+        }
+    };
     // Two opt-in builders rather than two more `new` parameters, because most recorders in this
     // tree have neither (plan D66-D68, D70). The grace the cap's cancel takes is this runtime's
     // own `CANCEL_GRACE`, riding on `RunCap` so `htui_agent::record::pump` keeps its signature.
@@ -2390,13 +2706,25 @@ pub async fn run_chat(args: ChatArgs) {
     }
 
     let now = Utc::now();
-    if let Err(err) = recorder
-        .record_prompt(&prompt, prompt_sections(), now)
-        .await
-    {
-        tracing::error!(%err, "the prompt row could not be written");
+    match &binding {
+        ChatBinding::Fresh(_) => {
+            if let Err(err) = recorder
+                .record_prompt(&prompt, prompt_sections(), now)
+                .await
+            {
+                tracing::error!(%err, "the prompt row could not be written");
+            }
+            frames.local("prompt", json!({ "text": prompt }), now);
+        }
+        // ANA-5 criterion 18: the opening — the handoff prompt, or the resume sentence — is the
+        // step's next `follow_up`, never a second `prompt` (which would rewrite the digest).
+        ChatBinding::Promoted { .. } => {
+            if let Err(err) = recorder.record_follow_up(&prompt, now).await {
+                tracing::error!(%err, "the opening's follow-up row could not be written");
+            }
+            frames.event(follow_up_frame(&prompt, now));
+        }
     }
-    frames.local("prompt", json!({ "text": prompt }), now);
 
     // Every call this session has seen, so a permission request can be evaluated against the tool
     // call it gates (`htui_agent::permission`).
@@ -2520,7 +2848,7 @@ pub async fn run_chat(args: ChatArgs) {
         tracing::error!(%err, "the recorder did not close cleanly");
         status = RunStatus::Failed;
     }
-    close_run(&writer, &chat, status).await;
+    binding.close(&writer, status).await;
     frames.ended(last_stop);
 }
 
@@ -2857,7 +3185,6 @@ pub(crate) mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::{Agent, AgentId, EventKind, EventRole, Scope, Transport};
     use htui_core::store::MemStore;
-    use htui_core::store::ReadStore as _;
     use std::sync::Arc;
 
     // -----------------------------------------------------------------------------------------
@@ -3426,6 +3753,237 @@ pub(crate) mod tests {
             store.active_runs(&scope()).await.expect("count"),
             before,
             "a finished chat stops counting as an active run"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A promoted graph step (MOD-4 plan D164, D165, blueprint D205, D206)
+    // -----------------------------------------------------------------------------------------
+
+    /// The fixture's `plan` step of `RUN_1`, promoted: the one step with a cached log, so the
+    /// continuing recorder has a tail to start past.
+    fn promoted(agent_id: AgentId, path: OpeningPath) -> crate::run_worker::Promoted {
+        crate::run_worker::Promoted {
+            run: ids::RUN_1,
+            step: ids::STEP_PLAN,
+            project: ids::PROJECT_HTUI,
+            opening: htui_orch::Opening {
+                agent_id,
+                agent_name: "fake".to_owned(),
+                model: None,
+                phase: "plan".to_owned(),
+                cwd: std::env::temp_dir(),
+                extra_dirs: vec![std::env::temp_dir().join("second-tree")],
+                path,
+            },
+        }
+    }
+
+    /// The promotion's address: the Chat tab's `PromoteStep`, at seq 7.
+    fn promote_addr() -> ReplyAddr {
+        ReplyAddr {
+            seq: 7,
+            origin: Origin::Tab(crate::ui::tabs::TabId("chat")),
+        }
+    }
+
+    /// Attaches `promoted`, queues the user's `Esc Esc` before the session is polled, and drives
+    /// it to its end: [`run`]'s shape for a promotion.
+    async fn attach_and_end(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        promoted: crate::run_worker::Promoted,
+        between: impl AsyncFnOnce(StepId),
+    ) -> Vec<ReplyEnvelope> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } = runtime
+            .attach_promoted(backend, &tx, promote_addr(), promoted)
+            .await
+        else {
+            panic!("a promotion over a registered row opens a session")
+        };
+        between(step_id).await;
+        let cancel = runtime
+            .serve(
+                backend,
+                &tx,
+                &envelope(8, StoreRequest::ChatCancel { step_id }),
+            )
+            .await;
+        assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
+        task.await;
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            replies.push(reply);
+        }
+        replies
+    }
+
+    /// Blueprint D192, R-48: a CLI step with a `session_started` banner is resumed — the spec the
+    /// driver starts carries the banner's session ref, the step's own id and the step's trees —
+    /// and the chat records against that step, past its log.
+    #[tokio::test]
+    async fn attach_promoted_resumes_a_cli_step_with_its_banner() {
+        let (store, backend, mut runtime, agent_id, spec) =
+            fixture_with_spec_spy(Script::one_turn(vec![ends(StopReason::EndTurn)]), None).await;
+        let tail = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("the fixture's step has a log");
+        let promotion = promoted(
+            agent_id,
+            OpeningPath::Resume {
+                session_ref: htui_agent::driver::AgentSessionRef::new("banner-1"),
+                text: htui_orch::promote::RESUME_OPENING.to_owned(),
+            },
+        );
+
+        let replies = attach_and_end(&mut runtime, &backend, promotion, async |_| {}).await;
+
+        let seen = spec
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .expect("the driver was started");
+        assert_eq!(
+            seen.resume,
+            Some(htui_agent::driver::AgentSessionRef::new("banner-1"))
+        );
+        assert_eq!(seen.step_id, ids::STEP_PLAN, "the step keeps its id");
+        assert_eq!(seen.cwd, std::env::temp_dir());
+        assert_eq!(
+            seen.extra_dirs,
+            vec![std::env::temp_dir().join("second-tree")]
+        );
+        assert!(
+            matches!(replies[0].reply, StoreReply::ChatAccepted { step_id, .. } if step_id == ids::STEP_PLAN)
+                && replies[0].seq == 7,
+            "the promotion's own address hears the acceptance: {:?}",
+            replies[0]
+        );
+
+        let log = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("a log");
+        let follow_up = log
+            .iter()
+            .find(|row| row.kind == EventKind::FollowUp)
+            .expect("the opening is recorded");
+        let last = tail.iter().map(|row| row.seq).max().expect("a tail");
+        assert_eq!(
+            follow_up.seq,
+            last + 1,
+            "the log continues past its last row"
+        );
+        assert_eq!(follow_up.turn, 1, "the opening opens the step's next turn");
+        assert_eq!(
+            follow_up.payload.get("text").and_then(Value::as_str),
+            Some(htui_orch::promote::RESUME_OPENING)
+        );
+    }
+
+    /// Blueprint D205: a promoted session neither mints a `run(kind='chat')` nor closes one — the
+    /// step and its run are the engine's, and stay as the promotion left them.
+    #[tokio::test]
+    async fn a_promoted_chat_never_closes_a_run() {
+        let (store, backend, mut runtime, agent_id) =
+            fixture(Script::one_turn(vec![ends(StopReason::EndTurn)])).await;
+        let run_before = store
+            .run(ids::RUN_1)
+            .await
+            .expect("the read answers")
+            .expect("the fixture's run");
+        let step_of = async |store: &MemStore| {
+            store
+                .run_steps(ids::RUN_1)
+                .await
+                .expect("the read answers")
+                .into_iter()
+                .find(|step| step.id == ids::STEP_PLAN)
+                .expect("the fixture's step")
+        };
+        let step_before = step_of(&store).await;
+        let active = store.active_runs(&scope()).await.expect("count");
+
+        let promotion = promoted(
+            agent_id,
+            OpeningPath::Handoff {
+                text: "pick up where the step stopped".to_owned(),
+                digest: "d-handoff".to_owned(),
+            },
+        );
+        let replies = attach_and_end(&mut runtime, &backend, promotion, async |_| {
+            assert_eq!(
+                store.active_runs(&scope()).await.expect("count"),
+                active,
+                "no chat run is minted for a promoted step"
+            );
+        })
+        .await;
+        assert!(
+            matches!(
+                replies.last().map(|reply| &reply.reply),
+                Some(StoreReply::Chat(ChatFrame::Ended { .. }))
+            ),
+            "the session ended: {replies:?}"
+        );
+
+        let run_after = store
+            .run(ids::RUN_1)
+            .await
+            .expect("the read answers")
+            .expect("the fixture's run");
+        assert_eq!(run_after.status, run_before.status, "the run is untouched");
+        assert_eq!(run_after.finished_at, run_before.finished_at);
+        let step_after = step_of(&store).await;
+        assert_eq!(step_after.status, step_before.status, "so is the step");
+        assert_eq!(
+            step_after.prompt_digest, step_before.prompt_digest,
+            "and the step's prompt digest is the original prompt's"
+        );
+        assert_eq!(store.active_runs(&scope()).await.expect("count"), active);
+    }
+
+    /// Blueprint D206 (F-H): a chat whose task has ended is not live, even while the runtime still
+    /// holds its entry — `caps` answers until the next `serve` sweeps it, `live_steps` does not.
+    #[tokio::test]
+    async fn live_steps_drops_an_ended_chat() {
+        let (_store, backend, mut runtime, agent_id) =
+            fixture(Script::one_turn(vec![ends(StopReason::EndTurn)])).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+            .await
+        else {
+            panic!("a chat start opens a session")
+        };
+        assert_eq!(
+            runtime.live_steps(),
+            vec![step_id],
+            "a started chat is live"
+        );
+
+        let cancel = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(8, StoreRequest::ChatCancel { step_id }),
+            )
+            .await;
+        assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
+        task.await;
+
+        assert!(
+            runtime.caps(step_id).is_some(),
+            "the ended chat's entry is still held until the next serve"
+        );
+        assert!(
+            runtime.live_steps().is_empty(),
+            "but its command channel is closed, so it is not live"
         );
     }
 
@@ -6543,13 +7101,13 @@ done
                 cancel: CancellationToken::new(),
                 commands: commands_rx,
                 opener: OpenerCommand::Custom(recorder(tmp.path())),
-                frames: Frames {
+                frames: Frames::new(
                     tx,
-                    addr: ReplyAddr {
+                    ReplyAddr {
                         seq: 2,
                         origin: origin.clone(),
                     },
-                },
+                ),
             })
             .await;
 

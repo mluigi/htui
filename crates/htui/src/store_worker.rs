@@ -56,8 +56,9 @@ pub const PROMPT_PREVIEW: &str = "prompt_preview";
 /// D183): the test harness without one.
 pub const NO_RUN_RUNTIME: &str = "no run runtime in this build";
 
-/// Blueprint D181's T6 stub: what a promotion is answered with until the Chat tab's runtime binds
-/// promoted steps (T7).
+/// What a promotion is answered with, after its engine writes, by a test harness that has a run
+/// runtime and no chat runtime to bind the promoted step to (blueprint D181). The store loop always
+/// holds both.
 pub const PROMOTION_NEEDS_CHAT: &str = "promotion needs the chat runtime";
 
 /// Who asked, and therefore who the reply is addressed to.
@@ -174,6 +175,19 @@ pub enum StoreRequest {
     },
     /// End a live chat.
     ChatCancel {
+        /// The step the chat records against.
+        step_id: StepId,
+    },
+    /// Stream a live chat's frames to this request's address from now on (MOD-4 plan D165,
+    /// blueprint D185).
+    ///
+    /// The Chat tab sends it when a promoted chat is accepted. A promotion's address is an `Orch`
+    /// request's, and any later `Orch` request from the tab — a second promotion the run runtime
+    /// refuses included — supersedes it in the shell's staleness index (`App::is_fresh`), which
+    /// would drop every frame after it. Nothing else from the tab supersedes this one while the
+    /// chat is live. Answered by the stream itself: no reply of its own, and none for a chat that
+    /// is already over.
+    ChatFollow {
         /// The step the chat records against.
         step_id: StepId,
     },
@@ -541,6 +555,7 @@ impl StoreRequest {
             Self::ChatSend { .. } => "chat_send",
             Self::ChatAnswer { .. } => "chat_answer",
             Self::ChatCancel { .. } => "chat_cancel",
+            Self::ChatFollow { .. } => "chat_follow",
             Self::ProbeAgents => "probe_agents",
             Self::InstallPlan { .. } => "install_plan",
             Self::InstallConfirm { .. } => "install_confirm",
@@ -966,9 +981,9 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             step_id: *step,
             events: backend.step_events(*step).await?,
         },
-        // The four chat requests need the worker loop's own state (the live sessions), and the
+        // The five chat requests need the worker loop's own state (the live sessions), and the
         // probe, the preview, the three install requests and MOD-21's four login ones need the
-        // runtime that owns their tasks, so all thirteen are served ahead of this function, exactly
+        // runtime that owns their tasks, so all fourteen are served ahead of this function, exactly
         // as `ApplyMigrations` is. One of them that reaches here at all belongs to a caller with no
         // runtime — the test harness without one — and saying so is more use than a panic.
         StoreRequest::PromptPreview { .. }
@@ -976,6 +991,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::ChatSend { .. }
         | StoreRequest::ChatAnswer { .. }
         | StoreRequest::ChatCancel { .. }
+        | StoreRequest::ChatFollow { .. }
         | StoreRequest::ProbeAgents
         | StoreRequest::InstallPlan { .. }
         | StoreRequest::InstallConfirm { .. }
@@ -1121,39 +1137,40 @@ pub fn spawn_with(
     spawn_with_runtimes(started, rx, tx, runtime, RunRuntime::production())
 }
 
-/// The steps a chat of this process is live on (blueprint D206): every started step whose chat
-/// the runtime still holds. T7's `AgentRuntime::live_steps` replaces the derivation.
+/// The steps a chat of this process is live on (blueprint D206): the runtime's chats whose
+/// session task is still running (`AgentRuntime::live_steps`).
 pub(crate) fn live_chats(runtime: &AgentRuntime) -> LiveChats {
-    LiveChats::of(
-        runtime
-            .steps()
-            .into_iter()
-            .filter(|step| runtime.caps(*step).is_some()),
-    )
+    LiveChats::of(runtime.live_steps())
 }
 
 /// What the loop does with a [`RunServed`] that is not a plain reply (blueprint D181): the
 /// runtime's event channel carries only `Attach`.
 ///
-/// **T6 stub**: the chat binding is T7's, so a promotion is answered `promote_step: promotion
-/// needs the chat runtime` at the request's address, after the engine's writes and the
-/// `Orch(Promoted)` reply.
+/// A promotion's engine writes are done and `Orch(Promoted)` has answered the request, so the chat
+/// runtime binds a session to the promoted step (MOD-4 plan D165). Its task answers the same
+/// address with `ChatAccepted` and every frame after it; a refusal is answered here, once.
 async fn on_run_served(
     served: RunServed,
-    _runtime: &mut AgentRuntime,
-    _backend: &Backend,
+    runtime: &mut AgentRuntime,
+    backend: &Backend,
     tx: &mpsc::UnboundedSender<ReplyEnvelope>,
 ) {
     match served {
-        RunServed::Attach { addr, .. } => {
-            let _ = tx.send(ReplyEnvelope {
-                seq: addr.seq,
-                origin: addr.origin,
-                reply: StoreReply::Failed {
-                    request: "promote_step",
-                    message: PROMOTION_NEEDS_CHAT.to_owned(),
-                },
-            });
+        RunServed::Attach { addr, promoted } => {
+            match runtime
+                .attach_promoted(backend, tx, addr.clone(), *promoted)
+                .await
+            {
+                Served::Start { step_id, task } => runtime.attach(step_id, tokio::spawn(task)),
+                Served::Reply(reply) => {
+                    let _ = tx.send(ReplyEnvelope {
+                        seq: addr.seq,
+                        origin: addr.origin,
+                        reply,
+                    });
+                }
+                Served::Deferred => {}
+            }
         }
         other @ (RunServed::Reply(_) | RunServed::Deferred) => {
             debug_assert!(false, "the run runtime's event channel carries only Attach");
@@ -1467,6 +1484,7 @@ pub fn spawn_with_runtimes(
                         | StoreRequest::ChatSend { .. }
                         | StoreRequest::ChatAnswer { .. }
                         | StoreRequest::ChatCancel { .. }
+                        | StoreRequest::ChatFollow { .. }
                         | StoreRequest::ProbeAgents
                         | StoreRequest::InstallPlan { .. }
                         | StoreRequest::InstallConfirm { .. }
@@ -2522,6 +2540,13 @@ mod tests {
             "auth_open"
         );
         assert_eq!(StoreRequest::AuthCancel.name(), "auth_cancel");
+        assert_eq!(
+            StoreRequest::ChatFollow {
+                step_id: StepId::new()
+            }
+            .name(),
+            "chat_follow"
+        );
     }
 
     /// A shell with no agent runtime answers each of the four by name, exactly once, rather than
@@ -2623,19 +2648,73 @@ mod tests {
         let _ = worker.await;
     }
 
-    /// Blueprint §8.10, D181: a promotion's engine writes are answered `Orch(Promoted)`, and the
-    /// runtime's `Attach` event reaches the loop, whose T6 stub answers with its sentence — both at
-    /// the request's `seq` and origin. T7 changes the second expectation (§10.5).
+    /// Blueprint §8.10, §10.5, D181: a promotion's engine writes are answered `Orch(Promoted)`, and
+    /// the runtime's `Attach` event reaches the loop, which binds the Chat tab's runtime to the
+    /// promoted step — `ChatAccepted` on that step, both at the request's `seq` and origin.
     #[tokio::test]
     async fn a_promotion_reaches_the_attach_hand_off() {
-        use crate::run_worker::tests::{Fixture, Worker, parked};
+        use crate::run_worker::tests::{Fixture, start_run, step_at};
         use crate::run_worker::{OrchReply, OrchRequest};
+        use htui_agent::conformance::{Script, ScriptEvent};
+        use htui_agent::event::{DoneEvent, DriverEvent};
 
         let fixture = Fixture::new().await;
-        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
-        let (run, step) = parked(&fixture, &mut worker).await;
+        // The chat's own transport: the fixture's scripted row is `acp`, and the chat runtime
+        // reaches it by row data like the walk does.
+        let adapter = htui_agent::fake::FakeAdapter::new();
+        adapter.load(Script::one_turn(vec![ScriptEvent::Emit(
+            DriverEvent::Done(DoneEvent {
+                stop_reason: StopReason::EndTurn,
+            }),
+        )]));
+        let mut factory = htui_agent::registry::DriverFactory::new();
+        factory.register("acp", Box::new(adapter));
+
+        let (requests, requests_rx) = mpsc::unbounded_channel();
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let _worker = spawn_with_runtimes(
+            Started::detached(Backend::memory(fixture.store.clone())),
+            requests_rx,
+            replies_tx,
+            AgentRuntime::new(factory).with_grace(std::time::Duration::ZERO),
+            fixture.runtime(),
+        );
+        let send = |seq, origin, request| {
+            requests
+                .send(RequestEnvelope {
+                    seq,
+                    origin,
+                    request,
+                })
+                .expect("the worker is running");
+        };
+        let mut seen: Vec<ReplyEnvelope> = Vec::new();
+        let mut next_at = async |seq: Seq| loop {
+            if let Some(at) = seen.iter().position(|envelope| {
+                envelope.seq == seq && !matches!(envelope.reply, StoreReply::RunStream(_))
+            }) {
+                return seen.remove(at);
+            }
+            let envelope = tokio::time::timeout(std::time::Duration::from_secs(20), replies.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no reply at seq {seq}"))
+                .expect("the worker is running");
+            seen.push(envelope);
+        };
+
+        send(1, Origin::App, start_run(ids::HTUI_ANA_2));
+        let started = next_at(1).await;
+        let StoreReply::Orch(OrchReply::Done(outcome)) = started.reply else {
+            panic!("a start answers Done: {:?}", started.reply)
+        };
+        let htui_orch::CommandOutcome::Started { run, .. } = *outcome else {
+            panic!("a start answers Started")
+        };
+        let step = step_at(&fixture, run, 0).await;
+
         let chat = Origin::Tab(TabId("chat"));
-        let promote = worker.send(
+        send(
+            2,
             chat.clone(),
             StoreRequest::Orch(OrchRequest::Command(htui_orch::Command::PromoteStep {
                 run,
@@ -2644,7 +2723,7 @@ mod tests {
             })),
         );
 
-        let first = worker.envelope(promote).await;
+        let first = next_at(2).await;
         assert_eq!(first.origin, chat);
         assert!(
             matches!(first.reply, StoreReply::Orch(OrchReply::Promoted { step: promoted, run: of, .. })
@@ -2652,12 +2731,11 @@ mod tests {
             "{:?}",
             first.reply
         );
-        let second = worker.envelope(promote).await;
+        let second = next_at(2).await;
         assert_eq!(second.origin, chat);
         assert!(
-            matches!(&second.reply, StoreReply::Failed { request: "promote_step", message }
-                if message == PROMOTION_NEEDS_CHAT),
-            "{:?}",
+            matches!(second.reply, StoreReply::ChatAccepted { step_id, .. } if step_id == step.id),
+            "the chat is bound to the promoted step: {:?}",
             second.reply
         );
     }

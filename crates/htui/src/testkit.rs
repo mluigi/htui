@@ -164,18 +164,43 @@ impl Harness {
     }
 
     /// What the harness does with a [`RunServed`] that is not a plain reply, as the store loop's
-    /// helper does (blueprint D181). **T6 stub**: a promotion's `Attach` is answered
-    /// `promote_step: promotion needs the chat runtime` at its address; T7 binds the chat.
-    fn on_run_served(&mut self, served: RunServed) {
+    /// helper does (blueprint D181): a promotion's `Attach` binds the chat runtime to the promoted
+    /// step (MOD-4 plan D165), and its session future joins the ones [`Harness::drive`] polls
+    /// inline instead of being spawned.
+    ///
+    /// A harness with no chat runtime answers the promotion
+    /// `promote_step: promotion needs the chat runtime` at its address, after the engine's writes.
+    async fn on_run_served(&mut self, served: RunServed) {
         match served {
-            RunServed::Attach { addr, .. } => {
-                let _ = self.replies.0.send(ReplyEnvelope {
-                    seq: addr.seq,
-                    origin: addr.origin,
-                    reply: StoreReply::Failed {
+            RunServed::Attach { addr, promoted } => {
+                let reply = match self.runtime.as_mut() {
+                    Some(runtime) => {
+                        match runtime
+                            .attach_promoted(
+                                &self.backend,
+                                &self.replies.0,
+                                addr.clone(),
+                                *promoted,
+                            )
+                            .await
+                        {
+                            Served::Start { step_id, task } => {
+                                self.chats.push((step_id, task));
+                                return;
+                            }
+                            Served::Deferred => return,
+                            Served::Reply(reply) => reply,
+                        }
+                    }
+                    None => StoreReply::Failed {
                         request: "promote_step",
                         message: store_worker::PROMOTION_NEEDS_CHAT.to_owned(),
                     },
+                };
+                let _ = self.replies.0.send(ReplyEnvelope {
+                    seq: addr.seq,
+                    origin: addr.origin,
+                    reply,
                 });
             }
             other @ (RunServed::Reply(_) | RunServed::Deferred) => {
@@ -240,6 +265,7 @@ impl Harness {
                         | StoreRequest::ChatSend { .. }
                         | StoreRequest::ChatAnswer { .. }
                         | StoreRequest::ChatCancel { .. }
+                        | StoreRequest::ChatFollow { .. }
                         | StoreRequest::ProbeAgents
                         | StoreRequest::InstallPlan { .. }
                         | StoreRequest::InstallConfirm { .. }
@@ -296,7 +322,7 @@ impl Harness {
                             // The runtime's task answers this request itself.
                             RunServed::Deferred => continue,
                             attach @ RunServed::Attach { .. } => {
-                                self.on_run_served(attach);
+                                self.on_run_served(attach).await;
                                 continue;
                             }
                         }
@@ -328,7 +354,7 @@ impl Harness {
             }
             for served in events {
                 progress = true;
-                self.on_run_served(served);
+                self.on_run_served(served).await;
             }
 
             // One poll each: a chat that is ready finishes, one that is waiting stays where it is.
@@ -723,10 +749,11 @@ mod tests {
         );
     }
 
-    /// Blueprint D181's T6 stub, through the harness: the promotion's writes land and the attach
-    /// hand-off answers the promoting tab with its sentence.
+    /// Blueprint D181, through a harness with a run runtime and no chat runtime: the promotion's
+    /// writes land, and the attach hand-off, with no chat runtime to bind, answers the promoting
+    /// tab with its sentence.
     #[tokio::test]
-    async fn a_promotion_in_the_harness_reaches_the_attach_stub() {
+    async fn a_promotion_in_a_harness_with_no_chat_runtime_is_answered_after_its_writes() {
         use crate::run_worker::tests::{Fixture, only_run, start_run, step_at};
 
         let fixture = Fixture::new().await;
