@@ -2773,6 +2773,65 @@ async fn a_merge_onto_a_moved_primary_diffs_only_its_own_paths() {
     );
 }
 
+/// Plan D146 (review M2): a later run's merge moves `HEAD` past the middle one's, which is then
+/// neither `HEAD` nor its first parent. The middle run's diff is still its own merge against that
+/// merge's first parent, naming `b.txt` only, and so it stays on a detached `HEAD` as well.
+#[tokio::test]
+async fn a_merge_with_head_moved_past_it_diffs_only_its_own_paths() {
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    let (c, _, c_rows) = committed_worktree_step(&fix, "c.txt", "run c\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let m1 = head_of(&git, &fix.core.path).await;
+    let second = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles on top of the first one's merge");
+    let m2 = head_of(&git, &fix.core.path).await;
+    fix.isolator
+        .reconcile(c, &c_rows, &[])
+        .await
+        .expect("the third run reconciles on top of the second one's merge");
+    let m3 = head_of(&git, &fix.core.path).await;
+    assert_ne!(m3, m2, "HEAD moved past the second run's merge");
+
+    for head in ["on the branch", "detached"] {
+        if head == "detached" {
+            git_out(&git, &fix.core.path, &["checkout", "-q", "--detach"]).await;
+        }
+        let diff = fix
+            .isolator
+            .diff(&b_rows, &second)
+            .await
+            .expect("the diff reads")
+            .expect("the second run committed");
+        assert_eq!(
+            diff.range,
+            format!("{m1}..{m2}"),
+            "the merge's own range, HEAD {head}"
+        );
+        assert!(diff.stat.contains("b.txt"), "its own path: {}", diff.stat);
+        assert!(
+            !diff.stat.contains("a.txt") && !diff.diff.contains("a.txt"),
+            "never the earlier run's path, HEAD {head}: {}",
+            diff.diff
+        );
+        assert!(
+            !diff.stat.contains("c.txt") && !diff.diff.contains("c.txt"),
+            "never the later run's path, HEAD {head}: {}",
+            diff.diff
+        );
+    }
+}
+
 /// Plan D146 (R-33): an agent's branch that ends in a two-parent commit it made itself, with D25's
 /// `htui: reconcile <step>` message, is not htui's merge: it is not on the primary's first-parent
 /// line. Its row still diffs `before..after`, so the agent's earlier commit stays in the diff.
