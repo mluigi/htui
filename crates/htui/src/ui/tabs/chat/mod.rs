@@ -125,6 +125,33 @@ pub struct ReplayState {
     pub missing: bool,
 }
 
+/// How many columns `text` takes.
+fn columns(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// `text` cut to `room` columns, its last one an ellipsis when anything was cut.
+fn clip(text: &str, room: usize) -> String {
+    if columns(text) <= room {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let width = columns(ch.encode_utf8(&mut [0; 4]));
+        // One column stays free for the ellipsis.
+        if used + width + 1 > room {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    if room > 0 {
+        out.push('\u{2026}');
+    }
+    out
+}
+
 /// The one line a replay shows instead of a transcript, or `None` when it has rows to show.
 ///
 /// The two messages are two different facts and must not read as one (D38): a step this box never
@@ -321,8 +348,9 @@ impl ChatTab {
     /// The header: who is talking, about which project, in which session.
     ///
     /// A promoted step's chat names the step instead (D165): `promoted · <phase> · <resumed |
-    /// handoff> · <agent> · <model> · session <ref>`. Every other chat's header is unchanged.
-    fn header(&self, ctx: &Ctx<'_>) -> Line<'static> {
+    /// handoff> · <agent> · <model> · session <ref>`, fitted to `width`. Every other chat's header
+    /// is unchanged.
+    fn header(&self, ctx: &Ctx<'_>, width: u16) -> Line<'static> {
         let session = self
             .session
             .as_ref()
@@ -334,15 +362,22 @@ impl ChatTab {
                 Via::Handoff => "handoff",
             };
             let model = promoted.model.as_deref().unwrap_or("default");
+            // The session ref is the one field here that exists to be read back (a later
+            // `session/load`), so the border never cuts it: a line too wide drops the `session `
+            // label first, then cuts the fields before the ref with an ellipsis.
+            let width = usize::from(width);
+            let lead = format!("promoted · {}", promoted.phase);
+            let middle = format!(" · {via} · {} · {model}", promoted.agent);
+            let mut tail = format!(" · session {session}");
+            if columns(&lead) + columns(&middle) + columns(&tail) > width {
+                tail = format!(" · {session}");
+            }
+            let room = width.saturating_sub(columns(&tail));
+            let lead = clip(&lead, room);
+            let middle = clip(&middle, room.saturating_sub(columns(&lead)));
             return Line::from(vec![
-                Span::styled(format!("promoted · {}", promoted.phase), ctx.theme.accent),
-                Span::styled(
-                    format!(
-                        " · {via} · {} · {model} · session {session}",
-                        promoted.agent
-                    ),
-                    ctx.theme.dim,
-                ),
+                Span::styled(lead, ctx.theme.accent),
+                Span::styled(format!("{middle}{tail}"), ctx.theme.dim),
             ]);
         }
         let agent = self
@@ -640,7 +675,7 @@ impl Tab for ChatTab {
 
         let header_line = match replay {
             Some(replay) => Self::replay_header(replay, ctx),
-            None => self.header(ctx),
+            None => self.header(ctx, header.width),
         };
         frame.render_widget(Paragraph::new(header_line), header);
         if let Some(text) = banner {
@@ -1075,6 +1110,41 @@ mod tests {
             tab.promoted().is_none(),
             "a chat on another step is the tab's own, and its header names the agent again"
         );
+    }
+
+    /// Verifier finding (D165): the session ref is what a later `session/load` reads back, so a
+    /// header too wide for its line drops the `session ` label, then cuts the fields before the
+    /// ref — never the ref itself.
+    #[test]
+    fn a_narrow_promoted_header_keeps_the_whole_session_ref() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        tab.promoted = Some(PromotedHeader {
+            step: StepId::new(),
+            phase: "implementation".to_owned(),
+            agent: "scripted".to_owned(),
+            model: Some("sonnet".to_owned()),
+            via: Via::Handoff,
+        });
+        let text = |width: u16| -> String {
+            tab.header(&shell.ctx(), width)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+
+        assert_eq!(
+            text(200),
+            "promoted · implementation · handoff · scripted · sonnet · session live-1"
+        );
+        assert_eq!(
+            text(66),
+            "promoted · implementation · handoff · scripted · sonnet · live-1",
+            "the label goes first"
+        );
+        assert_eq!(text(40), "promoted · implementation · ha\u{2026} · live-1");
+        assert_eq!(columns(&text(40)), 40, "and the line fits");
     }
 
     /// D38's two answers are two different facts and must not read as one.

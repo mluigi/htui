@@ -5,7 +5,7 @@ expression: rendered
 Graphics · DESKTOP-HTUI · memory · 0 runs
  1 Chat
 ┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
-│promoted · research · handoff · scripted · sonnet · session fake-<session>│
+│promoted · research · handoff · scripted · sonnet · fake-<session>     │
 │you  You are continuing work already under way on htui:ANA-2, phase research, attempt 1.A previous│
 │Picking the step back up.                                                                         │
 │— turn ended (end_turn) —                                                                         │
