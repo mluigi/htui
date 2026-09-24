@@ -641,6 +641,7 @@ pub enum OrchReply {
 pub struct RunFrame { pub item: ItemId, pub run: Option<RunId>, pub kind: FrameKind }
 #[derive(Debug, Clone)]
 pub enum FrameKind { Subscribed, Started, SessionDone { step: StepId }, Rested(htui_orch::Rest), Adopted, Error(String) }
+// T6 repair 8548711 added a seventh variant, `Changed`: a command whose outcome has no `Rest` (ClosedOut, a Reopen Unblock, a successful cleanup) publishes it so the pane re-reads. T8 must handle all seven.
 
 pub type Enabled = Result<(), String>;
 #[derive(Debug, Clone, PartialEq, Eq)]
