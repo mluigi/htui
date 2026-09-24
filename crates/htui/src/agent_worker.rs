@@ -504,6 +504,23 @@ impl AgentRuntime {
         self.live.get(&step_id).map(|chat| chat.caps)
     }
 
+    /// Blueprint D206: the steps whose chat task is still running — its command channel is open.
+    #[must_use]
+    pub fn live_steps(&self) -> Vec<StepId> {
+        todo!()
+    }
+
+    /// D165: `RunServed::Attach`'s other half, binding a chat to a promoted graph step.
+    pub async fn attach_promoted(
+        &mut self,
+        _backend: &Backend,
+        _replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        _addr: ReplyAddr,
+        _promoted: crate::run_worker::Promoted,
+    ) -> Served {
+        todo!()
+    }
+
     /// Serves one request the agent runtime owns: the four chat variants, `ProbeAgents`, and
     /// MOD-20's three install variants.
     ///
@@ -3426,6 +3443,237 @@ pub(crate) mod tests {
             store.active_runs(&scope()).await.expect("count"),
             before,
             "a finished chat stops counting as an active run"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A promoted graph step (MOD-4 plan D164, D165, blueprint D205, D206)
+    // -----------------------------------------------------------------------------------------
+
+    /// The fixture's `plan` step of `RUN_1`, promoted: the one step with a cached log, so the
+    /// continuing recorder has a tail to start past.
+    fn promoted(agent_id: AgentId, path: htui_orch::OpeningPath) -> crate::run_worker::Promoted {
+        crate::run_worker::Promoted {
+            run: ids::RUN_1,
+            step: ids::STEP_PLAN,
+            project: ids::PROJECT_HTUI,
+            opening: htui_orch::Opening {
+                agent_id,
+                agent_name: "fake".to_owned(),
+                model: None,
+                phase: "plan".to_owned(),
+                cwd: std::env::temp_dir(),
+                extra_dirs: vec![std::env::temp_dir().join("second-tree")],
+                path,
+            },
+        }
+    }
+
+    /// The promotion's address: the Chat tab's `PromoteStep`, at seq 7.
+    fn promote_addr() -> ReplyAddr {
+        ReplyAddr {
+            seq: 7,
+            origin: Origin::Tab(crate::ui::tabs::TabId("chat")),
+        }
+    }
+
+    /// Attaches `promoted`, queues the user's `Esc Esc` before the session is polled, and drives
+    /// it to its end: [`run`]'s shape for a promotion.
+    async fn attach_and_end(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        promoted: crate::run_worker::Promoted,
+        between: impl AsyncFnOnce(StepId),
+    ) -> Vec<ReplyEnvelope> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } = runtime
+            .attach_promoted(backend, &tx, promote_addr(), promoted)
+            .await
+        else {
+            panic!("a promotion over a registered row opens a session")
+        };
+        between(step_id).await;
+        let cancel = runtime
+            .serve(
+                backend,
+                &tx,
+                &envelope(8, StoreRequest::ChatCancel { step_id }),
+            )
+            .await;
+        assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
+        task.await;
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            replies.push(reply);
+        }
+        replies
+    }
+
+    /// Blueprint D192, R-48: a CLI step with a `session_started` banner is resumed — the spec the
+    /// driver starts carries the banner's session ref, the step's own id and the step's trees —
+    /// and the chat records against that step, past its log.
+    #[tokio::test]
+    async fn attach_promoted_resumes_a_cli_step_with_its_banner() {
+        let (store, backend, mut runtime, agent_id, spec) =
+            fixture_with_spec_spy(Script::one_turn(vec![ends(StopReason::EndTurn)]), None).await;
+        let tail = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("the fixture's step has a log");
+        let promotion = promoted(
+            agent_id,
+            htui_orch::OpeningPath::Resume {
+                session_ref: htui_agent::driver::AgentSessionRef::new("banner-1"),
+                text: htui_orch::promote::RESUME_OPENING.to_owned(),
+            },
+        );
+
+        let replies = attach_and_end(&mut runtime, &backend, promotion, async |_| {}).await;
+
+        let seen = spec
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .expect("the driver was started");
+        assert_eq!(
+            seen.resume,
+            Some(htui_agent::driver::AgentSessionRef::new("banner-1"))
+        );
+        assert_eq!(seen.step_id, ids::STEP_PLAN, "the step keeps its id");
+        assert_eq!(seen.cwd, std::env::temp_dir());
+        assert_eq!(
+            seen.extra_dirs,
+            vec![std::env::temp_dir().join("second-tree")]
+        );
+        assert!(
+            matches!(replies[0].reply, StoreReply::ChatAccepted { step_id, .. } if step_id == ids::STEP_PLAN)
+                && replies[0].seq == 7,
+            "the promotion's own address hears the acceptance: {:?}",
+            replies[0]
+        );
+
+        let log = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("a log");
+        let follow_up = log
+            .iter()
+            .find(|row| row.kind == EventKind::FollowUp)
+            .expect("the opening is recorded");
+        let last = tail.iter().map(|row| row.seq).max().expect("a tail");
+        assert_eq!(
+            follow_up.seq,
+            last + 1,
+            "the log continues past its last row"
+        );
+        assert_eq!(follow_up.turn, 1, "the opening opens the step's next turn");
+        assert_eq!(
+            follow_up.payload.get("text").and_then(Value::as_str),
+            Some(htui_orch::promote::RESUME_OPENING)
+        );
+    }
+
+    /// Blueprint D205: a promoted session neither mints a `run(kind='chat')` nor closes one — the
+    /// step and its run are the engine's, and stay as the promotion left them.
+    #[tokio::test]
+    async fn a_promoted_chat_never_closes_a_run() {
+        let (store, backend, mut runtime, agent_id) =
+            fixture(Script::one_turn(vec![ends(StopReason::EndTurn)])).await;
+        let run_before = store
+            .run(ids::RUN_1)
+            .await
+            .expect("the read answers")
+            .expect("the fixture's run");
+        let step_of = async |store: &MemStore| {
+            store
+                .run_steps(ids::RUN_1)
+                .await
+                .expect("the read answers")
+                .into_iter()
+                .find(|step| step.id == ids::STEP_PLAN)
+                .expect("the fixture's step")
+        };
+        let step_before = step_of(&store).await;
+        let active = store.active_runs(&scope()).await.expect("count");
+
+        let promotion = promoted(
+            agent_id,
+            htui_orch::OpeningPath::Handoff {
+                text: "pick up where the step stopped".to_owned(),
+                digest: "d-handoff".to_owned(),
+            },
+        );
+        let replies = attach_and_end(&mut runtime, &backend, promotion, async |_| {
+            assert_eq!(
+                store.active_runs(&scope()).await.expect("count"),
+                active,
+                "no chat run is minted for a promoted step"
+            );
+        })
+        .await;
+        assert!(
+            matches!(
+                replies.last().map(|reply| &reply.reply),
+                Some(StoreReply::Chat(ChatFrame::Ended { .. }))
+            ),
+            "the session ended: {replies:?}"
+        );
+
+        let run_after = store
+            .run(ids::RUN_1)
+            .await
+            .expect("the read answers")
+            .expect("the fixture's run");
+        assert_eq!(run_after.status, run_before.status, "the run is untouched");
+        assert_eq!(run_after.finished_at, run_before.finished_at);
+        let step_after = step_of(&store).await;
+        assert_eq!(step_after.status, step_before.status, "so is the step");
+        assert_eq!(
+            step_after.prompt_digest, step_before.prompt_digest,
+            "and the step's prompt digest is the original prompt's"
+        );
+        assert_eq!(store.active_runs(&scope()).await.expect("count"), active);
+    }
+
+    /// Blueprint D206 (F-H): a chat whose task has ended is not live, even while the runtime still
+    /// holds its entry — `caps` answers until the next `serve` sweeps it, `live_steps` does not.
+    #[tokio::test]
+    async fn live_steps_drops_an_ended_chat() {
+        let (_store, backend, mut runtime, agent_id) =
+            fixture(Script::one_turn(vec![ends(StopReason::EndTurn)])).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+            .await
+        else {
+            panic!("a chat start opens a session")
+        };
+        assert_eq!(
+            runtime.live_steps(),
+            vec![step_id],
+            "a started chat is live"
+        );
+
+        let cancel = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(8, StoreRequest::ChatCancel { step_id }),
+            )
+            .await;
+        assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
+        task.await;
+
+        assert!(
+            runtime.caps(step_id).is_some(),
+            "the ended chat's entry is still held until the next serve"
+        );
+        assert!(
+            runtime.live_steps().is_empty(),
+            "but its command channel is closed, so it is not live"
         );
     }
 

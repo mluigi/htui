@@ -2623,19 +2623,73 @@ mod tests {
         let _ = worker.await;
     }
 
-    /// Blueprint §8.10, D181: a promotion's engine writes are answered `Orch(Promoted)`, and the
-    /// runtime's `Attach` event reaches the loop, whose T6 stub answers with its sentence — both at
-    /// the request's `seq` and origin. T7 changes the second expectation (§10.5).
+    /// Blueprint §8.10, §10.5, D181: a promotion's engine writes are answered `Orch(Promoted)`, and
+    /// the runtime's `Attach` event reaches the loop, which binds the Chat tab's runtime to the
+    /// promoted step — `ChatAccepted` on that step, both at the request's `seq` and origin.
     #[tokio::test]
     async fn a_promotion_reaches_the_attach_hand_off() {
-        use crate::run_worker::tests::{Fixture, Worker, parked};
+        use crate::run_worker::tests::{Fixture, start_run, step_at};
         use crate::run_worker::{OrchReply, OrchRequest};
+        use htui_agent::conformance::{Script, ScriptEvent};
+        use htui_agent::event::{DoneEvent, DriverEvent};
 
         let fixture = Fixture::new().await;
-        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
-        let (run, step) = parked(&fixture, &mut worker).await;
+        // The chat's own transport: the fixture's scripted row is `acp`, and the chat runtime
+        // reaches it by row data like the walk does.
+        let adapter = htui_agent::fake::FakeAdapter::new();
+        adapter.load(Script::one_turn(vec![ScriptEvent::Emit(
+            DriverEvent::Done(DoneEvent {
+                stop_reason: StopReason::EndTurn,
+            }),
+        )]));
+        let mut factory = htui_agent::registry::DriverFactory::new();
+        factory.register("acp", Box::new(adapter));
+
+        let (requests, requests_rx) = mpsc::unbounded_channel();
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let _worker = spawn_with_runtimes(
+            Started::detached(Backend::memory(fixture.store.clone())),
+            requests_rx,
+            replies_tx,
+            AgentRuntime::new(factory).with_grace(std::time::Duration::ZERO),
+            fixture.runtime(),
+        );
+        let send = |seq, origin, request| {
+            requests
+                .send(RequestEnvelope {
+                    seq,
+                    origin,
+                    request,
+                })
+                .expect("the worker is running");
+        };
+        let mut seen: Vec<ReplyEnvelope> = Vec::new();
+        let mut next_at = async |seq: Seq| loop {
+            if let Some(at) = seen.iter().position(|envelope| {
+                envelope.seq == seq && !matches!(envelope.reply, StoreReply::RunStream(_))
+            }) {
+                return seen.remove(at);
+            }
+            let envelope = tokio::time::timeout(std::time::Duration::from_secs(20), replies.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no reply at seq {seq}"))
+                .expect("the worker is running");
+            seen.push(envelope);
+        };
+
+        send(1, Origin::App, start_run(ids::HTUI_ANA_2));
+        let started = next_at(1).await;
+        let StoreReply::Orch(OrchReply::Done(outcome)) = started.reply else {
+            panic!("a start answers Done: {:?}", started.reply)
+        };
+        let htui_orch::CommandOutcome::Started { run, .. } = *outcome else {
+            panic!("a start answers Started")
+        };
+        let step = step_at(&fixture, run, 0).await;
+
         let chat = Origin::Tab(TabId("chat"));
-        let promote = worker.send(
+        send(
+            2,
             chat.clone(),
             StoreRequest::Orch(OrchRequest::Command(htui_orch::Command::PromoteStep {
                 run,
@@ -2644,7 +2698,7 @@ mod tests {
             })),
         );
 
-        let first = worker.envelope(promote).await;
+        let first = next_at(2).await;
         assert_eq!(first.origin, chat);
         assert!(
             matches!(first.reply, StoreReply::Orch(OrchReply::Promoted { step: promoted, run: of, .. })
@@ -2652,12 +2706,11 @@ mod tests {
             "{:?}",
             first.reply
         );
-        let second = worker.envelope(promote).await;
+        let second = next_at(2).await;
         assert_eq!(second.origin, chat);
         assert!(
-            matches!(&second.reply, StoreReply::Failed { request: "promote_step", message }
-                if message == PROMOTION_NEEDS_CHAT),
-            "{:?}",
+            matches!(second.reply, StoreReply::ChatAccepted { step_id, .. } if step_id == step.id),
+            "the chat is bound to the promoted step: {:?}",
             second.reply
         );
     }
