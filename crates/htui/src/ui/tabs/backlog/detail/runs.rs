@@ -143,6 +143,9 @@ pub struct RunsTab {
     /// Every action's verdict for [`RunsTab::item`] (blueprint D182); `None` until the first
     /// `RunActions` reply for it.
     actions: Option<ItemActions>,
+    /// The item this pane's `RunStream` subscription is for (blueprint D199). Left alone by an
+    /// item change: the next `Runs` reply subscribes again.
+    subscribed: Option<ItemId>,
     /// What the pane is doing: browsing, or waiting on typed text or an answer.
     mode: Mode,
 }
@@ -1109,7 +1112,8 @@ mod tests {
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
     use crate::keymap::Keymap;
-    use crate::run_worker::{RunActions, StepActions};
+    use crate::run_worker::{FrameKind, RunActions, RunFrame, StepActions};
+    use htui_orch::Rest;
     use crate::store_worker::Origin;
     use chrono::TimeDelta;
     use crossterm::event::KeyModifiers;
@@ -2448,6 +2452,213 @@ mod tests {
         pane.on_key(key(KeyCode::Char('x')), &mut shell.ctx());
         pane.on_item_change(Some(ids::HTUI_ANA_2));
         assert!(!pane.captures_input(), "a new item drops whatever was open");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The subscription and the re-reads (MOD-4 plan D171, D172, blueprint D198, D199).
+    // -----------------------------------------------------------------------------------------
+
+    /// The store requests an emit queue held, in order.
+    fn requests(emitted: Vec<Action>) -> Vec<StoreRequest> {
+        emitted
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Store(request) => Some(request),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether `requests` is exactly one `Runs` read of `item`.
+    fn is_one_re_read(requests: &[StoreRequest], item: ItemId) -> bool {
+        matches!(requests, [StoreRequest::Runs(asked)] if *asked == item)
+    }
+
+    /// D199: the pane subscribes for its own item on the first `Runs` reply, and asks for the
+    /// verdicts on every one.
+    #[tokio::test]
+    async fn the_first_runs_reply_subscribes_once_and_asks_for_the_actions() {
+        let shell = Shell::new();
+        let runs = feat_1_runs().await;
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [
+                StoreRequest::RunStream { item: streamed },
+                StoreRequest::RunActions(asked),
+            ] if *streamed == ids::HTUI_FEAT_1 && *asked == ids::HTUI_FEAT_1),
+            "{sent:?}"
+        );
+
+        pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::RunActions(asked)] if *asked == ids::HTUI_FEAT_1),
+            "one subscription per item: {sent:?}"
+        );
+
+        // An item with no run is subscribed for too: the reply is empty, the item is the pane's.
+        pane.on_item_change(Some(ids::HTUI_ANA_2));
+        pane.on_reply(&StoreReply::Runs(Vec::new()), &mut shell.ctx());
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [
+                StoreRequest::RunStream { item: streamed },
+                StoreRequest::RunActions(asked),
+            ] if *streamed == ids::HTUI_ANA_2 && *asked == ids::HTUI_ANA_2),
+            "{sent:?}"
+        );
+
+        // Verdicts for another item are not this pane's.
+        let other = verdicts(ids::HTUI_FEAT_1, &runs, true, DocumentId::new());
+        pane.on_reply(&StoreReply::RunActions(Box::new(other)), &mut shell.ctx());
+        pane.on_key(shift('R'), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Error(sentence)] if sentence == NOT_LOADED),
+            "{emitted:?}"
+        );
+    }
+
+    /// D171: an `Orch` answer, and a refusal of any orchestrator request, re-read the runs so the
+    /// pane shows the rows as they are after a compare-and-set miss.
+    #[tokio::test]
+    async fn a_refusal_re_reads_the_runs() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: "retry_step",
+                message: "step is `superseded`".to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        assert!(is_one_re_read(&requests(shell.emit.take()), ids::HTUI_FEAT_1));
+
+        for name in crate::run_worker::ORCH_NAMES {
+            pane.on_reply(
+                &StoreReply::Failed {
+                    request: name,
+                    message: String::new(),
+                },
+                &mut shell.ctx(),
+            );
+            assert!(
+                is_one_re_read(&requests(shell.emit.take()), ids::HTUI_FEAT_1),
+                "`{name}`"
+            );
+        }
+
+        pane.on_reply(
+            &StoreReply::Orch(OrchReply::CleanedUp {
+                run: pane.runs[0].id,
+            }),
+            &mut shell.ctx(),
+        );
+        assert!(is_one_re_read(&requests(shell.emit.take()), ids::HTUI_FEAT_1));
+
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: "notes",
+                message: "not an orchestrator request".to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        assert!(shell.emit.is_empty(), "another read's refusal is not the pane's");
+    }
+
+    /// A frame of `item` with this kind.
+    fn frame(item: ItemId, kind: FrameKind) -> StoreReply {
+        StoreReply::RunStream(RunFrame {
+            item,
+            run: None,
+            kind,
+        })
+    }
+
+    /// D172: every frame but the acknowledgement is an invalidation, all six kinds of it.
+    #[tokio::test]
+    async fn a_run_stream_frame_re_reads_the_runs() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        let kinds = [
+            FrameKind::Started,
+            FrameKind::SessionDone {
+                step: ids::STEP_PLAN,
+            },
+            FrameKind::Rested(Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(1),
+                failure: None,
+            }),
+            FrameKind::Changed,
+            FrameKind::Adopted,
+            FrameKind::Error("the walk failed".to_owned()),
+        ];
+        for kind in kinds {
+            let name = format!("{kind:?}");
+            pane.on_reply(&frame(ids::HTUI_FEAT_1, kind), &mut shell.ctx());
+            assert!(
+                is_one_re_read(&requests(shell.emit.take()), ids::HTUI_FEAT_1),
+                "{name} re-reads"
+            );
+        }
+        pane.on_reply(&frame(ids::HTUI_ANA_2, FrameKind::Changed), &mut shell.ctx());
+        assert!(shell.emit.is_empty(), "another item's frame is not this pane's");
+    }
+
+    #[tokio::test]
+    async fn the_subscription_ack_does_not_re_read() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        pane.on_reply(
+            &StoreReply::RunStream(RunFrame::subscribed(ids::HTUI_FEAT_1)),
+            &mut shell.ctx(),
+        );
+        assert!(shell.emit.is_empty(), "the acknowledgement changes nothing");
+    }
+
+    /// D198: a re-read of the same item keeps the cursor on the step it was on, even when a new
+    /// run lands above it; a step that is gone gives way to the first entry.
+    #[tokio::test]
+    async fn a_re_read_keeps_the_cursor_on_its_step() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        let implement = pane.runs[0].steps[2].id;
+        assert_eq!(pane.selected_step(), Some(implement));
+
+        let mut newer = feat_1_runs().await.remove(0);
+        newer.id = RunId::new();
+        newer.steps.clear();
+        let mut runs = vec![newer];
+        runs.extend(feat_1_runs().await);
+        pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
+        assert_eq!(
+            pane.selected_step(),
+            Some(implement),
+            "the cursor follows its step, not its index"
+        );
+
+        // The stepless run is an entry of its own, and it is kept too.
+        pane.on_key(key(KeyCode::Char('K')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('K')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('K')), &mut shell.ctx());
+        assert_eq!(pane.entry_run().map(|run| run.id), Some(runs[0].id));
+        pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
+        assert_eq!(pane.entry_run().map(|run| run.id), Some(runs[0].id));
+        assert_eq!(pane.selected_step(), None);
+
+        runs.remove(0);
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        assert_eq!(
+            pane.selected_step(),
+            Some(ids::STEP_PRD),
+            "an entry that is gone gives way to the first one"
+        );
     }
 
     /// A new item's reply re-seats the cursor instead of leaving it on an index of the old one.
