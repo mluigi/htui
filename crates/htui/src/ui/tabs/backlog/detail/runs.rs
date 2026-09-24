@@ -525,18 +525,64 @@ fn render_artifact(
 fn reject_key(
     run: RunId,
     step: StepId,
-    field: TextField,
+    mut field: TextField,
     key: KeyEvent,
     ctx: &Ctx<'_>,
 ) -> Mode {
-    let _ = (run, step, field, key, ctx);
-    todo!()
+    match field.on_key(key) {
+        FieldOutcome::Submit => {
+            let note = field.text().unwrap_or_default().trim().to_owned();
+            if note.is_empty() {
+                ctx.emit(Action::Error(NOTE_NEEDED.to_owned()));
+                Mode::RejectNote { run, step, field }
+            } else {
+                ctx.request(command(Command::AnswerGate {
+                    run,
+                    step,
+                    answer: GateAnswer::Rejected { note },
+                }));
+                Mode::Browse
+            }
+        }
+        FieldOutcome::Cancel => Mode::Browse,
+        FieldOutcome::Consumed | FieldOutcome::Pass => Mode::RejectNote { run, step, field },
+    }
 }
 
 /// A key in [`Mode::CloseOut`], stage by stage (D167): the mode it leaves the pane in.
+///
+/// Counting and warning leave on `n`/`Esc`; the typed stage leaves on `Esc` only, because `n` is a
+/// letter there; in flight, every key waits for the answer.
 fn close_out_key(item: ItemId, stage: CloseOutStage, key: KeyEvent, ctx: &Ctx<'_>) -> Mode {
-    let _ = (item, stage, key, ctx);
-    todo!()
+    let stage = match stage {
+        CloseOutStage::Counting => match key.code {
+            KeyCode::Char('n') | KeyCode::Esc => return Mode::Browse,
+            _ => CloseOutStage::Counting,
+        },
+        CloseOutStage::Warn(preview) => match key.code {
+            KeyCode::Char('y') => CloseOutStage::Typed {
+                preview,
+                field: TextField::new(),
+            },
+            KeyCode::Char('n') | KeyCode::Esc => return Mode::Browse,
+            _ => CloseOutStage::Warn(preview),
+        },
+        CloseOutStage::Typed { preview, mut field } => match field.on_key(key) {
+            FieldOutcome::Submit if field.text() == Some(preview.key.as_str()) => {
+                ctx.request(command(Command::CloseOut { item }));
+                CloseOutStage::InFlight
+            }
+            FieldOutcome::Submit => {
+                field.clear();
+                ctx.emit(Action::Error(NOT_THE_KEY.to_owned()));
+                CloseOutStage::Typed { preview, field }
+            }
+            FieldOutcome::Cancel => return Mode::Browse,
+            FieldOutcome::Consumed | FieldOutcome::Pass => CloseOutStage::Typed { preview, field },
+        },
+        CloseOutStage::InFlight => CloseOutStage::InFlight,
+    };
+    Mode::CloseOut(stage)
 }
 
 /// A verdict's answer: `true` when the action may go, else the guard's sentence is on the status
@@ -2267,10 +2313,9 @@ mod tests {
             ]
         );
         pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
-        assert!(
-            footer(&pane)[0].starts_with("type FEAT-1 to close it: "),
-            "{:?}",
-            footer(&pane)
+        assert_eq!(
+            footer(&pane),
+            ["type FEAT-1 to close it:", "Enter close · Esc cancel"]
         );
         assert!(shell.emit.is_empty(), "nothing is written before the key is typed");
 
