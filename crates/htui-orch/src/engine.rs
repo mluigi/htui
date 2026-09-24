@@ -281,7 +281,16 @@ pub type DriverFor<'a> =
 /// [`Heartbeat::Abandoned`] never enters it: another process holds that lease. [`Engine::sweep`]
 /// first retries the release of every run in it and drops each one the store answers, so
 /// `adopt_runs` then sees the run as free. Plan D88 still keeps the sweep off every lease a live
-/// walk of this process holds, and a run this process takes again leaves the set. Milestone 6's
+/// walk of this process holds, and a run this process takes again leaves the set.
+///
+/// MOD-4 plan D210 (review H1): a dead walk's `shared_serialized` guards live in the isolator,
+/// not on the walk's stack, so a panic does not drop them. Wherever a run leaves the set its
+/// guards are released through `Isolator::release` (as plan D188's [`Engine::abandoned`] does):
+/// by the sweep's pre-pass before it gives the lease back, and by `Engine::renew_lease` when a
+/// command of this process takes the lease first. Both hold the run's fence, so no walk of the run
+/// is live in this process and every guard still held for it is stale. A release that finds none
+/// (the `Expired` arm already released them, or a skipped adopted run never took any) does
+/// nothing. Milestone 6's
 /// worker fences commands of one process against each other with a lock per run (MOD-4 plan
 /// D157), and [`Engine::sweep_fenced`] asks that fence before it gives a dead walk's lease back or
 /// recovers a run (plan D189), so a sweep can no longer race a resume of the same run (R-27).
@@ -311,8 +320,8 @@ impl DeadWalks {
         self.lock().iter().copied().collect()
     }
 
-    /// A walk task of this process died (a panic), so the next sweep releases and adopts it
-    /// (MOD-4 plan D158, R-12). `pub` because the task's supervisor in `run_worker` is the one
+    /// A walk task of this process died (a panic), so the next sweep releases its guards and its
+    /// lease and adopts it (MOD-4 plan D158, R-12, D210). `pub` because the task's supervisor in `run_worker` is the one
     /// place that sees the `JoinError`.
     pub fn mark(&self, run: RunId) {
         self.insert(run);
@@ -322,8 +331,10 @@ impl DeadWalks {
         self.lock().insert(run);
     }
 
-    fn remove(&self, run: RunId) {
-        self.lock().remove(&run);
+    /// Whether `run` was in the set (MOD-4 plan D210: a run leaving it in
+    /// [`Engine::renew_lease`] has its guards released there).
+    fn remove(&self, run: RunId) -> bool {
+        self.lock().remove(&run)
     }
 
     /// A poisoned lock is recovered: every change is one set operation, so a panic elsewhere
@@ -1683,6 +1694,11 @@ where
     ///
     /// Plan D140: a run taken here is about to be walked, so it leaves [`DeadWalks`]. The sweep
     /// must not give back the lease of a live walk.
+    ///
+    /// MOD-4 plan D210 (review H1): a run that leaves the set here has its guards released
+    /// first, best-effort (a `warn`), since no later pre-pass will. Every caller holds the run's
+    /// lock (a command, MOD-4 plan D157) or the sweep's fence (plan D189), so no walk of the run is
+    /// live in this process and the guards are a dead walk's.
     async fn renew_lease(&self, run: RunId) -> Result<Option<DateTime<Utc>>, EngineError> {
         let now = self.now();
         let until = now + self.lease_times().ttl;
@@ -1691,10 +1707,19 @@ where
             .store
             .take_lease(run, self.parts.box_id, self.parts.owner, now, until)
             .await?;
-        if taken {
-            self.parts.dead_walks.remove(run);
+        if taken && self.parts.dead_walks.remove(run) {
+            self.release_guards(run, "releasing a dead walk's guards at a lease take failed")
+                .await;
         }
         Ok(taken.then_some(until))
+    }
+
+    /// `Isolator::release(run)`, best-effort: a failure is a `warn` saying `what`, and nothing
+    /// raises (MOD-4 plan D188, D210).
+    async fn release_guards(&self, run: RunId, what: &'static str) {
+        if let Err(err) = self.parts.isolator.release(run).await {
+            tracing::warn!(%run, %err, "{what}");
+        }
     }
 
     /// Plan D149 (R-34): a command's window between its lease take and its
@@ -1758,7 +1783,9 @@ where
             .await
         {
             // `false`: the lease is no longer ours, so there is nothing of ours to give back.
-            Ok(_) => self.parts.dead_walks.remove(run),
+            Ok(_) => {
+                self.parts.dead_walks.remove(run);
+            }
             Err(err @ StoreError::NotFound { entity: "run", .. }) => {
                 tracing::warn!(%run, %err, "releasing the lease found no run; nothing to give back");
                 self.parts.dead_walks.remove(run);
@@ -1794,6 +1821,8 @@ where
     /// Plan D140: before adopting, the sweep gives back the lease of every run in [`DeadWalks`].
     /// Those runs' walks died in this process, and the release clears the owner, so
     /// `adopt_runs` sees them as free. A release that fails again leaves the run in the set.
+    /// MOD-4 plan D210: each such run's `shared_serialized` guards are released first
+    /// (`Isolator::release`, best-effort), as plan D188's [`Self::abandoned`] does.
     ///
     /// The heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
     /// driver enabled (blueprint H-3).
@@ -1805,7 +1834,7 @@ where
     }
 
     /// [`Self::sweep`] under a [`RunFence`] (MOD-4 plan D189, blueprint F-E): the dead-walk
-    /// pre-pass gives back no lease of a run the fence holds, and an adopted run the fence holds
+    /// pre-pass releases no guard and gives back no lease of a run the fence holds (plan D210), and an adopted run the fence holds
     /// is skipped with a `debug!` — the adopted lease is this owner's, and the holder's own
     /// `take_lease` renews it. The skipped run also enters [`DeadWalks`], so a holder that never
     /// takes the lease does not strand the run under it: the next sweep whose fence is free gives
@@ -1822,6 +1851,12 @@ where
                 tracing::debug!(%run, "the sweep leaves a held dead walk's lease alone");
                 continue;
             };
+            // MOD-4 plan D210 (review H1): the dead walk's guards first, as plan D188's
+            // `abandoned` does. Under the fence no walk of the run is live here, so any guard
+            // still held for it is stale; once the lease is given back another box's sweep may
+            // take the run, and this is the last place of this process that can free them.
+            self.release_guards(run, "releasing a dead walk's guards in the sweep failed")
+                .await;
             self.release_lease(run).await;
         }
         let now = self.now();
@@ -11416,7 +11451,11 @@ mod tests {
             .expect("the dead walk's run exists")
             .id;
         assert_eq!(harness.orch.run(run).await.status, RunStatus::Running);
-        assert_eq!(harness.orch.isolator.releases(), 0, "nothing freed the guard");
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            0,
+            "nothing freed the guard"
+        );
         run
     }
 
