@@ -1429,7 +1429,7 @@ fn subject(message: &[u8]) -> &[u8] {
     message
         .split(|byte| *byte == b'\n')
         .next()
-        .unwrap_or_default()
+        .unwrap_or(message)
         .trim_ascii()
 }
 
