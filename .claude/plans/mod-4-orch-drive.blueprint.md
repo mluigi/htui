@@ -499,10 +499,10 @@ No `run(kind='chat')` row is written, and neither `set_step_prompt` nor `record_
 2. `accept_enabled(&step, &phase, has_output, chat_live)`.
 3. `until = take_lease(run)`. Then, in `leased_window`:
    - `trees = step_trees(step)`;
-   - `verify = self.verify(VerifyStage { result: &Ok(DoneEvent { stop_reason: EndTurn }), started_at: step.started_at.unwrap_or(now), session_cwd: &cwd, .. })` (`:2515`);
+   - `verify = self.verify(VerifyStage { result: &Ok(DoneEvent { stop_reason: EndTurn }), started_at: now, session_cwd: &cwd, .. })` (`:2515`). **D211 (review round, §21):** `started_at` is the accept, not `step.started_at`, so the verify runs on a fresh copy of the phase deadline; measured from the step's start it was `Unavailable` (zero remainder) on every accept more than `deadline_seconds` after the agent began;
    - `after = isolator.capture(step, &trees)`, then `record_commits(step, &after)`;
    - `finish_step(StepOutcome { verify_outcome, verify_exit_code, finished_at: now, usage: None, trim_record: None, exit_code: None })`.
-4. `verify_outcome == Some(Fail)` → note, `release_lease`, and `Err(AcceptVerifyFailed { step, exit_code })`. The step stays promoted and `awaiting_approval`.
+4. `verify_outcome == Some(Fail)` → note, `release_lease`, and `Err(AcceptVerifyFailed { step, exit_code })`. The step stays promoted and `awaiting_approval`. `Some(Unavailable)` is not refused (D30: `unavailable` never fails a step): it is recorded, and the note `accept: verify unavailable: <reason>` is written in the same window (D211).
 5. Otherwise `self.answer_guarded(&run, &snapshot, &step, &phase, GateAnswer::Approved)` (`:633`). It re-takes the lease (a renewal), answers `approved`, unparks, reconciles, and walks from `position + 1` under the heartbeat. The outcome is mapped to `Accepted { rest }`.
 
 `GateAnswer::Skipped` stays unexposed (plan disagreement 4).
@@ -676,6 +676,7 @@ None of these carries a secret (`store_worker.rs:71-78`). A rejection note is th
   - `open` = the newest head of `phase.output_kind` produced by the step, else ``Err("step X produced no `<kind>` document")``.
 - Item level: `unblock_enabled(..).map(drop)`, `close_out_enabled`, `start_enabled`.
 - Per run: `cancel_enabled`, `cleanup_enabled`.
+- **D212 (review round, §21):** per run, `chatting = chat_free(steps, live)` comes first: while a chat of this process is live on a step of the run, `approve`, `reject`, `retry`, `select` of every step of the run and the run's `cancel` are its `ChatLive { step: Some(s) }` sentence — the refusal the worker answers them with (D184's one admission function).
 - Every `Err` is its `EngineError`'s `Display`.
 
 ### 8.3 `RunRuntime` inside the store worker's `select!` (commit c)
@@ -750,7 +751,8 @@ The `select!` futures are dropped before any handler runs, so handlers may borro
 
 ```rust
 /// R-27: one async mutex per run, minted on first use. Held by every command, resume, claim and
-/// sweep-driven recovery of that run for its whole duration.
+/// sweep-driven recovery of that run for its whole duration. Pruned at a sweep tick once nobody
+/// holds or waits for it (D214).
 #[derive(Debug, Clone, Default)]
 pub struct RunLocks(Arc<std::sync::Mutex<HashMap<RunId, Arc<tokio::sync::Mutex<()>>>>>);
 impl RunLocks {
@@ -784,7 +786,7 @@ drop(guard);
 | Request | Answer |
 |---|---|
 | `RunStream { item }` | `publisher.subscribe(origin, seq, item)`; `Reply(RunStream(RunFrame::subscribed(item)))` |
-| `RunActions(item)` | `Reply(actions(backend, item, live).await ⇒ RunActions \| Failed)` |
+| `RunActions(item)` | **D215 (review round, §21):** spawn a task tracked through `shared.track`, over clones of the backend, the reply sender and `live`: `actions(backend, item, live).await ⇒ RunActions \| Failed`, answered at `(origin, seq)` → `Deferred`. `try_serve`'s runtime-less path (D183) stays inline. (Was `Reply(actions(..).await ⇒ ..)`, inline on the loop.) |
 | `Orch(_)` with `backend.writer()` `None` | `Reply(Failed { request: name, message: DATABASE_UNREACHABLE })`. Nothing is spawned (D174). |
 | `Orch(Command(c))` | overwrite `chat_open`/`chat_live` from `live` (D185), then spawn the §8.6 task → `Deferred` |
 | `Orch(CloseOutPreview { item })` | spawn: `engine.close_out_preview` → `Orch(CloseOutPreview)` or `Failed` → `Deferred` |
@@ -793,7 +795,7 @@ drop(guard);
 **Per-task parts (D156, D202).** Each task owns clones and builds one `Engine` per step of work:
 - `Writer` (`backend.writer()`);
 - `BackendGraphs(backend.clone())`;
-- `Arc<dyn Isolator>` and `Arc<dyn Verifier>` from `Shared::singletons().await`. That is a `tokio::sync::Mutex<Option<Production>>` built at the first command. For `Gix` it reads `box_info`, `workspaces()` → `writer.repos(p)`, `repo_paths(box)`, `app_settings` and `identity::config_root()?/trees` (or the injected root). It builds `GixIsolator::new(IsolatorConfig { repos, scratch_root, copy_exclude: vec![], copy_max_total_bytes: app["copy_max_total_bytes"] or 20 GiB, box_id })`, and `ShellVerifier::new(&limits, Arc::new(MinimalScrubber::new(std::iter::empty())), clock)`, where `limits` is the box row's `command_limits`, falling back to `{"verify":1}`.
+- `Arc<dyn Isolator>` and `Arc<dyn Verifier>` from `Shared::singletons().await`. That is a `tokio::sync::Mutex<Option<Production>>` built at the first command. For `Gix` it reads `box_info`, `workspaces()` → `writer.repos(p)`, `repo_paths(box)`, `app_settings` and `identity::config_root()?/trees` (or the injected root). It builds `GixIsolator::new(IsolatorConfig { repos, scratch_root, copy_exclude: vec![], copy_max_total_bytes: app["copy_max_total_bytes"] or 20 GiB, box_id })` inside `tokio::task::spawn_blocking` (D213: the `git --version` probe and the scratch root's creation are blocking; a `JoinError` maps to the `String` refusal), and `ShellVerifier::new(&limits, Arc::new(MinimalScrubber::new(std::iter::empty())), clock)`, where `limits` is the box row's `command_limits`, falling back to `{"verify":1}` for a missing row or key (and, warned, a value that does not parse). A failed `box_row` read is passed up, so nothing is cached and the next command reads again (D216).
 - **Rebuild**: at each `StartRun`, when the repo map read now differs from the one the isolator was built from:
   - no run of this process is live → rebuild, and `isolator_builds += 1`;
   - otherwise → refuse `StartRun` with ``a repo was added or moved since the first run; wait for the live runs to rest (R-39)``.
@@ -834,8 +836,8 @@ Every task answers its request once at `(origin, seq)` and publishes one `Rested
 | Command | Task |
 |---|---|
 | `StartRun` | If `singletons` refuse (R-39) → `Failed`. `run = engine.enqueue(..)`, then `Started` frame, then lock `run` + child token, then `engine.claim(run)`. `ClaimRefused` → `queued.insert((queued_at, run))` + `Failed(sentence)`. Otherwise `Orch(Done(Started))`. |
-| `AnswerGate`, `RetryStep`, `SelectFanout`, `AcceptArtifact` | lock `run`, then `engine.dispatch(c)` |
-| `CancelRun{r}` | `walks.preempt(r)`, lock, dispatch. D179's lease take follows `abandoned`'s release. |
+| `AnswerGate`, `RetryStep`, `SelectFanout`, `AcceptArtifact` | lock `run`, then `engine.dispatch(c)`. **D212 (review round, §21):** first, right after `tag(run)`, `AnswerGate`, `RetryStep` and `SelectFanout` are refused through `ctx.refuse` with `chat_free(run_steps(run), live)`'s `ChatLive { step: Some(s) }` while a chat of this process is live on a step `s` of the run. |
+| `CancelRun{r}` | D212's refusal first (a cancel does not end the chat: "end that chat first (Chat tab, Esc Esc)"), then `walks.preempt(r)`, lock, dispatch. D179's lease take follows `abandoned`'s release. |
 | `PromoteStep{r, s, ..}` | `walks.preempt(r)` when the run has a live walk here, then lock, then dispatch. `Ok(Promoted { opening, .. })` sends `Orch(Promoted{..})` to `(origin, seq)` and then `events.send(RunServed::Attach { addr, promoted })`. `Err` → `Failed`. |
 | `Unblock{item}` | `case = engine.unblock_case(item)`. For `FollowRun(r)`/`Resume(r)`: lock `r`, re-check that `unblock_case` still names `r` (else ``the item changed; press `u` again``), then dispatch. |
 | `CloseOut{item}` | dispatch (the store refuses a live run in-transaction) |
@@ -844,12 +846,12 @@ Every task answers its request once at `(origin, seq)` and publishes one `Rested
 
 ### 8.7 Sweep (commit e, D158, D189, D190)
 
-`runs.sweep(backend, tx)` returns at once:
+`runs.sweep(backend, tx)` first prunes, in one lazy pass (D214, review round §21): finished task handles, `Walks` parents with no task under them, and `RunLocks` entries whose `Arc` only the map holds and whose mutex is free. Then it returns at once:
 - if a sweep task is still running, the tick is skipped;
 - if `backend.writer()` is `None`, nothing happens.
 
 Otherwise it spawns one task:
-1. `adopted = engine.sweep_fenced(&locks).await`.
+1. `adopted = engine.sweep_fenced(&locks).await`. Its dead-walk pre-pass, under the fence, calls `isolator.release(run)` (warn on error) before `release_lease(run)`, so a panicked walk's `shared_serialized` guards do not block its own adoption (D210). A run that leaves `DeadWalks` through `renew_lease` (a `Resume` before the sweep) has its guards released there.
 2. Each `Adopted`:
    - `Walk` → a resume task: lock, child token, `engine.resume(run)` → `Rested`/`Error` frame, then the claim retry;
    - `Parked(rest)` / `Finished(rest)` → a `Rested` frame;
@@ -1378,3 +1380,48 @@ F-A through F-S (§0). The ones the main thread records against ANA-2 or the PRD
 | **D207** | Harness: `with_run_runtime`. `drive` settles the runtime's tasks each round and drains its event receiver. `settle()` stays runtime-free. |
 | **D208** | The close-out body format and ordering (§5.1). Title `Close-out <key>`. |
 | **D209** | `StoreRequest::name` maps `Orch` to eleven per-verb names (`run_worker::ORCH_NAMES`). The status line reads `retry_step: …`, and the pane and Chat tab match on those names. |
+
+---
+
+## 21. Review round (rust-reviewer over `main..001ddef`, 2026-09-24)
+
+`rust-reviewer` returned **request-changes** with seven findings. One adversarial verifier per finding tried to refute it and reproduced what it could: findings 1–5 and 7 are real (three HIGH, three LOW once re-graded), and finding 6 is not a defect as designed. The maintainer answered every design question with the **recommended option** on 2026-09-24. Each behaviour change is test-first: every red commit compiles, and the first failing test is named in §21.2. Pins: orch `CASES` 68 → 70; store `CASES` and `.sqlx` unchanged.
+
+### 21.1 Decisions (D210–D216)
+
+| # | Finding | Decision | Commits (red, green) |
+|---|---|---|---|
+| **H1** (1) | A panicked walk's `shared_serialized` `(box, repo)` guard lives in the shared isolator's `held` map, not on the walk's stack, so unwinding never drops it. The sweep's dead-walk pre-pass only released the lease, and recovery never releases guards, so the adopted run's resumed walk (and any other run's `shared_serialized` step on that repository) waited on the lock forever. | **D210** `sweep_fenced`'s dead-walk pre-pass, under the fence, calls `isolator.release(run)` (warn on error) before `release_lease(run)`. `DeadWalks::remove` returns `bool`, and `renew_lease` releases the run's guards when the run was in the set, which covers a `Resume` that takes the lease before the next sweep. Every `renew_lease` caller holds the run's lock or the fence. One private helper, `release_guards`, serves both. | `223995e`, `073432a` |
+| **H2** (2) | `accept_artifact`'s verify measured the phase deadline from `step.started_at`, so every accept more than `deadline_seconds` (default 7200 s) after the agent began got `remaining = 0`, an `Unavailable` verify that never ran, and merged unverified. | **D211** The accept's `VerifyStage` uses `started_at: now`: a fresh copy of the phase deadline, measured from the accept (a hung command still cannot hold the lease forever). `Unavailable` is not refused (D30; some causes are permanent): it is recorded, and an `item_note` `accept: verify unavailable: <reason>` is written in the same window as the `Fail` note. §7.6 amended. | `869d96e`, `e14941a` |
+| **H3** (3) | Only `PromoteStep` and `AcceptArtifact` read the live-chat fact. Approve, reject, retry, select and cancel went through on a run whose promoted step was still chatted with: the next phase ran under the chat, a reject or cancel removed the worktree under the live agent, and the chat kept writing to a closed or superseded step. | **D212** (option a, `htui` only) `run_worker` refuses `AnswerGate` (approve and reject), `RetryStep`, `SelectFanout` and `CancelRun` with `EngineError::ChatLive { step: Some(live_step) }` while any step of the **same run** has a live chat (D185 allows one per process). The refusal is inside the task, after `tag(run)` and before any preemption, through `ctx.refuse`, so its D200 `Error` frame is published. Cancel refuses ("end that chat first (Chat tab, Esc Esc)"); it does not end the chat. One pure helper, `chat_free(steps, live)`, is used by the task and by `verdicts`, so the Runs pane greys `a`/`x`/`r`/`s`/`c` with the same sentence (D182, D184). §8.2 and §8.6 amended. | `91a0865`, `567e4e9` |
+| **L4** (4, re-graded from MEDIUM) | `Shared::singletons` ran `GixIsolator::new` — a `git --version` probe busy-polled for up to `PROBE_TIMEOUT` (10 s), `create_dir_all` and path canonicalisation — on a runtime worker thread. | **D213** `GixIsolator::new` runs inside `tokio::task::spawn_blocking`; a `JoinError` maps to the `String` refusal. Nothing is assigned until it answers. The docs on `GixIsolator::new` (`real.rs`), `PROBE_TIMEOUT` and the hung-probe test (`git.rs`) no longer say "at worker start". | `59b1734` (no red: a test needs a slow `git` on `PATH`) |
+| **L5** (5, re-graded from MEDIUM) | `Shared.tasks` kept one finished sweep handle (≈17 KB) per idle tick until the next `serve`; `Walks.parents` and `RunLocks` entries were never removed. | **D214** Lazy pruning: one pass per sweep tick (`Shared::prune`, at the top of `RunRuntime::sweep`) over finished task handles, `Walks` parents with `live == 0`, and `RunLocks` entries with `Arc::strong_count == 1` whose mutex `try_lock` succeeds, each under its map's own std mutex (the one `child()` and `entry()` mint under). `tasks_len`'s doc names the sweep. §8.4 and §8.7 amended. | `9233fdb`, `1c92c2e` |
+| **(6)** | `RunActions` is served inline on the store loop with 4 + 2N reads (`PgStore::runs` is two statements), on every Runs reply and Backlog cursor move. | **Not a defect as designed** (§8.2 and §8.5 chose the read shape and inline serving; R-NF-3 is about the UI thread); **changed by maintainer choice (D215)**. **D215** `serve` answers `RunActions` from a task tracked through `shared.track`, like `Orch` commands, returning `RunServed::Deferred`; the task answers at `envelope.seq` through the reply channel, over clones of the backend, the sender and `LiveChats`. `App::is_fresh` drops an overtaken reply. `try_serve`'s runtime-less path stays inline (D183). The offline unit case reads the verdicts from the channel; §8.5's table amended. | `6c066f4`, `8c0c1e4` |
+| **L7** (7) | `command_limits` turned a `box_row` store error (and a missing or unparseable value) into `{"verify":1}` silently, and `singletons` cached the verifier built from it for the life of the process. | **D216** `command_limits` returns `Result`: a `box_row` error propagates in `singletons` like the reads beside it, so nothing is cached and the next command retries. The `{"verify":1}` fallback stays for a missing row or key (D156); a stored value that does not parse falls back too, with a `tracing::warn!` (the only warning). | `1489e2d`, `9bdf218` |
+
+### 21.2 Tests (first failing test per decision)
+
+- **D210** (`htui-orch` engine unit, `graph.rs` untouched: FEAT-3 is re-pointed at `SharedSerialized` through `Harness::repoint`, and the walk is dropped mid-session with its guard held): `a_dead_shared_serialized_walk_is_adopted_and_walks_on` (the sweep adopts, `releases() == 1`, the resume parks at `prd` within 5 s) and `a_resume_before_the_sweep_releases_a_dead_walks_guards` (after `take_lease` the run leaves `DeadWalks` with `releases() == 1`; another run's `SharedSerialized` prepare finishes within 5 s; the resume completes). With the count assertions removed, red timed out instead, so the hang itself is covered.
+- **D211** (conformance, `CASES` 68 → 70; `cases_are_unique_and_seventy`, `fake_conformance::cases_len_is_seventy`): `accept_artifact_verifies_on_a_deadline_from_the_accept` (3 h past the deadline the verify gets the full 7200 s window; red 0 ns) and `accept_artifact_notes_an_unavailable_verify`.
+- **D212**: `tests/chat.rs` `the_run_s_verbs_are_refused_while_the_promoted_chat_is_live` (approve, reject, retry, select and cancel each refused with `<name>: step X is being chatted with; end that chat first (Chat tab, Esc Esc)`; nothing moves; the chat stays live; after `Esc Esc` the approve goes through); `run_worker` units `a_verb_on_a_run_being_chatted_with_is_refused_and_published` (the D200 `Error` frame reaches the item's subscriber) and `run_actions_grey_the_run_s_verbs_while_a_chat_is_live_on_it` (a chat on another run's step greys nothing).
+- **D214**: `a_sweep_prunes_finished_tasks_idle_parents_and_free_locks` (a live parent and a held lock stay).
+- **D215**: `run_actions_are_answered_from_a_tracked_task` (one tracked task, answered once at origin and `seq`, a refusal included); `an_offline_backend_refuses_every_orch_request_with_one_sentence` reads the verdicts from the channel.
+- **D216**: `command_limits_fail_with_the_store_and_default_a_missing_value` (offline `box_row` is an error; no row, no key and `"many"` give `{"verify":1}`; a stored map is read). The red commit changed the signature first, with the body still swallowing the error, so the test compiles.
+
+### 21.3 Risks
+
+| Risk | Likelihood | Handling |
+|---|---|---|
+| **R-55** (D216) `box.settings.command_limits` is read once per process (per server): an edit to it does not reach a running process's verifier until a restart or a server switch. Nothing edits it today. | Very low (no code path writes it) | Recorded. Whoever adds an editor re-reads the limits or rebuilds the verifier when no walk is live. |
+
+### 21.4 As landed
+
+- **D210**: the Resume-before-sweep case is tested through `engine.take_lease` (Resume's first step) followed by a full `harness.resume`: resuming a still-running step prepares the same `StepId` again, and the fake drops that step's own guard, so another run's prepare shows the repository is free. `223995e` fails `cargo fmt --check` on its own (one `assert_eq!`); `073432a` fixes it. Left unsquashed.
+- **D212**: the Runs pane needed no change (`allowed()` reads the verdicts). `cancel_enabled`'s doc (`command.rs`) names the new refusal. The window accepted for `accept_enabled` remains: a verb served just before a queued `PromoteStep` attaches its chat is not caught. A failed `run_steps` read in the check refuses the verb with the store's sentence.
+- **D216**: the `singletons` propagation has no store-level test (`MemStore` has no `box_row` fault, and `htui-core` was left untouched); the unit test pins `command_limits` itself.
+
+**Gate** at `9bdf218` (§15):
+- `cargo test --workspace --all-features --no-fail-fast -- --test-threads=1` (Postgres): 1838 passed, 8 failed, 26 ignored. All 8 were dev Postgres in recovery mode (`57P03` at `testkit.rs:118`) under load; `chat_usage_pg` (2), `connection` (50), `prompt_settings` (42) and `runs_pg` (3) each pass re-run alone. `htui` lib 240, `htui-orch` lib 411, `chat` 26.
+- `clippy --workspace --all-features --all-targets -D warnings` and `fmt --check` clean.
+- Workspace rustdoc shows only the two baseline errors (`htui-core` `MIRRORED_TABLES`, `htui-store` `step_exists`).
+- `cargo insta test -p htui --all-features`: 566 passed, nothing pending.
