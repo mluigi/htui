@@ -2617,11 +2617,6 @@ mod tests {
         let _ = worker.await;
     }
 
-    /// `go_offline` disarms the `lost_the_server` arm whatever the backend was.
-    ///
-    /// A health watch that outlived its `Online` backend would keep republishing the same
-    /// `Unreachable`, and the arm would resolve on every poll instead of parking - a spin. The
-    /// watch therefore goes before the `went_offline` guard, not after it.
     /// Blueprint §8.10, D181: a promotion's engine writes are answered `Orch(Promoted)`, and the
     /// runtime's `Attach` event reaches the loop, whose T6 stub answers with its sentence — both at
     /// the request's `seq` and origin. T7 changes the second expectation (§10.5).
@@ -2661,6 +2656,11 @@ mod tests {
         );
     }
 
+    /// `go_offline` disarms the `lost_the_server` arm whatever the backend was.
+    ///
+    /// A health watch that outlived its `Online` backend would keep republishing the same
+    /// `Unreachable`, and the arm would resolve on every poll instead of parking - a spin. The
+    /// watch therefore goes before the `went_offline` guard, not after it.
     #[tokio::test]
     async fn go_offline_drops_the_health_watch_on_a_backend_that_is_not_online() {
         let root = tempfile::tempdir().expect("temp root");
