@@ -6,9 +6,12 @@
 //! (`tests/chat.rs`, `tests/backlog.rs`) prove the same criteria against a memory store. What only
 //! this file can prove is that the writes they rely on are the ones **Postgres** accepts: the
 //! item-law edge T1 added is one that `PgStore`'s transition accepts, the close-out lands on the
-//! server as one write (the summary and the `closed` item together, or neither), and a promoted
-//! step's continued log is read back through the writer from the server, not from a mirror window
-//! (H-9).
+//! server as one write (the summary, its `(repo, step)` rows read from the server's
+//! `run_step_commit`, and the `closed` item together, or neither: a live run and a commit insert
+//! that fails after the document's are both refused inside `PgStore`'s own transaction with
+//! nothing written), and a promoted step's continued log is read back through the writer from the
+//! server, not from a mirror window (H-9): the step's second turn is written straight to the
+//! server, so the chat's turns follow a tail the shell never wrote itself.
 //!
 //! Every case builds the same stack: a throwaway database with the demo world
 //! (`testkit::demo_db`), a throwaway mirror (`CacheStore`), `Backend::Online` over the two, and a
@@ -39,11 +42,11 @@ use htui_agent::fake::{FakeAdapter, FakeDriver};
 use htui_agent::registry::{DriverFactory, TransportBuilder};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, DocumentHead, DocumentId, EventKind, Item, ItemId,
-    NewDocument, NewRepo, RepoId, Run, RunId, RunMode, RunStatus, RunStep, SessionEvent,
-    SnapshotPhase, Status, StepId, StepStatus, Transport, UsageTotals,
+    Agent, AgentBox, AgentId, Billing, DocumentHead, DocumentId, EventKind, EventRole, Item,
+    ItemId, NewDocument, NewRepo, RepoId, Run, RunId, RunMode, RunStatus, RunStep, RunStepCommit,
+    SessionEvent, SnapshotPhase, Status, StepId, StepStatus, Transport, UsageTotals,
 };
-use htui_core::store::{ReadStore as _, WriteStore as _};
+use htui_core::store::{ReadStore as _, StoreError, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::{Command, GateAnswer};
 use htui_store::{Backend, CacheStore, PgStore, testkit};
@@ -540,14 +543,54 @@ async fn a_promoted_step_continues_its_own_log_on_postgres() {
     );
 
     let walked = stack.log(step.id).await;
-    let last_seq = walked.iter().map(|row| row.seq).max().expect("walk rows");
-    let last_turn = walked.iter().map(|row| row.turn).max().expect("walk rows");
     let walked_usage = step_usage(&stack.db.pool, step.id).await;
     assert_eq!(
         walked_usage,
         Some(UsageTotals::from_rows(&walked).to_value()),
         "before the promotion `run_step.usage` is the walk's own sum"
     );
+    // A walk session sends one prompt, so its log ends at turn 0, where a recorder that ignored
+    // the tail's turn would also start. A second turn written straight to the server (a
+    // follow-up and its `done`, no spend) puts the tail at turn 1, so only a recorder seeded
+    // from the server's tail opens the chat at turn 2.
+    let tail = walked.last().expect("walk rows").clone();
+    let walk_done = walked
+        .iter()
+        .find(|row| row.kind == EventKind::Done)
+        .expect("the walk's turn ended")
+        .clone();
+    let second_turn = [
+        SessionEvent {
+            run_step_id: step.id,
+            seq: tail.seq + 1,
+            turn: tail.turn + 1,
+            kind: EventKind::FollowUp,
+            role: EventRole::User,
+            tool_call_id: None,
+            payload: json!({ "text": "and the edge cases" }),
+            raw: None,
+            at: Utc::now(),
+        },
+        SessionEvent {
+            seq: tail.seq + 2,
+            turn: tail.turn + 1,
+            at: Utc::now(),
+            ..walk_done
+        },
+    ];
+    assert_eq!(
+        stack
+            .db
+            .store
+            .append_events(&second_turn)
+            .await
+            .expect("the second turn lands"),
+        2
+    );
+    let walked = stack.log(step.id).await;
+    let last_seq = walked.iter().map(|row| row.seq).max().expect("walk rows");
+    let last_turn = walked.iter().map(|row| row.turn).max().expect("walk rows");
+    assert_eq!(last_turn, 1, "the step's log ends past its first turn");
     let chat_runs_before = chat_runs(&stack.db.pool).await;
 
     // The Runs pane's `p`, as the shell receives it (D165).
@@ -623,13 +666,14 @@ async fn a_promoted_step_continues_its_own_log_on_postgres() {
         .collect();
     assert_eq!(
         follow_ups.iter().map(|row| row.turn).collect::<Vec<_>>(),
-        vec![last_turn + 1, last_turn + 2],
-        "the handoff opening, then the composed message, each opening the step's next turn"
+        vec![last_turn, last_turn + 1, last_turn + 2],
+        "the step's own second turn, then the handoff opening, then the composed message, each \
+         opening the step's next turn"
     );
     assert_eq!(
-        follow_ups[0].seq,
+        follow_ups[1].seq,
         last_seq + 1,
-        "the opening is the row right after the walk's last (ANA-5 criterion 18)"
+        "the opening is the row right after the step's last (ANA-5 criterion 18)"
     );
 
     let after = stack.step_at(run, 0).await;
@@ -677,9 +721,26 @@ async fn a_promoted_step_continues_its_own_log_on_postgres() {
 // Criterion 20
 // ---------------------------------------------------------------------------------------------
 
+/// A `summary` for `item` that `PgStore::close_out` is handed directly, past the engine's guard.
+fn direct_summary(item: ItemId) -> NewDocument {
+    NewDocument {
+        id: DocumentId::new(),
+        item_id: item,
+        kind: "summary".to_owned(),
+        title: "direct".to_owned(),
+        body: "direct".to_owned(),
+        produced_by_step_id: None,
+        created_by: ids::USER,
+        created_at: Utc::now(),
+    }
+}
+
 /// ANA-2 §12 criterion 20 on Postgres (plan D167): while a run of the item is live the close-out
-/// is refused and writes nothing; once the run is done it writes exactly one `summary` document
-/// and closes the item with `closed_at` set, together.
+/// is refused and writes nothing, both by the engine's guard and by `PgStore::close_out`'s own
+/// check inside its transaction; a close-out whose commit insert fails after its document's is
+/// rolled back whole; once the run is done the engine's close-out writes exactly one `summary`
+/// document, with one row per `(repo, step)` carrying the server's `before..after`, and closes the
+/// item with `closed_at` set, together.
 #[tokio::test(flavor = "multi_thread")]
 async fn close_out_is_one_transaction_on_postgres() {
     let Some(mut stack) = Stack::new(None).await else {
@@ -710,6 +771,26 @@ async fn close_out_is_one_transaction_on_postgres() {
     assert_eq!(held.status, Status::AwaitingApproval, "and moves nothing");
     assert!(held.closed_at.is_none());
 
+    // The server's own check, past the engine's guard: the live run is refused inside the
+    // transaction.
+    let direct = stack
+        .db
+        .store
+        .close_out(item, direct_summary(item), &[])
+        .await;
+    assert!(
+        matches!(&direct, Err(StoreError::Constraint(text)) if text.contains(&run.to_string())),
+        "`PgStore::close_out` refuses the live run itself: {direct:?}"
+    );
+    assert_eq!(
+        stack.documents(item).await,
+        documents_before,
+        "the server's refusal writes no document"
+    );
+    let held = stack.item(item).await;
+    assert_eq!(held.status, Status::AwaitingApproval, "and moves nothing");
+    assert!(held.closed_at.is_none());
+
     for _ in 0..4 {
         stack.answer(run, GateAnswer::Approved).await;
     }
@@ -720,7 +801,42 @@ async fn close_out_is_one_transaction_on_postgres() {
     );
     assert_eq!(stack.item(item).await.status, Status::Done);
 
-    let documents_before = stack.documents(item).await.len();
+    // One write or none: a commit row naming no repo fails its insert after the summary's
+    // `document` insert has run, and the transaction takes the document back with it.
+    let documents_before = stack.documents(item).await;
+    let done = stack.item(item).await;
+    let first = stack.step_at(run, 0).await;
+    let partway = stack
+        .db
+        .store
+        .close_out(
+            item,
+            direct_summary(item),
+            &[RunStepCommit {
+                run_step_id: first.id,
+                repo_id: RepoId::new(),
+                before_hash: "before".to_owned(),
+                after_hash: Some("after".to_owned()),
+            }],
+        )
+        .await;
+    assert!(
+        matches!(partway, Err(StoreError::Constraint(_))),
+        "the unknown repo is refused: {partway:?}"
+    );
+    assert_eq!(
+        stack.documents(item).await,
+        documents_before,
+        "the refused close-out left no summary behind"
+    );
+    let held = stack.item(item).await;
+    assert_eq!(
+        (held.status, held.closed_at),
+        (Status::Done, done.closed_at),
+        "and did not close the item"
+    );
+
+    let documents_before = documents_before.len();
     stack.command(Command::CloseOut { item }).await;
     assert_eq!(stack.take_status(), None, "the close-out was accepted");
     let summaries = stack.summaries(item).await;
@@ -745,9 +861,54 @@ async fn close_out_is_one_transaction_on_postgres() {
         ),
         ("summary", 1, None)
     );
+    // Criterion 20's table: one row per `(repo, step)` with the `before..after` the server's
+    // `run_step_commit` holds for that step.
+    let mut expected = Vec::new();
+    for step in stack.steps(run).await {
+        let commits = stack
+            .db
+            .store
+            .step_commits(step.id)
+            .await
+            .expect("the read answers");
+        for commit in commits {
+            let after = commit.after_hash.expect("every walked step committed");
+            expected.push(format!(
+                "| htui | {} | {} | {} | {}..{after} |",
+                step.position, step.phase_name, step.attempt, commit.before_hash
+            ));
+        }
+    }
+    assert_eq!(
+        expected.len(),
+        4,
+        "four steps, each committed to the primary"
+    );
+    let rows: Vec<&str> = summary
+        .body
+        .lines()
+        .filter(|line| line.starts_with("| htui | "))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        expected.len(),
+        "one row per `(repo, step)`:\n{}",
+        summary.body
+    );
+    for row in &expected {
+        assert!(
+            rows.contains(&row.as_str()),
+            "the summary carries `{row}`:\n{}",
+            summary.body
+        );
+    }
     let closed = stack.item(item).await;
     assert_eq!(closed.status, Status::Closed);
     assert!(closed.closed_at.is_some(), "`closed_at` is set");
+    assert_ne!(
+        closed.closed_at, done.closed_at,
+        "by the close-out's own write, not left from `done`"
+    );
 
     stack.finish().await;
 }
