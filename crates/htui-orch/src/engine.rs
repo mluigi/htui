@@ -554,8 +554,13 @@ where
                 step,
                 chat_open,
             } => self.promote(run, step, chat_open).await,
-            Command::AcceptArtifact { .. } | Command::Unblock { .. } | Command::CloseOut { .. } => {
-                todo!("MOD-4 milestone 6: accept, unblock and close-out")
+            Command::AcceptArtifact {
+                run,
+                step,
+                chat_live,
+            } => self.accept_artifact(run, step, chat_live).await,
+            Command::Unblock { .. } | Command::CloseOut { .. } => {
+                todo!("MOD-4 milestone 6: unblock and close-out")
             }
         }
     }
@@ -1249,6 +1254,24 @@ where
             extra_dirs,
             path,
         })
+    }
+
+    /// §4.8's `accept artifact` (MOD-4 plan D166, blueprint D194, `docs/ANA-2.md:1223-1233`).
+    ///
+    /// The guard ([`crate::command::accept_enabled`]), the lease, then the promoted step's stage
+    /// 5 in the lease's window: the verify, as after a session that ended `EndTurn`; the capture
+    /// and its commits; the settle columns. A `fail` verify refuses with
+    /// [`EngineError::AcceptVerifyFailed`] — the outcome is recorded, a note says so, and the
+    /// step stays promoted and parked. Otherwise the `AnswerGate(Approved)` tail: the step
+    /// `done` with `approved`, the unpark, the merge, and the walk from `position + 1`.
+    async fn accept_artifact(
+        &self,
+        run: RunId,
+        step: StepId,
+        chat_live: bool,
+    ) -> Result<CommandOutcome, EngineError> {
+        let _ = (run, step, chat_live);
+        todo!("MOD-4 plan D166: accept artifact")
     }
 
     /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).

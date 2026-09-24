@@ -1563,6 +1563,34 @@ impl FakeOrchestrator {
         self.write_output(item, step, phase, key).await
     }
 
+    /// Blueprint D203's author, on the fake: writes `step`'s output document of `kind` with
+    /// `body`, stamped by this harness's user and clock, as a promoted step's chat — or MOD-11's
+    /// `document_write` — would. `run_worker`'s `StepAuthor` is the same seam behind the real
+    /// worker; a case uses this one to give a promoted step the artefact `AcceptArtifact` needs.
+    ///
+    /// # Errors
+    /// The store's own refusals.
+    pub async fn author(
+        &self,
+        item: ItemId,
+        step: &RunStep,
+        kind: &str,
+        body: &str,
+    ) -> Result<Document> {
+        self.store
+            .write_document(NewDocument {
+                id: DocumentId::new(),
+                item_id: item,
+                kind: kind.to_owned(),
+                title: format!("{kind} (attempt {}, authored)", step.attempt),
+                body: body.to_owned(),
+                produced_by_step_id: Some(step.id),
+                created_by: self.user,
+                created_at: self.clock.now(),
+            })
+            .await
+    }
+
     /// The scripted output document of one session, or none.
     async fn write_output(
         &self,

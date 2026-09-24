@@ -163,6 +163,18 @@ pub trait Orchestrate {
     /// Make stage 3 refuse `phase`'s own prompt (MOD-4 plan D162): its pinned template names a
     /// placeholder no role has, which is ANA-5 criterion 3's literal case.
     fn refuse_prompt(&self, phase: &str);
+
+    /// Blueprint D203: write `step`'s output document of `kind`, as a promoted step's chat would.
+    ///
+    /// # Errors
+    /// The store's own refusals.
+    async fn author(
+        &self,
+        item: ItemId,
+        step: &RunStep,
+        kind: &str,
+        body: &str,
+    ) -> Result<(), htui_core::store::StoreError>;
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -241,6 +253,16 @@ impl Orchestrate for FakeOrchestrator {
 
     fn refuse_prompt(&self, phase: &str) {
         Self::refuse_prompt(self, phase);
+    }
+
+    async fn author(
+        &self,
+        item: ItemId,
+        step: &RunStep,
+        kind: &str,
+        body: &str,
+    ) -> Result<(), htui_core::store::StoreError> {
+        Self::author(self, item, step, kind, body).await.map(drop)
     }
 }
 
@@ -434,6 +456,13 @@ pub const CASES: &[&str] = &[
     "promote_refuses_a_terminal_run",
     // Plan D163's engine half: a step a dropped walk left `running` is parked by the promotion.
     "promote_moves_a_dropped_running_step_to_awaiting",
+    // Criterion 17, second half (`:2131-2134`, plan D166): accept verifies, captures, approves
+    // and walks on at `position + 1`.
+    "accept_artifact_verifies_captures_and_resumes_at_the_next_position",
+    // `:1229-1231`: accept needs the promotion, the document and no live chat on the step.
+    "accept_artifact_needs_the_document_and_the_promotion",
+    // Blueprint D194: a failed verify refuses the accept and keeps the step promoted.
+    "accept_artifact_refuses_a_failed_verify",
 ];
 
 /// Run one case by name.
@@ -608,6 +637,15 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         "promote_refuses_a_terminal_run" => Box::pin(promote_refuses_a_terminal_run(harness)),
         "promote_moves_a_dropped_running_step_to_awaiting" => {
             Box::pin(promote_moves_a_dropped_running_step_to_awaiting(harness))
+        }
+        "accept_artifact_verifies_captures_and_resumes_at_the_next_position" => {
+            Box::pin(accept_artifact_verifies_captures_and_resumes_at_the_next_position(harness))
+        }
+        "accept_artifact_needs_the_document_and_the_promotion" => Box::pin(
+            accept_artifact_needs_the_document_and_the_promotion(harness),
+        ),
+        "accept_artifact_refuses_a_failed_verify" => {
+            Box::pin(accept_artifact_refuses_a_failed_verify(harness))
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -4797,6 +4835,205 @@ async fn promote_moves_a_dropped_running_step_to_awaiting<H: CaseHarness>(harnes
     );
 }
 
+/// `AcceptArtifact` on `step`, from a chat that has ended.
+async fn accept<O: Orchestrate>(
+    orch: &O,
+    run: RunId,
+    step: StepId,
+) -> Result<CommandOutcome, EngineError> {
+    orch.dispatch(Command::AcceptArtifact {
+        run,
+        step,
+        chat_live: false,
+    })
+    .await
+}
+
+/// ANA-2 §12 criterion 17, second half (`docs/ANA-2.md:1223-1233`, MOD-4 plan D166): a promoted
+/// `prd` is accepted. Its verify runs and is recorded, its tree is captured into one commit row,
+/// the step is `done` with `approved`, the merge runs, and the walk goes on to `plan` at
+/// `position + 1`, which parks at its gate.
+async fn accept_artifact_verifies_captures_and_resumes_at_the_next_position<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    let repo = primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    promote(&orch, run, prd.id).await;
+    orch.verifier().script_report(FakeVerifier::pass());
+
+    let outcome = accept(&orch, run, prd.id)
+        .await
+        .expect("a promoted step with its document");
+    let CommandOutcome::Accepted { rest } = outcome else {
+        panic!("`AcceptArtifact` answers `Accepted`, not {outcome:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the walk went on to `plan` and parked at its gate"
+    );
+
+    let prd = step_at(&orch, run, 0, 1).await;
+    assert_eq!(
+        (prd.status, prd.gate_outcome, prd.verify_outcome),
+        (
+            StepStatus::Done,
+            Some(GateOutcome::Approved),
+            Some(VerifyOutcome::Pass)
+        )
+    );
+    assert!(prd.promoted_at.is_some(), "it stays a promoted step");
+    let commits = orch
+        .store()
+        .step_commits(prd.id)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(commits.len(), 1, "one repo, one commit row");
+    assert_eq!(commits[0].repo_id, repo);
+    assert!(commits[0].after_hash.is_some(), "the capture landed");
+    assert_eq!(
+        command_runs_of(&orch, prd.id)
+            .await
+            .iter()
+            .map(|row| row.status)
+            .collect::<Vec<_>>(),
+        [CommandRunStatus::Done],
+        "the verify is recorded"
+    );
+    assert_eq!(
+        step_at(&orch, run, 1, 1).await.status,
+        StepStatus::AwaitingApproval,
+        "`plan` exists at position + 1"
+    );
+    assert!(
+        orch.isolator()
+            .reconciles()
+            .iter()
+            .any(|(winner, _)| *winner == prd.id),
+        "the accepted step was merged"
+    );
+}
+
+/// `docs/ANA-2.md:1229-1231` (MOD-4 plan D166): accept is refused for a step that was never
+/// promoted, for a promoted step with no document, and while a chat is live on the step — and
+/// none of the three writes anything. Once the chat wrote the document (blueprint D203's author)
+/// and ended, the same accept goes through.
+async fn accept_artifact_needs_the_document_and_the_promotion<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    orch.script("prd", 1, ScriptedStep::done_without_output());
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    assert_eq!(prd.status, StepStatus::AwaitingApproval);
+
+    let before = rows_of(&orch, run).await;
+    let refused = accept(&orch, run, prd.id)
+        .await
+        .expect_err("never promoted");
+    assert!(
+        matches!(refused, EngineError::NotPromoted { step } if step == prd.id),
+        "{refused}"
+    );
+    assert_eq!(rows_of(&orch, run).await, before, "nothing written");
+
+    promote(&orch, run, prd.id).await;
+    let before = rows_of(&orch, run).await;
+    let refused = accept(&orch, run, prd.id)
+        .await
+        .expect_err("no `prd` document");
+    assert!(
+        matches!(&refused, EngineError::MissingOutputForApproval { kind, .. } if kind == "prd"),
+        "{refused}"
+    );
+    assert_eq!(rows_of(&orch, run).await, before, "nothing written");
+
+    orch.author(ids::HTUI_FEAT_3, &prd, "prd", "written in the chat")
+        .await
+        .expect("the store takes the document");
+    let before = rows_of(&orch, run).await;
+    let refused = orch
+        .dispatch(Command::AcceptArtifact {
+            run,
+            step: prd.id,
+            chat_live: true,
+        })
+        .await
+        .expect_err("the chat on the step is live");
+    assert!(
+        matches!(refused, EngineError::ChatLive { step: Some(step) } if step == prd.id),
+        "{refused}"
+    );
+    assert_eq!(rows_of(&orch, run).await, before, "nothing written");
+
+    let outcome = accept(&orch, run, prd.id)
+        .await
+        .expect("the chat ended and left its document");
+    assert!(
+        matches!(outcome, CommandOutcome::Accepted { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(step_at(&orch, run, 0, 1).await.status, StepStatus::Done);
+}
+
+/// Blueprint D194: an accept whose verify fails is refused with the exit code. The outcome is
+/// recorded, a note says so, the step stays promoted and parked, the lease is given back, and
+/// the walk does not go on.
+async fn accept_artifact_refuses_a_failed_verify<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    promote(&orch, run, prd.id).await;
+    orch.verifier().script_report(FakeVerifier::fail(1));
+
+    let refused = accept(&orch, run, prd.id)
+        .await
+        .expect_err("the verify failed");
+    assert!(
+        matches!(
+            refused,
+            EngineError::AcceptVerifyFailed {
+                step,
+                exit_code: Some(1)
+            } if step == prd.id
+        ),
+        "{refused}"
+    );
+    let after = step_at(&orch, run, 0, 1).await;
+    assert_eq!(
+        (after.status, after.verify_outcome, after.gate_outcome),
+        (
+            StepStatus::AwaitingApproval,
+            Some(VerifyOutcome::Fail),
+            None
+        )
+    );
+    assert!(after.promoted_at.is_some(), "the step stays promoted");
+    let row = run_of(&orch, run).await;
+    assert_eq!(row.status, RunStatus::AwaitingApproval);
+    assert_eq!(
+        row.lease_expires_at,
+        Some(orch.clock().now()),
+        "the lease was given back"
+    );
+    assert_eq!(
+        steps_of(&orch, run).await.len(),
+        1,
+        "the walk did not go on"
+    );
+    assert!(
+        notes_of(&orch, ids::HTUI_FEAT_3)
+            .await
+            .iter()
+            .any(|body| body.starts_with("accept refused: ")),
+        "a human reads why"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -4821,7 +5058,7 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            60,
+            63,
             "18 + 5 + 13 + 6 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
