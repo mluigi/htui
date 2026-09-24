@@ -4,21 +4,43 @@
 //! lives here: the graph source over a [`Backend`], and — as the milestone lands — the runtime
 //! that serves the orchestrator's requests on its own tasks beside `AgentRuntime`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use htui_agent::driver::{AgentDriver, AgentSession, DriverCaps, DriverFuture, SessionSpec};
+use htui_agent::error::DriverError;
+use htui_agent::event::DoneEvent;
+use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, DocumentHead, DocumentId, Item, ItemId, PhaseAgent, PhaseId,
-    ProjectId, PromptTemplate, ResolvedGraph, Run, RunId, RunStep, StepId,
+    Agent, AgentBox, AgentId, AgentSummary, BoxId, BoxProfile, DocumentHead, DocumentId, Item,
+    ItemId, NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph,
+    Run, RunId, RunStep, SnapshotCandidate, SnapshotPhase, StepId, UserId,
 };
-use htui_core::store::{ReadStore as _, Result as StoreResult, StoreError};
+use htui_core::scrub::MinimalScrubber;
+use htui_core::store::{ReadStore as _, Result as StoreResult, StoreError, WriteStore as _};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
 use htui_orch::status::group_at;
 use htui_orch::{
-    Command, CommandOutcome, Cursor, EngineError, GateAnswer, GraphSource, Rest, accept_enabled,
-    cleanup_enabled, close_out_enabled, cursor, phase_at, promote_enabled, retry_admitted,
-    snapshot_of, start_enabled, unblock_enabled,
+    Clock, Command, CommandOutcome, Cursor, DeadWalks, DriverFor, Engine, EngineError, EngineParts,
+    FirstCandidate, GateAnswer, GixIsolator, GraphSource, Isolator, IsolatorConfig, LeaseTimes,
+    Opening, OpeningPath, RepoCheckout, Rest, RunFence, SessionKey, SessionSink, ShellVerifier,
+    SystemClock, UnblockCase, Verifier, accept_enabled, cleanup_enabled, close_out_enabled, cursor,
+    phase_at, promote_enabled, retry_admitted, snapshot_of, start_enabled, unblock_enabled,
 };
-use htui_store::{Backend, DATABASE_UNREACHABLE};
+use htui_store::{Backend, DATABASE_UNREACHABLE, Writer, identity};
+use serde_json::Value;
+use tokio::sync::{OwnedMutexGuard, mpsc};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::agent_worker::ReplyAddr;
+use crate::store_worker::{Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply, StoreRequest};
 
 /// Blueprint D209: the [`StoreRequest::name`](crate::store_worker::StoreRequest::name) of each
 /// [`OrchRequest`], in [`OrchRequest`]'s order — the nine commands of [`Command`], then the
@@ -450,6 +472,1287 @@ fn newest_output(heads: &[DocumentHead], kind: &str, step: StepId) -> Result<Doc
         .ok_or_else(|| format!("step {step} produced no `{kind}` document"))
 }
 
+// ---------------------------------------------------------------------------------------------
+// The runtime
+// ---------------------------------------------------------------------------------------------
+
+/// Blueprint D202 (R-39): a `StartRun` found the repo map changed while a walk of this process
+/// is live, so the isolator cannot be rebuilt under it.
+pub const REPOS_MOVED: &str =
+    "a repo was added or moved since the first run; wait for the live runs to rest (R-39)";
+
+/// The `copy_max_total_bytes` a box with no `app_setting` for it copies up to: 20 GiB.
+const DEFAULT_COPY_MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// What `RunRuntime::serve` (and the runtime's event channel) decided about one request.
+#[derive(Debug)]
+pub enum RunServed {
+    /// Answer with this reply, now.
+    Reply(StoreReply),
+    /// A task this runtime owns answers the request, exactly once.
+    Deferred,
+    /// D165/D181: a promotion's engine writes are done; the loop hands `promoted` to
+    /// `AgentRuntime::attach_promoted` (T7) and answers at `addr`.
+    Attach {
+        /// The promotion request's address.
+        addr: ReplyAddr,
+        /// What the chat binds to.
+        promoted: Box<Promoted>,
+    },
+}
+
+/// A promoted step, as the Chat tab's runtime binds to it (D165, D191).
+#[derive(Debug, Clone)]
+pub struct Promoted {
+    /// The step's run.
+    pub run: RunId,
+    /// The promoted step.
+    pub step: StepId,
+    /// `run.project_id`.
+    pub project: ProjectId,
+    /// How its chat opens.
+    pub opening: Opening,
+}
+
+/// Blueprint D203: the producer of a step's output document, behind the progress sink. Production
+/// has none — MOD-11's `document_write` writes documents (R-50) — and a test answers with one.
+pub trait StepAuthor: Send + Sync + core::fmt::Debug {
+    /// The document `step` produced, if any.
+    fn document(&self, item: ItemId, step: &RunStep, phase: &SnapshotPhase) -> Option<NewDocument>;
+}
+
+/// D172, D203: `after_done` publishes `SessionDone` for the item and, in a test, writes the step's
+/// output document. Production `author` is `None` (MOD-11 writes documents; R-50).
+#[derive(Debug, Clone)]
+pub struct ProgressSink {
+    publisher: Publisher,
+    writer: Writer,
+    author: Option<Arc<dyn StepAuthor>>,
+}
+
+impl SessionSink for ProgressSink {
+    async fn after_done(
+        &self,
+        item: ItemId,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        _key: &SessionKey<'_>,
+        _done: &DoneEvent,
+    ) -> Result<(), StoreError> {
+        if let Some(author) = &self.author
+            && let Some(document) = author.document(item, step, phase)
+        {
+            self.writer.write_document(document).await?;
+        }
+        self.publisher.publish(&RunFrame {
+            item,
+            run: Some(step.run_id),
+            kind: FrameKind::SessionDone { step: step.id },
+        });
+        Ok(())
+    }
+}
+
+/// A driver the registry refused: `start` answers that refusal, which the walk fails as a spawn
+/// failure under every gate. `DriverError` is `Clone`.
+#[derive(Debug)]
+struct RefusedDriver(DriverError);
+
+impl AgentDriver for RefusedDriver {
+    fn name(&self) -> &str {
+        "refused"
+    }
+
+    fn caps(&self) -> DriverCaps {
+        DriverCaps::default()
+    }
+
+    fn start<'a>(
+        &'a self,
+        _spec: SessionSpec,
+        _prompt: String,
+    ) -> DriverFuture<'a, Box<dyn AgentSession>> {
+        let refusal = self.0.clone();
+        Box::pin(async move { Err(refusal) })
+    }
+}
+
+/// Plan D172, blueprint §0a point 3: who is subscribed to which item's runs, and at which `seq`.
+///
+/// One subscription per origin: a later `RunStream` from the same origin replaces the earlier one,
+/// whose `seq` `App::latest` already treats as stale. Every frame for `item` goes to each
+/// subscriber of it at **its** subscription's `seq`, the only one `App::is_fresh` passes.
+#[derive(Debug, Clone, Default)]
+struct Publisher(Arc<StdMutex<Subscribers>>);
+
+#[derive(Debug, Default)]
+struct Subscribers {
+    subs: HashMap<Origin, Subscription>,
+    replies: Option<mpsc::UnboundedSender<ReplyEnvelope>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Subscription {
+    seq: Seq,
+    item: ItemId,
+}
+
+impl Publisher {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Subscribers> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The channel frames go out on: the loop's reply sender.
+    fn wire(&self, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
+        let mut state = self.lock();
+        if state
+            .replies
+            .as_ref()
+            .is_none_or(mpsc::UnboundedSender::is_closed)
+        {
+            state.replies = Some(replies.clone());
+        }
+    }
+
+    /// `origin` now follows `item`, at `seq`.
+    fn subscribe(&self, origin: Origin, seq: Seq, item: ItemId) {
+        self.lock().subs.insert(origin, Subscription { seq, item });
+    }
+
+    /// One frame to every subscriber of its item.
+    fn publish(&self, frame: &RunFrame) {
+        let state = self.lock();
+        let Some(replies) = state.replies.as_ref() else {
+            return;
+        };
+        for (origin, sub) in &state.subs {
+            if sub.item != frame.item {
+                continue;
+            }
+            let _ = replies.send(ReplyEnvelope {
+                seq: sub.seq,
+                origin: origin.clone(),
+                reply: StoreReply::RunStream(frame.clone()),
+            });
+        }
+    }
+}
+
+/// The isolator and verifier every engine of this process borrows (D156): injected, or built at
+/// the first command from the box's repos.
+enum Parts {
+    Injected {
+        isolator: Arc<dyn Isolator>,
+        verifier: Arc<dyn Verifier>,
+    },
+    Production {
+        scratch_root: Option<PathBuf>,
+        built: tokio::sync::Mutex<Built>,
+    },
+}
+
+impl core::fmt::Debug for Parts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Injected { isolator, .. } => f
+                .debug_struct("Injected")
+                .field("isolator", isolator)
+                .finish_non_exhaustive(),
+            Self::Production { scratch_root, .. } => f
+                .debug_struct("Production")
+                .field("scratch_root", scratch_root)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// What the production parts were built from, and the parts.
+#[derive(Default)]
+struct Built {
+    repos: Option<BTreeMap<RepoId, RepoCheckout>>,
+    isolator: Option<Arc<dyn Isolator>>,
+    verifier: Option<Arc<dyn Verifier>>,
+}
+
+/// Everything the runtime's tasks share.
+struct Shared {
+    parts: Parts,
+    drivers: Arc<DriverFactory>,
+    clock: Arc<dyn Clock>,
+    author: Option<Arc<dyn StepAuthor>>,
+    owner: Uuid,
+    dead_walks: Arc<DeadWalks>,
+    publisher: Publisher,
+    events: mpsc::UnboundedSender<RunServed>,
+    tasks: StdMutex<Vec<Tracked>>,
+    isolator_builds: AtomicUsize,
+    locks: RunLocks,
+    walks: Walks,
+    /// M5 D84: this process's runs a claim refused, by `queued_at`.
+    queued: StdMutex<BTreeSet<(DateTime<Utc>, RunId)>>,
+    /// D190: the sweep period in milliseconds, the lease TTL until a test fixes it.
+    sweep_every: AtomicU64,
+    /// Whether [`RunRuntime::with_sweep_every`] fixed the period.
+    sweep_fixed: bool,
+}
+
+/// One task of the runtime, with the run it works on once it knows it.
+#[derive(Debug)]
+struct Tracked {
+    tag: Arc<Tag>,
+    handle: JoinHandle<()>,
+}
+
+/// The run (and item) a task works on, set as soon as the task knows them.
+#[derive(Debug, Default)]
+struct Tag {
+    run: OnceLock<RunId>,
+    item: OnceLock<ItemId>,
+}
+
+impl Shared {
+    /// M5 D84: a run a claim refused waits in `queued_at` order.
+    fn queue(&self, queued_at: DateTime<Utc>, run: RunId) {
+        self.queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((queued_at, run));
+    }
+
+    fn track(&self, tag: Arc<Tag>, handle: JoinHandle<()>) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Tracked { tag, handle });
+    }
+
+    /// The process's isolator and verifier (D156, D202). A `StartRun` re-reads the repo map and
+    /// rebuilds the production isolator when it moved and no walk of this process is live, and is
+    /// refused with [`REPOS_MOVED`] when one is (R-39).
+    async fn singletons(
+        &self,
+        backend: &Backend,
+        writer: &Writer,
+        start_run: bool,
+    ) -> Result<(Arc<dyn Isolator>, Arc<dyn Verifier>), String> {
+        let (scratch_root, built) = match &self.parts {
+            Parts::Injected { isolator, verifier } => {
+                return Ok((Arc::clone(isolator), Arc::clone(verifier)));
+            }
+            Parts::Production {
+                scratch_root,
+                built,
+            } => (scratch_root, built),
+        };
+        let mut built = built.lock().await;
+        if !start_run && let (Some(isolator), Some(verifier)) = (&built.isolator, &built.verifier) {
+            return Ok((Arc::clone(isolator), Arc::clone(verifier)));
+        }
+        let box_id = registered_box(backend)
+            .await
+            .map_err(|err| err.to_string())?;
+        let repos = repo_map(backend, writer, box_id)
+            .await
+            .map_err(|err| err.to_string())?;
+        let rebuild = built.repos.as_ref() != Some(&repos);
+        if rebuild {
+            if built.isolator.is_some() && self.any_live() {
+                return Err(REPOS_MOVED.to_owned());
+            }
+            let app = backend
+                .app_settings()
+                .await
+                .map_err(|err| err.to_string())?;
+            let scratch_root = match scratch_root {
+                Some(root) => root.clone(),
+                None => identity::config_root()
+                    .map_err(|err| err.to_string())?
+                    .join("trees"),
+            };
+            let isolator = GixIsolator::new(IsolatorConfig {
+                repos: repos.clone(),
+                scratch_root,
+                copy_exclude: Vec::new(),
+                copy_max_total_bytes: app
+                    .get("copy_max_total_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(DEFAULT_COPY_MAX_TOTAL_BYTES),
+                box_id,
+            })
+            .map_err(|err| err.to_string())?;
+            built.isolator = Some(Arc::new(isolator));
+            built.repos = Some(repos);
+            self.isolator_builds.fetch_add(1, Ordering::SeqCst);
+        }
+        if built.verifier.is_none() {
+            let limits = command_limits(backend, box_id).await;
+            built.verifier = Some(Arc::new(ShellVerifier::new(
+                &limits,
+                Arc::new(MinimalScrubber::new(std::iter::empty::<String>())),
+                Arc::clone(&self.clock),
+            )));
+        }
+        match (&built.isolator, &built.verifier) {
+            (Some(isolator), Some(verifier)) => Ok((Arc::clone(isolator), Arc::clone(verifier))),
+            _ => Err("the run runtime has no isolator".to_owned()),
+        }
+    }
+
+    /// Whether a walk of this process is live.
+    fn any_live(&self) -> bool {
+        self.walks.any_live()
+    }
+
+    /// The run's lock, unless the task's token is cancelled first (H-6): a task cancelled while
+    /// it waits walks nothing.
+    async fn lock_unless_cancelled(
+        &self,
+        run: RunId,
+        walk: &WalkToken,
+    ) -> Option<OwnedMutexGuard<()>> {
+        tokio::select! {
+            biased;
+            () = walk.token.cancelled() => None,
+            guard = self.locks.lock(run) => Some(guard),
+        }
+    }
+}
+
+/// R-27: one async mutex per run, minted on first use. Held by every command, resume, claim and
+/// sweep-driven recovery of that run for its whole duration (plan D157).
+#[derive(Debug, Clone, Default)]
+pub struct RunLocks(Arc<StdMutex<HashMap<RunId, Arc<tokio::sync::Mutex<()>>>>>);
+
+impl RunLocks {
+    fn entry(&self, run: RunId) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(run)
+                .or_default(),
+        )
+    }
+
+    /// Waits for `run`'s lock.
+    pub async fn lock(&self, run: RunId) -> OwnedMutexGuard<()> {
+        self.entry(run).lock_owned().await
+    }
+
+    /// `run`'s lock when nobody holds it.
+    #[must_use]
+    pub fn try_lock(&self, run: RunId) -> Option<OwnedMutexGuard<()>> {
+        self.entry(run).try_lock_owned().ok()
+    }
+}
+
+/// Blueprint D189: a sweep leaves a run a command of this process holds alone.
+impl RunFence for RunLocks {
+    type Guard = OwnedMutexGuard<()>;
+
+    fn hold(&self, run: RunId) -> Option<Self::Guard> {
+        self.try_lock(run)
+    }
+}
+
+/// D187: one parent token per run; every task of the run works under a child. The std mutex is
+/// never held across an `.await`.
+#[derive(Debug, Clone, Default)]
+struct Walks(Arc<StdMutex<HashMap<RunId, Parent>>>);
+
+/// A run's parent token and how many tasks work under it.
+#[derive(Debug, Clone)]
+struct Parent {
+    token: CancellationToken,
+    live: Arc<AtomicUsize>,
+}
+
+/// One task's child token; dropping it is the task no longer working on the run.
+#[derive(Debug)]
+struct WalkToken {
+    token: CancellationToken,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for WalkToken {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Walks {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RunId, Parent>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A child of `run`'s parent, minting the parent on first use.
+    fn child(&self, run: RunId) -> WalkToken {
+        let mut walks = self.lock();
+        let parent = walks.entry(run).or_insert_with(|| Parent {
+            token: CancellationToken::new(),
+            live: Arc::new(AtomicUsize::new(0)),
+        });
+        parent.live.fetch_add(1, Ordering::SeqCst);
+        WalkToken {
+            token: parent.token.child_token(),
+            live: Arc::clone(&parent.live),
+        }
+    }
+
+    /// Whether a task of this process works on `run`.
+    fn is_live(&self, run: RunId) -> bool {
+        self.lock()
+            .get(&run)
+            .is_some_and(|parent| parent.live.load(Ordering::SeqCst) > 0)
+    }
+
+    /// Whether any task of this process works on any run.
+    fn any_live(&self) -> bool {
+        self.lock()
+            .values()
+            .any(|parent| parent.live.load(Ordering::SeqCst) > 0)
+    }
+
+    /// D187: removes and cancels `run`'s parent, so every task under it stops and the preempting
+    /// task's own child comes from a fresh one. Whether there was one.
+    fn preempt(&self, run: RunId) -> bool {
+        let parent = self.lock().remove(&run);
+        parent.is_some_and(|parent| {
+            parent.token.cancel();
+            true
+        })
+    }
+
+    /// Every run's parent, cancelled: the UI is gone.
+    fn cancel_all(&self) {
+        for (_, parent) in self.lock().drain() {
+            parent.token.cancel();
+        }
+    }
+}
+
+/// This box's id, or the refusal that says it has never been registered.
+async fn registered_box(backend: &Backend) -> StoreResult<BoxId> {
+    Ok(backend
+        .box_info()
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "box",
+            id: "this box is not registered".to_owned(),
+        })?
+        .box_id)
+}
+
+/// Blueprint D202: every repo of every project of every workspace, joined on this box's checkout
+/// paths. A repo with no checkout here is not isolatable here and is left out.
+async fn repo_map(
+    backend: &Backend,
+    writer: &Writer,
+    box_id: BoxId,
+) -> StoreResult<BTreeMap<RepoId, RepoCheckout>> {
+    let paths: BTreeMap<RepoId, String> = backend
+        .repo_paths(box_id)
+        .await?
+        .into_iter()
+        .map(|path| (path.repo_id, path.local_path))
+        .collect();
+    let mut projects = BTreeSet::new();
+    for workspace in backend.workspaces().await? {
+        projects.extend(workspace.projects.iter().map(|project| project.project_id));
+    }
+    let mut repos = BTreeMap::new();
+    for project in projects {
+        for repo in writer.repos(project).await? {
+            if let Some(path) = paths.get(&repo.id) {
+                repos.insert(
+                    repo.id,
+                    RepoCheckout {
+                        name: repo.name,
+                        local_path: PathBuf::from(path),
+                        is_primary: repo.is_primary,
+                    },
+                );
+            }
+        }
+    }
+    Ok(repos)
+}
+
+/// The box row's `settings.command_limits`, else `{"verify": 1}` (D156).
+async fn command_limits(backend: &Backend, box_id: BoxId) -> BTreeMap<String, u32> {
+    backend
+        .box_row(box_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.settings.get("command_limits").cloned())
+        .and_then(|limits| serde_json::from_value(limits).ok())
+        .unwrap_or_else(|| BTreeMap::from([("verify".to_owned(), 1)]))
+}
+
+/// The engine every task builds, per step of work, over [`Kit`]'s parts.
+type WorkerEngine<'a> = Engine<
+    'a,
+    Writer,
+    BackendGraphs,
+    dyn Isolator,
+    dyn Verifier,
+    dyn Clock,
+    FirstCandidate,
+    ProgressSink,
+>;
+
+/// Everything one task's engine borrows, owned (D156): the writer, the graph source, the two
+/// singletons, the clock, the sink, the identities, and the agent registry read once per task.
+struct Kit {
+    writer: Writer,
+    graphs: BackendGraphs,
+    isolator: Arc<dyn Isolator>,
+    verifier: Arc<dyn Verifier>,
+    clock: Arc<dyn Clock>,
+    sink: ProgressSink,
+    scrubber: MinimalScrubber,
+    app: BTreeMap<String, Value>,
+    box_profile: BoxProfile,
+    box_id: BoxId,
+    user: UserId,
+    owner: Uuid,
+    dead_walks: Arc<DeadWalks>,
+    agents: HashMap<AgentId, AgentSummary>,
+    drivers: Arc<DriverFactory>,
+}
+
+impl Kit {
+    /// Reads the parts. `start_run` asks the singletons to re-check the repo map (D202).
+    async fn read(shared: &Shared, backend: &Backend, start_run: bool) -> Result<Self, String> {
+        let writer = backend
+            .writer()
+            .ok_or_else(|| DATABASE_UNREACHABLE.to_owned())?;
+        let (isolator, verifier) = shared.singletons(backend, &writer, start_run).await?;
+        let sentence = |err: StoreError| err.to_string();
+        let box_id = registered_box(backend).await.map_err(sentence)?;
+        let user = backend.this_user().await.map_err(sentence)?;
+        let app = backend.app_settings().await.map_err(sentence)?;
+        let box_profile = backend
+            .box_profile(box_id)
+            .await
+            .map_err(sentence)?
+            .ok_or_else(|| "this box has no profile row".to_owned())?;
+        let agents = backend
+            .agents()
+            .await
+            .map_err(sentence)?
+            .into_iter()
+            .map(|summary| (summary.agent.id, summary))
+            .collect();
+        Ok(Self {
+            sink: ProgressSink {
+                publisher: shared.publisher.clone(),
+                writer: writer.clone(),
+                author: shared.author.clone(),
+            },
+            writer,
+            graphs: BackendGraphs(backend.clone()),
+            isolator,
+            verifier,
+            clock: Arc::clone(&shared.clock),
+            scrubber: MinimalScrubber::new(std::iter::empty::<String>()),
+            app,
+            box_profile,
+            box_id,
+            user,
+            owner: shared.owner,
+            dead_walks: Arc::clone(&shared.dead_walks),
+            agents,
+            drivers: Arc::clone(&shared.drivers),
+        })
+    }
+
+    /// The driver for one candidate: the registry row's, else the refusal (D156).
+    fn driver(&self, candidate: &SnapshotCandidate) -> Box<dyn AgentDriver> {
+        let Some(summary) = self.agents.get(&candidate.agent_id) else {
+            return Box::new(RefusedDriver(DriverError::Transport(format!(
+                "agent {} is not in the registry",
+                candidate.agent_id
+            ))));
+        };
+        match self
+            .drivers
+            .driver_for(&summary.agent, summary.on_box.as_ref())
+        {
+            Ok(driver) => driver,
+            Err(refusal) => Box::new(RefusedDriver(refusal)),
+        }
+    }
+
+    /// One engine over these parts.
+    fn engine<'a>(&'a self, driver: DriverFor<'a>) -> WorkerEngine<'a> {
+        Engine::new(EngineParts {
+            store: &self.writer,
+            graphs: &self.graphs,
+            isolator: &*self.isolator,
+            verifier: &*self.verifier,
+            clock: &*self.clock,
+            selector: &FirstCandidate,
+            sink: &self.sink,
+            driver,
+            scrubber: &self.scrubber,
+            app: self.app.clone(),
+            box_profile: self.box_profile.clone(),
+            box_id: self.box_id,
+            owner: self.owner,
+            dead_walks: &self.dead_walks,
+            user: self.user,
+        })
+    }
+}
+
+/// What a command preempted by a later one (D187), or cancelled while it waited for the run's
+/// lock (H-6), is answered with.
+pub const PREEMPTED: &str = "the walk was stopped by a later command on its run";
+
+/// Blueprint §8.6: an `Unblock` whose case moved while it waited for the run's lock.
+pub const UNBLOCK_MOVED: &str = "the item changed; press `u` again";
+
+/// A period as the millisecond count the runtime stores.
+fn millis(every: Duration) -> u64 {
+    u64::try_from(every.as_millis()).unwrap_or(u64::MAX).max(1)
+}
+
+/// The sweep period a runtime starts with: `LeaseTimes::from_app` over no settings, 120 s (D190).
+fn lease_period(app: &BTreeMap<String, Value>) -> Duration {
+    LeaseTimes::from_app(app)
+        .ttl
+        .to_std()
+        .unwrap_or(Duration::from_secs(120))
+}
+
+/// The orchestrator's runtime, inside the store worker's loop beside `AgentRuntime` (plan D153).
+///
+/// Every `Orch` command runs on a task this runtime owns and answers its request once, at the
+/// request's `seq` (`R-NF-3`, R-41); the loop never awaits a walk. A run's commands are serialised
+/// by [`RunLocks`] (R-27), and `CancelRun` and `PromoteStep` preempt a live walk through its token
+/// (D157, D187).
+pub struct RunRuntime {
+    shared: Arc<Shared>,
+    events: Option<mpsc::UnboundedReceiver<RunServed>>,
+}
+
+impl core::fmt::Debug for RunRuntime {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RunRuntime")
+            .field("parts", &self.shared.parts)
+            .field("adapters", &self.shared.drivers.adapter_ids())
+            .field("owner", &self.shared.owner)
+            .field("tasks", &self.tasks_len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunRuntime {
+    /// A runtime over this transport registry, whose isolator and verifier are the production
+    /// ones, built at the first command (D156).
+    #[must_use]
+    pub fn new(drivers: DriverFactory) -> Self {
+        Self::assemble(
+            Parts::Production {
+                scratch_root: None,
+                built: tokio::sync::Mutex::default(),
+            },
+            drivers,
+        )
+    }
+
+    /// The production runtime: [`DriverFactory::production`] and the production parts.
+    #[must_use]
+    pub fn production() -> Self {
+        Self::new(DriverFactory::production())
+    }
+
+    /// A runtime over injected parts, for tests.
+    #[must_use]
+    pub fn with_parts(
+        isolator: Arc<dyn Isolator>,
+        verifier: Arc<dyn Verifier>,
+        drivers: DriverFactory,
+    ) -> Self {
+        Self::assemble(Parts::Injected { isolator, verifier }, drivers)
+    }
+
+    fn assemble(parts: Parts, drivers: DriverFactory) -> Self {
+        let (events, receiver) = mpsc::unbounded_channel();
+        Self {
+            shared: Arc::new(Shared {
+                parts,
+                drivers: Arc::new(drivers),
+                clock: Arc::new(SystemClock),
+                author: None,
+                owner: Uuid::now_v7(),
+                dead_walks: Arc::new(DeadWalks::new()),
+                publisher: Publisher::default(),
+                events,
+                tasks: StdMutex::default(),
+                isolator_builds: AtomicUsize::new(0),
+                locks: RunLocks::default(),
+                walks: Walks::default(),
+                queued: StdMutex::default(),
+                sweep_every: AtomicU64::new(millis(lease_period(&BTreeMap::new()))),
+                sweep_fixed: false,
+            }),
+            events: Some(receiver),
+        }
+    }
+
+    /// D190: a runtime that sweeps every `every`, whatever `lease_ttl_seconds` says.
+    ///
+    /// # Panics
+    /// When called after the runtime has served.
+    #[must_use]
+    pub fn with_sweep_every(mut self, every: Duration) -> Self {
+        let shared = self.configure();
+        shared.sweep_every = AtomicU64::new(millis(every));
+        shared.sweep_fixed = true;
+        self
+    }
+
+    /// D190: how often the loop's ticker asks for a sweep.
+    #[must_use]
+    pub fn sweep_every(&self) -> Duration {
+        Duration::from_millis(self.shared.sweep_every.load(Ordering::SeqCst))
+    }
+
+    /// D158, D189, D190: one recovery sweep on a task of its own, unless one is still running or
+    /// there is no server.
+    pub fn sweep(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
+        let _ = (backend, replies);
+    }
+
+    /// The shared state, while nothing else holds it: configuration happens before the first
+    /// request.
+    fn configure(&mut self) -> &mut Shared {
+        Arc::get_mut(&mut self.shared).expect("a run runtime is configured before it serves")
+    }
+
+    /// A runtime whose engines read this clock; tests use a tokio-time one (H-2).
+    ///
+    /// # Panics
+    /// When called after the runtime has served.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.configure().clock = clock;
+        self
+    }
+
+    /// D203: a runtime whose progress sink writes each step's output document through `author`.
+    ///
+    /// # Panics
+    /// When called after the runtime has served.
+    #[must_use]
+    pub fn with_author(mut self, author: Arc<dyn StepAuthor>) -> Self {
+        self.configure().author = Some(author);
+        self
+    }
+
+    /// D202: the production isolator's scratch root, instead of `identity::config_root()/trees`.
+    ///
+    /// # Panics
+    /// When called after the runtime has served.
+    #[must_use]
+    pub fn with_scratch_root(mut self, root: PathBuf) -> Self {
+        if let Parts::Production { scratch_root, .. } = &mut self.configure().parts {
+            *scratch_root = Some(root);
+        }
+        self
+    }
+
+    /// D181: the receiver of the runtime's events — today only `RunServed::Attach` — which the
+    /// loop owns. Called once, before the loop; a second call hands out a fresh channel.
+    pub fn take_events(&mut self) -> mpsc::UnboundedReceiver<RunServed> {
+        self.events.take().unwrap_or_else(|| {
+            let (events, receiver) = mpsc::unbounded_channel();
+            self.configure().events = events;
+            receiver
+        })
+    }
+
+    /// How many isolators this process has built (D156's test hook).
+    #[must_use]
+    pub fn isolator_builds(&self) -> usize {
+        self.shared.isolator_builds.load(Ordering::SeqCst)
+    }
+
+    /// How many tasks this runtime still owns, finished ones included until the next `serve`.
+    #[must_use]
+    pub fn tasks_len(&self) -> usize {
+        self.shared
+            .tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Serves one `Orch`, `RunStream` or `RunActions` request (§8.5). Awaits nothing longer than
+    /// the verdict reads: every command is a task.
+    pub async fn serve(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        envelope: &RequestEnvelope,
+        live: &LiveChats,
+    ) -> RunServed {
+        self.shared
+            .tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|task| !task.handle.is_finished());
+        self.shared.publisher.wire(replies);
+        match &envelope.request {
+            StoreRequest::RunStream { item } => {
+                self.shared
+                    .publisher
+                    .subscribe(envelope.origin.clone(), envelope.seq, *item);
+                RunServed::Reply(StoreReply::RunStream(RunFrame::subscribed(*item)))
+            }
+            StoreRequest::RunActions(item) => {
+                RunServed::Reply(match actions(backend, *item, live).await {
+                    Ok(actions) => StoreReply::RunActions(Box::new(actions)),
+                    Err(err) => StoreReply::Failed {
+                        request: envelope.request.name(),
+                        message: err.to_string(),
+                    },
+                })
+            }
+            StoreRequest::Orch(request) => {
+                let name = request.name();
+                // D174: nothing is built and nothing is spawned without a server.
+                if backend.writer().is_none() {
+                    return RunServed::Reply(StoreReply::Failed {
+                        request: name,
+                        message: DATABASE_UNREACHABLE.to_owned(),
+                    });
+                }
+                let mut request = request.clone();
+                // D185: the facts only this process knows, whatever the view sent.
+                if let OrchRequest::Command(command) = &mut request {
+                    match command {
+                        Command::PromoteStep { chat_open, .. } => *chat_open = !live.is_empty(),
+                        Command::AcceptArtifact {
+                            step, chat_live, ..
+                        } => *chat_live = live.contains(*step),
+                        _ => {}
+                    }
+                }
+                let ctx = TaskCtx {
+                    shared: Arc::clone(&self.shared),
+                    backend: backend.clone(),
+                    replies: replies.clone(),
+                    addr: ReplyAddr {
+                        seq: envelope.seq,
+                        origin: envelope.origin.clone(),
+                    },
+                    name,
+                    tag: Arc::default(),
+                };
+                spawn_task(ctx, request);
+                RunServed::Deferred
+            }
+            other => RunServed::Reply(StoreReply::Failed {
+                request: other.name(),
+                message: "not an orchestrator request".to_owned(),
+            }),
+        }
+    }
+
+    /// Harness only: awaits every task, each under `limit`, and answers the runs whose task did
+    /// not finish (they are aborted).
+    pub async fn settle(&mut self, limit: Duration) -> Vec<RunId> {
+        let mut stuck = Vec::new();
+        loop {
+            let tasks = std::mem::take(
+                &mut *self
+                    .shared
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            if tasks.is_empty() {
+                return stuck;
+            }
+            for Tracked { tag, handle } in tasks {
+                let abort = handle.abort_handle();
+                if tokio::time::timeout(limit, handle).await.is_err() {
+                    abort.abort();
+                    if let Some(run) = tag.run.get() {
+                        stuck.push(*run);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The UI is gone: every walk is cancelled — its lease given back through `abandoned` — and
+    /// awaited for `2 × grace`, then aborted.
+    pub async fn shutdown(&mut self, grace: Duration) {
+        self.shared.walks.cancel_all();
+        let tasks = std::mem::take(
+            &mut *self
+                .shared
+                .tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for Tracked { tag, handle } in tasks {
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(grace * 2, handle).await.is_err() {
+                abort.abort();
+                tracing::warn!(run = ?tag.run.get(), "a run task did not end within the grace window");
+            }
+        }
+    }
+}
+
+/// One task's context: what it answers through and what it works on.
+#[derive(Clone)]
+struct TaskCtx {
+    shared: Arc<Shared>,
+    backend: Backend,
+    replies: mpsc::UnboundedSender<ReplyEnvelope>,
+    addr: ReplyAddr,
+    name: &'static str,
+    tag: Arc<Tag>,
+}
+
+impl TaskCtx {
+    /// The one answer to the request.
+    fn answer(&self, reply: StoreReply) {
+        let _ = self.replies.send(ReplyEnvelope {
+            seq: self.addr.seq,
+            origin: self.addr.origin.clone(),
+            reply,
+        });
+    }
+
+    /// The request refused with `message`, and the refusal published for the item (D200).
+    fn refuse(&self, message: String) {
+        self.publish(
+            self.tag.run.get().copied(),
+            FrameKind::Error(message.clone()),
+        );
+        self.answer(StoreReply::Failed {
+            request: self.name,
+            message,
+        });
+    }
+
+    /// A frame for the task's item, when it knows one.
+    fn publish(&self, run: Option<RunId>, kind: FrameKind) {
+        if let Some(item) = self.tag.item.get() {
+            self.shared.publisher.publish(&RunFrame {
+                item: *item,
+                run,
+                kind,
+            });
+        }
+    }
+
+    /// A command's outcome: the answer, then a `Rested` frame when the walk rested (D200).
+    fn done(&self, outcome: CommandOutcome) {
+        if let Some(rest) = rest_of(&outcome) {
+            self.publish(self.tag.run.get().copied(), FrameKind::Rested(rest));
+        }
+        self.answer(StoreReply::Orch(OrchReply::Done(Box::new(outcome))));
+    }
+
+    /// Records the run (and, from its row, the item) the task works on.
+    async fn tag_run(&self, writer: &Writer, run: RunId) -> Option<Run> {
+        let _ = self.tag.run.set(run);
+        let row = writer.run(run).await.ok().flatten();
+        if let Some(item) = row.as_ref().and_then(|row| row.item_id) {
+            let _ = self.tag.item.set(item);
+        }
+        row
+    }
+}
+
+/// Where a command's walk rested, when it walked.
+fn rest_of(outcome: &CommandOutcome) -> Option<Rest> {
+    match outcome {
+        CommandOutcome::Started { rest, .. }
+        | CommandOutcome::Answered { rest }
+        | CommandOutcome::Retried { rest, .. }
+        | CommandOutcome::Selected { rest }
+        | CommandOutcome::Cancelled { rest }
+        | CommandOutcome::Promoted { rest, .. }
+        | CommandOutcome::Accepted { rest } => Some(rest.clone()),
+        CommandOutcome::Unblocked { rest, .. } => rest.clone(),
+        CommandOutcome::ClosedOut { .. } => None,
+    }
+}
+
+/// `work`, unless the task's token is cancelled first: the walk future is dropped then (M5 D86).
+async fn walked<T>(walk: &WalkToken, work: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        out = work => Some(out),
+        () = walk.token.cancelled() => None,
+    }
+}
+
+/// Spawns one request's task and tracks it.
+fn spawn_task(ctx: TaskCtx, request: OrchRequest) {
+    let shared = Arc::clone(&ctx.shared);
+    let tag = Arc::clone(&ctx.tag);
+    let handle = tokio::spawn(run_request(ctx, request));
+    shared.track(tag, handle);
+}
+
+/// §8.6: one request, start to answer.
+async fn run_request(ctx: TaskCtx, request: OrchRequest) {
+    match request {
+        OrchRequest::Command(Command::StartRun {
+            item,
+            mode,
+            repo_scope,
+        }) => start_run(ctx, item, mode, repo_scope).await,
+        OrchRequest::Command(Command::Unblock { item }) => unblock(ctx, item).await,
+        OrchRequest::Command(command @ Command::CloseOut { item }) => {
+            let _ = ctx.tag.item.set(item);
+            let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+                Ok(kit) => kit,
+                Err(message) => return ctx.refuse(message),
+            };
+            let driver =
+                |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+            match kit.engine(&driver).dispatch(command).await {
+                Ok(outcome) => ctx.done(outcome),
+                Err(err) => ctx.refuse(err.to_string()),
+            }
+        }
+        OrchRequest::Command(command) => {
+            let (run, preempt) = match &command {
+                Command::CancelRun { run } => (*run, Preempt::Always),
+                Command::PromoteStep { run, .. } => (*run, Preempt::IfLive),
+                Command::AnswerGate { run, .. }
+                | Command::RetryStep { run, .. }
+                | Command::SelectFanout { run, .. }
+                | Command::AcceptArtifact { run, .. } => (*run, Preempt::Never),
+                Command::StartRun { .. } | Command::Unblock { .. } | Command::CloseOut { .. } => {
+                    unreachable!("matched above")
+                }
+            };
+            on_run(ctx, run, command, preempt).await;
+        }
+        OrchRequest::CloseOutPreview { item } => {
+            let _ = ctx.tag.item.set(item);
+            let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+                Ok(kit) => kit,
+                Err(message) => return ctx.refuse(message),
+            };
+            let driver =
+                |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+            match kit.engine(&driver).close_out_preview(item).await {
+                Ok(preview) => ctx.answer(StoreReply::Orch(OrchReply::CloseOutPreview(Box::new(
+                    preview,
+                )))),
+                Err(err) => ctx.answer(StoreReply::Failed {
+                    request: ctx.name,
+                    message: err.to_string(),
+                }),
+            }
+        }
+        OrchRequest::Cleanup { run } => cleanup(ctx, run).await,
+    }
+}
+
+/// Whether a command stops a live walk of its run before it waits for the lock (D157, D187).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preempt {
+    /// `CancelRun`.
+    Always,
+    /// `PromoteStep`: only a walk of this process that is live.
+    IfLive,
+    /// Every other verb waits for the walk to rest.
+    Never,
+}
+
+/// `StartRun` (D186): enqueue, then — under the run's lock and token — claim and walk.
+async fn start_run(
+    ctx: TaskCtx,
+    item: ItemId,
+    mode: htui_core::model::RunMode,
+    repo_scope: Option<Vec<RepoId>>,
+) {
+    let _ = ctx.tag.item.set(item);
+    let kit = match Kit::read(&ctx.shared, &ctx.backend, true).await {
+        Ok(kit) => kit,
+        Err(message) => return ctx.refuse(message),
+    };
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    let run = match engine.enqueue(item, mode, repo_scope).await {
+        Ok(run) => run,
+        Err(err) => return ctx.refuse(err.to_string()),
+    };
+    let _ = ctx.tag.run.set(run);
+    ctx.publish(Some(run), FrameKind::Started);
+
+    let walk = ctx.shared.walks.child(run);
+    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+        return ctx.refuse(PREEMPTED.to_owned());
+    };
+    match walked(&walk, engine.claim(run)).await {
+        None => {
+            engine.abandoned(run).await;
+            ctx.refuse(PREEMPTED.to_owned());
+        }
+        Some(Ok(outcome)) => ctx.done(outcome),
+        Some(Err(err @ EngineError::ClaimRefused { .. })) => {
+            if let Ok(Some(row)) = kit.writer.run(run).await {
+                ctx.shared.queue(row.queued_at, run);
+            }
+            ctx.refuse(err.to_string());
+        }
+        Some(Err(err)) => ctx.refuse(err.to_string()),
+    }
+    drop(guard);
+}
+
+/// Every verb on one run: preempt as the verb says, lock, dispatch (§8.6).
+async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt) {
+    let _ = ctx.tag.run.set(run);
+    let stop = match preempt {
+        Preempt::Always => true,
+        Preempt::IfLive => ctx.shared.walks.is_live(run),
+        Preempt::Never => false,
+    };
+    if stop {
+        ctx.shared.walks.preempt(run);
+    }
+    let walk = ctx.shared.walks.child(run);
+    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+        return ctx.refuse(PREEMPTED.to_owned());
+    };
+    let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+        Ok(kit) => kit,
+        Err(message) => return ctx.refuse(message),
+    };
+    let row = ctx.tag_run(&kit.writer, run).await;
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    match walked(&walk, engine.dispatch(command)).await {
+        None => {
+            engine.abandoned(run).await;
+            ctx.refuse(PREEMPTED.to_owned());
+        }
+        Some(Ok(CommandOutcome::Promoted {
+            step,
+            rest,
+            opening,
+        })) => {
+            let via = match opening.path {
+                OpeningPath::Resume { .. } => Via::Resumed,
+                OpeningPath::Handoff { .. } => Via::Handoff,
+            };
+            ctx.answer(StoreReply::Orch(OrchReply::Promoted {
+                step,
+                run,
+                phase: opening.phase.clone(),
+                agent: opening.agent_name.clone(),
+                model: opening.model.clone(),
+                via,
+            }));
+            ctx.publish(Some(run), FrameKind::Rested(rest));
+            // D181: the chat binding is the loop's; the runtime's event channel reaches it.
+            if let Some(row) = row {
+                let _ = ctx.shared.events.send(RunServed::Attach {
+                    addr: ctx.addr.clone(),
+                    promoted: Box::new(Promoted {
+                        run,
+                        step,
+                        project: row.project_id,
+                        opening: *opening,
+                    }),
+                });
+            }
+        }
+        Some(Ok(outcome)) => ctx.done(outcome),
+        Some(Err(err)) => ctx.refuse(err.to_string()),
+    }
+    drop(guard);
+}
+
+/// `Unblock` (D161): a reopen needs no run; the other two cases lock the run they name and check
+/// the case again under the lock (§8.6).
+async fn unblock(ctx: TaskCtx, item: ItemId) {
+    let _ = ctx.tag.item.set(item);
+    let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+        Ok(kit) => kit,
+        Err(message) => return ctx.refuse(message),
+    };
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    let case = match engine.unblock_case(item).await {
+        Ok(case) => case,
+        Err(err) => return ctx.refuse(err.to_string()),
+    };
+    let run = match case {
+        UnblockCase::Reopen => {
+            return match engine.dispatch(Command::Unblock { item }).await {
+                Ok(outcome) => ctx.done(outcome),
+                Err(err) => ctx.refuse(err.to_string()),
+            };
+        }
+        UnblockCase::FollowRun(run) | UnblockCase::Resume(run) => run,
+    };
+    let _ = ctx.tag.run.set(run);
+    let walk = ctx.shared.walks.child(run);
+    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+        return ctx.refuse(PREEMPTED.to_owned());
+    };
+    if engine.unblock_case(item).await.ok() != Some(case) {
+        return ctx.refuse(UNBLOCK_MOVED.to_owned());
+    }
+    match walked(&walk, engine.dispatch(Command::Unblock { item })).await {
+        None => {
+            engine.abandoned(run).await;
+            ctx.refuse(PREEMPTED.to_owned());
+        }
+        Some(Ok(outcome)) => ctx.done(outcome),
+        Some(Err(err)) => ctx.refuse(err.to_string()),
+    }
+    drop(guard);
+}
+
+/// D177 (R-25): a terminal run's cleanup, again, under the run's lock.
+async fn cleanup(ctx: TaskCtx, run: RunId) {
+    let _ = ctx.tag.run.set(run);
+    let walk = ctx.shared.walks.child(run);
+    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+        return ctx.refuse(PREEMPTED.to_owned());
+    };
+    let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+        Ok(kit) => kit,
+        Err(message) => return ctx.refuse(message),
+    };
+    let Some(row) = ctx.tag_run(&kit.writer, run).await else {
+        return ctx.refuse(
+            StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            }
+            .to_string(),
+        );
+    };
+    if let Err(err) = cleanup_enabled(&row) {
+        return ctx.refuse(err.to_string());
+    }
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    match kit.engine(&driver).cleanup_run(run).await {
+        Ok(()) => ctx.answer(StoreReply::Orch(OrchReply::CleanedUp { run })),
+        Err(err) => ctx.refuse(err.to_string()),
+    }
+    drop(guard);
+}
+
 /// Plan D155: `GraphSource` is `htui-orch`'s and `Backend` is `htui-store`'s, so `impl GraphSource
 /// for Backend` here is E0117 (proven: plan Verified claims). A local newtype is the answer, and it
 /// keeps invariant 10 (the orchestrator never names `htui-store`).
@@ -494,18 +1797,41 @@ impl GraphSource for BackendGraphs {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Utc};
+    use std::collections::{BTreeSet, VecDeque};
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+
+    use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
+    use htui_agent::conformance::{Script, ScriptEvent};
+    use htui_agent::driver::{
+        AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, PermissionAnswer,
+        PermissionRequestId, SessionSpec,
+    };
+    use htui_agent::error::DriverError;
+    use htui_agent::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason};
+    use htui_agent::fake::FakeDriver;
+    use htui_agent::registry::{DriverFactory, TransportBuilder};
     use htui_core::fixtures::{demo_at, ids};
-    use std::collections::BTreeSet;
-
-    use htui_core::model::{Agent, AgentBox, AgentId, Billing, RunId, RunMode, StepId, Transport};
+    use htui_core::model::{
+        Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, Run, RunId,
+        RunMode, RunStatus, RunStep, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, Transport,
+    };
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
-    use htui_orch::{Command, GateAnswer, GraphSource};
-    use htui_store::Backend;
+    use htui_orch::fake::{FakeIsolator, FakeVerifier};
+    use htui_orch::{Clock, Command, CommandOutcome, GateAnswer, GraphSource, Isolator};
+    use htui_store::{Backend, Started};
     use serde_json::json;
+    use tokio::sync::{Notify, mpsc};
 
-    use super::{BackendGraphs, FrameKind, ORCH_NAMES, OrchRequest};
-    use crate::store_worker::{self, StoreReply, StoreRequest};
+    use super::{
+        BackendGraphs, FrameKind, ORCH_NAMES, OrchReply, OrchRequest, RunRuntime, StepAuthor,
+    };
+    use crate::agent_worker::AgentRuntime;
+    use crate::store_worker::{
+        self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest, spawn_with_runtimes,
+    };
 
     /// The scripted registry row every walk test runs on (blueprint F-O): an `acp` row, because
     /// the fixture graphs gate every phase and stage 1's inline-approval interlock skips a `cli`
@@ -561,6 +1887,382 @@ mod tests {
             .await
             .expect("the agent_box row lands");
         (store, agent)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The walk fixture (blueprint §8.9, F-O)
+    // -----------------------------------------------------------------------------------------
+
+    /// What one agent session does.
+    #[derive(Debug, Clone)]
+    enum Play {
+        /// One turn, then `done`.
+        Done,
+        /// Waits on `release` before its first event; `reached` is raised when it starts waiting.
+        Stall(Stall),
+        /// The session's start panics.
+        Panic,
+    }
+
+    /// A stalled session's three signals.
+    #[derive(Debug, Clone, Default)]
+    struct Stall {
+        reached: Arc<Notify>,
+        release: Arc<Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    /// The sessions the fixture's builds play, in build order; [`Play::Done`] once it is empty.
+    #[derive(Debug, Default)]
+    struct Sessions(StdMutex<VecDeque<Play>>);
+
+    impl Sessions {
+        fn push(&self, play: Play) {
+            self.0.lock().expect("the queue").push_back(play);
+        }
+    }
+
+    /// The transport the scripted row reaches: one [`ScriptedDriver`] per session.
+    #[derive(Debug)]
+    struct Scripted(Arc<Sessions>);
+
+    impl TransportBuilder for Scripted {
+        fn build(
+            &self,
+            agent: &Agent,
+            _on_box: Option<&AgentBox>,
+            caps: DriverCaps,
+        ) -> Result<Box<dyn AgentDriver>, DriverError> {
+            let play = self
+                .0
+                .0
+                .lock()
+                .expect("the queue")
+                .pop_front()
+                .unwrap_or(Play::Done);
+            let done = Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                stop_reason: StopReason::EndTurn,
+            }))]);
+            Ok(Box::new(ScriptedDriver {
+                inner: FakeDriver::new(agent.name.clone(), caps, done),
+                play,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedDriver {
+        inner: FakeDriver,
+        play: Play,
+    }
+
+    impl AgentDriver for ScriptedDriver {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn caps(&self) -> DriverCaps {
+            self.inner.caps()
+        }
+
+        fn start<'a>(
+            &'a self,
+            spec: SessionSpec,
+            prompt: String,
+        ) -> DriverFuture<'a, Box<dyn AgentSession>> {
+            let inner = self.inner.start(spec, prompt);
+            let play = self.play.clone();
+            Box::pin(async move {
+                let session = inner.await?;
+                match play {
+                    Play::Done => Ok(session),
+                    Play::Stall(stall) => Ok(Box::new(Stalled {
+                        inner: session,
+                        stall,
+                        released: false,
+                    }) as Box<dyn AgentSession>),
+                    Play::Panic => panic!("a scripted session panics"),
+                }
+            })
+        }
+    }
+
+    /// A session that waits on its [`Stall`] before its first event, and says when it is dropped.
+    #[derive(Debug)]
+    struct Stalled {
+        inner: Box<dyn AgentSession>,
+        stall: Stall,
+        released: bool,
+    }
+
+    impl Drop for Stalled {
+        fn drop(&mut self) {
+            self.stall.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AgentSession for Stalled {
+        fn session_ref(&self) -> Option<&AgentSessionRef> {
+            self.inner.session_ref()
+        }
+
+        fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<DriverEnvelope>> {
+            Box::pin(async move {
+                if !self.released {
+                    self.stall.reached.notify_one();
+                    self.stall.release.notified().await;
+                    self.released = true;
+                }
+                self.inner.next_event().await
+            })
+        }
+
+        fn send_follow_up<'a>(&'a mut self, text: String) -> DriverFuture<'a, ()> {
+            self.inner.send_follow_up(text)
+        }
+
+        fn answer_permission<'a>(
+            &'a mut self,
+            request_id: PermissionRequestId,
+            answer: PermissionAnswer,
+        ) -> DriverFuture<'a, ()> {
+            self.inner.answer_permission(request_id, answer)
+        }
+
+        fn cancel<'a>(&'a mut self, grace: Duration) -> DriverFuture<'a, ()> {
+            self.inner.cancel(grace)
+        }
+    }
+
+    /// Blueprint H-2: `base + (tokio now - start)`, so a `start_paused` test moves the lease
+    /// fence with the heartbeat's own sleeps.
+    #[derive(Debug)]
+    struct TokioClock {
+        base: DateTime<Utc>,
+        start: tokio::time::Instant,
+    }
+
+    impl TokioClock {
+        fn new() -> Self {
+            Self {
+                base: Utc::now(),
+                start: tokio::time::Instant::now(),
+            }
+        }
+    }
+
+    impl Clock for TokioClock {
+        fn now(&self) -> DateTime<Utc> {
+            let elapsed = TimeDelta::from_std(self.start.elapsed()).expect("a test is short");
+            (self.base + elapsed).trunc_subsecs(TIMESTAMPTZ_DIGITS)
+        }
+    }
+
+    /// D203's author for tests: one document of the phase's `output_kind` per step.
+    #[derive(Debug)]
+    struct OutputAuthor;
+
+    impl StepAuthor for OutputAuthor {
+        fn document(
+            &self,
+            item: ItemId,
+            step: &RunStep,
+            phase: &SnapshotPhase,
+        ) -> Option<NewDocument> {
+            Some(NewDocument {
+                id: DocumentId::new(),
+                item_id: item,
+                kind: phase.output_kind.clone(),
+                title: format!("{} (attempt {})", phase.output_kind, step.attempt),
+                body: "authored".to_owned(),
+                produced_by_step_id: Some(step.id),
+                created_by: ids::USER,
+                created_at: Utc::now(),
+            })
+        }
+    }
+
+    /// The seeded store, the sessions its builds play, and the isolator its runs use.
+    struct Fixture {
+        store: MemStore,
+        sessions: Arc<Sessions>,
+        isolator: Arc<FakeIsolator>,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            let (store, _) = seeded_store().await;
+            Self {
+                store,
+                sessions: Arc::default(),
+                isolator: Arc::new(FakeIsolator::new()),
+            }
+        }
+
+        /// The registry the scripted row reaches the fake through, by row data (`acp`).
+        fn factory(&self) -> DriverFactory {
+            let mut factory = DriverFactory::new();
+            factory.register("acp", Box::new(Scripted(Arc::clone(&self.sessions))));
+            factory
+        }
+
+        /// Blueprint §8.9's runtime: the fakes, a tokio-time clock and the output author.
+        fn runtime(&self) -> RunRuntime {
+            RunRuntime::with_parts(
+                Arc::clone(&self.isolator) as Arc<dyn Isolator>,
+                Arc::new(FakeVerifier::new()),
+                self.factory(),
+            )
+            .with_clock(Arc::new(TokioClock::new()))
+            .with_author(Arc::new(OutputAuthor))
+        }
+
+        async fn run(&self, id: RunId) -> Run {
+            self.store
+                .run(id)
+                .await
+                .expect("the read answers")
+                .expect("the run exists")
+        }
+
+        async fn item(&self, id: ItemId) -> Item {
+            self.store
+                .item(id)
+                .await
+                .expect("the read answers")
+                .expect("the item exists")
+        }
+
+        async fn steps(&self, run: RunId) -> Vec<RunStep> {
+            self.store.run_steps(run).await.expect("the read answers")
+        }
+    }
+
+    /// How long a test waits for any one reply before it calls the worker stuck.
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    /// A store worker over the fixture's store, with the run runtime under test.
+    struct Worker {
+        requests: mpsc::UnboundedSender<RequestEnvelope>,
+        replies: mpsc::UnboundedReceiver<ReplyEnvelope>,
+        seen: Vec<ReplyEnvelope>,
+        seq: u64,
+    }
+
+    impl Worker {
+        fn spawn(store: &MemStore, runtime: RunRuntime) -> Self {
+            let (requests, requests_rx) = mpsc::unbounded_channel();
+            let (replies_tx, replies) = mpsc::unbounded_channel();
+            let _worker = spawn_with_runtimes(
+                Started::detached(Backend::memory(store.clone())),
+                requests_rx,
+                replies_tx,
+                AgentRuntime::new(DriverFactory::new()),
+                runtime,
+            );
+            Self {
+                requests,
+                replies,
+                seen: Vec::new(),
+                seq: 0,
+            }
+        }
+
+        /// Sends `request` from `origin` at the next `seq`.
+        fn send(&mut self, origin: Origin, request: StoreRequest) -> u64 {
+            self.seq += 1;
+            self.send_at(origin, self.seq, request)
+        }
+
+        /// Sends `request` from `origin` at exactly `seq`.
+        fn send_at(&mut self, origin: Origin, seq: u64, request: StoreRequest) -> u64 {
+            self.seq = self.seq.max(seq);
+            self.requests
+                .send(RequestEnvelope {
+                    seq,
+                    origin,
+                    request,
+                })
+                .expect("the worker is running");
+            seq
+        }
+
+        /// The first non-stream reply at `seq`, waiting for it.
+        async fn reply(&mut self, seq: u64) -> StoreReply {
+            loop {
+                if let Some(at) = self.seen.iter().position(|envelope| {
+                    envelope.seq == seq && !matches!(envelope.reply, StoreReply::RunStream(_))
+                }) {
+                    return self.seen.remove(at).reply;
+                }
+                let envelope = tokio::time::timeout(PATIENCE, self.replies.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("no reply at seq {seq} within {PATIENCE:?}"))
+                    .expect("the worker is running");
+                self.seen.push(envelope);
+            }
+        }
+
+        /// Whatever has arrived by now.
+        fn drain(&mut self) {
+            while let Ok(envelope) = self.replies.try_recv() {
+                self.seen.push(envelope);
+            }
+        }
+    }
+
+    /// `StartRun` for `item`, manual, default scope.
+    fn start_run(item: ItemId) -> StoreRequest {
+        StoreRequest::Orch(OrchRequest::Command(Command::StartRun {
+            item,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        }))
+    }
+
+    /// `future`, or a panic naming what did not happen.
+    async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(PATIENCE, future)
+            .await
+            .unwrap_or_else(|_| panic!("{what} did not happen within {PATIENCE:?}"))
+    }
+
+    /// The outcome of a `Done` reply, or a panic showing what came instead.
+    fn outcome(reply: StoreReply) -> CommandOutcome {
+        match reply {
+            StoreReply::Orch(OrchReply::Done(outcome)) => *outcome,
+            other => panic!("expected a command outcome, got {other:?}"),
+        }
+    }
+
+    /// `R-NF-3`: a walk mid-session does not hold the loop — the `Workspaces` read asked after
+    /// the `StartRun` is answered first, and the `StartRun` once its session ends.
+    #[tokio::test]
+    async fn an_orch_request_is_served_off_the_loop() {
+        let fixture = Fixture::new().await;
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        within("the session starting", stall.reached.notified()).await;
+        let workspaces = worker.send(Origin::App, StoreRequest::Workspaces);
+        assert!(matches!(
+            worker.reply(workspaces).await,
+            StoreReply::Workspaces(_)
+        ));
+        worker.drain();
+        assert!(
+            !worker.seen.iter().any(|envelope| envelope.seq == start),
+            "the walk is still in its session"
+        );
+
+        stall.release.notify_one();
+        let CommandOutcome::Started { run, rest } = outcome(worker.reply(start).await) else {
+            panic!("a start answers Started");
+        };
+        assert_eq!(rest.run, RunStatus::AwaitingApproval, "`research` gates");
+        assert_eq!(fixture.run(run).await.status, RunStatus::AwaitingApproval);
     }
 
     /// Plan D155: the five trait reads are the inherent reads of the same name.
@@ -686,7 +2388,7 @@ mod tests {
             StoreRequest::RunStream {
                 item: ids::HTUI_ANA_2,
             },
-            StoreRequest::Document(htui_core::model::DocumentId::new()),
+            StoreRequest::Document(DocumentId::new()),
             StoreRequest::RunActions(ids::HTUI_ANA_2),
             StoreRequest::Runs(ids::HTUI_ANA_2),
         ] {

@@ -40,6 +40,7 @@ use crate::catalogue::{self, CatalogueSnapshot};
 use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
+use crate::run_worker::{LiveChats, RunRuntime, RunServed};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
 
@@ -54,6 +55,10 @@ pub const PROMPT_PREVIEW: &str = "prompt_preview";
 /// What [`serve`] answers an orchestrator command with when no `RunRuntime` serves it (blueprint
 /// D183): the test harness without one.
 pub const NO_RUN_RUNTIME: &str = "no run runtime in this build";
+
+/// Blueprint D181's T6 stub: what a promotion is answered with until the Chat tab's runtime binds
+/// promoted steps (T7).
+pub const PROMOTION_NEEDS_CHAT: &str = "promotion needs the chat runtime";
 
 /// Who asked, and therefore who the reply is addressed to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1046,8 +1051,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             StoreReply::RunStream(crate::run_worker::RunFrame::subscribed(*item))
         }
         StoreRequest::RunActions(item) => StoreReply::RunActions(Box::new(
-            crate::run_worker::actions(backend, *item, &crate::run_worker::LiveChats::default())
-                .await?,
+            crate::run_worker::actions(backend, *item, &LiveChats::default()).await?,
         )),
         // A command needs the runtime that owns its task, and the loop serves every one of them
         // ahead of this function; one that reaches here belongs to a caller with no runtime.
@@ -1110,9 +1114,66 @@ pub fn spawn(
 /// user and the registry row) and the reply sender, and this task is the only owner of both.
 pub fn spawn_with(
     started: Started,
+    rx: mpsc::UnboundedReceiver<RequestEnvelope>,
+    tx: mpsc::UnboundedSender<ReplyEnvelope>,
+    runtime: AgentRuntime,
+) -> tokio::task::JoinHandle<()> {
+    spawn_with_runtimes(started, rx, tx, runtime, RunRuntime::production())
+}
+
+/// The steps a chat of this process is live on (blueprint D206): every started step whose chat
+/// the runtime still holds. T7's `AgentRuntime::live_steps` replaces the derivation.
+pub(crate) fn live_chats(runtime: &AgentRuntime) -> LiveChats {
+    LiveChats::of(
+        runtime
+            .steps()
+            .into_iter()
+            .filter(|step| runtime.caps(*step).is_some()),
+    )
+}
+
+/// What the loop does with a [`RunServed`] that is not a plain reply (blueprint D181): the
+/// runtime's event channel carries only `Attach`.
+///
+/// **T6 stub**: the chat binding is T7's, so a promotion is answered `promote_step: promotion
+/// needs the chat runtime` at the request's address, after the engine's writes and the
+/// `Orch(Promoted)` reply.
+async fn on_run_served(
+    served: RunServed,
+    _runtime: &mut AgentRuntime,
+    _backend: &Backend,
+    tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+) {
+    match served {
+        RunServed::Attach { addr, .. } => {
+            let _ = tx.send(ReplyEnvelope {
+                seq: addr.seq,
+                origin: addr.origin,
+                reply: StoreReply::Failed {
+                    request: "promote_step",
+                    message: PROMOTION_NEEDS_CHAT.to_owned(),
+                },
+            });
+        }
+        other @ (RunServed::Reply(_) | RunServed::Deferred) => {
+            debug_assert!(false, "the run runtime's event channel carries only Attach");
+            tracing::error!(?other, "a run event that is not an attach was dropped");
+        }
+    }
+}
+
+/// [`spawn_with`] over a chosen [`RunRuntime`] too (plan D153): the orchestrator's runtime lives
+/// inside this loop beside the chat one, for the same reason.
+///
+/// Beyond [`spawn_with`]'s three sources, the loop owns the run runtime's event receiver and a
+/// sweep ticker of `runs.sweep_every()` (D190), guarded on a writer; it sweeps at start when the
+/// backend has one and after every `Online` swap.
+pub fn spawn_with_runtimes(
+    started: Started,
     mut rx: mpsc::UnboundedReceiver<RequestEnvelope>,
     tx: mpsc::UnboundedSender<ReplyEnvelope>,
     mut runtime: AgentRuntime,
+    mut runs: RunRuntime,
 ) -> tokio::task::JoinHandle<()> {
     let Started {
         mut backend,
@@ -1154,7 +1215,21 @@ pub fn spawn_with(
         // A dial that overran its slot must not then be followed by a burst of catch-up dials.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+        // D181, D190: the run runtime's events and its sweep ticker are loop locals, like the two
+        // above, so a handler may borrow `runs` (H-4).
+        let mut run_events = runs.take_events();
+        let mut sweep_every = runs.sweep_every();
+        let mut sweeper = sweep_ticker(sweep_every);
+        if backend.writer().is_some() {
+            runs.sweep(&backend, &tx);
+        }
+
         loop {
+            // The first sweep reads `lease_ttl_seconds`; the ticker follows it.
+            if runs.sweep_every() != sweep_every {
+                sweep_every = runs.sweep_every();
+                sweeper = sweep_ticker(sweep_every);
+            }
             tokio::select! {
                 envelope = rx.recv() => {
                     // The UI is gone; there is nobody left to answer.
@@ -1184,6 +1259,8 @@ pub fn spawn_with(
                                             &mut backend, pg, &mut refresher, &mut health,
                                             &projects, settings,
                                         ).await;
+                                        // D190: an `Online` swap sweeps, whichever path made it.
+                                        runs.sweep(&backend, &tx);
                                         StoreReply::MigrationsApplied { applied }
                                     }
                                     Err(err) => {
@@ -1405,6 +1482,22 @@ pub fn spawn_with(
                                 }
                             }
                         }
+                        // Plan D153: every orchestrator command is a task of the run runtime, and
+                        // `Deferred => continue` is the whole of `R-NF-3` for it. `Document` is a
+                        // read and goes to `try_serve` below (D183).
+                        StoreRequest::Orch(_)
+                        | StoreRequest::RunStream { .. }
+                        | StoreRequest::RunActions(_) => {
+                            let live = live_chats(&runtime);
+                            match runs.serve(&backend, &tx, &envelope, &live).await {
+                                RunServed::Reply(reply) => reply,
+                                RunServed::Deferred => continue,
+                                attach @ RunServed::Attach { .. } => {
+                                    on_run_served(attach, &mut runtime, &backend, &tx).await;
+                                    continue;
+                                }
+                            }
+                        }
                         other => match try_serve(&backend, other).await {
                             Ok(reply) => reply,
                             Err(err) => {
@@ -1450,6 +1543,8 @@ pub fn spawn_with(
                         .await;
                         last_attempt = Some(Attempt { at: Utc::now(), outcome: AttemptOutcome::Online });
                         tracing::info!(label = backend.label(), "store online");
+                        // D190: every `Online` sweeps, so a run a dead process left is adopted.
+                        runs.sweep(&backend, &tx);
                     }
                     ConnEvent::MigrationsPending(pg, n) => {
                         pending = Some(n);
@@ -1475,6 +1570,14 @@ pub fn spawn_with(
                     }
                 }
 
+                Some(served) = run_events.recv() => {
+                    on_run_served(served, &mut runtime, &backend, &tx).await;
+                }
+
+                _ = sweeper.tick(), if backend.writer().is_some() => {
+                    runs.sweep(&backend, &tx);
+                }
+
                 err = lost_the_server(health.clone()) => {
                     // The refresher passes every `interval`, so it usually notices first.
                     go_offline(&mut backend, &mut refresher, &mut health, &err);
@@ -1490,15 +1593,24 @@ pub fn spawn_with(
             }
         }
 
-        // The UI is gone. Every live chat is cancelled and awaited **before** this task returns:
-        // dropping a session task at its first await orphans the agent process it spawned
-        // (`docs/ANA-4.md` §11 criterion 11).
+        // The UI is gone. Every walk is cancelled first — its lease given back, its agent killed
+        // by its guard — and then every live chat is cancelled and awaited **before** this task
+        // returns: dropping a session task at its first await orphans the agent process it
+        // spawned (`docs/ANA-4.md` §11 criterion 11).
+        runs.shutdown(crate::agent_worker::CANCEL_GRACE).await;
         runtime.shutdown(crate::agent_worker::CANCEL_GRACE).await;
 
         if let Some(refresher) = refresher {
             refresher.abort();
         }
     })
+}
+
+/// The sweep ticker (D190): first tick one period from now, `Delay` on a missed one.
+fn sweep_ticker(every: std::time::Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker
 }
 
 /// Runs one dial on its own task and reports it under the generation it was spawned in.
