@@ -276,7 +276,8 @@ pub type DriverFor<'a> =
 ///
 /// A run enters it when its walk ended on [`Heartbeat::Expired`] (plan D122: the store stopped
 /// answering, so the lease could not be given back), when a release of its lease failed, or when
-/// its walk task panicked ([`DeadWalks::mark`], MOD-4 plan D158).
+/// its walk task panicked ([`DeadWalks::mark`], MOD-4 plan D158), or when a fenced sweep adopted
+/// it and skipped it for the command holding it ([`Engine::sweep_fenced`], plan D189).
 /// [`Heartbeat::Abandoned`] never enters it: another process holds that lease. [`Engine::sweep`]
 /// first retries the release of every run in it and drops each one the store answers, so
 /// `adopt_runs` then sees the run as free. Plan D88 still keeps the sweep off every lease a live
@@ -1772,7 +1773,9 @@ where
     /// [`Self::sweep`] under a [`RunFence`] (MOD-4 plan D189, blueprint F-E): the dead-walk
     /// pre-pass gives back no lease of a run the fence holds, and an adopted run the fence holds
     /// is skipped with a `debug!` — the adopted lease is this owner's, and the holder's own
-    /// `take_lease` renews it. Every other run is recovered as [`Self::sweep`] does, with its
+    /// `take_lease` renews it. The skipped run also enters [`DeadWalks`], so a holder that never
+    /// takes the lease does not strand the run under it: the next sweep whose fence is free gives
+    /// it back and adopts the run. Every other run is recovered as [`Self::sweep`] does, with its
     /// fence held through the recovery.
     ///
     /// # Errors
@@ -1798,8 +1801,14 @@ where
         for run in adopted {
             // Plan D189: a run a command of this process holds is that command's to walk. The
             // lease the adoption took is this owner's, and the holder's own `take_lease` renews it.
+            // A holder may never take it, though: a command its guard refuses, or a walk past its
+            // release. Plan D88 would then keep every later sweep of this process off the lapsed
+            // lease, so the run joins the dead walks: the next pre-pass gives the lease back once
+            // the fence is free, and a holder that took it meanwhile left the set in
+            // `renew_lease`.
             let Some(_held) = fence.hold(run.id) else {
                 tracing::debug!(run = %run.id, "the sweep skips an adopted run a command holds");
+                self.parts.dead_walks.insert(run.id);
                 continue;
             };
             // Plan D126: `adopt_runs` leased every run at once, and only the one being recovered
@@ -11139,6 +11148,39 @@ mod tests {
             swept.is_empty(),
             "plan D88: once live, the lease is never this process's sweep's: {swept:?}"
         );
+    }
+
+    /// MOD-4 plan D189 with D88: the holder of a run a fenced sweep skipped may never take the
+    /// adopted lease (a command its guard refuses, or a walk past its release). Once the fence is
+    /// free and that lease has lapsed unused, this process's next sweep still adopts the run: the
+    /// skip put it in the dead-walk set, so the pre-pass gives the lease back first.
+    #[tokio::test]
+    async fn a_skipped_adopted_run_is_adopted_once_its_fence_is_free() {
+        let harness = Harness::new().await;
+        let run = leased_run(&harness).await;
+        let other = Harness {
+            orch: harness.orch.restarted(),
+        };
+        harness_engine!(other.orch, second);
+        let swept = second
+            .sweep_fenced(&Held(vec![run]))
+            .await
+            .expect("the sweep runs");
+        assert!(swept.is_empty(), "a held run is not recovered: {swept:?}");
+
+        // The holder gives the run up without taking the lease, which then lapses unused.
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        other.orch.clock.advance(ttl + TimeDelta::seconds(1));
+        let swept = second
+            .sweep_fenced(&Held(Vec::new()))
+            .await
+            .expect("the sweep runs");
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [run],
+            "the run is not stranded under this process's own lapsed lease"
+        );
+        assert!(!other.orch.dead_walks.contains(run));
     }
 
     /// MOD-4 plan D188 (blueprint F-D): an abandoned walk's guards are dropped and its lease is
