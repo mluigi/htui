@@ -833,7 +833,9 @@ const STAND_IN_MODEL: &str = "sonnet";
 /// make the engine's `G` be `&MemStore` and every call site `&&MemStore`. The engine borrows `&G`,
 /// so the source is used "over `&MemStore`" exactly as plan D19 says either way. Local trait,
 /// foreign type — the orphan rule permits it, and it lives behind `test-support` because
-/// `MemStore` is the fake harness's store; milestone 6's `Backend` impl lives in `htui`.
+/// `MemStore` is the fake harness's store. Milestone 6's source over `Backend` is `htui`'s
+/// `run_worker::BackendGraphs`, a newtype: `impl GraphSource for Backend` in `htui` would be an
+/// orphan impl (E0117, MOD-4 plan D155).
 ///
 /// Each body calls the *inherent* method of the same name. Method resolution prefers inherent
 /// candidates over trait ones, so this is delegation and not recursion — and

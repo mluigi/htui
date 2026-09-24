@@ -683,7 +683,8 @@ pub fn answer_gate_enabled(
 ///
 /// Two things this guard deliberately does **not** check, because they need rows it is not given:
 /// that the run is non-terminal, and that the item is not `blocked`
-/// ([`EngineError::ItemBlocked`], blueprint F-J). Both are the engine's, at dispatch.
+/// ([`EngineError::ItemBlocked`], blueprint F-J). Both are [`retry_admitted`]'s, the whole order
+/// the engine and the Runs tab share (blueprint D184).
 ///
 /// # Errors
 /// [`EngineError::NotGated`] for any other step status; [`EngineError::StaleSlot`] for an attempt
@@ -744,9 +745,9 @@ fn interrupted(step: &RunStep) -> bool {
 /// (`crates/htui-core/src/store/traits.rs:821-824`) — so a pick this guard admits is never refused
 /// by the write.
 ///
-/// **A parked run has no other resume verb** (blueprint R-7): a group parked because its winner's
-/// reconcile was refused carries `selected = true` and is refused here as
-/// [`EngineError::AlreadySelected`]; milestone 6's `Unblock`-shaped verb owns that retry (R-7).
+/// **A group parked because its winner's reconcile was refused is not selected again** (blueprint
+/// R-7): it carries `selected = true` and is refused here as [`EngineError::AlreadySelected`].
+/// `Unblock` (`u`, MOD-4 plan D161 case 3) resumes that run and retries the reconcile.
 ///
 /// # Errors
 /// [`EngineError::RunStatus`], [`EngineError::NotAFanout`], [`EngineError::AlreadySelected`],
@@ -886,8 +887,9 @@ fn unselected(
 ///
 /// **"Only if no session is live" is not checked here.** In this milestone's synchronous walk it
 /// is true by construction — a step is `running` only inside one `dispatch` call, and a second
-/// command cannot be dispatched while it is — and milestone 6, where a session outlives a
-/// dispatch, is where the kill belongs.
+/// command cannot be dispatched while it is — and since milestone 6, where a session outlives a
+/// dispatch, `run_worker` preempts the run's live walk before it dispatches the cancel (MOD-4
+/// plan D157), and the engine takes the run's lease first (plan D179).
 ///
 /// # Errors
 /// [`EngineError::RunStatus`] for a `done`, `failed` or `cancelled` run.

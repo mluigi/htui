@@ -489,8 +489,9 @@ pub struct Adopted {
 /// What the sweep's adjudication left an adopted run owing (plan D98, blueprint A-4).
 ///
 /// The sweep **walks nothing**: a [`Next::Walk`] run is walked by the caller through
-/// [`Engine::resume`], which is criterion 3's topology check and D86's heartbeat, and which
-/// milestone 6's `run_worker` calls once per run so one run's sessions never wait on another's.
+/// [`Engine::resume`], which is criterion 3's topology check and D86's heartbeat. `htui`'s
+/// `run_worker` is that caller: it resumes each `Walk` run on its own task, under the run's lock,
+/// so one run's sessions never wait on another's (MOD-4 plan D157, D158).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
     /// The run is `running` with its rows adjudicated: walk it on through [`Engine::resume`].
@@ -635,7 +636,8 @@ where
 
     /// Plan D84: `claim_run`, then the leased walk — `start_run`'s tail, factored out so a run a
     /// refusal left `queued` can be re-attempted. No [`Command`] variant carries it (ANA-2 §6.2
-    /// has none); milestone 6 decides the verb that calls it.
+    /// has none): `htui`'s `run_worker` calls it after [`Self::enqueue`] for `StartRun`, and again
+    /// for a run a refusal left `queued` once a walk of that process rests (MOD-4 plan D186).
     ///
     /// The walk runs under the lease's heartbeat, which sleeps on `tokio::time`: the caller needs
     /// a Tokio runtime with the time driver enabled (blueprint H-3).
@@ -1454,8 +1456,9 @@ where
     /// for `cursor` to name and a caller would be told `None` — "the run finished" — about a run
     /// that was stopped at position 2.
     ///
-    /// `pub` for the same reason [`cleanup_run`](Self::cleanup_run) is: milestone 6's Runs tab is
-    /// the caller ANA-2 §6.2 writes this row for.
+    /// `pub` for the same reason [`cleanup_run`](Self::cleanup_run) is: `htui`'s `run_worker`, on
+    /// the Runs tab's behalf, is the caller ANA-2 §6.2 writes this row for. It preempts a live
+    /// walk of the run before it cancels (MOD-4 plan D157).
     ///
     /// Since MOD-4 plan D179 (R-28) a `running` or parked run's lease is taken first, as every
     /// other command's is, and given back once the run is cancelled and cleaned up.
@@ -1664,8 +1667,9 @@ where
     /// otherwise keep it off while its lease names this process. Plan D133's `StaleWrite` on a
     /// command's first compare-and-set is one such `Err`.
     ///
-    /// Two commands on one run in one process share the owner, so one's window error can release
-    /// the other's live lease; that is R-27 (milestone 6).
+    /// Two commands on one run in one process share the owner, so one's window error could release
+    /// the other's live lease (R-27); `run_worker`'s per-run lock keeps two commands of one
+    /// process off one run at once (MOD-4 plan D157).
     async fn leased_window<T>(
         &self,
         run: RunId,
@@ -1687,11 +1691,11 @@ where
 
     /// MOD-4 plan D188 (blueprint F-D): a walk the worker dropped mid-flight — a preempting
     /// `CancelRun` or `PromoteStep`, or a token cancelled while it walked — ran neither of
-    /// [`Self::walk_leased`]'s release arms. This is what they would have done: the run's
+    /// `walk_leased`'s release arms. This is what they would have done: the run's
     /// `shared_serialized` guards dropped through `Isolator::release`, then the lease given back.
     ///
     /// Best-effort, and it never raises: a failed guard release is a `warn`, and a failed lease
-    /// release puts the run in [`DeadWalks`] as [`Self::release_lease`] always does.
+    /// release puts the run in [`DeadWalks`] as every lease release of the engine does.
     pub async fn abandoned(&self, run: RunId) {
         if let Err(err) = self.parts.isolator.release(run).await {
             tracing::warn!(%run, %err, "releasing an abandoned walk's guards failed");
@@ -2459,7 +2463,9 @@ where
     /// before the walk gives that lease back (plan D149). The walk itself runs under the
     /// heartbeat, and first unparks a run a command left parked over an answered step (plan D132,
     /// `walk_resumed`). Milestone 5's sweep adopts and adjudicates but does not walk; this is the
-    /// walk it hands a `Walk` run off to, and milestone 6's `run_worker` is the caller that does.
+    /// walk it hands a `Walk` run off to, and `htui`'s `run_worker` is the caller that does, on
+    /// the run's own task under its lock (MOD-4 plan D157, D158). `Unblock`'s third case calls it
+    /// too (plan D161).
     /// That heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
     /// driver enabled (blueprint H-3).
     ///
@@ -4480,9 +4486,9 @@ where
     /// gate a human answered hours later is reconciled by a different call than the one that
     /// prepared it.
     ///
-    /// **A parked run has no resume verb this milestone** (blueprint F-G, R-7): `AnswerGate` needs
-    /// a step at `awaiting_approval` and every step here is `done`. Milestone 6's `Unblock`-shaped
-    /// verb is where a retry of `reconcile` belongs.
+    /// **A parked run's resume verb is `Unblock`** (blueprint F-G, R-7): `AnswerGate` needs a step
+    /// at `awaiting_approval` and every step here is `done`, so `Unblock`'s third case (`u`, MOD-4
+    /// plan D161) resumes the run and retries the `reconcile`.
     ///
     /// `siblings` are the other candidates of a fan-out winner's slot, handed to the isolator so a
     /// `shared_serialized` checkout left at a sibling's commit may be moved to the winner's (plan
@@ -4571,9 +4577,11 @@ where
     ///
     /// Cleanup failures are `warn`ed and never raised (plan D36): the run is already terminal when
     /// this runs, and a failed `rm` must not un-terminate it. No sweep retries a terminal run's
-    /// cleanup, because the sweep adopts only `running` runs: milestone 6 owns that retry (R-25).
+    /// cleanup, because the sweep adopts only `running` runs: `run_worker`'s manual `Cleanup`
+    /// request is that retry (R-25, MOD-4 plan D177, admitted by
+    /// [`crate::command::cleanup_enabled`]).
     ///
-    /// `pub` because milestone 6's Runs tab calls it directly for a run the worker did not end.
+    /// `pub` because `htui`'s `run_worker` calls it directly for a run the worker did not end.
     ///
     /// # Errors
     /// The store's own refusals only. The isolator's are logged.

@@ -285,11 +285,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Fifty-two, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_fifty_two` and out of crate by `tests/fake_conformance.rs` — because
-/// a binding that silently ran fifty-one of them would still be green.
+/// Sixty-eight, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_sixty_eight` and out of crate by `tests/fake_conformance.rs` —
+/// because a binding that silently ran sixty-seven of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6 + 10.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 16.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -323,6 +323,14 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// merges re-reconciled once, the second after a review rejection (D97, C129); an interrupted
 /// candidate and an interrupted judge (D95); a half-written park (D96); and the runs no sweep
 /// adopts — a parked one, a live lease, and this process's own (D88).
+///
+/// **Sixteen for milestone 6** (MOD-4 plan D159-D167, D179): ANA-5 criterion 3's refused prompt
+/// at `walk_step` and at `drive_group`; criterion 3's running run that parks on a topology
+/// mismatch; a cancel that meets a live lease; four promotions (criterion 17's first half, a
+/// failed step of a parked run, a finished run refused, a dropped running step parked); three
+/// accepts (criterion 17's second half, the promotion and the document it needs, a failed
+/// verify); `Unblock`'s three cases (criterion 14's reopen, R-4's escalated run, R-7's refused
+/// reconcile); and criterion 20's close-out and its refusal while a run is live.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -491,7 +499,7 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 ///
 /// A plain function rather than a `match` inside [`run_case`]'s own body, and that is about the
 /// stack, not style: an unoptimised build gives every arm's case future its own stack slot, so a
-/// fifty-two-arm `match` in an `async fn` puts all fifty-two in the one frame every case is then
+/// sixty-eight-arm `match` in an `async fn` puts all sixty-eight in the one frame every case is then
 /// polled beneath, and the recovery cases' walks overflowed a test thread's 2 MiB. Here the slots
 /// are gone before the first poll.
 ///
@@ -5389,7 +5397,7 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_fifty_two() {
+    fn cases_are_unique_and_sixty_eight() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
@@ -5397,7 +5405,7 @@ mod tests {
         assert_eq!(
             CASES.len(),
             68,
-            "18 + 5 + 13 + 6 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            "18 + 5 + 13 + 6 + 10 + 16: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -5412,7 +5420,11 @@ mod tests {
              process's answer, and a live lease refusing that answer), and milestone 5's ten \
              recovery cases (criterion 18's finished and unfinished steps, the out-of-budget \
              park, criterion 12's dirty tree, two lost merges, an interrupted candidate and \
-             judge, a half-written park, and the runs no sweep adopts)"
+             judge, a half-written park, and the runs no sweep adopts), and milestone 6's \
+             sixteen (ANA-5 criterion 3's refused prompt at `walk_step` and at `drive_group`, \
+             criterion 3's running run parked on a topology mismatch, a cancel meeting a live \
+             lease, four promotions, three accepts, `Unblock`'s three cases, and criterion \
+             20's close-out and its refusal)"
         );
     }
 
