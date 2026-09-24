@@ -20,10 +20,10 @@ use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, Permissi
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxInfo, DocumentHead, Item, ItemFilter, ItemId, ItemKindId,
-    ItemKindPatch, ItemSummary, LinkGraph, Note, PhaseId, PhasePatch, ProjectId, ProjectPatch,
-    RepoId, RepoPatch, RunSummary, Scope, SessionEvent, StepGraphId, StepGraphPatch, StepId,
-    WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    AgentId, AgentSummary, BoxInfo, Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId,
+    ItemKindId, ItemKindPatch, ItemSummary, LinkGraph, Note, PhaseId, PhasePatch, ProjectId,
+    ProjectPatch, RepoId, RepoPatch, RunSummary, Scope, SessionEvent, StepGraphId, StepGraphPatch,
+    StepId, WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::store::{
@@ -50,6 +50,10 @@ pub type Seq = u64;
 /// the same string the request does (`preview::run_preview` cannot call `name()` — it no longer has
 /// the request).
 pub const PROMPT_PREVIEW: &str = "prompt_preview";
+
+/// What [`serve`] answers an orchestrator command with when no `RunRuntime` serves it (blueprint
+/// D183): the test harness without one.
+pub const NO_RUN_RUNTIME: &str = "no run runtime in this build";
 
 /// Who asked, and therefore who the reply is addressed to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -496,6 +500,19 @@ pub enum StoreRequest {
     SetQdrantApiKey(zeroize::Zeroizing<String>),
     /// Request to clear the Qdrant connection string.
     ClearQdrantSettings,
+    /// Plan D154: one orchestrator command or read, served by `run_worker::RunRuntime` on its own
+    /// task (`R-NF-3`). Answered once at this `seq`, possibly hours later (R-41).
+    Orch(crate::run_worker::OrchRequest),
+    /// Plan D172: a subscription. Answered at once with `RunFrame { kind: Subscribed }`, then with a
+    /// frame at **this** `seq` per change to the item's runs (blueprint §0a point 3).
+    RunStream {
+        /// The item whose runs the subscriber shows.
+        item: ItemId,
+    },
+    /// Plan D173: one document with its body.
+    Document(DocumentId),
+    /// Blueprint D182: every action's enabling verdict for the item, from the engine's own guards.
+    RunActions(ItemId),
 }
 
 impl StoreRequest {
@@ -566,6 +583,11 @@ impl StoreRequest {
             Self::SetQdrantUrl(_) => "set_qdrant_url",
             Self::SetQdrantApiKey(_) => "set_qdrant_api_key",
             Self::ClearQdrantSettings => "clear_qdrant_settings",
+            // Blueprint D209: one name per verb, `run_worker::ORCH_NAMES`.
+            Self::Orch(request) => request.name(),
+            Self::RunStream { .. } => "run_stream",
+            Self::Document(_) => "document",
+            Self::RunActions(_) => "run_actions",
         }
     }
 }
@@ -718,6 +740,14 @@ pub enum StoreReply {
     Connection(ConnectionSnapshot),
     /// Reply to QdrantInfo, SetQdrantDsn, ClearQdrantSettings requests.
     Qdrant(crate::qdrant_settings_info::QdrantSnapshot),
+    /// Answer to [`StoreRequest::Orch`], once, at its `seq`.
+    Orch(crate::run_worker::OrchReply),
+    /// One frame of a [`StoreRequest::RunStream`] subscription, at the subscribing `seq`.
+    RunStream(crate::run_worker::RunFrame),
+    /// Answer to [`StoreRequest::Document`]; `None` when no row has that id.
+    Document(Box<Option<Document>>),
+    /// Answer to [`StoreRequest::RunActions`].
+    RunActions(Box<crate::run_worker::ItemActions>),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -1007,6 +1037,23 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::ClearQdrantSettings => StoreReply::Failed {
             request: request.name(),
             message: "handled in worker loop".to_owned(),
+        },
+        // Blueprint D183 (F-C, F-P): the three orchestrator reads need no runtime. A shell with
+        // none — the test harness — gets a subscription acknowledgement, the verdicts with no live
+        // chat, and the document, so no view renders a status-line error for asking.
+        StoreRequest::Document(id) => StoreReply::Document(Box::new(backend.document(*id).await?)),
+        StoreRequest::RunStream { item } => {
+            StoreReply::RunStream(crate::run_worker::RunFrame::subscribed(*item))
+        }
+        StoreRequest::RunActions(item) => StoreReply::RunActions(Box::new(
+            crate::run_worker::actions(backend, *item, &crate::run_worker::LiveChats::default())
+                .await?,
+        )),
+        // A command needs the runtime that owns its task, and the loop serves every one of them
+        // ahead of this function; one that reaches here belongs to a caller with no runtime.
+        StoreRequest::Orch(_) => StoreReply::Failed {
+            request: request.name(),
+            message: NO_RUN_RUNTIME.to_owned(),
         },
     })
 }
