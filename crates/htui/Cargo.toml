@@ -24,6 +24,8 @@ testkit = []
 
 [dependencies]
 htui-agent         = { workspace = true }
+# MOD-4 milestone 6 (plan D153): `run_worker` drives the orchestrator from the store worker loop.
+htui-orch          = { workspace = true }
 htui-core          = { workspace = true, features = ["demo"] }
 chrono             = { workspace = true }
 serde_json         = { workspace = true }
@@ -48,6 +50,9 @@ sentry-tracing = { workspace = true }
 [dev-dependencies]
 # The chat tab's snapshots drive the fake transport through the same registry the ACP one uses.
 htui-agent = { workspace = true, features = ["test-support"] }
+# `run_worker`'s walk tests: `FakeIsolator`, `FakeVerifier`, and `htui-core/test-support`'s
+# `MemFault` for the store-outage case (MOD-4 plan D175).
+htui-orch  = { workspace = true, features = ["test-support"] }
 # `testkit::seed_mirror` and the throwaway-database harness: MOD-2 §11 criterion 12 is the one test
 # that needs a driver and a server at once, and this crate is the only one that can hold both.
 htui-store = { workspace = true, features = ["demo", "test-support"] }

@@ -2984,6 +2984,7 @@ dependencies = [
  "futures",
  "htui-agent",
  "htui-core",
+ "htui-orch",
  "htui-store",
  "insta",
  "ratatui",

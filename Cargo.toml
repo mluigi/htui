@@ -24,6 +24,7 @@ split-debuginfo = "unpacked"
 htui-core          = { path = "crates/htui-core" }
 htui-store         = { path = "crates/htui-store" }
 htui-agent         = { path = "crates/htui-agent" }
+htui-orch          = { path = "crates/htui-orch" }
 uuid               = { version = "1.26", features = ["v7", "serde"] }
 chrono             = { version = "0.4", features = ["serde"] }
 serde              = { version = "1", features = ["derive"] }
