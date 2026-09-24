@@ -1593,12 +1593,15 @@ pub fn spawn_with_runtimes(
             }
         }
 
-        // The UI is gone. Every walk is cancelled first — its lease given back, its agent killed
-        // by its guard — and then every live chat is cancelled and awaited **before** this task
+        // The UI is gone. Every walk is cancelled — its lease given back, its agent killed by its
+        // guard — and every live chat is cancelled, and both are awaited **before** this task
         // returns: dropping a session task at its first await orphans the agent process it
-        // spawned (`docs/ANA-4.md` §11 criterion 11).
-        runs.shutdown(crate::agent_worker::CANCEL_GRACE).await;
-        runtime.shutdown(crate::agent_worker::CANCEL_GRACE).await;
+        // spawned (`docs/ANA-4.md` §11 criterion 11). The two run side by side, so a slow walk
+        // does not eat the window `lib.rs`'s `SHUTDOWN` leaves the chats.
+        tokio::join!(
+            runs.shutdown(crate::agent_worker::CANCEL_GRACE),
+            runtime.shutdown(crate::agent_worker::CANCEL_GRACE),
+        );
 
         if let Some(refresher) = refresher {
             refresher.abort();

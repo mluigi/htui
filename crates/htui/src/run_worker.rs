@@ -875,8 +875,14 @@ impl RunFence for RunLocks {
 
 /// D187: one parent token per run; every task of the run works under a child. The std mutex is
 /// never held across an `.await`.
+///
+/// Every parent is a child of one root, which `close` cancels when the UI is gone: a parent minted
+/// after that is born cancelled, so a task that reaches its run after the shutdown walks nothing.
 #[derive(Debug, Clone, Default)]
-struct Walks(Arc<StdMutex<HashMap<RunId, Parent>>>);
+struct Walks {
+    parents: Arc<StdMutex<HashMap<RunId, Parent>>>,
+    root: CancellationToken,
+}
 
 /// A run's parent token and how many tasks work under it.
 #[derive(Debug, Clone)]
@@ -900,14 +906,15 @@ impl Drop for WalkToken {
 
 impl Walks {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RunId, Parent>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.parents.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A child of `run`'s parent, minting the parent on first use.
+    /// A child of `run`'s parent, minting the parent on first use; cancelled from birth once the
+    /// runtime is closed.
     fn child(&self, run: RunId) -> WalkToken {
         let mut walks = self.lock();
         let parent = walks.entry(run).or_insert_with(|| Parent {
-            token: CancellationToken::new(),
+            token: self.root.child_token(),
             live: Arc::new(AtomicUsize::new(0)),
         });
         parent.live.fetch_add(1, Ordering::SeqCst);
@@ -941,11 +948,15 @@ impl Walks {
         })
     }
 
-    /// Every run's parent, cancelled: the UI is gone.
-    fn cancel_all(&self) {
-        for (_, parent) in self.lock().drain() {
-            parent.token.cancel();
-        }
+    /// The UI is gone: the root is cancelled, and with it every run's parent, now and later.
+    fn close(&self) {
+        self.root.cancel();
+        self.lock().clear();
+    }
+
+    /// Whether [`Self::close`] ran.
+    fn closed(&self) -> bool {
+        self.root.is_cancelled()
     }
 }
 
@@ -1246,7 +1257,7 @@ impl RunRuntime {
     /// D158, D189, D190: one recovery sweep on a task of its own. Returns at once: the tick is
     /// skipped while a sweep is still running, and nothing happens without a server.
     pub fn sweep(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
-        if backend.writer().is_none() {
+        if backend.writer().is_none() || self.shared.walks.closed() {
             return;
         }
         if self
@@ -1445,22 +1456,30 @@ impl RunRuntime {
         }
     }
 
-    /// The UI is gone: every walk is cancelled — its lease given back through `abandoned` — and
-    /// awaited for `2 × grace`, then aborted.
+    /// The UI is gone: the runtime closes, so no walk, task or sweep starts after this; every
+    /// walk is cancelled — its lease given back through `abandoned` — and every task, including
+    /// one spawned while this waits, is awaited within **one** shared window of `2 × grace`, then
+    /// aborted. The loop cancels the chats beside this, inside the same bounded quit.
     pub async fn shutdown(&mut self, grace: Duration) {
-        self.shared.walks.cancel_all();
-        let tasks = std::mem::take(
-            &mut *self
-                .shared
-                .tasks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        for Tracked { tag, handle } in tasks {
-            let abort = handle.abort_handle();
-            if tokio::time::timeout(grace * 2, handle).await.is_err() {
-                abort.abort();
-                tracing::warn!(run = ?tag.run.get(), "a run task did not end within the grace window");
+        self.shared.walks.close();
+        let deadline = tokio::time::Instant::now() + grace * 2;
+        loop {
+            let tasks = std::mem::take(
+                &mut *self
+                    .shared
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            if tasks.is_empty() {
+                return;
+            }
+            for Tracked { tag, handle } in tasks {
+                let abort = handle.abort_handle();
+                if tokio::time::timeout_at(deadline, handle).await.is_err() {
+                    abort.abort();
+                    tracing::warn!(run = ?tag.run.get(), "a run task did not end within the grace window");
+                }
             }
         }
     }
@@ -1591,6 +1610,10 @@ fn spawn_supervised(ctx: TaskCtx, work: impl Future<Output = ()> + Send + 'stati
         }
     }
 
+    // The UI is gone: nothing new starts, and the request, if any, is answered once.
+    if ctx.shared.walks.closed() {
+        return ctx.refuse(PREEMPTED.to_owned());
+    }
     let shared = Arc::clone(&ctx.shared);
     let tag = Arc::clone(&ctx.tag);
     let handle = tokio::spawn(async move {
@@ -1857,6 +1880,10 @@ async fn start_run(
     };
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
+    // The UI went while the parts were read: no run is enqueued for nobody to walk.
+    if ctx.shared.walks.closed() {
+        return ctx.refuse(PREEMPTED.to_owned());
+    }
     let run = match engine.enqueue(item, mode, repo_scope).await {
         Ok(run) => run,
         Err(err) => return ctx.refuse(err.to_string()),
@@ -3024,6 +3051,79 @@ pub(crate) mod tests {
             }
         })
         .await;
+    }
+
+    /// The UI is gone: a command spawned just before `shutdown` walks nothing once it runs — it
+    /// is refused before it enqueues — and a sweep asked for after it spawns nothing.
+    #[tokio::test]
+    async fn a_command_that_outlives_shutdown_walks_nothing() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: start_run(ids::HTUI_ANA_2),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred));
+
+        runtime.shutdown(Duration::from_secs(1)).await;
+        let answer = answers.try_recv().expect("the start is answered");
+        assert!(
+            matches!(&answer.reply, StoreReply::Failed { request: "start_run", message } if message == PREEMPTED),
+            "{:?}",
+            answer.reply
+        );
+        assert!(
+            fixture
+                .store
+                .runs(ids::HTUI_ANA_2)
+                .await
+                .expect("the read answers")
+                .is_empty(),
+            "nothing was enqueued"
+        );
+
+        runtime.sweep(&backend, &replies);
+        assert_eq!(runtime.tasks_len(), 0, "a closed runtime sweeps nothing");
+    }
+
+    /// `shutdown` gives every task one shared window of `2 × grace`, not one each: the chats are
+    /// cancelled beside it inside the same bounded quit (`docs/ANA-4.md` §11 criterion 11).
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_gives_every_task_one_shared_window() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let (replies, _answers) = mpsc::unbounded_channel();
+        let ctx = super::TaskCtx {
+            shared: Arc::clone(&runtime.shared),
+            backend: Backend::memory(fixture.store.clone()),
+            replies,
+            addr: None,
+            name: "stuck",
+            tag: Arc::default(),
+        };
+        for _ in 0..3 {
+            super::spawn_supervised(ctx.unaddressed("stuck"), std::future::pending());
+        }
+
+        let grace = Duration::from_secs(2);
+        let began = tokio::time::Instant::now();
+        runtime.shutdown(grace).await;
+        assert!(
+            began.elapsed() <= grace * 2,
+            "three stuck tasks share one window: {:?}",
+            began.elapsed()
+        );
+        assert_eq!(runtime.tasks_len(), 0);
     }
 
     /// M5 D84: a run whose claim was refused waits, and is claimed again once a walk of this
