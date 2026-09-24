@@ -3287,3 +3287,66 @@ async fn a_second_isolated_run_that_conflicts_takes_the_merge_conflict_path() {
     assert_eq!(head_of(&git, &fix.core.path).await, m1);
     assert_eq!(porcelain_status(&git, &fix.core.path).await, "");
 }
+
+/// Plan D160 (R-26): a verb that changes the primary outlives the future that asked for it. A walk
+/// that is preempted or abandoned mid-merge drops that future; before D160 the drop reached the
+/// child's `kill_on_drop` handle and SIGKILLed `git` inside its `pre-merge-commit` hook, leaving
+/// the primary mid-merge. Now the merge finishes on its own task: it lands with D25's parents, and
+/// neither `index.lock` nor `MERGE_HEAD` is left in the user's tree.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
+
+    let Some(git) = skip_without_git!() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let primary = dir.path().join("primary");
+    std::fs::create_dir(&primary).expect("the primary directory is made");
+    let before = repo_with_one_commit(&primary);
+    let step = StepId::new();
+    let tree = dir.path().join("tree");
+    git.add_worktree(&primary, &tree, step, RunId::new(), &before)
+        .await
+        .expect("the worktree is added");
+    let after = commit_file(&tree, "written", "by the agent\n", "the step's work");
+
+    // An absolute `sleep`: the hook must not depend on the `PATH` `git` hands it.
+    let sleep = which::which("sleep").expect("a box that can run a test suite has `sleep`");
+    let hooks = primary.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).expect("the hooks directory is made");
+    let hook = hooks.join("pre-merge-commit");
+    std::fs::write(&hook, format!("#!/bin/sh\n'{}' 2\n", sleep.display()))
+        .expect("the hook is written");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+        .expect("the hook is executable");
+
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(300),
+        git.merge_no_ff(&primary, step, &before, &after),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "the merge was still inside its hook when its future was dropped: {dropped:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let dot_git = primary.join(".git");
+    assert!(
+        !dot_git.join("index.lock").exists(),
+        "no index.lock is left behind"
+    );
+    assert!(
+        !dot_git.join("MERGE_HEAD").exists(),
+        "the primary is not left mid-merge"
+    );
+    assert_eq!(
+        git_out(&git, &primary, &["log", "-1", "--format=%P", "HEAD"]).await,
+        format!("{before} {after}"),
+        "the merge landed with D25's parents [before, after]"
+    );
+    assert_eq!(porcelain_status(&git, &primary).await, "", "and clean");
+}
