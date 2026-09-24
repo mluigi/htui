@@ -7461,8 +7461,8 @@ mod tests {
     /// Plan D140: a release that fails puts the run in the dead-walk set, and the sweep retries
     /// it until the store answers. `MemFault::ReleaseLease` makes every release `Unreachable` at
     /// first (plan D152), so the sweep's retry fails too and plan D88 keeps it off the run, whose
-    /// lease is still this process's. Once the fault is switched off, the next sweep's retry
-    /// answers and the run leaves the set.
+    /// lease, expired by then, is still this process's. Once the fault is switched off, the next
+    /// sweep's retry answers and the run leaves the set.
     #[tokio::test(start_paused = true)]
     async fn a_failed_release_is_retried_by_the_sweep() {
         let harness = Harness::new().await;
@@ -7476,6 +7476,9 @@ mod tests {
             [run],
             "the failed release is remembered"
         );
+        // Past the lease's expiry, so only plan D88 (it names this process) keeps the sweep off it.
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        harness.orch.clock.advance(ttl + TimeDelta::seconds(1));
         let swept = engine.sweep().await.expect("the sweep runs");
         assert_eq!(
             harness.orch.dead_walks.runs(),
@@ -7484,7 +7487,7 @@ mod tests {
         );
         assert!(
             swept.iter().all(|adopted| adopted.run != run),
-            "plan D88: the lease the failed release left is still this process's"
+            "plan D88: the expired lease the failed release left is still this process's"
         );
 
         harness.orch.store.set_fault(MemFault::ReleaseLease, false);
