@@ -3170,6 +3170,53 @@ pub(crate) mod tests {
         );
     }
 
+    /// D215 (review finding 6, changed by maintainer choice): `RunActions` is served from a
+    /// tracked task like a command, so the loop awaits none of its reads, and it is answered once
+    /// at the request's own origin and `seq` — a refusal included.
+    #[tokio::test]
+    async fn run_actions_are_answered_from_a_tracked_task() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        let backlog = Origin::Tab(TabId("backlog"));
+
+        for (seq, item) in [(4, ids::HTUI_ANA_2), (5, ItemId::new())] {
+            let served = runtime
+                .serve(
+                    &backend,
+                    &replies,
+                    &RequestEnvelope {
+                        seq,
+                        origin: backlog.clone(),
+                        request: StoreRequest::RunActions(item),
+                    },
+                    &LiveChats::default(),
+                )
+                .await;
+            assert!(matches!(served, RunServed::Deferred), "{served:?}");
+            assert_eq!(
+                runtime.tasks_len(),
+                1,
+                "the verdicts task is tracked, so settle and shutdown bound it"
+            );
+            assert!(runtime.settle(PATIENCE).await.is_empty());
+            let answer = answers.try_recv().expect("the verdicts are answered");
+            assert_eq!((&answer.origin, answer.seq), (&backlog, seq));
+            assert!(answers.try_recv().is_err(), "answered once");
+            match answer.reply {
+                StoreReply::RunActions(actions) if seq == 4 => {
+                    assert_eq!(actions.item, item);
+                    assert_eq!(actions.run, Ok(()), "an open item may start a run");
+                }
+                StoreReply::Failed { request, .. } if seq == 5 => {
+                    assert_eq!(request, "run_actions", "an unknown item is refused by name");
+                }
+                other => panic!("seq {seq}: {other:?}"),
+            }
+        }
+    }
+
     /// The `research` phase as the ANA graph's snapshot carries it, for the author.
     fn research_phase() -> SnapshotPhase {
         SnapshotPhase {
@@ -4116,7 +4163,7 @@ pub(crate) mod tests {
         };
         let fixture = Fixture::new().await;
         let mut runtime = fixture.runtime();
-        let (replies, _answers) = mpsc::unbounded_channel();
+        let (replies, mut answers) = mpsc::unbounded_channel();
         let serve = async |runtime: &mut RunRuntime, seq: u64, request: StoreRequest| {
             runtime
                 .serve(
@@ -4160,10 +4207,13 @@ pub(crate) mod tests {
             }))
         ));
 
-        let RunServed::Reply(StoreReply::RunActions(actions)) =
-            serve(&mut runtime, 21, StoreRequest::RunActions(ids::HTUI_FEAT_1)).await
-        else {
-            panic!("the verdicts are read from the mirror");
+        let served = serve(&mut runtime, 21, StoreRequest::RunActions(ids::HTUI_FEAT_1)).await;
+        assert!(matches!(served, RunServed::Deferred), "{served:?}");
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        let answer = answers.try_recv().expect("the verdicts are answered");
+        assert_eq!(answer.seq, 21);
+        let StoreReply::RunActions(actions) = answer.reply else {
+            panic!("the verdicts are read from the mirror: {:?}", answer.reply);
         };
         let offline = Err(DATABASE_UNREACHABLE.to_owned());
         assert_eq!(actions.item, ids::HTUI_FEAT_1);
