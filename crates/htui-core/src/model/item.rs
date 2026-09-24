@@ -279,6 +279,7 @@ mod tests {
         (Status::AwaitingApproval, Status::Open),
         // `blocked`
         (Status::Blocked, Status::Open),
+        (Status::Blocked, Status::AwaitingApproval),
         (Status::Blocked, Status::Closed),
         // `failed`
         (Status::Failed, Status::Queued),
