@@ -50,7 +50,7 @@ use htui_orch::{
 };
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer, identity};
 use serde_json::Value;
-use tokio::sync::{OwnedMutexGuard, mpsc};
+use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -709,6 +709,9 @@ struct Shared {
     walks: Walks,
     /// M5 D84: this process's runs a claim refused, by `queued_at`.
     queued: StdMutex<BTreeSet<(DateTime<Utc>, RunId)>>,
+    /// How many tasks have ended: a refused `StartRun` compares it across its claim, so a walk
+    /// that rested meanwhile and found the queue empty does not leave the run waiting (M5 D84).
+    ended: AtomicU64,
     /// D190: the sweep period in milliseconds, the lease TTL until a test fixes it.
     sweep_every: AtomicU64,
     /// Whether [`RunRuntime::with_sweep_every`] fixed the period.
@@ -1231,6 +1234,7 @@ impl RunRuntime {
                 locks: RunLocks::default(),
                 walks: Walks::default(),
                 queued: StdMutex::default(),
+                ended: AtomicU64::new(0),
                 sweep_every: AtomicU64::new(millis(lease_period(&BTreeMap::new()))),
                 sweep_fixed: false,
                 sweeping: AtomicBool::new(false),
@@ -1645,14 +1649,15 @@ fn spawn_supervised(ctx: TaskCtx, work: impl Future<Output = ()> + Send + 'stati
             tracing::error!(run = ?ctx.tag.run.get(), "a run task panicked; the next sweep adopts its run");
             ctx.refuse(WALK_PANICKED.to_owned());
         }
+        // Before the queue is looked at, so a claim refused meanwhile sees the count move.
+        ctx.shared.ended.fetch_add(1, Ordering::SeqCst);
         retry_claims(&ctx).await;
     });
     shared.track(tag, handle);
 }
 
 /// M5 D84: once a task's run no longer walks — parked, finished, or gone — every run a refused
-/// claim left `queued` in this process is claimed again, in `queued_at` order, one task each,
-/// under its lock. `Admitted` or a terminal run leaves the set; a second refusal puts it back.
+/// claim left `queued` in this process is claimed again ([`claim_queued`]).
 async fn retry_claims(ctx: &TaskCtx) {
     let Some(run) = ctx.tag.run.get().copied() else {
         return;
@@ -1676,6 +1681,18 @@ async fn retry_claims(ctx: &TaskCtx) {
         | Err(_) => return,
         Ok(_) => {}
     }
+    claim_queued(ctx).await;
+}
+
+/// How often [`claim_queued`] reads whether a claim it is waiting on has admitted its run.
+const CLAIM_POLL: Duration = Duration::from_millis(20);
+
+/// M5 D84, blueprint §8.6: every run a refused claim left `queued` in this process, claimed again
+/// in `queued_at` order, each on a task of its own under its lock. A claim is decided — its task
+/// ended, or its run read to be no longer `queued` — before the next one is tried, so an earlier
+/// run is never overtaken for the scope a rested walk freed; the admitted run walks on its own
+/// task. `Admitted` or a terminal run leaves the set; a second refusal puts it back.
+async fn claim_queued(ctx: &TaskCtx) {
     let queued = std::mem::take(
         &mut *ctx
             .shared
@@ -1684,13 +1701,31 @@ async fn retry_claims(ctx: &TaskCtx) {
             .unwrap_or_else(PoisonError::into_inner),
     );
     for (queued_at, run) in queued {
+        let (decided, undecided) = oneshot::channel::<()>();
         let retry = ctx.unaddressed("claim_retry");
-        spawn_supervised(retry.clone(), reclaim(retry, run, queued_at));
+        spawn_supervised(retry.clone(), reclaim(retry, run, queued_at, decided));
+        tokio::select! {
+            _ = undecided => {}
+            () = left_the_queue(&ctx.backend, run) => {}
+        }
     }
 }
 
-/// One claim retry: the run's lock, then `claim` and its walk.
-async fn reclaim(ctx: TaskCtx, run: RunId, queued_at: DateTime<Utc>) {
+/// Returns once `run` is read to be anything but `queued`, or cannot be read.
+async fn left_the_queue(backend: &Backend, run: RunId) {
+    while let Ok(Some(Run {
+        status: RunStatus::Queued,
+        ..
+    })) = backend.run(run).await
+    {
+        tokio::time::sleep(CLAIM_POLL).await;
+    }
+}
+
+/// One claim retry: the run's lock, then `claim` and its walk. Dropping `decided` — when the task
+/// ends — tells [`claim_queued`] this claim no longer holds up the next.
+async fn reclaim(ctx: TaskCtx, run: RunId, queued_at: DateTime<Utc>, decided: oneshot::Sender<()>) {
+    let _decided = decided;
     ctx.tag(run).await;
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
@@ -1911,11 +1946,21 @@ async fn start_run(
     };
     let _ = ctx.tag.run.set(run);
     ctx.publish(Some(run), FrameKind::Started);
+    // M5 D84: read now, so a refused claim joins the queue with no await after the refusal.
+    let queued_at = kit
+        .writer
+        .run(run)
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(|| ctx.shared.clock.now(), |row| row.queued_at);
 
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
         return ctx.refuse(PREEMPTED.to_owned());
     };
+    let ended = ctx.shared.ended.load(Ordering::SeqCst);
+    let mut missed = false;
     match walked(&walk, engine.claim(run)).await {
         None => {
             engine.abandoned(run).await;
@@ -1923,14 +1968,18 @@ async fn start_run(
         }
         Some(Ok(outcome)) => ctx.done(outcome),
         Some(Err(err @ EngineError::ClaimRefused { .. })) => {
-            if let Ok(Some(row)) = kit.writer.run(run).await {
-                ctx.shared.queue(row.queued_at, run);
-            }
+            ctx.shared.queue(queued_at, run);
+            // A task that ended during the claim may have found the queue still empty and
+            // retried nothing; this task retries in its place.
+            missed = ctx.shared.ended.load(Ordering::SeqCst) != ended;
             ctx.refuse(err.to_string());
         }
         Some(Err(err)) => ctx.refuse(err.to_string()),
     }
     drop(guard);
+    if missed {
+        claim_queued(&ctx).await;
+    }
 }
 
 /// Every verb on one run: preempt as the verb says, lock, dispatch (§8.6).
@@ -3293,6 +3342,76 @@ pub(crate) mod tests {
         );
         outcome(worker.reply(cancel).await);
         rests_at(&fixture, second, RunStatus::AwaitingApproval).await;
+    }
+
+    /// M5 D84, blueprint §8.6: queued runs are claimed again in `queued_at` order — a later run
+    /// is not claimed while an earlier one's claim is undecided, so the earlier run gets the scope
+    /// a rested walk freed.
+    #[tokio::test]
+    async fn queued_runs_are_claimed_again_in_queued_at_order() {
+        let fixture = Fixture::new().await;
+        let runtime = fixture.runtime();
+        let shared = Arc::clone(&runtime.shared);
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+        let (first, _) = parked(&fixture, &mut worker).await;
+        // A third item of the project that may start a run.
+        assert!(
+            fixture
+                .store
+                .transition(ids::HTUI_FEAT_2, Status::Blocked, Status::Open)
+                .await
+                .expect("the reopen answers")
+        );
+        let mut queued = Vec::new();
+        for item in [ids::HTUI_CLEAN_1, ids::HTUI_FEAT_2] {
+            let start = worker.send(Origin::App, start_run(item));
+            let StoreReply::Failed { message, .. } = worker.reply(start).await else {
+                panic!("the claim is refused");
+            };
+            assert!(message.contains("overlaps run"), "{message}");
+            queued.push(only_run(&fixture.store, item).await);
+        }
+        let [earlier, later] = queued[..] else {
+            unreachable!("two starts")
+        };
+        let held = within("both runs waiting, the earlier one unheld", async {
+            loop {
+                let waiting = shared
+                    .queued
+                    .lock()
+                    .expect("the set")
+                    .iter()
+                    .filter(|(_, run)| *run == earlier || *run == later)
+                    .count();
+                if waiting == 2
+                    && let Some(held) = shared.locks.try_lock(earlier)
+                {
+                    break held;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let cancel = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run: first })),
+        );
+        outcome(worker.reply(cancel).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            fixture.run(later).await.status,
+            RunStatus::Queued,
+            "the later run waits for the earlier one's claim"
+        );
+
+        drop(held);
+        rests_at(&fixture, earlier, RunStatus::AwaitingApproval).await;
+        assert_eq!(
+            fixture.run(later).await.status,
+            RunStatus::Queued,
+            "and the earlier run's scope refuses it"
+        );
     }
 
     /// The frames (not the acknowledgements) received so far, taken out of `seen`.
