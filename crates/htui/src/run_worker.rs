@@ -1795,8 +1795,9 @@ impl GraphSource for BackendGraphs {
     }
 }
 
+/// The walk fixture is shared with `store_worker`'s promotion case (blueprint §8.10).
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeSet, VecDeque};
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1815,18 +1816,22 @@ mod tests {
     use htui_agent::registry::{DriverFactory, TransportBuilder};
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
-        Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, Run, RunId,
-        RunMode, RunStatus, RunStep, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, Transport,
+        Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, NewRepo, RepoId,
+        Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, TIMESTAMPTZ_DIGITS,
+        Transport,
     };
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
     use htui_orch::fake::{FakeIsolator, FakeVerifier};
-    use htui_orch::{Clock, Command, CommandOutcome, GateAnswer, GraphSource, Isolator};
+    use htui_orch::{
+        Clock, Command, CommandOutcome, EngineError, GateAnswer, GraphSource, Isolator,
+    };
     use htui_store::{Backend, Started};
     use serde_json::json;
     use tokio::sync::{Notify, mpsc};
 
     use super::{
-        BackendGraphs, FrameKind, ORCH_NAMES, OrchReply, OrchRequest, RunRuntime, StepAuthor,
+        BackendGraphs, FrameKind, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, PREEMPTED,
+        RunRuntime, RunServed, StepAuthor,
     };
     use crate::agent_worker::AgentRuntime;
     use crate::store_worker::{
@@ -1886,6 +1891,19 @@ mod tests {
             .upsert_agent_box(&ready_on_box(agent, demo_at(0, 0)))
             .await
             .expect("the agent_box row lands");
+        // The demo project has no repo, and a promoted step chats in its own tree: the primary
+        // repo is the scope a default `StartRun` resolves to.
+        store
+            .create_repo(NewRepo {
+                id: RepoId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "htui".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect("the demo project has no repo yet");
         (store, agent)
     }
 
@@ -2083,14 +2101,14 @@ mod tests {
     }
 
     /// The seeded store, the sessions its builds play, and the isolator its runs use.
-    struct Fixture {
-        store: MemStore,
+    pub(crate) struct Fixture {
+        pub(crate) store: MemStore,
         sessions: Arc<Sessions>,
         isolator: Arc<FakeIsolator>,
     }
 
     impl Fixture {
-        async fn new() -> Self {
+        pub(crate) async fn new() -> Self {
             let (store, _) = seeded_store().await;
             Self {
                 store,
@@ -2107,7 +2125,7 @@ mod tests {
         }
 
         /// Blueprint §8.9's runtime: the fakes, a tokio-time clock and the output author.
-        fn runtime(&self) -> RunRuntime {
+        pub(crate) fn runtime(&self) -> RunRuntime {
             RunRuntime::with_parts(
                 Arc::clone(&self.isolator) as Arc<dyn Isolator>,
                 Arc::new(FakeVerifier::new()),
@@ -2142,7 +2160,7 @@ mod tests {
     const PATIENCE: Duration = Duration::from_secs(20);
 
     /// A store worker over the fixture's store, with the run runtime under test.
-    struct Worker {
+    pub(crate) struct Worker {
         requests: mpsc::UnboundedSender<RequestEnvelope>,
         replies: mpsc::UnboundedReceiver<ReplyEnvelope>,
         seen: Vec<ReplyEnvelope>,
@@ -2150,7 +2168,7 @@ mod tests {
     }
 
     impl Worker {
-        fn spawn(store: &MemStore, runtime: RunRuntime) -> Self {
+        pub(crate) fn spawn(store: &MemStore, runtime: RunRuntime) -> Self {
             let (requests, requests_rx) = mpsc::unbounded_channel();
             let (replies_tx, replies) = mpsc::unbounded_channel();
             let _worker = spawn_with_runtimes(
@@ -2169,7 +2187,7 @@ mod tests {
         }
 
         /// Sends `request` from `origin` at the next `seq`.
-        fn send(&mut self, origin: Origin, request: StoreRequest) -> u64 {
+        pub(crate) fn send(&mut self, origin: Origin, request: StoreRequest) -> u64 {
             self.seq += 1;
             self.send_at(origin, self.seq, request)
         }
@@ -2188,12 +2206,17 @@ mod tests {
         }
 
         /// The first non-stream reply at `seq`, waiting for it.
-        async fn reply(&mut self, seq: u64) -> StoreReply {
+        pub(crate) async fn reply(&mut self, seq: u64) -> StoreReply {
+            self.envelope(seq).await.reply
+        }
+
+        /// The first non-stream envelope at `seq`, waiting for it.
+        pub(crate) async fn envelope(&mut self, seq: u64) -> ReplyEnvelope {
             loop {
                 if let Some(at) = self.seen.iter().position(|envelope| {
                     envelope.seq == seq && !matches!(envelope.reply, StoreReply::RunStream(_))
                 }) {
-                    return self.seen.remove(at).reply;
+                    return self.seen.remove(at);
                 }
                 let envelope = tokio::time::timeout(PATIENCE, self.replies.recv())
                     .await
@@ -2263,6 +2286,284 @@ mod tests {
         };
         assert_eq!(rest.run, RunStatus::AwaitingApproval, "`research` gates");
         assert_eq!(fixture.run(run).await.status, RunStatus::AwaitingApproval);
+    }
+
+    /// The one run of `item`, which a test has just started.
+    async fn only_run(store: &MemStore, item: ItemId) -> RunId {
+        let runs = store.runs(item).await.expect("the read answers");
+        assert_eq!(runs.len(), 1, "one run of the item: {runs:?}");
+        runs[0].id
+    }
+
+    /// The latest step at `position` of `run`.
+    async fn step_at(fixture: &Fixture, run: RunId, position: i32) -> RunStep {
+        fixture
+            .steps(run)
+            .await
+            .into_iter()
+            .filter(|step| step.position == position)
+            .max_by_key(|step| step.attempt)
+            .expect("a step at the position")
+    }
+
+    /// A parked run of `HTUI_ANA_2`: its `research` step awaits approval.
+    pub(crate) async fn parked(fixture: &Fixture, worker: &mut Worker) -> (RunId, RunStep) {
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        let CommandOutcome::Started { run, rest } = outcome(worker.reply(start).await) else {
+            panic!("a start answers Started");
+        };
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        (run, step_at(fixture, run, 0).await)
+    }
+
+    /// R-27: a second command on a run waits for the first to finish its walk, then is judged
+    /// against the rows that walk left.
+    #[tokio::test]
+    async fn two_commands_on_one_run_are_serialised() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let (run, research) = parked(&fixture, &mut worker).await;
+
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let retry = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::RetryStep {
+                run,
+                step: research.id,
+            })),
+        );
+        within("attempt 2's session starting", stall.reached.notified()).await;
+        let answer = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::AnswerGate {
+                run,
+                step: research.id,
+                answer: GateAnswer::Approved,
+            })),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        worker.drain();
+        assert!(
+            !worker
+                .seen
+                .iter()
+                .any(|envelope| envelope.seq == answer || envelope.seq == retry),
+            "neither command has answered while attempt 2 walks: {:?}",
+            worker.seen
+        );
+
+        stall.release.notify_one();
+        assert!(matches!(
+            outcome(worker.reply(retry).await),
+            CommandOutcome::Retried { .. }
+        ));
+        let StoreReply::Failed { request, message } = worker.reply(answer).await else {
+            panic!("the answer is refused");
+        };
+        assert_eq!(request, "answer_gate");
+        assert!(
+            message.contains(&format!("step {} is `superseded`", research.id)),
+            "the gate is judged after the retry moved the step: {message}"
+        );
+    }
+
+    /// D157, D187, D188: `CancelRun` stops a walk mid-session instead of waiting hours for it,
+    /// and the dropped walk's lease and guards are given back.
+    #[tokio::test]
+    async fn cancel_preempts_a_live_walk() {
+        let fixture = Fixture::new().await;
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        within("the session starting", stall.reached.notified()).await;
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        let cancel = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run })),
+        );
+
+        assert!(matches!(
+            outcome(worker.reply(cancel).await),
+            CommandOutcome::Cancelled { .. }
+        ));
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED),
+            "the preempted start is answered once, with the sentence"
+        );
+        assert!(
+            stall.dropped.load(Ordering::SeqCst),
+            "the session was dropped"
+        );
+        let row = fixture.run(run).await;
+        assert_eq!(row.status, RunStatus::Cancelled);
+        assert!(
+            row.lease_expires_at
+                .is_some_and(|until| until <= Utc::now()),
+            "the lease is given back: {:?}",
+            row.lease_expires_at
+        );
+        assert_eq!(fixture.item(ids::HTUI_ANA_2).await.status, Status::Open);
+        assert!(
+            fixture.isolator.releases() >= 1,
+            "the abandoned walk's guards were released"
+        );
+    }
+
+    /// D182, D184: the verdicts are the engine's own guards over the rows.
+    #[tokio::test]
+    async fn run_actions_grey_by_the_engine_guards() {
+        let fixture = Fixture::new().await;
+        let runtime = RunRuntime::with_parts(
+            Arc::clone(&fixture.isolator) as Arc<dyn Isolator>,
+            Arc::new(FakeVerifier::new()),
+            fixture.factory(),
+        )
+        .with_clock(Arc::new(TokioClock::new()));
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+        let (_run, research) = parked(&fixture, &mut worker).await;
+
+        let ask = worker.send(Origin::App, StoreRequest::RunActions(ids::HTUI_ANA_2));
+        let StoreReply::RunActions(actions) = worker.reply(ask).await else {
+            panic!("the verdicts");
+        };
+        assert_eq!(
+            actions.steps[&research.id].approve,
+            Err(EngineError::MissingOutputForApproval {
+                step: research.id,
+                kind: "research".to_owned(),
+            }
+            .to_string())
+        );
+        assert_eq!(actions.steps[&research.id].reject, Ok(()));
+
+        let document = OutputAuthor
+            .document(ids::HTUI_ANA_2, &research, &research_phase())
+            .expect("the author writes one");
+        fixture
+            .store
+            .write_document(document)
+            .await
+            .expect("the document lands");
+        let ask = worker.send(Origin::App, StoreRequest::RunActions(ids::HTUI_ANA_2));
+        let StoreReply::RunActions(actions) = worker.reply(ask).await else {
+            panic!("the verdicts");
+        };
+        assert_eq!(actions.steps[&research.id].approve, Ok(()));
+        assert!(actions.steps[&research.id].open.is_ok());
+        assert_eq!(actions.steps[&research.id].promote, Ok(()));
+
+        let live = super::actions(
+            &Backend::memory(fixture.store.clone()),
+            ids::HTUI_ANA_2,
+            &LiveChats::of([StepId::new()]),
+        )
+        .await
+        .expect("the verdicts");
+        assert_eq!(
+            live.steps[&research.id].promote,
+            Err(EngineError::ChatLive { step: None }.to_string()),
+            "a chat of this process is live elsewhere"
+        );
+    }
+
+    /// The `research` phase as the ANA graph's snapshot carries it, for the author.
+    fn research_phase() -> SnapshotPhase {
+        SnapshotPhase {
+            output_kind: "research".to_owned(),
+            ..serde_json::from_value(json!({
+                "position": 0, "name": "research", "fan_out": 1, "gate": "always",
+                "gate_effective": "always", "gate_hard": false, "retry_limit": 1,
+                "input_kinds": [], "output_kind": "research", "isolation": "worktree",
+                "command_queue": "fan_out_only", "verify_command": null,
+                "deadline_seconds": null, "template": { "name": "research", "version": 1 },
+                "token_budget": null, "candidates": [], "judge": null
+            }))
+            .expect("a phase")
+        }
+    }
+
+    /// D177 (R-25): a cleanup retry runs on a terminal run and is refused on a live one.
+    #[tokio::test]
+    async fn cleanup_retries_a_terminal_run() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let (run, _) = parked(&fixture, &mut worker).await;
+
+        let early = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Cleanup { run }),
+        );
+        assert_eq!(
+            match worker.reply(early).await {
+                StoreReply::Failed { message, .. } => message,
+                other => panic!("a live run is refused: {other:?}"),
+            },
+            EngineError::NotTerminal {
+                run,
+                status: RunStatus::AwaitingApproval,
+            }
+            .to_string()
+        );
+
+        let cancel = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run })),
+        );
+        outcome(worker.reply(cancel).await);
+        let before = fixture.isolator.cleanups();
+        let again = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Cleanup { run }),
+        );
+        assert!(matches!(
+            worker.reply(again).await,
+            StoreReply::Orch(OrchReply::CleanedUp { run: cleaned }) if cleaned == run
+        ));
+        assert_eq!(fixture.isolator.cleanups(), before + 1);
+    }
+
+    /// D156: the production isolator is built at the first command and kept while the repo map
+    /// does not move.
+    #[tokio::test]
+    async fn the_isolator_is_built_once_per_process() {
+        let fixture = Fixture::new().await;
+        let scratch = tempfile::tempdir().expect("a scratch root");
+        let mut runtime = RunRuntime::new(fixture.factory())
+            .with_clock(Arc::new(TokioClock::new()))
+            .with_scratch_root(scratch.path().to_path_buf());
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        assert_eq!(
+            runtime.isolator_builds(),
+            0,
+            "nothing is built before a command"
+        );
+
+        for (seq, item) in [(1, ids::HTUI_ANA_2), (2, ids::AGY_FEAT_1)] {
+            let served = runtime
+                .serve(
+                    &backend,
+                    &replies,
+                    &RequestEnvelope {
+                        seq,
+                        origin: Origin::App,
+                        request: start_run(item),
+                    },
+                    &LiveChats::default(),
+                )
+                .await;
+            assert!(matches!(served, RunServed::Deferred));
+            assert!(runtime.settle(PATIENCE).await.is_empty());
+        }
+        let mut answered = 0;
+        while answers.try_recv().is_ok() {
+            answered += 1;
+        }
+        assert!(answered >= 2, "both starts were answered");
+        assert_eq!(runtime.isolator_builds(), 1);
     }
 
     /// Plan D155: the five trait reads are the inherent reads of the same name.

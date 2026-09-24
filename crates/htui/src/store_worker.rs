@@ -2622,6 +2622,45 @@ mod tests {
     /// A health watch that outlived its `Online` backend would keep republishing the same
     /// `Unreachable`, and the arm would resolve on every poll instead of parking - a spin. The
     /// watch therefore goes before the `went_offline` guard, not after it.
+    /// Blueprint §8.10, D181: a promotion's engine writes are answered `Orch(Promoted)`, and the
+    /// runtime's `Attach` event reaches the loop, whose T6 stub answers with its sentence — both at
+    /// the request's `seq` and origin. T7 changes the second expectation (§10.5).
+    #[tokio::test]
+    async fn a_promotion_reaches_the_attach_hand_off() {
+        use crate::run_worker::tests::{Fixture, Worker, parked};
+        use crate::run_worker::{OrchReply, OrchRequest};
+
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let (run, step) = parked(&fixture, &mut worker).await;
+        let chat = Origin::Tab(TabId("chat"));
+        let promote = worker.send(
+            chat.clone(),
+            StoreRequest::Orch(OrchRequest::Command(htui_orch::Command::PromoteStep {
+                run,
+                step: step.id,
+                chat_open: false,
+            })),
+        );
+
+        let first = worker.envelope(promote).await;
+        assert_eq!(first.origin, chat);
+        assert!(
+            matches!(first.reply, StoreReply::Orch(OrchReply::Promoted { step: promoted, run: of, .. })
+                if promoted == step.id && of == run),
+            "{:?}",
+            first.reply
+        );
+        let second = worker.envelope(promote).await;
+        assert_eq!(second.origin, chat);
+        assert!(
+            matches!(&second.reply, StoreReply::Failed { request: "promote_step", message }
+                if message == PROMOTION_NEEDS_CHAT),
+            "{:?}",
+            second.reply
+        );
+    }
+
     #[tokio::test]
     async fn go_offline_drops_the_health_watch_on_a_backend_that_is_not_online() {
         let root = tempfile::tempdir().expect("temp root");
