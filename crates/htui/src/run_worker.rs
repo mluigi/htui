@@ -3455,6 +3455,97 @@ pub(crate) mod tests {
         assert_eq!(runtime.tasks_len(), 0, "a closed runtime sweeps nothing");
     }
 
+    /// D214 (review L5): every sweep tick prunes, in one pass, the finished task handles, the
+    /// parents of runs no task works on, and the locks nobody holds or waits for. A parent a task
+    /// still works under and a held lock stay.
+    #[tokio::test]
+    async fn a_sweep_prunes_finished_tasks_idle_parents_and_free_locks() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+        let envelope = |seq: u64, request: StoreRequest| RequestEnvelope {
+            seq,
+            origin: Origin::App,
+            request,
+        };
+        runtime
+            .serve(
+                &backend,
+                &replies,
+                &envelope(1, start_run(ids::HTUI_ANA_2)),
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        runtime
+            .serve(
+                &backend,
+                &replies,
+                &envelope(
+                    2,
+                    StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run })),
+                ),
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert!(
+            runtime.shared.walks.lock().contains_key(&run),
+            "the run's parent outlived its tasks"
+        );
+        assert!(
+            runtime
+                .shared
+                .locks
+                .0
+                .lock()
+                .expect("the map")
+                .contains_key(&run),
+            "and so did its lock"
+        );
+        let other = RunId::new();
+        let held = runtime
+            .shared
+            .locks
+            .try_lock(other)
+            .expect("nobody holds it");
+        let walking = runtime.shared.walks.child(other);
+
+        runtime.sweep(&backend, &replies);
+        within("the first sweep ending", async {
+            while !runtime
+                .shared
+                .tasks
+                .lock()
+                .expect("the tasks")
+                .iter()
+                .all(|task| task.handle.is_finished())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        runtime.sweep(&backend, &replies);
+
+        assert_eq!(
+            runtime.tasks_len(),
+            1,
+            "the finished sweep's handle was pruned; the new one is tracked"
+        );
+        let parents = runtime.shared.walks.lock();
+        assert!(!parents.contains_key(&run), "the idle parent was pruned");
+        assert!(parents.contains_key(&other), "a live one stays");
+        drop(parents);
+        let locks = runtime.shared.locks.0.lock().expect("the map");
+        assert!(!locks.contains_key(&run), "the free lock was pruned");
+        assert!(locks.contains_key(&other), "a held one stays");
+        drop(locks);
+        drop((held, walking));
+    }
+
     /// `shutdown` gives every task one shared window of `2 × grace`, not one each: the chats are
     /// cancelled beside it inside the same bounded quit (`docs/ANA-4.md` §11 criterion 11).
     #[tokio::test(start_paused = true)]
