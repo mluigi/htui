@@ -24,6 +24,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use crate::agent_worker::{AgentRuntime, ChatTask, Served};
 use crate::app::{Action, App, Ctx, Emit, Handled, TopBarState};
 use crate::keymap::{KeyChord, Keymap};
+use crate::run_worker::{RunRuntime, RunServed};
 use crate::store_worker::{self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::overlay::Overlay;
@@ -59,6 +60,11 @@ pub struct Harness {
     /// Chat futures [`Harness::drive`] polls inline: production spawns, the harness awaits, and
     /// that is what makes a streamed turn byte-stable in a snapshot with no sleeps.
     chats: Vec<(StepId, ChatTask)>,
+    /// The run runtime, when a test installed one (blueprint D207). Without it the orchestrator
+    /// requests are answered by `store_worker::serve` (D183).
+    runs: Option<RunRuntime>,
+    /// The run runtime's event receiver, taken when it was installed (D181).
+    run_events: Option<UnboundedReceiver<RunServed>>,
     /// The reply channel a chat writes its frames into.
     replies: (
         mpsc::UnboundedSender<ReplyEnvelope>,
@@ -126,6 +132,8 @@ impl Harness {
             rx,
             runtime: None,
             chats: Vec::new(),
+            runs: None,
+            run_events: None,
             replies: (reply_tx, reply_rx),
             store_state: None,
             term: terminal(width, height),
@@ -141,6 +149,40 @@ impl Harness {
     pub fn with_agent_runtime(mut self, runtime: AgentRuntime) -> Self {
         self.runtime = Some(runtime);
         self
+    }
+
+    /// Installs the run runtime the orchestrator requests are served by (blueprint D207), and
+    /// takes its event receiver.
+    ///
+    /// [`Harness::drive`] then settles the runtime's tasks every round, so a render never
+    /// photographs a half-walked run (H-5). [`Harness::settle`] stays runtime-free.
+    #[must_use]
+    pub fn with_run_runtime(mut self, mut runtime: RunRuntime) -> Self {
+        self.run_events = Some(runtime.take_events());
+        self.runs = Some(runtime);
+        self
+    }
+
+    /// What the harness does with a [`RunServed`] that is not a plain reply, as the store loop's
+    /// helper does (blueprint D181). **T6 stub**: a promotion's `Attach` is answered
+    /// `promote_step: promotion needs the chat runtime` at its address; T7 binds the chat.
+    fn on_run_served(&mut self, served: RunServed) {
+        match served {
+            RunServed::Attach { addr, .. } => {
+                let _ = self.replies.0.send(ReplyEnvelope {
+                    seq: addr.seq,
+                    origin: addr.origin,
+                    reply: StoreReply::Failed {
+                        request: "promote_step",
+                        message: store_worker::PROMOTION_NEEDS_CHAT.to_owned(),
+                    },
+                });
+            }
+            other @ (RunServed::Reply(_) | RunServed::Deferred) => {
+                debug_assert!(false, "the run runtime's event channel carries only Attach");
+                tracing::error!(?other, "a run event that is not an attach was dropped");
+            }
+        }
     }
 
     /// The steps of the chats this harness has started, oldest first.
@@ -227,6 +269,38 @@ impl Harness {
                             message: "no agent runtime in this harness".to_owned(),
                         },
                     },
+                    // Blueprint D207: the run runtime's three, through it when a test installed
+                    // one; without one `store_worker::serve` answers them (D183).
+                    (
+                        StoreRequest::Orch(_)
+                        | StoreRequest::RunStream { .. }
+                        | StoreRequest::RunActions(_),
+                        _,
+                    ) => {
+                        let live = self
+                            .runtime
+                            .as_ref()
+                            .map(store_worker::live_chats)
+                            .unwrap_or_default();
+                        let served = match self.runs.as_mut() {
+                            Some(runs) => {
+                                runs.serve(&self.backend, &self.replies.0, &envelope, &live)
+                                    .await
+                            }
+                            None => RunServed::Reply(
+                                store_worker::serve(&self.backend, &envelope.request).await,
+                            ),
+                        };
+                        match served {
+                            RunServed::Reply(reply) => reply,
+                            // The runtime's task answers this request itself.
+                            RunServed::Deferred => continue,
+                            attach @ RunServed::Attach { .. } => {
+                                self.on_run_served(attach);
+                                continue;
+                            }
+                        }
+                    }
                     (request, _) => store_worker::serve(&self.backend, request).await,
                 };
                 self.app.update(Action::Reply(ReplyEnvelope {
@@ -234,6 +308,27 @@ impl Harness {
                     origin: envelope.origin,
                     reply,
                 }));
+            }
+
+            // H-5: every walk task this round started is awaited to its rest, so the frame this
+            // drive is taken for never shows a half-walked run; then the runtime's events.
+            if let Some(runs) = self.runs.as_mut() {
+                let stuck = runs.settle(CHAT_END).await;
+                assert!(
+                    stuck.is_empty(),
+                    "the walks of runs {stuck:?} did not rest within {CHAT_END:?}: their task is \
+                     stuck, not slow"
+                );
+            }
+            let mut events = Vec::new();
+            if let Some(receiver) = self.run_events.as_mut() {
+                while let Ok(served) = receiver.try_recv() {
+                    events.push(served);
+                }
+            }
+            for served in events {
+                progress = true;
+                self.on_run_served(served);
             }
 
             // One poll each: a chat that is ready finishes, one that is waiting stays where it is.
@@ -577,6 +672,84 @@ mod tests {
         crate::app::register_all(harness.app());
         harness.drive_to_end().await;
         insta::assert_snapshot!("shell_empty", harness.render());
+    }
+
+    /// Blueprint D207: a harness with a run runtime serves `StartRun` through it, and `drive`
+    /// returns only once the walk has rested (H-5).
+    #[tokio::test]
+    async fn drive_settles_a_walk_of_the_run_runtime() {
+        use crate::run_worker::tests::{Fixture, only_run, start_run};
+
+        let fixture = Fixture::new().await;
+        let mut harness = Harness::over(fixture.store.clone()).with_run_runtime(fixture.runtime());
+        harness.drive().await;
+        harness.app().update(Action::Store(start_run(
+            htui_core::fixtures::ids::HTUI_ANA_2,
+        )));
+        harness.drive().await;
+
+        let run = only_run(&fixture.store, htui_core::fixtures::ids::HTUI_ANA_2).await;
+        assert_eq!(
+            fixture.run(run).await.status,
+            htui_core::model::RunStatus::AwaitingApproval,
+            "the walk rested inside the drive"
+        );
+        assert_eq!(harness.app().status, None, "and nothing failed");
+    }
+
+    /// Blueprint D183, D207: without a run runtime the stream and the verdicts still answer, so
+    /// nothing reaches the status line; only a command is refused, by name.
+    #[tokio::test]
+    async fn a_harness_without_a_run_runtime_answers_the_reads_and_refuses_a_command() {
+        use crate::run_worker::tests::start_run;
+
+        let mut harness = Harness::demo();
+        harness.drive().await;
+        let item = htui_core::fixtures::ids::HTUI_ANA_2;
+        harness
+            .app()
+            .update(Action::Store(StoreRequest::RunStream { item }));
+        harness
+            .app()
+            .update(Action::Store(StoreRequest::RunActions(item)));
+        harness.drive().await;
+        assert_eq!(harness.app().status, None);
+
+        harness.app().update(Action::Store(start_run(item)));
+        harness.drive().await;
+        assert_eq!(
+            harness.app().status.as_deref(),
+            Some("start_run: no run runtime in this build")
+        );
+    }
+
+    /// Blueprint D181's T6 stub, through the harness: the promotion's writes land and the attach
+    /// hand-off answers the promoting tab with its sentence.
+    #[tokio::test]
+    async fn a_promotion_in_the_harness_reaches_the_attach_stub() {
+        use crate::run_worker::tests::{Fixture, only_run, start_run, step_at};
+
+        let fixture = Fixture::new().await;
+        let mut harness = Harness::over(fixture.store.clone())
+            .with_run_runtime(fixture.runtime())
+            .with_replay_tab(crate::ui::tabs::TabId("chat"));
+        harness.drive().await;
+        let item = htui_core::fixtures::ids::HTUI_ANA_2;
+        harness.app().update(Action::Store(start_run(item)));
+        harness.drive().await;
+        let run = only_run(&fixture.store, item).await;
+        let step = step_at(&fixture, run, 0).await;
+
+        harness.app().update(Action::Promote { run, step: step.id });
+        harness.drive().await;
+        assert_eq!(
+            harness.app().status.as_deref(),
+            Some("promote_step: promotion needs the chat runtime")
+        );
+        assert!(
+            step_at(&fixture, run, 0).await.promoted_at.is_some(),
+            "the engine's writes are done"
+        );
     }
 
     #[tokio::test]

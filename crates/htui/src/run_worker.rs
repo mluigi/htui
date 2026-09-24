@@ -2379,7 +2379,7 @@ pub(crate) mod tests {
             .with_author(Arc::new(OutputAuthor))
         }
 
-        async fn run(&self, id: RunId) -> Run {
+        pub(crate) async fn run(&self, id: RunId) -> Run {
             self.store
                 .run(id)
                 .await
@@ -2484,7 +2484,7 @@ pub(crate) mod tests {
     }
 
     /// `StartRun` for `item`, manual, default scope.
-    fn start_run(item: ItemId) -> StoreRequest {
+    pub(crate) fn start_run(item: ItemId) -> StoreRequest {
         StoreRequest::Orch(OrchRequest::Command(Command::StartRun {
             item,
             mode: RunMode::Manual,
@@ -2538,14 +2538,14 @@ pub(crate) mod tests {
     }
 
     /// The one run of `item`, which a test has just started.
-    async fn only_run(store: &MemStore, item: ItemId) -> RunId {
+    pub(crate) async fn only_run(store: &MemStore, item: ItemId) -> RunId {
         let runs = store.runs(item).await.expect("the read answers");
         assert_eq!(runs.len(), 1, "one run of the item: {runs:?}");
         runs[0].id
     }
 
     /// The latest step at `position` of `run`.
-    async fn step_at(fixture: &Fixture, run: RunId, position: i32) -> RunStep {
+    pub(crate) async fn step_at(fixture: &Fixture, run: RunId, position: i32) -> RunStep {
         fixture
             .steps(run)
             .await
