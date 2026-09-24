@@ -799,6 +799,23 @@ impl Shared {
             .push(Tracked { tag, handle });
     }
 
+    /// Drops the handles of tasks that have ended: nothing reads a finished task's result.
+    fn prune_tasks(&self) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|task| !task.handle.is_finished());
+    }
+
+    /// D214 (review L5): one lazy pass per sweep tick — the finished task handles, the parent
+    /// tokens of runs no task works on, and the run locks nobody holds or waits for — so an idle
+    /// session keeps none of them for the life of the process.
+    fn prune(&self) {
+        self.prune_tasks();
+        self.walks.prune();
+        self.locks.prune();
+    }
+
     /// The process's isolator and verifier (D156, D202). A `StartRun` re-reads the repo map and
     /// rebuilds the production isolator when it moved and no walk of this process is live, and is
     /// refused with [`REPOS_MOVED`] when one is (R-39).
@@ -907,7 +924,8 @@ impl Shared {
 }
 
 /// R-27: one async mutex per run, minted on first use. Held by every command, resume, claim and
-/// sweep-driven recovery of that run for its whole duration (plan D157).
+/// sweep-driven recovery of that run for its whole duration (plan D157). An entry nobody holds or
+/// waits for is pruned at the next sweep tick (D214), and minted again when next used.
 #[derive(Debug, Clone, Default)]
 pub struct RunLocks(Arc<StdMutex<HashMap<RunId, Arc<tokio::sync::Mutex<()>>>>>);
 
@@ -931,6 +949,16 @@ impl RunLocks {
     #[must_use]
     pub fn try_lock(&self, run: RunId) -> Option<OwnedMutexGuard<()>> {
         self.entry(run).try_lock_owned().ok()
+    }
+
+    /// D214: drops every entry nobody holds or waits for. A guard and a waiter each own a clone
+    /// of the entry, which [`Self::entry`] hands out under this same map lock, so a count of one
+    /// that is also free means no task can be serialised by it: removing it keeps the exclusion.
+    fn prune(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, lock| Arc::strong_count(lock) > 1 || lock.try_lock().is_err());
     }
 }
 
@@ -1034,6 +1062,15 @@ impl Walks {
     /// Whether [`Self::close`] ran.
     fn closed(&self) -> bool {
         self.root.is_cancelled()
+    }
+
+    /// D214: drops the parent of every run no task works on. [`Self::child`] counts a task in under
+    /// this same lock, so none is minted meanwhile, and [`Self::is_live`] and [`Self::any_live`]
+    /// already read a parent with no task as absent; the next task of the run mints a fresh one,
+    /// a child of the root like the one dropped.
+    fn prune(&self) {
+        self.lock()
+            .retain(|_, parent| parent.live.load(Ordering::SeqCst) > 0);
     }
 }
 
@@ -1335,7 +1372,11 @@ impl RunRuntime {
 
     /// D158, D189, D190: one recovery sweep on a task of its own. Returns at once: the tick is
     /// skipped while a sweep is still running, and nothing happens without a server.
+    ///
+    /// Every tick first prunes what nothing uses any longer (D214): finished task handles, idle
+    /// run parents and free run locks.
     pub fn sweep(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
+        self.shared.prune();
         if backend.writer().is_none() || self.shared.walks.closed() {
             return;
         }
@@ -1444,7 +1485,8 @@ impl RunRuntime {
         self.shared.isolator_builds.load(Ordering::SeqCst)
     }
 
-    /// How many tasks this runtime still owns, finished ones included until the next `serve`.
+    /// How many tasks this runtime still owns, finished ones included until the next `serve` or
+    /// sweep tick prunes them (D214).
     #[must_use]
     pub fn tasks_len(&self) -> usize {
         self.shared
@@ -1463,11 +1505,7 @@ impl RunRuntime {
         envelope: &RequestEnvelope,
         live: &LiveChats,
     ) -> RunServed {
-        self.shared
-            .tasks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|task| !task.handle.is_finished());
+        self.shared.prune_tasks();
         self.shared.publisher.wire(replies);
         match &envelope.request {
             StoreRequest::RunStream { item } => {
