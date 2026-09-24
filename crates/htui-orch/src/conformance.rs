@@ -4923,6 +4923,7 @@ async fn accept_artifact_verifies_captures_and_resumes_at_the_next_position<H: C
 /// and ended, the same accept goes through.
 async fn accept_artifact_needs_the_document_and_the_promotion<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
+    primary_repo(&orch).await;
     free_feat_3(&orch).await;
     orch.script("prd", 1, ScriptedStep::done_without_output());
     let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;

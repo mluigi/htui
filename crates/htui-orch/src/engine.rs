@@ -24,7 +24,7 @@ use futures::future::Either;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
-use htui_agent::event::DoneEvent;
+use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
     BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, EventKind, Gate, GateOutcome,
@@ -703,6 +703,7 @@ where
         crate::command::answer_gate_enabled(&step, &phase, has_output, &answer)?;
         self.answer_guarded(&run, &snapshot, &step, &phase, answer)
             .await
+            .map(|rest| CommandOutcome::Answered { rest })
     }
 
     /// [`Self::answer_gate`] past its guard, over the rows the guard read: the lease, the answer,
@@ -714,7 +715,7 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
         answer: GateAnswer,
-    ) -> Result<CommandOutcome, EngineError> {
+    ) -> Result<Rest, EngineError> {
         // Plan D108: after the pure guard and before the first write, so a live lease elsewhere
         // refuses with the gate still unanswered (blueprint F-N).
         let until = self.take_lease(run.id).await?;
@@ -770,8 +771,7 @@ where
                 None => self.run_to_rest(run.id).await,
             }
         };
-        let rest = self.walk_leased(run.id, until, tail).await?;
-        Ok(CommandOutcome::Answered { rest })
+        self.walk_leased(run.id, until, tail).await
     }
 
     /// What a human's rejection means: the review loop when the phase can loop, the end of the run
@@ -1270,8 +1270,81 @@ where
         step: StepId,
         chat_live: bool,
     ) -> Result<CommandOutcome, EngineError> {
-        let _ = (run, step, chat_live);
-        todo!("MOD-4 plan D166: accept artifact")
+        let run = self.run(run).await?;
+        let snapshot = Self::snapshot_of(&run)?;
+        let row = self.step(run.id, step).await?;
+        let phase = Self::phase_at(run.id, &snapshot, row.position)?;
+        let item = Self::item_of(&run)?;
+        let has_output = self.output_of(item, &phase, row.id).await?.is_some();
+        crate::command::accept_enabled(&row, &phase, has_output, chat_live)?;
+
+        // Plan D108's order: after the pure guard and before the first write.
+        self.take_lease(run.id).await?;
+        let now = self.now();
+        self.leased_window(run.id, async {
+            let trees = self.parts.store.step_trees(row.id).await?;
+            let repos = self.parts.store.repos(run.project_id).await?;
+            let cwd = chat_dirs(&trees, &repos)
+                .map(|(cwd, _)| cwd)
+                .unwrap_or_default();
+            // The chat's session ended as a session does: `EndTurn`. A verify runs only after a
+            // `Done` (blueprint A-3), and this one's is the human's.
+            let verify = self
+                .verify(VerifyStage {
+                    run: &run,
+                    step: &row,
+                    phase: &phase,
+                    trees: &trees,
+                    started_at: row.started_at.unwrap_or(now),
+                    session_cwd: &cwd,
+                    result: &Ok(DoneEvent {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                })
+                .await?;
+            let after = self.parts.isolator.capture(row.id, &trees).await?;
+            self.parts.store.record_commits(row.id, &after).await?;
+            let verify_outcome = verify.as_ref().map(|report| report.outcome);
+            let verify_exit_code = verify.as_ref().and_then(|report| report.exit_code);
+            self.parts
+                .store
+                .finish_step(
+                    row.id,
+                    StepOutcome {
+                        exit_code: None,
+                        usage: None,
+                        trim_record: None,
+                        verify_outcome,
+                        verify_exit_code,
+                        finished_at: now,
+                    },
+                )
+                .await?;
+            // Blueprint D194: a failed verify is recorded and refused; the step stays promoted,
+            // and the window gives the lease back.
+            if verify_outcome == Some(VerifyOutcome::Fail) {
+                let refusal = EngineError::AcceptVerifyFailed {
+                    step: row.id,
+                    exit_code: verify_exit_code,
+                };
+                self.note(
+                    item,
+                    format!("accept refused: {refusal}"),
+                    Some(row.id),
+                    now,
+                )
+                .await?;
+                return Err(refusal);
+            }
+            Ok(())
+        })
+        .await?;
+
+        // `AnswerGate(Approved)`'s tail: its lease take is a renewal of the one held here.
+        let rest = self
+            .answer_guarded(&run, &snapshot, &row, &phase, GateAnswer::Approved)
+            .await?;
+        Ok(CommandOutcome::Accepted { rest })
     }
 
     /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).
