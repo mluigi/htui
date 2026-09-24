@@ -405,10 +405,10 @@ pub fn phase_at(run: RunId, s: &GraphSnapshot, position: i32) -> Result<Snapshot
 pub fn retry_admitted(run: &Run, item: Status, steps: &[RunStep], step: &RunStep, phase: &SnapshotPhase) -> Result<(), EngineError>;
 /// Step running|awaiting_approval|failed (§6.2 `:1563`), run non-terminal, item not blocked
 /// (ItemBlocked), not a fan-out candidate (phase.fan_out > 1 → PromoteCandidate), chat_open false.
-pub fn promote_enabled(run: &Run, item: Status, step: &RunStep, phase: &SnapshotPhase, chat_open: bool) -> Result<(), EngineError>;
+pub fn promote_enabled(run: &Run, item: Status, steps: &[RunStep], step: &RunStep, phase: &SnapshotPhase, chat_open: bool) -> Result<(), EngineError>; // steps added by T4 repair b6cb08f: refuses a non-latest attempt with StaleSlot
 /// Step awaiting_approval, promoted_at set (NotPromoted), has_output (MissingOutputForApproval),
 /// chat_live false (ChatLive(Some)).
-pub fn accept_enabled(step: &RunStep, phase: &SnapshotPhase, has_output: bool, chat_live: bool) -> Result<(), EngineError>;
+pub fn accept_enabled(steps: &[RunStep], step: &RunStep, phase: &SnapshotPhase, has_output: bool, chat_live: bool) -> Result<(), EngineError>; // steps added by T4 repair b6cb08f
 /// D161's three cases in order over (run, its cursor) pairs; resumable_park decides case 3.
 pub fn unblock_enabled(item: &Item, runs: &[(Run, Cursor)]) -> Result<UnblockCase, EngineError>;
 /// No active run (RunStatus naming the first live one), item done|failed|blocked (NotClosable).
@@ -669,8 +669,8 @@ None of these carries a secret (`store_worker.rs:71-78`). A rejection note is th
   - `approve = answer_gate_enabled(step, phase, has_output, &Approved)`;
   - `reject` = the same with `Rejected { note: String::new() }`;
   - `retry = retry_admitted(..)`;
-  - `promote = promote_enabled(run, item.status, step, phase, !live.is_empty())`;
-  - `accept = accept_enabled(step, phase, has_output, live.contains(step.id))`;
+  - `promote = promote_enabled(run, item.status, steps, step, phase, !live.is_empty())`;
+  - `accept = accept_enabled(steps, step, phase, has_output, live.contains(step.id))`;
   - `select = select_enabled(run, &group_at(steps, p, a), step.id, p, a)` for `fanout_index >= 0 && phase.fan_out > 1`, else `Err("step X is not a fan-out candidate")`;
   - `open` = the newest head of `phase.output_kind` produced by the step, else ``Err("step X produced no `<kind>` document")``.
 - Item level: `unblock_enabled(..).map(drop)`, `close_out_enabled`, `start_enabled`.
