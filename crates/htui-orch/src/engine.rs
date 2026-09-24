@@ -1364,14 +1364,17 @@ where
                 return Err(refusal);
             }
             // MOD-4 plan D211: `unavailable` is not refused, but a human reads that the merge
-            // goes in unverified, and why.
+            // goes in unverified, and why. Only the reason: `ShellVerifier` writes it on the first
+            // line and the command's captured tail after it, and that tail is already in
+            // `command_run.output`.
             if let Some(report) = verify
                 .as_ref()
                 .filter(|report| report.outcome == VerifyOutcome::Unavailable)
             {
+                let reason = report.output.lines().next().unwrap_or_default();
                 self.note(
                     item,
-                    format!("accept: verify unavailable: {}", report.output),
+                    format!("accept: verify unavailable: {reason}"),
                     Some(row.id),
                     now,
                 )
