@@ -42,8 +42,9 @@ use htui_core::store::{StoreError, WriteStore};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::closeout;
 use crate::command::{
-    Command, CommandOutcome, EngineError, GateAnswer, Rest, stale_run, stale_step,
+    Command, CommandOutcome, EngineError, GateAnswer, Rest, UnblockCase, stale_run, stale_step,
 };
 use crate::fanout::{
     AUTO_WIN_REASON, CandidateView, HUMAN_PICK_REASON, HumanReason, JUDGE_KIND, JudgeFailure,
@@ -297,6 +298,14 @@ impl DeadWalks {
         self.lock().iter().copied().collect()
     }
 
+    /// A walk task of this process died (a panic), so the next sweep releases and adopts it
+    /// (MOD-4 plan D158, R-12). `pub` because the task's supervisor in `run_worker` is the one
+    /// place that sees the `JoinError`.
+    pub fn mark(&self, run: RunId) {
+        let _ = run;
+        todo!("MOD-4 plan D158: mark a dead walk")
+    }
+
     fn insert(&self, run: RunId) {
         self.lock().insert(run);
     }
@@ -311,6 +320,32 @@ impl DeadWalks {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// MOD-4 plan D189 (blueprint F-E): the per-run fence a sweep has to respect.
+///
+/// Milestone 6's worker holds one lock per run across every command and walk of it (plan D157).
+/// [`Engine::sweep_fenced`] asks the fence before it touches a run: a run whose `hold` answers
+/// `None` is held by a live command of this process, so the sweep neither gives its lease back
+/// nor recovers it. The guard is held for as long as the sweep works on the run.
+pub trait RunFence: Sync {
+    /// What holding a run is; dropping it frees the run again.
+    type Guard: Send;
+
+    /// The run's fence when nobody holds it, or `None` when a command or walk does.
+    fn hold(&self, run: RunId) -> Option<Self::Guard>;
+}
+
+/// The fence of a caller that runs one command at a time: every run is free.
+#[derive(Debug, Default, Clone, Copy)]
+struct NoFence;
+
+impl RunFence for NoFence {
+    type Guard = ();
+
+    fn hold(&self, _run: RunId) -> Option<()> {
+        Some(())
     }
 }
 
@@ -511,6 +546,26 @@ where
                 todo!("MOD-4 milestone 6: promote, accept, unblock and close-out")
             }
         }
+    }
+
+    /// §6.2's `run`/`queue` up to the claim (MOD-4 plan D186, blueprint F-I): resolve the item's
+    /// graph, refuse rung 4 onto the item, and create the run `queued`. `create_run` moves the
+    /// item `open | failed -> queued` in its own transaction, so it admits one run per item and
+    /// no item lock is needed.
+    ///
+    /// `pub` so milestone 6's `run_worker` can take the run's lock between this and
+    /// [`Self::claim`]: `StartRun` is exactly the two, in that order.
+    ///
+    /// # Errors
+    /// [`EngineError::Resolve`] (rung 4, after its note on the item), and the store's refusals.
+    pub async fn enqueue(
+        &self,
+        item: ItemId,
+        mode: htui_core::model::RunMode,
+        repo_scope: Option<Vec<RepoId>>,
+    ) -> Result<RunId, EngineError> {
+        let _ = (item, mode, repo_scope);
+        todo!("MOD-4 plan D186: enqueue")
     }
 
     /// §6.2's `run`/`queue`: resolve, create, claim, walk.
@@ -1268,6 +1323,18 @@ where
         self.now() + self.lease_times().ttl
     }
 
+    /// MOD-4 plan D188 (blueprint F-D): a walk the worker dropped mid-flight — a preempting
+    /// `CancelRun` or `PromoteStep`, or a token cancelled while it walked — ran neither of
+    /// [`Self::walk_leased`]'s release arms. This is what they would have done: the run's
+    /// `shared_serialized` guards dropped through `Isolator::release`, then the lease given back.
+    ///
+    /// Best-effort, and it never raises: a failed guard release is a `warn`, and a failed lease
+    /// release puts the run in [`DeadWalks`] as [`Self::release_lease`] always does.
+    pub async fn abandoned(&self, run: RunId) {
+        let _ = run;
+        todo!("MOD-4 plan D188: an abandoned walk's release")
+    }
+
     /// Plan D87/D139: the store's `release_lease(run, owner, now)`. The lease reads as expired at
     /// once and has no owner, so every process's sweep may adopt the run, this one's included
     /// (plan D88 skips only a row this process still owns). A heartbeat refresh that hung and
@@ -1329,6 +1396,7 @@ where
     /// # Errors
     /// Only `adopt_runs`' own store error: nothing was adopted then.
     pub async fn sweep(&self) -> Result<Vec<Adopted>, EngineError> {
+        let _ = NoFence;
         for run in self.parts.dead_walks.runs() {
             self.release_lease(run).await;
         }
@@ -1384,6 +1452,39 @@ where
             swept.push(Adopted { run: run.id, next });
         }
         Ok(swept)
+    }
+
+    /// [`Self::sweep`] under a [`RunFence`] (MOD-4 plan D189, blueprint F-E): the dead-walk
+    /// pre-pass gives back no lease of a run the fence holds, and an adopted run the fence holds
+    /// is skipped with a `debug!` — the adopted lease is this owner's, and the holder's own
+    /// `take_lease` renews it. Every other run is recovered as [`Self::sweep`] does, with its
+    /// fence held through the recovery.
+    ///
+    /// # Errors
+    /// As [`Self::sweep`].
+    pub async fn sweep_fenced<F: RunFence>(&self, fence: &F) -> Result<Vec<Adopted>, EngineError> {
+        let _ = fence;
+        todo!("MOD-4 plan D189: the fenced sweep")
+    }
+
+    /// MOD-4 plan D161: which of `Unblock`'s three cases `item` is in, read-only — the item, then
+    /// each of its active runs with its cursor, handed to [`crate::command::unblock_enabled`].
+    ///
+    /// # Errors
+    /// [`EngineError::NotBlocked`], and the store's and the snapshot's own.
+    pub async fn unblock_case(&self, item: ItemId) -> Result<UnblockCase, EngineError> {
+        let _ = item;
+        todo!("MOD-4 plan D161: unblock's case")
+    }
+
+    /// MOD-4 plan D167's first confirmation, read-only: [`crate::command::close_out_enabled`],
+    /// then [`closeout::preview`] over exactly the rows `CloseOut` would write the summary from.
+    ///
+    /// # Errors
+    /// [`EngineError::RunStatus`] or [`EngineError::NotClosable`], and the store's own.
+    pub async fn close_out_preview(&self, item: ItemId) -> Result<closeout::Preview, EngineError> {
+        let _ = item;
+        todo!("MOD-4 plan D167: the close-out preview")
     }
 
     /// Blueprint A-4: one run's recovery failed. Warned, noted on the item, and the lease given
@@ -10019,6 +10120,295 @@ mod tests {
             .into_iter()
             .find(|step| step.run_id == ids::RUN_1 && step.position == 0)
             .expect("RUN_1 has a step at position 0")
+    }
+
+    /// A [`super::RunFence`] holding exactly the runs it names, as the worker's `RunLocks` would
+    /// for a run whose command is live.
+    struct Held(Vec<htui_core::model::RunId>);
+
+    impl super::RunFence for Held {
+        type Guard = ();
+
+        fn hold(&self, run: htui_core::model::RunId) -> Option<()> {
+            (!self.0.contains(&run)).then_some(())
+        }
+    }
+
+    /// MOD-4 plan D186: `StartRun` is `enqueue` then `claim`, and nothing walks in between — the
+    /// window the worker takes the run's lock in.
+    #[tokio::test]
+    async fn enqueue_then_claim_is_start_run() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness_engine!(harness.orch, engine);
+
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect("the graph resolves");
+        assert_eq!(harness.orch.run(run).await.status, RunStatus::Queued);
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Queued,
+            "`create_run` moved the item"
+        );
+        assert!(harness.orch.steps(run).await.is_empty(), "nothing walked");
+
+        let refused = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect_err("`create_run`'s compare-and-set admits one run per item");
+        assert!(matches!(refused, EngineError::Store(_)), "{refused}");
+
+        let CommandOutcome::Started { run: claimed, rest } =
+            engine.claim(run).await.expect("the box has a slot")
+        else {
+            panic!("`claim` answers `Started`");
+        };
+        assert_eq!(claimed, run);
+        assert_eq!(
+            (rest.run, rest.position, rest.failure),
+            (RunStatus::AwaitingApproval, Some(0), None),
+            "`StartRun`'s own first rest"
+        );
+    }
+
+    /// MOD-4 plan D158 (R-12): a walk task of this process that died leaves its run `running`
+    /// under a live lease naming this process, which plan D88 keeps the sweep off. `mark` puts
+    /// it in the dead-walk set, so the next sweep gives the lease back and adopts it.
+    #[tokio::test]
+    async fn a_marked_dead_walk_is_adopted_by_the_next_sweep() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let run = leased_run(&harness).await;
+        assert!(
+            engine
+                .sweep()
+                .await
+                .expect("the sweep runs")
+                .iter()
+                .all(|adopted| adopted.run != run),
+            "plan D88: a live walk's lease is not this process's sweep's"
+        );
+
+        harness.orch.dead_walks.mark(run);
+        assert!(harness.orch.dead_walks.contains(run));
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            swept,
+            [super::Adopted {
+                run,
+                next: super::Next::Walk
+            }],
+            "the dead walk's lease was given back, so this process adopts the run"
+        );
+        assert!(!harness.orch.dead_walks.contains(run));
+    }
+
+    /// MOD-4 plan D189 (blueprint F-E): a run the fence holds is neither released by the
+    /// dead-walk pre-pass nor recovered; an adopted one it holds keeps the lease the adoption
+    /// took, which is this owner's, and nothing is written to it.
+    #[tokio::test]
+    async fn a_fenced_sweep_skips_a_held_run_and_keeps_its_lease() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let run = leased_run(&harness).await;
+        harness.orch.dead_walks.mark(run);
+        let before = harness.orch.run(run).await;
+
+        let swept = engine
+            .sweep_fenced(&Held(vec![run]))
+            .await
+            .expect("the sweep runs");
+        assert!(swept.is_empty(), "{swept:?}");
+        assert!(
+            harness.orch.dead_walks.contains(run),
+            "the pre-pass gave back no lease of a held run"
+        );
+        assert_eq!(harness.orch.run(run).await, before, "the run is untouched");
+
+        // A second process, past the first one's lease: its sweep adopts the run, and its fence
+        // holds it, so the recovery is skipped and the adopted lease stays this owner's.
+        let other = Harness {
+            orch: harness.orch.restarted(),
+        };
+        harness_engine!(other.orch, second);
+        let swept = second
+            .sweep_fenced(&Held(vec![run]))
+            .await
+            .expect("the sweep runs");
+        assert!(swept.is_empty(), "a held run is not recovered: {swept:?}");
+        assert!(
+            other.orch.steps(run).await.is_empty(),
+            "no recovery wrote to it"
+        );
+        second
+            .take_lease(run)
+            .await
+            .expect("the adopted lease is this owner's, so the holder's take renews it");
+        let refused = engine
+            .take_lease(run)
+            .await
+            .expect_err("and no longer the first process's");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { .. }),
+            "{refused}"
+        );
+
+        let swept = second
+            .sweep_fenced(&Held(Vec::new()))
+            .await
+            .expect("the sweep runs");
+        assert!(
+            swept.is_empty(),
+            "plan D88: once live, the lease is never this process's sweep's: {swept:?}"
+        );
+    }
+
+    /// MOD-4 plan D188 (blueprint F-D): an abandoned walk's guards are dropped and its lease is
+    /// given back, so this process's own sweep adopts the run at once; a release the store cannot
+    /// answer is remembered for the sweep, and nothing raises.
+    #[tokio::test]
+    async fn abandoned_releases_the_guards_and_the_lease() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let run = leased_run(&harness).await;
+
+        engine.abandoned(run).await;
+        assert_eq!(harness.orch.isolator.releases(), 1, "the run's guards");
+        assert_eq!(
+            harness.orch.run(run).await.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "the lease is given back"
+        );
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [run]
+        );
+
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let run = leased_run(&harness).await;
+        harness.orch.store.set_fault(MemFault::ReleaseLease, true);
+        engine.abandoned(run).await;
+        assert_eq!(
+            harness.orch.dead_walks.runs(),
+            [run],
+            "an unanswered release waits for the sweep"
+        );
+    }
+
+    /// Blueprint D204 (R-52, H-3): milestone 6 spawns engine futures onto tokio tasks, so the
+    /// entries a task awaits are `Send` over the worker's own part shapes — `dyn Isolator`,
+    /// `dyn Verifier` and `dyn Clock`. A compile-time check: nothing is polled.
+    #[tokio::test]
+    async fn a_dispatch_future_is_send() {
+        fn assert_send<F: Send>(_: &F) {}
+
+        let orch = FakeOrchestrator::demo();
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let parts = super::fake_parts(&orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        let isolator: &dyn crate::isolate::Isolator = &orch.isolator;
+        let verifier: &dyn crate::verify::Verifier = &orch.verifier;
+        let clock: &dyn crate::isolate::Clock = &orch.clock;
+        let engine = super::Engine::new(super::EngineParts {
+            store: parts.store,
+            graphs: parts.graphs,
+            isolator,
+            verifier,
+            clock,
+            selector: parts.selector,
+            sink: &NoSink,
+            driver: parts.driver,
+            scrubber: parts.scrubber,
+            app: parts.app,
+            box_profile: parts.box_profile,
+            box_id: parts.box_id,
+            owner: parts.owner,
+            dead_walks: parts.dead_walks,
+            user: parts.user,
+        });
+
+        assert_send(&engine.dispatch(Command::CancelRun { run: ids::RUN_2 }));
+        assert_send(&engine.resume(ids::RUN_2));
+        assert_send(&engine.sweep_fenced(&Held(Vec::new())));
+    }
+
+    /// MOD-4 plan D161's read-only half: the item and its active runs, each with its cursor.
+    #[tokio::test]
+    async fn unblock_case_reads_the_item_and_its_active_runs() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness_engine!(harness.orch, engine);
+        let refused = engine
+            .unblock_case(ids::HTUI_FEAT_3)
+            .await
+            .expect_err("an open item");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { status: Status::Open, why, .. } if *why == crate::command::nothing_is_blocked()),
+            "{refused}"
+        );
+
+        let (run, _) = started(&harness).await;
+        let refused = engine
+            .unblock_case(ids::HTUI_FEAT_3)
+            .await
+            .expect_err("a real gate is answered, not unblocked");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { why, .. } if *why == crate::command::run_waits_at_a_gate(run)),
+            "{refused}"
+        );
+    }
+
+    /// MOD-4 plan D167's first confirmation counts what `CloseOut` would write, and is refused
+    /// while a run of the item is live.
+    #[tokio::test]
+    async fn close_out_preview_counts_what_close_out_writes() {
+        let harness = Harness::new().await;
+        harness.add_primary_repo().await;
+        harness_engine!(harness.orch, engine);
+        let (run, _) = started(&harness).await;
+        let refused = engine
+            .close_out_preview(ids::HTUI_FEAT_3)
+            .await
+            .expect_err("a live run");
+        assert!(
+            matches!(refused, EngineError::RunStatus { run: live, .. } if live == run),
+            "{refused}"
+        );
+
+        for _ in 0..4 {
+            let parked = harness
+                .orch
+                .steps(run)
+                .await
+                .into_iter()
+                .find(|step| step.status == StepStatus::AwaitingApproval)
+                .expect("a parked step");
+            harness
+                .dispatch(Command::AnswerGate {
+                    run,
+                    step: parked.id,
+                    answer: GateAnswer::Approved,
+                })
+                .await
+                .expect("the artefact is there");
+        }
+        let preview = engine
+            .close_out_preview(ids::HTUI_FEAT_3)
+            .await
+            .expect("a done item with no live run");
+        assert_eq!(
+            (preview.status, preview.runs, preview.rows, preview.version),
+            (Status::Done, 2, 4, 1),
+            "the seeded `RUN_2` and this one; one row per step, each committed to the primary"
+        );
     }
 
     async fn phase_of(orch: &FakeOrchestrator) -> SnapshotPhase {
