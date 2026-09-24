@@ -56,6 +56,7 @@ use uuid::Uuid;
 pub struct MemStore {
     state: Arc<RwLock<State>>,
     /// The writes [`MemStore::set_fault`] switched on, shared through clones as `state` is.
+    #[cfg(feature = "test-support")]
     faults: Arc<RwLock<HashSet<MemFault>>>,
 }
 
@@ -64,6 +65,7 @@ pub struct MemStore {
 ///
 /// A test seam only: nothing in production switches one on. A faulted write answers
 /// [`StoreError::Unreachable`] before it touches any state, until it is switched off.
+#[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemFault {
     /// [`WriteStore::refresh_lease`].
@@ -248,6 +250,7 @@ impl MemStore {
         };
         Self {
             state: Arc::new(RwLock::new(state)),
+            #[cfg(feature = "test-support")]
             faults: Arc::default(),
         }
     }
@@ -707,6 +710,7 @@ impl MemStore {
     /// MOD-4 plan D152: `on` makes the write `fault` names answer [`StoreError::Unreachable`]
     /// before it touches any state, on this store and every clone of it, until a call with
     /// `on == false` switches it off. A test seam; see [`MemFault`].
+    #[cfg(feature = "test-support")]
     pub fn set_fault(&self, fault: MemFault, on: bool) {
         let mut faults = self.faults.write().unwrap_or_else(PoisonError::into_inner);
         if on {
@@ -717,6 +721,7 @@ impl MemStore {
     }
 
     /// `Err(Unreachable)` when `fault` is switched on (plan D152), `Ok(())` otherwise.
+    #[cfg(feature = "test-support")]
     fn check_fault(&self, fault: MemFault) -> Result<()> {
         let faults = self.faults.read().unwrap_or_else(PoisonError::into_inner);
         if faults.contains(&fault) {
@@ -4331,6 +4336,7 @@ impl WriteStore for MemStore {
     }
 
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
+        #[cfg(feature = "test-support")]
         self.check_fault(MemFault::ItemTransition)?;
         let now = Utc::now();
         self.write(|state| state.transition(id, from, to, now))
@@ -4609,6 +4615,7 @@ impl WriteStore for MemStore {
     }
 
     async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
+        #[cfg(feature = "test-support")]
         self.check_fault(MemFault::RefreshLease)?;
         let now = Utc::now();
         self.write(|state| state.refresh_lease(run, owner, until, now))
@@ -4638,6 +4645,7 @@ impl WriteStore for MemStore {
     }
 
     async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+        #[cfg(feature = "test-support")]
         self.check_fault(MemFault::ReleaseLease)?;
         let stamp = Utc::now();
         self.write(|state| state.release_lease(run, owner, now, stamp))
