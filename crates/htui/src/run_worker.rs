@@ -2061,12 +2061,13 @@ pub(crate) mod tests {
         RepoId, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId,
         TIMESTAMPTZ_DIGITS, Transport,
     };
+    use htui_core::store::mem::MemFault;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
     use htui_orch::fake::{FakeIsolator, FakeVerifier};
     use htui_orch::{
         Clock, Command, CommandOutcome, EngineError, GateAnswer, GraphSource, Isolator,
     };
-    use htui_store::{Backend, Started};
+    use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore, Started};
     use serde_json::json;
     use tokio::sync::{Notify, mpsc};
 
@@ -2455,15 +2456,20 @@ pub(crate) mod tests {
 
         /// The first non-stream envelope at `seq`, waiting for it.
         pub(crate) async fn envelope(&mut self, seq: u64) -> ReplyEnvelope {
+            self.envelope_within(seq, PATIENCE).await
+        }
+
+        /// [`Self::envelope`], waiting up to `patience` for each arrival.
+        async fn envelope_within(&mut self, seq: u64, patience: Duration) -> ReplyEnvelope {
             loop {
                 if let Some(at) = self.seen.iter().position(|envelope| {
                     envelope.seq == seq && !matches!(envelope.reply, StoreReply::RunStream(_))
                 }) {
                     return self.seen.remove(at);
                 }
-                let envelope = tokio::time::timeout(PATIENCE, self.replies.recv())
+                let envelope = tokio::time::timeout(patience, self.replies.recv())
                     .await
-                    .unwrap_or_else(|_| panic!("no reply at seq {seq} within {PATIENCE:?}"))
+                    .unwrap_or_else(|_| panic!("no reply at seq {seq} within {patience:?}"))
                     .expect("the worker is running");
                 self.seen.push(envelope);
             }
@@ -2860,12 +2866,18 @@ pub(crate) mod tests {
 
     /// Polls the store until `run` reaches `status`.
     async fn rests_at(fixture: &Fixture, run: RunId, status: RunStatus) {
-        within(&format!("run {run} reaching `{status}`"), async {
+        rests_within(fixture, run, status, PATIENCE).await;
+    }
+
+    /// [`rests_at`] with a patience of its own: a paused-clock case waits out sweep periods.
+    async fn rests_within(fixture: &Fixture, run: RunId, status: RunStatus, patience: Duration) {
+        tokio::time::timeout(patience, async {
             while fixture.run(run).await.status != status {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await;
+        .await
+        .unwrap_or_else(|_| panic!("run {run} did not reach `{status}` within {patience:?}"));
     }
 
     /// D158: the startup sweep adopts every stranded run and resumes each on its own task, so one
@@ -3080,6 +3092,157 @@ pub(crate) mod tests {
         for (origin, seq, frame) in &later {
             assert_eq!((origin, *seq), (&backlog, 11), "{frame:?}");
         }
+    }
+
+    /// D174, PRD `:197`: off the server every command is refused with MOD-25's one sentence and
+    /// nothing is spawned, while the stream and the verdicts still answer from the mirror.
+    #[tokio::test]
+    async fn an_offline_backend_refuses_every_orch_request_with_one_sentence() {
+        let root = tempfile::tempdir().expect("a throwaway mirror root");
+        let cache = CacheStore::open(root.path(), "run-worker-offline", PgStore::schema_version())
+            .await
+            .expect("the mirror opens");
+        htui_store::testkit::seed_mirror(&cache, &htui_core::fixtures::demo_data())
+            .await
+            .expect("the mirror is seeded");
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: Some(Utc::now()),
+        };
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let (replies, _answers) = mpsc::unbounded_channel();
+        let serve = async |runtime: &mut RunRuntime, seq: u64, request: StoreRequest| {
+            runtime
+                .serve(
+                    &backend,
+                    &replies,
+                    &RequestEnvelope {
+                        seq,
+                        origin: Origin::App,
+                        request,
+                    },
+                    &LiveChats::default(),
+                )
+                .await
+        };
+
+        for (seq, request) in (1..).zip(every_orch_request()) {
+            let name = request.name();
+            let served = serve(&mut runtime, seq, StoreRequest::Orch(request)).await;
+            assert!(
+                matches!(&served, RunServed::Reply(StoreReply::Failed { request, message })
+                    if *request == name && message == DATABASE_UNREACHABLE),
+                "{served:?}"
+            );
+        }
+        assert_eq!(runtime.tasks_len(), 0, "nothing was spawned");
+        assert_eq!(runtime.isolator_builds(), 0, "and nothing was built");
+
+        let served = serve(
+            &mut runtime,
+            20,
+            StoreRequest::RunStream {
+                item: ids::HTUI_FEAT_1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            served,
+            RunServed::Reply(StoreReply::RunStream(super::RunFrame {
+                kind: FrameKind::Subscribed,
+                ..
+            }))
+        ));
+
+        let RunServed::Reply(StoreReply::RunActions(actions)) =
+            serve(&mut runtime, 21, StoreRequest::RunActions(ids::HTUI_FEAT_1)).await
+        else {
+            panic!("the verdicts are read from the mirror");
+        };
+        let offline = Err(DATABASE_UNREACHABLE.to_owned());
+        assert_eq!(actions.item, ids::HTUI_FEAT_1);
+        assert_eq!(
+            (&actions.run, &actions.unblock, &actions.close_out),
+            (&offline, &offline, &offline)
+        );
+        for verdict in actions.runs.values() {
+            assert_eq!((&verdict.cancel, &verdict.cleanup), (&offline, &offline));
+        }
+        for verdict in actions.steps.values() {
+            for enabled in [
+                &verdict.approve,
+                &verdict.reject,
+                &verdict.retry,
+                &verdict.promote,
+                &verdict.accept,
+                &verdict.select,
+            ] {
+                assert_eq!(enabled, &offline);
+            }
+        }
+        cache.close().await;
+    }
+
+    /// D175 (criterion 19 re-scoped): a store that stops answering lease refreshes fences the walk
+    /// — its run joins the dead walks with a `LeaseLost` frame — and once the store answers again
+    /// the next sweep adopts it and a second attempt rests it.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_outage_fences_the_walk_and_the_sweep_adopts_it_after() {
+        let fixture = Fixture::new().await;
+        fixture
+            .store
+            .set_app_setting("lease_ttl_seconds", json!(30));
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let runtime = fixture.runtime();
+        let shared = Arc::clone(&runtime.shared);
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+        let backlog = Origin::Tab(TabId("backlog"));
+        worker.send_at(
+            backlog,
+            1,
+            StoreRequest::RunStream {
+                item: ids::HTUI_ANA_2,
+            },
+        );
+
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        within("the session starting", stall.reached.notified()).await;
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        fixture.store.set_fault(MemFault::RefreshLease, true);
+
+        let StoreReply::Failed { message, .. } = worker
+            .envelope_within(start, Duration::from_secs(600))
+            .await
+            .reply
+        else {
+            panic!("a fenced walk is refused");
+        };
+        fixture.store.set_fault(MemFault::RefreshLease, false);
+        assert!(message.contains("lease"), "{message}");
+        assert!(shared.dead_walks.contains(run), "the run is a dead walk");
+        assert!(
+            frames(&mut worker).iter().any(
+                |(_, _, frame)| matches!(&frame.kind, FrameKind::Error(sentence) if *sentence == message)
+            ),
+            "the fence is published"
+        );
+        assert!(stall.dropped.load(Ordering::SeqCst), "the walk was dropped");
+
+        rests_within(
+            &fixture,
+            run,
+            RunStatus::AwaitingApproval,
+            Duration::from_secs(600),
+        )
+        .await;
+        assert_eq!(
+            step_at(&fixture, run, 0).await.attempt,
+            2,
+            "the adopted run walked a second attempt"
+        );
+        assert!(!shared.dead_walks.contains(run));
     }
 
     /// Plan D155: the five trait reads are the inherent reads of the same name.
