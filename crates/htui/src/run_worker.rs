@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -19,18 +19,19 @@ use htui_agent::registry::DriverFactory;
 use htui_core::model::{
     Agent, AgentBox, AgentId, AgentSummary, BoxId, BoxProfile, DocumentHead, DocumentId, Item,
     ItemId, NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph,
-    Run, RunId, RunStep, SnapshotCandidate, SnapshotPhase, StepId, UserId,
+    Run, RunId, RunStatus, RunStep, SnapshotCandidate, SnapshotPhase, StepId, UserId,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore as _, Result as StoreResult, StoreError, WriteStore as _};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
 use htui_orch::status::group_at;
 use htui_orch::{
-    Clock, Command, CommandOutcome, Cursor, DeadWalks, DriverFor, Engine, EngineError, EngineParts,
-    FirstCandidate, GateAnswer, GixIsolator, GraphSource, Isolator, IsolatorConfig, LeaseTimes,
-    Opening, OpeningPath, RepoCheckout, Rest, RunFence, SessionKey, SessionSink, ShellVerifier,
-    SystemClock, UnblockCase, Verifier, accept_enabled, cleanup_enabled, close_out_enabled, cursor,
-    phase_at, promote_enabled, retry_admitted, snapshot_of, start_enabled, unblock_enabled,
+    Adopted, Clock, Command, CommandOutcome, Cursor, DeadWalks, DriverFor, Engine, EngineError,
+    EngineParts, FirstCandidate, GateAnswer, GixIsolator, GraphSource, Isolator, IsolatorConfig,
+    LeaseTimes, Next, Opening, OpeningPath, RepoCheckout, Rest, Resume, RunFence, SessionKey,
+    SessionSink, ShellVerifier, SystemClock, UnblockCase, Verifier, accept_enabled,
+    cleanup_enabled, close_out_enabled, cursor, phase_at, promote_enabled, retry_admitted,
+    snapshot_of, start_enabled, unblock_enabled,
 };
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer, identity};
 use serde_json::Value;
@@ -694,6 +695,8 @@ struct Shared {
     sweep_every: AtomicU64,
     /// Whether [`RunRuntime::with_sweep_every`] fixed the period.
     sweep_fixed: bool,
+    /// D190: one sweep at a time.
+    sweeping: AtomicBool,
 }
 
 /// One task of the runtime, with the run it works on once it knows it.
@@ -1201,6 +1204,7 @@ impl RunRuntime {
                 queued: StdMutex::default(),
                 sweep_every: AtomicU64::new(millis(lease_period(&BTreeMap::new()))),
                 sweep_fixed: false,
+                sweeping: AtomicBool::new(false),
             }),
             events: Some(receiver),
         }
@@ -1224,10 +1228,43 @@ impl RunRuntime {
         Duration::from_millis(self.shared.sweep_every.load(Ordering::SeqCst))
     }
 
-    /// D158, D189, D190: one recovery sweep on a task of its own, unless one is still running or
-    /// there is no server.
+    /// D158, D189, D190: one recovery sweep on a task of its own. Returns at once: the tick is
+    /// skipped while a sweep is still running, and nothing happens without a server.
     pub fn sweep(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
-        let _ = (backend, replies);
+        if backend.writer().is_none() {
+            return;
+        }
+        if self
+            .shared
+            .sweeping
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        self.shared.publisher.wire(replies);
+        let ctx = TaskCtx {
+            shared: Arc::clone(&self.shared),
+            backend: backend.clone(),
+            replies: replies.clone(),
+            addr: None,
+            name: "sweep",
+            tag: Arc::default(),
+        };
+        let shared = Arc::clone(&self.shared);
+        let tag = Arc::clone(&ctx.tag);
+        let handle = tokio::spawn(async move {
+            /// Frees the one-sweep-at-a-time claim however the sweep ends.
+            struct Swept(Arc<Shared>);
+            impl Drop for Swept {
+                fn drop(&mut self) {
+                    self.0.sweeping.store(false, Ordering::SeqCst);
+                }
+            }
+            let _swept = Swept(Arc::clone(&ctx.shared));
+            sweep_once(ctx).await;
+        });
+        shared.track(tag, handle);
     }
 
     /// The shared state, while nothing else holds it: configuration happens before the first
@@ -1349,10 +1386,10 @@ impl RunRuntime {
                     shared: Arc::clone(&self.shared),
                     backend: backend.clone(),
                     replies: replies.clone(),
-                    addr: ReplyAddr {
+                    addr: Some(ReplyAddr {
                         seq: envelope.seq,
                         origin: envelope.origin.clone(),
-                    },
+                    }),
                     name,
                     tag: Arc::default(),
                 };
@@ -1420,7 +1457,9 @@ struct TaskCtx {
     shared: Arc<Shared>,
     backend: Backend,
     replies: mpsc::UnboundedSender<ReplyEnvelope>,
-    addr: ReplyAddr,
+    /// The request the task answers; `None` for a sweep's resume or a claim retry, which answer
+    /// nobody and only publish.
+    addr: Option<ReplyAddr>,
     name: &'static str,
     tag: Arc<Tag>,
 }
@@ -1428,11 +1467,25 @@ struct TaskCtx {
 impl TaskCtx {
     /// The one answer to the request.
     fn answer(&self, reply: StoreReply) {
-        let _ = self.replies.send(ReplyEnvelope {
-            seq: self.addr.seq,
-            origin: self.addr.origin.clone(),
-            reply,
-        });
+        if let Some(addr) = &self.addr {
+            let _ = self.replies.send(ReplyEnvelope {
+                seq: addr.seq,
+                origin: addr.origin.clone(),
+                reply,
+            });
+        }
+    }
+
+    /// A context for a task of this runtime's own: it answers nobody.
+    fn unaddressed(&self, name: &'static str) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            backend: self.backend.clone(),
+            replies: self.replies.clone(),
+            addr: None,
+            name,
+            tag: Arc::default(),
+        }
     }
 
     /// The request refused with `message`, and the refusal published for the item (D200).
@@ -1500,12 +1553,197 @@ async fn walked<T>(walk: &WalkToken, work: impl Future<Output = T>) -> Option<T>
     }
 }
 
-/// Spawns one request's task and tracks it.
+/// Spawns one request's task, supervised and tracked.
 fn spawn_task(ctx: TaskCtx, request: OrchRequest) {
+    let work = run_request(ctx.clone(), request);
+    spawn_supervised(ctx, work);
+}
+
+/// D158: every task runs inside a supervisor. A task that panicked has its run marked dead — the
+/// next sweep releases and adopts it (R-12) — and its request answered once with
+/// [`WALK_PANICKED`]. Whatever the end, this process's refused claims are then retried when the
+/// task's run no longer walks (M5 D84).
+fn spawn_supervised(ctx: TaskCtx, work: impl Future<Output = ()> + Send + 'static) {
     let shared = Arc::clone(&ctx.shared);
     let tag = Arc::clone(&ctx.tag);
-    let handle = tokio::spawn(run_request(ctx, request));
+    let handle = tokio::spawn(async move {
+        let inner = tokio::spawn(work);
+        if let Err(err) = inner.await
+            && err.is_panic()
+        {
+            if let Some(run) = ctx.tag.run.get() {
+                ctx.shared.dead_walks.mark(*run);
+            }
+            tracing::error!(run = ?ctx.tag.run.get(), "a run task panicked; the next sweep adopts its run");
+            ctx.refuse(WALK_PANICKED.to_owned());
+        }
+        retry_claims(&ctx).await;
+    });
     shared.track(tag, handle);
+}
+
+/// M5 D84: once a task's run no longer walks — parked, finished, or gone — every run a refused
+/// claim left `queued` in this process is claimed again, in `queued_at` order, one task each,
+/// under its lock. `Admitted` or a terminal run leaves the set; a second refusal puts it back.
+async fn retry_claims(ctx: &TaskCtx) {
+    let Some(run) = ctx.tag.run.get().copied() else {
+        return;
+    };
+    if ctx
+        .shared
+        .queued
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty()
+    {
+        return;
+    }
+    let walks = matches!(
+        ctx.backend.run(run).await,
+        Ok(Some(Run {
+            status: RunStatus::Running | RunStatus::Queued,
+            ..
+        }))
+    );
+    if walks {
+        return;
+    }
+    let queued = std::mem::take(
+        &mut *ctx
+            .shared
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    for (queued_at, run) in queued {
+        let retry = ctx.unaddressed("claim_retry");
+        spawn_supervised(retry.clone(), reclaim(retry, run, queued_at));
+    }
+}
+
+/// One claim retry: the run's lock, then `claim` and its walk.
+async fn reclaim(ctx: TaskCtx, run: RunId, queued_at: DateTime<Utc>) {
+    let _ = ctx.tag.run.set(run);
+    let walk = ctx.shared.walks.child(run);
+    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+        return;
+    };
+    let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+        Ok(kit) => kit,
+        Err(message) => {
+            ctx.shared.queue(queued_at, run);
+            return ctx.refuse(message);
+        }
+    };
+    if ctx.tag_run(&kit.writer, run).await.map(|row| row.status) != Some(RunStatus::Queued) {
+        return;
+    }
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    match walked(&walk, engine.claim(run)).await {
+        None => {
+            engine.abandoned(run).await;
+            ctx.refuse(PREEMPTED.to_owned());
+        }
+        Some(Ok(outcome)) => ctx.done(outcome),
+        Some(Err(err @ EngineError::ClaimRefused { .. })) => {
+            ctx.shared.queue(queued_at, run);
+            tracing::debug!(%run, %err, "a queued run's claim was refused again");
+        }
+        Some(Err(err)) => ctx.refuse(err.to_string()),
+    }
+    drop(guard);
+}
+
+/// D158, D189: one sweep. Nothing is built when there is nothing to adopt: no dead walk of this
+/// process and no run holding a slot on this box.
+async fn sweep_once(ctx: TaskCtx) {
+    let backend = &ctx.backend;
+    if !ctx.shared.sweep_fixed
+        && let Ok(app) = backend.app_settings().await
+    {
+        ctx.shared
+            .sweep_every
+            .store(millis(lease_period(&app)), Ordering::SeqCst);
+    }
+    let Ok(box_id) = registered_box(backend).await else {
+        return;
+    };
+    if ctx.shared.dead_walks.runs().is_empty()
+        && matches!(backend.active_runs_on_box(box_id).await, Ok(0))
+    {
+        return;
+    }
+    let kit = match Kit::read(&ctx.shared, backend, false).await {
+        Ok(kit) => kit,
+        Err(message) => {
+            tracing::warn!(%message, "the sweep could not build its engine");
+            return;
+        }
+    };
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    let adopted = match engine.sweep_fenced(&ctx.shared.locks).await {
+        Ok(adopted) => adopted,
+        Err(err) => {
+            tracing::warn!(%err, "the sweep failed");
+            return;
+        }
+    };
+    for Adopted { run, next } in adopted {
+        let item = kit
+            .writer
+            .run(run)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| row.item_id);
+        let frame = |kind: FrameKind| {
+            if let Some(item) = item {
+                ctx.shared.publisher.publish(&RunFrame {
+                    item,
+                    run: Some(run),
+                    kind,
+                });
+            }
+        };
+        match next {
+            Next::Walk => {
+                frame(FrameKind::Adopted);
+                let resume = ctx.unaddressed("resume");
+                spawn_supervised(resume.clone(), resumed(resume, run));
+            }
+            Next::Parked(rest) | Next::Finished(rest) => frame(FrameKind::Rested(rest)),
+            Next::Error(sentence) => frame(FrameKind::Error(sentence)),
+        }
+    }
+}
+
+/// D158: an adopted run's walk, resumed on its own task under its lock.
+async fn resumed(ctx: TaskCtx, run: RunId) {
+    let _ = ctx.tag.run.set(run);
+    let walk = ctx.shared.walks.child(run);
+    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+        return;
+    };
+    let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+        Ok(kit) => kit,
+        Err(message) => return ctx.refuse(message),
+    };
+    ctx.tag_run(&kit.writer, run).await;
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    match walked(&walk, engine.resume(run)).await {
+        None => {
+            engine.abandoned(run).await;
+            ctx.refuse(PREEMPTED.to_owned());
+        }
+        Some(Ok(Resume::Walked(rest) | Resume::TopologyChanged { rest, .. })) => {
+            ctx.publish(Some(run), FrameKind::Rested(rest));
+        }
+        Some(Err(err)) => ctx.refuse(err.to_string()),
+    }
+    drop(guard);
 }
 
 /// §8.6: one request, start to answer.
@@ -1665,9 +1903,9 @@ async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt) {
             }));
             ctx.publish(Some(run), FrameKind::Rested(rest));
             // D181: the chat binding is the loop's; the runtime's event channel reaches it.
-            if let Some(row) = row {
+            if let (Some(row), Some(addr)) = (row, ctx.addr.clone()) {
                 let _ = ctx.shared.events.send(RunServed::Attach {
-                    addr: ctx.addr.clone(),
+                    addr,
                     promoted: Box::new(Promoted {
                         run,
                         step,
