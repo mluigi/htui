@@ -18,11 +18,14 @@
 //!    flush the store refuses **commits nothing**: `seq` does not advance, and the rows it
 //!    numbered stay owed inside the recorder until a later flush writes them at exactly those
 //!    numbers. Gaplessness is therefore a property of the log, not merely of the counter.
+//!    [`Recorder::continuing`] starts past a log's last row, at its last `turn`, so a promoted step
+//!    continued by a chat is still one gapless log with one writer at a time (MOD-4 plan D164).
 //! 3. **The prompt digest.** `sha256` over the assembled prompt text, computed once, written both
 //!    as the `digest` key of the `prompt` payload and through
 //!    [`WriteStore::set_step_usage`]`(step, usage, Some(digest))`. Later usage writes for the same
 //!    step pass `None`, as that method's contract says. Passing `Some` rather than ANA-5 §4.4's
-//!    `None` is the plan's X8 ruling, and it stands until milestone 9.
+//!    `None` is the plan's X8 ruling, and it stands until milestone 9. A continuing recorder owes
+//!    no digest: it records no prompt, so `run_step.prompt_digest` stays the original prompt's.
 //! 4. **Scrub, then persist, then the UI.** Every payload and every `raw` blob goes through the
 //!    [`Scrubber`] at capture, and every payload goes through it a **second** time over the
 //!    assembled row at the flush - the pass that catches a secret no single chunk carried
@@ -509,8 +512,20 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         ui: Option<mpsc::Sender<DriverEnvelope>>,
         tail: &[SessionEvent],
     ) -> Self {
-        let _ = (store, scrubber, step, retain_raw, ui, tail);
-        todo!("MOD-4 plan D164: a recorder that continues a step's log")
+        let next_seq = tail
+            .iter()
+            .map(|row| row.seq)
+            .max()
+            .map_or(0, |last| last + 1);
+        let turn = tail.iter().map(|row| row.turn).max().unwrap_or(0);
+        let turns = if tail.is_empty() { 0 } else { turn + 1 };
+        Self {
+            next_seq,
+            turn,
+            turns,
+            usage: UsageTotals::from_rows(tail),
+            ..Self::new(store, scrubber, step, retain_raw, ui)
+        }
     }
 
     /// Records `agent_box.quota` for one row as well as the step's log (plan D66-D68).
