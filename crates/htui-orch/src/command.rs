@@ -978,8 +978,37 @@ pub fn retry_admitted(
     step: &RunStep,
     phase: &SnapshotPhase,
 ) -> Result<(), EngineError> {
-    let _ = (run, item, steps, step, phase, group_at);
-    todo!("blueprint D184: retry_step's admission")
+    if !matches!(run.status, RunStatus::Running | RunStatus::AwaitingApproval) {
+        return Err(EngineError::RunStatus {
+            run: run.id,
+            status: run.status,
+            expected: "running | awaiting_approval",
+        });
+    }
+    if item == Status::Blocked
+        && let Some(item) = run.item_id
+    {
+        return Err(EngineError::ItemBlocked { item });
+    }
+    if phase.fan_out > 1 {
+        // `retire_slot` retires the position's **latest** slot, so only a member of that one
+        // names something a retry could replace.
+        let latest = steps
+            .iter()
+            .filter(|row| row.position == step.position)
+            .map(|row| row.attempt)
+            .max()
+            .unwrap_or(step.attempt);
+        if step.attempt != latest {
+            return Err(EngineError::StaleSlot {
+                step: step.id,
+                attempt: step.attempt,
+                latest,
+            });
+        }
+        return retry_group_enabled(run, &group_at(steps, step.position, step.attempt), phase);
+    }
+    retry_enabled(steps, step, phase)
 }
 
 /// §6.2's `promote to chat` (`docs/ANA-2.md:1563`, MOD-4 plan D163, blueprint D191).
@@ -999,8 +1028,35 @@ pub fn promote_enabled(
     phase: &SnapshotPhase,
     chat_open: bool,
 ) -> Result<(), EngineError> {
-    let _ = (run, item, step, phase, chat_open);
-    todo!("MOD-4 plan D163: promote's admission")
+    if !matches!(run.status, RunStatus::Running | RunStatus::AwaitingApproval) {
+        return Err(EngineError::RunStatus {
+            run: run.id,
+            status: run.status,
+            expected: "running | awaiting_approval",
+        });
+    }
+    if !matches!(
+        step.status,
+        StepStatus::Running | StepStatus::AwaitingApproval | StepStatus::Failed
+    ) {
+        return Err(EngineError::NotGated {
+            step: step.id,
+            status: step.status,
+            expected: "running | awaiting_approval | failed",
+        });
+    }
+    if item == Status::Blocked
+        && let Some(item) = run.item_id
+    {
+        return Err(EngineError::ItemBlocked { item });
+    }
+    if phase.fan_out > 1 {
+        return Err(EngineError::PromoteCandidate { step: step.id });
+    }
+    if chat_open {
+        return Err(EngineError::ChatLive { step: None });
+    }
+    Ok(())
 }
 
 /// §4.8's `accept artifact` (`docs/ANA-2.md:1223-1233`, MOD-4 plan D166).
@@ -1017,8 +1073,28 @@ pub fn accept_enabled(
     has_output: bool,
     chat_live: bool,
 ) -> Result<(), EngineError> {
-    let _ = (step, phase, has_output, chat_live);
-    todo!("MOD-4 plan D166: accept's admission")
+    if step.status != StepStatus::AwaitingApproval {
+        return Err(EngineError::NotGated {
+            step: step.id,
+            status: step.status,
+            expected: "awaiting_approval",
+        });
+    }
+    if step.promoted_at.is_none() {
+        return Err(EngineError::NotPromoted { step: step.id });
+    }
+    if !has_output {
+        return Err(EngineError::MissingOutputForApproval {
+            step: step.id,
+            kind: phase.output_kind.clone(),
+        });
+    }
+    if chat_live {
+        return Err(EngineError::ChatLive {
+            step: Some(step.id),
+        });
+    }
+    Ok(())
 }
 
 /// §4.3 verdict 1's `unblock` (MOD-4 plan D161): which of [`UnblockCase`]'s three cases the item
@@ -1032,8 +1108,30 @@ pub fn accept_enabled(
 /// # Errors
 /// [`EngineError::NotBlocked`] for anything else, naming what holds the item.
 pub fn unblock_enabled(item: &Item, runs: &[(Run, Cursor)]) -> Result<UnblockCase, EngineError> {
-    let _ = (item, runs, resumable_park);
-    todo!("MOD-4 plan D161: unblock's three cases")
+    let active: Vec<&(Run, Cursor)> = runs
+        .iter()
+        .filter(|(run, _)| run.status.is_active())
+        .collect();
+    let parked = active
+        .iter()
+        .find(|(run, _)| run.status == RunStatus::AwaitingApproval);
+    let why = match (item.status, parked, active.first()) {
+        (Status::Blocked, _, None) => return Ok(UnblockCase::Reopen),
+        (Status::Blocked, Some((run, _)), _) => return Ok(UnblockCase::FollowRun(run.id)),
+        (Status::AwaitingApproval, Some((run, cursor)), _) if resumable_park(cursor) => {
+            return Ok(UnblockCase::Resume(run.id));
+        }
+        (Status::AwaitingApproval, Some((run, _)), _) => run_waits_at_a_gate(run.id),
+        (Status::Blocked | Status::AwaitingApproval, None, Some((run, _))) => {
+            run_is_walking(run.id, run.status)
+        }
+        _ => nothing_is_blocked(),
+    };
+    Err(EngineError::NotBlocked {
+        item: item.id,
+        status: item.status,
+        why,
+    })
 }
 
 /// `R-TUI-9`'s close-out (MOD-4 plan D167, ANA-2 §4.10): no run of the item is active, and the
@@ -1043,8 +1141,20 @@ pub fn unblock_enabled(item: &Item, runs: &[(Run, Cursor)]) -> Result<UnblockCas
 /// # Errors
 /// [`EngineError::RunStatus`] naming the first live run, then [`EngineError::NotClosable`].
 pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<(), EngineError> {
-    let _ = (item, runs);
-    todo!("MOD-4 plan D167: close-out's admission")
+    if let Some(live) = runs.iter().find(|run| run.status.is_active()) {
+        return Err(EngineError::RunStatus {
+            run: live.id,
+            status: live.status,
+            expected: "done | failed | cancelled",
+        });
+    }
+    if !matches!(item.status, Status::Done | Status::Failed | Status::Blocked) {
+        return Err(EngineError::NotClosable {
+            item: item.id,
+            status: item.status,
+        });
+    }
+    Ok(())
 }
 
 /// MOD-4 plan D177 (R-25): a manual cleanup retry is for a run that has finished.
@@ -1052,8 +1162,13 @@ pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<(), EngineError> {
 /// # Errors
 /// [`EngineError::NotTerminal`] for a `queued`, `running` or `awaiting_approval` run.
 pub fn cleanup_enabled(run: &Run) -> Result<(), EngineError> {
-    let _ = run;
-    todo!("MOD-4 plan D177: cleanup's admission")
+    if run.status.is_terminal() {
+        return Ok(());
+    }
+    Err(EngineError::NotTerminal {
+        run: run.id,
+        status: run.status,
+    })
 }
 
 /// §6.2's `run`/`queue` over the item row: the mirror of `create_run`'s own compare-and-set,
@@ -1066,8 +1181,7 @@ pub fn cleanup_enabled(run: &Run) -> Result<(), EngineError> {
 /// # Errors
 /// [`EngineError::Store`] carrying `legal_move`'s own refusal.
 pub fn start_enabled(item: &Item) -> Result<(), EngineError> {
-    let _ = item;
-    todo!("blueprint D184: start's row-level mirror")
+    htui_core::store::legal_move(item.status, Status::Queued).map_err(EngineError::Store)
 }
 
 #[cfg(test)]

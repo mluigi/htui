@@ -129,8 +129,7 @@ impl fmt::Display for RunFailure {
                 )
             }
             Self::PromptRefused { phase, reason } => {
-                let _ = (phase, reason);
-                todo!("MOD-4 plan D162: the prompt refusal's sentence")
+                write!(f, "prompt refused at `{phase}`: {reason}")
             }
         }
     }
@@ -306,8 +305,10 @@ pub fn cursor(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Cursor {
 /// (plan D161) both read this one predicate, so the two cannot drift.
 #[must_use]
 pub fn resumable_park(cursor: &Cursor) -> bool {
-    let _ = cursor;
-    todo!("MOD-4 plan D196: the resumable-park predicate")
+    matches!(
+        cursor,
+        Cursor::Create { .. } | Cursor::Run(_) | Cursor::Finished
+    )
 }
 
 /// Plan D59 for one fanned-out position; `None` when the slot is complete and the walk goes on.
