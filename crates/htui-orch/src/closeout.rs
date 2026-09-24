@@ -7,8 +7,8 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    DocumentHead, DocumentId, Item, NewDocument, Repo, RunStepCommit, RunSummary, Status, StepId,
-    UserId,
+    DocumentHead, DocumentId, Item, NewDocument, Repo, RepoId, RunId, RunStepCommit, RunSummary,
+    Status, StepId, UserId,
 };
 
 /// `document.kind` of the close-out summary (ANA-2 §4.10).
@@ -41,7 +41,20 @@ pub fn preview(
     commits: &[(StepId, Vec<RunStepCommit>)],
     heads: &[DocumentHead],
 ) -> Preview {
-    todo!("closeout::preview({item:?}, {runs:?}, {commits:?}, {heads:?})")
+    let version = heads
+        .iter()
+        .filter(|head| head.item_id == item.id && head.kind == KIND)
+        .map(|head| head.version)
+        .max()
+        .map_or(1, |latest| latest.saturating_add(1));
+    Preview {
+        key: item.key.clone(),
+        title: item.title.clone(),
+        status: item.status,
+        runs: runs.len(),
+        rows: rows(runs, commits, &[]).len(),
+        version,
+    }
 }
 
 /// The close-out summary document (blueprint D208): `kind = "summary"`, `title = "Close-out
@@ -62,7 +75,125 @@ pub fn summary(
     user: UserId,
     at: DateTime<Utc>,
 ) -> NewDocument {
-    todo!("closeout::summary({item:?}, {runs:?}, {commits:?}, {repos:?}, {id}, {user}, {at})")
+    let mut body = format!("# Close-out {} — {}\n\n", item.key, item.title);
+    body.push_str("| repo | position | phase | attempt | commits |\n|---|---|---|---|---|\n");
+    for row in rows(runs, commits, repos) {
+        body.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            cell(&row.repo),
+            row.position,
+            cell(&row.phase),
+            row.attempt,
+            cell(&row.commits),
+        ));
+    }
+    let mut oldest_first: Vec<&RunSummary> = runs.iter().collect();
+    oldest_first.sort_by_key(|run| (run.queued_at, run.id));
+    if !oldest_first.is_empty() {
+        body.push('\n');
+    }
+    for run in oldest_first {
+        body.push_str(&format!("- {} run {}: {}", run.kind, run.id, run.status));
+        if let Some(finished) = run.finished_at {
+            body.push_str(&format!(
+                ", finished {}",
+                finished.format("%Y-%m-%d %H:%M UTC")
+            ));
+        }
+        body.push('\n');
+    }
+    NewDocument {
+        id,
+        item_id: item.id,
+        kind: KIND.to_owned(),
+        title: format!("Close-out {}", item.key),
+        body,
+        produced_by_step_id: None,
+        created_by: user,
+        created_at: at,
+    }
+}
+
+/// Where a row sorts: the run's `queued_at` and id, then the step's `(position, attempt,
+/// fanout_index)`.
+type RowKey = (DateTime<Utc>, RunId, i32, i32, i32);
+
+/// One line of the commit table, before it is rendered.
+struct Row {
+    /// `None` for a step no listed run carries, which sorts after every known one.
+    key: Option<RowKey>,
+    /// The step, which keeps an unknown step's rows together.
+    step: StepId,
+    /// `repo.name`, or the id when `repos` does not carry it.
+    repo: String,
+    /// The repo id, the last tie-break.
+    repo_id: RepoId,
+    /// `run_step.position`, or `-`.
+    position: String,
+    /// `run_step.phase_name`, or the step id.
+    phase: String,
+    /// `run_step.attempt`, or `-`.
+    attempt: String,
+    /// `before_hash..after_hash`, as stored.
+    commits: String,
+}
+
+/// Every `(step, repo)` with an `after_hash`, in blueprint D208's order. `repos` only names the
+/// rows, so [`preview`] passes none and counts the same rows [`summary`] renders.
+fn rows(runs: &[RunSummary], commits: &[(StepId, Vec<RunStepCommit>)], repos: &[Repo]) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (step_id, list) in commits {
+        let step = runs.iter().find_map(|run| {
+            run.steps
+                .iter()
+                .find(|step| step.id == *step_id)
+                .map(|step| (run, step))
+        });
+        for commit in list {
+            let Some(after) = &commit.after_hash else {
+                continue;
+            };
+            let repo = repos
+                .iter()
+                .find(|repo| repo.id == commit.repo_id)
+                .map_or_else(|| commit.repo_id.to_string(), |repo| repo.name.clone());
+            rows.push(Row {
+                key: step.map(|(run, step)| {
+                    (
+                        run.queued_at,
+                        run.id,
+                        step.position,
+                        step.attempt,
+                        step.fanout_index,
+                    )
+                }),
+                step: *step_id,
+                repo,
+                repo_id: commit.repo_id,
+                position: step
+                    .map_or_else(|| "-".to_owned(), |(_, step)| step.position.to_string()),
+                phase: step
+                    .map_or_else(|| step_id.to_string(), |(_, step)| step.phase_name.clone()),
+                attempt: step.map_or_else(|| "-".to_owned(), |(_, step)| step.attempt.to_string()),
+                commits: format!("{}..{after}", commit.before_hash),
+            });
+        }
+    }
+    rows.sort_by(|a, b| {
+        (a.key.is_none(), a.key, a.step, &a.repo, a.repo_id).cmp(&(
+            b.key.is_none(),
+            b.key,
+            b.step,
+            &b.repo,
+            b.repo_id,
+        ))
+    });
+    rows
+}
+
+/// A table cell: a `|` or a line break in a name would otherwise split the row.
+fn cell(text: &str) -> String {
+    text.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
 #[cfg(test)]
@@ -70,8 +201,8 @@ mod tests {
     use super::*;
     use chrono::TimeZone as _;
     use htui_core::model::{
-        BoxId, ItemId, ItemKindId, ProjectId, RepoId, RunId, RunKind, RunMode, RunStatus,
-        RunStepSummary, StepStatus,
+        BoxId, ItemId, ItemKindId, ProjectId, RunKind, RunMode, RunStatus, RunStepSummary,
+        StepStatus,
     };
     use uuid::Uuid;
 

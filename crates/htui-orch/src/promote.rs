@@ -34,7 +34,24 @@ pub enum OpeningKind {
 /// answers `None`.
 #[must_use]
 pub fn banner(events: &[SessionEvent]) -> Option<AgentSessionRef> {
-    todo!("promote::banner({events:?})")
+    events
+        .iter()
+        .filter(|row| row.kind == EventKind::Other)
+        .filter_map(|row| match envelope_from_row(row) {
+            Ok(envelope) => match envelope.event {
+                DriverEvent::Other(other) if other.update == SESSION_STARTED => {
+                    Some((row.seq, other.body))
+                }
+                _ => None,
+            },
+            Err(_) => None,
+        })
+        .min_by_key(|(seq, _)| *seq)
+        .and_then(|(_, body)| {
+            body.get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| AgentSessionRef(id.to_owned()))
+        })
 }
 
 /// Blueprint D192: resume only where the transport honours `SessionSpec.resume` today. That is
@@ -48,7 +65,10 @@ pub fn opening_kind(
     transport: Transport,
     events: &[SessionEvent],
 ) -> OpeningKind {
-    todo!("promote::opening_kind({caps:?}, {transport}, {events:?})")
+    if !caps.resume || transport != Transport::Cli {
+        return OpeningKind::Handoff;
+    }
+    banner(events).map_or(OpeningKind::Handoff, OpeningKind::Resume)
 }
 
 /// §4.6(c)'s handoff spec built from the phase's own spec: role `Handoff`, the pinned `handoff`
@@ -64,10 +84,23 @@ pub fn handoff_spec(
     diff_so_far: Option<DiffBlock>,
     failure_reason: String,
 ) -> PromptSpec {
-    todo!(
-        "promote::handoff_spec({phase:?}, {template:?}, {events:?}, {roots:?}, {diff_so_far:?}, \
-         {failure_reason})"
-    )
+    PromptSpec {
+        role: TemplateRole::Handoff,
+        template: TemplateRef {
+            name: template.name.clone(),
+            version: template.version,
+        },
+        body: template.body.clone(),
+        verify_failure: None,
+        previous_diff: None,
+        judge: None,
+        handoff: Some(HandoffInputs {
+            step_summary: StepSummary::from_events(events, roots),
+            diff_so_far,
+            failure_reason,
+        }),
+        ..phase
+    }
 }
 
 #[cfg(test)]
