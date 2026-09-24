@@ -895,7 +895,9 @@ fn unselected(
 /// is true by construction — a step is `running` only inside one `dispatch` call, and a second
 /// command cannot be dispatched while it is — and since milestone 6, where a session outlives a
 /// dispatch, `run_worker` preempts the run's live walk before it dispatches the cancel (MOD-4
-/// plan D157), and the engine takes the run's lease first (plan D179).
+/// plan D157), and the engine takes the run's lease first (plan D179). A promoted step's chat is
+/// no walk and outlives every one, so `run_worker` refuses the cancel while a chat is live on a
+/// step of the run (plan D212).
 ///
 /// # Errors
 /// [`EngineError::RunStatus`] for a `done`, `failed` or `cancelled` run.

@@ -375,10 +375,15 @@ fn verdicts(
     let mut active: Vec<(Run, Cursor)> = Vec::new();
     let mut unblock_refusal = None;
     for (run, steps) in runs {
+        // D212: while a step of this run is chatted with, the verbs that would move the run grey
+        // with the refusal the worker answers them with, ahead of the engine's own guards.
+        let chatting = chat_free(steps, live).map_err(sentence);
         actions.runs.insert(
             run.id,
             RunActions {
-                cancel: cancel_enabled(run).map_err(sentence),
+                cancel: chatting
+                    .clone()
+                    .and_then(|()| cancel_enabled(run).map_err(sentence)),
                 cleanup: cleanup_enabled(run).map_err(sentence),
             },
         );
@@ -410,33 +415,41 @@ fn verdicts(
             };
             let open = newest_output(heads, &phase.output_kind, step.id);
             let has_output = open.is_ok();
-            let select = if step.fanout_index >= 0 && phase.fan_out > 1 {
-                select_enabled(
-                    run,
-                    &group_at(steps, step.position, step.attempt),
-                    step.id,
-                    step.position,
-                    step.attempt,
-                )
-                .map_err(sentence)
-            } else {
-                Err(not_a_candidate(step.id))
-            };
+            let select = chatting.clone().and_then(|()| {
+                if step.fanout_index >= 0 && phase.fan_out > 1 {
+                    select_enabled(
+                        run,
+                        &group_at(steps, step.position, step.attempt),
+                        step.id,
+                        step.position,
+                        step.attempt,
+                    )
+                    .map_err(sentence)
+                } else {
+                    Err(not_a_candidate(step.id))
+                }
+            });
             actions.steps.insert(
                 step.id,
                 StepActions {
-                    approve: answer_gate_enabled(step, &phase, has_output, &GateAnswer::Approved)
-                        .map_err(sentence),
-                    reject: answer_gate_enabled(
-                        step,
-                        &phase,
-                        has_output,
-                        &GateAnswer::Rejected {
-                            note: String::new(),
-                        },
-                    )
-                    .map_err(sentence),
-                    retry: retry_admitted(run, item.status, steps, step, &phase).map_err(sentence),
+                    approve: chatting.clone().and_then(|()| {
+                        answer_gate_enabled(step, &phase, has_output, &GateAnswer::Approved)
+                            .map_err(sentence)
+                    }),
+                    reject: chatting.clone().and_then(|()| {
+                        answer_gate_enabled(
+                            step,
+                            &phase,
+                            has_output,
+                            &GateAnswer::Rejected {
+                                note: String::new(),
+                            },
+                        )
+                        .map_err(sentence)
+                    }),
+                    retry: chatting.clone().and_then(|()| {
+                        retry_admitted(run, item.status, steps, step, &phase).map_err(sentence)
+                    }),
                     promote: promote_enabled(
                         run,
                         item.status,
@@ -459,6 +472,38 @@ fn verdicts(
         None => unblock_enabled(item, &active).map(drop).map_err(sentence),
     };
     actions
+}
+
+/// Blueprint D212 (review H3): `Ok` unless a chat of this process is live on one of `steps` — the
+/// steps of one run — and then `ChatLive(Some)` naming it (D185 allows one live chat per process,
+/// so there is at most one).
+///
+/// The one admission for the verbs that would move a run under its chat ([`moves_the_run`]): the
+/// worker refuses them with it inside their task, and [`verdicts`] greys the same keys with it
+/// (D182, D184). Keyed on the run, not the named step: a group retry retires every member of the
+/// slot and a selection resolves it, whichever step the chat is on.
+///
+/// # Errors
+/// [`EngineError::ChatLive`] naming the step being chatted with.
+fn chat_free(steps: &[RunStep], live: &LiveChats) -> Result<(), EngineError> {
+    match steps.iter().find(|step| live.contains(step.id)) {
+        Some(step) => Err(EngineError::ChatLive {
+            step: Some(step.id),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// D212: the verbs [`chat_free`] admits — approve and reject (`AnswerGate`), retry, select and
+/// cancel. A cancel is refused rather than ending the chat: the loop, not this runtime, owns it.
+const fn moves_the_run(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::AnswerGate { .. }
+            | Command::RetryStep { .. }
+            | Command::SelectFanout { .. }
+            | Command::CancelRun { .. }
+    )
 }
 
 /// Every step verdict of a run whose snapshot (or phase) could not be read: that sentence.
@@ -1464,7 +1509,7 @@ impl RunRuntime {
                     name,
                     tag: Arc::default(),
                 };
-                spawn_task(ctx, request);
+                spawn_task(ctx, request, live.clone());
                 RunServed::Deferred
             }
             other => RunServed::Reply(StoreReply::Failed {
@@ -1646,9 +1691,10 @@ async fn walked<T>(walk: &WalkToken, work: impl Future<Output = T>) -> Option<T>
     }
 }
 
-/// Spawns one request's task, supervised and tracked.
-fn spawn_task(ctx: TaskCtx, request: OrchRequest) {
-    let work = run_request(ctx.clone(), request);
+/// Spawns one request's task, supervised and tracked. `live` is the loop's [`LiveChats`] when the
+/// request was served (D212).
+fn spawn_task(ctx: TaskCtx, request: OrchRequest, live: LiveChats) {
+    let work = run_request(ctx.clone(), request, live);
     spawn_supervised(ctx, work);
 }
 
@@ -1892,7 +1938,7 @@ async fn resumed(ctx: TaskCtx, run: RunId) {
 }
 
 /// §8.6: one request, start to answer.
-async fn run_request(ctx: TaskCtx, request: OrchRequest) {
+async fn run_request(ctx: TaskCtx, request: OrchRequest, live: LiveChats) {
     match request {
         OrchRequest::Command(Command::StartRun {
             item,
@@ -1925,7 +1971,7 @@ async fn run_request(ctx: TaskCtx, request: OrchRequest) {
                     unreachable!("matched above")
                 }
             };
-            on_run(ctx, run, command, preempt).await;
+            on_run(ctx, run, command, preempt, &live).await;
         }
         OrchRequest::CloseOutPreview { item } => {
             let _ = ctx.tag.item.set(item);
@@ -2021,8 +2067,21 @@ async fn start_run(
 }
 
 /// Every verb on one run: preempt as the verb says, lock, dispatch (§8.6).
-async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt) {
+///
+/// D212 (review H3): a verb that would move the run under a live chat ([`moves_the_run`]) is
+/// refused first, before it preempts or waits, with [`chat_free`]'s sentence — published for the
+/// item, because the task is tagged (D200).
+async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt, live: &LiveChats) {
     let early = ctx.tag(run).await;
+    if moves_the_run(&command) && !live.is_empty() {
+        let refusal = match ctx.backend.run_steps(run).await {
+            Ok(steps) => chat_free(&steps, live).err().map(|err| err.to_string()),
+            Err(err) => Some(err.to_string()),
+        };
+        if let Some(refusal) = refusal {
+            return ctx.refuse(refusal);
+        }
+    }
     let stop = match preempt {
         Preempt::Always => true,
         Preempt::IfLive => ctx.shared.walks.is_live(run),
