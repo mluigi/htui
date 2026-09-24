@@ -47,10 +47,11 @@ use htui_agent::record::{
 use htui_agent::registry::{DriverFactory, caps_for};
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, ChatRunSpec, ItemId, PER_TOKEN_CAP_BATCH, ProjectCaps,
-    ProjectId, QuotaSource, RunStatus, Scope, StepId, Transport,
+    ProjectId, QuotaSource, RunStatus, Scope, SessionEvent, StepId, Transport,
 };
 use htui_core::scrub::MinimalScrubber;
-use htui_core::store::{StoreError, WriteStore};
+use htui_core::store::{ReadStore as _, StoreError, WriteStore};
+use htui_orch::OpeningPath;
 use htui_store::{Backend, Writer};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -522,15 +523,143 @@ impl AgentRuntime {
         steps
     }
 
-    /// D165: `RunServed::Attach`'s other half, binding a chat to a promoted graph step.
+    /// MOD-4 plan D165: `RunServed::Attach`'s other half, binding a chat to a promoted graph step.
+    ///
+    /// [`start`](Self::start)'s checks minus the mint, plus the tail: the writer (refused off the
+    /// server), the box, the opening agent's row (enabled), `driver_for`, its settings, the
+    /// project's caps and the quota latch, then the step's log read **through the writer**
+    /// (blueprint H-9), whose absence is "the step's log is not on this box". The spec is the
+    /// promoted step's: its id, `cwd` and `extra_dirs` from the opening, and `resume` on
+    /// [`OpeningPath::Resume`]. No re-probe rides on it: the walk that ran the step already
+    /// started this agent here.
+    ///
+    /// Answers [`Served::Start`], whose session answers `addr` with `ChatAccepted` and every frame
+    /// after it, or a `Failed` for `promote_step`.
     pub async fn attach_promoted(
         &mut self,
-        _backend: &Backend,
-        _replies: &mpsc::UnboundedSender<ReplyEnvelope>,
-        _addr: ReplyAddr,
-        _promoted: crate::run_worker::Promoted,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        promoted: crate::run_worker::Promoted,
     ) -> Served {
-        todo!()
+        match self.bind_promoted(backend, replies, addr, promoted).await {
+            Ok(served) => served,
+            Err(err) => Served::Reply(failed(PROMOTE_STEP, &err)),
+        }
+    }
+
+    /// [`attach_promoted`](Self::attach_promoted)'s body, with `?` for the store's refusals.
+    async fn bind_promoted(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        promoted: crate::run_worker::Promoted,
+    ) -> Result<Served, StoreError> {
+        // A chat that ended on this step before must not make the new one a second entry.
+        self.live.retain(|_, chat| !chat.commands.is_closed());
+        let crate::run_worker::Promoted {
+            step: step_id,
+            project: project_id,
+            opening,
+            ..
+        } = promoted;
+
+        let writer = backend
+            .writer()
+            .ok_or_else(|| StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned()))?;
+        let writer_label = writer.label();
+        let box_id = registered_box(backend).await?;
+        let summary = backend
+            .agents()
+            .await?
+            .into_iter()
+            .find(|summary| summary.agent.id == opening.agent_id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "agent",
+                id: opening.agent_id.to_string(),
+            })?;
+        if !summary.agent.enabled {
+            return Err(StoreError::Constraint(format!(
+                "agent `{}` is disabled",
+                summary.agent.name
+            )));
+        }
+        let driver = self
+            .factory
+            .driver_for(&summary.agent, summary.on_box.as_ref())
+            .map_err(|err| StoreError::Backend(err.to_string()))?;
+        let settings: AgentSettings =
+            serde_json::from_value(summary.agent.settings.clone()).unwrap_or_default();
+        let project_caps = project_caps_for(
+            &writer,
+            project_id,
+            backend.project_settings(project_id).await?,
+        )?;
+        let quota_latch = quota_latch_for(&writer, &summary.agent, box_id, settings.quota.source);
+        let Some(tail) = writer.step_events(step_id).await? else {
+            return Ok(Served::Reply(StoreReply::Failed {
+                request: PROMOTE_STEP,
+                message: "the step's log is not on this box".to_owned(),
+            }));
+        };
+
+        let (resume, opening_text) = match opening.path {
+            OpeningPath::Resume { session_ref, text } => (Some(session_ref), text),
+            OpeningPath::Handoff { text, .. } => (None, text),
+        };
+        let spec = SessionSpec {
+            agent_id: opening.agent_id,
+            step_id,
+            cwd: opening.cwd,
+            extra_dirs: opening.extra_dirs,
+            env: std::collections::BTreeMap::new(),
+            model: opening
+                .model
+                .or_else(|| summary.agent.default_model.clone()),
+            tools: htui_agent::driver::ToolExposure::default(),
+            mcp: Vec::new(),
+            permission: settings.permission.clone(),
+            retain_raw: std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
+            resume,
+            budget_micros: project_caps.run_micros,
+        };
+
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let caps = driver.caps();
+        self.live.insert(
+            step_id,
+            LiveChat {
+                commands: commands_tx,
+                caps,
+                task: None,
+            },
+        );
+        self.started.push(step_id);
+
+        let args = ChatArgs {
+            driver,
+            writer,
+            writer_label,
+            binding: ChatBinding::Promoted { step_id, tail },
+            spec,
+            prompt: opening_text,
+            policy: settings.permission,
+            caps,
+            commands: commands_rx,
+            frames: Frames {
+                tx: replies.clone(),
+                addr,
+            },
+            grace: self.grace,
+            reprobe: None,
+            project_caps,
+            quota_latch,
+        };
+        Ok(Served::Start {
+            step_id,
+            task: Box::pin(run_chat(args)),
+        })
     }
 
     /// Serves one request the agent runtime owns: the four chat variants, `ProbeAgents`, and
@@ -1368,6 +1497,15 @@ impl AgentRuntime {
 enum ChatBinding {
     /// MOD-2's own chat: a `run(kind='chat')` minted at start, closed at the end.
     Fresh(ChatRunSpec),
+    /// MOD-4 plan D165: a promoted graph step. No run is minted and none is closed: the step's
+    /// status is the engine's (`awaiting_approval`, promoted) and stays so when the session ends.
+    Promoted {
+        /// The promoted step, which keeps its id.
+        step_id: StepId,
+        /// The step's persisted rows, read through the writer (blueprint H-9): where the
+        /// continuing recorder starts (plan D164).
+        tail: Vec<SessionEvent>,
+    },
 }
 
 impl ChatBinding {
@@ -1375,6 +1513,7 @@ impl ChatBinding {
     const fn step_id(&self) -> StepId {
         match self {
             Self::Fresh(chat) => chat.step_id,
+            Self::Promoted { step_id, .. } => *step_id,
         }
     }
 
@@ -1382,16 +1521,23 @@ impl ChatBinding {
     const fn request(&self) -> &'static str {
         match self {
             Self::Fresh(_) => "chat_start",
+            Self::Promoted { .. } => PROMOTE_STEP,
         }
     }
 
-    /// Closes what the session opened when it ends with `status`.
+    /// Closes what the session opened when it ends with `status`. A promoted step's session
+    /// opened nothing: `finish_chat_run` is never called for a graph step.
     async fn close(&self, writer: &Writer, status: RunStatus) {
         match self {
             Self::Fresh(chat) => close_run(writer, chat, status).await,
+            Self::Promoted { .. } => {}
         }
     }
 }
+
+/// [`StoreRequest::name`] of a promotion (blueprint D209): what a promoted chat's refusals are
+/// answered as, since the promotion is the request that opened it.
+const PROMOTE_STEP: &str = "promote_step";
 
 /// Everything one chat session needs.
 pub struct ChatArgs {
@@ -2432,13 +2578,17 @@ pub async fn run_chat(args: ChatArgs) {
     );
 
     let (ui_tx, mut ui_rx) = mpsc::channel(UI_FRAMES);
-    let mut recorder = Recorder::new(
-        &writer,
-        &scrubber,
-        step_id,
-        std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
-        Some(ui_tx),
-    );
+    let retain_raw = std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1");
+    let mut recorder = match &binding {
+        ChatBinding::Fresh(_) => {
+            Recorder::new(&writer, &scrubber, step_id, retain_raw, Some(ui_tx))
+        }
+        // Plan D164: the step's log goes on past its last row, at its next turn, with its
+        // pre-promotion spend in the running total and its prompt digest left alone.
+        ChatBinding::Promoted { tail, .. } => {
+            Recorder::continuing(&writer, &scrubber, step_id, retain_raw, Some(ui_tx), tail)
+        }
+    };
     // Two opt-in builders rather than two more `new` parameters, because most recorders in this
     // tree have neither (plan D66-D68, D70). The grace the cap's cancel takes is this runtime's
     // own `CANCEL_GRACE`, riding on `RunCap` so `htui_agent::record::pump` keeps its signature.
@@ -2450,13 +2600,25 @@ pub async fn run_chat(args: ChatArgs) {
     }
 
     let now = Utc::now();
-    if let Err(err) = recorder
-        .record_prompt(&prompt, prompt_sections(), now)
-        .await
-    {
-        tracing::error!(%err, "the prompt row could not be written");
+    match &binding {
+        ChatBinding::Fresh(_) => {
+            if let Err(err) = recorder
+                .record_prompt(&prompt, prompt_sections(), now)
+                .await
+            {
+                tracing::error!(%err, "the prompt row could not be written");
+            }
+            frames.local("prompt", json!({ "text": prompt }), now);
+        }
+        // ANA-5 criterion 18: the opening — the handoff prompt, or the resume sentence — is the
+        // step's next `follow_up`, never a second `prompt` (which would rewrite the digest).
+        ChatBinding::Promoted { .. } => {
+            if let Err(err) = recorder.record_follow_up(&prompt, now).await {
+                tracing::error!(%err, "the opening's follow-up row could not be written");
+            }
+            frames.event(follow_up_frame(&prompt, now));
+        }
     }
-    frames.local("prompt", json!({ "text": prompt }), now);
 
     // Every call this session has seen, so a permission request can be evaluated against the tool
     // call it gates (`htui_agent::permission`).
@@ -2917,7 +3079,6 @@ pub(crate) mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::{Agent, AgentId, EventKind, EventRole, Scope, Transport};
     use htui_core::store::MemStore;
-    use htui_core::store::ReadStore as _;
     use std::sync::Arc;
 
     // -----------------------------------------------------------------------------------------
@@ -3495,7 +3656,7 @@ pub(crate) mod tests {
 
     /// The fixture's `plan` step of `RUN_1`, promoted: the one step with a cached log, so the
     /// continuing recorder has a tail to start past.
-    fn promoted(agent_id: AgentId, path: htui_orch::OpeningPath) -> crate::run_worker::Promoted {
+    fn promoted(agent_id: AgentId, path: OpeningPath) -> crate::run_worker::Promoted {
         crate::run_worker::Promoted {
             run: ids::RUN_1,
             step: ids::STEP_PLAN,
@@ -3567,7 +3728,7 @@ pub(crate) mod tests {
             .expect("the fixture's step has a log");
         let promotion = promoted(
             agent_id,
-            htui_orch::OpeningPath::Resume {
+            OpeningPath::Resume {
                 session_ref: htui_agent::driver::AgentSessionRef::new("banner-1"),
                 text: htui_orch::promote::RESUME_OPENING.to_owned(),
             },
@@ -3644,7 +3805,7 @@ pub(crate) mod tests {
 
         let promotion = promoted(
             agent_id,
-            htui_orch::OpeningPath::Handoff {
+            OpeningPath::Handoff {
                 text: "pick up where the step stopped".to_owned(),
                 digest: "d-handoff".to_owned(),
             },
