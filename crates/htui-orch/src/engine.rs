@@ -1274,11 +1274,17 @@ where
     /// §4.8's `accept artifact` (MOD-4 plan D166, blueprint D194, `docs/ANA-2.md:1223-1233`).
     ///
     /// The guard ([`crate::command::accept_enabled`]), the lease, then the promoted step's stage
-    /// 5 in the lease's window, under the heartbeat ([`Self::heartbeaten`], plan D86): the verify, as after a session that ended `EndTurn`; the capture
-    /// and its commits; the settle columns. A `fail` verify refuses with
-    /// [`EngineError::AcceptVerifyFailed`] — the outcome is recorded, a note says so, and the
-    /// step stays promoted and parked. Otherwise the `AnswerGate(Approved)` tail: the step
-    /// `done` with `approved`, the unpark, the merge, and the walk from `position + 1`.
+    /// 5 in the lease's window, under the heartbeat ([`Self::heartbeaten`], plan D86): the verify,
+    /// as after a session that ended `EndTurn`; the capture and its commits; the settle columns.
+    /// MOD-4 plan D211 (review H2): the verify's deadline is a fresh copy of the phase's, measured
+    /// from the accept — a promoted step's `started_at` is its agent attempt's, often hours before
+    /// the human accepts, and measured from it the verify would be `unavailable` without running.
+    /// A `fail` verify refuses with [`EngineError::AcceptVerifyFailed`] — the outcome is recorded,
+    /// a note says so, and the step stays promoted and parked. An `unavailable` one is not refused
+    /// (plan D30: it never fails a step, and some of its causes are permanent); it is recorded and
+    /// a note `accept: verify unavailable: <reason>` says the merge goes in unverified (D211).
+    /// Otherwise the `AnswerGate(Approved)` tail: the step `done` with `approved`, the unpark,
+    /// the merge, and the walk from `position + 1`.
     async fn accept_artifact(
         &self,
         run: RunId,
@@ -1308,14 +1314,15 @@ where
                 .map(|(cwd, _)| cwd)
                 .unwrap_or_default();
             // The chat's session ended as a session does: `EndTurn`. A verify runs only after a
-            // `Done` (blueprint A-3), and this one's is the human's.
+            // `Done` (blueprint A-3), and this one's is the human's. MOD-4 plan D211: its deadline
+            // is measured from the accept, not from the step's own start (review H2).
             let verify = self
                 .verify(VerifyStage {
                     run: &run,
                     step: &row,
                     phase: &phase,
                     trees: &trees,
-                    started_at: row.started_at.unwrap_or(now),
+                    started_at: now,
                     session_cwd: &cwd,
                     result: &Ok(DoneEvent {
                         stop_reason: StopReason::EndTurn,
@@ -1355,6 +1362,20 @@ where
                 )
                 .await?;
                 return Err(refusal);
+            }
+            // MOD-4 plan D211: `unavailable` is not refused, but a human reads that the merge
+            // goes in unverified, and why.
+            if let Some(report) = verify
+                .as_ref()
+                .filter(|report| report.outcome == VerifyOutcome::Unavailable)
+            {
+                self.note(
+                    item,
+                    format!("accept: verify unavailable: {}", report.output),
+                    Some(row.id),
+                    now,
+                )
+                .await?;
             }
             Ok(())
         });
