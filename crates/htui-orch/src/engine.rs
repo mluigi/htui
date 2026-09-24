@@ -1067,32 +1067,51 @@ where
     /// `pub` for the same reason [`cleanup_run`](Self::cleanup_run) is: milestone 6's Runs tab is
     /// the caller ANA-2 §6.2 writes this row for.
     ///
+    /// Since MOD-4 plan D179 (R-28) a `running` or parked run's lease is taken first, as every
+    /// other command's is, and given back once the run is cancelled and cleaned up.
+    ///
     /// # Errors
-    /// [`EngineError::RunStatus`] for a run that has already finished; the store's own refusals.
+    /// [`EngineError::RunStatus`] for a run that has already finished; [`EngineError::LeaseHeld`]
+    /// for a live lease another process holds, with nothing written; the store's own refusals.
     pub async fn cancel_run(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         let row = self.run(run).await?;
         crate::command::cancel_enabled(&row)?;
         let position = self.resting(&row).await?.position;
 
-        let now = self.now();
-        let steps = self.parts.store.run_steps(run).await?;
-        for step in &steps {
-            if step.status.is_terminal() {
-                continue;
+        // MOD-4 plan D179 (R-28): a `running` or parked run's lease is taken after the guard and
+        // before the first write, so a live stranger's lease refuses the cancel with nothing
+        // written (`LeaseHeld`). A `queued` run was never claimed and has no lease to take.
+        let leased = matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval);
+        if leased {
+            self.take_lease(run).await?;
+        }
+        let window = async {
+            let now = self.now();
+            let steps = self.parts.store.run_steps(run).await?;
+            for step in &steps {
+                if step.status.is_terminal() {
+                    continue;
+                }
+                self.parts
+                    .store
+                    .transition_step(step.id, step.status, StepStatus::Cancelled, now)
+                    .await?;
             }
+            // `finish_run` mirrors the item `queued | in_progress | awaiting_approval -> open`
+            // (`store/traits.rs`), which is what frees it for a second run; `failure` stays NULL
+            // because a cancel is a human's decision and not a failure.
             self.parts
                 .store
-                .transition_step(step.id, step.status, StepStatus::Cancelled, now)
+                .finish_run(run, RunStatus::Cancelled, None, now)
                 .await?;
+            self.cleanup_run(run).await
+        };
+        if leased {
+            self.leased_window(run, window).await?;
+            self.release_lease(run).await;
+        } else {
+            window.await?;
         }
-        // `finish_run` mirrors the item `queued | in_progress | awaiting_approval -> open`
-        // (`store/traits.rs`), which is what frees it for a second run; `failure` stays NULL
-        // because a cancel is a human's decision and not a failure.
-        self.parts
-            .store
-            .finish_run(run, RunStatus::Cancelled, None, now)
-            .await?;
-        self.cleanup_run(run).await?;
         Ok(CommandOutcome::Cancelled {
             rest: Rest {
                 run: RunStatus::Cancelled,
@@ -2063,8 +2082,8 @@ where
         // Plan D149: the reads, the live graph's resolve and both notes give the lease back on
         // any error. `Some` is the topology mismatch, which walks nothing.
         if let Some(changed) = self.leased_window(run, self.resume_window(run)).await? {
-            // Plan D150: so the lease just taken is given back whatever the run's status. A
-            // `running` run is then adopted again by the next sweep of any process (R-36).
+            // Plan D150: the lease just taken is given back whatever the run's status. A run that
+            // was `running` was parked first (MOD-4 plan D159), so no sweep adopts it again.
             self.release_lease(run).await;
             return Ok(changed);
         }
@@ -2127,6 +2146,20 @@ where
                     created_at: now,
                 })
                 .await?;
+            // MOD-4 plan D159 (R-36, criterion 3): a `running` run parks for the human the
+            // mismatch is addressed to — run, then item — rather than being handed back to every
+            // sweep as a `running` run. A run already parked is left as it is.
+            let row = if row.status == RunStatus::Running {
+                self.move_run(run, RunStatus::Running, RunStatus::AwaitingApproval, now)
+                    .await?;
+                self.parts
+                    .store
+                    .transition(item.id, Status::InProgress, Status::AwaitingApproval)
+                    .await?;
+                self.run(run).await?
+            } else {
+                row
+            };
             let rest = self.resting(&row).await?;
             return Ok(Some(Resume::TopologyChanged {
                 snapshot: snapshot.topology,
@@ -2157,7 +2190,15 @@ where
             let steps = self.parts.store.run_steps(run).await?;
             // Blueprint D196: the one predicate `Unblock`'s third case reads too.
             if resumable_park(&cursor(&snapshot, &steps)) {
-                self.unpark(row, self.now()).await?;
+                // MOD-4 plan D180 (R-31): the unpark is this walk's first compare-and-set, and a
+                // run another command unparked first is not this walk's to merge or walk.
+                if !self.unpark(row, self.now()).await? {
+                    return Err(stale_run(
+                        run,
+                        RunStatus::AwaitingApproval,
+                        RunStatus::Running,
+                    ));
+                }
                 if let Some(winner) = recover::frontier(&snapshot, &steps)
                     && let Some(done) = steps.iter().find(|step| step.id == winner)
                 {
@@ -2510,7 +2551,10 @@ where
                     .await
                     .map(Some);
             }
-            Err(StageThree::Refused(err)) => return Err(err.into()),
+            // MOD-4 plan D162: the step fails before a token and the item is blocked.
+            Err(StageThree::Refused(err)) => {
+                return self.refuse_prompt(run, step, phase, &err).await.map(Some);
+            }
         };
         // `unwrap_or(Value::Null)` here wrote a **null** `trim_record` and said nothing: the row
         // that records which sections were dropped and why would silently become "there was no
@@ -2824,11 +2868,28 @@ where
             Ok(prompt) => prompt,
             Err(StageThree::MissingInput(missing)) => {
                 return self
-                    .fail_group_before_a_token(run, phase, &pending, missing)
+                    .fail_group_before_a_token(
+                        run,
+                        phase,
+                        &pending,
+                        RunFailure::MissingInput(missing),
+                        false,
+                    )
                     .await
                     .map(Some);
             }
-            Err(StageThree::Refused(err)) => return Err(err.into()),
+            // MOD-4 plan D162 at `drive_group` (blueprint D195): no candidate is live yet, so the
+            // whole group fails before a token and the item is blocked.
+            Err(StageThree::Refused(err)) => {
+                let failure = RunFailure::PromptRefused {
+                    phase: phase.name.clone(),
+                    reason: err.to_string(),
+                };
+                return self
+                    .fail_group_before_a_token(run, phase, &pending, failure, true)
+                    .await
+                    .map(Some);
+            }
         };
 
         let settled = futures::future::join_all(pending.iter().map(|step| {
@@ -2939,9 +3000,9 @@ where
         run: &Run,
         phase: &SnapshotPhase,
         pending: &[&RunStep],
-        kind: String,
+        failure: RunFailure,
+        block: bool,
     ) -> Result<Rest, EngineError> {
-        let failure = RunFailure::MissingInput(kind);
         let now = self.now();
         for step in pending {
             // Plan D125: a candidate another writer moved stops the walk before the run is failed.
@@ -2956,11 +3017,15 @@ where
             self.fail_candidate(run, phase, step, &failure.to_string())
                 .await?;
         }
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
-            .await?;
-        self.cleanup_run(run.id).await?;
+        if block {
+            self.block_and_fail(run, &failure, None, now).await?;
+        } else {
+            self.parts
+                .store
+                .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+                .await?;
+            self.cleanup_run(run.id).await?;
+        }
         Ok(Rest {
             run: RunStatus::Failed,
             position: Some(phase.position),
@@ -4168,6 +4233,67 @@ where
         })
     }
 
+    /// MOD-4 plan D162 (blueprint D195, ANA-5 criterion 3): stage 3's assembler refused the
+    /// phase's own prompt, so the step fails before a token is spent and the item is `blocked`.
+    ///
+    /// The step goes `running -> failed` with **no** `gate_note`: the one writer of a note on that
+    /// edge is the sweep's `interrupt_step`, whose `interrupted` prefix `retry_enabled` keys on, so
+    /// the sentence lives in `run.failure` and the item's note. Then [`Self::block_and_fail`]. No
+    /// recorder is opened: stage 4 is never reached. A step another writer moved first is plan
+    /// D125's `StaleWrite`, and nothing else is written.
+    async fn refuse_prompt(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        err: &htui_core::prompt::AssembleError,
+    ) -> Result<Rest, EngineError> {
+        let failure = RunFailure::PromptRefused {
+            phase: phase.name.clone(),
+            reason: err.to_string(),
+        };
+        let now = self.now();
+        self.move_step(
+            run.id,
+            step.id,
+            StepStatus::Running,
+            StepStatus::Failed,
+            now,
+        )
+        .await?;
+        self.block_and_fail(run, &failure, Some(step.id), now)
+            .await?;
+        Ok(Rest {
+            run: RunStatus::Failed,
+            position: Some(step.position),
+            failure: Some(failure),
+        })
+    }
+
+    /// Plan D162's tail at both call sites, in `refuse_no_candidate`'s actual order (blueprint
+    /// F-J): the item `in_progress -> blocked`, the failure as its note, then `finish_run(Failed)`
+    /// — whose item mirror finds a `blocked` item and leaves it — and plan D36's cleanup.
+    async fn block_and_fail(
+        &self,
+        run: &Run,
+        failure: &RunFailure,
+        via: Option<StepId>,
+        now: DateTime<Utc>,
+    ) -> Result<(), EngineError> {
+        if let Some(item) = run.item_id {
+            self.parts
+                .store
+                .transition(item, Status::InProgress, Status::Blocked)
+                .await?;
+            self.note(item, failure.to_string(), via, now).await?;
+        }
+        self.parts
+            .store
+            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+            .await?;
+        self.cleanup_run(run.id).await
+    }
+
     /// Stage 3: the phase's spec ([`Self::phase_spec`]) and `assemble`.
     ///
     /// The inner `Err` is the run's own outcome rather than an engine fault (blueprint D195):
@@ -4494,7 +4620,8 @@ where
             // `shared_serialized` or `local` step, which lives in its own checkout somewhere else
             // on the box. An agent that cannot read it cannot work in it.
             extra_dirs,
-            // `R-SEC-2`: ANA-7 resolves secrets and milestone 6 wires them; the walk invents none.
+            // `R-SEC-2`: no secret provider exists yet; MOD-10 (secret provider, from ANA-7) owns
+            // wiring one. The walk invents none.
             env: BTreeMap::new(),
             model: Some(candidate.model.clone()),
             tools: ToolExposure::default(),
@@ -7752,7 +7879,13 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let refused = engine
-            .fail_group_before_a_token(&row, &snapshot.phases[0], &[&stale], "spec".to_owned())
+            .fail_group_before_a_token(
+                &row,
+                &snapshot.phases[0],
+                &[&stale],
+                RunFailure::MissingInput("spec".to_owned()),
+                false,
+            )
             .await
             .expect_err("the candidate's compare-and-set found the row moved");
         let EngineError::StaleWrite {
