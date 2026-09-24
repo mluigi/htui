@@ -741,6 +741,8 @@ runs.shutdown(CANCEL_GRACE).await;                // before runtime.shutdown (:1
 - The event channel carries only `Attach`. A `Reply` or `Deferred` arriving there is a bug: `debug_assert!` plus a `tracing::error!`, and it is dropped.
 - **T7** replaces the `Attach` stub (§10.3).
 
+**Server switch (T6 repair).** `SetDsn` step (6) calls `runs.forget_server()`. A walk belongs to the server it was claimed on, so every walk of this process is preempted and gives its lease back to that server through `abandoned` (that server's next sweep, in any process, adopts the run); the production isolator and verifier and the claim queue are forgotten, so the new server's first command builds its own parts and is never refused with R-39's sentence for the old server's walks. Shutdown cancels walks and chats side by side (`tokio::join!`), each runtime inside one `2 × CANCEL_GRACE` window.
+
 The `select!` futures are dropped before any handler runs, so handlers may borrow `runs` and `runtime`. The receiver and the ticker are locals, like `ticker` and `events` (`:1086-1115`). **`event_loop.rs` is untouched** (ANA-2 `:1687`).
 
 ### 8.4 `RunLocks`, tokens and preemption (commit d, D157, D187)

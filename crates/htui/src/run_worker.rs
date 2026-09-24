@@ -688,6 +688,8 @@ impl core::fmt::Debug for Parts {
 /// What the production parts were built from, and the parts.
 #[derive(Default)]
 struct Built {
+    /// The [`Shared::server`] generation they belong to.
+    server: u64,
     repos: Option<BTreeMap<RepoId, RepoCheckout>>,
     isolator: Option<Arc<dyn Isolator>>,
     verifier: Option<Arc<dyn Verifier>>,
@@ -712,6 +714,8 @@ struct Shared {
     /// How many tasks have ended: a refused `StartRun` compares it across its claim, so a walk
     /// that rested meanwhile and found the queue empty does not leave the run waiting (M5 D84).
     ended: AtomicU64,
+    /// Which server the production parts are for; [`RunRuntime::forget_server`] moves it.
+    server: AtomicU64,
     /// D190: the sweep period in milliseconds, the lease TTL until a test fixes it.
     sweep_every: AtomicU64,
     /// Whether [`RunRuntime::with_sweep_every`] fixed the period.
@@ -769,6 +773,14 @@ impl Shared {
             } => (scratch_root, built),
         };
         let mut built = built.lock().await;
+        // Parts built for a server the session has left are another server's repos and box.
+        let server = self.server.load(Ordering::SeqCst);
+        if built.server != server {
+            *built = Built {
+                server,
+                ..Built::default()
+            };
+        }
         if !start_run && let (Some(isolator), Some(verifier)) = (&built.isolator, &built.verifier) {
             return Ok((Arc::clone(isolator), Arc::clone(verifier)));
         }
@@ -952,6 +964,13 @@ impl Walks {
             parent.token.cancel();
             true
         })
+    }
+
+    /// Every run's parent removed and cancelled; the root stays, so later tasks walk again.
+    fn preempt_all(&self) {
+        for (_, parent) in self.lock().drain() {
+            parent.token.cancel();
+        }
     }
 
     /// The UI is gone: the root is cancelled, and with it every run's parent, now and later.
@@ -1235,6 +1254,7 @@ impl RunRuntime {
                 walks: Walks::default(),
                 queued: StdMutex::default(),
                 ended: AtomicU64::new(0),
+                server: AtomicU64::new(0),
                 sweep_every: AtomicU64::new(millis(lease_period(&BTreeMap::new()))),
                 sweep_fixed: false,
                 sweeping: AtomicBool::new(false),
@@ -1346,6 +1366,24 @@ impl RunRuntime {
             self.configure().events = events;
             receiver
         })
+    }
+
+    /// The session moved to another server (`SetDsn`, MOD-15 D11 step 6).
+    ///
+    /// A walk belongs to the server it was claimed on: every walk of this process is preempted,
+    /// giving its lease back to that server through `abandoned` (whose next sweep, in any
+    /// process, adopts the run), so no walk keeps writing to a database the session has left or
+    /// keeps its pool open. The production isolator and verifier, built from the old server's
+    /// repo map and box, and the claim queue, the old server's runs, are forgotten: the new
+    /// server's first command builds its own parts, with no `REPOS_MOVED` refusal on the way.
+    pub fn forget_server(&mut self) {
+        self.shared.server.fetch_add(1, Ordering::SeqCst);
+        self.shared.walks.preempt_all();
+        self.shared
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     /// How many isolators this process has built (D156's test hook).
@@ -3412,6 +3450,92 @@ pub(crate) mod tests {
             RunStatus::Queued,
             "and the earlier run's scope refuses it"
         );
+    }
+
+    /// `SetDsn` (MOD-15 D11 step 6): a walk belongs to the server it was claimed on, so a switch
+    /// preempts it — the lease goes back to that server through `abandoned` — and the claim
+    /// queue, the old server's runs, is forgotten.
+    #[tokio::test]
+    async fn a_server_switch_preempts_every_walk_and_forgets_the_queue() {
+        let fixture = Fixture::new().await;
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: start_run(ids::HTUI_ANA_2),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred));
+        within("the session starting", stall.reached.notified()).await;
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        runtime.shared.queue(Utc::now(), RunId::new());
+
+        runtime.forget_server();
+        let answer = within("the old walk stopping", answers.recv())
+            .await
+            .expect("the runtime answers");
+        assert!(
+            matches!(&answer.reply, StoreReply::Failed { message, .. } if message == PREEMPTED),
+            "{:?}",
+            answer.reply
+        );
+        assert!(
+            stall.dropped.load(Ordering::SeqCst),
+            "the session was dropped"
+        );
+        assert!(
+            fixture
+                .run(run)
+                .await
+                .lease_expires_at
+                .is_some_and(|until| until <= Utc::now()),
+            "the lease went back to the server the walk was claimed on"
+        );
+        assert!(
+            runtime.shared.queued.lock().expect("the set").is_empty(),
+            "the old server's queued runs are forgotten"
+        );
+    }
+
+    /// A server switch forgets the production isolator, built from the old server's repo map and
+    /// box: the new server's first command builds its own.
+    #[tokio::test]
+    async fn a_server_switch_rebuilds_the_isolator() {
+        let fixture = Fixture::new().await;
+        let scratch = tempfile::tempdir().expect("a scratch root");
+        let mut runtime = RunRuntime::new(fixture.factory())
+            .with_clock(Arc::new(TokioClock::new()))
+            .with_scratch_root(scratch.path().to_path_buf());
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+
+        for (seq, item) in [(1, ids::HTUI_ANA_2), (2, ids::AGY_FEAT_1)] {
+            runtime
+                .serve(
+                    &backend,
+                    &replies,
+                    &RequestEnvelope {
+                        seq,
+                        origin: Origin::App,
+                        request: start_run(item),
+                    },
+                    &LiveChats::default(),
+                )
+                .await;
+            assert!(runtime.settle(PATIENCE).await.is_empty());
+            runtime.forget_server();
+        }
+        assert_eq!(runtime.isolator_builds(), 2);
     }
 
     /// The frames (not the acknowledgements) received so far, taken out of `seen`.

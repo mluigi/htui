@@ -1335,6 +1335,9 @@ pub fn spawn_with_runtimes(
                             held = None;
                             pending = None;
                             dials.fetch_add(1, Ordering::SeqCst);
+                            // Every walk goes back to the server it was claimed on, and the run
+                            // runtime forgets the old server's parts and queue (MOD-4 T6).
+                            runs.forget_server();
                             backend = Backend::Offline {
                                 cache: applied.cache,
                                 // `since: None` renders `connecting`, which is what the top bar
