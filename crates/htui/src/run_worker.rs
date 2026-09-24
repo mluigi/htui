@@ -1496,8 +1496,8 @@ impl RunRuntime {
             .len()
     }
 
-    /// Serves one `Orch`, `RunStream` or `RunActions` request (§8.5). Awaits nothing longer than
-    /// the verdict reads: every command is a task.
+    /// Serves one `Orch`, `RunStream` or `RunActions` request (§8.5). Awaits nothing: every
+    /// command, and every verdict read (D215), is a task that answers at the request's `seq`.
     pub async fn serve(
         &mut self,
         backend: &Backend,
@@ -1514,14 +1514,26 @@ impl RunRuntime {
                     .subscribe(envelope.origin.clone(), envelope.seq, *item);
                 RunServed::Reply(StoreReply::RunStream(RunFrame::subscribed(*item)))
             }
+            // D215: the verdicts read the item, its documents, its runs and each run's row and
+            // steps, so they are a tracked task like a command and answer at the request's own
+            // `seq`; `App::is_fresh` drops a reply a later one overtook.
             StoreRequest::RunActions(item) => {
-                RunServed::Reply(match actions(backend, *item, live).await {
-                    Ok(actions) => StoreReply::RunActions(Box::new(actions)),
-                    Err(err) => StoreReply::Failed {
-                        request: envelope.request.name(),
-                        message: err.to_string(),
-                    },
-                })
+                let (backend, replies, live, item) =
+                    (backend.clone(), replies.clone(), live.clone(), *item);
+                let (seq, origin) = (envelope.seq, envelope.origin.clone());
+                let request = envelope.request.name();
+                let handle = tokio::spawn(async move {
+                    let reply = match actions(&backend, item, &live).await {
+                        Ok(actions) => StoreReply::RunActions(Box::new(actions)),
+                        Err(err) => StoreReply::Failed {
+                            request,
+                            message: err.to_string(),
+                        },
+                    };
+                    let _ = replies.send(ReplyEnvelope { seq, origin, reply });
+                });
+                self.shared.track(Arc::default(), handle);
+                RunServed::Deferred
             }
             StoreRequest::Orch(request) => {
                 let name = request.name();

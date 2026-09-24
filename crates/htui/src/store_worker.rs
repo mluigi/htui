@@ -1504,7 +1504,8 @@ pub fn spawn_with_runtimes(
                             }
                         }
                         // Plan D153: every orchestrator command is a task of the run runtime, and
-                        // `Deferred => continue` is the whole of `R-NF-3` for it. `Document` is a
+                        // so is every `RunActions` read (D215); `Deferred => continue` is the
+                        // whole of `R-NF-3` for them. `Document` is a
                         // read and goes to `try_serve` below (D183).
                         StoreRequest::Orch(_)
                         | StoreRequest::RunStream { .. }
