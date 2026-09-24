@@ -3,7 +3,7 @@
 //! Everything else in the crate produces [`Action`]s; this file is the only consumer. Adding a
 //! feature adds an arm here and a file under `ui/`, never an arm in the event loop.
 
-use htui_core::model::{Scope, StepId, WorkspaceId, WorkspaceSummary};
+use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
 
 use crate::app::action::{Action, OverlayAction, TabAction};
 use crate::app::state::{App, Ctx};
@@ -26,6 +26,7 @@ impl App {
             Action::Reply(envelope) => self.on_reply(envelope),
             Action::SetScope { workspace } => self.set_scope(workspace),
             Action::Replay { step_id } => self.replay(step_id),
+            Action::Promote { run, step } => self.promote(run, step),
             Action::ToggleHelp => self.help_visible = !self.help_visible,
             Action::Error(message) => self.status = Some(message),
             Action::Tick => {
@@ -133,6 +134,16 @@ impl App {
         };
         self.update_tab(TabAction::Focus(tab));
         self.dispatch(Origin::Tab(tab), StoreRequest::StepEvents(step_id));
+    }
+
+    /// Promotes a step to a chat: focus the tab that drives chats, then ask for the promotion on
+    /// its behalf (MOD-4 plan D165), the shape of [`Self::replay`].
+    ///
+    /// The request carries `chat_open: false`; the run runtime overwrites it with what this
+    /// process knows (blueprint D185).
+    fn promote(&mut self, run: RunId, step: StepId) {
+        let _ = (run, step);
+        todo!()
     }
 
     /// A reply came back: top bar first, then the staleness gate, then the addressee.
@@ -324,6 +335,7 @@ mod tests {
     use super::*;
     use crate::app::Handled;
     use crate::keymap::Keymap;
+    use crate::run_worker::OrchRequest;
     use crate::store_worker::RequestEnvelope;
     use crate::ui::overlay::MigrationPrompt;
     use crate::ui::tabs::{Tab, TabId};
@@ -332,6 +344,7 @@ mod tests {
     use htui_core::model::{
         ItemFilter, ItemId, ItemKindId, ItemSummary, ProjectId, ProjectRef, Status,
     };
+    use htui_orch::Command;
     use ratatui::Frame;
     use ratatui::layout::Rect;
     use std::cell::RefCell;
@@ -620,6 +633,50 @@ mod tests {
         assert!(
             app.overlays.is_empty(),
             "an answered prompt is not re-asked every fourth tick"
+        );
+    }
+
+    /// MOD-4 plan D165: the promotion is asked for on the chat-driving tab's behalf, so its replies
+    /// land there.
+    #[test]
+    fn promote_focuses_the_chat_tab_and_addresses_it() {
+        let (mut app, mut rx, _seen) = shell();
+        app.replay_tab = Some(Recorder::ID);
+        while rx.try_recv().is_ok() {}
+        let (run, step) = (RunId::new(), StepId::new());
+
+        app.update(Action::Promote { run, step });
+        assert_eq!(app.tabs.active_id(), Some(Recorder::ID));
+        let envelope = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|envelope| matches!(envelope.request, StoreRequest::Orch(_)))
+            .expect("the promotion is dispatched");
+        assert_eq!(envelope.origin, Origin::Tab(Recorder::ID));
+        assert!(matches!(
+            envelope.request,
+            StoreRequest::Orch(OrchRequest::Command(Command::PromoteStep {
+                run: asked,
+                step: promoted,
+                chat_open: false,
+            })) if asked == run && promoted == step
+        ));
+    }
+
+    #[test]
+    fn promote_with_no_chat_tab_says_so() {
+        let (mut app, mut rx, _seen) = shell();
+        while rx.try_recv().is_ok() {}
+        app.update(Action::Promote {
+            run: RunId::new(),
+            step: StepId::new(),
+        });
+        assert_eq!(
+            app.status.as_deref(),
+            Some("no tab can drive a promoted step")
+        );
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .all(|envelope| !matches!(envelope.request, StoreRequest::Orch(_))),
+            "nothing is asked for"
         );
     }
 
