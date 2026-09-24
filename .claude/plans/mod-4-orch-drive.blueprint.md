@@ -1,6 +1,6 @@
 # Blueprint: MOD-4 milestone 6, "the maintainer drives it"
 
-**Status**: **draft for the maintainer** (2026-09-24). Findings F-A..F-S (§0) and decisions D181–D209 (§20) need an accept or a veto before T1 is dispatched. Where a finding says **Blocker**, the plan read literally does not compile, cannot pass its own case, or leaves a state nobody can recover. The fix column is what the implementer builds unless the maintainer overrules it.
+**Status**: **accepted** (2026-09-24). The maintainer accepted findings F-A..F-S (§0) and decisions D181–D209 (§20) as written. Where a finding says **Blocker**, the plan read literally does not compile, cannot pass its own case, or leaves a state nobody can recover; the fix column is what the implementer builds.
 
 **Plan**: `.claude/plans/mod-4-orch-drive.plan.md`, confirmed 2026-09-24 with every OQ default. It covers D153–D180 and R-38–R-47. The fact-check's "(amended at fact-check)" notes and its Verified-claims table take precedence over the plan's original prose, and this blueprint follows them. **PRD**: `.claude/prds/mod-4-orchestrator-manual-mode.prd.md`, milestone 6 (`:312`). PRD D1–D8 win over this blueprint where they disagree. **Design authority**: ANA-2 §4.3, §4.8, §4.10, §6.2 and §8 (`docs/ANA-2.md:520-687`, `:1160-1240`, `:1380-1392`, `:1551-1580`, `:1681-1697`).
 
