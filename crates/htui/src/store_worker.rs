@@ -1156,12 +1156,18 @@ async fn on_run_served(
     tx: &mpsc::UnboundedSender<ReplyEnvelope>,
 ) {
     match served {
-        RunServed::Attach { addr, promoted } => {
+        RunServed::Attach {
+            addr,
+            promoted,
+            ended,
+        } => {
             match runtime
                 .attach_promoted(backend, tx, addr.clone(), *promoted)
                 .await
             {
-                Served::Start { step_id, task } => runtime.attach(step_id, tokio::spawn(task)),
+                Served::Start { step_id, task } => {
+                    runtime.attach(step_id, tokio::spawn(ended.after(task)));
+                }
                 Served::Reply(reply) => {
                     let _ = tx.send(ReplyEnvelope {
                         seq: addr.seq,

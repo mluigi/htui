@@ -562,7 +562,42 @@ pub enum RunServed {
         addr: ReplyAddr,
         /// What the chat binds to.
         promoted: Box<Promoted>,
+        /// What the chat's end publishes: the loop wraps the session task in it (D212).
+        ended: ChatEnd,
     },
+}
+
+/// Blueprint D212: what a promoted chat's end publishes for its item.
+///
+/// The Runs pane greys the run's verbs while a step of it is chatted with, refuses a greyed key
+/// itself, and reads its verdicts again only on a frame of its item. Ending a chat writes nothing
+/// the walk publishes, so without a frame of its own the verbs would stay greyed after `Esc Esc`.
+/// The session task is wrapped in [`after`](Self::after), which publishes `Changed` for the item
+/// and run once the task has returned.
+#[derive(Debug, Clone)]
+pub struct ChatEnd {
+    publisher: Publisher,
+    tag: Arc<Tag>,
+}
+
+impl ChatEnd {
+    /// `task`, then a `Changed` frame for the promoted step's item. The session's command
+    /// receiver dies with `task`, so by the time the frame is out
+    /// `AgentRuntime::live_steps` no longer names the step and the verdicts the pane reads next
+    /// are the chat-free ones.
+    #[must_use]
+    pub fn after(self, task: crate::agent_worker::ChatTask) -> crate::agent_worker::ChatTask {
+        Box::pin(async move {
+            task.await;
+            if let Some(item) = self.tag.item.get() {
+                self.publisher.publish(&RunFrame {
+                    item: *item,
+                    run: self.tag.run.get().copied(),
+                    kind: FrameKind::Changed,
+                });
+            }
+        })
+    }
 }
 
 /// A promoted step, as the Chat tab's runtime binds to it (D165, D191).
@@ -2220,6 +2255,10 @@ async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt, li
                                 project,
                                 opening: *opening,
                             }),
+                            ended: ChatEnd {
+                                publisher: ctx.shared.publisher.clone(),
+                                tag: Arc::clone(&ctx.tag),
+                            },
                         });
                     }
                     Err(err) => ctx.answer(StoreReply::Failed {

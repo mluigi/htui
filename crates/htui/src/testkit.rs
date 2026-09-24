@@ -172,7 +172,11 @@ impl Harness {
     /// `promote_step: promotion needs the chat runtime` at its address, after the engine's writes.
     async fn on_run_served(&mut self, served: RunServed) {
         match served {
-            RunServed::Attach { addr, promoted } => {
+            RunServed::Attach {
+                addr,
+                promoted,
+                ended,
+            } => {
                 let reply = match self.runtime.as_mut() {
                     Some(runtime) => {
                         match runtime
@@ -185,7 +189,7 @@ impl Harness {
                             .await
                         {
                             Served::Start { step_id, task } => {
-                                self.chats.push((step_id, task));
+                                self.chats.push((step_id, ended.after(task)));
                                 return;
                             }
                             Served::Deferred => return,
