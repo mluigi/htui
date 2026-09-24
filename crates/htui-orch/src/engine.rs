@@ -504,6 +504,12 @@ where
                 attempt,
                 winner,
             } => self.select_fanout(run, position, attempt, winner).await,
+            Command::PromoteStep { .. }
+            | Command::AcceptArtifact { .. }
+            | Command::Unblock { .. }
+            | Command::CloseOut { .. } => {
+                todo!("MOD-4 milestone 6: promote, accept, unblock and close-out")
+            }
         }
     }
 
