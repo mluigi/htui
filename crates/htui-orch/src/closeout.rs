@@ -482,7 +482,7 @@ mod tests {
             (step_id(13), vec![commit(13, 2, "p1a", Some("p1b"))]),
         ];
         // Repo 3 is not in the list, so its row renders the id.
-        let repos = [repo(1, "zeta"), repo(2, "alpha")];
+        let repos = [repo(1, "omega"), repo(2, "alpha")];
 
         let doc = write(&runs, &commits, &repos);
 
@@ -491,11 +491,11 @@ mod tests {
             [
                 "| alpha | 1 | plan | 1 | p1a..p1b |".to_owned(),
                 "| alpha | 1 | plan | 2 | p2c..p2d |".to_owned(),
-                "| zeta | 1 | plan | 2 | p2a..p2b |".to_owned(),
+                "| omega | 1 | plan | 2 | p2a..p2b |".to_owned(),
                 format!("| {} | 2 | implement | 1 | f0a..f0b |", repo_id(3)),
-                "| zeta | 2 | implement | 1 | f1a..f1b |".to_owned(),
+                "| omega | 2 | implement | 1 | f1a..f1b |".to_owned(),
                 "| alpha | 1 | implement | 1 | r2c..r2d |".to_owned(),
-                "| zeta | 1 | implement | 1 | r2a..r2b |".to_owned(),
+                "| omega | 1 | implement | 1 | r2a..r2b |".to_owned(),
             ],
             "run queued_at, then (position, attempt, fanout_index), then repo name:\n{}",
             doc.body
