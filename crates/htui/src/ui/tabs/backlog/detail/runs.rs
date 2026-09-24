@@ -213,18 +213,142 @@ fn indicator(step: &RunStepSummary) -> Option<String> {
 /// Counted in `char`s, like the text field (`ui/text_field.rs`). A control character, a newline in
 /// a failure sentence say, becomes a space: one line is one line.
 fn fit(text: &str, width: usize) -> String {
-    todo!("{text} {width}")
+    let flat: Vec<char> = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if flat.len() <= width {
+        let mut out: String = flat.iter().collect();
+        out.extend(core::iter::repeat_n(' ', width - flat.len()));
+        out
+    } else if width == 0 {
+        String::new()
+    } else {
+        let mut out: String = flat[..width - 1].iter().collect();
+        out.push(CUT);
+        out
+    }
+}
+
+/// A blank cell of `width` columns.
+fn blank(width: usize) -> String {
+    " ".repeat(width)
+}
+
+/// Four cells on [`RUN_GRID`], single-spaced.
+fn run_grid(cells: [(&str, Style); 4]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(7);
+    for (at, ((text, style), width)) in cells.into_iter().zip(RUN_GRID).enumerate() {
+        if at > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(fit(text, width), style));
+    }
+    Line::from(spans)
 }
 
 /// The run grid's two header lines, `kind status box started` over `mode … finished`.
 fn header_lines(theme: &Theme) -> [Line<'static>; 2] {
-    todo!("{theme:?}")
+    let title = theme.title;
+    [
+        run_grid([
+            ("kind", title),
+            ("status", title),
+            ("box", title),
+            ("started", title),
+        ]),
+        run_grid([("mode", title), ("", title), ("", title), ("finished", title)]),
+    ]
+}
+
+/// `run.status` in the run grid's nine columns: `awaiting_approval` is the one that does not fit,
+/// and it reads `awaiting`, as a step's does (D197).
+const fn run_status(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::AwaitingApproval => "awaiting",
+        other => other.as_str(),
+    }
+}
+
+/// `run_step.status` in the step grid's ten columns (D197).
+const fn step_status(status: StepStatus) -> &'static str {
+    match status {
+        StepStatus::AwaitingApproval => "awaiting",
+        other => other.as_str(),
+    }
+}
+
+/// A timestamp in the pane's [`STAMP`] format, or [`PENDING`].
+fn stamp(at: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    at.map_or_else(|| PENDING.to_owned(), |at| at.format(STAMP).to_string())
 }
 
 /// One run's lines: `kind status box started`, `mode … finished`, and the failure when there is
 /// one, fitted to the pane.
 fn run_lines(run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
-    todo!("{run:?} {theme:?}")
+    let started = stamp(run.started_at);
+    let finished = stamp(run.finished_at);
+    let mut lines = vec![
+        run_grid([
+            (run.kind.as_str(), theme.base),
+            (run_status(run.status), run_style(theme, run.status)),
+            (&run.box_hostname, theme.base),
+            (&started, theme.base),
+        ]),
+        run_grid([
+            (run.mode.as_str(), theme.dim),
+            ("", theme.dim),
+            ("", theme.dim),
+            (&finished, theme.dim),
+        ]),
+    ];
+    if let Some(failure) = &run.failure {
+        lines.push(Line::from(Span::styled(fit(failure, PANE), theme.error)));
+    }
+    lines
+}
+
+/// The slot a step sits in: `p.a`, plus `/i` in a fan-out slot and `/j` for its judge.
+fn slot(step: &RunStepSummary, siblings: &[RunStepSummary]) -> String {
+    let fanned = siblings.iter().any(|sibling| {
+        sibling.position == step.position
+            && sibling.attempt == step.attempt
+            && sibling.fanout_index != 0
+    });
+    let at = format!("{}.{}", step.position, step.attempt);
+    match (fanned, step.fanout_index) {
+        (false, _) => at,
+        (true, -1) => format!("{at}/j"),
+        (true, index) => format!("{at}/{index}"),
+    }
+}
+
+/// The gate cell: the outcome or `—`, then `*` for a promoted step and `✓` for a selected one.
+fn gate(step: &RunStepSummary) -> String {
+    let mut gate = step
+        .gate_outcome
+        .map_or(PENDING, |outcome| outcome.as_str())
+        .to_owned();
+    if step.promoted_at.is_some() {
+        gate.push('*');
+    }
+    if step.selected == Some(true) {
+        gate.push('\u{2713}');
+    }
+    gate
+}
+
+/// Line 2's tail: D106's indicator, then `agent/model`.
+fn tail(step: &RunStepSummary) -> String {
+    let who = format!(
+        "{}/{}",
+        step.agent_name.as_deref().unwrap_or(PENDING),
+        step.model.as_deref().unwrap_or(PENDING)
+    );
+    match indicator(step) {
+        Some(figure) => format!("{figure} {who}"),
+        None => who,
+    }
 }
 
 /// One step's two lines (D197). `siblings` are the steps of its run: a fan-out slot is known by a
@@ -235,19 +359,109 @@ fn step_lines(
     on_cursor: bool,
     theme: &Theme,
 ) -> [Line<'static>; 2] {
-    todo!("{step:?} {siblings:?} {on_cursor} {theme:?}")
+    let label = if on_cursor { theme.accent } else { theme.dim };
+    let mark = if on_cursor { CURSOR } else { " " };
+    let first = Line::from(vec![
+        Span::styled(mark, label),
+        Span::raw(" "),
+        Span::styled(fit(&slot(step, siblings), SLOT_WIDTH), label),
+        Span::raw(" "),
+        Span::styled(
+            fit(step_status(step.status), STATUS_WIDTH),
+            step_style(theme, step.status),
+        ),
+        Span::raw(" "),
+        Span::styled(fit(&step.phase_name, PHASE_WIDTH), label),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:>USAGE_WIDTH$}", usage_cell(step.usage.as_ref())),
+            theme.dim,
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:>DURATION_WIDTH$}", duration_cell(step)),
+            theme.dim,
+        ),
+    ]);
+    let second = Line::from(vec![
+        Span::raw(blank(INDENT)),
+        Span::styled(fit(&gate(step), GATE_WIDTH), theme.dim),
+        Span::raw(" "),
+        Span::styled(fit(&tail(step), TAIL_WIDTH), theme.dim),
+    ]);
+    [first, second]
 }
 
 /// D170's usage cell: dollars when the usage document carries a cost, else tokens, else `—`. At
 /// most [`USAGE_WIDTH`] characters over the whole of `i64`.
+///
+/// Computed in `i128`, so rounding `i64::MAX` cannot overflow.
 fn usage_cell(usage: Option<&Value>) -> String {
-    todo!("{usage:?}")
+    let Some(totals) =
+        usage.and_then(|usage| serde_json::from_value::<UsageTotals>(usage.clone()).ok())
+    else {
+        return PENDING.to_owned();
+    };
+    let cost = i128::from(totals.cost_micros.unwrap_or(0));
+    if cost > 0 {
+        let cents = (cost + 5_000) / 10_000;
+        if cents < 10_000 {
+            return format!("${}.{:02}", cents / 100, cents % 100);
+        }
+        let dollars = (cost + 500_000) / 1_000_000;
+        return if dollars < 100_000 {
+            format!("${dollars}")
+        } else {
+            ">$99k".to_owned()
+        };
+    }
+    let tokens = i128::from(totals.input_tokens.unwrap_or(0))
+        + i128::from(totals.output_tokens.unwrap_or(0));
+    if tokens <= 0 {
+        return PENDING.to_owned();
+    }
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    let thousands = (tokens + 500) / 1_000;
+    if thousands < 1_000 {
+        return format!("{thousands}k");
+    }
+    // Tenths of a million below ten million, so `999 500` reads `1.0M` rather than `1000k`.
+    let tenths = (tokens + 50_000) / 100_000;
+    if tenths < 100 {
+        return format!("{}.{}M", tenths / 10, tenths % 10);
+    }
+    let millions = (tokens + 500_000) / 1_000_000;
+    if millions < 1_000 {
+        format!("{millions}M")
+    } else {
+        ">999M".to_owned()
+    }
 }
 
 /// D170's duration cell: `finished_at - started_at`, `…` while running, `—` before starting. At
 /// most [`DURATION_WIDTH`] characters.
 fn duration_cell(step: &RunStepSummary) -> String {
-    todo!("{step:?}")
+    let Some(started) = step.started_at else {
+        return PENDING.to_owned();
+    };
+    let Some(finished) = step.finished_at else {
+        return RUNNING.to_owned();
+    };
+    let seconds = (finished - started).num_seconds().max(0);
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    if seconds < 3_600 {
+        return format!("{}m", seconds / 60);
+    }
+    let hours = seconds / 3_600;
+    if hours < 100 {
+        format!("{hours}h{:02}", (seconds % 3_600) / 60)
+    } else {
+        ">99h".to_owned()
+    }
 }
 
 impl DetailTab for RunsTab {
@@ -956,7 +1170,8 @@ mod tests {
             360_000,
             i64::from(i32::MAX),
         ];
-        seconds.extend((0..40).map(|exponent| 3_i64.pow(exponent) / 7));
+        // Up to about 25 000 years: `chrono`'s own range ends not far past that.
+        seconds.extend((0..26).map(|exponent| 3_i64.pow(exponent) / 7));
         for seconds in seconds {
             let cell = duration_cell(&span(seconds));
             assert!(

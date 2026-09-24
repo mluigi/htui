@@ -10,14 +10,14 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │  ANA-2    open               Orchestrator step grap…││mode                          finished     │
 │  CLEAN-1  failed             Drop the legacy markdo…││graph  done      DESKTOP-HTUI 09-02 08:00  │
 │  FEAT-1   in_progress        TUI scaffold           ││manual                        09-02 12:00  │
-│  FEAT-2   blocked            Agent driver and chat …││▸ 0    done      prd          09-02 08:00  │
-│  FEAT-3   queued             Postgres store and cac…││  1    done      plan         09-02 09:00  │
-│  FIX-1    closed             Terminal left raw afte…││  2    done      implement    09-02 10:00  │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││                 ~36k !                    │
-│▾ agy (3)                                            ││  3    done      review       09-02 11:00  │
-│  ANA-1    done               Prompt assembly survey ││                                           │
-│  FEAT-1   open               ACP transport upgrade  ││                                           │
-│  FIX-1    open               Session leak on cancel ││                                           │
+│  FEAT-2   blocked            Agent driver and chat …││▸ 0.1   done       prd              —  1h00│
+│  FEAT-3   queued             Postgres store and cac…││        approved   claude/sonnet           │
+│  FIX-1    closed             Terminal left raw afte…││  1.1   done       plan           14k  1h00│
+│  TOOL-1   awaiting_approval  CI matrix for the thre…││        approved   claude/sonnet           │
+│▾ agy (3)                                            ││  2.1   done       implement        —  1h00│
+│  ANA-1    done               Prompt assembly survey ││        approved   ~36k ! claude/opus      │
+│  FEAT-1   open               ACP transport upgrade  ││  3.1   done       review           —  1h00│
+│  FIX-1    open               Session leak on cancel ││        approved   agy/default             │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
