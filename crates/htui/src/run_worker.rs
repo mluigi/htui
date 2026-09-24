@@ -1666,15 +1666,15 @@ async fn retry_claims(ctx: &TaskCtx) {
     {
         return;
     }
-    let walks = matches!(
-        ctx.backend.run(run).await,
+    // Only a run read to be resting frees anything. A failed read proves nothing, and treating it
+    // as a rest would have a queued run's own failed retry retrigger itself for a whole outage.
+    match ctx.backend.run(run).await {
         Ok(Some(Run {
             status: RunStatus::Running | RunStatus::Queued,
             ..
         }))
-    );
-    if walks {
-        return;
+        | Err(_) => return,
+        Ok(_) => {}
     }
     let queued = std::mem::take(
         &mut *ctx
@@ -3219,6 +3219,52 @@ pub(crate) mod tests {
             runtime.isolator_builds(),
             0,
             "the isolator was refused, not built"
+        );
+    }
+
+    /// M5 D84: only a run read to be resting triggers the claim retry. A status read that fails —
+    /// the store is gone — retries nothing, so a queued run does not keep retrying itself for the
+    /// whole outage.
+    #[tokio::test]
+    async fn a_failed_status_read_retries_no_claim() {
+        let root = tempfile::tempdir().expect("a throwaway mirror root");
+        let cache = CacheStore::open(root.path(), "run-worker-retry", PgStore::schema_version())
+            .await
+            .expect("the mirror opens");
+        cache.close().await;
+        let backend = Backend::Offline {
+            cache,
+            since: Some(Utc::now()),
+        };
+        let ended = RunId::new();
+        assert!(backend.run(ended).await.is_err(), "every read fails");
+
+        let fixture = Fixture::new().await;
+        let runtime = fixture.runtime();
+        let (replies, _answers) = mpsc::unbounded_channel();
+        let ctx = super::TaskCtx {
+            shared: Arc::clone(&runtime.shared),
+            backend,
+            replies,
+            addr: None,
+            name: "walk",
+            tag: Arc::default(),
+        };
+        let _ = ctx.tag.run.set(ended);
+        let waiting = RunId::new();
+        runtime.shared.queue(Utc::now(), waiting);
+
+        super::retry_claims(&ctx).await;
+        assert_eq!(runtime.tasks_len(), 0, "no retry was spawned");
+        assert!(
+            runtime
+                .shared
+                .queued
+                .lock()
+                .expect("the set")
+                .iter()
+                .any(|(_, run)| *run == waiting),
+            "the run still waits"
         );
     }
 
