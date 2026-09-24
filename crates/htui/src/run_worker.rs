@@ -1935,7 +1935,7 @@ async fn start_run(
 
 /// Every verb on one run: preempt as the verb says, lock, dispatch (§8.6).
 async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt) {
-    ctx.tag(run).await;
+    let early = ctx.tag(run).await;
     let stop = match preempt {
         Preempt::Always => true,
         Preempt::IfLive => ctx.shared.walks.is_live(run),
@@ -1952,7 +1952,8 @@ async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt) {
         Ok(kit) => kit,
         Err(message) => return ctx.refuse(message),
     };
-    let row = ctx.tag_run(&kit.writer, run).await;
+    // `project_id` never changes, so the row read before the lock stands in for a failed one.
+    let row = ctx.tag_run(&kit.writer, run).await.or(early);
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
     match walked(&walk, engine.dispatch(command)).await {
@@ -1978,17 +1979,39 @@ async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt) {
                 via,
             }));
             ctx.publish(Some(run), FrameKind::Rested(rest));
-            // D181: the chat binding is the loop's; the runtime's event channel reaches it.
-            if let (Some(row), Some(addr)) = (row, ctx.addr.clone()) {
-                let _ = ctx.shared.events.send(RunServed::Attach {
-                    addr,
-                    promoted: Box::new(Promoted {
-                        run,
-                        step,
-                        project: row.project_id,
-                        opening: *opening,
+            // D181: the chat binding is the loop's; the runtime's event channel reaches it. The
+            // run's project comes from the row read before the dispatch, or read again now: a
+            // promotion whose chat cannot be bound is answered, never left waiting.
+            let project = match row {
+                Some(row) => Ok(row.project_id),
+                None => kit.writer.run(run).await.and_then(|row| {
+                    row.map(|row| row.project_id)
+                        .ok_or_else(|| StoreError::NotFound {
+                            entity: "run",
+                            id: run.to_string(),
+                        })
+                }),
+            };
+            if let Some(addr) = ctx.addr.clone() {
+                match project {
+                    Ok(project) => {
+                        let _ = ctx.shared.events.send(RunServed::Attach {
+                            addr,
+                            promoted: Box::new(Promoted {
+                                run,
+                                step,
+                                project,
+                                opening: *opening,
+                            }),
+                        });
+                    }
+                    Err(err) => ctx.answer(StoreReply::Failed {
+                        request: ctx.name,
+                        message: format!(
+                            "the step was promoted, but its run could not be read to bind its chat: {err}"
+                        ),
                     }),
-                });
+                }
             }
         }
         Some(Ok(outcome)) => ctx.done(outcome),
