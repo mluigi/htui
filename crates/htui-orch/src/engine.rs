@@ -1092,7 +1092,8 @@ where
         let row = self.step(run.id, step).await?;
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = self.item(Self::item_of(&run)?).await?;
-        crate::command::promote_enabled(&run, item.status, &row, &phase, chat_open)?;
+        let steps = self.parts.store.run_steps(run.id).await?;
+        crate::command::promote_enabled(&run, item.status, &steps, &row, &phase, chat_open)?;
 
         // Plan D108's order: after the pure guard and before the first write.
         self.take_lease(run.id).await?;
@@ -1278,7 +1279,8 @@ where
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = Self::item_of(&run)?;
         let has_output = self.output_of(item, &phase, row.id).await?.is_some();
-        crate::command::accept_enabled(&row, &phase, has_output, chat_live)?;
+        let steps = self.parts.store.run_steps(run.id).await?;
+        crate::command::accept_enabled(&steps, &row, &phase, has_output, chat_live)?;
 
         // Plan D108's order: after the pure guard and before the first write.
         self.take_lease(run.id).await?;
@@ -10748,6 +10750,89 @@ mod tests {
             "the primary repo's tree, though it is second in the scope"
         );
         assert_eq!(opening.extra_dirs, vec![path_of(docs)]);
+    }
+
+    /// Plan D134 at `PromoteStep`: a `failed` attempt a retry replaced stays `failed` for good
+    /// (`retry_guarded` leaves it alone), and it is not the position's latest. Promoting it would
+    /// park a second step beside the real one, and `AcceptArtifact` would then merge the old tree
+    /// and leave the run `running` with nothing walking it. The promotion is refused as
+    /// `StaleSlot`, and nothing is written.
+    #[tokio::test]
+    async fn promote_refuses_an_attempt_a_retry_replaced() {
+        let harness = Harness::new().await;
+        harness.add_primary_repo().await;
+        let (run, first) = started(&harness).await;
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(
+                    first,
+                    GateOutcome::Rejected,
+                    Some("not this".to_owned()),
+                    harness.orch.clock.now(),
+                )
+                .await
+                .expect("MemStore takes the answer"),
+            "attempt 1 is `failed` under the parked run"
+        );
+        harness
+            .dispatch(Command::RetryStep { run, step: first })
+            .await
+            .expect("`retry_limit = 1` permits a second attempt");
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step.attempt, step.status))
+                .collect::<Vec<_>>(),
+            [(1, StepStatus::Failed), (2, StepStatus::AwaitingApproval)]
+        );
+        let (before, notes) = (
+            (harness.orch.run(run).await, steps),
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+        );
+
+        let refused = harness
+            .dispatch(Command::PromoteStep {
+                run,
+                step: first,
+                chat_open: false,
+            })
+            .await
+            .expect_err("attempt 2 replaced attempt 1");
+        assert!(
+            matches!(
+                refused,
+                EngineError::StaleSlot {
+                    step,
+                    attempt: 1,
+                    latest: 2,
+                } if step == first
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            (harness.orch.run(run).await, harness.orch.steps(run).await),
+            before,
+            "nothing was written"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            notes
+        );
     }
 
     /// MOD-4 plan D180 (R-31): `walk_resumed`'s unpark is its first compare-and-set. A run another

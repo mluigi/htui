@@ -706,15 +706,7 @@ pub fn retry_enabled(
     }
     // Plan D134: a later attempt already replaced this one, so there is nothing for a retry to
     // replace — and A-8's exemption below must not reach an older interrupted row.
-    if let Some(latest) = latest_at(steps, step.position)
-        && latest.attempt != step.attempt
-    {
-        return Err(EngineError::StaleSlot {
-            step: step.id,
-            attempt: step.attempt,
-            latest: latest.attempt,
-        });
-    }
+    latest_attempt(steps, step)?;
     if !may_attempt(step.attempt + 1, phase.retry_limit) && !interrupted(step) {
         return Err(EngineError::RetryExhausted {
             step: step.id,
@@ -723,6 +715,20 @@ pub fn retry_enabled(
         });
     }
     Ok(())
+}
+
+/// Plan D134: `step` is its position's latest attempt ([`latest_at`] over the run's `steps`), so
+/// a verb on it names the row the walk reads. An attempt a later one replaced is
+/// [`EngineError::StaleSlot`].
+fn latest_attempt(steps: &[RunStep], step: &RunStep) -> Result<(), EngineError> {
+    match latest_at(steps, step.position) {
+        Some(latest) if latest.attempt != step.attempt => Err(EngineError::StaleSlot {
+            step: step.id,
+            attempt: step.attempt,
+            latest: latest.attempt,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Blueprint A-8: a `failed` step whose `gate_note` the sweep wrote (`interrupted`, or
@@ -1015,17 +1021,23 @@ pub fn retry_admitted(
 
 /// §6.2's `promote to chat` (`docs/ANA-2.md:1563`, MOD-4 plan D163, blueprint D191).
 ///
-/// The run has not finished, the step is `running`, `awaiting_approval` or `failed`, the item is
-/// not `blocked` (an escalated item needs `Unblock` first, plan D161 case 2), the step is not a
-/// fan-out candidate, and no chat of this process is live (blueprint D185: the Chat tab hosts one
-/// session).
+/// The run has not finished, the step is `running`, `awaiting_approval` or `failed`, the step is
+/// its position's latest attempt, the item is not `blocked` (an escalated item needs `Unblock`
+/// first, plan D161 case 2), the step is not a fan-out candidate, and no chat of this process is
+/// live (blueprint D185: the Chat tab hosts one session).
+///
+/// `steps` are the run's rows. Plan D134's rule, as [`retry_enabled`] applies it: a `failed`
+/// attempt a retry replaced stays `failed` for good, and promoting it would park a second step
+/// beside the position's real one, which the walk never reads ([`latest_at`]).
 ///
 /// # Errors
-/// [`EngineError::RunStatus`], [`EngineError::NotGated`], [`EngineError::ItemBlocked`],
-/// [`EngineError::PromoteCandidate`] or [`EngineError::ChatLive`], in that order.
+/// [`EngineError::RunStatus`], [`EngineError::NotGated`], [`EngineError::StaleSlot`],
+/// [`EngineError::ItemBlocked`], [`EngineError::PromoteCandidate`] or [`EngineError::ChatLive`],
+/// in that order.
 pub fn promote_enabled(
     run: &Run,
     item: Status,
+    steps: &[RunStep],
     step: &RunStep,
     phase: &SnapshotPhase,
     chat_open: bool,
@@ -1047,6 +1059,7 @@ pub fn promote_enabled(
             expected: "running | awaiting_approval | failed",
         });
     }
+    latest_attempt(steps, step)?;
     if item == Status::Blocked
         && let Some(item) = run.item_id
     {
@@ -1063,13 +1076,17 @@ pub fn promote_enabled(
 
 /// §4.8's `accept artifact` (`docs/ANA-2.md:1223-1233`, MOD-4 plan D166).
 ///
-/// The step is parked, was promoted, produced its `output_kind` document (`has_output`, resolved
-/// as [`answer_gate_enabled`]'s is), and no chat of this process is live on it.
+/// The step is parked, is its position's latest attempt (plan D134, as [`promote_enabled`]
+/// checks it: a second line of defence, since accepting a replaced attempt would merge its old
+/// tree), was promoted, produced its `output_kind` document (`has_output`, resolved as
+/// [`answer_gate_enabled`]'s is), and no chat of this process is live on it. `steps` are the
+/// run's rows.
 ///
 /// # Errors
-/// [`EngineError::NotGated`], [`EngineError::NotPromoted`],
+/// [`EngineError::NotGated`], [`EngineError::StaleSlot`], [`EngineError::NotPromoted`],
 /// [`EngineError::MissingOutputForApproval`] or [`EngineError::ChatLive`], in that order.
 pub fn accept_enabled(
+    steps: &[RunStep],
     step: &RunStep,
     phase: &SnapshotPhase,
     has_output: bool,
@@ -1082,6 +1099,7 @@ pub fn accept_enabled(
             expected: "awaiting_approval",
         });
     }
+    latest_attempt(steps, step)?;
     if step.promoted_at.is_none() {
         return Err(EngineError::NotPromoted { step: step.id });
     }
@@ -1888,6 +1906,7 @@ mod tests {
     fn promote_is_enabled_on_a_live_step_of_a_live_run() {
         let (mut step, phase) = review();
         let mut run = parked_run();
+        let steps = [step.clone()];
         for status in [
             StepStatus::Running,
             StepStatus::AwaitingApproval,
@@ -1895,7 +1914,8 @@ mod tests {
         ] {
             step.status = status;
             assert!(
-                promote_enabled(&run, Status::AwaitingApproval, &step, &phase, false).is_ok(),
+                promote_enabled(&run, Status::AwaitingApproval, &steps, &step, &phase, false)
+                    .is_ok(),
                 "`{status}` is promotable"
             );
         }
@@ -1906,8 +1926,9 @@ mod tests {
             StepStatus::Cancelled,
         ] {
             step.status = status;
-            let refused = promote_enabled(&run, Status::AwaitingApproval, &step, &phase, false)
-                .expect_err("only a live step is promotable");
+            let refused =
+                promote_enabled(&run, Status::AwaitingApproval, &steps, &step, &phase, false)
+                    .expect_err("only a live step is promotable");
             assert!(
                 matches!(
                     refused,
@@ -1922,8 +1943,9 @@ mod tests {
 
         for status in [RunStatus::Done, RunStatus::Failed, RunStatus::Cancelled] {
             run.status = status;
-            let refused = promote_enabled(&run, Status::AwaitingApproval, &step, &phase, false)
-                .expect_err("a finished run has nothing to chat in");
+            let refused =
+                promote_enabled(&run, Status::AwaitingApproval, &steps, &step, &phase, false)
+                    .expect_err("a finished run has nothing to chat in");
             assert!(
                 matches!(refused, EngineError::RunStatus { status: got, .. } if got == status),
                 "the run is read first: {refused}"
@@ -1932,7 +1954,19 @@ mod tests {
         run.status = RunStatus::AwaitingApproval;
         step.status = StepStatus::Failed;
 
-        let refused = promote_enabled(&run, Status::Blocked, &step, &phase, false)
+        // Plan D134: a `failed` attempt a retry replaced stays `failed`, and is not promotable.
+        let mut later = step.clone();
+        later.id = StepId::new();
+        later.attempt = step.attempt + 1;
+        let replaced = [step.clone(), later];
+        let refused = promote_enabled(&run, Status::Blocked, &replaced, &step, &phase, false)
+            .expect_err("a later attempt replaced it");
+        assert!(
+            matches!(refused, EngineError::StaleSlot { step: id, latest, .. } if id == step.id && latest == step.attempt + 1),
+            "the slot is read before the item: {refused}"
+        );
+
+        let refused = promote_enabled(&run, Status::Blocked, &steps, &step, &phase, false)
             .expect_err("an escalated item follows its run first");
         assert!(
             matches!(refused, EngineError::ItemBlocked { .. }),
@@ -1941,14 +1975,21 @@ mod tests {
 
         let mut fanned = phase.clone();
         fanned.fan_out = 3;
-        let refused = promote_enabled(&run, Status::AwaitingApproval, &step, &fanned, false)
-            .expect_err("a candidate is selected, not promoted");
+        let refused = promote_enabled(
+            &run,
+            Status::AwaitingApproval,
+            &steps,
+            &step,
+            &fanned,
+            false,
+        )
+        .expect_err("a candidate is selected, not promoted");
         assert!(
             matches!(refused, EngineError::PromoteCandidate { step: id } if id == step.id),
             "{refused}"
         );
 
-        let refused = promote_enabled(&run, Status::AwaitingApproval, &step, &phase, true)
+        let refused = promote_enabled(&run, Status::AwaitingApproval, &steps, &step, &phase, true)
             .expect_err("the Chat tab hosts one session");
         assert!(
             matches!(refused, EngineError::ChatLive { step: None }),
@@ -1962,28 +2003,42 @@ mod tests {
         let (mut step, phase) = review();
         step.status = StepStatus::AwaitingApproval;
         step.promoted_at = chrono::DateTime::from_timestamp(1_788_393_600, 0);
-        assert!(accept_enabled(&step, &phase, true, false).is_ok());
+        let steps = [step.clone()];
+        assert!(accept_enabled(&steps, &step, &phase, true, false).is_ok());
 
-        let refused = accept_enabled(&step, &phase, false, false).expect_err("no document");
+        let refused = accept_enabled(&steps, &step, &phase, false, false).expect_err("no document");
         assert!(
             matches!(&refused, EngineError::MissingOutputForApproval { kind, .. } if *kind == phase.output_kind),
             "{refused}"
         );
-        let refused = accept_enabled(&step, &phase, true, true).expect_err("a live chat");
+        let refused = accept_enabled(&steps, &step, &phase, true, true).expect_err("a live chat");
         assert!(
             matches!(refused, EngineError::ChatLive { step: Some(id) } if id == step.id),
             "{refused}"
         );
 
+        // Plan D134, the second line of defence: a replaced attempt is never accepted.
+        let mut later = step.clone();
+        later.id = StepId::new();
+        later.attempt = step.attempt + 1;
+        let replaced = [step.clone(), later];
+        let refused =
+            accept_enabled(&replaced, &step, &phase, true, false).expect_err("a later attempt");
+        assert!(
+            matches!(refused, EngineError::StaleSlot { step: id, .. } if id == step.id),
+            "{refused}"
+        );
+
         step.promoted_at = None;
-        let refused = accept_enabled(&step, &phase, true, false).expect_err("never promoted");
+        let refused =
+            accept_enabled(&steps, &step, &phase, true, false).expect_err("never promoted");
         assert!(
             matches!(refused, EngineError::NotPromoted { step: id } if id == step.id),
             "{refused}"
         );
 
         step.status = StepStatus::Done;
-        let refused = accept_enabled(&step, &phase, true, false).expect_err("not parked");
+        let refused = accept_enabled(&steps, &step, &phase, true, false).expect_err("not parked");
         assert!(
             matches!(
                 refused,
