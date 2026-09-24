@@ -529,7 +529,7 @@ impl AgentRuntime {
 
     /// MOD-4 plan D165: `RunServed::Attach`'s other half, binding a chat to a promoted graph step.
     ///
-    /// [`start`](Self::start)'s checks minus the mint, plus the tail: the writer (refused off the
+    /// `start`'s checks minus the mint, plus the tail: the writer (refused off the
     /// server), the box, the opening agent's row (enabled), `driver_for`, its settings, the
     /// project's caps and the quota latch, then the step's log read **through the writer**
     /// (blueprint H-9), whose absence is "the step's log is not on this box". The spec is the
