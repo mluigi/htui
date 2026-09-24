@@ -560,7 +560,7 @@ where
                 chat_live,
             } => self.accept_artifact(run, step, chat_live).await,
             Command::Unblock { item } => self.unblock(item).await,
-            Command::CloseOut { .. } => todo!("MOD-4 milestone 6: close-out"),
+            Command::CloseOut { item } => self.close_out(item).await,
         }
     }
 
@@ -1410,6 +1410,19 @@ where
             }
         };
         Ok(CommandOutcome::Unblocked { item, case, rest })
+    }
+
+    /// `R-TUI-9`'s close-out (MOD-4 plan D167, blueprint D208, ANA-2 §4.10).
+    ///
+    /// The reads [`Self::close_out_preview`] counts over, the guard
+    /// ([`crate::command::close_out_enabled`]), then one `summary` document built by
+    /// [`closeout::summary`] and written by `WriteStore::close_out` with the item's move to
+    /// `closed`, in one transaction. No run lease is involved: the store re-checks a live run and
+    /// the item's status inside that transaction, so a run started since is refused there with
+    /// nothing written. The commit rows already exist, so none are passed.
+    async fn close_out(&self, item: ItemId) -> Result<CommandOutcome, EngineError> {
+        let _ = item;
+        todo!("MOD-4 plan D167: close-out")
     }
 
     /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).

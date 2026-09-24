@@ -472,6 +472,10 @@ pub const CASES: &[&str] = &[
     "unblock_lets_an_escalated_run_be_promoted_and_approved",
     // R-7 (plan D161 case 3): a run parked by a refused reconcile is resumed.
     "unblock_resumes_a_reconcile_refused_park",
+    // Criterion 20 (`:2141-2143`, plan D167): close-out writes one summary and closes the item.
+    "close_out_writes_one_summary_and_closes_the_item",
+    // Criterion 20: close-out is refused while a run of the item is live, and writes nothing.
+    "close_out_is_refused_while_a_run_is_live",
 ];
 
 /// Run one case by name.
@@ -664,6 +668,12 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         ),
         "unblock_resumes_a_reconcile_refused_park" => {
             Box::pin(unblock_resumes_a_reconcile_refused_park(harness))
+        }
+        "close_out_writes_one_summary_and_closes_the_item" => {
+            Box::pin(close_out_writes_one_summary_and_closes_the_item(harness))
+        }
+        "close_out_is_refused_while_a_run_is_live" => {
+            Box::pin(close_out_is_refused_while_a_run_is_live(harness))
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -5259,6 +5269,109 @@ async fn unblock_resumes_a_reconcile_refused_park<H: CaseHarness>(harness: &H) {
     );
 }
 
+/// The item's `summary` document heads.
+async fn summaries_of<O: Orchestrate>(
+    orch: &O,
+    item: ItemId,
+) -> Vec<htui_core::model::DocumentHead> {
+    orch.store()
+        .documents(item)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .filter(|head| head.kind == "summary")
+        .collect()
+}
+
+/// ANA-2 §12 criterion 20 (`docs/ANA-2.md:2141-2143`, MOD-4 plan D167): a `done` item is closed
+/// out. One `summary` document lands at version 1, produced by no step, with a table row per
+/// `(repo, step)` that committed; the item is `closed` with `closed_at` set.
+async fn close_out_writes_one_summary_and_closes_the_item<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let rest = approve(&orch, run, 4).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    let key = item_of(&orch, ids::HTUI_FEAT_3).await.key;
+
+    let outcome = orch
+        .dispatch(Command::CloseOut {
+            item: ids::HTUI_FEAT_3,
+        })
+        .await
+        .expect("a done item with no live run");
+    let CommandOutcome::ClosedOut {
+        item,
+        summary,
+        version,
+    } = outcome
+    else {
+        panic!("`CloseOut` answers `ClosedOut`, not {outcome:?}");
+    };
+    assert_eq!((item, version), (ids::HTUI_FEAT_3, 1));
+    let document = orch
+        .store()
+        .document(summary)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the summary was written");
+    assert_eq!(
+        (
+            document.kind.as_str(),
+            document.version,
+            document.produced_by_step_id
+        ),
+        ("summary", 1, None)
+    );
+    assert_eq!(document.title, format!("Close-out {key}"));
+    assert_eq!(
+        document
+            .body
+            .lines()
+            .filter(|line| line.starts_with("| htui | "))
+            .count(),
+        4,
+        "one row per step, each committed to the primary:\n{}",
+        document.body
+    );
+    assert_eq!(summaries_of(&orch, ids::HTUI_FEAT_3).await.len(), 1);
+    let row = item_of(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(row.status, Status::Closed);
+    assert!(row.closed_at.is_some());
+}
+
+/// Criterion 20's refusal: a run of the item is live, so close-out names it, and neither a
+/// document nor a move is written.
+async fn close_out_is_refused_while_a_run_is_live<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+
+    let refused = orch
+        .dispatch(Command::CloseOut {
+            item: ids::HTUI_FEAT_3,
+        })
+        .await
+        .expect_err("a live run");
+    assert!(
+        matches!(
+            refused,
+            EngineError::RunStatus {
+                run: live,
+                status: RunStatus::AwaitingApproval,
+                ..
+            } if live == run
+        ),
+        "{refused}"
+    );
+    assert!(summaries_of(&orch, ids::HTUI_FEAT_3).await.is_empty());
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -5283,7 +5396,7 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            66,
+            68,
             "18 + 5 + 13 + 6 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
