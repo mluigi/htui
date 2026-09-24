@@ -375,7 +375,7 @@ than what was offered.
 | The mirror keeps serving a deleted project because refresh rides `updated_at` and only `item_link` tombstones | High if unguarded | Medium | D13 rebuilds the mirror on the delete path; a test asserting the Backlog is empty of it without a manual rebuild |
 | Compare-and-set on `updated_at` fights the trigger, or two writes inside one clock tick compare equal | Medium | Medium | `clock_timestamp()` in the trigger, not `now()`; a conformance case over two writes in one transaction-free sequence |
 | The item is large enough that milestone 1's seam churns under milestones 3–6 | Medium | Medium | Milestones 1 and 2 are UI-free and land first; sections consume a settled seam |
-| Five registered sections overflow the strip at the pinned 100×30 harness width | Medium | Low | The same class as MOD-30, which is open and owns the fix; this item pins strip width against the pane in a test rather than re-accepting snapshots |
+| Five registered sections overflow the strip at the pinned 100×30 harness width | Medium | Low | The same class as MOD-30 (done 2026-09-24, `docs/decisions/mod/mod-30.md`); this item pins strip width against the pane in a test rather than re-accepting snapshots |
 | `repo_box_path`'s symlink guard is written here and re-implemented by MOD-7 | Medium | Medium | D11 makes it a shared guard and names MOD-7 as its second caller |
 | The keyring backend behaves differently on Windows, or is absent on a headless Linux box | Medium | Medium | Existing `secret.rs` surface is unchanged; runtime verification is MOD-16's, and `--set-dsn` remains a working fallback |
 

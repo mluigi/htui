@@ -131,7 +131,8 @@ under them.
 - **The sub-tab strip is already two columns over.** `" Body "+" Runs "+" Graph "+" Documents "+" Notes "+" Prompt "`
   = **45** columns against a **43**-column inner pane at the pinned 100×30, verified in the recorded
   frame: `backlog__detail_runs.snap` line 8 ends `Promp`. 15 `backlog__*.snap` files carry the clip;
-  the fix is MOD-30's, and MOD-30 is open.
+  the fix is MOD-30's (done 2026-09-24, `docs/decisions/mod/mod-30.md`: single-space separators,
+  width pinned by a test).
 - **No queue overlay, and two overlays in total.** `WorkspaceSwitcher` and `MigrationPrompt`
   (`app/mod.rs:60-73`). The reusable pieces MOD-4 inherits are `TextField` (`ui/text_field.rs`, 616
   lines, with `masked()` and a `Debug` that never prints the buffer) and MOD-15's two-stage delete —
@@ -266,7 +267,8 @@ Concretely in scope:
   change, not a MOD-4 call (D2).
 - **Remote dispatch** — `R-ORCH-12` v1 stores `target_box_id` and refuses a run that is not local.
 - **The excerpt provider seam and F-104's loosening** — deferred (D4); nothing registers a provider.
-- **The sub-tab strip overflow** — MOD-30, landing before milestone 7 (D5).
+- **The sub-tab strip overflow** — MOD-30, landing before milestone 7 (D5); done 2026-09-24
+  (`docs/decisions/mod/mod-30.md`).
 - **Splitting `AgentRuntime::background` by what a task writes** — MOD-31 (D7).
 - **Scrubbing `trim_record`'s own strings** — MOD-32; this item adds no new unscrubbed write path.
 - **Any second migration.** If a decision seems to need `0004`, it is the wrong decision.
@@ -319,7 +321,7 @@ cut point is removed. See `.claude/plans/mod-4-orch-seam.plan.md` **D0**.
 
 Milestones 1–2 need nothing from MOD-2 and touch no git (ANA-2 §9). Milestone 3 is where `gix`
 enters the workspace and where Windows runtime facts start accruing to MOD-16. Milestone 6 re-records
-the Backlog snapshots, and **MOD-30 lands before it** (D5) — milestone 1 also re-records exactly one,
+the Backlog snapshots, and **MOD-30 lands before it** (D5; landed 2026-09-24) — milestone 1 also re-records exactly one,
 `connection__confirm.snap`, because the mirrored-table count is rendered into the rebuild
 confirmation copy.
 

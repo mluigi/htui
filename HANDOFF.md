@@ -14,12 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-20):** **MOD-35 was done**
+**Current status (2026-09-24):** **MOD-30 was done**
+(`docs/decisions/mod/mod-30.md`): the detail sub-tab strip separates titles by one space and a test
+pins its width against the pane, so MOD-4 milestone 6 (PRD D5) is unblocked.
+Before it, **MOD-35 was done**
 (`docs/decisions/mod/mod-35.md`): Added Qdrant connection settings to mirror Postgres DSN configuration.
 Before it, **ANA-20 was done**
 (`docs/decisions/ana/ana-20.md`): Defined Qdrant feature requirements for MOD-34 (FastEmbed, Hybrid Search, single collection).
-Before it, **ANA-19 was done**
-(`docs/decisions/ana/ana-18.md`): Concluded JEV model is not implementable.
 **Live coordinates.** Migration `0002_agent_probe.sql` exists, so MOD-4's `0003_orchestration.sql`
 is no longer held (`docs/ANA-2.md` §9) and is **still the next migration** — MOD-2 milestone 9 and
 MOD-20 both deliberately added none. Adapters install under `HTUI_AGENTS_ROOT`, default
@@ -112,17 +113,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   (rule 8's "no machine identifier" becomes true of the digest rather than of the prompt) — the
   amendment is maintainer-approved and recorded here per the milestone-5 precedent that an ANA edit
   is maintainer-only. Its write-up should carry the ANA-5 sections it touches.
-- [ ] **MOD-30 - The detail sub-tab strip overflows at the pinned width** (from MOD-2, finding
-  F-71). `R-TUI-3`. The sixth sub-tab took the strip past the pane: ` Body ` + ` Runs ` + ` Graph ` +
-  ` Documents ` + ` Notes ` + ` Prompt ` is **45 columns** against a **43-column** inner pane at the
-  harness's pinned 100×30, so `Prompt` renders clipped to ` Promp` and all 21 re-accepted snapshots
-  carry the clip. Two candidate fixes, both cross-cutting, and **this is the maintainer's choice**:
-  single-space separators in `detail/mod.rs::render_strip` (45 → **40** columns, and it changes every
-  snapshot in `crates/htui/tests/snapshots/` plus the Settings and top-level strips if the rule is
-  applied uniformly), or `DETAIL_PERCENT` 45 → 47 in `ui/tabs/backlog/mod.rs:30` (which widens the
-  detail pane and narrows the backlog list, moving every backlog snapshot instead). A seventh sub-tab
-  breaks whichever is chosen, so the fix should also pin the strip width against the pane in a test
-  rather than leaving it to a re-accepted snapshot. Found during MOD-2 T67, 2026-09-14.
 - [ ] **MOD-31 - A running prompt preview makes an adapter install refuse** (from MOD-2, finding
   F-121). `R-AGT-10`, `R-TUI-8`, `R-NF-3`. `AgentRuntime::serve` pushes the deferred preview task
   into `self.background` (`agent_worker.rs:824`), and the install guard refuses whenever
@@ -599,6 +589,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 24 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-30 detail strip overflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 23 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0                                                                                        |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
