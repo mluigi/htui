@@ -1557,10 +1557,24 @@ impl TaskCtx {
     async fn tag_run(&self, writer: &Writer, run: RunId) -> Option<Run> {
         let _ = self.tag.run.set(run);
         let row = writer.run(run).await.ok().flatten();
-        if let Some(item) = row.as_ref().and_then(|row| row.item_id) {
+        self.tag_item(row.as_ref());
+        row
+    }
+
+    /// [`Self::tag_run`] through the task's backend, before the task waits for its lock or reads
+    /// its parts, so a refusal that comes before either still reaches the item's subscribers
+    /// (D200).
+    async fn tag(&self, run: RunId) -> Option<Run> {
+        let _ = self.tag.run.set(run);
+        let row = self.backend.run(run).await.ok().flatten();
+        self.tag_item(row.as_ref());
+        row
+    }
+
+    fn tag_item(&self, row: Option<&Run>) {
+        if let Some(item) = row.and_then(|row| row.item_id) {
             let _ = self.tag.item.set(item);
         }
-        row
     }
 }
 
@@ -1772,16 +1786,20 @@ async fn sweep_once(ctx: TaskCtx) {
 
 /// D158: an adopted run's walk, resumed on its own task under its lock.
 async fn resumed(ctx: TaskCtx, run: RunId) {
-    let _ = ctx.tag.run.set(run);
+    ctx.tag(run).await;
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
         return;
     };
     let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
         Ok(kit) => kit,
-        Err(message) => return ctx.refuse(message),
+        Err(message) => {
+            // The sweep made this process the run's lease owner, and plan D88 keeps every later
+            // sweep of it off that lease: only the dead-walk pre-pass gives it back to adopt.
+            ctx.shared.dead_walks.mark(run);
+            return ctx.refuse(message);
+        }
     };
-    ctx.tag_run(&kit.writer, run).await;
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
     match walked(&walk, engine.resume(run)).await {
@@ -3124,6 +3142,55 @@ pub(crate) mod tests {
             began.elapsed()
         );
         assert_eq!(runtime.tasks_len(), 0);
+    }
+
+    /// D158: a resume that cannot read its parts leaves its run to the next sweep — the run joins
+    /// the dead walks, whose pre-pass gives the adopted lease back — and the refusal is published
+    /// for the run's item.
+    #[tokio::test]
+    async fn a_resume_that_cannot_read_its_parts_leaves_the_run_to_the_next_sweep() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        // A scratch root under a regular file cannot be created, so the production isolator,
+        // and with it every part the resume reads, is refused.
+        let scratch = tempfile::NamedTempFile::new().expect("a regular file");
+        let runtime = RunRuntime::new(fixture.factory())
+            .with_clock(Arc::new(TokioClock::new()))
+            .with_scratch_root(scratch.path().join("trees"));
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        let backlog = Origin::Tab(TabId("backlog"));
+        runtime.shared.publisher.wire(&replies);
+        runtime
+            .shared
+            .publisher
+            .subscribe(backlog.clone(), 3, ids::HTUI_ANA_2);
+        let ctx = super::TaskCtx {
+            shared: Arc::clone(&runtime.shared),
+            backend: Backend::memory(fixture.store.clone()),
+            replies,
+            addr: None,
+            name: "resume",
+            tag: Arc::default(),
+        };
+
+        super::resumed(ctx, run).await;
+        assert!(
+            runtime.shared.dead_walks.contains(run),
+            "the next sweep gives the adopted lease back"
+        );
+        let frame = answers.try_recv().expect("the refusal is published");
+        assert_eq!((&frame.origin, frame.seq), (&backlog, 3));
+        assert!(
+            matches!(&frame.reply, StoreReply::RunStream(super::RunFrame { item, run: Some(of), kind: FrameKind::Error(_) })
+                if *item == ids::HTUI_ANA_2 && *of == run),
+            "{:?}",
+            frame.reply
+        );
+        assert_eq!(
+            runtime.isolator_builds(),
+            0,
+            "the isolator was refused, not built"
+        );
     }
 
     /// M5 D84: a run whose claim was refused waits, and is claimed again once a walk of this
