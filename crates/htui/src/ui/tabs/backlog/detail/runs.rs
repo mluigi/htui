@@ -30,7 +30,8 @@ use htui_core::model::{
     Document, DocumentId, ItemId, RunId, RunMode, RunStatus, RunStepSummary, RunSummary, StepId,
     StepStatus, UsageTotals,
 };
-use htui_orch::{Command, GateAnswer};
+use htui_orch::closeout::Preview;
+use htui_orch::{Command, CommandOutcome, GateAnswer};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -39,9 +40,10 @@ use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
 
 use crate::app::{Action, Ctx, Handled};
-use crate::run_worker::{Enabled, ItemActions, OrchRequest};
+use crate::run_worker::{Enabled, ItemActions, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
+use crate::ui::text_field::{FieldOutcome, TextField};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -53,6 +55,18 @@ pub const NO_STEP: &str = "no step is under the cursor";
 
 /// What a run key says with no run under the cursor.
 pub const NO_RUN: &str = "no run is under the cursor";
+
+/// What `Enter` on an empty rejection note says: ANA-2's `reject with note` requires one.
+pub const NOTE_NEEDED: &str = "a rejection needs a note";
+
+/// What the typed close-out stage says to a key that is not the item's (D167).
+pub const NOT_THE_KEY: &str = "that is not the item's key";
+
+/// `Orch(CloseOutPreview)`'s and `Orch(Command(CloseOut))`'s names (blueprint D209), which a
+/// refusal is answered under.
+const CLOSE_OUT_PREVIEW: &str = "close_out_preview";
+/// See [`CLOSE_OUT_PREVIEW`].
+const CLOSE_OUT: &str = "close_out";
 
 /// What `o` says when the step's document is not in this box's store (D173).
 pub const NOT_ON_BOX: &str = "the document is not on this box";
@@ -156,6 +170,22 @@ enum Mode {
     /// The run list, the cursor and the action keys.
     #[default]
     Browse,
+    /// `x`: the note a rejection needs, typed.
+    RejectNote {
+        /// The step's run.
+        run: RunId,
+        /// The parked step.
+        step: StepId,
+        /// The note.
+        field: TextField,
+    },
+    /// `c`: `y` cancels the run, `n` or `Esc` does not.
+    ConfirmCancel {
+        /// The run to cancel.
+        run: RunId,
+    },
+    /// `C`: the two-stage close-out confirmation (MOD-4 plan D167).
+    CloseOut(CloseOutStage),
     /// The read-only body view of a step's output document (MOD-4 plan D173).
     Artifact {
         /// The document asked for.
@@ -165,6 +195,24 @@ enum Mode {
         /// First visible body line.
         scroll: Scroll,
     },
+}
+
+/// Where a close-out confirmation is (MOD-15's slug confirmation, `settings/hierarchy.rs`).
+#[derive(Debug)]
+enum CloseOutStage {
+    /// `CloseOutPreview` is on its way.
+    Counting,
+    /// The counts are shown; `y` goes on to the typed stage.
+    Warn(Preview),
+    /// The item key has to be typed back.
+    Typed {
+        /// The counts, and the key to match.
+        preview: Preview,
+        /// What was typed.
+        field: TextField,
+    },
+    /// `CloseOut` is on its way; every key waits for its answer.
+    InFlight,
 }
 
 impl RunsTab {
@@ -255,12 +303,25 @@ impl RunsTab {
 
     /// A key while the pane captures (blueprint D201): a `CONTROL` chord passes, so `ctrl-c`
     /// still quits, and everything else is the mode's, answered or swallowed.
-    fn modal_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+    fn modal_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Handled::Pass;
         }
         self.mode = match core::mem::take(&mut self.mode) {
             Mode::Browse => Mode::Browse,
+            Mode::RejectNote { run, step, field } => reject_key(run, step, field, key, ctx),
+            Mode::ConfirmCancel { run } => match key.code {
+                KeyCode::Char('y') => {
+                    ctx.request(command(Command::CancelRun { run }));
+                    Mode::Browse
+                }
+                KeyCode::Char('n') | KeyCode::Esc => Mode::Browse,
+                _ => Mode::ConfirmCancel { run },
+            },
+            Mode::CloseOut(stage) => match self.item {
+                Some(item) => close_out_key(item, stage, key, ctx),
+                None => Mode::Browse,
+            },
             Mode::Artifact { id, doc, mut scroll } => {
                 let code = match key.code {
                     KeyCode::Char('j') => KeyCode::Char('J'),
@@ -323,20 +384,36 @@ impl RunsTab {
                     }));
                 }
             }
-            'T' => {
+            'C' => {
+                if allowed(&actions.close_out, ctx) {
+                    ctx.request(StoreRequest::Orch(OrchRequest::CloseOutPreview { item }));
+                    self.mode = Mode::CloseOut(CloseOutStage::Counting);
+                }
+            }
+            'c' | 'T' => {
                 let Some(run) = self.entry_run().map(|run| run.id) else {
                     ctx.emit(Action::Error(NO_RUN.to_owned()));
                     return Handled::Consumed;
                 };
-                let verdict = actions
-                    .runs
-                    .get(&run)
-                    .map_or_else(|| Err(NOT_LOADED.to_owned()), |run| run.cleanup.clone());
+                let verdict = actions.runs.get(&run).map_or_else(
+                    || Err(NOT_LOADED.to_owned()),
+                    |verdicts| {
+                        if key == 'c' {
+                            verdicts.cancel.clone()
+                        } else {
+                            verdicts.cleanup.clone()
+                        }
+                    },
+                );
                 if allowed(&verdict, ctx) {
-                    ctx.request(StoreRequest::Orch(OrchRequest::Cleanup { run }));
+                    if key == 'c' {
+                        self.mode = Mode::ConfirmCancel { run };
+                    } else {
+                        ctx.request(StoreRequest::Orch(OrchRequest::Cleanup { run }));
+                    }
                 }
             }
-            'a' | 'r' | 'p' | 'o' | 's' | 'A' => {
+            'a' | 'x' | 'r' | 'p' | 'o' | 's' | 'A' => {
                 let Some((run, step)) = self.entry_step() else {
                     ctx.emit(Action::Error(NO_STEP.to_owned()));
                     return Handled::Consumed;
@@ -353,6 +430,13 @@ impl RunsTab {
                             step: id,
                             answer: GateAnswer::Approved,
                         }));
+                    }
+                    'x' if allowed(&verdicts.reject, ctx) => {
+                        self.mode = Mode::RejectNote {
+                            run,
+                            step: id,
+                            field: TextField::new(),
+                        };
                     }
                     'r' if allowed(&verdicts.retry, ctx) => {
                         ctx.request(command(Command::RetryStep { run, step: id }));
@@ -434,6 +518,25 @@ fn render_artifact(
         Paragraph::new(Line::styled("read-only · j/k scroll · Esc close", theme.dim)),
         hint,
     );
+}
+
+/// A key in [`Mode::RejectNote`]: `Enter` with a note rejects, `Enter` without one says a note is
+/// needed, `Esc` goes back to the list and everything else is typed.
+fn reject_key(
+    run: RunId,
+    step: StepId,
+    field: TextField,
+    key: KeyEvent,
+    ctx: &Ctx<'_>,
+) -> Mode {
+    let _ = (run, step, field, key, ctx);
+    todo!()
+}
+
+/// A key in [`Mode::CloseOut`], stage by stage (D167): the mode it leaves the pane in.
+fn close_out_key(item: ItemId, stage: CloseOutStage, key: KeyEvent, ctx: &Ctx<'_>) -> Mode {
+    let _ = (item, stage, key, ctx);
+    todo!()
 }
 
 /// A verdict's answer: `true` when the action may go, else the guard's sentence is on the status
@@ -833,6 +936,26 @@ impl DetailTab for RunsTab {
             StoreReply::RunActions(actions) if Some(actions.item) == self.item => {
                 self.actions = Some((**actions).clone());
             }
+            StoreReply::Orch(OrchReply::CloseOutPreview(preview))
+                if matches!(self.mode, Mode::CloseOut(CloseOutStage::Counting)) =>
+            {
+                self.mode = Mode::CloseOut(CloseOutStage::Warn((**preview).clone()));
+            }
+            StoreReply::Orch(OrchReply::Done(outcome))
+                if matches!(**outcome, CommandOutcome::ClosedOut { .. })
+                    && matches!(self.mode, Mode::CloseOut(CloseOutStage::InFlight)) =>
+            {
+                self.mode = Mode::Browse;
+            }
+            StoreReply::Failed { request, .. }
+                if (*request == CLOSE_OUT_PREVIEW
+                    && matches!(self.mode, Mode::CloseOut(CloseOutStage::Counting)))
+                    || (*request == CLOSE_OUT
+                        && matches!(self.mode, Mode::CloseOut(CloseOutStage::InFlight))) =>
+            {
+                // The refusal is on the status line already (`app/update.rs`).
+                self.mode = Mode::Browse;
+            }
             StoreReply::Document(doc) => self.on_document(doc.as_ref().as_ref(), ctx),
             StoreReply::Failed { request, .. }
                 if *request == DOCUMENT && matches!(self.mode, Mode::Artifact { .. }) =>
@@ -880,7 +1003,58 @@ impl DetailTab for RunsTab {
                 ));
             }
         }
-        frame.render_widget(Paragraph::new(lines), area);
+        let footer = self.footer(area.width, ctx.theme);
+        let height = footer
+            .iter()
+            .map(|line| line.width().max(1).div_ceil(usize::from(area.width.max(1))))
+            .sum::<usize>();
+        let [list, prompt] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(u16::try_from(height).unwrap_or(u16::MAX)),
+        ])
+        .areas(area);
+        frame.render_widget(Paragraph::new(lines), list);
+        frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), prompt);
+    }
+}
+
+impl RunsTab {
+    /// What a capturing mode asks, drawn under the run list; nothing while browsing.
+    fn footer(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let hint = |text: &str| Line::styled(text.to_owned(), theme.dim);
+        match &self.mode {
+            Mode::Browse | Mode::Artifact { .. } => Vec::new(),
+            Mode::RejectNote { field, .. } => vec![
+                Line::styled("reject with a note:", theme.title),
+                field.line(width, true, theme),
+                hint("Enter reject · Esc cancel"),
+            ],
+            Mode::ConfirmCancel { .. } => vec![
+                Line::styled("cancel this run?", theme.title),
+                hint("y cancel it · n keep it"),
+            ],
+            Mode::CloseOut(CloseOutStage::Counting) => {
+                vec![hint("counting what the close-out writes\u{2026}")]
+            }
+            Mode::CloseOut(CloseOutStage::Warn(preview)) => vec![
+                Line::styled(
+                    format!(
+                        "close {} · {} runs · {} commit rows · summary v{}",
+                        preview.key, preview.runs, preview.rows, preview.version
+                    ),
+                    theme.title,
+                ),
+                hint("y continue · n cancel"),
+            ],
+            Mode::CloseOut(CloseOutStage::Typed { preview, field }) => {
+                let prompt = format!("type {} to close it: ", preview.key);
+                let room = width.saturating_sub(u16::try_from(prompt.chars().count()).unwrap_or(0));
+                let mut line = Line::from(Span::styled(prompt, theme.title));
+                line.spans.extend(field.line(room, true, theme).spans);
+                vec![line, hint("Enter close · Esc cancel")]
+            }
+            Mode::CloseOut(CloseOutStage::InFlight) => vec![hint("closing\u{2026}")],
+        }
     }
 }
 
@@ -1942,6 +2116,293 @@ mod tests {
                 winner: run.steps[1].id,
             }]
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The modes (MOD-4 plan D167, D168, blueprint D201).
+    // -----------------------------------------------------------------------------------------
+
+    /// Types `text` one key at a time, asserting the pane takes every one of them.
+    fn type_text(pane: &mut RunsTab, shell: &Shell, text: &str) {
+        for c in text.chars() {
+            assert_eq!(
+                pane.on_key(key(KeyCode::Char(c)), &mut shell.ctx()),
+                Handled::Consumed,
+                "`{c}` is typed, not navigated"
+            );
+        }
+    }
+
+    /// The footer the pane draws under its list, as text.
+    fn footer(pane: &RunsTab) -> Vec<String> {
+        pane.footer(43, &Theme::default())
+            .iter()
+            .map(|line| text(line).trim_end().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn x_asks_for_a_note_then_rejects() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('x')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(shell.emit.is_empty(), "`x` only opens the note");
+        assert!(pane.captures_input());
+
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Error(sentence)] if sentence == NOTE_NEEDED),
+            "{emitted:?}"
+        );
+        assert!(pane.captures_input(), "the note stays open");
+
+        type_text(&mut pane, &shell, "  needs work: check jkl  ");
+        assert_eq!(
+            footer(&pane)[1],
+            "  needs work: check jkl",
+            "the note is on screen"
+        );
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert_eq!(
+            emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
+            [&Command::AnswerGate {
+                run: pane.runs[0].id,
+                step: ids::STEP_PLAN,
+                answer: GateAnswer::Rejected {
+                    note: "needs work: check jkl".to_owned()
+                },
+            }],
+            "the trimmed note: {emitted:?}"
+        );
+        assert!(!pane.captures_input(), "and back to the list");
+
+        pane.on_key(key(KeyCode::Char('x')), &mut shell.ctx());
+        type_text(&mut pane, &shell, "never mind");
+        pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert!(!pane.captures_input(), "`Esc` drops the note");
+        assert!(shell.emit.is_empty(), "and sends nothing");
+
+        assert_refused(key(KeyCode::Char('x')), "reject").await;
+    }
+
+    #[tokio::test]
+    async fn c_asks_then_cancels() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        let run = pane.runs[0].id;
+        pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
+        assert!(shell.emit.is_empty(), "`c` only asks");
+        assert_eq!(footer(&pane), ["cancel this run?", "y cancel it · n keep it"]);
+
+        for swallowed in ['q', 'j', 'x', '1'] {
+            assert_eq!(
+                pane.on_key(key(KeyCode::Char(swallowed)), &mut shell.ctx()),
+                Handled::Consumed
+            );
+        }
+        assert!(shell.emit.is_empty() && pane.captures_input(), "anything else is swallowed");
+
+        pane.on_key(key(KeyCode::Char('n')), &mut shell.ctx());
+        assert!(!pane.captures_input() && shell.emit.is_empty(), "`n` keeps the run");
+
+        pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert_eq!(
+            emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
+            [&Command::CancelRun { run }]
+        );
+        assert!(!pane.captures_input());
+
+        assert_refused(key(KeyCode::Char('c')), "cancel").await;
+    }
+
+    /// The first confirmation's figures for `FEAT-1`.
+    fn preview() -> Preview {
+        Preview {
+            key: "FEAT-1".to_owned(),
+            title: "TUI scaffold".to_owned(),
+            status: htui_core::model::Status::Done,
+            runs: 1,
+            rows: 3,
+            version: 2,
+        }
+    }
+
+    /// `C` on an allowed pane, then the preview's answer: the pane at the warning.
+    async fn warned(shell: &Shell) -> RunsTab {
+        let (mut pane, _) = driven(shell, true).await;
+        pane.on_key(shift('C'), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(),
+                [Action::Store(StoreRequest::Orch(OrchRequest::CloseOutPreview { item }))]
+                    if *item == ids::HTUI_FEAT_1),
+            "`C` asks for the counts first: {emitted:?}"
+        );
+        assert!(pane.captures_input(), "and waits for them");
+        assert_eq!(footer(&pane), ["counting what the close-out writes\u{2026}"]);
+        pane.on_reply(
+            &StoreReply::Orch(OrchReply::CloseOutPreview(Box::new(preview()))),
+            &mut shell.ctx(),
+        );
+        pane
+    }
+
+    #[tokio::test]
+    async fn shift_c_counts_then_asks_for_the_key() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        assert_eq!(
+            footer(&pane),
+            [
+                "close FEAT-1 · 1 runs · 3 commit rows · summary v2",
+                "y continue · n cancel"
+            ]
+        );
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        assert!(
+            footer(&pane)[0].starts_with("type FEAT-1 to close it: "),
+            "{:?}",
+            footer(&pane)
+        );
+        assert!(shell.emit.is_empty(), "nothing is written before the key is typed");
+
+        // `Esc`/`n` leave at the first two stages.
+        let mut pane = warned(&shell).await;
+        pane.on_key(key(KeyCode::Char('n')), &mut shell.ctx());
+        assert!(!pane.captures_input());
+        pane.on_key(shift('C'), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert!(!pane.captures_input(), "`Esc` while counting leaves too");
+        let _ = shell.emit.take();
+
+        // A refused preview (a run went live meanwhile) closes the counting stage.
+        pane.on_key(shift('C'), &mut shell.ctx());
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: CLOSE_OUT_PREVIEW,
+                message: "run is live".to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        assert!(!pane.captures_input());
+
+        assert_refused(shift('C'), "close_out").await;
+    }
+
+    /// D167: the typed stage wants the item's key exactly; a wrong key clears the field, `n` is a
+    /// letter there, and once sent every key waits for the answer.
+    #[tokio::test]
+    async fn the_close_out_key_must_match_and_other_keys_are_swallowed() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        for swallowed in ['x', 'q', 'j', 'G', '3'] {
+            assert_eq!(
+                pane.on_key(key(KeyCode::Char(swallowed)), &mut shell.ctx()),
+                Handled::Consumed
+            );
+        }
+        assert!(
+            footer(&pane)[0].starts_with("close FEAT-1"),
+            "still warning"
+        );
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+
+        type_text(&mut pane, &shell, "FEAT-2n");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Error(sentence)] if sentence == NOT_THE_KEY),
+            "{emitted:?}"
+        );
+        assert_eq!(
+            footer(&pane)[0],
+            "type FEAT-1 to close it:",
+            "the field is cleared"
+        );
+
+        type_text(&mut pane, &shell, "FEAT-1");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert_eq!(
+            emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
+            [&Command::CloseOut {
+                item: ids::HTUI_FEAT_1
+            }]
+        );
+        for swallowed in [KeyCode::Esc, KeyCode::Char('y'), KeyCode::Enter] {
+            assert_eq!(pane.on_key(key(swallowed), &mut shell.ctx()), Handled::Consumed);
+        }
+        assert!(shell.emit.is_empty() && pane.captures_input(), "in flight");
+
+        pane.on_reply(
+            &StoreReply::Orch(OrchReply::Done(Box::new(CommandOutcome::ClosedOut {
+                item: ids::HTUI_FEAT_1,
+                summary: DocumentId::new(),
+                version: 2,
+            }))),
+            &mut shell.ctx(),
+        );
+        assert!(!pane.captures_input(), "the answer ends the close-out");
+
+        // A refused close-out ends it too; the sentence is the status line's.
+        let mut pane = warned(&shell).await;
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        type_text(&mut pane, &shell, "FEAT-1");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: CLOSE_OUT,
+                message: "refused".to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        assert!(!pane.captures_input());
+
+        // `Esc` leaves the typed stage.
+        let mut pane = warned(&shell).await;
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert!(!pane.captures_input());
+    }
+
+    /// D201: the pane captures exactly while it is not browsing, and a `CONTROL` chord always
+    /// passes so `ctrl-c` quits from any mode.
+    #[tokio::test]
+    async fn captures_input_follows_the_mode() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!pane.captures_input(), "browsing");
+        assert_eq!(pane.on_key(ctrl_c, &mut shell.ctx()), Handled::Pass);
+
+        for (opener, name) in [
+            (key(KeyCode::Char('x')), "a note"),
+            (key(KeyCode::Char('c')), "a y/n"),
+            (shift('C'), "a close-out"),
+            (key(KeyCode::Char('o')), "a document"),
+        ] {
+            pane.on_key(opener, &mut shell.ctx());
+            assert!(pane.captures_input(), "{name} captures");
+            assert_eq!(
+                pane.on_key(ctrl_c, &mut shell.ctx()),
+                Handled::Pass,
+                "{name} lets `ctrl-c` through"
+            );
+            pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+            assert!(!pane.captures_input(), "{name} ends on `Esc`");
+        }
+
+        pane.on_key(key(KeyCode::Char('x')), &mut shell.ctx());
+        pane.on_item_change(Some(ids::HTUI_ANA_2));
+        assert!(!pane.captures_input(), "a new item drops whatever was open");
     }
 
     /// A new item's reply re-seats the cursor instead of leaving it on an index of the old one.
