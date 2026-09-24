@@ -26,6 +26,7 @@
 //! | `u` / `R` | item | `Unblock` / `StartRun` |
 //! | `C` | item | close-out: the counts, a `y`, then the item key typed back (D167) |
 
+use core::cell::Cell;
 use htui_core::model::{
     Document, DocumentId, ItemId, RunId, RunMode, RunStatus, RunStepSummary, RunSummary, StepId,
     StepStatus, UsageTotals,
@@ -204,8 +205,11 @@ enum Mode {
         id: DocumentId,
         /// Its row, once the `Document` reply is in.
         doc: Option<Box<Document>>,
-        /// First visible body line.
+        /// First visible body row, counted after wrapping.
         scroll: Scroll,
+        /// The width the body last wrapped at, which is what a scroll key clamps against: only
+        /// `render` knows it. `0` until the first draw, read as [`PANE`].
+        width: Cell<u16>,
     },
 }
 
@@ -387,6 +391,7 @@ impl RunsTab {
                 id,
                 doc,
                 mut scroll,
+                width,
             } => {
                 let code = match key.code {
                     KeyCode::Char('j') => KeyCode::Char('J'),
@@ -396,9 +401,16 @@ impl RunsTab {
                 if code == KeyCode::Esc {
                     Mode::Browse
                 } else {
-                    let len = doc.as_ref().map_or(0, |doc| body_lines(doc).len());
+                    let len = doc
+                        .as_ref()
+                        .map_or(0, |doc| artifact_rows(doc, width.get()).len());
                     let _ = scroll.on_key(KeyEvent::new(code, KeyModifiers::NONE), len);
-                    Mode::Artifact { id, doc, scroll }
+                    Mode::Artifact {
+                        id,
+                        doc,
+                        scroll,
+                        width,
+                    }
                 }
             }
         };
@@ -532,6 +544,7 @@ impl RunsTab {
                                 id: *document,
                                 doc: None,
                                 scroll: Scroll::default(),
+                                width: Cell::new(0),
                             };
                         }
                         Err(sentence) => ctx.emit(Action::Error(sentence.clone())),
@@ -559,19 +572,70 @@ const fn invalidates(kind: &FrameKind) -> bool {
     }
 }
 
-/// The artifact view's text: `<kind> v<version> · <title>`, then the body line by line.
-fn body_lines(doc: &Document) -> Vec<String> {
-    let mut lines = vec![format!("{} v{} · {}", doc.kind, doc.version, doc.title)];
-    lines.extend(doc.body.lines().map(str::to_owned));
-    lines
+/// The artifact view's rows at `width` columns (`0` reads as [`PANE`]): `<kind> v<version> ·
+/// <title>`, then the body line by line, each wrapped by [`wrap_line`]. The `bool` marks the
+/// title's rows.
+///
+/// Wrapped here rather than by `Paragraph::wrap`, so the scroll clamps against the rows the reader
+/// sees: a document of long paragraphs has many more of those than it has lines.
+fn artifact_rows(doc: &Document, width: u16) -> Vec<(bool, String)> {
+    let width = if width == 0 { PANE } else { usize::from(width) };
+    let title = format!("{} v{} · {}", doc.kind, doc.version, doc.title);
+    let mut rows: Vec<(bool, String)> = wrap_line(&title, width)
+        .into_iter()
+        .map(|row| (true, row))
+        .collect();
+    for line in doc.body.lines() {
+        rows.extend(wrap_line(line, width).into_iter().map(|row| (false, row)));
+    }
+    rows
+}
+
+/// `line` in rows of at most `width` characters: broken at a space where one fits, inside a word
+/// only when the word alone is wider. An empty line is one empty row; the spaces a line starts
+/// with are kept, so an indented block stays indented.
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    for (at, word) in line.split(' ').enumerate() {
+        let used = rows.last().map_or(0, |row| row.chars().count());
+        if at > 0 {
+            if used + 1 + word.chars().count() <= width {
+                if let Some(row) = rows.last_mut() {
+                    row.push(' ');
+                    row.push_str(word);
+                }
+                continue;
+            }
+            if word.is_empty() {
+                // A space that does not fit is the break itself.
+                continue;
+            }
+            if used > 0 {
+                rows.push(String::new());
+            }
+        }
+        for c in word.chars() {
+            if rows.last().is_some_and(|row| row.chars().count() >= width) {
+                rows.push(String::new());
+            }
+            if let Some(row) = rows.last_mut() {
+                row.push(if c.is_control() { ' ' } else { c });
+            }
+        }
+    }
+    rows
 }
 
 /// Draws the artifact view (D173): the document read-only over the pane, `Esc` to leave.
+///
+/// Records the width it wrapped at in `width`, which is what the next scroll key clamps against.
 fn render_artifact(
     frame: &mut Frame<'_>,
     area: Rect,
     doc: Option<&Document>,
     scroll: Scroll,
+    width: &Cell<u16>,
     theme: &Theme,
 ) {
     let [body, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
@@ -579,15 +643,16 @@ fn render_artifact(
         message(frame, body, "Opening the document\u{2026}", theme);
         return;
     };
-    let lines: Vec<Line<'static>> = body_lines(doc)
+    width.set(body.width);
+    let rows = artifact_rows(doc, body.width);
+    // A pane that widened since the last key has fewer rows than the offset assumed.
+    let last = u16::try_from(rows.len().saturating_sub(1)).unwrap_or(u16::MAX);
+    let lines: Vec<Line<'static>> = rows
         .into_iter()
-        .enumerate()
-        .map(|(at, line)| Line::styled(line, if at == 0 { theme.title } else { theme.base }))
+        .map(|(title, row)| Line::styled(row, if title { theme.title } else { theme.base }))
         .collect();
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll.offset(), 0)),
+        Paragraph::new(lines).scroll((scroll.offset().min(last), 0)),
         body,
     );
     frame.render_widget(
@@ -1106,8 +1171,11 @@ impl DetailTab for RunsTab {
             message(frame, area, "No item selected.", ctx.theme);
             return;
         }
-        if let Mode::Artifact { doc, scroll, .. } = &self.mode {
-            render_artifact(frame, area, doc.as_deref(), *scroll, ctx.theme);
+        if let Mode::Artifact {
+            doc, scroll, width, ..
+        } = &self.mode
+        {
+            render_artifact(frame, area, doc.as_deref(), *scroll, width, ctx.theme);
             return;
         }
 
@@ -1878,6 +1946,24 @@ mod tests {
             "counted in chars, not bytes"
         );
         assert_eq!(fit("abc", 0), "");
+    }
+
+    #[test]
+    fn wrap_line_breaks_at_spaces_and_inside_only_a_wider_word() {
+        assert_eq!(wrap_line("", 5), [""]);
+        assert_eq!(wrap_line("ab cd ef", 5), ["ab cd", "ef"]);
+        assert_eq!(wrap_line("  ab", 5), ["  ab"], "an indent is kept");
+        assert_eq!(wrap_line("abcdefgh ij", 3), ["abc", "def", "gh", "ij"]);
+        assert_eq!(
+            wrap_line("abc ", 3),
+            ["abc"],
+            "a space that does not fit is the break"
+        );
+        assert!(
+            wrap_line(&"word ".repeat(40), 7)
+                .iter()
+                .all(|row| row.chars().count() <= 7)
+        );
     }
 
     // -----------------------------------------------------------------------------------------
