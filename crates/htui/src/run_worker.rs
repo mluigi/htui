@@ -1123,16 +1123,28 @@ async fn repo_map(
     Ok(repos)
 }
 
-/// The box row's `settings.command_limits`, else `{"verify": 1}` (D156).
+/// The box row's `settings.command_limits`, else `{"verify": 1}` (D156): no row, no key, or a
+/// stored value that does not parse (warned) all get the default.
+///
+/// D216 (review L7): a read that fails is not the default. `singletons` passes it up like the
+/// reads beside it, so no verifier is cached from it and the next command reads again. The limits
+/// are read once per process (per server): an edit to them reaches the next process (R-55).
+///
+/// # Errors
+/// The store's own read failure.
 async fn command_limits(backend: &Backend, box_id: BoxId) -> StoreResult<BTreeMap<String, u32>> {
-    Ok(backend
+    let default = || BTreeMap::from([("verify".to_owned(), 1)]);
+    let Some(stored) = backend
         .box_row(box_id)
-        .await
-        .ok()
-        .flatten()
+        .await?
         .and_then(|row| row.settings.get("command_limits").cloned())
-        .and_then(|limits| serde_json::from_value(limits).ok())
-        .unwrap_or_else(|| BTreeMap::from([("verify".to_owned(), 1)])))
+    else {
+        return Ok(default());
+    };
+    Ok(serde_json::from_value(stored).unwrap_or_else(|err| {
+        tracing::warn!(%box_id, %err, "box.settings.command_limits does not parse; verify runs one at a time");
+        default()
+    }))
 }
 
 /// The engine every task builds, per step of work, over [`Kit`]'s parts.
