@@ -3573,6 +3573,22 @@ mod tests {
         assert!(super::has_commit(first.path(), "not-hex").is_err());
     }
 
+    /// Plan D147: only a message's first line is its subject, ASCII-trimmed, so a body a
+    /// commit-msg hook or a `merge.log` shortlog appends never hides D25's message.
+    #[test]
+    fn subject_is_the_trimmed_first_line() {
+        assert_eq!(
+            super::subject(b"htui: reconcile X\n\nChange-Id: I1\n"),
+            b"htui: reconcile X",
+            "a body after the subject is not the subject"
+        );
+        assert_eq!(
+            super::subject(b"  htui: reconcile X\r\n"),
+            b"htui: reconcile X",
+            "the subject's surrounding whitespace and CR are trimmed"
+        );
+    }
+
     /// A `sh` script that answers `--version` like `git` does, marked executable.
     #[cfg(unix)]
     fn fake_git(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
