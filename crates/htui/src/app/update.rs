@@ -4,10 +4,12 @@
 //! feature adds an arm here and a file under `ui/`, never an arm in the event loop.
 
 use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
+use htui_orch::Command;
 
 use crate::app::action::{Action, OverlayAction, TabAction};
 use crate::app::state::{App, Ctx};
 use crate::connection::DsnState;
+use crate::run_worker::OrchRequest;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
 use crate::ui::tabs::SettingsTab;
 use crate::ui::tabs::settings::ConnectionSection;
@@ -142,8 +144,19 @@ impl App {
     /// The request carries `chat_open: false`; the run runtime overwrites it with what this
     /// process knows (blueprint D185).
     fn promote(&mut self, run: RunId, step: StepId) {
-        let _ = (run, step);
-        todo!()
+        let Some(tab) = self.replay_tab else {
+            self.status = Some("no tab can drive a promoted step".to_owned());
+            return;
+        };
+        self.update_tab(TabAction::Focus(tab));
+        self.dispatch(
+            Origin::Tab(tab),
+            StoreRequest::Orch(OrchRequest::Command(Command::PromoteStep {
+                run,
+                step,
+                chat_open: false,
+            })),
+        );
     }
 
     /// A reply came back: top bar first, then the staleness gate, then the addressee.
@@ -335,7 +348,6 @@ mod tests {
     use super::*;
     use crate::app::Handled;
     use crate::keymap::Keymap;
-    use crate::run_worker::OrchRequest;
     use crate::store_worker::RequestEnvelope;
     use crate::ui::overlay::MigrationPrompt;
     use crate::ui::tabs::{Tab, TabId};
