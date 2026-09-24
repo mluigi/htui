@@ -5136,8 +5136,11 @@ async fn accept_artifact_notes_an_unavailable_verify<H: CaseHarness>(harness: &H
     let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
     let prd = step_at(&orch, run, 0, 1).await;
     promote(&orch, run, prd.id).await;
-    orch.verifier()
-        .script_report(FakeVerifier::unavailable("verify_command timed out"));
+    // `ShellVerifier`'s timed-out, signalled and cannot-wait reports carry the reason line and
+    // then the command's captured tail; the tail belongs to `command_run.output`, not the note.
+    let mut report = FakeVerifier::unavailable("verify_command timed out");
+    report.output = format!("{}\nrunning 12 tests\ntest parse ... ok", report.output);
+    orch.verifier().script_report(report);
 
     let outcome = accept(&orch, run, prd.id)
         .await
@@ -5159,11 +5162,14 @@ async fn accept_artifact_notes_an_unavailable_verify<H: CaseHarness>(harness: &H
             Some(VerifyOutcome::Unavailable)
         )
     );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
     assert!(
-        notes_of(&orch, ids::HTUI_FEAT_3)
-            .await
-            .contains(&"accept: verify unavailable: verify_command timed out".to_owned()),
-        "a human reads that the merge went in unverified"
+        notes.contains(&"accept: verify unavailable: verify_command timed out".to_owned()),
+        "a human reads that the merge went in unverified, and only the reason: {notes:?}"
+    );
+    assert!(
+        !notes.iter().any(|note| note.contains("running 12 tests")),
+        "the command's tail stays in `command_run.output`: {notes:?}"
     );
 }
 
