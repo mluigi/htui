@@ -285,11 +285,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Sixty-eight, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_sixty_eight` and out of crate by `tests/fake_conformance.rs` —
-/// because a binding that silently ran sixty-seven of them would still be green.
+/// Seventy, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_seventy` and out of crate by `tests/fake_conformance.rs` —
+/// because a binding that silently ran sixty-nine of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 16.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -324,12 +324,12 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// candidate and an interrupted judge (D95); a half-written park (D96); and the runs no sweep
 /// adopts — a parked one, a live lease, and this process's own (D88).
 ///
-/// **Sixteen for milestone 6** (MOD-4 plan D159-D167, D179): ANA-5 criterion 3's refused prompt
-/// at `walk_step` and at `drive_group`; criterion 3's running run that parks on a topology
+/// **Eighteen for milestone 6** (MOD-4 plan D159-D167, D179, D211): ANA-5 criterion 3's refused
+/// prompt at `walk_step` and at `drive_group`; criterion 3's running run that parks on a topology
 /// mismatch; a cancel that meets a live lease; four promotions (criterion 17's first half, a
-/// failed step of a parked run, a finished run refused, a dropped running step parked); three
+/// failed step of a parked run, a finished run refused, a dropped running step parked); five
 /// accepts (criterion 17's second half, the promotion and the document it needs, a failed
-/// verify); `Unblock`'s three cases (criterion 14's reopen, R-4's escalated run, R-7's refused
+/// verify, a verify on a deadline measured from the accept, an `unavailable` verify noted); `Unblock`'s three cases (criterion 14's reopen, R-4's escalated run, R-7's refused
 /// reconcile); and criterion 20's close-out and its refusal while a run is live.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
@@ -473,6 +473,11 @@ pub const CASES: &[&str] = &[
     "accept_artifact_needs_the_document_and_the_promotion",
     // Blueprint D194: a failed verify refuses the accept and keeps the step promoted.
     "accept_artifact_refuses_a_failed_verify",
+    // MOD-4 plan D211 (review H2): the accept's verify runs on a fresh phase deadline measured
+    // from the accept, even past the step's own.
+    "accept_artifact_verifies_on_a_deadline_from_the_accept",
+    // MOD-4 plan D211: an `unavailable` verify is recorded and noted, not refused.
+    "accept_artifact_notes_an_unavailable_verify",
     // Criterion 14's `Unblock` half (`:2121-2122`, plan D161): rung 4's blocked item reopens.
     "unblock_opens_a_blocked_item_with_no_run",
     // R-4 (plan D161 case 2): an escalated item follows its parked run, which is then promoted
@@ -499,7 +504,7 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 ///
 /// A plain function rather than a `match` inside [`run_case`]'s own body, and that is about the
 /// stack, not style: an unoptimised build gives every arm's case future its own stack slot, so a
-/// sixty-eight-arm `match` in an `async fn` puts all sixty-eight in the one frame every case is then
+/// seventy-arm `match` in an `async fn` puts all seventy in the one frame every case is then
 /// polled beneath, and the recovery cases' walks overflowed a test thread's 2 MiB. Here the slots
 /// are gone before the first poll.
 ///
@@ -667,6 +672,12 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         ),
         "accept_artifact_refuses_a_failed_verify" => {
             Box::pin(accept_artifact_refuses_a_failed_verify(harness))
+        }
+        "accept_artifact_verifies_on_a_deadline_from_the_accept" => Box::pin(
+            accept_artifact_verifies_on_a_deadline_from_the_accept(harness),
+        ),
+        "accept_artifact_notes_an_unavailable_verify" => {
+            Box::pin(accept_artifact_notes_an_unavailable_verify(harness))
         }
         "unblock_opens_a_blocked_item_with_no_run" => {
             Box::pin(unblock_opens_a_blocked_item_with_no_run(harness))
@@ -5071,6 +5082,91 @@ async fn accept_artifact_refuses_a_failed_verify<H: CaseHarness>(harness: &H) {
     );
 }
 
+/// MOD-4 plan D211 (review H2): the accept's verify runs on a fresh copy of the phase deadline,
+/// measured from the accept. A promoted step accepted three hours after its agent started —
+/// past the seeded two-hour deadline — still hands the verifier the whole window; measured from
+/// the step's `started_at` the remainder would be zero, which the real verifier answers
+/// `unavailable` to without running the command, and the chat's edits would merge unverified.
+async fn accept_artifact_verifies_on_a_deadline_from_the_accept<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    promote(&orch, run, prd.id).await;
+    orch.clock().advance(TimeDelta::hours(3));
+    orch.verifier().script_report(FakeVerifier::pass());
+
+    let outcome = accept(&orch, run, prd.id)
+        .await
+        .expect("a promoted step with its document");
+    assert!(
+        matches!(outcome, CommandOutcome::Accepted { .. }),
+        "{outcome:?}"
+    );
+    let windows = orch
+        .verifier()
+        .remaining()
+        .into_iter()
+        .filter(|(step, _)| *step == prd.id)
+        .map(|(_, remaining)| remaining)
+        .collect::<Vec<_>>();
+    assert_eq!(windows.len(), 2, "the walk's verify, then the accept's");
+    assert!(
+        windows[0].is_some_and(|window| window > std::time::Duration::ZERO),
+        "the phase has a deadline, whole when the walk verified: {windows:?}"
+    );
+    assert_eq!(
+        windows[1], windows[0],
+        "the accept's verify gets the whole deadline again, measured from the accept"
+    );
+    assert_eq!(
+        step_at(&orch, run, 0, 1).await.verify_outcome,
+        Some(VerifyOutcome::Pass)
+    );
+}
+
+/// MOD-4 plan D211: an accept whose verify comes back `unavailable` is not refused — plan D30's
+/// `unavailable` never fails a step, and some of its causes (`no primary tree`) are permanent —
+/// but it is recorded, and a note tells the human the merge went in unverified.
+async fn accept_artifact_notes_an_unavailable_verify<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    promote(&orch, run, prd.id).await;
+    orch.verifier()
+        .script_report(FakeVerifier::unavailable("verify_command timed out"));
+
+    let outcome = accept(&orch, run, prd.id)
+        .await
+        .expect("an unavailable verify does not refuse the accept");
+    let CommandOutcome::Accepted { rest } = outcome else {
+        panic!("`AcceptArtifact` answers `Accepted`, not {outcome:?}");
+    };
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the walk went on to `plan`"
+    );
+    let prd = step_at(&orch, run, 0, 1).await;
+    assert_eq!(
+        (prd.status, prd.gate_outcome, prd.verify_outcome),
+        (
+            StepStatus::Done,
+            Some(GateOutcome::Approved),
+            Some(VerifyOutcome::Unavailable)
+        )
+    );
+    assert!(
+        notes_of(&orch, ids::HTUI_FEAT_3)
+            .await
+            .contains(&"accept: verify unavailable: verify_command timed out".to_owned()),
+        "a human reads that the merge went in unverified"
+    );
+}
+
 /// `Unblock` on `item`, unwrapped to its case and rest.
 ///
 /// # Panics
@@ -5397,15 +5493,15 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_sixty_eight() {
+    fn cases_are_unique_and_seventy() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            68,
-            "18 + 5 + 13 + 6 + 10 + 16: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            70,
+            "18 + 5 + 13 + 6 + 10 + 18: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -5421,9 +5517,9 @@ mod tests {
              recovery cases (criterion 18's finished and unfinished steps, the out-of-budget \
              park, criterion 12's dirty tree, two lost merges, an interrupted candidate and \
              judge, a half-written park, and the runs no sweep adopts), and milestone 6's \
-             sixteen (ANA-5 criterion 3's refused prompt at `walk_step` and at `drive_group`, \
+             eighteen (ANA-5 criterion 3's refused prompt at `walk_step` and at `drive_group`, \
              criterion 3's running run parked on a topology mismatch, a cancel meeting a live \
-             lease, four promotions, three accepts, `Unblock`'s three cases, and criterion \
+             lease, four promotions, five accepts, `Unblock`'s three cases, and criterion \
              20's close-out and its refusal)"
         );
     }
