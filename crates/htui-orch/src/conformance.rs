@@ -32,7 +32,9 @@ use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, OpeningPath, Rest};
+use crate::command::{
+    Command, CommandOutcome, EngineError, GateAnswer, OpeningPath, Rest, UnblockCase,
+};
 use crate::engine::{Adopted, Next, Resume};
 use crate::fake::{FakeIsolator, FakeOrchestrator, FakeVerifier, ScriptedStep, TestClock};
 use crate::isolate::Clock as _;
@@ -463,6 +465,13 @@ pub const CASES: &[&str] = &[
     "accept_artifact_needs_the_document_and_the_promotion",
     // Blueprint D194: a failed verify refuses the accept and keeps the step promoted.
     "accept_artifact_refuses_a_failed_verify",
+    // Criterion 14's `Unblock` half (`:2121-2122`, plan D161): rung 4's blocked item reopens.
+    "unblock_opens_a_blocked_item_with_no_run",
+    // R-4 (plan D161 case 2): an escalated item follows its parked run, which is then promoted
+    // and approved.
+    "unblock_lets_an_escalated_run_be_promoted_and_approved",
+    // R-7 (plan D161 case 3): a run parked by a refused reconcile is resumed.
+    "unblock_resumes_a_reconcile_refused_park",
 ];
 
 /// Run one case by name.
@@ -646,6 +655,15 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         ),
         "accept_artifact_refuses_a_failed_verify" => {
             Box::pin(accept_artifact_refuses_a_failed_verify(harness))
+        }
+        "unblock_opens_a_blocked_item_with_no_run" => {
+            Box::pin(unblock_opens_a_blocked_item_with_no_run(harness))
+        }
+        "unblock_lets_an_escalated_run_be_promoted_and_approved" => Box::pin(
+            unblock_lets_an_escalated_run_be_promoted_and_approved(harness),
+        ),
+        "unblock_resumes_a_reconcile_refused_park" => {
+            Box::pin(unblock_resumes_a_reconcile_refused_park(harness))
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -5035,6 +5053,212 @@ async fn accept_artifact_refuses_a_failed_verify<H: CaseHarness>(harness: &H) {
     );
 }
 
+/// `Unblock` on `item`, unwrapped to its case and rest.
+///
+/// # Panics
+/// When the command is refused, which every caller of this helper expects not to be.
+async fn unblock<O: Orchestrate>(orch: &O, item: ItemId) -> (UnblockCase, Option<Rest>) {
+    let outcome = orch
+        .dispatch(Command::Unblock { item })
+        .await
+        .expect("the item is held by something `Unblock` clears");
+    let CommandOutcome::Unblocked {
+        item: unblocked,
+        case,
+        rest,
+    } = outcome
+    else {
+        panic!("`Unblock` answers `Unblocked`, not {outcome:?}");
+    };
+    assert_eq!(unblocked, item);
+    (case, rest)
+}
+
+/// ANA-2 §12 criterion 14's `Unblock` half (`docs/ANA-2.md:2121-2122`, MOD-4 plan D161 case 1):
+/// rung 4 at `StartRun` leaves the item `blocked` with no run; `Unblock` reopens it, and once the
+/// phase has a candidate again `StartRun` walks it.
+async fn unblock_opens_a_blocked_item_with_no_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    orch.with_candidates("prd", Vec::new());
+    orch.dispatch(Command::StartRun {
+        item: ids::HTUI_FEAT_3,
+        mode: RunMode::Manual,
+        repo_scope: None,
+    })
+    .await
+    .expect_err("rung 4 refuses before a run row exists");
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Blocked
+    );
+
+    let (case, rest) = unblock(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!((case, rest), (UnblockCase::Reopen, None));
+    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Open);
+    assert!(
+        notes_of(&orch, ids::HTUI_FEAT_3)
+            .await
+            .contains(&"unblocked: back to `open`".to_owned())
+    );
+    let refused = orch
+        .dispatch(Command::Unblock {
+            item: ids::HTUI_FEAT_3,
+        })
+        .await
+        .expect_err("an open item is not blocked");
+    assert!(
+        matches!(
+            refused,
+            EngineError::NotBlocked {
+                status: Status::Open,
+                ..
+            }
+        ),
+        "{refused}"
+    );
+
+    orch.with_candidates("prd", vec![(ids::AGENT_CLAUDE, "sonnet")]);
+    let (_, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        rest.run,
+        RunStatus::AwaitingApproval,
+        "`R` starts a new run on the reopened item"
+    );
+}
+
+/// R-4 (MOD-4 plan D161 case 2, `docs/ANA-2.md:551`): the review loop escalates — the item
+/// `blocked`, the run parked over the rejected review — and no gate verb reaches the run. `Unblock`
+/// lets the item follow its run to `awaiting_approval`; the review is then promoted and approved,
+/// and the run finishes.
+async fn unblock_lets_an_escalated_run_be_promoted_and_approved<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    primary_repo(&orch).await;
+    orch.script("review", 1, ScriptedStep::review("approve", "first"));
+    orch.script("review", 2, ScriptedStep::review("approve", "second"));
+    for hash in ["prd", "plan", "h1", "review-1", "h2", "review-2"] {
+        orch.isolator().script_after(Some(hash));
+    }
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    approve(&orch, run, 3).await;
+    for note in ["no tests", "still no tests"] {
+        answer(
+            &orch,
+            run,
+            GateAnswer::Rejected {
+                note: note.to_owned(),
+            },
+        )
+        .await;
+        if note == "no tests" {
+            approve(&orch, run, 1).await;
+        }
+    }
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Blocked,
+        "the loop escalated"
+    );
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+    let review = step_at(&orch, run, 3, 2).await;
+    assert_eq!(review.status, StepStatus::Failed);
+
+    let refused = orch
+        .dispatch(Command::PromoteStep {
+            run,
+            step: review.id,
+            chat_open: false,
+        })
+        .await
+        .expect_err("a blocked item is not walked on");
+    assert!(
+        matches!(refused, EngineError::ItemBlocked { .. }),
+        "{refused}"
+    );
+
+    let (case, rest) = unblock(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!((case, rest), (UnblockCase::FollowRun(run), None));
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval,
+        "plan D161's `blocked -> awaiting_approval` edge"
+    );
+
+    let (step, _, _) = promote(&orch, run, review.id).await;
+    assert_eq!(step, review.id);
+    let outcome = orch
+        .dispatch(Command::AnswerGate {
+            run,
+            step: review.id,
+            answer: GateAnswer::Approved,
+        })
+        .await
+        .expect("the promoted review has its document");
+    let CommandOutcome::Answered { rest } = outcome else {
+        panic!("`AnswerGate` answers `Answered`, not {outcome:?}");
+    };
+    assert_eq!(
+        rest.run,
+        RunStatus::Done,
+        "the review was the last position"
+    );
+    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Done);
+}
+
+/// R-7 (MOD-4 plan D161 case 3): a refused reconcile parks the run over a `done` step, which
+/// no gate verb reaches. `Unblock` resumes it: the merge is tried again, and the walk goes on to
+/// `plan`'s gate.
+async fn unblock_resumes_a_reconcile_refused_park<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::Never;
+        }
+    })
+    .await;
+    orch.isolator().refuse_reconcile("dirty_primary_tree");
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0))
+    );
+    let prd = step_at(&orch, run, 0, 1).await;
+    assert_eq!(prd.status, StepStatus::Done);
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+
+    let (case, rest) = unblock(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(case, UnblockCase::Resume(run));
+    assert_eq!(
+        rest,
+        Some(Rest {
+            run: RunStatus::AwaitingApproval,
+            position: Some(1),
+            failure: None,
+        }),
+        "the walk went on to `plan`'s gate"
+    );
+    assert_eq!(
+        orch.isolator().reconciles(),
+        [(prd.id, Vec::new()), (prd.id, Vec::new())],
+        "refused once, merged on the resume"
+    );
+    assert_eq!(
+        step_at(&orch, run, 1, 1).await.status,
+        StepStatus::AwaitingApproval
+    );
+    assert!(
+        notes_of(&orch, ids::HTUI_FEAT_3)
+            .await
+            .contains(&format!("unblocked: resuming run {run}"))
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -5059,7 +5283,7 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            63,
+            66,
             "18 + 5 + 13 + 6 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \

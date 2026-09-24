@@ -559,9 +559,8 @@ where
                 step,
                 chat_live,
             } => self.accept_artifact(run, step, chat_live).await,
-            Command::Unblock { .. } | Command::CloseOut { .. } => {
-                todo!("MOD-4 milestone 6: unblock and close-out")
-            }
+            Command::Unblock { item } => self.unblock(item).await,
+            Command::CloseOut { .. } => todo!("MOD-4 milestone 6: close-out"),
         }
     }
 
@@ -1345,6 +1344,17 @@ where
             .answer_guarded(&run, &snapshot, &row, &phase, GateAnswer::Approved)
             .await?;
         Ok(CommandOutcome::Accepted { rest })
+    }
+
+    /// §4.3 verdict 1's `unblock` (MOD-4 plan D161): one human action clears a held item.
+    ///
+    /// [`Self::unblock_case`] decides, then: [`UnblockCase::Reopen`] moves the item
+    /// `blocked -> open`; [`UnblockCase::FollowRun`] moves it `blocked -> awaiting_approval`
+    /// beside its parked run, so the run's gate verbs reach it (R-4); [`UnblockCase::Resume`]
+    /// resumes the parked run through [`Self::resume`] (R-7). Each writes a note first.
+    async fn unblock(&self, item: ItemId) -> Result<CommandOutcome, EngineError> {
+        let _ = item;
+        todo!("MOD-4 plan D161: unblock")
     }
 
     /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).
