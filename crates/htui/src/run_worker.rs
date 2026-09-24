@@ -2078,6 +2078,7 @@ pub(crate) mod tests {
     use crate::store_worker::{
         self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest, spawn_with_runtimes,
     };
+    use crate::ui::tabs::TabId;
     use uuid::Uuid;
 
     /// The scripted registry row every walk test runs on (blueprint F-O): an `acp` row, because
@@ -2973,6 +2974,112 @@ pub(crate) mod tests {
         );
         outcome(worker.reply(cancel).await);
         rests_at(&fixture, second, RunStatus::AwaitingApproval).await;
+    }
+
+    /// The frames (not the acknowledgements) received so far, taken out of `seen`.
+    fn frames(worker: &mut Worker) -> Vec<(Origin, u64, super::RunFrame)> {
+        worker.drain();
+        let (frames, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut worker.seen)
+            .into_iter()
+            .partition(|envelope| {
+                matches!(&envelope.reply, StoreReply::RunStream(frame)
+                    if !matches!(frame.kind, FrameKind::Subscribed))
+            });
+        worker.seen = rest;
+        frames
+            .into_iter()
+            .map(|envelope| match envelope.reply {
+                StoreReply::RunStream(frame) => (envelope.origin, envelope.seq, frame),
+                _ => unreachable!("partitioned above"),
+            })
+            .collect()
+    }
+
+    /// Blueprint §0a point 3: every frame of an item goes to its subscribers at **their**
+    /// subscription's `seq`, whoever asked for the command, and a re-subscription moves it.
+    #[tokio::test]
+    async fn run_stream_frames_carry_the_subscription_seq() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let backlog = Origin::Tab(TabId("backlog"));
+        let chat = Origin::Tab(TabId("chat"));
+        worker.send_at(
+            backlog.clone(),
+            7,
+            StoreRequest::RunStream {
+                item: ids::HTUI_ANA_2,
+            },
+        );
+        worker.send_at(
+            chat.clone(),
+            9,
+            StoreRequest::RunStream {
+                item: ids::HTUI_FEAT_1,
+            },
+        );
+
+        let start = worker.send_at(Origin::App, 10, start_run(ids::HTUI_ANA_2));
+        let CommandOutcome::Started { run, .. } = outcome(worker.reply(start).await) else {
+            panic!("a start answers Started");
+        };
+        let acks: Vec<(Origin, u64)> = worker
+            .seen
+            .iter()
+            .filter(|envelope| {
+                matches!(&envelope.reply, StoreReply::RunStream(frame)
+                if matches!(frame.kind, FrameKind::Subscribed))
+            })
+            .map(|envelope| (envelope.origin.clone(), envelope.seq))
+            .collect();
+        assert_eq!(acks, [(backlog.clone(), 7), (chat.clone(), 9)]);
+
+        let first = frames(&mut worker);
+        assert!(
+            first
+                .iter()
+                .any(|(_, _, frame)| matches!(frame.kind, FrameKind::Started)),
+            "{first:?}"
+        );
+        assert!(
+            first
+                .iter()
+                .any(|(_, _, frame)| matches!(frame.kind, FrameKind::SessionDone { .. })),
+            "{first:?}"
+        );
+        assert!(
+            first
+                .iter()
+                .any(|(_, _, frame)| matches!(frame.kind, FrameKind::Rested(_))),
+            "{first:?}"
+        );
+        for (origin, seq, frame) in &first {
+            assert_eq!((origin, *seq), (&backlog, 7), "{frame:?}");
+            assert_eq!(frame.item, ids::HTUI_ANA_2);
+        }
+
+        worker.send_at(
+            backlog.clone(),
+            11,
+            StoreRequest::RunStream {
+                item: ids::HTUI_ANA_2,
+            },
+        );
+        let research = step_at(&fixture, run, 0).await;
+        let answer = worker.send_at(
+            Origin::App,
+            12,
+            StoreRequest::Orch(OrchRequest::Command(Command::AnswerGate {
+                run,
+                step: research.id,
+                answer: GateAnswer::Approved,
+            })),
+        );
+        outcome(worker.reply(answer).await);
+        let later = frames(&mut worker);
+        assert!(!later.is_empty());
+        for (origin, seq, frame) in &later {
+            assert_eq!((origin, *seq), (&backlog, 11), "{frame:?}");
+        }
     }
 
     /// Plan D155: the five trait reads are the inherent reads of the same name.
