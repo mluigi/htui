@@ -1425,3 +1425,17 @@ F-A through F-S (§0). The ones the main thread records against ANA-2 or the PRD
 - `clippy --workspace --all-features --all-targets -D warnings` and `fmt --check` clean.
 - Workspace rustdoc shows only the two baseline errors (`htui-core` `MIRRORED_TABLES`, `htui-store` `step_exists`).
 - `cargo insta test -p htui --all-features`: 566 passed, nothing pending.
+
+### 21.5 Verification of the round (three findings, all confirmed)
+
+| # | Finding | Repair | Commits (red, green) |
+|---|---|---|---|
+| **V1** (LOW, D211) | The unavailable note wrote `report.output`. `ShellVerifier`'s timed-out, signalled and cannot-wait reports are `with_output(reason, tail)`, so the note carried up to 64 KiB of the command's tail, which `command_run.output` already holds. | The note is `accept: verify unavailable: <first line of the report>`, the reason `with_output` writes first. `accept_artifact_notes_an_unavailable_verify` now scripts a reason line plus two output lines and checks that the tail is not in the note. | `669f4ee`, `440ab8d` |
+| **V2** (MEDIUM, D212) | The Runs pane stores verdicts only from a `RunActions` reply, which it asks for only after a `Runs` read, and nothing re-read them when a chat ended: after `Esc Esc` the pane kept refusing `a`/`x`/`r`/`s`/`c` (and `A`, since D206) with the chat sentence and sent nothing until the item cursor moved. | `RunServed::Attach` carries a `ChatEnd` (the task's publisher and tag); the store loop and the harness wrap the promoted session task in `ChatEnd::after`, which publishes `FrameKind::Changed` for the item and run once the task has returned. The session's command receiver dies with the task, so `live_steps` no longer names the step, and the pane's re-read of `Runs` and `RunActions` gets the chat-free verdicts. Test: `tests/chat.rs` `the_runs_pane_ungreys_the_run_s_verbs_when_the_chat_ends` (Backlog and Chat tabs; `R`, `p`, `a` greyed, `Esc Esc`, then `a` approves the step). | `68d24fe`, `a3d15a0` |
+| **V3** (LOW, D212) | §21.2 said the verdict unit proves "a chat on another run's step greys nothing"; its negative case is a step of no run, and it skipped `select`. | §21.2 reworded; the unit's negative case also checks that `select` is not the chat's refusal. | `2b13b3d` |
+
+**Gate** at `2b13b3d` (§15):
+- `cargo test --workspace --all-features --no-fail-fast -- --test-threads=1` (Postgres): 1847 passed, 0 failed, 26 ignored.
+- `clippy --workspace --all-features --all-targets -D warnings` and `fmt --check` clean.
+- Workspace rustdoc shows only the two baseline errors (`htui-core` `MIRRORED_TABLES`, `htui-store` `step_exists`).
+- `cargo insta test -p htui --all-features`: 567 passed, nothing pending.
