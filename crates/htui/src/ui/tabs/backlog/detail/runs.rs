@@ -4,13 +4,19 @@
 //! over the flattened `(run, step)` list and `Enter` emits [`Action::Replay`] for the step under
 //! it. The pane does not read the step's rows itself — it holds no store handle (`R-NF-3`) — and
 //! it does not know which tab will show them either; naming the step is its whole part.
+//!
+//! Every step is two lines at the pane's 43 columns (MOD-4 plan D169, blueprint D197): slot,
+//! status, phase, usage and duration, then the gate, the prompt figure and the agent/model.
 
-use htui_core::model::{ItemId, RunStatus, RunStepSummary, RunSummary, StepId, StepStatus};
+use htui_core::model::{
+    ItemId, RunStatus, RunStepSummary, RunSummary, StepId, StepStatus, UsageTotals,
+};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Text};
-use ratatui::widgets::{Cell, Row, Table};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use serde_json::Value;
 
 use crate::app::{Action, Ctx, Handled};
 use crate::store_worker::StoreReply;
@@ -18,30 +24,58 @@ use crate::ui::Theme;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crossterm::event::{KeyCode, KeyEvent};
 
-/// Two lines per row: `kind` over `mode`, `started` over `finished`.
-///
-/// Six columns do not fit the 43 columns a detail pane has at 100x30; folding the two pairs that
-/// belong together is what keeps every field of the blueprint's list visible instead of clipped.
-const ROW: u16 = 2;
+/// The width of a detail pane at 100x30, which every step line fills exactly (MOD-4 plan D169,
+/// blueprint D197).
+const PANE: usize = 43;
 
-/// What replaces a timestamp a run has not reached yet.
+/// The run grid: `kind`, `status`, `box`, `started`, single-spaced (41 columns). Two lines per run:
+/// `kind` over `mode`, `started` over `finished`, because six columns do not fit the 43 a detail
+/// pane has at 100x30 and folding the pairs that belong together keeps every field visible.
+const RUN_GRID: [usize; 4] = [6, 9, 12, 11];
+
+/// The step grid's line 1 (D197): cursor, slot, status, phase, usage, duration, single-spaced.
+/// `1 + 5 + 10 + 11 + 6 + 5` plus five spaces is exactly [`PANE`].
+const SLOT_WIDTH: usize = 5;
+/// See [`SLOT_WIDTH`].
+const STATUS_WIDTH: usize = 10;
+/// See [`SLOT_WIDTH`].
+const USAGE_WIDTH: usize = 6;
+/// See [`SLOT_WIDTH`].
+const DURATION_WIDTH: usize = 5;
+
+/// The step grid's line 2 (D197): an indent to the status column, the gate, then a tail that
+/// starts in the phase column. `8 + 10 + 1 + 24` is exactly [`PANE`].
+const INDENT: usize = 8;
+/// See [`INDENT`].
+const GATE_WIDTH: usize = 10;
+/// See [`INDENT`].
+const TAIL_WIDTH: usize = 24;
+
+/// What replaces a timestamp a run has not reached yet, and any figure a step does not have.
 const PENDING: &str = "\u{2014}";
+
+/// The duration of a step that has not finished: no clock is read in `render` (D170).
+const RUNNING: &str = "\u{2026}";
+
+/// Marks a cut in [`fit`].
+const CUT: char = '\u{2026}';
 
 /// Marks the step the cursor is on. Unselected step rows carry a space of the same width, so the
 /// columns do not shift as the cursor moves.
 const CURSOR: &str = "\u{25b8}";
 
-/// Marks a step whose prompt was trimmed (D106). One character, because it shares the phase cell
-/// with the token figure; the record that says *what* was trimmed is the `Prompt` sub-tab's.
+/// Marks a step whose prompt was trimmed (D106). One character, because it shares the tail with
+/// the token figure; the record that says *what* was trimmed is the `Prompt` sub-tab's.
 const TRIMMED: &str = "!";
 
-/// Width of the phase column, which D106's second line shares with the phase name (hazard H-26).
+/// Width of the phase column (D197), which is also where line 2's tail, D106's indicator first,
+/// starts (hazard H-26).
 ///
-/// Named because it is the bound [`indicator`] has to fit in: a fifth column does not exist at 43
-/// columns, so a figure too wide for this cell clips instead of wrapping.
-const PHASE_WIDTH: u16 = 12;
+/// Named because it is the bound [`indicator`] has to fit in: the widest figure, `~-2147.5M !`
+/// over `i32::MIN`, is exactly this wide.
+const PHASE_WIDTH: usize = 11;
 
-/// The `Runs` reply as a table of kind, mode, status, box, started and finished, with one line
+/// The `Runs` reply as a table of kind, mode, status, box, started and finished, with two lines
 /// per step under each run.
 #[derive(Debug, Default)]
 pub struct RunsTab {
@@ -138,7 +172,7 @@ fn step_style(theme: &Theme, status: StepStatus) -> Style {
     }
 }
 
-/// D106's token figure in the seven characters B.17's second line has room for.
+/// D106's token figure, which leads line 2's tail.
 ///
 /// Under a thousand is exact (`~812`), thousands are whole and **rounded** (`~36k`), and a million
 /// or more takes one decimal (`~1.2M`). The `~` is not decoration: every number in a `trim_record`
@@ -160,7 +194,7 @@ fn figure(tokens: i32) -> String {
     }
 }
 
-/// The second line of a step row, or `None` for a step that stays one line (B.17).
+/// D106's prompt indicator, or `None` for a step no assembler wrote a record for.
 ///
 /// The two `RunStepSummary` fields are independent — a record can carry a trim and no readable
 /// `estimated_after` — so the marker renders alone rather than suppressing itself for want of a
@@ -172,6 +206,48 @@ fn indicator(step: &RunStepSummary) -> Option<String> {
         (Some(tokens), false) => Some(figure(tokens)),
         (Some(tokens), true) => Some(format!("{} {TRIMMED}", figure(tokens))),
     }
+}
+
+/// `text` in exactly `width` characters: space-padded, or cut with `…` as its last character.
+///
+/// Counted in `char`s, like the text field (`ui/text_field.rs`). A control character, a newline in
+/// a failure sentence say, becomes a space: one line is one line.
+fn fit(text: &str, width: usize) -> String {
+    todo!("{text} {width}")
+}
+
+/// The run grid's two header lines, `kind status box started` over `mode … finished`.
+fn header_lines(theme: &Theme) -> [Line<'static>; 2] {
+    todo!("{theme:?}")
+}
+
+/// One run's lines: `kind status box started`, `mode … finished`, and the failure when there is
+/// one, fitted to the pane.
+fn run_lines(run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
+    todo!("{run:?} {theme:?}")
+}
+
+/// One step's two lines (D197). `siblings` are the steps of its run: a fan-out slot is known by a
+/// sibling at the same `(position, attempt)` with a non-zero `fanout_index`.
+fn step_lines(
+    step: &RunStepSummary,
+    siblings: &[RunStepSummary],
+    on_cursor: bool,
+    theme: &Theme,
+) -> [Line<'static>; 2] {
+    todo!("{step:?} {siblings:?} {on_cursor} {theme:?}")
+}
+
+/// D170's usage cell: dollars when the usage document carries a cost, else tokens, else `—`. At
+/// most [`USAGE_WIDTH`] characters over the whole of `i64`.
+fn usage_cell(usage: Option<&Value>) -> String {
+    todo!("{usage:?}")
+}
+
+/// D170's duration cell: `finished_at - started_at`, `…` while running, `—` before starting. At
+/// most [`DURATION_WIDTH`] characters.
+fn duration_cell(step: &RunStepSummary) -> String {
+    todo!("{step:?}")
 }
 
 impl DetailTab for RunsTab {
@@ -231,95 +307,19 @@ impl DetailTab for RunsTab {
         }
 
         let cursor = self.selected_step();
-        let mut rows: Vec<Row<'_>> = Vec::new();
+        let mut lines: Vec<Line<'static>> = header_lines(ctx.theme).into();
         for run in self.runs.iter().skip(self.first_visible()) {
-            let started = run
-                .started_at
-                .map_or_else(|| PENDING.to_owned(), |at| at.format(STAMP).to_string());
-            let finished = run
-                .finished_at
-                .map_or_else(|| PENDING.to_owned(), |at| at.format(STAMP).to_string());
-            rows.push(
-                Row::new(vec![
-                    Cell::from(Text::from(vec![
-                        Line::styled(run.kind.as_str(), ctx.theme.base),
-                        Line::styled(run.mode.as_str(), ctx.theme.dim),
-                    ])),
-                    Cell::from(Line::styled(
-                        run.status.as_str(),
-                        run_style(ctx.theme, run.status),
-                    )),
-                    Cell::from(Line::styled(run.box_hostname.clone(), ctx.theme.base)),
-                    Cell::from(Text::from(vec![
-                        Line::styled(started, ctx.theme.base),
-                        Line::styled(finished, ctx.theme.dim),
-                    ])),
-                ])
-                .height(ROW),
-            );
-
+            lines.extend(run_lines(run, ctx.theme));
             for step in &run.steps {
-                let on_cursor = cursor == Some(step.id);
-                let mark = if on_cursor { CURSOR } else { " " };
-                let label = if on_cursor {
-                    ctx.theme.accent
-                } else {
-                    ctx.theme.dim
-                };
-                let started = step
-                    .started_at
-                    .map_or_else(|| PENDING.to_owned(), |at| at.format(STAMP).to_string());
-                // D106's two indicators fold into the phase cell rather than taking a fifth
-                // column: four columns and their spacing already fill the 41 of a 43-wide pane.
-                let indicator = indicator(step);
-                let phase = match &indicator {
-                    Some(line) => Cell::from(Text::from(vec![
-                        Line::styled(step.phase_name.clone(), label),
-                        Line::styled(line.clone(), ctx.theme.dim),
-                    ])),
-                    None => Cell::from(Line::styled(step.phase_name.clone(), label)),
-                };
-                let row = Row::new(vec![
-                    Cell::from(Line::styled(format!("{mark} {}", step.position), label)),
-                    Cell::from(Line::styled(
-                        step.status.as_str(),
-                        step_style(ctx.theme, step.status),
-                    )),
-                    phase,
-                    Cell::from(Line::styled(started, ctx.theme.dim)),
-                ]);
-                rows.push(if indicator.is_some() {
-                    row.height(ROW)
-                } else {
-                    row
-                });
+                lines.extend(step_lines(
+                    step,
+                    &run.steps,
+                    cursor == Some(step.id),
+                    ctx.theme,
+                ));
             }
         }
-
-        let header = Row::new(vec![
-            Cell::from(Text::from(vec![Line::raw("kind"), Line::raw("mode")])),
-            Cell::from("status"),
-            Cell::from("box"),
-            Cell::from(Text::from(vec![
-                Line::raw("started"),
-                Line::raw("finished"),
-            ])),
-        ])
-        .height(ROW)
-        .style(ctx.theme.title);
-
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(6),
-                Constraint::Length(9),
-                Constraint::Length(PHASE_WIDTH),
-                Constraint::Length(11),
-            ],
-        )
-        .header(header)
-        .column_spacing(1);
-        frame.render_widget(table, area);
+        frame.render_widget(Paragraph::new(lines), area);
     }
 }
 
@@ -329,10 +329,12 @@ mod tests {
     use crate::app::{Action, Emit, TopBarState};
     use crate::keymap::Keymap;
     use crate::store_worker::Origin;
+    use chrono::TimeDelta;
     use crossterm::event::KeyModifiers;
-    use htui_core::fixtures::ids;
-    use htui_core::model::{ProjectRef, Scope, WorkspaceId};
+    use htui_core::fixtures::{demo_at, ids};
+    use htui_core::model::{GateOutcome, ProjectRef, Scope, WorkspaceId};
     use htui_core::store::{MemStore, ReadStore};
+    use serde_json::json;
 
     /// Everything a `Ctx` borrows, kept alive for the length of a test.
     struct Shell {
@@ -376,12 +378,17 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// A Runs pane holding the fixture's `FEAT-1` runs: one run, four steps.
-    async fn pane(shell: &Shell) -> RunsTab {
-        let runs = MemStore::demo()
+    /// The fixture's `FEAT-1` runs: one run, four steps.
+    async fn feat_1_runs() -> Vec<RunSummary> {
+        MemStore::demo()
             .runs(ids::HTUI_FEAT_1)
             .await
-            .expect("the memory store never fails");
+            .expect("the memory store never fails")
+    }
+
+    /// A Runs pane holding the fixture's `FEAT-1` runs: one run, four steps.
+    async fn pane(shell: &Shell) -> RunsTab {
+        let runs = feat_1_runs().await;
         let mut pane = RunsTab::new();
         pane.on_item_change(Some(ids::HTUI_FEAT_1));
         pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
@@ -484,8 +491,14 @@ mod tests {
             .collect()
     }
 
-    /// D106: the fixture's `implement` step is the one with a `trim_record`, so it is the one step
-    /// that grows a second line, and the line sits under its phase name.
+    /// The char column `needle` starts at in `line`: the grid is counted in characters, and the
+    /// cursor, the gate's `—` and a cut's `…` are several bytes each.
+    fn column(line: &str, needle: &str) -> Option<usize> {
+        line.find(needle).map(|byte| line[..byte].chars().count())
+    }
+
+    /// D106: the fixture's `implement` step is the one with a `trim_record`, and its figure leads
+    /// the tail of the step's second line, which starts in the phase column.
     #[tokio::test]
     async fn a_step_with_a_trim_record_takes_two_lines() {
         let shell = Shell::new();
@@ -500,13 +513,12 @@ mod tests {
             .expect("the `implement` row has a second line");
         assert!(
             second.contains("~36k"),
-            "the figure sits in the phase cell under the phase name, not on the row above: \
-             {second:?}"
+            "the figure sits on the step's second line, not on the row above: {second:?}"
         );
         assert_eq!(
-            second.find("~36k"),
-            lines[at].find("implement"),
-            "and in the same column, because it is the same cell"
+            column(second, "~36k"),
+            column(&lines[at], "implement"),
+            "and in the same column: the tail starts where the phase does"
         );
     }
 
@@ -549,44 +561,419 @@ mod tests {
             let step = RunStepSummary {
                 prompt_tokens: Some(tokens),
                 trimmed: true,
-                ..MemStore::demo()
-                    .runs(ids::HTUI_FEAT_1)
-                    .await
-                    .expect("the memory store never fails")[0]
-                    .steps[0]
-                    .clone()
+                ..feat_1_runs().await[0].steps[0].clone()
             };
             let rendered = indicator(&step).expect("a step with a figure has a second line");
             assert!(
-                u16::try_from(rendered.chars().count()).expect("a short string") <= PHASE_WIDTH,
+                rendered.chars().count() <= PHASE_WIDTH,
                 "`{rendered}` does not fit the phase cell"
             );
         }
     }
 
-    /// The other three fixture steps have no record, so the pane is one line per step for them —
-    /// which is what keeps `backlog__detail_runs.snap` one line longer rather than four.
+    /// Every step is two lines (D169), whether or not it has a prompt record: the second line
+    /// always carries the gate and the agent/model, so the figure no longer decides the height.
     #[tokio::test]
-    async fn a_step_without_one_stays_one_line() {
+    async fn every_step_takes_two_lines() {
         let shell = Shell::new();
         let pane = pane(&shell).await;
         let lines = lines(&pane, &shell);
-        for phase in ["prd", "plan", "review"] {
+        for phase in ["prd", "plan", "implement", "review"] {
             let at = lines
                 .iter()
                 .position(|line| line.contains(phase))
                 .unwrap_or_else(|| panic!("the `{phase}` step is listed"));
             let next = lines.get(at + 1).map_or("", String::as_str);
+            let gate = next.chars().skip(INDENT).take(GATE_WIDTH).collect::<String>();
             assert!(
-                !next.contains('~') && !next.contains('!'),
-                "`{phase}` has no record and so no second line, but got {next:?}"
+                next.chars().take(INDENT).all(|c| c == ' ') && !gate.trim().is_empty(),
+                "`{phase}`'s second line starts with its gate at the status column: {next:?}"
             );
         }
         assert_eq!(
             lines.iter().filter(|line| line.contains('~')).count(),
             1,
-            "exactly one step row carries an indicator"
+            "exactly one step carries a prompt figure"
         );
+        assert_eq!(
+            lines.iter().filter(|line| !line.is_empty()).count(),
+            2 + 2 + 4 * 2,
+            "the header, the run and four two-line steps"
+        );
+    }
+
+    /// The text of a line, spans joined.
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    /// A 40-character agent name.
+    const LONG_AGENT: &str = "an-agent-whose-name-is-forty-characters!";
+
+    /// A 60-character model id.
+    const LONG_MODEL: &str = "a-model-id-sixty-characters-long-which-no-column-could-hold-";
+
+    /// Every fixture step, plus the synthetic extremes of blueprint §9.6.
+    async fn extremes() -> Vec<RunStepSummary> {
+        let mut steps = feat_1_runs().await[0].steps.clone();
+        let base = steps[0].clone();
+        steps.push(RunStepSummary {
+            phase_name: "research:judge".to_owned(),
+            position: 123,
+            attempt: 45,
+            fanout_index: -1,
+            ..base.clone()
+        });
+        steps.push(RunStepSummary {
+            status: StepStatus::AwaitingApproval,
+            gate_outcome: Some(GateOutcome::Rejected),
+            promoted_at: Some(demo_at(1, 0)),
+            selected: Some(true),
+            ..base.clone()
+        });
+        steps.push(RunStepSummary {
+            prompt_tokens: Some(i32::MIN),
+            trimmed: true,
+            agent_name: Some(LONG_AGENT.to_owned()),
+            model: Some(LONG_MODEL.to_owned()),
+            ..base.clone()
+        });
+        steps.push(RunStepSummary {
+            usage: Some(json!({ "cost_micros": i64::MAX })),
+            started_at: Some(demo_at(0, 0)),
+            finished_at: Some(demo_at(0, 0) + TimeDelta::hours(1_000)),
+            ..base.clone()
+        });
+        steps.push(RunStepSummary {
+            usage: Some(json!({ "input_tokens": i64::MAX, "output_tokens": i64::MAX })),
+            status: StepStatus::Superseded,
+            ..base
+        });
+        steps
+    }
+
+    /// D169, D197: every step line is exactly the pane's 43 columns, with each field in its own
+    /// column: status at 8, phase at 19, usage at 31 and duration at 38.
+    #[tokio::test]
+    async fn every_step_row_fits_forty_three_columns() {
+        let theme = Theme::default();
+        let steps = extremes().await;
+        for step in &steps {
+            for on_cursor in [false, true] {
+                let [first, second] = step_lines(step, &steps, on_cursor, &theme);
+                for line in [&first, &second] {
+                    assert_eq!(
+                        line.width(),
+                        PANE,
+                        "{:?} is not {PANE} columns wide",
+                        text(line)
+                    );
+                }
+                let chars: Vec<char> = text(&first).chars().collect();
+                for gap in [1, 7, 18, 30, 37] {
+                    assert_eq!(
+                        chars[gap], ' ',
+                        "column {gap} separates two cells: {chars:?}"
+                    );
+                }
+                let cell = |from: usize, to: usize| -> String {
+                    chars[from..to].iter().collect::<String>().trim().to_owned()
+                };
+                let status = if step.status == StepStatus::AwaitingApproval {
+                    "awaiting"
+                } else {
+                    step.status.as_str()
+                };
+                assert_eq!(cell(8, 18), status, "the status starts at column 8");
+                assert_eq!(
+                    cell(19, 30),
+                    fit(&step.phase_name, PHASE_WIDTH).trim(),
+                    "the phase starts at column 19"
+                );
+                assert_eq!(
+                    cell(31, 37),
+                    usage_cell(step.usage.as_ref()),
+                    "usage at 31"
+                );
+                assert_eq!(cell(38, 43), duration_cell(step), "duration at 38");
+                assert_eq!(chars[0], if on_cursor { '\u{25b8}' } else { ' ' });
+
+                let tail: Vec<char> = text(&second).chars().collect();
+                assert!(tail[..INDENT].iter().all(|c| *c == ' '), "{tail:?}");
+                assert_eq!(tail[INDENT + GATE_WIDTH], ' ', "{tail:?}");
+            }
+        }
+
+        let [judge, _] = step_lines(&steps[4], &steps, false, &theme);
+        assert!(
+            text(&judge).starts_with("  123.\u{2026}"),
+            "a slot too wide for its cell is cut: {:?}",
+            text(&judge)
+        );
+        let [_, gate] = step_lines(&steps[5], &steps, false, &theme);
+        assert!(
+            text(&gate).contains("rejected*\u{2713}"),
+            "promoted and selected both mark the gate: {:?}",
+            text(&gate)
+        );
+        let [_, long] = step_lines(&steps[6], &steps, false, &theme);
+        assert!(
+            text(&long).trim_end().ends_with('\u{2026}'),
+            "a long agent/model is cut with `…`: {:?}",
+            text(&long)
+        );
+        assert!(text(&long).contains("~-2147.5M !"), "{:?}", text(&long));
+    }
+
+    /// The slot names the fan-out candidate, and the judge by `j`.
+    #[tokio::test]
+    async fn a_fanout_slot_names_its_candidates() {
+        let base = feat_1_runs().await[0].steps[0].clone();
+        let steps: Vec<RunStepSummary> = [0, 1, -1]
+            .into_iter()
+            .map(|fanout_index| RunStepSummary {
+                position: 2,
+                attempt: 1,
+                fanout_index,
+                ..base.clone()
+            })
+            .collect();
+        let theme = Theme::default();
+        let slots: Vec<String> = steps
+            .iter()
+            .map(|step| {
+                let [first, _] = step_lines(step, &steps, false, &theme);
+                text(&first).chars().skip(2).take(SLOT_WIDTH).collect::<String>()
+            })
+            .collect();
+        assert_eq!(slots, ["2.1/0", "2.1/1", "2.1/j"]);
+
+        let [single, _] = step_lines(&base, std::slice::from_ref(&base), false, &theme);
+        assert!(
+            text(&single).starts_with("  0.1   "),
+            "a step alone in its slot is `p.a`: {:?}",
+            text(&single)
+        );
+    }
+
+    /// D169: a run with a `failure` gains a third header line, fitted to the pane.
+    #[tokio::test]
+    async fn a_run_with_a_failure_gets_a_third_line_that_fits() {
+        let theme = Theme::default();
+        let run = feat_1_runs().await.remove(0);
+        assert_eq!(run_lines(&run, &theme).len(), 2, "no failure, two lines");
+
+        let failed = RunSummary {
+            status: RunStatus::Failed,
+            failure: Some(format!(
+                "stage 3 refused the prompt:\n{}",
+                "a sentence far too long for the pane ".repeat(3)
+            )),
+            ..run
+        };
+        let lines = run_lines(&failed, &theme);
+        assert_eq!(lines.len(), 3);
+        let third = text(&lines[2]);
+        assert_eq!(lines[2].width(), PANE, "{third:?}");
+        assert!(
+            third.starts_with("stage 3 refused the prompt: a"),
+            "{third:?}"
+        );
+        assert!(third.ends_with('\u{2026}'), "{third:?}");
+    }
+
+    /// The run grid is today's, byte for byte, and `awaiting_approval` reads `awaiting`.
+    #[tokio::test]
+    async fn the_run_lines_keep_the_run_grid() {
+        let theme = Theme::default();
+        let [kind, mode] = header_lines(&theme);
+        assert_eq!(
+            text(&kind).trim_end(),
+            "kind   status    box          started"
+        );
+        assert_eq!(
+            text(&mode).trim_end(),
+            "mode                          finished"
+        );
+
+        let run = feat_1_runs().await.remove(0);
+        let lines = run_lines(&run, &theme);
+        assert_eq!(
+            text(&lines[0]).trim_end(),
+            "graph  done      DESKTOP-HTUI 09-02 08:00"
+        );
+        assert_eq!(
+            text(&lines[1]).trim_end(),
+            "manual                        09-02 12:00"
+        );
+
+        let parked = RunSummary {
+            status: RunStatus::AwaitingApproval,
+            finished_at: None,
+            ..run
+        };
+        let lines = run_lines(&parked, &theme);
+        assert!(text(&lines[0]).starts_with("graph  awaiting  DESKTOP-HTUI"));
+        assert_eq!(
+            text(&lines[1]).trim_end(),
+            "manual                        \u{2014}"
+        );
+    }
+
+    /// D170: no clock is read in `render`, so a step still running has no duration yet.
+    #[tokio::test]
+    async fn a_running_step_shows_no_duration() {
+        let running = RunStepSummary {
+            status: StepStatus::Running,
+            finished_at: None,
+            ..feat_1_runs().await[0].steps[0].clone()
+        };
+        assert_eq!(duration_cell(&running), "\u{2026}");
+        let [first, _] = step_lines(
+            &running,
+            std::slice::from_ref(&running),
+            false,
+            &Theme::default(),
+        );
+        assert!(text(&first).ends_with("    \u{2026}"), "{:?}", text(&first));
+
+        let unstarted = RunStepSummary {
+            started_at: None,
+            ..running
+        };
+        assert_eq!(duration_cell(&unstarted), PENDING);
+    }
+
+    /// D170 over the whole domain: the two cells never outgrow their width.
+    #[test]
+    fn usage_and_duration_cells_never_exceed_their_width() {
+        assert_eq!(usage_cell(None), PENDING);
+        assert_eq!(usage_cell(Some(&json!({}))), PENDING);
+        assert_eq!(usage_cell(Some(&json!("not an object"))), PENDING);
+        assert_eq!(
+            usage_cell(Some(&json!({ "cost_micros": 420_000 }))),
+            "$0.42"
+        );
+        assert_eq!(
+            usage_cell(Some(&json!({ "cost_micros": 12_340_000 }))),
+            "$12.34"
+        );
+        assert_eq!(
+            usage_cell(Some(&json!({ "cost_micros": 123_000_000 }))),
+            "$123"
+        );
+        assert_eq!(
+            usage_cell(Some(&json!({ "cost_micros": 100_000_000_000_i64 }))),
+            ">$99k"
+        );
+        assert_eq!(
+            usage_cell(Some(
+                &json!({ "cost_micros": 0, "input_tokens": 700, "output_tokens": 112 })
+            )),
+            "812",
+            "no cost falls back to tokens"
+        );
+        assert_eq!(usage_cell(Some(&json!({ "input_tokens": 12_000 }))), "12k");
+        assert_eq!(
+            usage_cell(Some(&json!({ "output_tokens": 1_234_567 }))),
+            "1.2M"
+        );
+        assert_eq!(
+            usage_cell(Some(&json!({ "output_tokens": 999_500 }))),
+            "1.0M"
+        );
+        assert_eq!(
+            usage_cell(Some(&json!({ "output_tokens": 45_000_000 }))),
+            "45M"
+        );
+        assert_eq!(
+            usage_cell(Some(&json!({ "output_tokens": 1_000_000_000 }))),
+            ">999M"
+        );
+        assert_eq!(usage_cell(Some(&json!({ "input_tokens": -5 }))), PENDING);
+
+        let mut figures = vec![i64::MIN, -1, 0, 1, i64::MAX];
+        for exponent in 0..19 {
+            let power = 10_i64.pow(exponent);
+            figures.extend([power - 1, power, power + power / 2, 5 * power - 1]);
+        }
+        for figure in figures {
+            for document in [
+                json!({ "cost_micros": figure }),
+                json!({ "input_tokens": figure, "output_tokens": figure }),
+                json!({ "input_tokens": figure }),
+            ] {
+                let cell = usage_cell(Some(&document));
+                assert!(
+                    cell.chars().count() <= USAGE_WIDTH,
+                    "`{cell}` from {document} is wider than {USAGE_WIDTH}"
+                );
+            }
+        }
+
+        let base = RunStepSummary {
+            id: StepId::new(),
+            position: 0,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "prd".to_owned(),
+            agent_id: None,
+            model: None,
+            status: StepStatus::Done,
+            gate_outcome: None,
+            started_at: Some(demo_at(0, 0)),
+            finished_at: None,
+            prompt_tokens: None,
+            trimmed: false,
+            usage: None,
+            selected: None,
+            exit_code: None,
+            verify_outcome: None,
+            promoted_at: None,
+            agent_name: None,
+        };
+        let span = |seconds: i64| RunStepSummary {
+            finished_at: Some(demo_at(0, 0) + TimeDelta::seconds(seconds)),
+            ..base.clone()
+        };
+        assert_eq!(duration_cell(&span(45)), "45s");
+        assert_eq!(duration_cell(&span(12 * 60 + 59)), "12m");
+        assert_eq!(duration_cell(&span(3_600 + 4 * 60)), "1h04");
+        assert_eq!(duration_cell(&span(99 * 3_600 + 59 * 60 + 59)), "99h59");
+        assert_eq!(duration_cell(&span(100 * 3_600)), ">99h");
+        assert_eq!(
+            duration_cell(&span(-30)),
+            "0s",
+            "a negative span is no time at all"
+        );
+        let mut seconds = vec![
+            0,
+            59,
+            60,
+            3_599,
+            3_600,
+            359_999,
+            360_000,
+            i64::from(i32::MAX),
+        ];
+        seconds.extend((0..40).map(|exponent| 3_i64.pow(exponent) / 7));
+        for seconds in seconds {
+            let cell = duration_cell(&span(seconds));
+            assert!(
+                cell.chars().count() <= DURATION_WIDTH,
+                "`{cell}` for {seconds}s is wider than {DURATION_WIDTH}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_pads_cuts_and_flattens() {
+        assert_eq!(fit("ab", 4), "ab  ");
+        assert_eq!(fit("abcd", 4), "abcd");
+        assert_eq!(fit("abcde", 4), "abc\u{2026}");
+        assert_eq!(fit("a\nb", 3), "a b");
+        assert_eq!(fit("\u{2014}", 2), "\u{2014} ", "counted in chars, not bytes");
+        assert_eq!(fit("abc", 0), "");
     }
 
     /// A new item's reply re-seats the cursor instead of leaving it on an index of the old one.
