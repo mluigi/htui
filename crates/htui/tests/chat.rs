@@ -38,8 +38,8 @@ use htui_core::model::{
     RunId, RunMode, RunStatus, RunStep, SessionEvent, SnapshotPhase, StepId, StepStatus, Transport,
 };
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
-use htui_orch::Command;
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
+use htui_orch::{Command, GateAnswer};
 use serde_json::json;
 use tokio::sync::{Notify, mpsc};
 
@@ -1320,6 +1320,115 @@ async fn accept_is_refused_while_the_promoted_chat_is_live() {
     assert_ne!(
         next.phase_name, step.phase_name,
         "and the walk moved on: {next:?}"
+    );
+}
+
+/// Blueprint D212 (review H3): while a step of the run is chatted with, every verb that would move
+/// the run under the chat — approve, reject, retry, select and cancel — is refused with
+/// `ChatLive(Some)`'s sentence and nothing moves; the chat stays live, because cancel does not end
+/// it. Once the chat has ended (`Esc Esc`) the same approve goes through.
+#[tokio::test]
+async fn the_run_s_verbs_are_refused_while_the_promoted_chat_is_live() {
+    let (mut harness, store) =
+        promotion_harness(Script::one_turn(vec![chunk("Here."), done()])).await;
+    let (run, step) = parked(&mut harness, &store).await;
+    promote(&mut harness, run, step.id).await;
+    let approve = || {
+        Action::Store(StoreRequest::Orch(OrchRequest::Command(
+            Command::AnswerGate {
+                run,
+                step: step.id,
+                answer: GateAnswer::Approved,
+            },
+        )))
+    };
+    let refusal = format!(
+        "step {} is being chatted with; end that chat first (Chat tab, Esc Esc)",
+        step.id
+    );
+
+    let verbs = [
+        ("answer_gate", approve()),
+        (
+            "answer_gate",
+            Action::Store(StoreRequest::Orch(OrchRequest::Command(
+                Command::AnswerGate {
+                    run,
+                    step: step.id,
+                    answer: GateAnswer::Rejected {
+                        note: "not yet".to_owned(),
+                    },
+                },
+            ))),
+        ),
+        (
+            "retry_step",
+            Action::Store(StoreRequest::Orch(OrchRequest::Command(
+                Command::RetryStep { run, step: step.id },
+            ))),
+        ),
+        (
+            "select_fanout",
+            Action::Store(StoreRequest::Orch(OrchRequest::Command(
+                Command::SelectFanout {
+                    run,
+                    position: step.position,
+                    attempt: step.attempt,
+                    winner: step.id,
+                },
+            ))),
+        ),
+        (
+            "cancel_run",
+            Action::Store(StoreRequest::Orch(OrchRequest::Command(
+                Command::CancelRun { run },
+            ))),
+        ),
+    ];
+    for (name, verb) in verbs {
+        harness.app().status = None;
+        harness.app().update(verb);
+        harness.drive().await;
+        assert_eq!(
+            harness.app().status.as_deref(),
+            Some(format!("{name}: {refusal}").as_str()),
+            "{name} is refused while the chat is live"
+        );
+    }
+    let after = step_at(&store, run, 0).await;
+    assert_eq!(
+        (after.id, after.status),
+        (step.id, StepStatus::AwaitingApproval),
+        "the step did not move"
+    );
+    assert_eq!(
+        store
+            .run(run)
+            .await
+            .expect("the read answers")
+            .expect("the run")
+            .status,
+        RunStatus::AwaitingApproval,
+        "nor did the run"
+    );
+    assert_eq!(
+        harness.chat_steps(),
+        vec![step.id],
+        "and the chat is still live: a refused cancel does not end it"
+    );
+
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+    harness.app().status = None;
+    harness.app().update(approve());
+    harness.drive().await;
+
+    assert_eq!(harness.app().status, None, "the approve went through");
+    assert_eq!(
+        step_at(&store, run, 0).await.status,
+        StepStatus::Done,
+        "the promoted step is approved"
     );
 }
 

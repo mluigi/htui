@@ -2247,7 +2247,7 @@ pub(crate) mod tests {
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
         Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, NewRepo, NewRun,
-        RepoId, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId,
+        RepoId, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
         TIMESTAMPTZ_DIGITS, Transport,
     };
     use htui_core::store::mem::MemFault;
@@ -2904,6 +2904,165 @@ pub(crate) mod tests {
             live.steps[&research.id].promote,
             Err(EngineError::ChatLive { step: None }.to_string()),
             "a chat of this process is live elsewhere"
+        );
+    }
+
+    /// D212 (review H3): while a step of a run is chatted with, the verbs that would move the run
+    /// under the chat — approve, reject, retry, select and cancel — grey with the worker's own
+    /// refusal. A chat on a step of no run of the item greys none of them.
+    #[tokio::test]
+    async fn run_actions_grey_the_run_s_verbs_while_a_chat_is_live_on_it() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let (run, research) = parked(&fixture, &mut worker).await;
+        let backend = Backend::memory(fixture.store.clone());
+
+        let live = super::actions(&backend, ids::HTUI_ANA_2, &LiveChats::of([research.id]))
+            .await
+            .expect("the verdicts");
+        let refusal = Err(EngineError::ChatLive {
+            step: Some(research.id),
+        }
+        .to_string());
+        let verdict = &live.steps[&research.id];
+        for (verb, enabled) in [
+            ("approve", &verdict.approve),
+            ("reject", &verdict.reject),
+            ("retry", &verdict.retry),
+            ("select", &verdict.select),
+            ("cancel", &live.runs[&run].cancel),
+        ] {
+            assert_eq!(enabled, &refusal, "{verb} greys while the chat is live");
+        }
+
+        let elsewhere = super::actions(&backend, ids::HTUI_ANA_2, &LiveChats::of([StepId::new()]))
+            .await
+            .expect("the verdicts");
+        let verdict = &elsewhere.steps[&research.id];
+        for (verb, enabled) in [
+            ("approve", &verdict.approve),
+            ("reject", &verdict.reject),
+            ("retry", &verdict.retry),
+            ("cancel", &elsewhere.runs[&run].cancel),
+        ] {
+            assert_eq!(
+                enabled,
+                &Ok(()),
+                "{verb} stays enabled beside another run's chat"
+            );
+        }
+    }
+
+    /// D212 (review H3), D200: a verb on a run one of whose steps is chatted with is refused inside
+    /// its task with `ChatLive(Some)`'s sentence, the refusal is published for the run's item, and
+    /// nothing moves.
+    #[tokio::test]
+    async fn a_verb_on_a_run_being_chatted_with_is_refused_and_published() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        let envelope = |seq: u64, origin: Origin, request: StoreRequest| RequestEnvelope {
+            seq,
+            origin,
+            request,
+        };
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &envelope(1, Origin::App, start_run(ids::HTUI_ANA_2)),
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred));
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        let research = step_at(&fixture, run, 0).await;
+        assert_eq!(research.status, StepStatus::AwaitingApproval);
+        let backlog = Origin::Tab(TabId("backlog"));
+        runtime
+            .serve(
+                &backend,
+                &replies,
+                &envelope(
+                    2,
+                    backlog.clone(),
+                    StoreRequest::RunStream {
+                        item: ids::HTUI_ANA_2,
+                    },
+                ),
+                &LiveChats::default(),
+            )
+            .await;
+        while answers.try_recv().is_ok() {}
+
+        let live = LiveChats::of([research.id]);
+        let refusal = EngineError::ChatLive {
+            step: Some(research.id),
+        }
+        .to_string();
+        let verbs = [
+            Command::AnswerGate {
+                run,
+                step: research.id,
+                answer: GateAnswer::Approved,
+            },
+            Command::AnswerGate {
+                run,
+                step: research.id,
+                answer: GateAnswer::Rejected {
+                    note: "not yet".to_owned(),
+                },
+            },
+            Command::RetryStep {
+                run,
+                step: research.id,
+            },
+            Command::SelectFanout {
+                run,
+                position: 0,
+                attempt: research.attempt,
+                winner: research.id,
+            },
+            Command::CancelRun { run },
+        ];
+        for (seq, command) in (3..).zip(verbs) {
+            let request = StoreRequest::Orch(OrchRequest::Command(command));
+            let name = request.name();
+            let served = runtime
+                .serve(
+                    &backend,
+                    &replies,
+                    &envelope(seq, Origin::App, request),
+                    &live,
+                )
+                .await;
+            assert!(matches!(served, RunServed::Deferred), "{name}: {served:?}");
+            assert!(runtime.settle(PATIENCE).await.is_empty());
+            let (mut answered, mut published) = (None, false);
+            while let Ok(answer) = answers.try_recv() {
+                match answer.reply {
+                    StoreReply::Failed { request, message } if answer.seq == seq => {
+                        answered = Some((request, message));
+                    }
+                    StoreReply::RunStream(super::RunFrame {
+                        kind: FrameKind::Error(sentence),
+                        ..
+                    }) if answer.origin == backlog => {
+                        assert_eq!(sentence, refusal, "{name}");
+                        published = true;
+                    }
+                    other => panic!("{name}: nothing else is answered or published: {other:?}"),
+                }
+            }
+            assert_eq!(answered, Some((name, refusal.clone())));
+            assert!(published, "{name}: the refusal is published for the item");
+        }
+        assert_eq!(fixture.run(run).await.status, RunStatus::AwaitingApproval);
+        assert_eq!(
+            step_at(&fixture, run, 0).await.status,
+            StepStatus::AwaitingApproval
         );
     }
 
