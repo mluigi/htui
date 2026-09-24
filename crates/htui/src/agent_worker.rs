@@ -1537,7 +1537,7 @@ impl ChatBinding {
 
 /// [`StoreRequest::name`] of a promotion (blueprint D209): what a promoted chat's refusals are
 /// answered as, since the promotion is the request that opened it.
-const PROMOTE_STEP: &str = "promote_step";
+const PROMOTE_STEP: &str = crate::run_worker::ORCH_NAMES[5];
 
 /// Everything one chat session needs.
 pub struct ChatArgs {

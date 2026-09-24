@@ -1085,7 +1085,11 @@ async fn promotion_opens_the_chat_on_the_same_step() {
         )),
         "the header names the promotion: {rendered}"
     );
-    stable().bind(|| insta::assert_snapshot!("chat_promoted", rendered));
+    // The promoted header is wider than the fake's session id leaves room for, so the id is cut
+    // at the border wherever it ends: every visible hex digit of it is substituted.
+    let mut settings = stable();
+    settings.add_filter(r"session fake-[0-9a-f-]+", "session fake-<session>");
+    settings.bind(|| insta::assert_snapshot!("chat_promoted", rendered));
 }
 
 /// ANA-5 criterion 17: a message composed in the promoted chat is a `follow_up` on the step's own
