@@ -15,11 +15,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use htui::agent_worker::AgentRuntime;
-use htui::app::Action;
+use htui::app::{Action, TabAction};
 use htui::run_worker::{OrchReply, OrchRequest, RunRuntime, StepAuthor};
 use htui::store_worker::{Origin, RequestEnvelope, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::tabs::ChatTab;
+use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::conformance::{Script, ScriptEvent};
 use htui_agent::driver::{
     AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, PermissionAnswer,
@@ -1425,6 +1426,91 @@ async fn the_run_s_verbs_are_refused_while_the_promoted_chat_is_live() {
     harness.drive().await;
 
     assert_eq!(harness.app().status, None, "the approve went through");
+    assert_eq!(
+        step_at(&store, run, 0).await.status,
+        StepStatus::Done,
+        "the promoted step is approved"
+    );
+}
+
+/// Blueprint D212, through the Runs pane's keys: the pane greys the run's verbs while the promoted
+/// chat is live, and ungreys them once `Esc Esc` has ended it. The pane refuses a greyed key
+/// itself and sends nothing, so its verdicts have to be read again when the chat ends: the loop
+/// publishes a `Changed` frame for the item then, and the pane re-reads its runs and verdicts.
+#[tokio::test]
+async fn the_runs_pane_ungreys_the_run_s_verbs_when_the_chat_ends() {
+    let store = graph_store().await;
+    let mut harness = Harness::over(store.clone())
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_tab(Box::new(ChatTab::new()))
+        .with_replay_tab(ChatTab::ID)
+        .with_agent_runtime(chat_runtime(Script::one_turn(vec![chunk("Here."), done()])))
+        .with_run_runtime(run_runtime(&Arc::new(Walks::default())));
+    harness.drive().await;
+    let platform = MemStore::demo()
+        .workspaces()
+        .await
+        .expect("the memory store never fails")
+        .into_iter()
+        .find(|workspace| workspace.slug == "platform")
+        .expect("the demo fixture holds the `platform` workspace");
+    harness.app().update(Action::SetScope {
+        workspace: platform,
+    });
+    harness.drive().await;
+    // htui `ANA-2`, one row below the arrival row, on the Runs sub-tab.
+    harness.key("j");
+    harness.drive().await;
+    harness.key("l");
+    harness.key("R");
+    harness.drive().await;
+    let runs = store.runs(ids::HTUI_ANA_2).await.expect("the read answers");
+    assert_eq!(runs.len(), 1, "`R` started one run: {runs:?}");
+    let run = runs[0].id;
+    let step = step_at(&store, run, 0).await;
+    assert_eq!(
+        step.status,
+        StepStatus::AwaitingApproval,
+        "parked at the gate"
+    );
+
+    harness.key("p");
+    harness.drive().await;
+    assert_eq!(
+        harness.chat_steps(),
+        vec![step.id],
+        "the promoted chat is live"
+    );
+    let backlog = || Action::Tab(TabAction::Focus(BacklogTab::ID));
+    harness.app().update(backlog());
+    harness.app().status = None;
+    harness.key("a");
+    harness.drive().await;
+    assert_eq!(
+        harness.app().status,
+        Some(format!(
+            "step {} is being chatted with; end that chat first (Chat tab, Esc Esc)",
+            step.id
+        )),
+        "the pane greys `a` while the chat is live"
+    );
+
+    harness
+        .app()
+        .update(Action::Tab(TabAction::Focus(ChatTab::ID)));
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+    harness.app().update(backlog());
+    harness.app().status = None;
+    harness.key("a");
+    harness.drive().await;
+
+    assert_eq!(
+        harness.app().status,
+        None,
+        "the pane sent `a` once the chat had ended"
+    );
     assert_eq!(
         step_at(&store, run, 0).await.status,
         StepStatus::Done,
