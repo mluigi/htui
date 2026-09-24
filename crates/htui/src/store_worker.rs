@@ -56,8 +56,9 @@ pub const PROMPT_PREVIEW: &str = "prompt_preview";
 /// D183): the test harness without one.
 pub const NO_RUN_RUNTIME: &str = "no run runtime in this build";
 
-/// Blueprint D181's T6 stub: what a promotion is answered with until the Chat tab's runtime binds
-/// promoted steps (T7).
+/// What a promotion is answered with, after its engine writes, by a test harness that has a run
+/// runtime and no chat runtime to bind the promoted step to (blueprint D181). The store loop always
+/// holds both.
 pub const PROMOTION_NEEDS_CHAT: &str = "promotion needs the chat runtime";
 
 /// Who asked, and therefore who the reply is addressed to.
@@ -1121,39 +1122,40 @@ pub fn spawn_with(
     spawn_with_runtimes(started, rx, tx, runtime, RunRuntime::production())
 }
 
-/// The steps a chat of this process is live on (blueprint D206): every started step whose chat
-/// the runtime still holds. T7's `AgentRuntime::live_steps` replaces the derivation.
+/// The steps a chat of this process is live on (blueprint D206): the runtime's chats whose
+/// session task is still running (`AgentRuntime::live_steps`).
 pub(crate) fn live_chats(runtime: &AgentRuntime) -> LiveChats {
-    LiveChats::of(
-        runtime
-            .steps()
-            .into_iter()
-            .filter(|step| runtime.caps(*step).is_some()),
-    )
+    LiveChats::of(runtime.live_steps())
 }
 
 /// What the loop does with a [`RunServed`] that is not a plain reply (blueprint D181): the
 /// runtime's event channel carries only `Attach`.
 ///
-/// **T6 stub**: the chat binding is T7's, so a promotion is answered `promote_step: promotion
-/// needs the chat runtime` at the request's address, after the engine's writes and the
-/// `Orch(Promoted)` reply.
+/// A promotion's engine writes are done and `Orch(Promoted)` has answered the request, so the chat
+/// runtime binds a session to the promoted step (MOD-4 plan D165). Its task answers the same
+/// address with `ChatAccepted` and every frame after it; a refusal is answered here, once.
 async fn on_run_served(
     served: RunServed,
-    _runtime: &mut AgentRuntime,
-    _backend: &Backend,
+    runtime: &mut AgentRuntime,
+    backend: &Backend,
     tx: &mpsc::UnboundedSender<ReplyEnvelope>,
 ) {
     match served {
-        RunServed::Attach { addr, .. } => {
-            let _ = tx.send(ReplyEnvelope {
-                seq: addr.seq,
-                origin: addr.origin,
-                reply: StoreReply::Failed {
-                    request: "promote_step",
-                    message: PROMOTION_NEEDS_CHAT.to_owned(),
-                },
-            });
+        RunServed::Attach { addr, promoted } => {
+            match runtime
+                .attach_promoted(backend, tx, addr.clone(), *promoted)
+                .await
+            {
+                Served::Start { step_id, task } => runtime.attach(step_id, tokio::spawn(task)),
+                Served::Reply(reply) => {
+                    let _ = tx.send(ReplyEnvelope {
+                        seq: addr.seq,
+                        origin: addr.origin,
+                        reply,
+                    });
+                }
+                Served::Deferred => {}
+            }
         }
         other @ (RunServed::Reply(_) | RunServed::Deferred) => {
             debug_assert!(false, "the run runtime's event channel carries only Attach");
