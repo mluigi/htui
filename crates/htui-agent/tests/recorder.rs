@@ -3314,3 +3314,133 @@ async fn pump_reports_a_session_that_closed_without_done() {
         "what did arrive is still recorded"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// MOD-4 plan D164: a recorder that continues a step's log
+// ---------------------------------------------------------------------------------------------
+
+/// ANA-5 criterion 18's persistence half: a promoted step's handoff is recorded as a `follow_up`
+/// at the next turn of the **same** log, never as a second `prompt`, and the step's
+/// `prompt_digest` is the original prompt's before and after.
+#[tokio::test]
+async fn a_handoff_is_a_follow_up_at_the_next_turn_not_a_second_prompt() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+    recorder
+        .record_prompt("implement the item", json!([]), at())
+        .await
+        .expect("the prompt row must land");
+    recorder
+        .record(chunk("done, with tests", "m1"))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        })))
+        .await
+        .expect("recording must land");
+    let before = recorder.finish().await.expect("close");
+    let digest = before
+        .prompt_digest
+        .clone()
+        .expect("the original prompt has a digest");
+    let digest_before = step_digest(&store, &chat).await;
+    assert_eq!(digest_before.as_deref(), Some(digest.as_str()));
+
+    let tail = rows(&store, chat.step_id).await;
+    let last_seq = tail
+        .iter()
+        .map(|row| row.seq)
+        .max()
+        .expect("a non-empty log");
+    let last_turn = tail
+        .iter()
+        .map(|row| row.turn)
+        .max()
+        .expect("a non-empty log");
+    let calls_before = store.usage_calls().len();
+
+    let mut recorder = Recorder::continuing(&store, &scrubber, chat.step_id, false, None, &tail);
+    recorder
+        .record_follow_up("the handoff: continue from the accepted plan", at())
+        .await
+        .expect("the handoff row must land");
+    recorder
+        .record(chunk("continuing", "m2"))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(env(DriverEvent::Usage(UsageEvent {
+            input_tokens: Some(3),
+            ..UsageEvent::default()
+        })))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        })))
+        .await
+        .expect("recording must land");
+    recorder.finish().await.expect("close");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        (0..i32::try_from(log.len()).expect("the log is short")).collect::<Vec<_>>(),
+        "one gapless log across both recorders"
+    );
+    let prompts: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::Prompt)
+        .collect();
+    assert_eq!(prompts.len(), 1, "exactly one prompt row, before and after");
+    assert_eq!(prompts[0].seq, 0, "and it is still seq 0");
+
+    let follow_ups: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::FollowUp)
+        .collect();
+    assert_eq!(follow_ups.len(), 1, "the handoff is one follow_up row");
+    assert_eq!(
+        follow_ups[0].seq,
+        last_seq + 1,
+        "right after the log's last row"
+    );
+    assert_eq!(follow_ups[0].turn, last_turn + 1, "at the next turn");
+    assert_eq!(
+        text_of(follow_ups[0]),
+        "the handoff: continue from the accepted plan"
+    );
+
+    assert_eq!(
+        step_digest(&store, &chat).await,
+        digest_before,
+        "run_step.prompt_digest is unchanged"
+    );
+    let continued = &store.usage_calls()[calls_before..];
+    assert!(
+        !continued.is_empty(),
+        "the continuation wrote run_step.usage"
+    );
+    assert!(
+        continued.iter().all(|call| call.prompt_digest.is_none()),
+        "and never offered a digest with it"
+    );
+}
+
+/// `run_step.prompt_digest` of the chat's step, read through `ReadStore::run_steps`.
+async fn step_digest(store: &SpyStore, chat: &ChatRunSpec) -> Option<String> {
+    store
+        .run_steps(chat.run_id)
+        .await
+        .expect("reading the steps must not fail")
+        .into_iter()
+        .find(|step| step.id == chat.step_id)
+        .expect("the chat step is there")
+        .prompt_digest
+}
