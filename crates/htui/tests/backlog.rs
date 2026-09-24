@@ -5,13 +5,28 @@
 //! size the whole snapshot suite is pinned to (plan risk row).
 #![cfg(feature = "testkit")]
 
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
 use htui::agent_worker::AgentRuntime;
 use htui::app::Action;
+use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
 use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
+use htui_agent::conformance::{Script, ScriptEvent};
+use htui_agent::event::{DoneEvent, DriverEvent, StopReason};
+use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
-use htui_core::model::WorkspaceSummary;
-use htui_core::store::MemStore;
+use htui_core::fixtures::{demo_at, ids};
+use htui_core::model::{
+    Agent, AgentBox, AgentId, Billing, DocumentId, ItemId, NewDocument, RunStep, SnapshotPhase,
+    Transport, WorkspaceSummary,
+};
+use htui_core::store::{MemStore, WriteStore as _};
+use htui_orch::Clock;
+use htui_orch::fake::{FakeIsolator, FakeVerifier};
+use htui_store::Backend;
+use serde_json::json;
 
 /// The workspace of the demo fixture with this slug.
 ///
@@ -252,4 +267,236 @@ async fn a_scope_change_clears_the_list_and_the_detail() {
         frame.contains("Chapter 12 parity"),
         "the new scope was re-queried"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Runs pane driving a run (MOD-4 plan D166-D173, blueprint §9.6, §9.7).
+// ---------------------------------------------------------------------------------------------
+
+/// The one instant the engine writes in these cases, so a run's timestamps are byte-stable.
+#[derive(Debug)]
+struct Fixed;
+
+impl Clock for Fixed {
+    fn now(&self) -> DateTime<Utc> {
+        demo_at(23, 9)
+    }
+}
+
+/// D203's author: every step writes one document of its phase's `output_kind`.
+#[derive(Debug)]
+struct Author;
+
+impl StepAuthor for Author {
+    fn document(&self, item: ItemId, step: &RunStep, phase: &SnapshotPhase) -> Option<NewDocument> {
+        Some(NewDocument {
+            id: DocumentId::new(),
+            item_id: item,
+            kind: phase.output_kind.clone(),
+            title: format!("{} of attempt {}", phase.output_kind, step.attempt),
+            body: "What the step found.\n\nThree sources agree; one does not.".to_owned(),
+            produced_by_step_id: Some(step.id),
+            created_by: ids::USER,
+            created_at: demo_at(23, 9),
+        })
+    }
+}
+
+/// Blueprint F-O: the demo with its own agents disabled and one scripted `acp` row ready on the
+/// demo box, so a walk's candidate chain names exactly it.
+async fn seeded_store() -> MemStore {
+    let store = MemStore::demo();
+    for summary in store.agents().await.expect("the fixture's agents") {
+        let mut row = summary.agent;
+        row.enabled = false;
+        store.upsert_agent(&row).await.expect("the row is disabled");
+    }
+    let agent = AgentId::new();
+    store
+        .upsert_agent(&Agent {
+            id: agent,
+            name: "scripted".to_owned(),
+            transport: Transport::Acp,
+            billing: Billing::Subscription,
+            models: Vec::new(),
+            default_model: Some("sonnet".to_owned()),
+            launch: json!({ "command": "unused", "args": [] }),
+            settings: json!({}),
+            enabled: true,
+            created_at: demo_at(0, 0),
+            updated_at: demo_at(0, 0),
+        })
+        .await
+        .expect("the scripted row lands");
+    store
+        .upsert_agent_box(&AgentBox {
+            agent_id: agent,
+            box_id: ids::BOX,
+            enabled: true,
+            version: Some("0.0.0-fake".to_owned()),
+            path: None,
+            probed_at: Some(demo_at(0, 0)),
+            quota: None,
+            quota_at: None,
+            updated_at: demo_at(0, 0),
+            probe: Some(json!({ "status": "ready", "source": "probe" })),
+        })
+        .await
+        .expect("the agent_box row lands");
+    store
+}
+
+/// A settled Backlog tab over `store`, scoped to `Platform`, with a run runtime whose sessions
+/// each play one `done` turn from `adapter`.
+async fn driving(store: MemStore, adapter: &FakeAdapter) -> Harness {
+    let mut factory = DriverFactory::new();
+    factory.register("acp", Box::new(adapter.clone()));
+    let runtime = RunRuntime::with_parts(
+        Arc::new(FakeIsolator::new()),
+        Arc::new(FakeVerifier::new()),
+        factory,
+    )
+    .with_clock(Arc::new(Fixed))
+    .with_author(Arc::new(Author));
+    let mut harness = Harness::over(store)
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_run_runtime(runtime);
+    harness.drive().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive().await;
+    harness
+}
+
+/// One `done` turn: the session the research step's walk runs.
+fn one_turn() -> Script {
+    Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+        stop_reason: StopReason::EndTurn,
+    }))])
+}
+
+/// htui `ANA-2` on the Runs pane, its run started with `R` and parked at `research`.
+async fn parked() -> Harness {
+    let adapter = FakeAdapter::new();
+    let mut harness = driving(seeded_store().await, &adapter).await;
+    for _ in 0..TO_ANA_2 {
+        harness.key("j");
+        harness.drive().await;
+    }
+    sub_tab(&mut harness, 1);
+    adapter.load(one_turn());
+    harness.key("R");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("awaiting") && frame.contains("research"),
+        "`R` started a run that parked at `research`:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None, "and nothing failed");
+    harness
+}
+
+/// Types `text`, a space as `space`.
+fn type_text(harness: &mut Harness, text: &str) {
+    for c in text.chars() {
+        if c == ' ' {
+            harness.key("space");
+        } else {
+            harness.key(&c.to_string());
+        }
+    }
+}
+
+/// D168, D201: `x` on a parked step opens a note that takes every letter, including the ones the
+/// list moves on.
+#[tokio::test]
+async fn x_note_letters_do_not_move_the_list() {
+    let mut harness = parked().await;
+    harness.key("x");
+    type_text(&mut harness, "jkgGlh[]q1");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(frame.contains("┌ ANA-2"), "the list did not move:\n{frame}");
+    assert!(
+        frame.contains("jkgGlh[]q1"),
+        "every letter is in the note, and the Runs pane is still the one shown:\n{frame}"
+    );
+    assert!(!harness.app().should_quit, "`q` was typed, not obeyed");
+}
+
+#[tokio::test]
+async fn the_reject_note_renders_under_the_parked_run() {
+    let mut harness = parked().await;
+    harness.key("x");
+    type_text(&mut harness, "needs work");
+    harness.drive().await;
+    insta::assert_snapshot!("runs_reject_note", harness.render());
+}
+
+/// D173: `o` on the parked step opens the document it produced, over the pane, read-only.
+#[tokio::test]
+async fn o_shows_the_step_s_document_read_only() {
+    let mut harness = parked().await;
+    harness.key("o");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("What the step found."),
+        "the body is shown:\n{frame}"
+    );
+    insta::assert_snapshot!("runs_artifact", frame);
+
+    harness.key("esc");
+    assert!(harness.render().contains("research"), "`Esc` is back on the list");
+}
+
+/// D167: `C` on a `done` item with no live run counts what the close-out writes, then asks for
+/// the item's key typed back.
+#[tokio::test]
+async fn the_close_out_counts_then_asks_for_the_key() {
+    let adapter = FakeAdapter::new();
+    let mut harness = driving(MemStore::demo(), &adapter).await;
+    sub_tab(&mut harness, 1);
+    assert!(harness.render().contains("┌ ANA-1"), "the arrival row is htui `ANA-1`");
+    harness.key("C");
+    harness.drive().await;
+    let warn = harness.render();
+    assert!(warn.contains("close ANA-1"), "the counts line:\n{warn}");
+    insta::assert_snapshot!("runs_closeout_warn", warn);
+
+    harness.key("y");
+    type_text(&mut harness, "ANA");
+    harness.drive().await;
+    let typed = harness.render();
+    assert!(typed.contains("type ANA-1 to close it: ANA"), "{typed}");
+    assert!(typed.contains("┌ ANA-1"), "`A`, `N` and `A` are typed, not bound");
+    insta::assert_snapshot!("runs_closeout_typed", typed);
+    assert_eq!(harness.app().status, None);
+}
+
+/// D168, D182: a refused key shows the engine guard's own sentence and sends nothing: with no run
+/// runtime here, an `Orch` request would put `no run runtime in this build` on the status line.
+#[tokio::test]
+async fn the_runs_pane_greys_a_key_with_the_guard_s_sentence() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, 1);
+
+    let verdicts = run_worker::actions(
+        &Backend::memory(MemStore::demo()),
+        ids::HTUI_FEAT_1,
+        &LiveChats::default(),
+    )
+    .await
+    .expect("the verdicts read");
+    let sentence = verdicts.steps[&ids::STEP_PRD]
+        .approve
+        .clone()
+        .expect_err("a `done` step cannot be approved");
+
+    harness.key("a");
+    harness.drive().await;
+    assert_eq!(harness.app().status.as_deref(), Some(sentence.as_str()));
 }
