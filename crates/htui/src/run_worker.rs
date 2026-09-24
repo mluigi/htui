@@ -1,8 +1,23 @@
 //! The orchestrator, driven from the store worker loop (MOD-4 milestone 6, plan D153).
 //!
 //! `htui-orch` never names `htui-store` (ANA-2 invariant 10), so everything that joins the two
-//! lives here: the graph source over a [`Backend`], and — as the milestone lands — the runtime
-//! that serves the orchestrator's requests on its own tasks beside `AgentRuntime`.
+//! lives here:
+//!
+//! - [`BackendGraphs`], the graph source over a [`Backend`] (D155);
+//! - the request and reply shapes the views speak — [`OrchRequest`], [`OrchReply`], [`RunFrame`],
+//!   [`ItemActions`] — and [`actions`], every verdict from the engine's own admission functions
+//!   (D182, D184);
+//! - [`RunRuntime`], which lives in the store worker's `select!` beside `AgentRuntime` and runs
+//!   every command on a task of its own that answers its request once, at the request's `seq`
+//!   (`R-NF-3`, R-41). One [`RunLocks`] entry per run serialises a run's commands, walks and
+//!   recoveries (R-27, D157); `CancelRun` and `PromoteStep` preempt a live walk through its
+//!   cancellation token and give its lease and guards back (D187, D188); the sweep runs at start,
+//!   at every `Online` and on a ticker, fenced by the same locks (D158, D189, D190); every task is
+//!   supervised, so a panicked walk is adopted by the next sweep (R-12) and a refused claim is
+//!   retried once a walk rests (M5 D84). Progress reaches the Runs pane as `RunStream` frames at
+//!   each subscriber's own `seq` (D172, blueprint §0a point 3).
+//!
+//! Off the server every command is refused with MOD-25's sentence and nothing is spawned (D174).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
