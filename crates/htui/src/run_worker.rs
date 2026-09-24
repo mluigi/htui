@@ -23,13 +23,11 @@ pub struct BackendGraphs(pub Backend);
 
 impl GraphSource for BackendGraphs {
     async fn resolve_graph(&self, item: ItemId) -> StoreResult<Option<ResolvedGraph>> {
-        let _ = item;
-        todo!()
+        self.0.resolve_graph(item).await
     }
 
     async fn phase_agents(&self, phase: PhaseId) -> StoreResult<Vec<PhaseAgent>> {
-        let _ = phase;
-        todo!()
+        self.0.phase_agents(phase).await
     }
 
     async fn prompt_template(
@@ -38,18 +36,21 @@ impl GraphSource for BackendGraphs {
         name: &str,
         version: Option<i32>,
     ) -> StoreResult<Option<PromptTemplate>> {
-        let _ = (project, name, version);
-        todo!()
+        self.0.prompt_template(project, name, version).await
     }
 
     async fn agent(&self, id: AgentId) -> StoreResult<Option<Agent>> {
-        let _ = id;
-        todo!()
+        Ok(self
+            .0
+            .agents()
+            .await?
+            .into_iter()
+            .map(|summary| summary.agent)
+            .find(|agent| agent.id == id))
     }
 
     async fn agent_boxes(&self, box_id: BoxId) -> StoreResult<Vec<AgentBox>> {
-        let _ = box_id;
-        todo!()
+        self.0.agent_boxes(box_id).await
     }
 }
 
