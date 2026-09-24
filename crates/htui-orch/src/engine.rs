@@ -27,11 +27,12 @@ use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposur
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
-    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, EventKind, Gate, GateOutcome,
-    GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId,
-    Project, ProjectSettings, PromptScope, Repo, RepoId, Run, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase, SnapshotTemplate,
-    Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, DocumentId, EventKind, Gate,
+    GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
+    NewRunStep, NoteId, Project, ProjectSettings, PromptScope, Repo, RepoId, Run, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase,
+    SnapshotTemplate, Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId,
+    VerifyOutcome,
 };
 use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoRoot, RootSource};
 use htui_core::prompt::{
@@ -1421,8 +1422,24 @@ where
     /// the item's status inside that transaction, so a run started since is refused there with
     /// nothing written. The commit rows already exist, so none are passed.
     async fn close_out(&self, item: ItemId) -> Result<CommandOutcome, EngineError> {
-        let _ = item;
-        todo!("MOD-4 plan D167: close-out")
+        let reads = self.close_out_reads(item).await?;
+        crate::command::close_out_enabled(&reads.item, &reads.runs)?;
+        let repos = self.parts.store.repos(reads.item.project_id).await?;
+        let summary = closeout::summary(
+            &reads.item,
+            &reads.summaries,
+            &reads.commits,
+            &repos,
+            DocumentId::new(),
+            self.parts.user,
+            self.now(),
+        );
+        let written = self.parts.store.close_out(item, summary, &[]).await?;
+        Ok(CommandOutcome::ClosedOut {
+            item,
+            summary: written.id,
+            version: written.version,
+        })
     }
 
     /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).
