@@ -24,13 +24,15 @@ use htui_core::model::{
     RunId, RunMode, RunStatus, RunStep, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
     VerifyOutcome,
 };
-use htui_core::model::{Claim, NewItem, OverlapRule, Quota, QuotaSource, Spend};
+use htui_core::model::{
+    Claim, NewItem, OverlapRule, Quota, QuotaSource, RunKind, Scope, Spend, WorkspaceId,
+};
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
+use crate::command::{Command, CommandOutcome, EngineError, GateAnswer, OpeningPath, Rest};
 use crate::engine::{Adopted, Next, Resume};
 use crate::fake::{FakeIsolator, FakeOrchestrator, FakeVerifier, ScriptedStep, TestClock};
 use crate::isolate::Clock as _;
@@ -423,6 +425,15 @@ pub const CASES: &[&str] = &[
     "a_topology_mismatch_parks_a_running_run",
     // R-28 (plan D179): a cancel meets a live lease elsewhere and writes nothing.
     "cancel_meets_a_live_lease_and_writes_nothing",
+    // Criterion 17, first half (`:2131-2134`, plan D163): a promotion keeps the step's row and
+    // writes no chat run.
+    "promote_keeps_the_step_and_writes_no_chat_run",
+    // `:1563`: a failed step under a parked run is promotable.
+    "promote_a_failed_step_of_a_parked_run",
+    // `:1563`: a finished run has nothing to promote, and nothing is written.
+    "promote_refuses_a_terminal_run",
+    // Plan D163's engine half: a step a dropped walk left `running` is parked by the promotion.
+    "promote_moves_a_dropped_running_step_to_awaiting",
 ];
 
 /// Run one case by name.
@@ -587,6 +598,16 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         }
         "cancel_meets_a_live_lease_and_writes_nothing" => {
             Box::pin(cancel_meets_a_live_lease_and_writes_nothing(harness))
+        }
+        "promote_keeps_the_step_and_writes_no_chat_run" => {
+            Box::pin(promote_keeps_the_step_and_writes_no_chat_run(harness))
+        }
+        "promote_a_failed_step_of_a_parked_run" => {
+            Box::pin(promote_a_failed_step_of_a_parked_run(harness))
+        }
+        "promote_refuses_a_terminal_run" => Box::pin(promote_refuses_a_terminal_run(harness)),
+        "promote_moves_a_dropped_running_step_to_awaiting" => {
+            Box::pin(promote_moves_a_dropped_running_step_to_awaiting(harness))
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -4550,6 +4571,232 @@ async fn cancel_meets_a_live_lease_and_writes_nothing<H: CaseHarness>(harness: &
     assert_eq!(harness_cleanups(&other), 0, "nothing was cleaned up");
 }
 
+// -- MOD-4 milestone 6: the maintainer drives it (plan D161, D163, D166, D167) -------------------
+
+/// The HTUI project's active runs, graph and chat alike: a chat run is created `running`, so a
+/// promotion that minted one would show here.
+async fn active_runs_of<O: Orchestrate>(orch: &O) -> usize {
+    orch.store()
+        .active_runs(&Scope {
+            workspace_id: WorkspaceId::new(),
+            project_ids: vec![ids::PROJECT_HTUI],
+        })
+        .await
+        .expect("MemStore never fails a read")
+}
+
+/// `PromoteStep` on `step`, unwrapped to its answer.
+///
+/// # Panics
+/// When the promotion is refused, which every caller of this helper expects not to be.
+async fn promote<O: Orchestrate>(
+    orch: &O,
+    run: RunId,
+    step: StepId,
+) -> (StepId, Rest, crate::command::Opening) {
+    let outcome = orch
+        .dispatch(Command::PromoteStep {
+            run,
+            step,
+            chat_open: false,
+        })
+        .await
+        .expect("the step is promotable");
+    let CommandOutcome::Promoted {
+        step,
+        rest,
+        opening,
+    } = outcome
+    else {
+        panic!("`PromoteStep` answers `Promoted`, not {outcome:?}");
+    };
+    (step, rest, *opening)
+}
+
+/// ANA-2 §12 criterion 17, first half (`docs/ANA-2.md:2131-2134`, MOD-4 plan D163): `prd`
+/// parked at its gate is promoted. The step keeps its id and its `prompt_digest`, gains
+/// `promoted_at`, and waits `awaiting_approval` under a parked run and item. No chat run is
+/// minted, and the opening is a handoff — the fake's `claude` row does not resume (blueprint
+/// D192) — in the step's own tree.
+async fn promote_keeps_the_step_and_writes_no_chat_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let repo = primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    assert_eq!(prd.status, StepStatus::AwaitingApproval);
+    let (runs_before, active_before) = (
+        orch.store()
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len(),
+        active_runs_of(&orch).await,
+    );
+
+    let (step, rest, opening) = promote(&orch, run, prd.id).await;
+    assert_eq!(step, prd.id, "the same `run_step` (criterion 17)");
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0))
+    );
+    let after = step_at(&orch, run, 0, 1).await;
+    assert_eq!(after.id, prd.id);
+    assert_eq!(after.status, StepStatus::AwaitingApproval);
+    assert!(after.promoted_at.is_some(), "`promote_step` stamped it");
+    assert_eq!(
+        after.prompt_digest, prd.prompt_digest,
+        "the step's own prompt is never rewritten"
+    );
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+    let runs = orch
+        .store()
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(runs.len(), runs_before);
+    assert!(runs.iter().all(|row| row.kind == RunKind::Graph));
+    assert_eq!(
+        active_runs_of(&orch).await,
+        active_before,
+        "zero `run(kind = 'chat')` rows: no run was minted"
+    );
+    assert_eq!(
+        run_of(&orch, run).await.lease_expires_at,
+        Some(orch.clock().now()),
+        "a parked run holds no lease"
+    );
+    assert!(
+        notes_of(&orch, ids::HTUI_FEAT_3).await.contains(&format!(
+            "step {} (`prd` attempt 1) promoted to chat",
+            prd.id
+        )),
+        "the promotion is a note"
+    );
+
+    let tree = orch
+        .store()
+        .step_trees(prd.id)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|tree| tree.repo_id == repo)
+        .expect("stage 2 recorded the primary's tree");
+    assert_eq!(
+        (
+            opening.agent_id,
+            opening.agent_name.as_str(),
+            opening.model.as_deref(),
+            opening.phase.as_str()
+        ),
+        (ids::AGENT_CLAUDE, "claude", Some("sonnet"), "prd")
+    );
+    assert_eq!(opening.cwd, std::path::PathBuf::from(&tree.path));
+    assert!(opening.extra_dirs.is_empty());
+    let OpeningPath::Handoff { text, digest } = &opening.path else {
+        panic!("the fake agent row does not resume: {:?}", opening.path);
+    };
+    assert!(!text.is_empty() && !digest.is_empty());
+}
+
+/// `docs/ANA-2.md:1563`: a `failed` step under a parked run is promotable. Here it is a step the
+/// sweep failed `interrupted` and parked out of budget (plan D92, D94); the promotion moves it
+/// `failed -> awaiting_approval`, and the handoff says why it stopped.
+async fn promote_a_failed_step_of_a_parked_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| phase.retry_limit = 0).await;
+    let stalled = orch.stall_after_done("prd", 1, None, false);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let other = orch.restarted();
+    other.sweep().await.expect("the sweep adopts");
+    let prd = step_at(&other, run, 0, 1).await;
+    assert_eq!(prd.status, StepStatus::Failed);
+    assert_eq!(
+        run_of(&other, run).await.status,
+        RunStatus::AwaitingApproval
+    );
+
+    let (step, rest, opening) = promote(&other, run, prd.id).await;
+    assert_eq!(step, prd.id);
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    let after = step_at(&other, run, 0, 1).await;
+    assert_eq!(after.status, StepStatus::AwaitingApproval);
+    assert!(after.promoted_at.is_some());
+    let OpeningPath::Handoff { text, .. } = &opening.path else {
+        panic!("a handoff: {:?}", opening.path);
+    };
+    assert!(
+        text.contains("interrupted"),
+        "the failure reason is the step's gate note: {text}"
+    );
+}
+
+/// `docs/ANA-2.md:1563`: a finished run has no step to chat with. The refusal names the run, and
+/// nothing is written.
+async fn promote_refuses_a_terminal_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    set_input_kinds(&orch, ids::HTUI_FEAT_3, 0, &["spec"]).await;
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Failed);
+    let prd = step_at(&orch, run, 0, 1).await;
+    assert_eq!(prd.status, StepStatus::Failed);
+    let before = rows_of(&orch, run).await;
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+
+    let refused = orch
+        .dispatch(Command::PromoteStep {
+            run,
+            step: prd.id,
+            chat_open: false,
+        })
+        .await
+        .expect_err("a finished run");
+    assert!(
+        matches!(
+            refused,
+            EngineError::RunStatus {
+                status: RunStatus::Failed,
+                ..
+            }
+        ),
+        "{refused}"
+    );
+    assert_eq!(rows_of(&orch, run).await, before, "nothing was written");
+    assert_eq!(notes_of(&orch, ids::HTUI_FEAT_3).await, notes);
+}
+
+/// MOD-4 plan D163's engine half: a walk dropped mid-session (the worker's preemption, a crash
+/// here) leaves `prd` `running` under this process's own live lease. The promotion renews that
+/// lease, parks the step `running -> awaiting_approval`, and stamps it.
+async fn promote_moves_a_dropped_running_step_to_awaiting<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    let stalled = orch.stall_after_done("prd", 1, None, true);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    assert_eq!(step_at(&orch, run, 0, 1).await.status, StepStatus::Running);
+
+    let prd = step_at(&orch, run, 0, 1).await;
+    let (step, rest, _) = promote(&orch, run, prd.id).await;
+    assert_eq!(step, prd.id);
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    let after = step_at(&orch, run, 0, 1).await;
+    assert_eq!(after.status, StepStatus::AwaitingApproval);
+    assert!(after.promoted_at.is_some());
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -4574,7 +4821,7 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            56,
+            60,
             "18 + 5 + 13 + 6 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \

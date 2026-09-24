@@ -538,11 +538,13 @@ where
                 attempt,
                 winner,
             } => self.select_fanout(run, position, attempt, winner).await,
-            Command::PromoteStep { .. }
-            | Command::AcceptArtifact { .. }
-            | Command::Unblock { .. }
-            | Command::CloseOut { .. } => {
-                todo!("MOD-4 milestone 6: promote, accept, unblock and close-out")
+            Command::PromoteStep {
+                run,
+                step,
+                chat_open,
+            } => self.promote(run, step, chat_open).await,
+            Command::AcceptArtifact { .. } | Command::Unblock { .. } | Command::CloseOut { .. } => {
+                todo!("MOD-4 milestone 6: accept, unblock and close-out")
             }
         }
     }
@@ -1050,6 +1052,25 @@ where
             .map(|step| step.id)
             .filter(|id| *id != winner)
             .collect()
+    }
+
+    /// §4.8's `promote to chat` (MOD-4 plan D163, blueprint D191, D192).
+    ///
+    /// The guard ([`crate::command::promote_enabled`]) over the rows read, the lease, then in
+    /// its window: a `running` step (reached only after the worker preempted its walk) moves to
+    /// `awaiting_approval`, `promote_step` stamps `promoted_at` and parks the run and the item in
+    /// one transaction, and a note says so. The lease is given back — a parked run holds none
+    /// (plan D87) — and the answer says how the chat opens ([`Self::opening`]). No
+    /// `run(kind = 'chat')` row is written, and the step's `prompt_digest` and `trim_record` are
+    /// never touched.
+    async fn promote(
+        &self,
+        run: RunId,
+        step: StepId,
+        chat_open: bool,
+    ) -> Result<CommandOutcome, EngineError> {
+        let _ = (run, step, chat_open);
+        todo!("MOD-4 plan D163: promote")
     }
 
     /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).
@@ -10251,6 +10272,75 @@ mod tests {
             .into_iter()
             .find(|step| step.run_id == ids::RUN_1 && step.position == 0)
             .expect("RUN_1 has a step at position 0")
+    }
+
+    /// MOD-4 plan D163 (ANA-2 `:1208-1213`): the promoted step's chat opens in the step's own
+    /// trees — the primary repo's as `cwd`, wherever it sits in the scope, and every other one as
+    /// an extra directory.
+    #[tokio::test]
+    async fn the_opening_uses_the_step_s_own_trees_as_cwd() {
+        let harness = Harness::new().await;
+        let primary = harness.add_primary_repo().await;
+        let docs = RepoId::new();
+        harness
+            .orch
+            .store
+            .create_repo(NewRepo {
+                id: docs,
+                project_id: ids::PROJECT_HTUI,
+                name: "docs".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            })
+            .await
+            .expect("the demo project has no `docs` repo yet");
+        harness.free_feat_3().await;
+        let CommandOutcome::Started { run, .. } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: Some(vec![docs, primary]),
+            })
+            .await
+            .expect("an explicit scope of the project's repos")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        let prd = harness.orch.steps(run).await.remove(0);
+        let trees = harness
+            .orch
+            .store
+            .step_trees(prd.id)
+            .await
+            .expect("MemStore never fails a read");
+        let path_of = |repo: RepoId| {
+            std::path::PathBuf::from(
+                &trees
+                    .iter()
+                    .find(|tree| tree.repo_id == repo)
+                    .expect("stage 2 recorded a tree per repo of the scope")
+                    .path,
+            )
+        };
+
+        let CommandOutcome::Promoted { opening, .. } = harness
+            .dispatch(Command::PromoteStep {
+                run,
+                step: prd.id,
+                chat_open: false,
+            })
+            .await
+            .expect("a parked step")
+        else {
+            panic!("`PromoteStep` answers `Promoted`");
+        };
+        assert_eq!(
+            opening.cwd,
+            path_of(primary),
+            "the primary repo's tree, though it is second in the scope"
+        );
+        assert_eq!(opening.extra_dirs, vec![path_of(docs)]);
     }
 
     /// MOD-4 plan D180 (R-31): `walk_resumed`'s unpark is its first compare-and-set. A run another
