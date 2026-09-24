@@ -43,8 +43,8 @@ use crate::app::{Action, Ctx, Handled};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
-use crate::ui::text_field::{FieldOutcome, TextField};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
+use crate::ui::text_field::{FieldOutcome, TextField};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// What an action key says while the verdicts it reads have not arrived.
@@ -383,7 +383,11 @@ impl RunsTab {
                 Some(item) => close_out_key(item, stage, key, ctx),
                 None => Mode::Browse,
             },
-            Mode::Artifact { id, doc, mut scroll } => {
+            Mode::Artifact {
+                id,
+                doc,
+                mut scroll,
+            } => {
                 let code = match key.code {
                     KeyCode::Char('j') => KeyCode::Char('J'),
                     KeyCode::Char('k') => KeyCode::Char('K'),
@@ -570,8 +574,7 @@ fn render_artifact(
     scroll: Scroll,
     theme: &Theme,
 ) {
-    let [body, hint] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    let [body, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     let Some(doc) = doc else {
         message(frame, body, "Opening the document\u{2026}", theme);
         return;
@@ -579,9 +582,7 @@ fn render_artifact(
     let lines: Vec<Line<'static>> = body_lines(doc)
         .into_iter()
         .enumerate()
-        .map(|(at, line)| {
-            Line::styled(line, if at == 0 { theme.title } else { theme.base })
-        })
+        .map(|(at, line)| Line::styled(line, if at == 0 { theme.title } else { theme.base }))
         .collect();
     frame.render_widget(
         Paragraph::new(lines)
@@ -590,7 +591,10 @@ fn render_artifact(
         body,
     );
     frame.render_widget(
-        Paragraph::new(Line::styled("read-only · j/k scroll · Esc close", theme.dim)),
+        Paragraph::new(Line::styled(
+            "read-only · j/k scroll · Esc close",
+            theme.dim,
+        )),
         hint,
     );
 }
@@ -784,7 +788,12 @@ fn header_lines(theme: &Theme) -> [Line<'static>; 2] {
             ("box", title),
             ("started", title),
         ]),
-        run_grid([("mode", title), ("", title), ("", title), ("finished", title)]),
+        run_grid([
+            ("mode", title),
+            ("", title),
+            ("", title),
+            ("finished", title),
+        ]),
     ]
 }
 
@@ -1188,13 +1197,13 @@ mod tests {
     use crate::app::{Action, Emit, TopBarState};
     use crate::keymap::Keymap;
     use crate::run_worker::{RunActions, RunFrame, StepActions};
-    use htui_orch::Rest;
     use crate::store_worker::Origin;
     use chrono::TimeDelta;
     use crossterm::event::KeyModifiers;
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{GateOutcome, ProjectRef, Scope, WorkspaceId};
     use htui_core::store::{MemStore, ReadStore};
+    use htui_orch::Rest;
     use serde_json::json;
 
     /// Everything a `Ctx` borrows, kept alive for the length of a test.
@@ -1447,7 +1456,11 @@ mod tests {
                 .position(|line| line.contains(phase))
                 .unwrap_or_else(|| panic!("the `{phase}` step is listed"));
             let next = lines.get(at + 1).map_or("", String::as_str);
-            let gate = next.chars().skip(INDENT).take(GATE_WIDTH).collect::<String>();
+            let gate = next
+                .chars()
+                .skip(INDENT)
+                .take(GATE_WIDTH)
+                .collect::<String>();
             assert!(
                 next.chars().take(INDENT).all(|c| c == ' ') && !gate.trim().is_empty(),
                 "`{phase}`'s second line starts with its gate at the status column: {next:?}"
@@ -1467,7 +1480,10 @@ mod tests {
 
     /// The text of a line, spans joined.
     fn text(line: &Line<'_>) -> String {
-        line.spans.iter().map(|span| span.content.as_ref()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     /// A 40-character agent name.
@@ -1553,11 +1569,7 @@ mod tests {
                     fit(&step.phase_name, PHASE_WIDTH).trim(),
                     "the phase starts at column 19"
                 );
-                assert_eq!(
-                    cell(31, 37),
-                    usage_cell(step.usage.as_ref()),
-                    "usage at 31"
-                );
+                assert_eq!(cell(31, 37), usage_cell(step.usage.as_ref()), "usage at 31");
                 assert_eq!(cell(38, 43), duration_cell(step), "duration at 38");
                 assert_eq!(chars[0], if on_cursor { '\u{25b8}' } else { ' ' });
 
@@ -1606,7 +1618,11 @@ mod tests {
             .iter()
             .map(|step| {
                 let [first, _] = step_lines(step, &steps, false, &theme);
-                text(&first).chars().skip(2).take(SLOT_WIDTH).collect::<String>()
+                text(&first)
+                    .chars()
+                    .skip(2)
+                    .take(SLOT_WIDTH)
+                    .collect::<String>()
             })
             .collect();
         assert_eq!(slots, ["2.1/0", "2.1/1", "2.1/j"]);
@@ -1836,7 +1852,11 @@ mod tests {
         assert_eq!(fit("abcd", 4), "abcd");
         assert_eq!(fit("abcde", 4), "abc\u{2026}");
         assert_eq!(fit("a\nb", 3), "a b");
-        assert_eq!(fit("\u{2014}", 2), "\u{2014} ", "counted in chars, not bytes");
+        assert_eq!(
+            fit("\u{2014}", 2),
+            "\u{2014} ",
+            "counted in chars, not bytes"
+        );
         assert_eq!(fit("abc", 0), "");
     }
 
@@ -2135,7 +2155,10 @@ mod tests {
             matches!(emitted.as_slice(), [Action::Error(sentence)] if sentence == NOT_ON_BOX),
             "{emitted:?}"
         );
-        assert!(!pane.captures_input(), "a document this box lacks closes the view");
+        assert!(
+            !pane.captures_input(),
+            "a document this box lacks closes the view"
+        );
 
         assert_refused(key(KeyCode::Char('o')), "open").await;
     }
@@ -2325,7 +2348,10 @@ mod tests {
         let run = pane.runs[0].id;
         pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
         assert!(shell.emit.is_empty(), "`c` only asks");
-        assert_eq!(footer(&pane), ["cancel this run?", "y cancel it · n keep it"]);
+        assert_eq!(
+            footer(&pane),
+            ["cancel this run?", "y cancel it · n keep it"]
+        );
 
         for swallowed in ['q', 'j', 'x', '1'] {
             assert_eq!(
@@ -2333,10 +2359,16 @@ mod tests {
                 Handled::Consumed
             );
         }
-        assert!(shell.emit.is_empty() && pane.captures_input(), "anything else is swallowed");
+        assert!(
+            shell.emit.is_empty() && pane.captures_input(),
+            "anything else is swallowed"
+        );
 
         pane.on_key(key(KeyCode::Char('n')), &mut shell.ctx());
-        assert!(!pane.captures_input() && shell.emit.is_empty(), "`n` keeps the run");
+        assert!(
+            !pane.captures_input() && shell.emit.is_empty(),
+            "`n` keeps the run"
+        );
 
         pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
         pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
@@ -2374,7 +2406,10 @@ mod tests {
             "`C` asks for the counts first: {emitted:?}"
         );
         assert!(pane.captures_input(), "and waits for them");
-        assert_eq!(footer(&pane), ["counting what the close-out writes\u{2026}"]);
+        assert_eq!(
+            footer(&pane),
+            ["counting what the close-out writes\u{2026}"]
+        );
         pane.on_reply(
             &StoreReply::Orch(OrchReply::CloseOutPreview(Box::new(preview()))),
             &mut shell.ctx(),
@@ -2402,7 +2437,10 @@ mod tests {
             footer(&pane),
             ["type FEAT-1 to close it:", "Enter close · Esc cancel"]
         );
-        assert!(shell.emit.is_empty(), "nothing is written before the key is typed");
+        assert!(
+            shell.emit.is_empty(),
+            "nothing is written before the key is typed"
+        );
 
         // `Esc`/`n` leave at the first two stages.
         let mut pane = warned(&shell).await;
@@ -2468,7 +2506,10 @@ mod tests {
             }]
         );
         for swallowed in [KeyCode::Esc, KeyCode::Char('y'), KeyCode::Enter] {
-            assert_eq!(pane.on_key(key(swallowed), &mut shell.ctx()), Handled::Consumed);
+            assert_eq!(
+                pane.on_key(key(swallowed), &mut shell.ctx()),
+                Handled::Consumed
+            );
         }
         assert!(shell.emit.is_empty() && pane.captures_input(), "in flight");
 
@@ -2616,7 +2657,10 @@ mod tests {
             },
             &mut shell.ctx(),
         );
-        assert!(is_one_re_read(&requests(shell.emit.take()), ids::HTUI_FEAT_1));
+        assert!(is_one_re_read(
+            &requests(shell.emit.take()),
+            ids::HTUI_FEAT_1
+        ));
 
         for name in ORCH_NAMES {
             pane.on_reply(
@@ -2638,7 +2682,10 @@ mod tests {
             }),
             &mut shell.ctx(),
         );
-        assert!(is_one_re_read(&requests(shell.emit.take()), ids::HTUI_FEAT_1));
+        assert!(is_one_re_read(
+            &requests(shell.emit.take()),
+            ids::HTUI_FEAT_1
+        ));
 
         pane.on_reply(
             &StoreReply::Failed {
@@ -2647,7 +2694,10 @@ mod tests {
             },
             &mut shell.ctx(),
         );
-        assert!(shell.emit.is_empty(), "another read's refusal is not the pane's");
+        assert!(
+            shell.emit.is_empty(),
+            "another read's refusal is not the pane's"
+        );
     }
 
     /// A frame of `item` with this kind.
@@ -2686,8 +2736,14 @@ mod tests {
                 "{name} re-reads"
             );
         }
-        pane.on_reply(&frame(ids::HTUI_ANA_2, FrameKind::Changed), &mut shell.ctx());
-        assert!(shell.emit.is_empty(), "another item's frame is not this pane's");
+        pane.on_reply(
+            &frame(ids::HTUI_ANA_2, FrameKind::Changed),
+            &mut shell.ctx(),
+        );
+        assert!(
+            shell.emit.is_empty(),
+            "another item's frame is not this pane's"
+        );
     }
 
     #[tokio::test]

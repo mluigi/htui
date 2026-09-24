@@ -389,7 +389,11 @@ mod tests {
             );
         }
         assert_eq!(*seen.borrow(), keys, "every key reached the sub-tab");
-        assert_eq!(tab.selected, Some(first), "and the list cursor did not move");
+        assert_eq!(
+            tab.selected,
+            Some(first),
+            "and the list cursor did not move"
+        );
         assert!(emit.is_empty(), "so no detail read went out");
 
         capturing.set(false);

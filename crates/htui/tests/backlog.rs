@@ -449,7 +449,10 @@ async fn o_shows_the_step_s_document_read_only() {
     insta::assert_snapshot!("runs_artifact", frame);
 
     harness.key("esc");
-    assert!(harness.render().contains("research"), "`Esc` is back on the list");
+    assert!(
+        harness.render().contains("research"),
+        "`Esc` is back on the list"
+    );
 }
 
 /// D167: `C` on a `done` item with no live run counts what the close-out writes, then asks for
@@ -459,7 +462,10 @@ async fn the_close_out_counts_then_asks_for_the_key() {
     let adapter = FakeAdapter::new();
     let mut harness = driving(MemStore::demo(), &adapter).await;
     sub_tab(&mut harness, 1);
-    assert!(harness.render().contains("┌ ANA-1"), "the arrival row is htui `ANA-1`");
+    assert!(
+        harness.render().contains("┌ ANA-1"),
+        "the arrival row is htui `ANA-1`"
+    );
     harness.key("C");
     harness.drive().await;
     let warn = harness.render();
@@ -471,7 +477,10 @@ async fn the_close_out_counts_then_asks_for_the_key() {
     harness.drive().await;
     let typed = harness.render();
     assert!(typed.contains("type ANA-1 to close it: ANA"), "{typed}");
-    assert!(typed.contains("┌ ANA-1"), "`A`, `N` and `A` are typed, not bound");
+    assert!(
+        typed.contains("┌ ANA-1"),
+        "`A`, `N` and `A` are typed, not bound"
+    );
     insta::assert_snapshot!("runs_closeout_typed", typed);
     assert_eq!(harness.app().status, None);
 }
