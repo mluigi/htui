@@ -157,6 +157,10 @@ pub trait Orchestrate {
         slot: Option<(i32, u32)>,
         write_output: bool,
     ) -> Arc<Notify>;
+
+    /// Make stage 3 refuse `phase`'s own prompt (MOD-4 plan D162): its pinned template names a
+    /// placeholder no role has, which is ANA-5 criterion 3's literal case.
+    fn refuse_prompt(&self, phase: &str);
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -231,6 +235,10 @@ impl Orchestrate for FakeOrchestrator {
         write_output: bool,
     ) -> Arc<Notify> {
         Self::stall_after_done(self, phase, attempt, slot, write_output)
+    }
+
+    fn refuse_prompt(&self, phase: &str) {
+        Self::refuse_prompt(self, phase);
     }
 }
 
@@ -406,6 +414,15 @@ pub const CASES: &[&str] = &[
     "a_half_written_park_is_completed",
     // `:1306` and plan D88: a parked run, a live lease and this process's own are never adopted.
     "the_sweep_never_touches_a_parked_run_or_a_live_lease",
+    // MOD-4 milestone 6, ANA-5 criterion 3 (`docs/ANA-5.md:2271-2273`, plan D162) at `walk_step`:
+    // a refused prompt fails the step, blocks the item and starts no session.
+    "a_prompt_refusal_blocks_the_item_and_starts_no_session",
+    // The same at `drive_group` (blueprint D195): every candidate fails, and the item is blocked.
+    "a_prompt_refusal_in_a_fan_out_blocks_the_item",
+    // Criterion 3 (`:2090-2091`, plan D159): a `running` run whose graph moved parks on resume.
+    "a_topology_mismatch_parks_a_running_run",
+    // R-28 (plan D179): a cancel meets a live lease elsewhere and writes nothing.
+    "cancel_meets_a_live_lease_and_writes_nothing",
 ];
 
 /// Run one case by name.
@@ -559,6 +576,18 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         "the_sweep_never_touches_a_parked_run_or_a_live_lease" => Box::pin(
             the_sweep_never_touches_a_parked_run_or_a_live_lease(harness),
         ),
+        "a_prompt_refusal_blocks_the_item_and_starts_no_session" => Box::pin(
+            a_prompt_refusal_blocks_the_item_and_starts_no_session(harness),
+        ),
+        "a_prompt_refusal_in_a_fan_out_blocks_the_item" => {
+            Box::pin(a_prompt_refusal_in_a_fan_out_blocks_the_item(harness))
+        }
+        "a_topology_mismatch_parks_a_running_run" => {
+            Box::pin(a_topology_mismatch_parks_a_running_run(harness))
+        }
+        "cancel_meets_a_live_lease_and_writes_nothing" => {
+            Box::pin(cancel_meets_a_live_lease_and_writes_nothing(harness))
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1203,9 +1232,14 @@ async fn topology_mismatch_parks_on_resume<H: CaseHarness>(harness: &H) {
     assert_ne!(snapshot, live, "two digests, and they are not the same one");
     assert_eq!(
         (rest.run, rest.position),
-        (RunStatus::Running, Some(1)),
-        "the run is where it was, owing the position it owed: a mismatch is a human's decision, \
-         not the engine's"
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the run is parked where it was, owing the position it owed: a mismatch is a human's \
+         decision, not the engine's (MOD-4 plan D159)"
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval,
+        "the item follows its run to the gate"
     );
 
     let after = steps_of(&orch, run).await;
@@ -4287,6 +4321,235 @@ async fn the_sweep_never_touches_a_parked_run_or_a_live_lease<H: CaseHarness>(ha
     );
 }
 
+// -- MOD-4 milestone 6: the carried engine fixes (plan D159, D162, D179) ---------------------------
+
+/// The sentence `assemble` refuses [`crate::fake::REFUSED_TEMPLATE_BODY`] with.
+const REFUSED_PROMPT: &str = "unknown prompt placeholder: {{no_such_placeholder}}";
+
+/// ANA-5 criterion 3 (`docs/ANA-5.md:2271-2273`, MOD-4 plan D162) at `walk_step`: stage 3's
+/// assembler refuses `prd`'s own prompt. The step fails with no `gate_note`, the item is
+/// `blocked` — not `failed`: the block lands before `finish_run`, whose mirror then leaves it — the
+/// run fails with the refusal, one note says so, and no session ever started.
+async fn a_prompt_refusal_blocks_the_item_and_starts_no_session<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    orch.refuse_prompt("prd");
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    let expected = RunFailure::PromptRefused {
+        phase: "prd".to_owned(),
+        reason: REFUSED_PROMPT.to_owned(),
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.as_ref()),
+        (RunStatus::Failed, Some(0), Some(&expected))
+    );
+    let row = run_of(&orch, run).await;
+    assert_eq!(
+        row.failure.as_deref(),
+        Some("prompt refused at `prd`: unknown prompt placeholder: {{no_such_placeholder}}")
+    );
+    assert!(row.finished_at.is_some());
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Blocked,
+        "ANA-5 criterion 3: the item is blocked"
+    );
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(steps.len(), 1, "stage 3 fails the one step it reached");
+    assert_eq!(steps[0].status, StepStatus::Failed);
+    assert_eq!(
+        steps[0].gate_note, None,
+        "the reason is the run's and the note's, not a gate note"
+    );
+    assert!(steps[0].prompt_digest.is_none(), "no prompt was recorded");
+    assert!(
+        orch.store()
+            .step_events(steps[0].id)
+            .await
+            .expect("MemStore never fails a read")
+            .unwrap_or_default()
+            .is_empty(),
+        "and no session started: zero `session_event` rows"
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|body| **body == expected.to_string())
+            .count(),
+        1,
+        "one note a human reads: {notes:?}"
+    );
+    assert_eq!(
+        harness_cleanups(&orch),
+        1,
+        "plan D36: a failed run is cleaned up"
+    );
+}
+
+/// ANA-5 criterion 3 at `drive_group` (blueprint D195): the group's one prompt is refused before
+/// any candidate is live, so every candidate goes `pending -> running -> failed`, the item is
+/// `blocked`, the run fails with the refusal, and no candidate started a session.
+async fn a_prompt_refusal_in_a_fan_out_blocks_the_item<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    repoint(&orch, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "research" {
+            phase.fan_out = 2;
+        }
+    })
+    .await;
+    orch.refuse_prompt("research");
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    let expected = RunFailure::PromptRefused {
+        phase: "research".to_owned(),
+        reason: REFUSED_PROMPT.to_owned(),
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure.as_ref()),
+        (RunStatus::Failed, Some(0), Some(&expected))
+    );
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        slot_of(&steps, 0, 1),
+        [(0, StepStatus::Failed, None), (1, StepStatus::Failed, None)],
+        "both candidates failed before a token"
+    );
+    for step in &steps {
+        assert!(step.prompt_digest.is_none());
+        assert!(
+            orch.store()
+                .step_events(step.id)
+                .await
+                .expect("MemStore never fails a read")
+                .unwrap_or_default()
+                .is_empty(),
+            "no candidate started a session"
+        );
+    }
+    assert_eq!(
+        item_of(&orch, ids::HTUI_ANA_2).await.status,
+        Status::Blocked
+    );
+    assert_eq!(
+        run_of(&orch, run).await.failure.as_deref(),
+        Some(expected.to_string().as_str())
+    );
+    assert!(
+        notes_of(&orch, ids::HTUI_ANA_2)
+            .await
+            .contains(&expected.to_string()),
+        "the item's note names the refusal"
+    );
+}
+
+/// ANA-2 §12 criterion 3 (`docs/ANA-2.md:2090-2091`, MOD-4 plan D159): a run another process's
+/// sweep adopted as `Walk`, whose graph moved meanwhile, **parks** on resume — run and item
+/// `awaiting_approval` — rather than being handed back to the next sweep as a `running` run
+/// (R-36). It replaces milestone 5's engine test of the release-only answer.
+async fn a_topology_mismatch_parks_a_running_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    let stalled = orch.stall_after_done("prd", 1, None, false);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+
+    let other = orch.restarted();
+    set_input_kinds(&other, ids::HTUI_FEAT_3, 0, &["spec"]).await;
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert_eq!(
+        adopted,
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+
+    let resumed = other.resume(run).await.expect("the run is readable");
+    let Resume::TopologyChanged {
+        snapshot,
+        live,
+        rest,
+    } = resumed
+    else {
+        panic!("the live graph moved: {resumed:?}");
+    };
+    assert_ne!(snapshot, live);
+    assert_eq!(
+        rest.run,
+        RunStatus::AwaitingApproval,
+        "parked, not left running"
+    );
+    let row = run_of(&other, run).await;
+    assert_eq!(row.status, RunStatus::AwaitingApproval);
+    assert_eq!(
+        row.lease_expires_at,
+        Some(other.clock().now()),
+        "a parked run holds no lease"
+    );
+    assert_eq!(
+        item_of(&other, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+    assert!(
+        notes_of(&other, ids::HTUI_FEAT_3)
+            .await
+            .iter()
+            .any(|body| body.contains("topology mismatch")),
+        "the human reads why"
+    );
+    assert_eq!(
+        other.sweep().await.expect("the sweep runs"),
+        [],
+        "R-36: no sweep adopts the parked run again"
+    );
+}
+
+/// R-28 (MOD-4 plan D179): `CancelRun` takes the run's lease after its guard and before its first
+/// write, so a live lease another process holds refuses it with `LeaseHeld` and nothing moves.
+async fn cancel_meets_a_live_lease_and_writes_nothing<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    let other = orch.restarted();
+    assert!(
+        orch.store()
+            .take_lease(
+                run,
+                ids::BOX,
+                orch.owner(),
+                orch.clock().now(),
+                other.clock().now() + TimeDelta::days(1)
+            )
+            .await
+            .expect("MemStore takes the lease"),
+        "the first process takes its released lease back, for a day"
+    );
+    let before = rows_of(&orch, run).await;
+
+    let refused = other
+        .dispatch(Command::CancelRun { run })
+        .await
+        .expect_err("a live lease elsewhere");
+    assert!(
+        matches!(refused, EngineError::LeaseHeld { run: held } if held == run),
+        "{refused}"
+    );
+    assert_eq!(
+        rows_of(&orch, run).await,
+        before,
+        "every step and the run are unchanged"
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+    assert_eq!(harness_cleanups(&other), 0, "nothing was cleaned up");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -4311,7 +4574,7 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            52,
+            56,
             "18 + 5 + 13 + 6 + 10: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \

@@ -13,7 +13,7 @@
 //! candidate chain are both empty on `MemStore::demo()` — the fake carries an explicit per-phase candidates map as
 //! its documented stand-in (plan D20, blueprint A-1).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -44,6 +44,11 @@ use crate::verify::{Verifier, VerifierFuture, VerifyReport, VerifyRequest};
 
 /// The root every synthetic tree path hangs from. Nothing ever creates it.
 const FAKE_TREE_ROOT: &str = "/fake/trees";
+
+/// The body a [`FakeOrchestrator::refuse_prompt`] template carries: a placeholder no role has,
+/// which `assemble` refuses as `TemplateError::UnknownPlaceholder` (ANA-5 criterion 3's literal
+/// case, MOD-4 plan D162).
+pub const REFUSED_TEMPLATE_BODY: &str = "{{no_such_placeholder}}";
 
 /// A reconcile stall: the 1-based call it takes, the signal that call raises, and the resume it
 /// waits for — `None` for a call that never answers (blueprint F-A, plan D145).
@@ -888,6 +893,8 @@ pub struct FakeGraphSource<'a> {
     fallback: Vec<(AgentId, String)>,
     /// Learned from `resolve_graph`, so `phase_agents` can answer by name.
     names: Mutex<BTreeMap<PhaseId, String>>,
+    /// Template names whose body answers [`REFUSED_TEMPLATE_BODY`] (MOD-4 plan D162).
+    refused: BTreeSet<String>,
 }
 
 impl<'a> FakeGraphSource<'a> {
@@ -899,6 +906,7 @@ impl<'a> FakeGraphSource<'a> {
             candidates: BTreeMap::new(),
             fallback: vec![(ids::AGENT_CLAUDE, STAND_IN_MODEL.to_owned())],
             names: Mutex::new(BTreeMap::new()),
+            refused: BTreeSet::new(),
         }
     }
 
@@ -976,7 +984,13 @@ impl GraphSource for FakeGraphSource<'_> {
         name: &str,
         version: Option<i32>,
     ) -> Result<Option<PromptTemplate>> {
-        GraphSource::prompt_template(self.store, project, name, version).await
+        let template = GraphSource::prompt_template(self.store, project, name, version).await?;
+        Ok(template.map(|mut template| {
+            if self.refused.contains(name) {
+                REFUSED_TEMPLATE_BODY.clone_into(&mut template.body);
+            }
+            template
+        }))
     }
 
     async fn agent(&self, id: AgentId) -> Result<Option<Agent>> {
@@ -1212,6 +1226,9 @@ pub struct FakeOrchestrator {
     /// each with whether the document is written first and the signal raised. Never carried by
     /// [`restarted`](Self::restarted).
     stalls: Mutex<BTreeMap<ScriptKey, (bool, Arc<Notify>)>>,
+    /// MOD-4 plan D162: the phases whose pinned template stage 3 refuses. Carried by
+    /// [`restarted`](Self::restarted): it is the graph's, not the process's.
+    refused_prompts: Mutex<BTreeSet<String>>,
     default_script: ScriptedStep,
     caps: DriverCaps,
     box_id: BoxId,
@@ -1244,6 +1261,7 @@ impl FakeOrchestrator {
             candidates: Mutex::new(BTreeMap::new()),
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
+            refused_prompts: Mutex::new(BTreeSet::new()),
             default_script: ScriptedStep::done_with_output("scripted output"),
             caps: FakeDriver::full_caps(),
             box_id: ids::BOX,
@@ -1287,6 +1305,12 @@ impl FakeOrchestrator {
             candidates: Mutex::new(candidates),
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
+            refused_prompts: Mutex::new(
+                self.refused_prompts
+                    .lock()
+                    .expect("no panic holds the fake orchestrator's lock")
+                    .clone(),
+            ),
             default_script: self.default_script.clone(),
             caps: self.caps,
             box_id: self.box_id,
@@ -1353,6 +1377,21 @@ impl FakeOrchestrator {
     /// Give a phase no candidate at all, for the rung-4 refusal.
     pub fn without_candidates(&self, phase: &str) {
         self.with_candidates(phase, Vec::new());
+    }
+
+    /// Make stage 3 refuse `phase`'s own prompt (MOD-4 plan D162, ANA-5 criterion 3): the
+    /// graph source answers the phase's pinned template with [`REFUSED_TEMPLATE_BODY`], which
+    /// `assemble` refuses as an unknown placeholder. Every seeded phase pins the template named
+    /// after itself, so the template is found by the phase's name. Its version is unchanged, so
+    /// resolution still pins it.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    pub fn refuse_prompt(&self, phase: &str) {
+        self.refused_prompts
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert(phase.to_owned());
     }
 
     /// Make one session's [`after_done`](Self::after_done) **never return** — a process killed
@@ -1422,6 +1461,11 @@ impl FakeOrchestrator {
             .clone();
         let mut source = FakeGraphSource::new(&self.store);
         source.candidates = registered;
+        source.refused = self
+            .refused_prompts
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .clone();
         source
     }
 

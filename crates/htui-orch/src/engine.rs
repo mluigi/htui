@@ -2146,12 +2146,18 @@ where
     /// (`Fan`, `Select`), is left where it is.
     async fn walk_resumed(&self, run: RunId) -> Result<Rest, EngineError> {
         let row = self.run(run).await?;
+        self.walk_resumed_from(&row).await
+    }
+
+    /// [`Self::walk_resumed`] over the run row it read.
+    async fn walk_resumed_from(&self, row: &Run) -> Result<Rest, EngineError> {
+        let run = row.id;
         if row.status == RunStatus::AwaitingApproval {
-            let snapshot = Self::snapshot_of(&row)?;
+            let snapshot = Self::snapshot_of(row)?;
             let steps = self.parts.store.run_steps(run).await?;
             // Blueprint D196: the one predicate `Unblock`'s third case reads too.
             if resumable_park(&cursor(&snapshot, &steps)) {
-                self.unpark(&row, self.now()).await?;
+                self.unpark(row, self.now()).await?;
                 if let Some(winner) = recover::frontier(&snapshot, &steps)
                     && let Some(done) = steps.iter().find(|step| step.id == winner)
                 {
@@ -9664,38 +9670,6 @@ mod tests {
         }
     }
 
-    /// Plan D150 (R-34): the graph moved under a `running` run, so `resume` walks nothing and
-    /// gives back the lease it took whatever the run's status. The same process's next sweep then
-    /// adopts the run, which plan D88 would keep it off while the lease named this process.
-    #[tokio::test]
-    async fn a_topology_mismatch_on_a_running_run_leaves_it_adoptable_by_the_same_process() {
-        let (harness, run) = parked_run_with_a_moved_graph().await;
-        let now = harness.orch.clock.now();
-        assert!(
-            harness
-                .orch
-                .store
-                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
-                .await
-                .expect("MemStore moves the run"),
-            "the run is `running` again, as a crash between an unpark and a walk leaves it"
-        );
-
-        let resumed = harness.resume(run).await.expect("the run is readable");
-        assert!(
-            matches!(resumed, Resume::TopologyChanged { .. }),
-            "{resumed:?}"
-        );
-
-        harness_engine!(harness.orch, engine);
-        let swept = engine.sweep().await.expect("the sweep runs");
-        assert_eq!(
-            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
-            [run],
-            "the lease was given back, so this process's sweep adopts the run"
-        );
-    }
-
     /// `FEAT-3` started and parked at `prd`, then `prd`'s `input_kinds` edited, so the live
     /// graph's topology digest no longer matches the run's snapshot (ANA-2 §12 criterion 3).
     async fn parked_run_with_a_moved_graph() -> (Harness, htui_core::model::RunId) {
@@ -10144,6 +10118,169 @@ mod tests {
             .into_iter()
             .find(|step| step.run_id == ids::RUN_1 && step.position == 0)
             .expect("RUN_1 has a step at position 0")
+    }
+
+    /// MOD-4 plan D180 (R-31): `walk_resumed`'s unpark is its first compare-and-set. A run another
+    /// command unparked between the read and the write stops the walk with `StaleWrite`: nothing
+    /// is merged again and nothing is walked twice.
+    #[tokio::test]
+    async fn walk_resumed_stops_on_a_stale_unpark() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        let now = harness.orch.clock.now();
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(prd, GateOutcome::Approved, None, now)
+                .await
+                .expect("MemStore takes the answer"),
+            "a crash between the answer and the unpark: a resumable park"
+        );
+        let stale = harness.orch.run(run).await;
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move"),
+            "another command unparked the run first"
+        );
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .walk_resumed_from(&stale)
+            .await
+            .expect_err("the unpark found the run moved");
+        let EngineError::StaleWrite { row, from, to, .. } = &refused else {
+            panic!("a stale unpark is a `StaleWrite`, not {refused}");
+        };
+        assert_eq!(
+            (row.as_str(), from.as_str(), to.as_str()),
+            ("the run", "awaiting_approval", "running")
+        );
+        assert!(
+            harness.orch.isolator.reconciles().is_empty(),
+            "nothing was merged"
+        );
+        assert_eq!(harness.orch.steps(run).await.len(), 1, "nothing was walked");
+    }
+
+    /// Plan D132's retry path (MOD-4 plan D180): `RetryStep` superseded the parked step and the
+    /// process died before its unpark. The cursor asks for the next attempt, which is a
+    /// resumable park, so `resume` unparks the run and walks attempt 2 to its gate.
+    #[tokio::test]
+    async fn a_crash_between_a_retry_and_the_unpark_is_resumed() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(prd, GateOutcome::Retried, None, harness.orch.clock.now())
+                .await
+                .expect("MemStore takes the answer"),
+            "the retry's first write landed and its unpark did not"
+        );
+
+        let resumed = harness.resume(run).await.expect("the walk resumes");
+        assert_eq!(
+            resumed,
+            Resume::Walked(crate::command::Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(0),
+                failure: None,
+            })
+        );
+        let steps = harness.orch.steps(run).await;
+        assert!(
+            steps.iter().any(|step| step.position == 0
+                && step.attempt == 2
+                && step.status == StepStatus::AwaitingApproval),
+            "attempt 2 ran and parked: {steps:?}"
+        );
+        assert!(
+            harness.orch.isolator.reconciles().is_empty(),
+            "a superseded step is not merged"
+        );
+    }
+
+    /// Plan D132's group-retry path (MOD-4 plan D180): `retire_slot` retired the parked group and
+    /// the process died before the unpark. A slot retired whole asks for the next attempt, which
+    /// is a resumable park, so `resume` unparks the run and drives the group again.
+    #[tokio::test]
+    async fn a_crash_between_a_group_retry_and_the_unpark_is_resumed() {
+        let harness = Harness::new().await;
+        let (run, [first, second]) = parked_group(&harness).await;
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let steps = harness.orch.steps(run).await;
+        harness_engine!(harness.orch, engine);
+        crate::gate::retire_slot(
+            &engine.gate_context(&row, &snapshot),
+            &steps,
+            0,
+            harness.orch.clock.now(),
+        )
+        .await
+        .expect("the retry's first write landed and its unpark did not");
+
+        let resumed = harness.resume(run).await.expect("the walk resumes");
+        assert_eq!(
+            resumed,
+            Resume::Walked(crate::command::Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(0),
+                failure: None,
+            }),
+            "attempt 2's group was driven and parked for a human again"
+        );
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.attempt == 2 && step.fanout_index >= 0)
+                .count(),
+            2,
+            "the whole group was admitted again: {steps:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .filter(|step| step.id == first || step.id == second)
+                .all(|step| step.attempt == 1),
+        );
+    }
+
+    /// Plan D132's selection path (MOD-4 plan D180): `select_fanout` settled the slot and the
+    /// process died before the unpark. The next position is uncreated, a resumable park, so
+    /// `resume` unparks, merges the winner with its sibling once, and walks on to `plan`.
+    #[tokio::test]
+    async fn a_crash_between_a_selection_and_the_unpark_is_resumed() {
+        let harness = Harness::new().await;
+        let (run, [first, second]) = parked_group(&harness).await;
+        harness
+            .orch
+            .store
+            .select_fanout(run, 0, 1, first, Some("picked by a human".to_owned()))
+            .await
+            .expect("the selection's first write landed and its unpark did not");
+
+        let resumed = harness.resume(run).await.expect("the walk resumes");
+        assert_eq!(
+            resumed,
+            Resume::Walked(crate::command::Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(1),
+                failure: None,
+            })
+        );
+        assert_eq!(
+            harness.orch.isolator.reconciles(),
+            [(first, vec![second])],
+            "the winner is merged once, with its sibling"
+        );
     }
 
     /// A [`super::RunFence`] holding exactly the runs it names, as the worker's `RunLocks` would
