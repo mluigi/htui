@@ -40,7 +40,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
 
 use crate::app::{Action, Ctx, Handled};
-use crate::run_worker::{Enabled, ItemActions, OrchReply, OrchRequest};
+use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::text_field::{FieldOutcome, TextField};
@@ -167,6 +167,15 @@ enum Entry {
     },
 }
 
+/// An [`Entry`] by identity rather than position, so a re-read can find it again (D198).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKey {
+    /// A step.
+    Step(StepId),
+    /// A run with no step.
+    Run(RunId),
+}
+
 /// The pane's modes. Anything but [`Mode::Browse`] captures the keyboard (blueprint D201).
 #[derive(Debug, Default)]
 enum Mode {
@@ -289,11 +298,6 @@ impl RunsTab {
         self.selected = Some(current.saturating_add_signed(delta).min(last));
     }
 
-    /// Puts the cursor on the first entry, or takes it away when there is none.
-    fn reselect(&mut self) {
-        self.selected = (!self.entries().is_empty()).then_some(0);
-    }
-
     /// First run to draw: the scrolled-to one, except that the cursor is never scrolled off the
     /// top - the offset is derived here rather than being a second thing `J` has to keep right.
     fn first_visible(&self) -> usize {
@@ -302,6 +306,60 @@ impl RunsTab {
             .and_then(|run| self.runs.iter().position(|summary| summary.id == run.id))
             .unwrap_or(usize::MAX);
         self.scroll.skip().min(cursor_run)
+    }
+
+    /// What an entry is across a re-read: its run's index moves, its ids do not (D198).
+    fn entry_key(&self, entry: Entry) -> Option<EntryKey> {
+        match entry {
+            Entry::Step { step, .. } => Some(EntryKey::Step(step)),
+            Entry::Run { run } => self.runs.get(run).map(|run| EntryKey::Run(run.id)),
+        }
+    }
+
+    /// A `Runs` reply: the rows, the cursor kept on its entry (D198), the subscription for this
+    /// item when it has none yet (D199), and the verdicts over the new rows.
+    fn on_runs(&mut self, runs: &[RunSummary], ctx: &Ctx<'_>) {
+        let kept = self.entry().and_then(|entry| self.entry_key(entry));
+        self.runs = runs.to_vec();
+        let entries = self.entries();
+        self.selected = kept
+            .and_then(|kept| {
+                entries
+                    .iter()
+                    .position(|entry| self.entry_key(*entry) == Some(kept))
+            })
+            .or_else(|| (!entries.is_empty()).then_some(0));
+        let Some(item) = self.item else {
+            return;
+        };
+        if self.subscribed != Some(item) {
+            ctx.request(StoreRequest::RunStream { item });
+            self.subscribed = Some(item);
+        }
+        ctx.request(StoreRequest::RunActions(item));
+    }
+
+    /// Asks for this item's runs again.
+    fn re_read(&self, ctx: &Ctx<'_>) {
+        if let Some(item) = self.item {
+            ctx.request(StoreRequest::Runs(item));
+        }
+    }
+
+    /// The close-out's transitions on an `Orch` answer (D167): the counts move `Counting` to
+    /// `Warn`, and `ClosedOut` ends an in-flight close-out.
+    fn on_orch(&mut self, reply: &OrchReply) {
+        match (reply, &self.mode) {
+            (OrchReply::CloseOutPreview(preview), Mode::CloseOut(CloseOutStage::Counting)) => {
+                self.mode = Mode::CloseOut(CloseOutStage::Warn((**preview).clone()));
+            }
+            (OrchReply::Done(outcome), Mode::CloseOut(CloseOutStage::InFlight))
+                if matches!(**outcome, CommandOutcome::ClosedOut { .. }) =>
+            {
+                self.mode = Mode::Browse;
+            }
+            _ => {}
+        }
     }
 
     /// A key while the pane captures (blueprint D201): a `CONTROL` chord passes, so `ctrl-c`
@@ -480,6 +538,20 @@ impl RunsTab {
             _ => return Handled::Pass,
         }
         Handled::Consumed
+    }
+}
+
+/// Whether a frame of the pane's item means its rows changed: every kind but the subscription's
+/// acknowledgement (D172). Written out, so a new kind has to be placed deliberately.
+const fn invalidates(kind: &FrameKind) -> bool {
+    match kind {
+        FrameKind::Subscribed => false,
+        FrameKind::Started
+        | FrameKind::SessionDone { .. }
+        | FrameKind::Rested(_)
+        | FrameKind::Changed
+        | FrameKind::Adopted
+        | FrameKind::Error(_) => true,
     }
 }
 
@@ -975,42 +1047,45 @@ impl DetailTab for RunsTab {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// The pane's replies (blueprint §9.5): its rows, its verdicts, the stream's invalidations,
+    /// the answers to what it sent, and the document it opened.
+    ///
+    /// Every `Orch` answer and every refusal of an orchestrator request re-reads the runs, so a
+    /// compare-and-set miss renders the rows as they are (D171); so does every frame of the item's
+    /// stream but the acknowledgement (D172).
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
-            StoreReply::Runs(runs) => {
-                self.runs = runs.clone();
-                self.scroll.reset();
-                self.reselect();
-            }
+            StoreReply::Runs(runs) => self.on_runs(runs, ctx),
             StoreReply::RunActions(actions) if Some(actions.item) == self.item => {
                 self.actions = Some((**actions).clone());
             }
-            StoreReply::Orch(OrchReply::CloseOutPreview(preview))
-                if matches!(self.mode, Mode::CloseOut(CloseOutStage::Counting)) =>
+            StoreReply::RunStream(frame)
+                if Some(frame.item) == self.item && invalidates(&frame.kind) =>
             {
-                self.mode = Mode::CloseOut(CloseOutStage::Warn((**preview).clone()));
+                self.re_read(ctx);
             }
-            StoreReply::Orch(OrchReply::Done(outcome))
-                if matches!(**outcome, CommandOutcome::ClosedOut { .. })
-                    && matches!(self.mode, Mode::CloseOut(CloseOutStage::InFlight)) =>
-            {
-                self.mode = Mode::Browse;
+            StoreReply::Orch(reply) => {
+                self.re_read(ctx);
+                self.on_orch(reply);
             }
-            StoreReply::Failed { request, .. }
-                if (*request == CLOSE_OUT_PREVIEW
-                    && matches!(self.mode, Mode::CloseOut(CloseOutStage::Counting)))
-                    || (*request == CLOSE_OUT
-                        && matches!(self.mode, Mode::CloseOut(CloseOutStage::InFlight))) =>
-            {
-                // The refusal is on the status line already (`app/update.rs`).
-                self.mode = Mode::Browse;
+            StoreReply::Failed { request, .. } if ORCH_NAMES.contains(request) => {
+                self.re_read(ctx);
+                let ends = match &self.mode {
+                    Mode::CloseOut(CloseOutStage::Counting) => *request == CLOSE_OUT_PREVIEW,
+                    Mode::CloseOut(CloseOutStage::InFlight) => *request == CLOSE_OUT,
+                    _ => false,
+                };
+                if ends {
+                    // The refusal is on the status line already (`app/update.rs`).
+                    self.mode = Mode::Browse;
+                }
             }
-            StoreReply::Document(doc) => self.on_document(doc.as_ref().as_ref(), ctx),
             StoreReply::Failed { request, .. }
                 if *request == DOCUMENT && matches!(self.mode, Mode::Artifact { .. }) =>
             {
                 self.mode = Mode::Browse;
             }
+            StoreReply::Document(doc) => self.on_document(doc.as_ref().as_ref(), ctx),
             _ => {}
         }
     }
@@ -1112,7 +1187,7 @@ mod tests {
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
     use crate::keymap::Keymap;
-    use crate::run_worker::{FrameKind, RunActions, RunFrame, StepActions};
+    use crate::run_worker::{RunActions, RunFrame, StepActions};
     use htui_orch::Rest;
     use crate::store_worker::Origin;
     use chrono::TimeDelta;
@@ -1172,12 +1247,14 @@ mod tests {
             .expect("the memory store never fails")
     }
 
-    /// A Runs pane holding the fixture's `FEAT-1` runs: one run, four steps.
+    /// A Runs pane holding the fixture's `FEAT-1` runs: one run, four steps. What the reply made
+    /// it ask for (its subscription and its verdicts) is drained.
     async fn pane(shell: &Shell) -> RunsTab {
         let runs = feat_1_runs().await;
         let mut pane = RunsTab::new();
         pane.on_item_change(Some(ids::HTUI_FEAT_1));
         pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        let _ = shell.emit.take();
         pane
     }
 
@@ -2302,6 +2379,10 @@ mod tests {
             &StoreReply::Orch(OrchReply::CloseOutPreview(Box::new(preview()))),
             &mut shell.ctx(),
         );
+        assert!(
+            is_one_re_read(&requests(shell.emit.take()), ids::HTUI_FEAT_1),
+            "an `Orch` answer re-reads the runs (D171)"
+        );
         pane
     }
 
@@ -2537,7 +2618,7 @@ mod tests {
         );
         assert!(is_one_re_read(&requests(shell.emit.take()), ids::HTUI_FEAT_1));
 
-        for name in crate::run_worker::ORCH_NAMES {
+        for name in ORCH_NAMES {
             pane.on_reply(
                 &StoreReply::Failed {
                     request: name,
