@@ -508,7 +508,7 @@ is therefore not an argument for a server either way.** The arguments for one ar
 | Agent credentials | Wherever the agent keeps them | Never, by `R-AGT-9` (`docs/REQUIREMENTS.md:166-173`) | A manager **may not** distribute these |
 | Project secrets | `SecretProvider` (`R-SEC-1`, `REQUIREMENTS.md:252-253`) | Not built (no `SecretProvider` in `crates/`) | `R-SEC-2`: into the agent's env only |
 | Planned personas | `~/.config/htui/agents.d/` (MOD-26, `HANDOFF.md:141`) | Per-box files | Works against `R-ID-3`; could be registry rows instead |
-| Container images and digests, child-box profiles | Not yet (MOD-D, §5.3) | - | New config either way |
+| Container images and digests, child-box profiles | Not yet (MOD-41, §5.3) | - | New config either way |
 | The `htui` build itself | Per box | Manual | C5 |
 
 **Reading.** Everything durable a manager would distribute is already in Postgres, so under O3
@@ -570,7 +570,7 @@ and its offline cache, so `R-STO-3/4/6` and `R-TUI-8` are untouched. Responsibil
    (GitLab `PatchTrace`, Buildkite ordered chunks).
 7. **Live relay and permission relay.** Transient deltas and `permission_request` go worker to
    server to subscribed TUIs, never persisted; the answer is written as a row and pushed to the
-   worker. This is MOD-B with push instead of polling; it still needs `pump`'s parked-request fix
+   worker. This is MOD-39 with push instead of polling; it still needs `pump`'s parked-request fix
    (`record.rs:1684-1713`). The TUI subscribes to the server for live views only; durable reads stay
    on its DSN.
 8. **Versions.** The server holds the one schema pin (`R-STO-5`) and accepts protocol N-1 from
@@ -588,7 +588,7 @@ unaffected except for live views.
 Store surface. The worker needs a remote store. If that is a full `WriteStore` (66 methods,
 `crates/htui-core/src/store/traits.rs:195-1058`), it is the third implementation MOD-25 removed
 (`HANDOFF.md:155-158`, `:165-166`). It must instead be the narrow verb set the worker actually calls (claim,
-lease, adopt, step status, events, usage, finish), which is a constraint on MOD-A now (§8).
+lease, adopt, step status, events, usage, finish), which is a constraint on MOD-38 now (§8).
 
 **O5b - full server, Postgres private.** As O5a, and the TUI too talks only to the server. Adds:
 Postgres never leaves a private network; one pool total. Costs: an RPC mirror of `ReadStore` (16),
@@ -608,8 +608,8 @@ item's "htui as just the interface" claim that the requirements resist most.
 | Connections | ~8 per process, ~12 processes at PG16 defaults | 1 server pool + TUIs | 1 pool |
 | Security, DB exposure | Full-DB DSN on every box; 5432 reachable from every box | Box-scoped revocable key on workers; 5432 reachable from TUIs and server only | Postgres private |
 | Headless credential (`R-STO-1`) | DSN on a headless host: hard blocker (§9.1) | Moved, not solved: a worker key in a file, but box-scoped and revocable | As O5a, plus TUI tokens |
-| Permission relay | Rows plus poll or `NOTIFY` (MOD-B) | Push through server; same `pump` fix | Same |
-| Live streaming | Flush bursts; `NOTIFY` deltas < 8000 B, lossy (MOD-F) | Native relay | Native relay |
+| Permission relay | Rows plus poll or `NOTIFY` (MOD-39) | Push through server; same `pump` fix | Same |
+| Live streaming | Flush bursts; `NOTIFY` deltas < 8000 B, lossy (MOD-43) | Native relay | Native relay |
 | Worker liveness | Lease per run; box heartbeat to add | Connection plus lease | Same |
 | Config drift, version skew | DB config shared; off-DB surface unmanaged; schema lockstep (C5) | Manifest + watch, targeted secrets, target build, N-1 protocol | Same, TUIs included |
 | Ops cost, SPOF | Postgres only | Adds one daemon; worker dispatch stops while it is down, TUIs continue | Adds a daemon in series with Postgres for everything |
@@ -627,7 +627,7 @@ item's "htui as just the interface" claim that the requirements resist most.
    reach**: a revocable box-scoped credential instead of the database, no inbound 5432, N-1 version
    skew, a real live channel, and pushing the off-database config of §6.2. For one developer whose
    boxes share a trusted network (`R-USR-1`) and whose containers are child boxes driven by the
-   host's worker (so a container never holds the DSN, §5.3 and MOD-D in §8), those gains are small next to a new
+   host's worker (so a container never holds the DSN, §5.3 and MOD-41 in §8), those gains are small next to a new
    daemon, a protocol and an enrolment CA.
 4. **O5b buys little over O5a** (Postgres fully private, one pool) at the price of the RPC mirror,
    a second offline hop and the most requirement friction. Rejected.
@@ -649,7 +649,7 @@ that workers dial out to: it enrols boxes and mints their ids, holds the only wo
 dispatch, targeted secrets, a versioned config manifest, the target build, the live and permission
 relay, and the schema pin. It holds no durable state, so `R-ID-3` stands. Phase 2 is opened when the
 first of these holds: a worker on a box outside the user's trusted network or behind NAT, team use
-(`R-USR-3`), more worker processes than the Postgres connection budget allows, or MOD-F's `NOTIFY`
+(`R-USR-3`), more worker processes than the Postgres connection budget allows, or MOD-43's `NOTIFY`
 deltas proving inadequate. Phase 1 is built so phase 2 is additive: the worker talks to a narrow
 store surface, never a full `WriteStore` mirror. A full server in front of the TUI (O5b) is rejected:
 it adds a second offline hop, an RPC mirror of the whole store and the most requirement friction for
@@ -687,11 +687,11 @@ Requirement amendments to put to the maintainer:
 
 ## 8. Phasing
 
-Placeholder IDs. Real `MOD-N` IDs are minted when the items are opened. Order is dependency order.
+IDs minted 2026-09-24 when the items were opened (placeholders G, A-F, H, I became MOD-37..45 in that order). Order is dependency order.
 
 **Phase 1 - no server (O3 + O2).**
 
-1. **MOD-G - Multi-writer store hardening.** `R-ID-3`, `R-HIS-1`, ANA-2 inv. 1.
+1. **MOD-37 - Multi-writer store hardening.** `R-ID-3`, `R-HIS-1`, ANA-2 inv. 1.
    - C1: fence step writes (`append_events`, `set_step_usage`, `finish_step`) on the run's
      `lease_owner`. C8: error on a short insert outside replay.
    - C2: lease times from `clock_timestamp()` in SQL. C3: ordered quota write. C6: `updated_at` CAS
@@ -699,8 +699,8 @@ Placeholder IDs. Real `MOD-N` IDs are minted when the items are opened. Order is
    - C4: box keyed on the `box.toml` id, not the hostname; a box heartbeat bumping `last_seen_at`.
    - C5: a headless connect never migrates and reports "schema is newer" as a worker state;
      `htui_version` compared against a target in `app_setting`.
-   - Depends on nothing; MOD-A depends on it.
-2. **MOD-A - Headless worker (`htui worker`).** `R-ORCH-12`, `R-ID-2` (amended), `R-STO-1`,
+   - Depends on nothing; MOD-38 depends on it.
+2. **MOD-38 - Headless worker (`htui worker`).** `R-ORCH-12`, `R-ID-2` (amended), `R-STO-1`,
    `R-NF-2`, `R-NF-3`.
    - A ratatui-free worker entry point hosting MOD-4 M6's run supervision: lease refresh, sweep, one
      engine task per claimed run, claims only `target_box_id = self`.
@@ -710,19 +710,19 @@ Placeholder IDs. Real `MOD-N` IDs are minted when the items are opened. Order is
      credential). Maintainer decision.
    - A per-worker pool size setting (default below 8) for the connection budget (§6.1).
    - Includes the ask to MOD-4 M6: `run_worker` in a library both binaries link.
-   - Depends on MOD-G, MOD-4 (M6) and MOD-7.
-3. **MOD-B - Permission and control relay through Postgres.** `R-AGT-1`, `R-HIS-1`, `R-TUI-6`.
+   - Depends on MOD-37, MOD-4 (M6) and MOD-7.
+3. **MOD-39 - Permission and control relay through Postgres.** `R-AGT-1`, `R-HIS-1`, `R-TUI-6`.
    - Replaces `pump`'s silent failure on a parked ACP request: the worker records
      `permission_request`, waits on a `permission_answer` row, then answers the session. Cancel and
      follow-up become command rows. Also fixes the engine's in-process path.
    - Answers from another box go through the relay, never `take_lease` (C2).
-   - Depends on MOD-4 (M6). MOD-A consumes it. Its row protocol is the payload O5a later pushes.
-4. **MOD-C - Remote dispatch in the TUI.** `R-ORCH-11`, `R-ORCH-12`, `R-TUI-1`, `R-NF-3`.
+   - Depends on MOD-4 (M6). MOD-38 consumes it. Its row protocol is the payload O5a later pushes.
+4. **MOD-40 - Remote dispatch in the TUI.** `R-ORCH-11`, `R-ORCH-12`, `R-TUI-1`, `R-NF-3`.
    - Target box on run start and in auto mode; a non-local target stays `queued` until its worker
      claims it (`docs/ANA-2.md:2165`); the Runs view follows `session_event` by `seq` with
      `LISTEN`/`NOTIFY` hints and a poll backstop; worker liveness from the box heartbeat.
-   - Depends on MOD-A and MOD-B, and on MOD-12 for auto mode.
-5. **MOD-D - Container execution environment.** `R-BOX-1..3`, `R-AGT-5`, `R-AGT-6`, `R-AGT-9`,
+   - Depends on MOD-38 and MOD-39, and on MOD-12 for auto mode.
+5. **MOD-41 - Container execution environment.** `R-BOX-1..3`, `R-AGT-5`, `R-AGT-6`, `R-AGT-9`,
    `R-SEC-2`, `R-MCP-1`, `R-NF-1`, `R-NF-2` (amended).
    - A child `box` of kind `container` (parent, image and digest, mounts, limits, egress policy),
      with its own id and a hostname distinct from its parent's (C4).
@@ -731,23 +731,23 @@ Placeholder IDs. Real `MOD-N` IDs are minted when the items are opened. Order is
      `TransportBuilder`; cancel as a signal inside the container, kill-tree as container removal;
      secrets via exec env after checking `docker inspect`; agent credentials on a named volume htui
      never reads. The container never holds the DSN.
-   - Linux and macOS first; Windows deferred to MOD-16. Depends on MOD-7; needs MOD-A to survive TUI
+   - Linux and macOS first; Windows deferred to MOD-16. Depends on MOD-7; needs MOD-38 to survive TUI
      exit.
-6. **MOD-E - Remote box provisioning over SSH.** `R-BOX-1`, `R-BOX-4`, `R-AGT-9`, `R-STO-1`.
+6. **MOD-42 - Remote box provisioning over SSH.** `R-BOX-1`, `R-BOX-4`, `R-AGT-9`, `R-STO-1`.
    - System `ssh` to a host; install the matching `htui` build and a user service running
      `htui worker`; set the credential through the worker's stdin (never argv or a file); the worker
      self-registers. Agent login uses MOD-22's paste-back. SSH is not used after provisioning.
    - Under phase 2 the credential it installs is an enrolment token, not a DSN.
-   - Depends on MOD-A and MOD-22.
-7. **MOD-F - Live streaming via `NOTIFY` (optional).** `R-HIS-1`, `R-NF-3`.
+   - Depends on MOD-38 and MOD-22.
+7. **MOD-43 - Live streaming via `NOTIFY` (optional).** `R-HIS-1`, `R-NF-3`.
    - Transient `NOTIFY` deltas under 8000 bytes between recorder flushes, droppable, superseded by
      durable rows. Open only if flush bursts prove unusable; if phase 2 is already open, the relay
      replaces it.
-   - Depends on MOD-C.
+   - Depends on MOD-40.
 
 **Phase 2 - control plane (O5a), opened on a §7 trigger.**
 
-8. **MOD-H - `htui server` control plane.** `R-NF-2`, `R-ID-2`, `R-ORCH-12`, `R-STO-1`, `R-STO-5`
+8. **MOD-44 - `htui server` control plane.** `R-NF-2`, `R-ID-2`, `R-ORCH-12`, `R-STO-1`, `R-STO-5`
    (all as amended), `R-USR-3`, `R-SEC-1..4`, `R-ID-7`.
    - A subcommand or binary reusing `htui-store`, the only worker-facing DSN holder; stateless
      except in-memory subscriptions and an enrolment CA key.
@@ -757,15 +757,15 @@ Placeholder IDs. Real `MOD-N` IDs are minted when the items are opened. Order is
      ingest idempotent on `(run_step_id, seq)`, live and permission relay to TUI subscribers.
    - A decision on server-down behaviour: reset-and-retry kept, or an `unknown`/`lost_after` state
      (amends ANA-2).
-   - Depends on MOD-A (narrow store surface), MOD-B, MOD-G.
-9. **MOD-I - Config manager and secret distribution.** `R-ID-3`, `R-AGT-9`, `R-AGT-10`, `R-SEC-1`,
+   - Depends on MOD-38 (narrow store surface), MOD-39, MOD-37.
+9. **MOD-45 - Config manager and secret distribution.** `R-ID-3`, `R-AGT-9`, `R-AGT-10`, `R-SEC-1`,
    `R-SEC-2`.
    - `GetManifest`/`WatchManifest` over §6.2's rows plus images, target build and download digest;
      full resync on a stale cursor; worker-side cache of the last manifest.
    - Targeted per-run secrets, or worker-side resolution if `R-SEC-2` is not amended. Never agent
      credentials.
    - Worker self-update to the manifest's target build.
-   - Depends on MOD-H and MOD-10 (secret provider).
+   - Depends on MOD-44 and MOD-10 (secret provider).
 
 Existing items affected (for the maintainer, not edited here):
 - MOD-4 M6: library placement of `run_worker` and the narrow worker-store surface.
@@ -786,7 +786,7 @@ Existing items affected (for the maintainer, not edited here):
 1. **Headless DSN (`R-STO-1`).** The Linux keyring backend is `sync-secret-service` only
    (`Cargo.toml:45-46`), and a headless server or container has no secret-service daemon. Options:
    keyring `linux-native` (kernel keyutils, lost on reboot) or a systemd credential (a file, which
-   `R-STO-1` forbids). Needs a maintainer amendment before MOD-A. Phase 2 does not remove the
+   `R-STO-1` forbids). Needs a maintainer amendment before MOD-38. Phase 2 does not remove the
    problem; it shrinks what is stored to a revocable box-scoped key.
 2. **Permission gap is present today.** `pump` (`record.rs:1684-1703`) plus ACP parking
    (`acp/mod.rs:507-510`) plus no policy evaluation on the engine path means engine-driven ACP steps
@@ -795,7 +795,7 @@ Existing items affected (for the maintainer, not edited here):
    Locally the child sees htui's whole environment, at odds with `R-SEC-2`'s "never exposed to a
    session", and under O3 a same-user agent may be able to reach the worker's DSN (inference). Under
    O2 `docker exec` passes nothing implicitly, but explicit `-e` values may be visible through
-   `docker inspect` and `/proc`. Verify before MOD-D.
+   `docker inspect` and `/proc`. Verify before MOD-41.
 4. **Kill semantics across a wrapper.** Killing a local `docker exec` or `ssh -T` client is not
    known to terminate the far process (unverified). For O2, per-session containers make removal the
    kill-tree. `docs/ANA-4.md:1365-1366` requires that no agent process is left behind.
@@ -820,23 +820,23 @@ Existing items affected (for the maintainer, not edited here):
     limit holds. The remaining hazard is C1 (a suspended process writing after adoption). Still
     decide whether a headless worker on a box disables in-process execution there, for clarity
     rather than safety.
-11. **Stale lease holder (C1) and clock skew (C2).** Until MOD-G, a process resumed from suspend can
+11. **Stale lease holder (C1) and clock skew (C2).** Until MOD-37, a process resumed from suspend can
     overwrite an adopted step; once a relay answers across boxes, worker clocks matter.
 12. **Box identity by hostname (C4).** A container or cloned VM with a duplicate hostname silently
     merges into another box's row, sharing its sweep. Whether Docker host networking passes the host
-    hostname through is unverified. Fix before MOD-D and MOD-E.
+    hostname through is unverified. Fix before MOD-41 and MOD-42.
 13. **Postgres exposure and connection budget.** Under O3 every worker needs a reachable DSN, TLS
     optional (`R-STO-2`), and about 8 connections (§6.1). Acceptable for `R-USR-1` on a trusted
     network; team use (`R-USR-3`), untrusted hosts or more worker processes than the connection
     budget allows (about 12 processes at defaults, §6.1) are phase 2 triggers (§7).
-14. **Version skew (C5).** Until MOD-G, one box migrating locks out every older worker at its next
+14. **Version skew (C5).** Until MOD-37, one box migrating locks out every older worker at its next
     connect, while open pools keep running old code. Phase 2 moves the pin to the server.
 15. **Phase 2 costs.** A new daemon on the dispatch path (a second SPOF beside Postgres for workers),
     an enrolment CA to protect, a protocol to version, and the risk of the worker-store surface
-    creeping toward a full `WriteStore` mirror (MOD-25's third store). The narrow surface in MOD-A is
+    creeping toward a full `WriteStore` mirror (MOD-25's third store). The narrow surface in MOD-38 is
     the guard.
 16. **Server-down semantics.** Reset-and-retry after 120 s versus an `unknown`/`lost_after` state
-    that amends ANA-2's single liveness marker. Decide in MOD-H.
+    that amends ANA-2's single liveness marker. Decide in MOD-44.
 17. **ACP network transport.** If the Streamable-HTTP/WebSocket RFD stabilises, O6 becomes cheaper.
     It still would not remove the need for an executor that owns the tree.
 
@@ -845,4 +845,4 @@ Existing items affected (for the maintainer, not edited here):
 | Date | Change |
 |---|---|
 | 2026-09-24 | Original conclusion: no central server; a headless worker per box talking only to Postgres (O3 + O2). O5 rejected on `R-ID-2`, `R-NF-2` and `R-ID-3` alone |
-| 2026-09-24 | After the maintainer's challenge ("wouldn't a central server be better? what if multiple agents write at the same time on postgres?"): added §6.1 showing concurrent writers are already coordinated by CAS, row locks and `SKIP LOCKED`, and listing eight multi-writer gaps (C1-C8) that bind any design; corrected hazard 10 (admission is serialised by the box-row lock); added §6.2's config inventory; split O5 into O5a (control plane, TUI direct) and O5b (full server) and compared them with O3 on twelve axes. Verdict revised from "no server" to **phased**: O3 + O2 first, with MOD-G (store hardening) and a narrow worker-store surface; O5a as phase 2 (MOD-H server, MOD-I config manager) on stated triggers; O5b rejected. Phase 2 requirement amendments added |
+| 2026-09-24 | After the maintainer's challenge ("wouldn't a central server be better? what if multiple agents write at the same time on postgres?"): added §6.1 showing concurrent writers are already coordinated by CAS, row locks and `SKIP LOCKED`, and listing eight multi-writer gaps (C1-C8) that bind any design; corrected hazard 10 (admission is serialised by the box-row lock); added §6.2's config inventory; split O5 into O5a (control plane, TUI direct) and O5b (full server) and compared them with O3 on twelve axes. Verdict revised from "no server" to **phased**: O3 + O2 first, with MOD-37 (store hardening) and a narrow worker-store surface; O5a as phase 2 (MOD-44 server, MOD-45 config manager) on stated triggers; O5b rejected. Phase 2 requirement amendments added |
