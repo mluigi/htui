@@ -303,8 +303,10 @@ pub struct GixIsolator {
 impl GixIsolator {
     /// Validates the configuration against ANA-2 invariant 4 and probes `git` once.
     ///
-    /// Synchronous, because it spawns `git --version`: milestone 6 calls it at worker start, once
-    /// per process. A box with no usable `git` is **not** an error here — `local` and
+    /// Synchronous, because it spawns `git --version` and creates the scratch root: milestone 6's
+    /// run runtime calls it on a blocking thread (`spawn_blocking`) at the first orchestrator
+    /// command of a process, and again only when a `StartRun` finds the repo map changed or the
+    /// session moved to another server (MOD-4 plan D156, D202, D213). A box with no usable `git` is **not** an error here — `local` and
     /// `shared_serialized` never shell out, so the isolator is built and the two modes that do
     /// refuse with the sentence the probe produced.
     ///

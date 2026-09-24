@@ -39,7 +39,9 @@ pub const MIN_GIT: (u32, u32, u32) = (2, 33, 0);
 /// One verb's wall-clock budget; on expiry the process group is killed and nothing is retried.
 pub const VERB_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The bound on `git --version` inside [`Cli::probe`], which runs synchronously at worker start.
+/// The bound on `git --version` inside [`Cli::probe`], which runs synchronously inside
+/// `GixIsolator::new`, on a blocking thread when the run runtime builds its isolator (MOD-4 plan
+/// D213).
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a killed child gets to be reaped before it is abandoned.
@@ -2969,8 +2971,8 @@ mod tests {
         );
     }
 
-    /// `GixIsolator::new` runs the probe synchronously at worker start, so a `git` that hangs on
-    /// `--version` must be refused within a bound rather than hang the worker with it.
+    /// `GixIsolator::new` runs the probe synchronously, so a `git` that hangs on `--version` must
+    /// be refused within a bound rather than hang the thread that builds the isolator with it.
     #[cfg(unix)]
     #[test]
     fn a_probe_that_hangs_is_refused_within_its_bound() {

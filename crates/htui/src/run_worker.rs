@@ -850,7 +850,7 @@ impl Shared {
                     .map_err(|err| err.to_string())?
                     .join("trees"),
             };
-            let isolator = GixIsolator::new(IsolatorConfig {
+            let config = IsolatorConfig {
                 repos: repos.clone(),
                 scratch_root,
                 copy_exclude: Vec::new(),
@@ -859,8 +859,15 @@ impl Shared {
                     .and_then(Value::as_u64)
                     .unwrap_or(DEFAULT_COPY_MAX_TOTAL_BYTES),
                 box_id,
-            })
-            .map_err(|err| err.to_string())?;
+            };
+            // D213 (review L4): `GixIsolator::new` probes `git --version` for up to its bound and
+            // creates the scratch root, so it runs on a blocking thread, never on a runtime worker
+            // (`R-NF-3`). Nothing is assigned until it answers, so a task aborted meanwhile leaves
+            // no half-built parts.
+            let isolator = tokio::task::spawn_blocking(move || GixIsolator::new(config))
+                .await
+                .map_err(|err| format!("the isolator could not be built: {err}"))?
+                .map_err(|err| err.to_string())?;
             built.isolator = Some(Arc::new(isolator));
             built.repos = Some(repos);
             self.isolator_builds.fetch_add(1, Ordering::SeqCst);
