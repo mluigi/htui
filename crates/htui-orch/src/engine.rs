@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::path::PathBuf;
 
 use futures::future::Either;
 
@@ -28,11 +29,11 @@ use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
     BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, EventKind, Gate, GateOutcome,
     GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId,
-    Project, ProjectSettings, PromptScope, RepoId, Run, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId,
-    StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    Project, ProjectSettings, PromptScope, Repo, RepoId, Run, RunId, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase, SnapshotTemplate,
+    Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
 };
-use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet};
+use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoRoot, RootSource};
 use htui_core::prompt::{
     AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PromptSpec, SectionName,
     TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
@@ -44,7 +45,8 @@ use uuid::Uuid;
 
 use crate::closeout;
 use crate::command::{
-    Command, CommandOutcome, EngineError, GateAnswer, Rest, UnblockCase, stale_run, stale_step,
+    Command, CommandOutcome, EngineError, GateAnswer, Opening, OpeningPath, Rest, UnblockCase,
+    stale_run, stale_step,
 };
 use crate::fanout::{
     AUTO_WIN_REASON, CandidateView, HUMAN_PICK_REASON, HumanReason, JUDGE_KIND, JudgeFailure,
@@ -54,6 +56,7 @@ use crate::fanout::{
 use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{Clock, FanoutSlot, Isolator};
+use crate::promote::{self, OpeningKind};
 use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
 use crate::select::{self, SelectInput, Skipped, Walk};
 use crate::status::{
@@ -73,6 +76,14 @@ const REVIEW_PHASE: &str = "review";
 /// The `prompt_template.name` of the judge role (`crates/htui-core/src/prompt/template.rs:54`),
 /// read when the snapshot pinned no judge template (plan D53).
 const JUDGE_TEMPLATE: &str = "judge";
+
+/// The `prompt_template.name` of the handoff role, which a promoted step's fresh chat opens with
+/// (MOD-4 plan D163, `crates/htui-core/src/prompt/defaults.rs`).
+const HANDOFF_TEMPLATE: &str = "handoff";
+
+/// A handoff's `failure_reason` when neither the run nor the step recorded one: the maintainer
+/// promoted a step that was waiting at its gate (blueprint §7.5).
+const PROMOTED_AT_A_GATE: &str = "promoted by the maintainer at a gate";
 
 /// `run_step.fanout_index` of a slot's judge row (`docs/ANA-2.md` §4.5, plan D51).
 const JUDGE_FANOUT_INDEX: i32 = -1;
@@ -1069,8 +1080,175 @@ where
         step: StepId,
         chat_open: bool,
     ) -> Result<CommandOutcome, EngineError> {
-        let _ = (run, step, chat_open);
-        todo!("MOD-4 plan D163: promote")
+        let run = self.run(run).await?;
+        let snapshot = Self::snapshot_of(&run)?;
+        let row = self.step(run.id, step).await?;
+        let phase = Self::phase_at(run.id, &snapshot, row.position)?;
+        let item = self.item(Self::item_of(&run)?).await?;
+        crate::command::promote_enabled(&run, item.status, &row, &phase, chat_open)?;
+
+        // Plan D108's order: after the pure guard and before the first write.
+        self.take_lease(run.id).await?;
+        let now = self.now();
+        self.leased_window(run.id, async {
+            if row.status == StepStatus::Running {
+                self.move_step(
+                    run.id,
+                    row.id,
+                    StepStatus::Running,
+                    StepStatus::AwaitingApproval,
+                    now,
+                )
+                .await?;
+            }
+            self.parts.store.promote_step(row.id, now).await?;
+            self.note(
+                item.id,
+                format!(
+                    "step {} (`{}` attempt {}) promoted to chat",
+                    row.id, phase.name, row.attempt
+                ),
+                Some(row.id),
+                now,
+            )
+            .await
+        })
+        .await?;
+        // A parked run holds no lease (plan D87).
+        self.release_lease(run.id).await;
+
+        let rest = self.resting(&self.run(run.id).await?).await?;
+        // The promotion is written by now: an opening that cannot be built is raised with the
+        // step promoted, and the chat is simply not opened (the worker reports the sentence).
+        let opening = self.opening(&run, &snapshot, &row, &phase, item.id).await?;
+        Ok(CommandOutcome::Promoted {
+            step: row.id,
+            rest,
+            opening: Box::new(opening),
+        })
+    }
+
+    /// How a promoted step's chat opens (MOD-4 plan D163, blueprint D192, D193).
+    ///
+    /// The step's agent row decides with [`promote::opening_kind`]: its own session is resumed
+    /// only on the CLI transport, with `resume` in its caps and a `session_started` banner in its
+    /// log (R-48); otherwise a fresh session opens with the `handoff` role's prompt, built from
+    /// the phase's own spec ([`Self::phase_spec`]) with the step's summary, its diff so far and
+    /// why it stopped. `cwd` is the step's primary tree, else its first; every other tree is an
+    /// extra directory (ANA-2 `:1208-1213`). Nothing here writes.
+    async fn opening(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        item: ItemId,
+    ) -> Result<Opening, EngineError> {
+        let candidate = Self::candidate_of(step, phase)?;
+        let agent = self
+            .parts
+            .graphs
+            .agent(candidate.agent_id)
+            .await?
+            .ok_or_else(|| EngineError::Snapshot {
+                run: run.id,
+                reason: format!(
+                    "step {} names agent {}, which has no row",
+                    step.id, candidate.agent_id
+                ),
+            })?;
+        let events = self
+            .parts
+            .store
+            .step_events(step.id)
+            .await?
+            .unwrap_or_default();
+        let trees = self.parts.store.step_trees(step.id).await?;
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let (cwd, extra_dirs) = chat_dirs(&trees, &repos).ok_or_else(|| EngineError::Snapshot {
+            run: run.id,
+            reason: "the step has no tree to chat in".to_owned(),
+        })?;
+
+        let caps = htui_agent::registry::caps_for(&agent);
+        let path = match promote::opening_kind(caps, agent.transport, &events) {
+            OpeningKind::Resume(session_ref) => OpeningPath::Resume {
+                session_ref,
+                text: promote::RESUME_OPENING.to_owned(),
+            },
+            OpeningKind::Handoff => {
+                let spec = match self
+                    .phase_spec(run, snapshot, step, phase, item, false)
+                    .await?
+                {
+                    Ok(spec) => spec,
+                    // Not reachable with `strict = false`: a missing input is a note there.
+                    Err(kind) => {
+                        return Err(EngineError::Snapshot {
+                            run: run.id,
+                            reason: format!("the handoff prompt found no `{kind}` document"),
+                        });
+                    }
+                };
+                let template = self
+                    .parts
+                    .graphs
+                    .prompt_template(run.project_id, HANDOFF_TEMPLATE, None)
+                    .await?
+                    .ok_or_else(|| ResolveError::NoTemplate {
+                        phase: phase.name.clone(),
+                        name: HANDOFF_TEMPLATE.to_owned(),
+                        project: run.project_id,
+                    })?;
+                let roots: Vec<RepoRoot> = trees
+                    .iter()
+                    .map(|tree| RepoRoot {
+                        repo: repos
+                            .iter()
+                            .find(|repo| repo.id == tree.repo_id)
+                            .map_or_else(|| tree.repo_id.to_string(), |repo| repo.name.clone()),
+                        root: PathBuf::from(&tree.path),
+                        source: RootSource::RunStepTree,
+                    })
+                    .collect();
+                let commits = self.parts.store.step_commits(step.id).await?;
+                // The diff is advisory (plan D55): a failed one opens the chat without it.
+                let diff_so_far = match self.parts.isolator.diff(&trees, &commits).await {
+                    Ok(diff) => diff,
+                    Err(err) => {
+                        tracing::warn!(step = %step.id, %err, "the handoff opens without a diff");
+                        None
+                    }
+                };
+                let failure_reason = run
+                    .failure
+                    .clone()
+                    .or_else(|| step.gate_note.clone())
+                    .unwrap_or_else(|| PROMOTED_AT_A_GATE.to_owned());
+                let spec = promote::handoff_spec(
+                    spec,
+                    &template,
+                    &events,
+                    &roots,
+                    diff_so_far,
+                    failure_reason,
+                );
+                let assembled = assemble(&spec, self.parts.scrubber)?;
+                OpeningPath::Handoff {
+                    text: assembled.text,
+                    digest: assembled.digest,
+                }
+            }
+        };
+        Ok(Opening {
+            agent_id: agent.id,
+            agent_name: agent.name,
+            model: step.model.clone(),
+            phase: step.phase_name.clone(),
+            cwd,
+            extra_dirs,
+            path,
+        })
     }
 
     /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).
@@ -2721,7 +2899,7 @@ where
             .verifier
             .run(VerifyRequest {
                 command: phase.verify_command.clone(),
-                cwd: primary.map(|tree| std::path::PathBuf::from(&tree.path)),
+                cwd: primary.map(|tree| PathBuf::from(&tree.path)),
                 remaining: Self::remaining(phase, started_at, self.now()),
                 step: step.id,
             })
@@ -4331,7 +4509,10 @@ where
         phase: &SnapshotPhase,
         item: ItemId,
     ) -> Result<Result<AssembledPrompt, StageThree>, EngineError> {
-        let spec = match self.phase_spec(run, snapshot, step, phase, item).await? {
+        let spec = match self
+            .phase_spec(run, snapshot, step, phase, item, true)
+            .await?
+        {
             Ok(spec) => spec,
             Err(missing) => return Ok(Err(StageThree::MissingInput(missing))),
         };
@@ -4341,7 +4522,8 @@ where
     /// The phase's [`PromptSpec`] for `step`: its resolved inputs, its pinned template, its
     /// upstream summaries and, from attempt 2, the loop's forwarded sections (plan D67).
     ///
-    /// `Err(kind)` is a required input that resolved to no document.
+    /// `Err(kind)` is a required input that resolved to no document, when `strict`. A promoted
+    /// step's handoff (plan D163) is not strict: its chat opens with the gap noted instead.
     async fn phase_spec(
         &self,
         run: &Run,
@@ -4349,6 +4531,7 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
         item: ItemId,
+        strict: bool,
     ) -> Result<Result<PromptSpec, String>, EngineError> {
         let row = self.item(item).await?;
         let project = self.project(row.project_id).await?;
@@ -4367,9 +4550,13 @@ where
                     version: document.version,
                     body: document.body,
                 }),
-                None if required.contains(&input.kind) => {
+                None if strict && required.contains(&input.kind) => {
                     return Ok(Err(input.kind));
                 }
+                None if required.contains(&input.kind) => notes.push(format!(
+                    "input `{}` resolves to no document; the handoff opens without it",
+                    input.kind
+                )),
                 None => notes.push(format!(
                     "input `{}` is produced at a later position and has not run yet; \
                      it is optional on this attempt (plan D21)",
@@ -4538,8 +4725,8 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
         prompt: &AssembledPrompt,
-        cwd: std::path::PathBuf,
-        extra_dirs: Vec<std::path::PathBuf>,
+        cwd: PathBuf,
+        extra_dirs: Vec<PathBuf>,
     ) -> Result<(SessionResult, Option<htui_agent::record::CapBreach>), EngineError> {
         let mut recorder = self.open_recorder(run, step, prompt).await?;
         // A spawn failure is folded in rather than propagated straight out of the `?`: the
@@ -4624,8 +4811,8 @@ where
         phase: &SnapshotPhase,
         key: &SessionKey<'_>,
         text: &str,
-        cwd: std::path::PathBuf,
-        extra_dirs: Vec<std::path::PathBuf>,
+        cwd: PathBuf,
+        extra_dirs: Vec<PathBuf>,
         recorder: &mut Recorder<'a, S>,
     ) -> Result<SessionResult, EngineError> {
         let project = self.project(run.project_id).await?;
@@ -5097,6 +5284,27 @@ fn min_budget(app: &BTreeMap<String, Value>) -> i64 {
         .and_then(Value::as_i64)
         .filter(|micros| *micros > 0)
         .unwrap_or(0)
+}
+
+/// A promoted step's chat directories (ANA-2 `:1208-1213`): the primary repo's tree as `cwd`,
+/// else the first tree, and every other tree beside it. `None` for a step with no tree.
+fn chat_dirs(trees: &[RunStepTree], repos: &[Repo]) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let primary = trees
+        .iter()
+        .position(|tree| {
+            repos
+                .iter()
+                .any(|repo| repo.id == tree.repo_id && repo.is_primary)
+        })
+        .unwrap_or(0);
+    let cwd = PathBuf::from(&trees.get(primary)?.path);
+    let extra_dirs = trees
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != primary)
+        .map(|(_, tree)| PathBuf::from(&tree.path))
+        .collect();
+    Some((cwd, extra_dirs))
 }
 
 /// An excerpt set with no files whose audit records the caps a pass *would* have run under.
