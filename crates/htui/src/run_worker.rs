@@ -1114,6 +1114,9 @@ pub const PREEMPTED: &str = "the walk was stopped by a later command on its run"
 /// Blueprint §8.6: an `Unblock` whose case moved while it waited for the run's lock.
 pub const UNBLOCK_MOVED: &str = "the item changed; press `u` again";
 
+/// D158: what a task that panicked is answered and published with.
+pub const WALK_PANICKED: &str = "the walk task panicked; the next sweep adopts it";
+
 /// A period as the millisecond count the runtime stores.
 fn millis(every: Duration) -> u64 {
     u64::try_from(every.as_millis()).unwrap_or(u64::MAX).max(1)
@@ -1816,9 +1819,9 @@ pub(crate) mod tests {
     use htui_agent::registry::{DriverFactory, TransportBuilder};
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
-        Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, NewRepo, RepoId,
-        Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, TIMESTAMPTZ_DIGITS,
-        Transport,
+        Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, NewRepo, NewRun,
+        RepoId, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId,
+        TIMESTAMPTZ_DIGITS, Transport,
     };
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
     use htui_orch::fake::{FakeIsolator, FakeVerifier};
@@ -1831,12 +1834,13 @@ pub(crate) mod tests {
 
     use super::{
         BackendGraphs, FrameKind, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, PREEMPTED,
-        RunRuntime, RunServed, StepAuthor,
+        RunRuntime, RunServed, StepAuthor, WALK_PANICKED,
     };
     use crate::agent_worker::AgentRuntime;
     use crate::store_worker::{
         self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest, spawn_with_runtimes,
     };
+    use uuid::Uuid;
 
     /// The scripted registry row every walk test runs on (blueprint F-O): an `acp` row, because
     /// the fixture graphs gate every phase and stage 1's inline-approval interlock skips a `cli`
@@ -2564,6 +2568,173 @@ pub(crate) mod tests {
         }
         assert!(answered >= 2, "both starts were answered");
         assert_eq!(runtime.isolator_builds(), 1);
+    }
+
+    /// A run of `item` another process claimed an hour ago and never renewed: `running`, its
+    /// lease expired, its owner not this one. No step was created.
+    async fn stranded(fixture: &Fixture, item: ItemId) -> RunId {
+        let backend = Backend::memory(fixture.store.clone());
+        let row = fixture.item(item).await;
+        let app = fixture.store.app_settings().await.expect("the settings");
+        let resolved = htui_orch::resolve(
+            &fixture.store,
+            &BackendGraphs(backend),
+            &row,
+            RunMode::Manual,
+            &app,
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the item resolves");
+        let past = Utc::now() - TimeDelta::hours(1);
+        let run = RunId::new();
+        fixture
+            .store
+            .create_run(NewRun {
+                id: run,
+                project_id: row.project_id,
+                item_id: row.id,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                started_by: ids::USER,
+                graph_snapshot: resolved.snapshot,
+                repo_scope: resolved.repo_scope,
+                queued_at: past,
+            })
+            .await
+            .expect("the run lands");
+        let claim = fixture
+            .store
+            .claim_run(
+                run,
+                ids::BOX,
+                Uuid::now_v7(),
+                past,
+                past + TimeDelta::minutes(1),
+            )
+            .await
+            .expect("the claim answers");
+        assert!(claim.is_admitted(), "{claim}");
+        run
+    }
+
+    /// Polls the store until `run` reaches `status`.
+    async fn rests_at(fixture: &Fixture, run: RunId, status: RunStatus) {
+        within(&format!("run {run} reaching `{status}`"), async {
+            while fixture.run(run).await.status != status {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
+    /// D158: the startup sweep adopts every stranded run and resumes each on its own task, so one
+    /// run's session never waits on another's.
+    #[tokio::test]
+    async fn the_sweep_resumes_each_adopted_run_on_its_own_task() {
+        let fixture = Fixture::new().await;
+        let first = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let second = stranded(&fixture, ids::AGY_FEAT_1).await;
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let _worker = Worker::spawn(&fixture.store, fixture.runtime());
+
+        within("one resumed session starting", stall.reached.notified()).await;
+        within("the other run resting while the first stalls", async {
+            loop {
+                let rested = [first, second].len()
+                    - [fixture.run(first).await, fixture.run(second).await]
+                        .iter()
+                        .filter(|row| row.status == RunStatus::Running)
+                        .count();
+                if rested == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        stall.release.notify_one();
+        rests_at(&fixture, first, RunStatus::AwaitingApproval).await;
+        rests_at(&fixture, second, RunStatus::AwaitingApproval).await;
+    }
+
+    /// D189: a sweep leaves a run a command of this process holds alone — its lease renewed to
+    /// this owner by the adoption, and the run left to the holder.
+    #[tokio::test]
+    async fn a_sweep_skips_a_run_a_command_holds() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let mut runtime = fixture.runtime();
+        let held = runtime.shared.locks.try_lock(run).expect("nobody holds it");
+        let (replies, _answers) = mpsc::unbounded_channel();
+
+        runtime.sweep(&Backend::memory(fixture.store.clone()), &replies);
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+
+        let row = fixture.run(run).await;
+        assert_eq!(row.status, RunStatus::Running, "not recovered");
+        assert!(fixture.steps(run).await.is_empty(), "nothing walked");
+        assert!(
+            row.lease_expires_at.is_some_and(|until| until > Utc::now()),
+            "the adoption leased it to this owner: {:?}",
+            row.lease_expires_at
+        );
+        assert!(
+            runtime.shared.dead_walks.contains(run),
+            "and the next free sweep gives it back"
+        );
+        drop(held);
+    }
+
+    /// R-12, D158: a walk task that panics is marked dead, answered once with the sentence, and
+    /// the next sweep releases and adopts its run, which a healthy session then rests.
+    #[tokio::test]
+    async fn a_panicked_walk_is_adopted_by_the_next_sweep() {
+        let fixture = Fixture::new().await;
+        fixture.sessions.push(Play::Panic);
+        let mut worker = Worker::spawn(
+            &fixture.store,
+            fixture
+                .runtime()
+                .with_sweep_every(Duration::from_millis(100)),
+        );
+
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == WALK_PANICKED),
+            "the panicked task's request is answered"
+        );
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        rests_at(&fixture, run, RunStatus::AwaitingApproval).await;
+    }
+
+    /// M5 D84: a run whose claim was refused waits, and is claimed again once a walk of this
+    /// process rests.
+    #[tokio::test]
+    async fn a_refused_claim_is_retried_when_a_walk_rests() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let (first, _) = parked(&fixture, &mut worker).await;
+
+        let start = worker.send(Origin::App, start_run(ids::HTUI_CLEAN_1));
+        let StoreReply::Failed { message, .. } = worker.reply(start).await else {
+            panic!("the second claim is refused");
+        };
+        assert!(
+            message.contains("overlaps run"),
+            "both runs scope the primary repo: {message}"
+        );
+        let second = only_run(&fixture.store, ids::HTUI_CLEAN_1).await;
+        assert_eq!(fixture.run(second).await.status, RunStatus::Queued);
+
+        let cancel = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run: first })),
+        );
+        outcome(worker.reply(cancel).await);
+        rests_at(&fixture, second, RunStatus::AwaitingApproval).await;
     }
 
     /// Plan D155: the five trait reads are the inherent reads of the same name.
