@@ -505,9 +505,21 @@ impl AgentRuntime {
     }
 
     /// Blueprint D206: the steps whose chat task is still running — its command channel is open.
+    ///
+    /// Not [`caps`](Self::caps): an ended chat keeps its entry until the next
+    /// [`serve`](Self::serve) sweeps it (F-H), and a promotion or an accept judged against that
+    /// entry would be refused over a chat that is already over. The receiver lives in
+    /// [`run_chat`], so a closed channel is exactly a session task that has returned.
     #[must_use]
     pub fn live_steps(&self) -> Vec<StepId> {
-        todo!()
+        let mut steps: Vec<StepId> = self
+            .live
+            .iter()
+            .filter(|(_, chat)| !chat.commands.is_closed())
+            .map(|(step, _)| *step)
+            .collect();
+        steps.sort_unstable();
+        steps
     }
 
     /// D165: `RunServed::Attach`'s other half, binding a chat to a promoted graph step.
@@ -1329,7 +1341,7 @@ impl AgentRuntime {
             driver,
             writer,
             writer_label,
-            chat,
+            binding: ChatBinding::Fresh(chat),
             spec,
             prompt,
             policy: settings.permission,
@@ -1351,6 +1363,36 @@ impl AgentRuntime {
     }
 }
 
+/// Blueprint D205: what a chat session records against.
+#[derive(Debug)]
+enum ChatBinding {
+    /// MOD-2's own chat: a `run(kind='chat')` minted at start, closed at the end.
+    Fresh(ChatRunSpec),
+}
+
+impl ChatBinding {
+    /// The step every row of the session is recorded against.
+    const fn step_id(&self) -> StepId {
+        match self {
+            Self::Fresh(chat) => chat.step_id,
+        }
+    }
+
+    /// The request a failed start is answered as: the one that opened the session.
+    const fn request(&self) -> &'static str {
+        match self {
+            Self::Fresh(_) => "chat_start",
+        }
+    }
+
+    /// Closes what the session opened when it ends with `status`.
+    async fn close(&self, writer: &Writer, status: RunStatus) {
+        match self {
+            Self::Fresh(chat) => close_run(writer, chat, status).await,
+        }
+    }
+}
+
 /// Everything one chat session needs.
 pub struct ChatArgs {
     driver: Box<dyn AgentDriver>,
@@ -1358,7 +1400,8 @@ pub struct ChatArgs {
     /// [`Writer::label`], taken before the writer moves: what the tab's header says about where
     /// this conversation is being kept (plan D42).
     writer_label: &'static str,
-    chat: ChatRunSpec,
+    /// What the session records against (blueprint D205).
+    binding: ChatBinding,
     spec: SessionSpec,
     prompt: String,
     policy: PermissionPolicy,
@@ -1386,7 +1429,7 @@ impl core::fmt::Debug for ChatArgs {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ChatArgs")
             .field("driver", &self.driver.name())
-            .field("step", &self.chat.step_id)
+            .field("step", &self.binding.step_id())
             .field("spec", &self.spec)
             .field("project_caps", &self.project_caps)
             // Whether this chat latches, not which row it names: `Recorder`'s own `Debug` makes
@@ -2329,7 +2372,7 @@ pub async fn run_chat(args: ChatArgs) {
         driver,
         writer,
         writer_label,
-        chat,
+        binding,
         spec,
         prompt,
         policy,
@@ -2343,7 +2386,7 @@ pub async fn run_chat(args: ChatArgs) {
     } = args;
 
     let scrubber = MinimalScrubber::new(spec.env.values().cloned());
-    let step_id = chat.step_id;
+    let step_id = binding.step_id();
     let start_addr = frames.addr.clone();
 
     let mut session = match driver.start(spec, prompt.clone()).await {
@@ -2353,11 +2396,11 @@ pub async fn run_chat(args: ChatArgs) {
             frames.reply(
                 &start_addr,
                 StoreReply::Failed {
-                    request: "chat_start",
+                    request: binding.request(),
                     message: message.clone(),
                 },
             );
-            close_run(&writer, &chat, RunStatus::Failed).await;
+            binding.close(&writer, RunStatus::Failed).await;
             frames.failed(message);
             // Plan D60. A failure to *spawn* is a fact about this box's row, not about the
             // conversation: the adapter it names is gone, moved by a self-update, or no longer
@@ -2537,7 +2580,7 @@ pub async fn run_chat(args: ChatArgs) {
         tracing::error!(%err, "the recorder did not close cleanly");
         status = RunStatus::Failed;
     }
-    close_run(&writer, &chat, status).await;
+    binding.close(&writer, status).await;
     frames.ended(last_stop);
 }
 
