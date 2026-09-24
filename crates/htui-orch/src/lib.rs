@@ -13,10 +13,12 @@
 //! walk over a phase's candidates (plan D60), and [`fanout`], the pure half of fan-out: the
 //! prefilter, the group's route, the judge's phase and inputs, and its verdict (plan D49, D52,
 //! D53). Milestone 5 adds `overlap`, ANA-2 §4.7's scope resolution, and [`recover`], §4.9's lease
-//! heartbeat and the sweep's pure half (plan D85, D86, D90, D91, D97). `queue.rs`, also named by
-//! ANA-2 §8, remains MOD-12's and is deliberately not created, not even empty (plan D1).
+//! heartbeat and the sweep's pure half (plan D85, D86, D90, D91, D97). Milestone 6 adds
+//! [`closeout`] and [`promote`], the pure halves of close-out and promotion. `queue.rs`, also named
+//! by ANA-2 §8, remains MOD-12's and is deliberately not created, not even empty (plan D1).
 #![warn(missing_docs)]
 
+pub mod closeout;
 pub mod command;
 #[cfg(feature = "test-support")]
 pub mod conformance;
@@ -28,6 +30,7 @@ pub mod gate;
 pub mod graph;
 pub mod isolate;
 pub mod overlap;
+pub mod promote;
 pub mod recover;
 pub mod select;
 pub mod status;
