@@ -7,22 +7,58 @@
 //!
 //! Every step is two lines at the pane's 43 columns (MOD-4 plan D169, blueprint D197): slot,
 //! status, phase, usage and duration, then the gate, the prompt figure and the agent/model.
+//!
+//! The pane is also where a run is driven (MOD-4 plan D166-D168). Each action key reads its
+//! verdict from the `RunActions` answer, which the worker computes with the engine's own guards
+//! (blueprint D182): an enabled key sends its `Orch` request, a refused one puts the guard's
+//! sentence on the status line and sends nothing.
+//!
+//! | Key | On | Sends |
+//! |---|---|---|
+//! | `a` / `x` | step | approve / reject with a typed note (`AnswerGate`) |
+//! | `r` | step | `RetryStep` |
+//! | `p` | step | promote to chat (`Action::Promote`, served for the Chat tab) |
+//! | `s` | step | `SelectFanout` with the step as the winner |
+//! | `A` | step | `AcceptArtifact` |
+//! | `o` | step | opens the step's output document read-only, over the pane (D173) |
+//! | `c` | run | `CancelRun`, after a `y` |
+//! | `T` | run | a retry of the run's cleanup |
+//! | `u` / `R` | item | `Unblock` / `StartRun` |
+//! | `C` | item | close-out: the counts, a `y`, then the item key typed back (D167) |
 
 use htui_core::model::{
-    ItemId, RunStatus, RunStepSummary, RunSummary, StepId, StepStatus, UsageTotals,
+    Document, DocumentId, ItemId, RunId, RunMode, RunStatus, RunStepSummary, RunSummary, StepId,
+    StepStatus, UsageTotals,
 };
+use htui_orch::{Command, GateAnswer};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
 
 use crate::app::{Action, Ctx, Handled};
-use crate::store_worker::StoreReply;
+use crate::run_worker::{Enabled, ItemActions, OrchRequest};
+use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// What an action key says while the verdicts it reads have not arrived.
+pub const NOT_LOADED: &str = "the run actions have not loaded yet";
+
+/// What a step key says with no step under the cursor.
+pub const NO_STEP: &str = "no step is under the cursor";
+
+/// What a run key says with no run under the cursor.
+pub const NO_RUN: &str = "no run is under the cursor";
+
+/// What `o` says when the step's document is not in this box's store (D173).
+pub const NOT_ON_BOX: &str = "the document is not on this box";
+
+/// `StoreRequest::Document`'s name, which a refused read is answered under.
+const DOCUMENT: &str = "document";
 
 /// The width of a detail pane at 100x30, which every step line fills exactly (MOD-4 plan D169,
 /// blueprint D197).
@@ -85,11 +121,50 @@ pub struct RunsTab {
     item: Option<ItemId>,
     /// First visible run.
     scroll: Scroll,
-    /// Index into the flattened `(run, step)` list: runs in reply order, steps in each run's own
-    /// order (`RunSummary.steps` is already sorted by `(position, attempt, fanout_index)`).
+    /// Index into [`RunsTab::entries`]: runs in reply order, steps in each run's own order
+    /// (`RunSummary.steps` is already sorted by `(position, attempt, fanout_index)`).
     ///
-    /// `None` while no run has a step, which is also every state before the first `Runs` reply.
+    /// `None` while there is no run, which is also every state before the first `Runs` reply.
     selected: Option<usize>,
+    /// Every action's verdict for [`RunsTab::item`] (blueprint D182); `None` until the first
+    /// `RunActions` reply for it.
+    actions: Option<ItemActions>,
+    /// What the pane is doing: browsing, or waiting on typed text or an answer.
+    mode: Mode,
+}
+
+/// One place the cursor can be (blueprint D198): a step, or the header of a run with no step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    /// A step; `run` indexes [`RunsTab::runs`].
+    Step {
+        /// Its run.
+        run: usize,
+        /// The step.
+        step: StepId,
+    },
+    /// A run with no step yet.
+    Run {
+        /// The run.
+        run: usize,
+    },
+}
+
+/// The pane's modes. Anything but [`Mode::Browse`] captures the keyboard (blueprint D201).
+#[derive(Debug, Default)]
+enum Mode {
+    /// The run list, the cursor and the action keys.
+    #[default]
+    Browse,
+    /// The read-only body view of a step's output document (MOD-4 plan D173).
+    Artifact {
+        /// The document asked for.
+        id: DocumentId,
+        /// Its row, once the `Document` reply is in.
+        doc: Option<Box<Document>>,
+        /// First visible body line.
+        scroll: Scroll,
+    },
 }
 
 impl RunsTab {
@@ -102,31 +177,60 @@ impl RunsTab {
         Self::default()
     }
 
-    /// The step under the cursor, or `None` when this item's runs have no steps.
+    /// The step under the cursor, or `None` when the cursor is on no step.
     ///
     /// The one question the modules above this one ask the pane, and what its `Enter` replays.
     #[must_use]
     pub fn selected_step(&self) -> Option<StepId> {
-        let at = self.selected?;
-        self.steps().nth(at).map(|(_, step)| step)
+        match self.entry()? {
+            Entry::Step { step, .. } => Some(step),
+            Entry::Run { .. } => None,
+        }
     }
 
-    /// The flattened `(run index, step id)` list the cursor indexes into.
-    fn steps(&self) -> impl Iterator<Item = (usize, StepId)> + '_ {
+    /// Every cursor entry: each run's steps, or the run itself when it has none (D198).
+    fn entries(&self) -> Vec<Entry> {
         self.runs
             .iter()
             .enumerate()
-            .flat_map(|(at, run)| run.steps.iter().map(move |step| (at, step.id)))
+            .flat_map(|(run, summary)| {
+                if summary.steps.is_empty() {
+                    vec![Entry::Run { run }]
+                } else {
+                    summary
+                        .steps
+                        .iter()
+                        .map(|step| Entry::Step { run, step: step.id })
+                        .collect()
+                }
+            })
+            .collect()
     }
 
-    /// How many steps there are to move over.
-    fn step_count(&self) -> usize {
-        self.runs.iter().map(|run| run.steps.len()).sum()
+    /// The entry under the cursor.
+    fn entry(&self) -> Option<Entry> {
+        self.entries().get(self.selected?).copied()
     }
 
-    /// Moves the step cursor, clamped to both ends. A pane with no step keeps `None`.
+    /// The run of the entry under the cursor.
+    fn entry_run(&self) -> Option<&RunSummary> {
+        let (Entry::Step { run, .. } | Entry::Run { run }) = self.entry()?;
+        self.runs.get(run)
+    }
+
+    /// The step under the cursor, with its run.
+    fn entry_step(&self) -> Option<(RunId, &RunStepSummary)> {
+        let Entry::Step { run, step } = self.entry()? else {
+            return None;
+        };
+        let run = self.runs.get(run)?;
+        let step = run.steps.iter().find(|summary| summary.id == step)?;
+        Some((run.id, step))
+    }
+
+    /// Moves the cursor, clamped to both ends. A pane with no entry keeps `None`.
     fn move_cursor(&mut self, delta: isize) {
-        let Some(last) = self.step_count().checked_sub(1) else {
+        let Some(last) = self.entries().len().checked_sub(1) else {
             self.selected = None;
             return;
         };
@@ -134,20 +238,125 @@ impl RunsTab {
         self.selected = Some(current.saturating_add_signed(delta).min(last));
     }
 
-    /// Puts the cursor on the first step, or takes it away when there is none.
+    /// Puts the cursor on the first entry, or takes it away when there is none.
     fn reselect(&mut self) {
-        self.selected = (self.step_count() > 0).then_some(0);
+        self.selected = (!self.entries().is_empty()).then_some(0);
     }
 
     /// First run to draw: the scrolled-to one, except that the cursor is never scrolled off the
     /// top - the offset is derived here rather than being a second thing `J` has to keep right.
     fn first_visible(&self) -> usize {
         let cursor_run = self
-            .selected
-            .and_then(|at| self.steps().nth(at))
-            .map_or(usize::MAX, |(run, _)| run);
+            .entry_run()
+            .and_then(|run| self.runs.iter().position(|summary| summary.id == run.id))
+            .unwrap_or(usize::MAX);
         self.scroll.skip().min(cursor_run)
     }
+
+    /// A key while the pane captures (blueprint D201): a `CONTROL` chord passes, so `ctrl-c`
+    /// still quits, and everything else is the mode's, answered or swallowed.
+    fn modal_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Handled::Pass;
+        }
+        self.mode = match core::mem::take(&mut self.mode) {
+            Mode::Browse => Mode::Browse,
+            Mode::Artifact { id, doc, mut scroll } => {
+                let code = match key.code {
+                    KeyCode::Char('j') => KeyCode::Char('J'),
+                    KeyCode::Char('k') => KeyCode::Char('K'),
+                    other => other,
+                };
+                if code == KeyCode::Esc {
+                    Mode::Browse
+                } else {
+                    let len = doc.as_ref().map_or(0, |doc| body_lines(doc).len());
+                    let _ = scroll.on_key(KeyEvent::new(code, KeyModifiers::NONE), len);
+                    Mode::Artifact { id, doc, scroll }
+                }
+            }
+        };
+        Handled::Consumed
+    }
+
+    /// A `Document` reply: the artifact view's body, or back to the list when the box does not
+    /// hold it (D173).
+    fn on_document(&mut self, doc: Option<&Document>, ctx: &Ctx<'_>) {
+        let Mode::Artifact { id, doc: slot, .. } = &mut self.mode else {
+            return;
+        };
+        match doc {
+            Some(doc) if doc.id == *id => *slot = Some(Box::new(doc.clone())),
+            Some(_) => {}
+            None => {
+                ctx.emit(Action::Error(NOT_ON_BOX.to_owned()));
+                self.mode = Mode::Browse;
+            }
+        }
+    }
+
+    /// One action key in [`Mode::Browse`] (MOD-4 plan D168, blueprint §9.3).
+    fn action(&mut self, key: char, ctx: &mut Ctx<'_>) -> Handled {
+        let _ = ctx;
+        todo!("{key} {:?}", self.actions)
+    }
+}
+
+/// The artifact view's text: `<kind> v<version> · <title>`, then the body line by line.
+fn body_lines(doc: &Document) -> Vec<String> {
+    let mut lines = vec![format!("{} v{} · {}", doc.kind, doc.version, doc.title)];
+    lines.extend(doc.body.lines().map(str::to_owned));
+    lines
+}
+
+/// Draws the artifact view (D173): the document read-only over the pane, `Esc` to leave.
+fn render_artifact(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    doc: Option<&Document>,
+    scroll: Scroll,
+    theme: &Theme,
+) {
+    let [body, hint] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    let Some(doc) = doc else {
+        message(frame, body, "Opening the document\u{2026}", theme);
+        return;
+    };
+    let lines: Vec<Line<'static>> = body_lines(doc)
+        .into_iter()
+        .enumerate()
+        .map(|(at, line)| {
+            Line::styled(line, if at == 0 { theme.title } else { theme.base })
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.offset(), 0)),
+        body,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("read-only · j/k scroll · Esc close", theme.dim)),
+        hint,
+    );
+}
+
+/// A verdict's answer: `true` when the action may go, else the guard's sentence is on the status
+/// line and nothing is sent.
+fn allowed(verdict: &Enabled, ctx: &Ctx<'_>) -> bool {
+    match verdict {
+        Ok(()) => true,
+        Err(sentence) => {
+            ctx.emit(Action::Error(sentence.clone()));
+            false
+        }
+    }
+}
+
+/// An `Orch` command, as the store request that carries it.
+fn command(command: Command) -> StoreRequest {
+    StoreRequest::Orch(OrchRequest::Command(command))
 }
 
 /// The style a run status renders with. `Theme::status_style` is about items, not runs.
@@ -478,16 +687,27 @@ impl DetailTab for RunsTab {
         self.runs.clear();
         self.scroll.reset();
         self.selected = None;
+        self.actions = None;
+        self.mode = Mode::Browse;
     }
 
-    /// `J` / `K` move the step cursor, `Enter` replays the step under it, and everything else is
-    /// still the shared scroll.
+    /// `J` / `K` move the cursor, `Enter` replays the step under it, the action keys act, and
+    /// everything else is still the shared scroll.
     ///
     /// The cursor takes `J` / `K` off [`Scroll::on_key`] on this pane: the steps are the rows a
     /// reader moves between, and `PageDown` / `PageUp` remain the way to walk a long run list.
     /// `Enter` with no step under the cursor passes, so the Backlog tab's keymap row is what
     /// answers it — the pane never consumes a key it cannot act on.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if !matches!(self.mode, Mode::Browse) {
+            return self.modal_key(key, ctx);
+        }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Handled::Pass;
+        }
         match key.code {
             KeyCode::Char('J') => self.move_cursor(1),
             KeyCode::Char('K') => self.move_cursor(-1),
@@ -497,16 +717,35 @@ impl DetailTab for RunsTab {
                 };
                 ctx.emit(Action::Replay { step_id });
             }
+            KeyCode::Char(
+                key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'A' | 'R' | 'C' | 'T'),
+            ) => return self.action(key, ctx),
             _ => return self.scroll.on_key(key, self.runs.len()),
         }
         Handled::Consumed
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
-        if let StoreReply::Runs(runs) = reply {
-            self.runs = runs.clone();
-            self.scroll.reset();
-            self.reselect();
+    fn captures_input(&self) -> bool {
+        !matches!(self.mode, Mode::Browse)
+    }
+
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+        match reply {
+            StoreReply::Runs(runs) => {
+                self.runs = runs.clone();
+                self.scroll.reset();
+                self.reselect();
+            }
+            StoreReply::RunActions(actions) if Some(actions.item) == self.item => {
+                self.actions = Some((**actions).clone());
+            }
+            StoreReply::Document(doc) => self.on_document(doc.as_ref().as_ref(), ctx),
+            StoreReply::Failed { request, .. }
+                if *request == DOCUMENT && matches!(self.mode, Mode::Artifact { .. }) =>
+            {
+                self.mode = Mode::Browse;
+            }
+            _ => {}
         }
     }
 
@@ -520,15 +759,29 @@ impl DetailTab for RunsTab {
             return;
         }
 
-        let cursor = self.selected_step();
+        if let Mode::Artifact { doc, scroll, .. } = &self.mode {
+            render_artifact(frame, area, doc.as_deref(), *scroll, ctx.theme);
+            return;
+        }
+
+        let cursor = self.entry();
+        let step_cursor = self.selected_step();
         let mut lines: Vec<Line<'static>> = header_lines(ctx.theme).into();
-        for run in self.runs.iter().skip(self.first_visible()) {
-            lines.extend(run_lines(run, ctx.theme));
+        for (at, run) in self.runs.iter().enumerate().skip(self.first_visible()) {
+            let mut header = run_lines(run, ctx.theme);
+            if cursor == Some(Entry::Run { run: at }) {
+                // A run with no step is its own entry (D198); the run grid has no cursor column,
+                // so its kind cell takes the accent instead.
+                if let Some(kind) = header.first_mut().and_then(|line| line.spans.first_mut()) {
+                    kind.style = ctx.theme.accent;
+                }
+            }
+            lines.extend(header);
             for step in &run.steps {
                 lines.extend(step_lines(
                     step,
                     &run.steps,
-                    cursor == Some(step.id),
+                    step_cursor == Some(step.id),
                     ctx.theme,
                 ));
             }
@@ -542,6 +795,7 @@ mod tests {
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
     use crate::keymap::Keymap;
+    use crate::run_worker::{RunActions, StepActions};
     use crate::store_worker::Origin;
     use chrono::TimeDelta;
     use crossterm::event::KeyModifiers;
@@ -613,7 +867,7 @@ mod tests {
     async fn a_runs_reply_puts_the_cursor_on_the_first_step() {
         let shell = Shell::new();
         let pane = pane(&shell).await;
-        assert_eq!(pane.step_count(), 4, "the FEAT-1 run has four steps");
+        assert_eq!(pane.entries().len(), 4, "the FEAT-1 run has four steps");
         assert_eq!(pane.selected_step(), Some(ids::STEP_PRD));
     }
 
@@ -1189,6 +1443,411 @@ mod tests {
         assert_eq!(fit("a\nb", 3), "a b");
         assert_eq!(fit("\u{2014}", 2), "\u{2014} ", "counted in chars, not bytes");
         assert_eq!(fit("abc", 0), "");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The action keys (MOD-4 plan D168, blueprint §9.3): criterion 21's reachability.
+    // -----------------------------------------------------------------------------------------
+
+    /// The sentence a hand-built refusal carries, so a test can tell which verdict a key read.
+    fn refused(verdict: &str) -> String {
+        format!("{verdict} is refused")
+    }
+
+    /// Hand-built verdicts over `runs` (blueprint §9.6): every one `Ok`, or every one refused.
+    fn verdicts(
+        item: ItemId,
+        runs: &[RunSummary],
+        allow: bool,
+        document: DocumentId,
+    ) -> ItemActions {
+        let verdict = |name: &str| if allow { Ok(()) } else { Err(refused(name)) };
+        ItemActions {
+            item,
+            key: "FEAT-1".to_owned(),
+            run: verdict("run"),
+            unblock: verdict("unblock"),
+            close_out: verdict("close_out"),
+            runs: runs
+                .iter()
+                .map(|run| {
+                    (
+                        run.id,
+                        RunActions {
+                            cancel: verdict("cancel"),
+                            cleanup: verdict("cleanup"),
+                        },
+                    )
+                })
+                .collect(),
+            steps: runs
+                .iter()
+                .flat_map(|run| &run.steps)
+                .map(|step| {
+                    (
+                        step.id,
+                        StepActions {
+                            approve: verdict("approve"),
+                            reject: verdict("reject"),
+                            retry: verdict("retry"),
+                            promote: verdict("promote"),
+                            accept: verdict("accept"),
+                            select: verdict("select"),
+                            open: if allow {
+                                Ok(document)
+                            } else {
+                                Err(refused("open"))
+                            },
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// A `FEAT-1` pane holding hand-built verdicts, its emit queue drained, and the document its
+    /// `open` verdicts name.
+    async fn driven(shell: &Shell, allow: bool) -> (RunsTab, DocumentId) {
+        let mut pane = pane(shell).await;
+        let document = DocumentId::new();
+        let actions = verdicts(ids::HTUI_FEAT_1, &pane.runs, allow, document);
+        pane.on_reply(&StoreReply::RunActions(Box::new(actions)), &mut shell.ctx());
+        let _ = shell.emit.take();
+        (pane, document)
+    }
+
+    /// The command an emitted action sends, when it sends one.
+    fn sent_command(action: &Action) -> Option<&Command> {
+        match action {
+            Action::Store(StoreRequest::Orch(OrchRequest::Command(command))) => Some(command),
+            _ => None,
+        }
+    }
+
+    /// `code` on a pane whose verdicts all refuse: the verdict's sentence and nothing else.
+    async fn assert_refused(code: KeyEvent, verdict: &str) {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, false).await;
+        assert_eq!(pane.on_key(code, &mut shell.ctx()), Handled::Consumed);
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Error(sentence)] if *sentence == refused(verdict)),
+            "{code:?} is refused with `{verdict}`'s sentence and sends nothing: {emitted:?}"
+        );
+        assert!(!pane.captures_input(), "a refused key opens nothing");
+    }
+
+    /// `code` on a pane whose verdicts all allow, the cursor `down` entries down: the one action it
+    /// emitted.
+    async fn allowed_emit(code: KeyEvent, down: usize) -> (RunsTab, Action, DocumentId) {
+        let shell = Shell::new();
+        let (mut pane, document) = driven(&shell, true).await;
+        for _ in 0..down {
+            pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        }
+        assert_eq!(pane.on_key(code, &mut shell.ctx()), Handled::Consumed);
+        let mut emitted = shell.emit.take();
+        assert_eq!(emitted.len(), 1, "one action: {emitted:?}");
+        (pane, emitted.remove(0), document)
+    }
+
+    fn shift(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    #[tokio::test]
+    async fn a_approves_a_parked_step() {
+        let (pane, action, _) = allowed_emit(key(KeyCode::Char('a')), 1).await;
+        assert_eq!(
+            sent_command(&action),
+            Some(&Command::AnswerGate {
+                run: pane.runs[0].id,
+                step: ids::STEP_PLAN,
+                answer: GateAnswer::Approved,
+            })
+        );
+        assert_refused(key(KeyCode::Char('a')), "approve").await;
+    }
+
+    #[tokio::test]
+    async fn r_retries() {
+        let (pane, action, _) = allowed_emit(key(KeyCode::Char('r')), 0).await;
+        assert_eq!(
+            sent_command(&action),
+            Some(&Command::RetryStep {
+                run: pane.runs[0].id,
+                step: ids::STEP_PRD,
+            })
+        );
+        assert_refused(key(KeyCode::Char('r')), "retry").await;
+    }
+
+    /// `p` names the step and nothing else: the shell asks for the promotion from the Chat tab
+    /// (D165), so its replies land where the chat opens.
+    #[tokio::test]
+    async fn p_emits_promote() {
+        let (pane, action, _) = allowed_emit(key(KeyCode::Char('p')), 2).await;
+        assert!(
+            matches!(action, Action::Promote { run, step }
+                if run == pane.runs[0].id && step == pane.runs[0].steps[2].id),
+            "{action:?}"
+        );
+        assert_refused(key(KeyCode::Char('p')), "promote").await;
+    }
+
+    #[tokio::test]
+    async fn s_selects_a_candidate() {
+        let (pane, action, _) = allowed_emit(key(KeyCode::Char('s')), 3).await;
+        let step = &pane.runs[0].steps[3];
+        assert_eq!(
+            sent_command(&action),
+            Some(&Command::SelectFanout {
+                run: pane.runs[0].id,
+                position: step.position,
+                attempt: step.attempt,
+                winner: step.id,
+            })
+        );
+        assert_refused(key(KeyCode::Char('s')), "select").await;
+    }
+
+    #[tokio::test]
+    async fn u_unblocks() {
+        let (_, action, _) = allowed_emit(key(KeyCode::Char('u')), 0).await;
+        assert_eq!(
+            sent_command(&action),
+            Some(&Command::Unblock {
+                item: ids::HTUI_FEAT_1
+            })
+        );
+        assert_refused(key(KeyCode::Char('u')), "unblock").await;
+    }
+
+    /// `chat_live` is sent `false`: only the worker knows, and it overwrites it (D185).
+    #[tokio::test]
+    async fn shift_a_accepts_the_artifact() {
+        let (pane, action, _) = allowed_emit(shift('A'), 1).await;
+        assert_eq!(
+            sent_command(&action),
+            Some(&Command::AcceptArtifact {
+                run: pane.runs[0].id,
+                step: ids::STEP_PLAN,
+                chat_live: false,
+            })
+        );
+        assert_refused(shift('A'), "accept").await;
+    }
+
+    #[tokio::test]
+    async fn shift_r_starts_a_run() {
+        let (_, action, _) = allowed_emit(shift('R'), 0).await;
+        assert_eq!(
+            sent_command(&action),
+            Some(&Command::StartRun {
+                item: ids::HTUI_FEAT_1,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+        );
+        assert_refused(shift('R'), "run").await;
+    }
+
+    /// R-25: the run under the cursor, whichever of its steps the cursor is on.
+    #[tokio::test]
+    async fn t_retries_the_cleanup() {
+        let (pane, action, _) = allowed_emit(shift('T'), 2).await;
+        assert!(
+            matches!(&action, Action::Store(StoreRequest::Orch(OrchRequest::Cleanup { run }))
+                if *run == pane.runs[0].id),
+            "{action:?}"
+        );
+        assert_refused(shift('T'), "cleanup").await;
+    }
+
+    /// A document row for the artifact view.
+    fn document(id: DocumentId, body: &str) -> Document {
+        Document {
+            id,
+            item_id: ids::HTUI_FEAT_1,
+            kind: "plan".to_owned(),
+            version: 2,
+            title: "Plan: TUI scaffold".to_owned(),
+            body: body.to_owned(),
+            produced_by_step_id: Some(ids::STEP_PLAN),
+            created_by: ids::USER,
+            created_at: demo_at(1, 0),
+        }
+    }
+
+    /// D173: `o` reads the document and shows it over the pane, read-only: every action key is
+    /// swallowed, `j` scrolls and `Esc` goes back to the list.
+    #[tokio::test]
+    async fn o_opens_the_artifact_read_only() {
+        let shell = Shell::new();
+        let (mut pane, id) = driven(&shell, true).await;
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('o')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Store(StoreRequest::Document(asked))] if *asked == id),
+            "`o` reads the verdict's document: {emitted:?}"
+        );
+        assert!(pane.captures_input(), "the view takes the keyboard");
+
+        let body = (1..=40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        pane.on_reply(
+            &StoreReply::Document(Box::new(Some(document(id, &body)))),
+            &mut shell.ctx(),
+        );
+        let drawn = lines(&pane, &shell);
+        assert_eq!(drawn[0], "plan v2 · Plan: TUI scaffold");
+        assert_eq!(drawn[1], "line 1");
+
+        for pressed in ['a', 'x', 'q', 'R', 'C', '1'] {
+            assert_eq!(
+                pane.on_key(key(KeyCode::Char(pressed)), &mut shell.ctx()),
+                Handled::Consumed,
+                "`{pressed}` is swallowed"
+            );
+        }
+        assert!(shell.emit.is_empty(), "read-only: nothing was sent");
+        pane.on_key(key(KeyCode::Char('j')), &mut shell.ctx());
+        assert_eq!(lines(&pane, &shell)[0], "line 1", "`j` scrolls the body");
+        assert_eq!(
+            pane.on_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut shell.ctx()
+            ),
+            Handled::Pass,
+            "a `CONTROL` chord still reaches the shell"
+        );
+
+        pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert!(!pane.captures_input(), "`Esc` closes the view");
+        assert!(lines(&pane, &shell)[0].starts_with("kind"));
+
+        pane.on_key(key(KeyCode::Char('o')), &mut shell.ctx());
+        let _ = shell.emit.take();
+        pane.on_reply(&StoreReply::Document(Box::new(None)), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Error(sentence)] if sentence == NOT_ON_BOX),
+            "{emitted:?}"
+        );
+        assert!(!pane.captures_input(), "a document this box lacks closes the view");
+
+        assert_refused(key(KeyCode::Char('o')), "open").await;
+    }
+
+    /// Before the verdicts arrive a key says so and sends nothing; a step key needs a step.
+    #[tokio::test]
+    async fn an_action_key_needs_its_verdicts_and_its_entry() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        let _ = shell.emit.take();
+        pane.on_key(key(KeyCode::Char('a')), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Error(sentence)] if sentence == NOT_LOADED),
+            "{emitted:?}"
+        );
+
+        // A run with no step yet is an entry of its own (D198): run keys act on it, step keys
+        // say there is no step.
+        let mut run = feat_1_runs().await.remove(0);
+        run.steps.clear();
+        pane.on_reply(&StoreReply::Runs(vec![run.clone()]), &mut shell.ctx());
+        pane.on_reply(
+            &StoreReply::RunActions(Box::new(verdicts(
+                ids::HTUI_FEAT_1,
+                std::slice::from_ref(&run),
+                true,
+                DocumentId::new(),
+            ))),
+            &mut shell.ctx(),
+        );
+        let _ = shell.emit.take();
+        assert_eq!(pane.selected_step(), None);
+        pane.on_key(key(KeyCode::Char('a')), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Error(sentence)] if sentence == NO_STEP),
+            "{emitted:?}"
+        );
+        pane.on_key(shift('T'), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Store(StoreRequest::Orch(OrchRequest::Cleanup { run: id }))] if *id == run.id),
+            "{emitted:?}"
+        );
+
+        // With no item there is nothing to act on, and the key is not this pane's.
+        pane.on_item_change(None);
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('a')), &mut shell.ctx()),
+            Handled::Pass
+        );
+    }
+
+    /// M4 OQ-4's human path: a slot parked for selection lists its candidates and the judge, and
+    /// `s` on a candidate names it the winner.
+    #[tokio::test]
+    async fn a_parked_fanout_shows_its_candidates_and_s_picks_one() {
+        let shell = Shell::new();
+        let mut run = feat_1_runs().await.remove(0);
+        run.status = RunStatus::AwaitingApproval;
+        let base = run.steps[1].clone();
+        run.steps = [0, 1, -1]
+            .into_iter()
+            .map(|fanout_index| RunStepSummary {
+                id: StepId::new(),
+                position: 1,
+                attempt: 1,
+                fanout_index,
+                status: StepStatus::AwaitingApproval,
+                ..base.clone()
+            })
+            .collect();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(vec![run.clone()]), &mut shell.ctx());
+        pane.on_reply(
+            &StoreReply::RunActions(Box::new(verdicts(
+                ids::HTUI_FEAT_1,
+                std::slice::from_ref(&run),
+                true,
+                DocumentId::new(),
+            ))),
+            &mut shell.ctx(),
+        );
+        let _ = shell.emit.take();
+
+        let drawn = lines(&pane, &shell);
+        for slot in ["1.1/0", "1.1/1", "1.1/j"] {
+            assert!(
+                drawn.iter().any(|line| line.contains(slot)),
+                "`{slot}` is listed: {drawn:#?}"
+            );
+        }
+
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('s')), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert_eq!(
+            emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
+            [&Command::SelectFanout {
+                run: run.id,
+                position: 1,
+                attempt: 1,
+                winner: run.steps[1].id,
+            }]
+        );
     }
 
     /// A new item's reply re-seats the cursor instead of leaving it on an index of the old one.
