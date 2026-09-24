@@ -217,28 +217,29 @@ pub fn render(
     }
 }
 
-/// Draws the sub-tab strip: ` Body  Runs  Graph  Documents  Notes  Prompt `, the active one
-/// accented.
+/// Draws the sub-tab strip: ` Body Runs Graph Documents Notes Prompt `, the active one accented.
 pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &DetailRegistry, theme: &Theme) {
     frame.render_widget(Paragraph::new(strip_line(registry, theme)), area);
 }
 
 /// The sub-tab strip as one line, so its width can be checked against the pane (MOD-30).
+///
+/// Titles are separated by a single space, not the two the Settings and top-level strips use: six
+/// sub-tabs at two spaces are 45 columns against the 43 the pane has at 100×30 (MOD-30 D1). The
+/// accent covers the title only, never a separator.
 #[must_use]
 pub fn strip_line<'a>(registry: &'a DetailRegistry, theme: &Theme) -> Line<'a> {
     let active = registry.active_id();
-    let spans: Vec<Span<'_>> = registry
-        .titles()
-        .into_iter()
-        .map(|(id, title)| {
-            let style: Style = if Some(id) == active {
-                theme.accent
-            } else {
-                theme.dim
-            };
-            Span::styled(format!(" {title} "), style)
-        })
-        .collect();
+    let mut spans: Vec<Span<'a>> = vec![Span::raw(" ")];
+    for (id, title) in registry.titles() {
+        let style: Style = if Some(id) == active {
+            theme.accent
+        } else {
+            theme.dim
+        };
+        spans.push(Span::styled(title, style));
+        spans.push(Span::raw(" "));
+    }
     Line::from(spans)
 }
 

@@ -5,7 +5,7 @@ expression: last
 Platform · DESKTOP-HTUI · memory · 1 run
  1 Backlog
 ┌ Backlog (11) ───────────────────────────────────────┐┌ FIX-1 ────────────────────────────────────┐
-│▾ htui (8)                                           ││ Body  Runs  Graph  Documents  Notes  Promp│
+│▾ htui (8)                                           ││ Body Runs Graph Documents Notes Prompt    │
 │  ANA-1    done               Data model, box regist…││Session leak on cancel                     │
 │  ANA-2    open               Orchestrator step grap…││FIX-1  FIX  open                           │
 │  CLEAN-1  failed             Drop the legacy markdo…││no tags · priority 0 · version 1           │
