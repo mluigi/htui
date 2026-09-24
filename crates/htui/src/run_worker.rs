@@ -193,6 +193,9 @@ pub enum FrameKind {
     },
     /// A walk rested.
     Rested(Rest),
+    /// A command changed the item's rows with no walk to rest: a reopen, a close-out, a cleanup
+    /// (D200).
+    Changed,
     /// A sweep adopted the run; its walk resumes on a task of its own.
     Adopted,
     /// A command or walk failed, with the sentence.
@@ -1545,11 +1548,11 @@ impl TaskCtx {
         }
     }
 
-    /// A command's outcome: the answer, then a `Rested` frame when the walk rested (D200).
+    /// A command's outcome: the answer, then a `Rested` frame when the walk rested, and a
+    /// `Changed` one when nothing walked (D200).
     fn done(&self, outcome: CommandOutcome) {
-        if let Some(rest) = rest_of(&outcome) {
-            self.publish(self.tag.run.get().copied(), FrameKind::Rested(rest));
-        }
+        let kind = rest_of(&outcome).map_or(FrameKind::Changed, FrameKind::Rested);
+        self.publish(self.tag.run.get().copied(), kind);
         self.answer(StoreReply::Orch(OrchReply::Done(Box::new(outcome))));
     }
 
@@ -1688,7 +1691,7 @@ async fn retry_claims(ctx: &TaskCtx) {
 
 /// One claim retry: the run's lock, then `claim` and its walk.
 async fn reclaim(ctx: TaskCtx, run: RunId, queued_at: DateTime<Utc>) {
-    let _ = ctx.tag.run.set(run);
+    ctx.tag(run).await;
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
         return;
@@ -1932,7 +1935,7 @@ async fn start_run(
 
 /// Every verb on one run: preempt as the verb says, lock, dispatch (§8.6).
 async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt) {
-    let _ = ctx.tag.run.set(run);
+    ctx.tag(run).await;
     let stop = match preempt {
         Preempt::Always => true,
         Preempt::IfLive => ctx.shared.walks.is_live(run),
@@ -2038,7 +2041,7 @@ async fn unblock(ctx: TaskCtx, item: ItemId) {
 
 /// D177 (R-25): a terminal run's cleanup, again, under the run's lock.
 async fn cleanup(ctx: TaskCtx, run: RunId) {
-    let _ = ctx.tag.run.set(run);
+    ctx.tag(run).await;
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
         return ctx.refuse(PREEMPTED.to_owned());
@@ -2061,7 +2064,10 @@ async fn cleanup(ctx: TaskCtx, run: RunId) {
     }
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     match kit.engine(&driver).cleanup_run(run).await {
-        Ok(()) => ctx.answer(StoreReply::Orch(OrchReply::CleanedUp { run })),
+        Ok(()) => {
+            ctx.publish(Some(run), FrameKind::Changed);
+            ctx.answer(StoreReply::Orch(OrchReply::CleanedUp { run }));
+        }
         Err(err) => ctx.refuse(err.to_string()),
     }
     drop(guard);
@@ -3324,6 +3330,107 @@ pub(crate) mod tests {
         for (origin, seq, frame) in &later {
             assert_eq!((origin, *seq), (&backlog, 11), "{frame:?}");
         }
+    }
+
+    /// D200: a command that changes an item's rows with no walk — a reopen, a close-out — still
+    /// publishes one frame for the item, so its Runs pane re-reads.
+    #[tokio::test]
+    async fn a_command_with_no_walk_still_publishes_a_frame() {
+        for command in [
+            Command::Unblock {
+                item: ids::HTUI_FEAT_2,
+            },
+            Command::CloseOut {
+                item: ids::HTUI_FEAT_2,
+            },
+        ] {
+            let fixture = Fixture::new().await;
+            let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+            let backlog = Origin::Tab(TabId("backlog"));
+            worker.send_at(
+                backlog.clone(),
+                5,
+                StoreRequest::RunStream {
+                    item: ids::HTUI_FEAT_2,
+                },
+            );
+            let request = StoreRequest::Orch(OrchRequest::Command(command));
+            let name = request.name();
+            let asked = worker.send(Origin::App, request);
+            let done = outcome(worker.reply(asked).await);
+            assert!(
+                matches!(
+                    done,
+                    CommandOutcome::Unblocked { rest: None, .. } | CommandOutcome::ClosedOut { .. }
+                ),
+                "{name}: {done:?}"
+            );
+            let published = frames(&mut worker);
+            assert_eq!(published.len(), 1, "{name}: {published:?}");
+            let (origin, seq, frame) = &published[0];
+            assert_eq!((origin, *seq), (&backlog, 5));
+            assert_eq!(frame.item, ids::HTUI_FEAT_2);
+            assert!(
+                matches!(frame.kind, FrameKind::Changed),
+                "{name}: {frame:?}"
+            );
+        }
+    }
+
+    /// D200: a command preempted while it waits for its run's lock publishes its refusal for the
+    /// run's item, like the walk it waited behind.
+    #[tokio::test]
+    async fn a_command_preempted_in_the_lock_queue_publishes_its_refusal() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let backlog = Origin::Tab(TabId("backlog"));
+        worker.send_at(
+            backlog,
+            1,
+            StoreRequest::RunStream {
+                item: ids::HTUI_ANA_2,
+            },
+        );
+        let (run, research) = parked(&fixture, &mut worker).await;
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let retry = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::RetryStep {
+                run,
+                step: research.id,
+            })),
+        );
+        within("attempt 2's session starting", stall.reached.notified()).await;
+        let answer = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::AnswerGate {
+                run,
+                step: research.id,
+                answer: GateAnswer::Approved,
+            })),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        frames(&mut worker);
+
+        let cancel = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run })),
+        );
+        outcome(worker.reply(cancel).await);
+        for seq in [retry, answer] {
+            assert!(
+                matches!(worker.reply(seq).await, StoreReply::Failed { ref message, .. } if message == PREEMPTED)
+            );
+        }
+        let refusals = frames(&mut worker)
+            .into_iter()
+            .filter(|(_, _, frame)| matches!(&frame.kind, FrameKind::Error(sentence) if sentence == PREEMPTED))
+            .count();
+        assert_eq!(
+            refusals, 2,
+            "the stopped walk and the command queued behind it"
+        );
     }
 
     /// D174, PRD `:197`: off the server every command is refused with MOD-25's one sentence and
