@@ -19,14 +19,15 @@
 BM25 sparse, RRF-fused, scoped by project, filterable to decisions) through `htui --index-items` and
 `htui --search-items`; the agent tool waits on MOD-11, automatic sync on MOD-41, requirements on
 MOD-38.
+Before it, **ANA-17 was concluded** (`docs/decisions/ana/ana-17.md`): the
+prompt's section framing is **not** calibrated per model. The `<section>` wrapper and the blank line
+between blocks under one placeholder are one frame for every model, and the blank line is now
+settled contract rather than MOD-2's placeholder. No item spawned; a note on MOD-36 corrects the
+estimator seam.
 Before it, **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`):
 requirements get dedicated tables with suspect-aware item citations; a decision is a closed item with
 a new `item.resolution` and its `summary` document. Spawned MOD-38 (schema, blocked on the
 maintainer applying `docs/ANA-11.md` §7) and MOD-39 (TUI).
-Before it, **ANA-16 was done** (2026-09-24, `docs/decisions/ana/ana-16.md`): remote and container
-execution is a headless `htui worker` per box on Postgres first (MOD-40..46), with a self-hosted
-control plane and config manager as trigger-gated phase 2 (MOD-47, MOD-48); requirement amendments
-are open questions inside those items.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration` and
 `0004_max_agents_per_run_default` (cache: `0001`..`0003`), so **the next migration is `0005`**.
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins at MOD-4's close
@@ -60,7 +61,9 @@ CLI's own directory (MOD-21).
 **Concluded analyses the open items lean on:** ANA-10 (`docs/decisions/ana/ana-10.md`) — **its
 verdict is withdrawn**, see MOD-25 (`docs/decisions/mod/mod-25.md`); the document stays in the tree
 as the analysis that was done and not taken, and anything leaning on its local-only half is stale;
-ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration;
+ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration, with
+ANA-17 (`docs/decisions/ana/ana-17.md`) settling its block separator and keeping one frame for
+every model;
 ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
 `htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-7, MOD-9, MOD-11, MOD-12, MOD-13
 and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
@@ -72,18 +75,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 ### Analyses
 
 
-- [ ] **ANA-17 - Per-model calibration of the prompt's section framing** (from MOD-2, finding F-37).
-  `R-PRM-1`, `R-PRM-2`. ANA-5 fixes the `<section name="...">` wrapper but never fixes what separates
-  the N blocks a single placeholder expands to — `{{documents}}` renders one block per document,
-  `{{candidates}}` one per candidate. MOD-2 shipped a blank line between them
-  (`prompt/render.rs`, stable under §4.7 step 5's "collapse 3+ LFs to 2"), chosen for readability
-  rather than measured against any model. The question this analysis owns is whether the framing
-  should be **calibrated per model at all** — separator, and plausibly the wrapper itself — since
-  the registry already carries a row per agent and `TokenEstimator::for_agent` already varies by
-  model family (D108). Any verdict has to price the cost of varying it: the separator bytes are
-  digest input, so a per-model frame means `prompt_digest` is only comparable within one model, and
-  every golden snapshot in `crates/htui-core/tests/snapshots/` is re-recorded on each change. Leave
-  the current blank line in place until this concludes.
 - [ ] **ANA-21 - Per-model weights for agent assignment, derived from public sources** (from MOD-4
   milestone 4, OQ-7; maintainer-requested 2026-09-23; MOD-4 is done, `docs/decisions/mod/mod-4.md`).
   `R-AGT-8`, `R-ORCH-7`. Blocks MOD-36.
@@ -193,6 +184,11 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   families need either the tightest budget or per-candidate trimming, which breaks "identical prompt
   across siblings" (ANA-5 `:1870`); each candidate draws on its own agent's quota; the judge must not
   learn which model wrote which candidate (position-bias control extends to model-identity bias).
+  **ANA-17 note (2026-09-25, `docs/decisions/ana/ana-17.md`):** the section framing is one frame for
+  every model, so the estimator is the only thing a mixed-family group can diverge on. The function is
+  `TokenEstimator::for_model` (keyed on a model id), not `for_agent`, and every production
+  `PromptSpec` passes `TokenEstimator::DEFAULT` today (`htui-orch/src/engine.rs:4323`, `:4945`,
+  `htui/src/preview.rs:252`), so choosing it per group or per candidate is new wiring.
 - [ ] **MOD-33 - The box hostname leaves the digest and gains a settings switch** (from MOD-2,
   finding L-5; maintainer-decided 2026-09-16). `R-PRM-1`, `R-PRM-3`, `R-TUI-8`. Two changes to the
   box section (`prompt/render.rs`, the §4.2 projection over `BoxProfile`):
@@ -612,7 +608,7 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 2 (ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
+| ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
 | MOD-N   | 33 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
