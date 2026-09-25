@@ -46,7 +46,11 @@ pub struct TextArea {
 /// might carry a view derives `Debug` (`TextField`'s rule).
 impl core::fmt::Debug for TextArea {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        todo!()
+        f.debug_struct("TextArea")
+            .field("len", &self.text.len())
+            .field("lines", &self.line_count())
+            .field("cursor", &self.cursor)
+            .finish()
     }
 }
 
@@ -54,52 +58,127 @@ impl TextArea {
     /// An empty buffer.
     #[must_use]
     pub fn new() -> Self {
-        todo!()
+        Self::default()
     }
 
     /// A buffer holding `text`, cursor at byte 0 and the viewport at the top left.
     #[must_use]
     pub fn with_text(text: &str) -> Self {
-        todo!()
+        Self {
+            text: text.to_owned(),
+            ..Self::default()
+        }
     }
 
     /// The whole buffer.
     #[must_use]
     pub fn text(&self) -> &str {
-        todo!()
+        &self.text
     }
 
     /// Moves the buffer out.
     #[must_use]
     pub fn into_text(self) -> String {
-        todo!()
+        self.text
     }
 
     /// The cursor, as a byte offset into [`text`](TextArea::text).
     #[must_use]
     pub fn cursor(&self) -> usize {
-        todo!()
+        self.cursor
     }
 
     /// Puts the cursor on `byte`: clamped to the buffer's length, then floored to a char boundary,
     /// so a byte offset from `parse` inside a multi-byte char lands on that char.
     pub fn set_cursor(&mut self, byte: usize) {
-        todo!()
+        let mut byte = byte.min(self.text.len());
+        while !self.text.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        self.cursor = byte;
+        self.goal_col = None;
     }
 
     /// The cursor as a 0-based line and a 0-based **char** column.
     #[must_use]
     pub fn cursor_line_col(&self) -> (usize, usize) {
-        todo!()
+        let before = &self.text[..self.cursor];
+        let line = before.bytes().filter(|&b| b == b'\n').count();
+        let col = before[line_start(before, before.len())..].chars().count();
+        (line, col)
     }
 
     /// Feeds one key; `page` is how many lines `PageUp`/`PageDown` move (at least one).
+    ///
+    /// Every modifier but `SHIFT` passes (`SHIFT` is how a terminal reports a capital). `Char`
+    /// inserts unless it is a control char, which is swallowed; `Enter` inserts `\n`;
+    /// `Backspace`/`Delete` join lines at their ends; `Left`/`Right` cross them; `Up`/`Down` and
+    /// `PageUp`/`PageDown` keep the goal column; `Home`/`End` stay on the line; `Esc` cancels and
+    /// everything else passes. Edits happen in place: no key builds a new `String`.
     pub fn on_key(&mut self, key: KeyEvent, page: u16) -> AreaOutcome {
-        todo!()
+        if key.modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::META
+                | KeyModifiers::HYPER,
+        ) {
+            return AreaOutcome::Pass;
+        }
+        let page = usize::from(page.max(1));
+        match key.code {
+            KeyCode::Char(c) => {
+                if !c.is_control() {
+                    self.insert(c);
+                }
+            }
+            KeyCode::Enter => self.insert('\n'),
+            KeyCode::Backspace => {
+                if let Some(previous) = self.previous_boundary() {
+                    self.text.remove(previous);
+                    self.cursor = previous;
+                }
+                self.goal_col = None;
+            }
+            KeyCode::Delete => {
+                if self.cursor < self.text.len() {
+                    self.text.remove(self.cursor);
+                }
+                self.goal_col = None;
+            }
+            KeyCode::Left => {
+                self.cursor = self.previous_boundary().unwrap_or(self.cursor);
+                self.goal_col = None;
+            }
+            KeyCode::Right => {
+                self.cursor = self.next_boundary().unwrap_or(self.cursor);
+                self.goal_col = None;
+            }
+            KeyCode::Home => {
+                self.cursor = line_start(&self.text, self.cursor);
+                self.goal_col = None;
+            }
+            KeyCode::End => {
+                self.cursor = line_end(&self.text, self.cursor);
+                self.goal_col = None;
+            }
+            KeyCode::Up => self.move_lines(false, 1),
+            KeyCode::Down => self.move_lines(true, 1),
+            KeyCode::PageUp => self.move_lines(false, page),
+            KeyCode::PageDown => self.move_lines(true, page),
+            KeyCode::Esc => return AreaOutcome::Cancel,
+            _ => return AreaOutcome::Pass,
+        }
+        AreaOutcome::Consumed
     }
 
     /// At most `height` lines, each the `width`-char window of its line that keeps the cursor in
     /// view, for the caller to place in its own `Rect`.
+    ///
+    /// The viewport moves only as far as it must to show the cursor, and is remembered (D19), so a
+    /// cursor moving inside the window does not scroll it. Every line is `theme.base`; while
+    /// `focused`, the cursor cell (a space past the end of its line) is `theme.selected`. No room,
+    /// no lines.
     #[must_use]
     pub fn lines(
         &self,
@@ -108,7 +187,117 @@ impl TextArea {
         focused: bool,
         theme: &Theme,
     ) -> Vec<Line<'static>> {
-        todo!()
+        let (width, height) = (usize::from(width), usize::from(height));
+        if width == 0 || height == 0 {
+            return Vec::new();
+        }
+        let (line, col) = self.cursor_line_col();
+        let top = follow(self.top.get(), line, height);
+        let left = follow(self.left.get(), col, width);
+        self.top.set(top);
+        self.left.set(left);
+
+        self.text
+            .split('\n')
+            .enumerate()
+            .skip(top)
+            .take(height)
+            .map(|(index, text)| {
+                let mut chars = text.chars().skip(left);
+                if !(focused && index == line) {
+                    let window: String = chars.take(width).collect();
+                    return Line::from(Span::styled(window, theme.base));
+                }
+                let before: String = chars.by_ref().take(col - left).collect();
+                let at = chars.next().unwrap_or(' ');
+                let after: String = chars.take(left + width - col - 1).collect();
+                let mut spans = Vec::with_capacity(3);
+                if !before.is_empty() {
+                    spans.push(Span::styled(before, theme.base));
+                }
+                spans.push(Span::styled(at.to_string(), theme.selected));
+                if !after.is_empty() {
+                    spans.push(Span::styled(after, theme.base));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    }
+
+    /// How many lines the buffer holds: one more than its `\n`s.
+    fn line_count(&self) -> usize {
+        self.text.bytes().filter(|&b| b == b'\n').count() + 1
+    }
+
+    /// Inserts one char at the cursor and steps over it.
+    fn insert(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+        self.goal_col = None;
+    }
+
+    /// The char boundary before the cursor, if any.
+    fn previous_boundary(&self) -> Option<usize> {
+        self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(byte, _)| byte)
+    }
+
+    /// The char boundary after the cursor, if any.
+    fn next_boundary(&self) -> Option<usize> {
+        self.text[self.cursor..]
+            .chars()
+            .next()
+            .map(|c| self.cursor + c.len_utf8())
+    }
+
+    /// Moves `count` lines down (or up), clamped to the buffer, aiming for the goal column.
+    fn move_lines(&mut self, down: bool, count: usize) {
+        let (line, col) = self.cursor_line_col();
+        let goal = self.goal_col.unwrap_or(col);
+        let target = if down {
+            line.saturating_add(count).min(self.line_count() - 1)
+        } else {
+            line.saturating_sub(count)
+        };
+        let start = if target == 0 {
+            0
+        } else {
+            self.text
+                .match_indices('\n')
+                .nth(target - 1)
+                .map_or(self.text.len(), |(byte, _)| byte + 1)
+        };
+        let end = line_end(&self.text, start);
+        self.cursor = self.text[start..end]
+            .char_indices()
+            .nth(goal)
+            .map_or(end, |(byte, _)| start + byte);
+        self.goal_col = Some(goal);
+    }
+}
+
+/// The byte where the line holding byte `at` starts.
+fn line_start(text: &str, at: usize) -> usize {
+    text[..at].rfind('\n').map_or(0, |newline| newline + 1)
+}
+
+/// The byte where the line holding byte `at` ends (its `\n`, or the buffer's end).
+fn line_end(text: &str, at: usize) -> usize {
+    text[at..]
+        .find('\n')
+        .map_or(text.len(), |newline| at + newline)
+}
+
+/// The first visible index of a `span`-wide window that was at `first` and must now show `at`.
+const fn follow(first: usize, at: usize, span: usize) -> usize {
+    if at < first {
+        at
+    } else if at >= first + span {
+        at + 1 - span
+    } else {
+        first
     }
 }
 
