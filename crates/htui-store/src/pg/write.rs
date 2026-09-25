@@ -2131,7 +2131,7 @@ impl WriteStore for PgStore {
 
     /// D3 amended by blueprint D16: one `INSERT … SELECT … WHERE head IS NOT DISTINCT FROM $6 ON
     /// CONFLICT DO NOTHING`. Two saves at one head: the second blocks on the unique index and then
-    /// inserts nothing (probed on 16.13). Zero rows is split by one head read, [`cas_miss`]'s
+    /// inserts nothing (probed on 16.13). Zero rows is split by one head read, `cas_miss`'s
     /// shape. Bad input pays the head read first so a spent token still answers `Stale` (D18,
     /// review M2). A project or `created_by` that names no row is the FK's `23503`, which
     /// [`map_sqlx`] turns into [`StoreError::Constraint`].
