@@ -13,6 +13,7 @@ pub mod agent_worker;
 pub mod app;
 pub mod catalogue;
 pub mod cli;
+pub mod concepts;
 pub mod connection;
 pub mod event_loop;
 pub mod hierarchy;
@@ -50,7 +51,8 @@ use crate::keymap::Keymap;
 ///
 /// Startup order (blueprint D.4), and it matters: logging, then the two keyring flags — which exit
 /// **before** any terminal work, so the DSN is typed into a normal shell and never into a raw-mode
-/// terminal — then the backend, then the worker, then the shell, then the terminal.
+/// terminal — then the two concepts-index flags (MOD-34), which also print to the shell and exit,
+/// then the backend, then the worker, then the shell, then the terminal.
 ///
 /// The backend is always available immediately: `connect::start` opens the local mirror and hands
 /// back an offline backend, and the connection runs on its own task (ANA-9 §4.4). A missing DSN, an
@@ -74,6 +76,18 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
         secret::clear_dsn()?;
         eprintln!("DSN removed from the OS keyring.");
         return Ok(());
+    }
+    if args.index_items {
+        return concepts::index_items(args.project.as_deref()).await;
+    }
+    if let Some(query) = args.search_items {
+        return concepts::search_items(&concepts::SearchOptions {
+            query,
+            project: args.project,
+            decisions: args.decisions,
+            limit: args.limit.unwrap_or(concepts::DEFAULT_LIMIT),
+        })
+        .await;
     }
 
     let started = if args.demo {

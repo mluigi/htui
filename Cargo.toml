@@ -106,7 +106,6 @@ sentry-anyhow         = "0.49.2"
 sentry-tracing        = "0.49.2"
 qdrant-client         = "1.19.0"
 fastembed             = "3.14.1"
-ort                   = { version = "=2.0.0-rc.4", default-features = false, features = ["download-binaries"] }
 ureq                  = { version = "2.12.1", features = ["tls"] }
 walkdir               = "2"
 # MOD-4 milestone 3 (plan D22, D47): every read and every ref write of the isolator. No default

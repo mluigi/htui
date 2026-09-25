@@ -3087,7 +3087,6 @@ dependencies = [
  "htui-core",
  "htui-store",
  "keyring",
- "ort",
  "qdrant-client",
  "rustls",
  "serde",
@@ -3100,7 +3099,6 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
- "walkdir",
  "windows-registry",
  "zeroize",
 ]

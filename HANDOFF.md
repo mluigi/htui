@@ -14,19 +14,20 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-25):** **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`):
+**Current status (2026-09-25):** **MOD-34 was done** (`docs/decisions/mod/mod-34.md`, new
+`R-STO-8`): Postgres items and their latest documents are indexed into Qdrant (BGE-small dense plus
+BM25 sparse, RRF-fused, scoped by project, filterable to decisions) through `htui --index-items` and
+`htui --search-items`; the agent tool waits on MOD-11, automatic sync on MOD-41, requirements on
+MOD-38.
+Before it, **ANA-17 was concluded** (`docs/decisions/ana/ana-17.md`): the
+prompt's section framing is **not** calibrated per model. The `<section>` wrapper and the blank line
+between blocks under one placeholder are one frame for every model, and the blank line is now
+settled contract rather than MOD-2's placeholder. No item spawned; a note on MOD-36 corrects the
+estimator seam.
+Before it, **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`):
 requirements get dedicated tables with suspect-aware item citations; a decision is a closed item with
 a new `item.resolution` and its `summary` document. Spawned MOD-38 (schema, blocked on the
 maintainer applying `docs/ANA-11.md` §7) and MOD-39 (TUI).
-Before it, **ANA-16 was done** (2026-09-24, `docs/decisions/ana/ana-16.md`): remote and container
-execution is a headless `htui worker` per box on Postgres first (MOD-40..46), with a self-hosted
-control plane and config manager as trigger-gated phase 2 (MOD-47, MOD-48); requirement amendments
-are open questions inside those items.
-Before it, **MOD-4 was done** (`docs/decisions/mod/mod-4.md`): the
-orchestrator runs in manual mode across all six milestones. `htui-orch` walks step graphs with gates,
-the review loop, judged fan-out and four git isolation modes under a leased heartbeat and a recovery
-sweep, and `run_worker.rs` and the Runs pane let the maintainer drive it, promote a step to chat and
-close an item out. Its carried risks are **MOD-37** and **CLEAN-4**.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default` and `0005_box_identity` (MOD-7 milestone 1; cache: `0001`..`0003`),
 so **the next migration is `0006`**. Pins moved by MOD-7 milestone 1: store `CASES` 56,
@@ -62,7 +63,9 @@ CLI's own directory (MOD-21).
 **Concluded analyses the open items lean on:** ANA-10 (`docs/decisions/ana/ana-10.md`) — **its
 verdict is withdrawn**, see MOD-25 (`docs/decisions/mod/mod-25.md`); the document stays in the tree
 as the analysis that was done and not taken, and anything leaning on its local-only half is stale;
-ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration;
+ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration, with
+ANA-17 (`docs/decisions/ana/ana-17.md`) settling its block separator and keeping one frame for
+every model;
 ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
 `htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-7, MOD-9, MOD-11, MOD-12, MOD-13
 and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
@@ -74,18 +77,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 ### Analyses
 
 
-- [ ] **ANA-17 - Per-model calibration of the prompt's section framing** (from MOD-2, finding F-37).
-  `R-PRM-1`, `R-PRM-2`. ANA-5 fixes the `<section name="...">` wrapper but never fixes what separates
-  the N blocks a single placeholder expands to — `{{documents}}` renders one block per document,
-  `{{candidates}}` one per candidate. MOD-2 shipped a blank line between them
-  (`prompt/render.rs`, stable under §4.7 step 5's "collapse 3+ LFs to 2"), chosen for readability
-  rather than measured against any model. The question this analysis owns is whether the framing
-  should be **calibrated per model at all** — separator, and plausibly the wrapper itself — since
-  the registry already carries a row per agent and `TokenEstimator::for_agent` already varies by
-  model family (D108). Any verdict has to price the cost of varying it: the separator bytes are
-  digest input, so a per-model frame means `prompt_digest` is only comparable within one model, and
-  every golden snapshot in `crates/htui-core/tests/snapshots/` is re-recorded on each change. Leave
-  the current blank line in place until this concludes.
 - [ ] **ANA-21 - Per-model weights for agent assignment, derived from public sources** (from MOD-4
   milestone 4, OQ-7; maintainer-requested 2026-09-23; MOD-4 is done, `docs/decisions/mod/mod-4.md`).
   `R-AGT-8`, `R-ORCH-7`. Blocks MOD-36.
@@ -96,6 +87,11 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   the weight or stays a separate quota concern (ANA-4). Deliver: the weight table's schema and where
   it lives (`agent` row, `app_setting`, or a new table), a refresh method (manual, scripted from
   named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
+  **Findings committed (2026-09-25):** draft verdict in `docs/ANA-21.md` (coarse tiers per phase
+  name in `agent.settings.weights`, cost kept out, deterministic slot rule, manual refresh, draft
+  initial values). Still open: the session's proxy blocked most benchmark and vendor pages, so the
+  figures in §3.3 and the initial values in §5.7 are second-hand and must be re-read from primary
+  sources, and the maintainer calls in §7 are undecided. No close-out yet.
 
 ### Next features
 - [ ] **MOD-38 - Requirements schema, seam and close-out resolution** (from ANA-11). `R-ENT-8`,
@@ -108,6 +104,9 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   only for `rejected`/`withdrawn`/`superseded`/`duplicate`, which amends ANA-2 §4.3. The demo fixture
   gains requirements with one suspect citation. **Blocked on a maintainer decision:** apply or
   amend the requirement text proposed in `docs/ANA-11.md` §7 to `docs/REQUIREMENTS.md` first.
+  **MOD-34 left two things here** (`docs/decisions/mod/mod-34.md`, `R-STO-8`): index requirements
+  into the concepts collection as `type = requirement` points, and add `item.resolution` to the
+  point payload so `htui --search-items --decisions` stops meaning "done or closed".
 - [ ] **MOD-39 - Requirements tab and item traceability** (from ANA-11; blocked on MOD-38).
   `R-TUI-1`, `R-TUI-9`, proposed `R-ENT-14..15`. Requirements tab (areas, requirements, coverage by
   citing item with status and resolution, withdrawn rows dimmed, revision trail with the deciding
@@ -192,7 +191,11 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   families need either the tightest budget or per-candidate trimming, which breaks "identical prompt
   across siblings" (ANA-5 `:1870`); each candidate draws on its own agent's quota; the judge must not
   learn which model wrote which candidate (position-bias control extends to model-identity bias).
-- [ ] **MOD-34 - Qdrant related concepts search** (from ANA-19). Update `compose.yaml` to include the `qdrant/qdrant` image. Introduce `VectorStore` trait and `QdrantStore`. Implement local embedding generation using `fastembed-rs` (avoiding external APIs per ANA-20). Implement hybrid search (Dense + BM25) and single-collection payload indexing for `docs/` and items, then wire semantic search to the `search_concepts` MCP tool.
+  **ANA-17 note (2026-09-25, `docs/decisions/ana/ana-17.md`):** the section framing is one frame for
+  every model, so the estimator is the only thing a mixed-family group can diverge on. The function is
+  `TokenEstimator::for_model` (keyed on a model id), not `for_agent`, and every production
+  `PromptSpec` passes `TokenEstimator::DEFAULT` today (`htui-orch/src/engine.rs:4323`, `:4945`,
+  `htui/src/preview.rs:252`), so choosing it per group or per candidate is new wiring.
 - [ ] **MOD-33 - The box hostname leaves the digest and gains a settings switch** (from MOD-2,
   finding L-5; maintainer-decided 2026-09-16). `R-PRM-1`, `R-PRM-3`, `R-TUI-8`. Two changes to the
   box section (`prompt/render.rs`, the §4.2 projection over `BoxProfile`):
@@ -343,6 +346,8 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   clear once `document_write` exists.
   **Relates to ANA-16** (`docs/ANA-16.md` §8): the MCP server must be reachable inside a container
   or on a remote box, and a stdio `McpServerSpec` must be launchable there (MOD-44, MOD-41).
+  **MOD-34 left the `search_concepts` tool here** (`docs/decisions/mod/mod-34.md`): expose
+  `htui_store::vector::VectorStore::search` (`R-STO-8`), scoped to the step's projects.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
@@ -547,6 +552,9 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   (`crates/htui/src/run_worker.rs`, whose crate depends on `ratatui` and `crossterm`), so moving it
   into a library crate the TUI and `htui worker` both link is part of this item; no worker-store
   trait exists yet either. The MOD-4 (M6) dependency is met.
+  **MOD-34 left the concepts-index sync here** (`docs/decisions/mod/mod-34.md`, `R-STO-8`):
+  run `htui_store::vector_sync::Indexer::sync` as a background job; until then it is
+  `htui --index-items`.
 - [ ] **MOD-42 - Permission and control relay through Postgres** (from ANA-16, §8 item 3).
   `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`record.rs:1684-1703`) cannot answer a
   parked ACP request, so engine-driven ACP steps fail on their first permission request today. The
@@ -647,7 +655,7 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 2 (ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 35 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
+| MOD-N   | 34 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
