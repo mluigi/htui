@@ -48,10 +48,11 @@ pub struct Args {
     #[arg(long, requires = "search_items", conflicts_with = "index_items")]
     pub decisions: bool,
 
-    /// With `--search-items`: how many hits to print (default 10).
+    /// With `--search-items`: how many hits to print, 1 to 1000 (default 10).
     #[arg(
         long,
         value_name = "N",
+        value_parser = clap::value_parser!(u64).range(1..=1000),
         requires = "search_items",
         conflicts_with = "index_items"
     )]
@@ -102,6 +103,14 @@ mod tests {
             &["htui", "--decisions"],
             &["htui", "--index-items", "--decisions"],
             &["htui", "--index-items", "--limit", "3"],
+            &["htui", "--search-items", "q", "--limit", "0"],
+            &[
+                "htui",
+                "--search-items",
+                "q",
+                "--limit",
+                "18446744073709551615",
+            ],
         ] {
             assert!(Args::try_parse_from(bad).is_err(), "{bad:?} must not parse");
         }

@@ -40,9 +40,6 @@ impl FastEmbedder {
     pub fn new() -> Result<Self, StoreError> {
         use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-        // The first run downloads the model over TLS. `Err` means a provider is already
-        // installed, which is the outcome wanted (see `htui_agent::install::http`).
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut options = InitOptions {
             model_name: EmbeddingModel::BGESmallENV15,
             show_download_progress: false,

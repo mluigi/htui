@@ -152,9 +152,15 @@ pub fn format_hit(hit: &Hit) -> String {
         (PointType::Document, Some((_, kind))) => format!("{kind} document"),
         _ => "item".to_owned(),
     };
+    // The snippet is already stripped of control characters (`vector::snippet`); the key and the
+    // document kind are stripped here, so nothing stored can drive the terminal it is printed on.
+    let clean = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
     format!(
         "{:<10} {:<18} {:.3}  {}",
-        hit.key, place, hit.score, hit.snippet
+        clean(&hit.key),
+        clean(&place),
+        hit.score,
+        hit.snippet
     )
 }
 

@@ -80,6 +80,23 @@ A first pass had landed unlabelled inside the import commit `2698f0b`: a `qdrant
   `fast_embedder_returns_384_dims`). The proxy blocks HuggingFace. It needs one run on a box with
   network.
 
+## Review
+
+The configured reviewer (`rust-reviewer`) found no blocking defects. Three fixes were applied:
+- qdrant-client's compatibility check is skipped, because it printed to stdout and blocked on its
+  own health probe;
+- `--limit` is bounded to 1..=1000, and the prefetch depth uses a saturating multiply;
+- control characters are stripped from snippets, keys and document kinds before printing.
+
+Deferred:
+- Points whose payload no longer parses are invisible to `indexed()`, so a sync never deletes them.
+  This matters once MOD-38 writes `requirement` points.
+- A change to the chunking rules needs a new collection name, because document freshness compares
+  IDs, not the way the text was split.
+- `FastEmbedder::new` loads the model synchronously. That is fine for the CLI, but it should move to
+  the blocking pool when MOD-41 reuses it.
+- Each sync makes one `documents()` query per item.
+
 ## Build note
 
 `ort 2.0.0-rc.4` downloads onnxruntime from `parcel.pyke.io` at build time whenever `local-embed` is

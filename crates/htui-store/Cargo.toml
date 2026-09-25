@@ -19,7 +19,7 @@ test-support = ["demo"]
 # MOD-34 D2: the production embedder (`embed::FastEmbedder`). Off by default because `ort`
 # downloads onnxruntime at build time; the `htui` binary turns it on. Offline builds can point
 # `ORT_LIB_LOCATION` at a local onnxruntime 1.18 instead.
-local-embed = ["dep:fastembed", "dep:rustls"]
+local-embed = ["dep:fastembed"]
 
 [dependencies]
 htui-core   = { workspace = true, features = ["sqlx"] }
@@ -39,8 +39,6 @@ tokio       = { workspace = true }
 tracing     = { workspace = true }
 qdrant-client      = { workspace = true }
 fastembed          = { workspace = true, optional = true }
-# `FastEmbedder::new` installs ring as the process provider before hf-hub downloads the model.
-rustls             = { workspace = true, optional = true }
 
 [dev-dependencies]
 htui-core = { workspace = true, features = ["test-support"] }

@@ -205,8 +205,16 @@ fn backend(context: &str, e: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(format!("qdrant: {context}: {e}"))
 }
 
+/// The start of `text`, whitespace folded and control characters dropped: item and document
+/// bodies are often agent-written, and a snippet ends up printed to a terminal.
 fn snippet(text: &str) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
     match flat.char_indices().nth(SNIPPET_CHARS) {
         Some((cut, _)) => format!("{}…", &flat[..cut]),
         None => flat,
@@ -351,7 +359,9 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         embedder: E,
         collection: &str,
     ) -> Result<Self, StoreError> {
-        let mut builder = Qdrant::from_url(&settings.url);
+        // No compatibility check: it prints to stdout (which `--search-items` owns) and blocks on
+        // its own health probe; `ensure_collection` fails fast on a bad server anyway.
+        let mut builder = Qdrant::from_url(&settings.url).skip_compatibility_check();
         if let Some(key) = &settings.api_key {
             builder = builder.api_key(key.as_str());
         }
@@ -380,9 +390,28 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             .collection_exists(&self.collection)
             .await
             .map_err(|e| backend("collection exists", e))?;
-        if exists {
-            return Ok(());
+        if !exists {
+            self.create_collection().await?;
         }
+        // Every time, not only on creation: re-creating an existing index is a no-op in Qdrant, and
+        // a first run that died between the collection and its indexes is repaired here.
+        for field in [TYPE, PROJECT_ID, STATUS, ITEM_ID] {
+            self.client
+                .create_field_index(
+                    CreateFieldIndexCollectionBuilder::new(
+                        &self.collection,
+                        field,
+                        FieldType::Keyword,
+                    )
+                    .wait(true),
+                )
+                .await
+                .map_err(|e| backend("create payload index", e))?;
+        }
+        Ok(())
+    }
+
+    async fn create_collection(&self) -> Result<(), StoreError> {
         let mut dense = VectorsConfigBuilder::default();
         dense.add_named_vector_params(
             DENSE,
@@ -401,19 +430,6 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             )
             .await
             .map_err(|e| backend("create collection", e))?;
-        for field in [TYPE, PROJECT_ID, STATUS, ITEM_ID] {
-            self.client
-                .create_field_index(
-                    CreateFieldIndexCollectionBuilder::new(
-                        &self.collection,
-                        field,
-                        FieldType::Keyword,
-                    )
-                    .wait(true),
-                )
-                .await
-                .map_err(|e| backend("create payload index", e))?;
-        }
         Ok(())
     }
 }
@@ -504,7 +520,7 @@ impl<E: DenseEmbedder> VectorStore for QdrantStore<E> {
         let sparse = sparse_pairs(&bm25::query_vector(&query.text));
         let filter = search_filter(query);
         // Each arm fetches more than the final limit so the fusion has overlap to work with.
-        let depth = (query.limit * 4).max(20);
+        let depth = query.limit.saturating_mul(4).max(20);
         let mut request = QueryPointsBuilder::new(&self.collection)
             .add_prefetch(
                 PrefetchQueryBuilder::default()
@@ -714,6 +730,7 @@ mod tests {
     #[test]
     fn snippets_are_flattened_and_capped() {
         assert_eq!(snippet("a\n\n  b"), "a b");
+        assert_eq!(snippet("x\u{1b}]52;c;AAAA\u{7}y"), "x]52;c;AAAAy");
         let long = "x".repeat(SNIPPET_CHARS + 10);
         assert_eq!(snippet(&long).chars().count(), SNIPPET_CHARS + 1);
     }
