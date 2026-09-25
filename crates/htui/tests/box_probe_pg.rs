@@ -240,13 +240,13 @@ impl Stack {
         .expect("read this box's tools")
     }
 
-    /// How many `box` rows carry this box's id.
-    async fn rows(&self) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM box WHERE id = $1")
-            .bind(self.box_id().as_uuid())
+    /// How many `box` rows this user has: a registration that minted a second row shows here.
+    async fn boxes_of_this_user(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM box WHERE user_id = $1")
+            .bind(self.db.store.this_user().as_uuid())
             .fetch_one(self.pool())
             .await
-            .expect("count this box's rows")
+            .expect("count this user's boxes")
     }
 
     async fn drop_db(self) {
@@ -409,7 +409,7 @@ async fn a_renamed_box_keeps_its_row_and_its_probe() {
         ),
         "a rename is the same box: {answer:?}"
     );
-    assert_eq!(stack.rows().await, 1, "one row");
+    assert_eq!(stack.boxes_of_this_user().await, 1, "one row");
     let hostname: String = sqlx::query_scalar("SELECT hostname FROM box WHERE id = $1")
         .bind(stack.box_id().as_uuid())
         .fetch_one(stack.pool())
