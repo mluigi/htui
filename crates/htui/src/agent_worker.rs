@@ -120,11 +120,19 @@ pub struct BoxProbeReport {
 
 impl BoxProbeReport {
     /// The status-line sentence (blueprint D25): the head, then the install offer, the agent
-    /// half's failure and the ignored spec, each only when there is one.
+    /// half's failure and the ignored spec, each only when there is one. An
+    /// [`unchanged`](Self::unchanged) report probed nothing, so it says only that and the
+    /// ignored spec.
     #[must_use]
     pub fn status_line(&self) -> String {
         use core::fmt::Write as _;
 
+        if self.unchanged {
+            return match &self.spec_error {
+                Some(error) => format!("box probe unchanged · {error}"),
+                None => "box probe unchanged".to_owned(),
+            };
+        }
         let mut line = match &self.box_failed {
             Some(message) => format!("box probe failed: {message}"),
             None if self.probed_tags.is_empty() => {
@@ -2054,9 +2062,10 @@ impl core::fmt::Debug for BoxProbeArgs {
 /// One [`EffectiveSpec`](box_probe::spec::EffectiveSpec) is computed from the stored
 /// `box_probe_spec` and used for both the decision and the probe, so the digest compared and the
 /// digest recorded cannot differ. With `decide`, a box probed by this `htui` under this spec is
-/// left alone and **nothing is sent**: a reconnect costs three reads. Otherwise exactly one
-/// [`StoreReply::BoxProbed`] goes back, failures included — never a `Failed`, which the shell
-/// would drop at [`UNSOLICITED`] (blueprint F-D).
+/// left alone and a reconnect costs three reads; **nothing is sent** unless the stored spec was
+/// ignored, which one [`unchanged`](BoxProbeReport::unchanged) report names at every reconnect
+/// (plan D17). Otherwise exactly one [`StoreReply::BoxProbed`] goes back, failures included —
+/// never a `Failed`, which the shell would drop at [`UNSOLICITED`] (blueprint F-D).
 async fn run_box_probe(args: BoxProbeArgs) {
     let BoxProbeArgs {
         backend,
@@ -2100,7 +2109,15 @@ async fn run_box_probe(args: BoxProbeArgs) {
             Ok(records) => match records.iter().find(|record| record.row.id == box_id) {
                 Some(record) if record.needs_probe(htui_store::HTUI_VERSION, &effective.digest) => {
                 }
-                Some(_) => return,
+                // Probed already, but an ignored overlay is still worth saying: the maintainer
+                // who stored it would otherwise never hear that it did not merge.
+                Some(_) => {
+                    if effective.error.is_some() {
+                        report.unchanged = true;
+                        send(report);
+                    }
+                    return;
+                }
                 None => {
                     tracing::warn!(%box_id, "this box is not among the user's boxes; no probe");
                     return;
