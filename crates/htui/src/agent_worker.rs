@@ -7929,7 +7929,68 @@ done
         );
         let report = the_report(&replies);
         assert_eq!(report.installable, ["installable"]);
+        assert!(
+            report
+                .status_line()
+                .contains("installable is missing and can be installed: Settings > Agents, i"),
+            "the install offer: {}",
+            report.status_line()
+        );
         assert!(!runtime.install_running());
+    }
+
+    /// Blueprint D25: the status line is the head, then the install offer, the agent half's
+    /// failure and the ignored spec, in that order and each only when there is one.
+    #[test]
+    fn the_status_line_reads_each_part_in_order() {
+        let probed = BoxProbeReport {
+            tools: 2,
+            probed_tags: vec!["gpu".to_owned(), "rust".to_owned()],
+            ..BoxProbeReport::default()
+        };
+        assert_eq!(probed.status_line(), "box probed: 2 tools · tags gpu, rust");
+
+        assert_eq!(
+            BoxProbeReport::default().status_line(),
+            "box probed: 0 tools · no tags"
+        );
+
+        let failed = BoxProbeReport {
+            box_failed: Some("x".to_owned()),
+            ..BoxProbeReport::default()
+        };
+        assert_eq!(failed.status_line(), "box probe failed: x");
+
+        let one = BoxProbeReport {
+            installable: vec!["a".to_owned()],
+            ..BoxProbeReport::default()
+        };
+        assert_eq!(
+            one.status_line(),
+            "box probed: 0 tools · no tags · a is missing and can be installed: Settings > Agents, i"
+        );
+
+        let two = BoxProbeReport {
+            installable: vec!["a".to_owned(), "b".to_owned()],
+            ..BoxProbeReport::default()
+        };
+        assert_eq!(
+            two.status_line(),
+            "box probed: 0 tools · no tags · a, b are missing and can be installed: \
+             Settings > Agents, i"
+        );
+
+        let all = BoxProbeReport {
+            installable: vec!["a".to_owned()],
+            agents_failed: Some("y".to_owned()),
+            spec_error: Some("z".to_owned()),
+            ..probed
+        };
+        assert_eq!(
+            all.status_line(),
+            "box probed: 2 tools · tags gpu, rust · a is missing and can be installed: \
+             Settings > Agents, i · agent probe failed: y · z"
+        );
     }
 
     /// Blueprint D27: an install is refused while the registration probe holds the claim.
