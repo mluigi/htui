@@ -13,9 +13,9 @@
 //! render side never holds a `UserId` (`R-NF-3`). Nothing here reads the clock; the store stamps
 //! both instants.
 
-use htui_core::model::{ProjectId, PromptTemplate};
-use htui_core::store::Result;
-use htui_store::Backend;
+use htui_core::model::{NewPromptTemplate, ProjectId, PromptTemplate, PromptTemplateId, Scope};
+use htui_core::store::{CasOutcome, Result, StoreError, WriteStore};
+use htui_store::{Backend, DATABASE_UNREACHABLE};
 
 use crate::store_worker::{StoreReply, StoreRequest};
 
@@ -42,14 +42,47 @@ impl TemplatesSnapshot {
     /// passes. `None` when the project is not in the snapshot or holds no such name.
     #[must_use]
     pub fn head(&self, project: ProjectId, name: &str) -> Option<&PromptTemplate> {
-        todo!("{project} {name}")
+        self.named(project, name).max_by_key(|row| row.version)
     }
 
     /// One version of `(project, name)`.
     #[must_use]
     pub fn version(&self, project: ProjectId, name: &str, version: i32) -> Option<&PromptTemplate> {
-        todo!("{project} {name} {version}")
+        self.named(project, name).find(|row| row.version == version)
     }
+
+    /// Every version of `(project, name)`, in snapshot order.
+    fn named<'a, 'n>(
+        &'a self,
+        project: ProjectId,
+        name: &'n str,
+    ) -> impl Iterator<Item = &'a PromptTemplate> + use<'a, 'n> {
+        self.projects
+            .iter()
+            .filter(move |entry| entry.project_id == project)
+            .flat_map(|entry| entry.templates.iter())
+            .filter(move |row| row.name == name)
+    }
+}
+
+/// One read of the scope: `Backend::prompt_templates` for each id of `scope.project_ids`, in that
+/// order. N reads on purpose, per event and never per keystroke, as [`crate::prompt_settings`]
+/// does. Unlike that module, an id that names no project yields an empty entry rather than being
+/// skipped: `prompt_templates` answers an empty list for it, and a second read to tell the two
+/// apart would buy the view nothing.
+///
+/// # Errors
+/// Whatever the backend reports; offline, [`StoreError::Unreachable`] with
+/// [`htui_store::PROMPT_ON_SERVER_ONLY`].
+pub async fn snapshot(backend: &Backend, scope: &Scope) -> Result<TemplatesSnapshot> {
+    let mut projects = Vec::with_capacity(scope.project_ids.len());
+    for id in &scope.project_ids {
+        projects.push(ProjectTemplates {
+            project_id: *id,
+            templates: backend.prompt_templates(*id).await?,
+        });
+    }
+    Ok(TemplatesSnapshot { projects })
 }
 
 /// The two request names, in [`StoreRequest`] order.
@@ -69,11 +102,52 @@ pub const READ_NAME: &str = REQUEST_NAMES[0];
 /// for the read and `DATABASE_UNREACHABLE` for the save; [`StoreError::Backend`] for a request
 /// that is not one of this module's two.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
-    todo!(
-        "MOD-9 D5: the template read and the CAS save ({}, {})",
-        backend.label(),
-        request.name()
-    )
+    match request {
+        // The read goes through `Backend` rather than a `Writer`: `prompt_templates` is inherent on
+        // each store and refuses offline with its own sentence, which is the one the view shows.
+        StoreRequest::Templates(scope) => Ok(StoreReply::Templates(Box::new(
+            snapshot(backend, scope).await?,
+        ))),
+        StoreRequest::SaveTemplate {
+            scope,
+            project,
+            name,
+            body,
+            expected,
+        } => {
+            let writer = backend
+                .writer()
+                .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
+            let created_by = backend.this_user().await?;
+            let outcome = writer
+                .append_prompt_template(
+                    NewPromptTemplate {
+                        id: PromptTemplateId::new(),
+                        project_id: *project,
+                        name: name.clone(),
+                        body: body.clone(),
+                        created_by,
+                    },
+                    *expected,
+                )
+                .await?;
+            // The worker re-reads rather than handing the view the one row the outcome carries:
+            // the view renders a tree, and a row patched in locally would be a second source of
+            // truth (the `cas` shape of `catalogue.rs` and `prompt_settings.rs`).
+            let fresh = Box::new(snapshot(backend, scope).await?);
+            Ok(match outcome {
+                CasOutcome::Applied(_) => StoreReply::Templates(fresh),
+                CasOutcome::Stale(_) => StoreReply::TemplatesStale(fresh),
+            })
+        }
+        // `try_serve` routes exactly this module's two variants here, so the last arm is
+        // unreachable from the shell; a caller that reached it anyway is better told which request
+        // it sent than killed.
+        other => Err(StoreError::Backend(format!(
+            "not a template request: {}",
+            other.name()
+        ))),
+    }
 }
 
 #[cfg(test)]
