@@ -15,13 +15,14 @@ use std::collections::BTreeMap;
 
 use htui_core::model::{
     Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
-    BoxTool, CommandQueue, CoverageRow, Document, DocumentHead, DocumentId, Gate, GateOutcome,
-    Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, LinkEdge, LinkGraph,
-    LinkKind, Note, PhaseAgent, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
-    PromptTemplate, Repo, RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementFilter,
-    RequirementId, RequirementRevision, RequirementSpec, ResolvedGraph, ResolvedInput,
-    ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunStepTree, RunSummary, Scope, SessionEvent, SkillId, SkillVersion, StepGraph, StepGraphId,
+    BoxTool, CitationKind, CommandQueue, CoverageRow, Document, DocumentHead, DocumentId, Gate,
+    GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemSummary, LinkEdge, LinkGraph, LinkKind, Note, PhaseAgent, PhaseId, Priority, Project,
+    ProjectId, ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementRevision,
+    RequirementSpec, RequirementState, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
+    Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree,
+    RunSummary, Scope, SessionEvent, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
     StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, VerifyOutcome, Workspace,
     WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
@@ -65,11 +66,7 @@ impl ReadStore for PgStore {
     /// `array_position`, so the Backlog list renders the statement's order directly. The readiness
     /// conjunct is ANA-9 §7.4's `NOT EXISTS` plus `status = 'open'`, compared against the wanted
     /// boolean so `ready: Some(false)` selects the *not*-ready items.
-    async fn items(
-        &self,
-        scope: &Scope,
-        filter: &ItemFilter,
-    ) -> Result<Vec<htui_core::model::ItemSummary>> {
+    async fn items(&self, scope: &Scope, filter: &ItemFilter) -> Result<Vec<ItemSummary>> {
         if scope.is_empty() {
             return Ok(Vec::new()); // `= ANY('{}')` is false for every row; skip the round trip.
         }
@@ -82,7 +79,7 @@ impl ReadStore for PgStore {
         });
 
         sqlx::query_as!(
-            htui_core::model::ItemSummary,
+            ItemSummary,
             r#"
             SELECT i.id            AS "id: ItemId",
                    i.project_id    AS "project_id: ProjectId",
@@ -832,41 +829,288 @@ impl ReadStore for PgStore {
             .collect())
     }
 
-    // ---- ANA-11 §5.1 (MOD-38): stubs until T8 makes them real ----
+    // ---- ANA-11 §5.1 (MOD-38) ----
+    //
+    // Every ordering over text is `COLLATE "C"`, which is byte order: the seam promises bytes
+    // (blueprint §4.1), and `MemStore` and the mirror compare bytes whatever the database's default
+    // collation is. `suspect` is derived in the statement and never stored (plan D11).
 
-    async fn requirement_spec(&self, _project: ProjectId) -> Result<Option<RequirementSpec>> {
-        unimplemented!("MOD-38 T8")
+    /// The project's one `requirement_spec` row, or `None`.
+    async fn requirement_spec(&self, project: ProjectId) -> Result<Option<RequirementSpec>> {
+        sqlx::query_as!(
+            RequirementSpec,
+            r#"
+            SELECT project_id AS "project_id: ProjectId",
+                   owner_id   AS "owner_id: UserId",
+                   preamble,
+                   version,
+                   updated_at
+              FROM requirement_spec WHERE project_id = $1
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
-    async fn requirement_areas(&self, _project: ProjectId) -> Result<Vec<RequirementArea>> {
-        unimplemented!("MOD-38 T8")
+    /// The project's areas in `(position, code)` order.
+    async fn requirement_areas(&self, project: ProjectId) -> Result<Vec<RequirementArea>> {
+        sqlx::query_as!(
+            RequirementArea,
+            r#"
+            SELECT id         AS "id: RequirementAreaId",
+                   project_id AS "project_id: ProjectId",
+                   code,
+                   title,
+                   description,
+                   position,
+                   updated_at
+              FROM requirement_area
+             WHERE project_id = $1
+             ORDER BY position, code COLLATE "C"
+            "#,
+            project.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
+    /// Every [`RequirementFilter`] field in SQL, the way `items` binds [`ItemFilter`] (plan D14),
+    /// in `(area_code, number)` order.
     async fn requirements(
         &self,
-        _project: ProjectId,
-        _filter: &RequirementFilter,
+        project: ProjectId,
+        filter: &RequirementFilter,
     ) -> Result<Vec<Requirement>> {
-        unimplemented!("MOD-38 T8")
+        let states = filter.states.as_ref().map(|list| {
+            list.iter()
+                .map(|s| s.as_str().to_owned())
+                .collect::<Vec<_>>()
+        });
+        let priorities = filter.priorities.as_ref().map(|list| {
+            list.iter()
+                .map(|p| p.as_str().to_owned())
+                .collect::<Vec<_>>()
+        });
+
+        sqlx::query_as!(
+            Requirement,
+            r#"
+            SELECT r.id         AS "id: RequirementId",
+                   r.project_id AS "project_id: ProjectId",
+                   r.area_id    AS "area_id: RequirementAreaId",
+                   r.area_code,
+                   r.number,
+                   r.key        AS "key!",
+                   r.body,
+                   r.rationale,
+                   r.priority   AS "priority: Priority",
+                   r.state      AS "state: RequirementState",
+                   r.version,
+                   r.created_by AS "created_by: UserId",
+                   r.created_at,
+                   r.updated_at
+              FROM requirement r
+             WHERE r.project_id = $1
+               AND ($2::text[] IS NULL OR r.area_code = ANY($2))
+               AND ($3::text[] IS NULL OR r.state = ANY($3))
+               AND ($4::text[] IS NULL OR r.priority = ANY($4))
+               -- A literal substring, as in `items`: `position`, not ILIKE.
+               AND ($5::text IS NULL
+                    OR position(lower($5::text) in lower(r.key)) > 0
+                    OR position(lower($5::text) in lower(r.body)) > 0)
+             ORDER BY r.area_code COLLATE "C", r.number
+            "#,
+            project.as_uuid(),
+            filter.area_codes.as_deref(),
+            states.as_deref(),
+            priorities.as_deref(),
+            filter.text.as_deref(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
-    async fn requirement(&self, _id: RequirementId) -> Result<Option<Requirement>> {
-        unimplemented!("MOD-38 T8")
+    /// One requirement with every column.
+    async fn requirement(&self, id: RequirementId) -> Result<Option<Requirement>> {
+        sqlx::query_as!(
+            Requirement,
+            r#"
+            SELECT id         AS "id: RequirementId",
+                   project_id AS "project_id: ProjectId",
+                   area_id    AS "area_id: RequirementAreaId",
+                   area_code,
+                   number,
+                   key        AS "key!",
+                   body,
+                   rationale,
+                   priority   AS "priority: Priority",
+                   state      AS "state: RequirementState",
+                   version,
+                   created_by AS "created_by: UserId",
+                   created_at,
+                   updated_at
+              FROM requirement WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
+    /// Always `Some`: Postgres holds every revision, so an unknown id is an empty history rather
+    /// than "not cached" (plan D12).
     async fn requirement_revisions(
         &self,
-        _id: RequirementId,
+        id: RequirementId,
     ) -> Result<Option<Vec<RequirementRevision>>> {
-        unimplemented!("MOD-38 T8")
+        sqlx::query_as!(
+            RequirementRevision,
+            r#"
+            SELECT requirement_id     AS "requirement_id: RequirementId",
+                   version,
+                   body,
+                   rationale,
+                   priority           AS "priority: Priority",
+                   state              AS "state: RequirementState",
+                   author_id          AS "author_id: UserId",
+                   box_id             AS "box_id: BoxId",
+                   reason,
+                   amended_by_item_id AS "amended_by_item_id: ItemId",
+                   created_at
+              FROM requirement_revision
+             WHERE requirement_id = $1
+             ORDER BY version
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(Some)
+        .map_err(map_sqlx)
     }
 
-    async fn item_requirements(&self, _item: ItemId) -> Result<Vec<ItemCitation>> {
-        unimplemented!("MOD-38 T8")
+    /// The item's live citations, each joined to the requirement as it is now, in
+    /// `(area_code, number, kind)` order.
+    async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT r.id                   AS "id!: RequirementId",
+                   r.project_id           AS "project_id!: ProjectId",
+                   r.area_id              AS "area_id!: RequirementAreaId",
+                   r.area_code            AS "area_code!",
+                   r.number               AS "number!",
+                   r.key                  AS "key!",
+                   r.body                 AS "body!",
+                   r.rationale            AS "rationale!",
+                   r.priority             AS "priority!: Priority",
+                   r.state                AS "state!: RequirementState",
+                   r.version              AS "version!",
+                   r.created_by           AS "created_by!: UserId",
+                   r.created_at           AS "created_at!",
+                   r.updated_at           AS "updated_at!",
+                   ir.kind                AS "kind!: CitationKind",
+                   ir.requirement_version AS "requirement_version!",
+                   ir.proposed_by_step_id AS "proposed_by_step_id?: StepId",
+                   r.version > ir.requirement_version AS "suspect!"
+              FROM item_requirement ir
+              JOIN requirement r ON r.id = ir.requirement_id
+             WHERE ir.item_id = $1 AND ir.deleted_at IS NULL
+             ORDER BY r.area_code COLLATE "C", r.number, ir.kind COLLATE "C"
+            "#,
+            item.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| ItemCitation {
+                requirement: Requirement {
+                    id: row.id,
+                    project_id: row.project_id,
+                    area_id: row.area_id,
+                    area_code: row.area_code,
+                    number: row.number,
+                    key: row.key,
+                    body: row.body,
+                    rationale: row.rationale,
+                    priority: row.priority,
+                    state: row.state,
+                    version: row.version,
+                    created_by: row.created_by,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                },
+                kind: row.kind,
+                requirement_version: row.requirement_version,
+                proposed_by_step_id: row.proposed_by_step_id,
+                suspect: row.suspect,
+            })
+            .collect())
     }
 
-    async fn requirement_coverage(&self, _requirement: RequirementId) -> Result<Vec<CoverageRow>> {
-        unimplemented!("MOD-38 T8")
+    /// The requirement's live citations, each joined to the citing item's summary and
+    /// resolution, in `(key_prefix, key_number, item id, kind)` order.
+    async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT i.id                   AS "id!: ItemId",
+                   i.project_id           AS "project_id!: ProjectId",
+                   i.kind_id              AS "kind_id!: ItemKindId",
+                   i.key                  AS "key!",
+                   i.key_prefix           AS "key_prefix!",
+                   i.key_number           AS "key_number!",
+                   i.title                AS "title!",
+                   i.status               AS "status!: Status",
+                   i.priority             AS "priority!",
+                   i.required_tags        AS "required_tags!",
+                   i.updated_at           AS "updated_at!",
+                   i.touched_paths        AS "touched_paths!",
+                   i.resolution           AS "resolution?: Resolution",
+                   ir.kind                AS "kind!: CitationKind",
+                   ir.requirement_version AS "requirement_version!",
+                   r.version > ir.requirement_version AS "suspect!"
+              FROM item_requirement ir
+              JOIN requirement r ON r.id = ir.requirement_id
+              JOIN item i        ON i.id = ir.item_id
+             WHERE ir.requirement_id = $1 AND ir.deleted_at IS NULL
+             ORDER BY i.key_prefix COLLATE "C", i.key_number, i.id, ir.kind COLLATE "C"
+            "#,
+            requirement.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| CoverageRow {
+                item: ItemSummary {
+                    id: row.id,
+                    project_id: row.project_id,
+                    kind_id: row.kind_id,
+                    key: row.key,
+                    key_prefix: row.key_prefix,
+                    key_number: row.key_number,
+                    title: row.title,
+                    status: row.status,
+                    priority: row.priority,
+                    required_tags: row.required_tags,
+                    updated_at: row.updated_at,
+                    touched_paths: row.touched_paths,
+                },
+                kind: row.kind,
+                resolution: row.resolution,
+                requirement_version: row.requirement_version,
+                suspect: row.suspect,
+            })
+            .collect())
     }
 }
 
@@ -1626,18 +1870,14 @@ impl PgStore {
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
-    pub async fn ready_items(
-        &self,
-        scope: &Scope,
-        box_id: BoxId,
-    ) -> Result<Vec<htui_core::model::ItemSummary>> {
+    pub async fn ready_items(&self, scope: &Scope, box_id: BoxId) -> Result<Vec<ItemSummary>> {
         if scope.is_empty() {
             return Ok(Vec::new()); // `= ANY('{}')` is false for every row; skip the round trip.
         }
         let projects = project_uuids(scope);
 
         sqlx::query_as!(
-            htui_core::model::ItemSummary,
+            ItemSummary,
             r#"
             SELECT i.id            AS "id: ItemId",
                    i.project_id    AS "project_id: ProjectId",

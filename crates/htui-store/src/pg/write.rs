@@ -8,7 +8,9 @@
 //! MOD-2's chat-run pair, which writes one `run` and one `run_step` and therefore takes an explicit
 //! transaction, exactly as the pending-buffer upload does (`crate::cache::pending`), and MOD-15's
 //! two deletes, which count and delete in one transaction **at `REPEATABLE READ`** so that the two
-//! statements share a snapshot as well (review M1; see [`begin_repeatable_read`]).
+//! statements share a snapshot as well (review M1; see [`begin_repeatable_read`]). MOD-38's amend,
+//! withdraw and `cite` also take one, because each decides a refusal on a row it has locked
+//! before it writes (see [`revise_requirement`]).
 //!
 //! There is **no `DELETE FROM item`** in this file and none may be added: §4.1's "keys are never
 //! reused" is enforced by the absence of the path, and the conformance case `no_delete_path` is
@@ -22,25 +24,27 @@ use htui_core::model::{
     Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
     NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
-    Project, ProjectId, ProjectPatch, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
-    RequirementSpec, RequirementUpdate, Resolution, Run, RunId, RunKind, RunMode, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, overlaps, scope_of,
+    Priority, Project, ProjectId, ProjectPatch, PromptTemplateId, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
+    RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung, StoreError,
-    StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, chat_step_status,
+    StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, chat_step_status, citation_key,
     close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
     finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move,
-    invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
-    not_a_fanout_candidate, not_a_terminal_status, references_no_row, reserved_phase_name,
-    resolution_not_closable, row_names_another_step, run_is_terminal, step_is_not_promotable,
-    summary_names_another_item, winner_is_not_settled,
+    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
+    legal_move, not_a_fanout_candidate, not_a_terminal_status, references_no_row,
+    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_step,
+    run_is_terminal, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -293,7 +297,7 @@ async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Opt
 /// What a project delete reaches, in one statement of scalar subqueries over `0001_init.sql`'s
 /// `ON DELETE CASCADE` chain (PRD D13, plan V11). `None` when no row has that id.
 ///
-/// The seven CTEs are the id sets the cascade walks, named as
+/// The nine CTEs are the id sets the cascade walks, named as
 /// [`MemStore`](htui_core::store::MemStore)'s `ProjectReach` names them, so the two backends count
 /// the same rows: `run` is reached by `project_id` **or** by an `item_id` of the project
 /// (`0001_init.sql:450` cascades from the item), and `item_link` by **either** end, tombstones
@@ -301,6 +305,10 @@ async fn workspace_reach(conn: &mut PgConnection, id: WorkspaceId) -> Result<Opt
 ///
 /// `command_run` hangs off `s` like `session_event` and `run_step_commit` do (`0001_init.sql:539`);
 /// plan V11's list of the cascade left it out and this is where that is corrected (review L1).
+///
+/// MOD-38's `ra` and `rq` are the project's requirement areas and requirements
+/// (`0005_requirements.sql`, blueprint §4.4). `item_requirement` is reached by **either** end, as
+/// `item_link` is: a citation from another project's item goes with the requirement it cites.
 ///
 /// `workspace_box_paths` is `0`: a project is not a workspace.
 async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<DeleteReach>> {
@@ -314,7 +322,9 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
              ph AS (SELECT id FROM step_graph_phase WHERE graph_id IN (SELECT id FROM g)),
              rp AS (SELECT id FROM repo             WHERE project_id = $1),
              t  AS (SELECT run_step_id FROM run_step_tree
-                     WHERE run_step_id IN (SELECT id FROM s))
+                     WHERE run_step_id IN (SELECT id FROM s)),
+             ra AS (SELECT id FROM requirement_area WHERE project_id = $1),
+             rq AS (SELECT id FROM requirement      WHERE project_id = $1)
         SELECT (SELECT count(*) FROM workspace_project WHERE project_id = $1) AS "workspace_links!",
                (SELECT count(*) FROM i)                                       AS "items!",
                (SELECT count(*) FROM item_key_counter WHERE project_id = $1)  AS "item_key_counters!",
@@ -345,7 +355,17 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
                  WHERE from_item_id IN (SELECT id FROM i)
                     OR to_item_id   IN (SELECT id FROM i))                    AS "links!",
                (SELECT count(*) FROM document
-                 WHERE item_id IN (SELECT id FROM i))                         AS "documents!"
+                 WHERE item_id IN (SELECT id FROM i))                         AS "documents!",
+               (SELECT count(*) FROM requirement_spec WHERE project_id = $1)  AS "requirement_specs!",
+               (SELECT count(*) FROM ra)                                      AS "requirement_areas!",
+               (SELECT count(*) FROM requirement_key_counter
+                 WHERE area_id IN (SELECT id FROM ra))                        AS "requirement_key_counters!",
+               (SELECT count(*) FROM rq)                                      AS "requirements!",
+               (SELECT count(*) FROM requirement_revision
+                 WHERE requirement_id IN (SELECT id FROM rq))                 AS "requirement_revisions!",
+               (SELECT count(*) FROM item_requirement
+                 WHERE item_id IN (SELECT id FROM i)
+                    OR requirement_id IN (SELECT id FROM rq))                 AS "item_requirements!"
           FROM project WHERE id = $1
         "#,
         id.as_uuid(),
@@ -377,14 +397,188 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
         revisions: rows(row.revisions),
         links: rows(row.links),
         documents: rows(row.documents),
-        // MOD-38: placeholders until T8 counts the requirement tables.
-        requirement_specs: 0,
-        requirement_areas: 0,
-        requirement_key_counters: 0,
-        requirements: 0,
-        requirement_revisions: 0,
-        item_requirements: 0,
+        requirement_specs: rows(row.requirement_specs),
+        requirement_areas: rows(row.requirement_areas),
+        requirement_key_counters: rows(row.requirement_key_counters),
+        requirements: rows(row.requirements),
+        requirement_revisions: rows(row.requirement_revisions),
+        item_requirements: rows(row.item_requirements),
     }))
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-38 helpers (ANA-11 §5.1, plan D9, D10).
+// ------------------------------------------------------------------------------------------------
+
+/// What an amend or a withdraw writes: the columns it moves (`None` leaves one as it is), the
+/// revision it records and the deciding item's citation (PRD D3).
+///
+/// [`WriteStore::amend_requirement`] and [`WriteStore::withdraw_requirement`] differ only in these
+/// values, so both are [`revise_requirement`] with a different edit.
+struct RequirementEdit {
+    body: Option<String>,
+    rationale: Option<String>,
+    priority: Option<Priority>,
+    state: Option<RequirementState>,
+    author_id: UserId,
+    box_id: Option<BoxId>,
+    reason: String,
+    decided_by: ItemId,
+    kind: CitationKind,
+}
+
+/// The compare-and-set of an amend or a withdraw, one transaction (plan D9, PRD D3).
+///
+/// The row is locked `FOR UPDATE` first, so the three refusals are decided against the version
+/// the write will move, in the seam's order: NotFound, divergence, then a withdrawn requirement
+/// ([`requirement_withdrawn`]). Under that lock one statement moves the row to `version + 1`,
+/// inserts its revision and upserts the deciding item's citation at the new version, reviving a
+/// tombstone. An `amended_by` / author / box that names no row fails that statement with `23503`,
+/// and the transaction is dropped unwritten.
+///
+/// A divergence answers the revision at `expected_version` as its ancestor; a token newer than
+/// the head has no such revision and is `NotFound { entity: "requirement_revision" }`, as
+/// `update_item`'s is for `item_revision`.
+async fn revise_requirement(
+    pool: &sqlx::PgPool,
+    id: RequirementId,
+    expected_version: i32,
+    edit: RequirementEdit,
+) -> Result<RequirementUpdate> {
+    let mut tx = pool.begin().await.map_err(map_sqlx)?;
+
+    let Some(head) = sqlx::query_as!(
+        Requirement,
+        r#"
+        SELECT id         AS "id: RequirementId",
+               project_id AS "project_id: ProjectId",
+               area_id    AS "area_id: RequirementAreaId",
+               area_code,
+               number,
+               key        AS "key!",
+               body,
+               rationale,
+               priority   AS "priority: Priority",
+               state      AS "state: RequirementState",
+               version,
+               created_by AS "created_by: UserId",
+               created_at,
+               updated_at
+          FROM requirement WHERE id = $1 FOR UPDATE
+        "#,
+        id.as_uuid(),
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx)?
+    else {
+        return Err(StoreError::NotFound {
+            entity: "requirement",
+            id: id.to_string(),
+        });
+    };
+
+    if head.version != expected_version {
+        let ancestor = sqlx::query_as!(
+            RequirementRevision,
+            r#"
+            SELECT requirement_id     AS "requirement_id: RequirementId",
+                   version,
+                   body,
+                   rationale,
+                   priority           AS "priority: Priority",
+                   state              AS "state: RequirementState",
+                   author_id          AS "author_id: UserId",
+                   box_id             AS "box_id: BoxId",
+                   reason,
+                   amended_by_item_id AS "amended_by_item_id: ItemId",
+                   created_at
+              FROM requirement_revision WHERE requirement_id = $1 AND version = $2
+            "#,
+            id.as_uuid(),
+            expected_version,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "requirement_revision",
+            id: format!("{id}@{expected_version}"),
+        })?;
+        return Ok(RequirementUpdate::Diverged { head, ancestor });
+    }
+    if head.state == RequirementState::Withdrawn {
+        return Err(StoreError::Constraint(requirement_withdrawn(&head.key)));
+    }
+
+    let updated = sqlx::query_as!(
+        Requirement,
+        r#"
+        WITH u AS (
+            UPDATE requirement SET
+                body      = COALESCE($2, body),
+                rationale = COALESCE($3, rationale),
+                priority  = COALESCE($4, priority),
+                state     = COALESCE($5, state),
+                version   = version + 1
+             WHERE id = $1
+            RETURNING id, project_id, area_id, area_code, number, key, body, rationale, priority,
+                      state, version, created_by, created_at, updated_at
+        ), v AS (
+            INSERT INTO requirement_revision (requirement_id, version, body, rationale, priority,
+                                              state, author_id, box_id, reason,
+                                              amended_by_item_id)
+            SELECT id, version, body, rationale, priority, state, $6, $7, $8, $9 FROM u
+            RETURNING requirement_id
+        ), c AS (
+            INSERT INTO item_requirement (item_id, requirement_id, kind, requirement_version)
+            SELECT $9, id, $10, version FROM u
+            ON CONFLICT (item_id, requirement_id, kind)
+            DO UPDATE SET requirement_version = EXCLUDED.requirement_version, deleted_at = NULL
+            RETURNING item_id
+        )
+        SELECT u.id         AS "id!: RequirementId",
+               u.project_id AS "project_id!: ProjectId",
+               u.area_id    AS "area_id!: RequirementAreaId",
+               u.area_code  AS "area_code!",
+               u.number     AS "number!",
+               u.key        AS "key!",
+               u.body       AS "body!",
+               u.rationale  AS "rationale!",
+               u.priority   AS "priority!: Priority",
+               u.state      AS "state!: RequirementState",
+               u.version    AS "version!",
+               u.created_by AS "created_by!: UserId",
+               u.created_at AS "created_at!",
+               u.updated_at AS "updated_at!"
+          FROM u, v, c
+        "#,
+        id.as_uuid(),
+        edit.body,
+        edit.rationale,
+        edit.priority.map(Priority::as_str),
+        edit.state.map(RequirementState::as_str),
+        edit.author_id.as_uuid(),
+        edit.box_id.map(BoxId::as_uuid),
+        edit.reason,
+        edit.decided_by.as_uuid(),
+        edit.kind.as_str(),
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx)?;
+
+    let Some(updated) = updated else {
+        // Impossible for `close_out`'s reason: the row has been locked `FOR UPDATE` since this
+        // transaction's first statement, and the `UPDATE` has no other conjunct.
+        return Err(StoreError::Backend(format!(
+            "requirement `{id}` did not move from version {expected_version} under the row lock \
+             this transaction holds"
+        )));
+    };
+
+    tx.commit().await.map_err(map_sqlx)?;
+    Ok(RequirementUpdate::Updated(updated))
 }
 
 impl WriteStore for PgStore {
@@ -4071,77 +4265,421 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)
     }
 
-    // ---- ANA-11 §5.1 (MOD-38): stubs until T8 makes them real ----
+    // ---- ANA-11 §5.1 (MOD-38) ----
 
+    /// The spec header's compare-and-set (plan D9), one statement per branch plus
+    /// [`cas_miss`]'s follow-up read on a miss.
+    ///
+    /// `None` is an `INSERT ... ON CONFLICT DO NOTHING`, so a header that already exists is
+    /// untouched and answered `Stale`; `Some(v)` is an `UPDATE ... WHERE version = v`, and a miss
+    /// with no row at all is `NotFound`. `updated_at` is the column default on the insert and the
+    /// trigger's on the update.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "requirement_spec" }` for `Some(_)` with no header;
+    /// [`StoreError::Constraint`] for a project or owner that names no row (`23503`).
     async fn set_requirement_spec(
         &self,
-        _project: ProjectId,
-        _expected_version: Option<i32>,
-        _owner_id: UserId,
-        _preamble: String,
+        project: ProjectId,
+        expected_version: Option<i32>,
+        owner_id: UserId,
+        preamble: String,
     ) -> Result<CasOutcome<RequirementSpec>> {
-        unimplemented!("MOD-38 T8")
+        let written = match expected_version {
+            None => sqlx::query_as!(
+                RequirementSpec,
+                r#"
+                INSERT INTO requirement_spec (project_id, owner_id, preamble)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (project_id) DO NOTHING
+                RETURNING project_id AS "project_id: ProjectId",
+                          owner_id   AS "owner_id: UserId",
+                          preamble,
+                          version,
+                          updated_at
+                "#,
+                project.as_uuid(),
+                owner_id.as_uuid(),
+                preamble,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+            Some(version) => sqlx::query_as!(
+                RequirementSpec,
+                r#"
+                UPDATE requirement_spec
+                   SET owner_id = $3, preamble = $4, version = version + 1
+                 WHERE project_id = $1 AND version = $2
+                RETURNING project_id AS "project_id: ProjectId",
+                          owner_id   AS "owner_id: UserId",
+                          preamble,
+                          version,
+                          updated_at
+                "#,
+                project.as_uuid(),
+                version,
+                owner_id.as_uuid(),
+                preamble,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+        };
+
+        match written {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => cas_miss(
+                self.requirement_spec(project).await?,
+                "requirement_spec",
+                project,
+            ),
+        }
     }
 
-    async fn create_requirement_area(&self, _new: NewRequirementArea) -> Result<RequirementArea> {
-        unimplemented!("MOD-38 T8")
+    /// One `requirement_area` row. The code is checked here, before the insert, so the refusal
+    /// is [`invalid_area_code`]'s sentence on both stores rather than the `CHECK`'s own text.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] for a code outside `^[A-Z][A-Z0-9]{1,15}$`, a code the project
+    /// already has or a duplicate id (`23505`), or an unknown project (`23503`).
+    async fn create_requirement_area(&self, new: NewRequirementArea) -> Result<RequirementArea> {
+        if !RequirementArea::code_is_valid(&new.code) {
+            return Err(StoreError::Constraint(invalid_area_code(&new.code)));
+        }
+        sqlx::query_as!(
+            RequirementArea,
+            r#"
+            INSERT INTO requirement_area (id, project_id, code, title, description, position)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id         AS "id: RequirementAreaId",
+                      project_id AS "project_id: ProjectId",
+                      code,
+                      title,
+                      description,
+                      position,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.project_id.as_uuid(),
+            new.code,
+            new.title,
+            new.description,
+            new.position,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
+    /// Mints a requirement: counter upsert, row insert and revision 1 in one statement, the
+    /// shape of [`mint_item`](WriteStore::mint_item) (plan D8).
+    ///
+    /// `a` is the area row, and every later CTE selects from it, so an unknown area makes the
+    /// whole statement insert nothing and return zero rows - which is exactly the `NotFound`.
+    /// A refusal inside the statement (`23503` on `created_by` / `box_id`, `23505` on the id)
+    /// rolls the counter upsert back with it, so no number is burned. The project, the code and
+    /// the number all come from the area and its counter, never from the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "requirement_area" }` for an unknown area;
+    /// [`StoreError::Constraint`] for a duplicate id or a `created_by` / `box_id` that names no
+    /// row.
     async fn mint_requirement(
         &self,
-        _area: RequirementAreaId,
-        _new: NewRequirement,
+        area: RequirementAreaId,
+        new: NewRequirement,
     ) -> Result<Requirement> {
-        unimplemented!("MOD-38 T8")
+        let minted = sqlx::query_as!(
+            Requirement,
+            r#"
+            WITH a AS (
+                SELECT id, project_id, code FROM requirement_area WHERE id = $1
+            ), c AS (
+                INSERT INTO requirement_key_counter (area_id, last_value)
+                SELECT id, 1 FROM a
+                ON CONFLICT (area_id)
+                DO UPDATE SET last_value = requirement_key_counter.last_value + 1
+                RETURNING last_value
+            ), r AS (
+                INSERT INTO requirement (id, project_id, area_id, area_code, number, body,
+                                         rationale, priority, created_by)
+                SELECT $2, a.project_id, a.id, a.code, c.last_value, $3, $4, $5, $6 FROM a, c
+                RETURNING id, project_id, area_id, area_code, number, key, body, rationale,
+                          priority, state, version, created_by, created_at, updated_at
+            ), v AS (
+                INSERT INTO requirement_revision (requirement_id, version, body, rationale,
+                                                  priority, state, author_id, box_id, reason)
+                SELECT id, version, body, rationale, priority, state, $6, $7, 'created' FROM r
+                RETURNING requirement_id
+            )
+            SELECT r.id         AS "id!: RequirementId",
+                   r.project_id AS "project_id!: ProjectId",
+                   r.area_id    AS "area_id!: RequirementAreaId",
+                   r.area_code  AS "area_code!",
+                   r.number     AS "number!",
+                   r.key        AS "key!",
+                   r.body       AS "body!",
+                   r.rationale  AS "rationale!",
+                   r.priority   AS "priority!: Priority",
+                   r.state      AS "state!: RequirementState",
+                   r.version    AS "version!",
+                   r.created_by AS "created_by!: UserId",
+                   r.created_at AS "created_at!",
+                   r.updated_at AS "updated_at!"
+              FROM r, v
+            "#,
+            area.as_uuid(),
+            new.id.as_uuid(),
+            new.body,
+            new.rationale,
+            new.priority.as_str(),
+            new.created_by.as_uuid(),
+            new.box_id.map(BoxId::as_uuid),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        minted.ok_or_else(|| StoreError::NotFound {
+            entity: "requirement_area",
+            id: area.to_string(),
+        })
     }
 
+    /// [`revise_requirement`] with the patch's columns and reason, and an `amends` citation.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "requirement" }`; [`StoreError::Constraint`] for a
+    /// withdrawn requirement ([`requirement_withdrawn`]) or an `amended_by` / author / box that
+    /// names no row.
     async fn amend_requirement(
         &self,
-        _id: RequirementId,
-        _expected_version: i32,
-        _patch: RequirementPatch,
-        _amended_by: ItemId,
+        id: RequirementId,
+        expected_version: i32,
+        patch: RequirementPatch,
+        amended_by: ItemId,
     ) -> Result<RequirementUpdate> {
-        unimplemented!("MOD-38 T8")
+        revise_requirement(
+            &self.pool,
+            id,
+            expected_version,
+            RequirementEdit {
+                body: patch.body,
+                rationale: patch.rationale,
+                priority: patch.priority,
+                state: None,
+                author_id: patch.author_id,
+                box_id: patch.box_id,
+                reason: patch.reason,
+                decided_by: amended_by,
+                kind: CitationKind::Amends,
+            },
+        )
+        .await
     }
 
+    /// [`revise_requirement`] to `state = withdrawn`, reason `withdrawn`, and a `withdraws`
+    /// citation.
+    ///
+    /// # Errors
+    ///
+    /// As [`amend_requirement`](WriteStore::amend_requirement), an already-withdrawn requirement
+    /// included.
     async fn withdraw_requirement(
         &self,
-        _id: RequirementId,
-        _expected_version: i32,
-        _withdrawn_by: ItemId,
-        _author_id: UserId,
-        _box_id: Option<BoxId>,
+        id: RequirementId,
+        expected_version: i32,
+        withdrawn_by: ItemId,
+        author_id: UserId,
+        box_id: Option<BoxId>,
     ) -> Result<RequirementUpdate> {
-        unimplemented!("MOD-38 T8")
+        revise_requirement(
+            &self.pool,
+            id,
+            expected_version,
+            RequirementEdit {
+                body: None,
+                rationale: None,
+                priority: None,
+                state: Some(RequirementState::Withdrawn),
+                author_id,
+                box_id,
+                reason: "withdrawn".to_owned(),
+                decided_by: withdrawn_by,
+                kind: CitationKind::Withdraws,
+            },
+        )
+        .await
     }
 
+    /// Upserts a live citation at the requirement's current version (plan D10), one transaction.
+    ///
+    /// The requirement is read `FOR SHARE`, which a concurrent amend or withdraw's `FOR UPDATE`
+    /// waits on: the state the withdrawn rule is decided against and the version the row is
+    /// stamped with are the ones the citation commits beside. The upsert revives a tombstone and
+    /// overwrites `proposed_by_step_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "item" }` then `{ entity: "requirement" }`;
+    /// [`StoreError::Constraint`] for an `addresses` / `reserves` citation of a withdrawn
+    /// requirement ([`withdrawn_requirement_cited`]) or a step that names no row (`23503`).
     async fn cite(
         &self,
-        _item: ItemId,
-        _requirement: RequirementId,
-        _kind: CitationKind,
-        _proposed_by: Option<StepId>,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+        proposed_by: Option<StepId>,
     ) -> Result<ItemRequirement> {
-        unimplemented!("MOD-38 T8")
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        sqlx::query_scalar!("SELECT 1 FROM item WHERE id = $1", item.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "item",
+                id: item.to_string(),
+            })?;
+        let Some(cited) = sqlx::query!(
+            r#"
+            SELECT key     AS "key!",
+                   state   AS "state: RequirementState",
+                   version
+              FROM requirement WHERE id = $1 FOR SHARE
+            "#,
+            requirement.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        else {
+            return Err(StoreError::NotFound {
+                entity: "requirement",
+                id: requirement.to_string(),
+            });
+        };
+        if cited.state == RequirementState::Withdrawn
+            && matches!(kind, CitationKind::Addresses | CitationKind::Reserves)
+        {
+            return Err(StoreError::Constraint(withdrawn_requirement_cited(
+                &cited.key, kind,
+            )));
+        }
+
+        let row = sqlx::query_as!(
+            ItemRequirement,
+            r#"
+            INSERT INTO item_requirement (item_id, requirement_id, kind, requirement_version,
+                                          proposed_by_step_id)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (item_id, requirement_id, kind) DO UPDATE
+               SET requirement_version = EXCLUDED.requirement_version,
+                   proposed_by_step_id = EXCLUDED.proposed_by_step_id,
+                   deleted_at          = NULL
+            RETURNING item_id             AS "item_id: ItemId",
+                      requirement_id      AS "requirement_id: RequirementId",
+                      kind                AS "kind: CitationKind",
+                      requirement_version,
+                      proposed_by_step_id AS "proposed_by_step_id: StepId",
+                      created_at,
+                      updated_at,
+                      deleted_at
+            "#,
+            item.as_uuid(),
+            requirement.as_uuid(),
+            kind.as_str(),
+            cited.version,
+            proposed_by.map(StepId::as_uuid),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(row)
     }
 
+    /// Tombstones a live citation: `deleted_at` is set, the row stays (plan D10).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "item_requirement", id: citation_key(..) }` when no
+    /// live row matches, a tombstone included.
     async fn uncite(
         &self,
-        _item: ItemId,
-        _requirement: RequirementId,
-        _kind: CitationKind,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
     ) -> Result<()> {
-        unimplemented!("MOD-38 T8")
+        let tombstoned = sqlx::query!(
+            "UPDATE item_requirement SET deleted_at = clock_timestamp() \
+              WHERE item_id = $1 AND requirement_id = $2 AND kind = $3 AND deleted_at IS NULL",
+            item.as_uuid(),
+            requirement.as_uuid(),
+            kind.as_str(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if tombstoned == 0 {
+            return Err(StoreError::NotFound {
+                entity: "item_requirement",
+                id: citation_key(item, requirement, kind),
+            });
+        }
+        Ok(())
     }
 
+    /// Re-stamps a live citation at the requirement's current version, in one `UPDATE ... FROM`,
+    /// which clears `suspect` (plan D11).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "item_requirement", id: citation_key(..) }` when no
+    /// live row matches, a tombstone included.
     async fn reconfirm(
         &self,
-        _item: ItemId,
-        _requirement: RequirementId,
-        _kind: CitationKind,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
     ) -> Result<ItemRequirement> {
-        unimplemented!("MOD-38 T8")
+        sqlx::query_as!(
+            ItemRequirement,
+            r#"
+            UPDATE item_requirement ir
+               SET requirement_version = r.version
+              FROM requirement r
+             WHERE r.id = ir.requirement_id
+               AND ir.item_id = $1 AND ir.requirement_id = $2 AND ir.kind = $3
+               AND ir.deleted_at IS NULL
+            RETURNING ir.item_id             AS "item_id!: ItemId",
+                      ir.requirement_id      AS "requirement_id!: RequirementId",
+                      ir.kind                AS "kind!: CitationKind",
+                      ir.requirement_version AS "requirement_version!",
+                      ir.proposed_by_step_id AS "proposed_by_step_id?: StepId",
+                      ir.created_at          AS "created_at!",
+                      ir.updated_at          AS "updated_at!",
+                      ir.deleted_at          AS "deleted_at?"
+            "#,
+            item.as_uuid(),
+            requirement.as_uuid(),
+            kind.as_str(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "item_requirement",
+            id: citation_key(item, requirement, kind),
+        })
     }
 }
 
