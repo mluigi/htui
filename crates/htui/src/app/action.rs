@@ -5,6 +5,7 @@
 
 use htui_core::model::{RunId, StepId, WorkspaceSummary};
 
+use crate::editor::ExternalEdit;
 use crate::store_worker::{ReplyEnvelope, StoreRequest};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
@@ -48,6 +49,10 @@ pub enum Action {
         /// The step to promote.
         step: StepId,
     },
+    /// Hand text to `$VISUAL`/`$EDITOR` (MOD-9 D10). Stamped with the emitting tab in
+    /// `App::drain`, which holds it for the event loop; any other origin is refused on the status
+    /// line.
+    EditExternally(ExternalEdit),
     /// Show or hide the key help.
     ToggleHelp,
     /// Put a message on the status line: what a `StoreReply::Failed` becomes.

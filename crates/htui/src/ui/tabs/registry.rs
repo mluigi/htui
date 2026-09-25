@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
+use crate::editor::ExternalEditOutcome;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::tabs::settings::SectionId;
@@ -57,6 +58,9 @@ pub trait Tab {
     fn focus_section(&mut self, _section: SectionId) -> bool {
         false
     }
+    /// The `$EDITOR` handoff this tab asked for came back (MOD-9 D10). Defaulted, the trait's
+    /// second default after `focus_section`, so no other tab changes.
+    fn on_external_edit(&mut self, _outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {}
 }
 
 /// Every registered tab, in registration order, plus which one is active.

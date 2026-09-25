@@ -2,7 +2,8 @@
 //!
 //! A new tab, overlay, action or store request adds no arm here. The arms are the terminal, the
 //! worker's replies and the tick; everything else is an [`Action`] that
-//! [`App::update`](crate::app::App::update) applies.
+//! [`App::update`](crate::app::App::update) applies. One post-step, not an arm, suspends the
+//! terminal for `$EDITOR` (MOD-9 D9).
 
 use std::time::Duration;
 
@@ -43,6 +44,24 @@ pub async fn run(
         }
         if app.should_quit {
             break;
+        }
+        // MOD-9 D9: a view asked for `$EDITOR`. The stream goes first: crossterm 0.29 parks a
+        // thread in `poll_internal(None, ..)` that reads the tty until the stream is dropped
+        // (`crossterm-0.29.0/src/event/stream.rs:44-55`, `:140-145`), and it would take the
+        // editor's keys. A fresh stream after; `reset` so a long edit does not replay a burst of
+        // ticks (`interval` is `Burst`). Replies queue in the unbounded channel meanwhile. A
+        // terminal that cannot be taken back is an error: `lib.rs` restores and exits (D21).
+        if let Some((tab, edit)) = app.take_external_edit() {
+            drop(events);
+            let outcome = crate::editor::run_suspended(
+                term,
+                &crate::editor::EditorCommand::from_env(),
+                &edit,
+            )
+            .await?;
+            events = crossterm::event::EventStream::new();
+            ticker.reset();
+            app.finish_external_edit(tab, outcome);
         }
         if std::mem::take(&mut app.dirty) {
             term.terminal_mut().draw(|frame| app.render(frame))?;

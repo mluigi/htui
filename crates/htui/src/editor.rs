@@ -115,8 +115,7 @@ impl core::fmt::Debug for ExternalEdit {
 /// What came back (D9, D24).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalEditOutcome {
-    /// The file changed; the normalised text
-    /// ([`normalise_newlines`](htui_core::prompt::render::normalise_newlines)).
+    /// The file changed; the normalised text ([`normalise_newlines`]).
     Edited(String),
     /// Byte-identical after normalising both sides.
     Unchanged {
