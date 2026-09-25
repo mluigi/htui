@@ -21,8 +21,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
+use crate::error::Result;
 use crate::launch::{ResolvedLaunch, ToolProbe};
-use crate::probe::{ProbeEnv, resolve_tool, run_bounded};
+use crate::probe::{ProbeEnv, ToolResolution, resolve_tool, run_bounded};
 
 use self::hardware::HardwareSource;
 use self::spec::{EffectiveSpec, Fact, GpuVendor, TagRule};
@@ -138,15 +139,39 @@ async fn probe_tools(
 
 /// One tool: present when found, and — for a versioned tool — only when its version was captured
 /// (OQ-11).
+///
+/// A versioned `kind: "path"` tool tries its `names` one at a time, in order, and keeps the first
+/// whose version was captured: the Windows Store `python3.exe` stub is found first but prints no
+/// version, and the `python` after it is the real interpreter. A presence-only tool, or any other
+/// kind, is resolved once and keeps the first file found.
 async fn probe_tool(name: String, probe: &ToolProbe, env: &ProbeEnv) -> Option<ProbedTool> {
-    let versioned = matches!(
-        probe,
-        ToolProbe::Path {
-            version: Some(_),
-            ..
+    let ToolProbe::Path {
+        names,
+        version: Some(version),
+    } = probe
+    else {
+        return accept(name, resolve_tool(probe, env).await, false);
+    };
+    for file in names {
+        let one = ToolProbe::Path {
+            names: vec![file.clone()],
+            version: Some(version.clone()),
+        };
+        if let Some(tool) = accept(name.clone(), resolve_tool(&one, env).await, true) {
+            return Some(tool);
         }
-    );
-    match resolve_tool(probe, env).await {
+    }
+    None
+}
+
+/// What one resolution of tool `name` reports: the tool when found and — when `versioned` — its
+/// version was captured, else nothing, logged.
+fn accept(
+    name: String,
+    resolved: Result<Option<ToolResolution>>,
+    versioned: bool,
+) -> Option<ProbedTool> {
+    match resolved {
         Ok(Some(found)) if !versioned || found.version.is_some() => Some(ProbedTool {
             version: found.version.unwrap_or_default(),
             path: found.path.to_string_lossy().into_owned(),

@@ -31,7 +31,7 @@
     "podman":     {"kind": "path", "names": ["podman"],     "version": {"args": ["--version"], "pattern": "^podman version (\\S+)"}},
     "powershell": {"kind": "path", "names": ["powershell"]},
     "pwsh":       {"kind": "path", "names": ["pwsh"],       "version": {"args": ["--version"], "pattern": "^PowerShell (\\S+)"}},
-    "python3":    {"kind": "path", "names": ["python3", "python"], "version": {"args": ["--version"], "pattern": "^Python (\\S+)"}},
+    "python3":    {"kind": "path", "names": ["python3", "python"], "version": {"args": ["--version"], "pattern": "^Python (\\d+(?:\\.\\d+)+\\S*)"}},
     "qemu-img":   {"kind": "path", "names": ["qemu-img"],   "version": {"args": ["--version"], "pattern": "^qemu-img version (\\S+)"}},
     "rustc":      {"kind": "path", "names": ["rustc"],      "version": {"args": ["--version"], "pattern": "^rustc (\\S+)"}},
     "uv":         {"kind": "path", "names": ["uv"],         "version": {"args": ["--version"], "pattern": "^uv (\\S+)"}},
