@@ -29,10 +29,10 @@ use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
     BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, DocumentId, EventKind, Gate,
     GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
-    NewRunStep, NoteId, Project, ProjectSettings, PromptScope, Repo, RepoId, Run, RunId, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase,
-    SnapshotTemplate, Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId,
-    VerifyOutcome,
+    NewRunStep, NoteId, Project, ProjectSettings, PromptScope, Repo, RepoId, Resolution, Run,
+    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate,
+    SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
+    UserId, VerifyOutcome,
 };
 use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoRoot, RootSource};
 use htui_core::prompt::{
@@ -574,7 +574,7 @@ where
                 chat_live,
             } => self.accept_artifact(run, step, chat_live).await,
             Command::Unblock { item } => self.unblock(item).await,
-            Command::CloseOut { item } => self.close_out(item).await,
+            Command::CloseOut { item, resolution } => self.close_out(item, resolution).await,
         }
     }
 
@@ -1474,10 +1474,16 @@ where
     /// The reads [`Self::close_out_preview`] counts over, the guard
     /// ([`crate::command::close_out_enabled`]), then one `summary` document built by
     /// [`closeout::summary`] and written by `WriteStore::close_out` with the item's move to
-    /// `closed`, in one transaction. No run lease is involved: the store re-checks a live run and
-    /// the item's status inside that transaction, so a run started since is refused there with
-    /// nothing written. The commit rows already exist, so none are passed.
-    async fn close_out(&self, item: ItemId) -> Result<CommandOutcome, EngineError> {
+    /// `closed` as `resolution`, in one transaction. No run lease is involved: the store re-checks
+    /// a live run, the item's status and `Resolution::closes_from` inside that transaction, so a
+    /// run started since is refused there with nothing written. The commit rows already exist, so
+    /// none are passed. Until MOD-39 the guard still refuses an `open` item, whatever the
+    /// resolution (MOD-38 plan D6).
+    async fn close_out(
+        &self,
+        item: ItemId,
+        resolution: Resolution,
+    ) -> Result<CommandOutcome, EngineError> {
         let reads = self.close_out_reads(item).await?;
         crate::command::close_out_enabled(&reads.item, &reads.runs)?;
         let repos = self.parts.store.repos(reads.item.project_id).await?;
@@ -1490,9 +1496,6 @@ where
             self.parts.user,
             self.now(),
         );
-        // MOD-38 T3's placeholder until T4 threads the command's own resolution through.
-        let resolution = htui_core::model::Resolution::default_for(reads.item.status)
-            .unwrap_or(htui_core::model::Resolution::Withdrawn);
         let written = self
             .parts
             .store
@@ -1978,16 +1981,18 @@ where
     }
 
     /// MOD-4 plan D167's first confirmation, read-only: [`crate::command::close_out_enabled`],
-    /// then [`closeout::preview`] over exactly the rows `CloseOut` would write the summary from.
+    /// then [`closeout::preview`] over exactly the rows `CloseOut` would write the summary from,
+    /// carrying the resolution the guard answers (MOD-38 plan D6).
     ///
     /// # Errors
     /// [`EngineError::RunStatus`] or [`EngineError::NotClosable`], and the store's own.
     pub async fn close_out_preview(&self, item: ItemId) -> Result<closeout::Preview, EngineError> {
         let reads = self.close_out_reads(item).await?;
-        crate::command::close_out_enabled(&reads.item, &reads.runs)?;
+        let resolution = crate::command::close_out_enabled(&reads.item, &reads.runs)?;
         let heads = self.parts.store.documents(item).await?;
         Ok(closeout::preview(
             &reads.item,
+            resolution,
             &reads.summaries,
             &reads.commits,
             &heads,
@@ -5881,8 +5886,8 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::{
         Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewRunStep, NewStepGraph, PhaseId,
-        PhasePatch, RepoId, RunMode, RunStatus, SnapshotCandidate, SnapshotPhase, Status,
-        StepGraphId, StepGraphPhase, StepId, StepStatus,
+        PhasePatch, RepoId, Resolution, RunMode, RunStatus, SnapshotCandidate, SnapshotPhase,
+        Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
@@ -11696,9 +11701,16 @@ mod tests {
             .await
             .expect("a done item with no live run");
         assert_eq!(
-            (preview.status, preview.runs, preview.rows, preview.version),
-            (Status::Done, 2, 4, 1),
-            "the seeded `RUN_2` and this one; one row per step, each committed to the primary"
+            (
+                preview.status,
+                preview.resolution,
+                preview.runs,
+                preview.rows,
+                preview.version
+            ),
+            (Status::Done, Resolution::Done, 2, 4, 1),
+            "the seeded `RUN_2` and this one; one row per step, each committed to the primary; a \
+             `done` item closes as `done` (MOD-38 plan D6)"
         );
     }
 

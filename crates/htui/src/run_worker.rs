@@ -367,6 +367,7 @@ fn verdicts(
             item,
             &runs.iter().map(|(run, _)| run.clone()).collect::<Vec<_>>(),
         )
+        .map(|_| ())
         .map_err(sentence),
         runs: BTreeMap::new(),
         steps: BTreeMap::new(),
@@ -2052,7 +2053,7 @@ async fn run_request(ctx: TaskCtx, request: OrchRequest, live: LiveChats) {
             repo_scope,
         }) => start_run(ctx, item, mode, repo_scope).await,
         OrchRequest::Command(Command::Unblock { item }) => unblock(ctx, item).await,
-        OrchRequest::Command(command @ Command::CloseOut { item }) => {
+        OrchRequest::Command(command @ Command::CloseOut { item, .. }) => {
             let _ = ctx.tag.item.set(item);
             let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
                 Ok(kit) => kit,
@@ -2416,8 +2417,8 @@ pub(crate) mod tests {
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
         Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, NewRepo, NewRun,
-        RepoId, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
-        TIMESTAMPTZ_DIGITS, Transport,
+        RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId,
+        StepStatus, TIMESTAMPTZ_DIGITS, Transport,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
@@ -4183,6 +4184,7 @@ pub(crate) mod tests {
             },
             Command::CloseOut {
                 item: ids::HTUI_FEAT_2,
+                resolution: Resolution::Withdrawn,
             },
         ] {
             let fixture = Fixture::new().await;
@@ -4528,6 +4530,7 @@ pub(crate) mod tests {
             }),
             OrchRequest::Command(Command::CloseOut {
                 item: ids::HTUI_ANA_2,
+                resolution: Resolution::Done,
             }),
             OrchRequest::CloseOutPreview {
                 item: ids::HTUI_ANA_2,
