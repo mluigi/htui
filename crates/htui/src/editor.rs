@@ -149,7 +149,7 @@ pub trait Suspend {
 /// Stdio is inherited: the caller has already given the terminal away ([`run_suspended`]). The
 /// temp file is removed on every path out, a dropped future included, and the editor child is
 /// killed if the future is dropped (D25). While the editor runs, the terminal's interrupt keys
-/// reach the editor and not htui ([`Interrupts`]).
+/// reach the editor and not htui (`Interrupts`, private).
 pub async fn run(cmd: &EditorCommand, text: &str, stem: &str) -> ExternalEditOutcome {
     use ExternalEditOutcome::{Edited, Failed, Unchanged};
 
