@@ -716,6 +716,41 @@ async fn scrolling_reveals_a_hunk_below_the_fold() {
     );
 }
 
+/// The list is 32 columns: a name longer than its 13-column field is cut with `…`, so the head and
+/// the role stay on the row. A name that fits is shown whole.
+#[tokio::test]
+async fn a_long_name_is_cut_so_the_version_and_role_stay() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    for name in ["a-very-long-template-name", "thirteen-char"] {
+        let outcome = store
+            .append_prompt_template(
+                NewPromptTemplate {
+                    id: PromptTemplateId::new(),
+                    project_id: ids::PROJECT_VULKAN,
+                    name: name.to_owned(),
+                    body: "Do {{item}}\n".to_owned(),
+                    created_by: ids::USER,
+                },
+                None,
+            )
+            .await
+            .expect("the direct write");
+        assert!(matches!(outcome, CasOutcome::Applied(_)), "{name}");
+    }
+    harness.key("r");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{2502}  a-very-long-\u{2026} v1   phase    \u{2502}"),
+        "the long name is cut to its field: {frame}"
+    );
+    assert!(
+        frame.contains("\u{2502}  thirteen-char v1   phase    \u{2502}"),
+        "a name that fits is whole: {frame}"
+    );
+}
+
 #[tokio::test]
 async fn external_edit_is_requested_with_the_shown_body() {
     let mut harness = open().await;
