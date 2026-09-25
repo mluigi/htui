@@ -102,6 +102,29 @@ async fn save_implement_v2(harness: &mut Harness, marker: &str) {
     harness.settle().await;
 }
 
+/// Appends `body` to `implement` straight into the shared store, as another session would, over
+/// head `expected`.
+async fn append_implement(store: &MemStore, body: &str, expected: i32) {
+    let outcome = store
+        .append_prompt_template(
+            NewPromptTemplate {
+                id: PromptTemplateId::new(),
+                project_id: ids::PROJECT_VULKAN,
+                name: "implement".to_owned(),
+                body: body.to_owned(),
+                created_by: ids::USER,
+            },
+            Some(expected),
+        )
+        .await
+        .expect("the direct write");
+    assert!(
+        matches!(outcome, CasOutcome::Applied(ref row) if row.version == expected + 1),
+        "v{} was not applied",
+        expected + 1
+    );
+}
+
 // --- snapshots ---------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -576,6 +599,121 @@ async fn d_upper_diffs_against_the_compiled_default() {
     assert!(frame.contains("diff default \u{2192} v2"), "{frame}");
     assert!(frame.contains("+MARKER"), "{frame}");
     assert!(frame.contains("--- implement default"), "{frame}");
+}
+
+/// A default body's lines run to 150-200 columns; the pane is about 66 wide. The body and the diff
+/// wrap, so a change past the pane's width is on screen.
+#[tokio::test]
+async fn a_change_past_column_80_is_visible() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    let default = body_of("implement").expect("a default");
+    let mut lines: Vec<String> = default.lines().map(str::to_owned).collect();
+    let long = lines
+        .iter_mut()
+        .find(|line| line.chars().count() >= 80)
+        .expect("a line of 80 columns or more");
+    long.push_str(" WIDEMARK");
+    append_implement(&store, &format!("{}\n", lines.join("\n")), 1).await;
+    harness.key("r");
+    harness.settle().await;
+    select(&mut harness, "implement");
+    let frame = harness.render();
+    assert!(frame.contains("WIDEMARK"), "the body wraps: {frame}");
+    harness.key("d");
+    let frame = harness.render();
+    assert!(
+        frame.contains("diff v1 \u{2192} v2"),
+        "the pane title: {frame}"
+    );
+    assert!(frame.contains("WIDEMARK"), "the diff wraps: {frame}");
+}
+
+/// `J`/`K` scroll the pane a row, `PageDown`/`PageUp` ten; a hunk below the fold comes into view.
+/// Moving the tree's cursor, or the version with `,`/`.`, starts the pane at its top again.
+#[tokio::test]
+async fn scrolling_reveals_a_hunk_below_the_fold() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    let body = |changed: bool| {
+        let lines: Vec<String> = (1..=60)
+            .map(|n| {
+                if changed && n % 10 == 0 {
+                    format!("line {n} CHANGED{n}")
+                } else {
+                    format!("line {n}")
+                }
+            })
+            .collect();
+        format!("TOPLINE {{{{item}}}}\n{}\n", lines.join("\n"))
+    };
+    append_implement(&store, &body(false), 1).await;
+    append_implement(&store, &body(true), 2).await;
+    harness.key("r");
+    harness.settle().await;
+    select(&mut harness, "implement");
+    harness.key("d");
+    let frame = harness.render();
+    assert!(
+        frame.contains("diff v2 \u{2192} v3"),
+        "the pane title: {frame}"
+    );
+    assert!(frame.contains("CHANGED10"), "the first hunk: {frame}");
+    assert!(
+        !frame.contains("CHANGED60"),
+        "the last hunk is below the fold: {frame}"
+    );
+    assert!(
+        frame.contains("J/K PgUp/PgDn scroll"),
+        "the pane says it scrolls: {frame}"
+    );
+
+    let mut presses = 0;
+    while !harness.render().contains("CHANGED60") {
+        presses += 1;
+        assert!(presses <= 10, "PageDown never reached the last hunk");
+        harness.key("pagedown");
+    }
+    assert!(
+        !harness.render().contains("--- implement v2"),
+        "the header scrolled off"
+    );
+    for _ in 0..10 {
+        harness.key("pageup");
+    }
+    assert!(
+        harness.render().contains("--- implement v2"),
+        "back at the top"
+    );
+    harness.key("J");
+    assert!(
+        !harness.render().contains("--- implement v2"),
+        "`J` is one row"
+    );
+    harness.key("K");
+    assert!(
+        harness.render().contains("--- implement v2"),
+        "`K` is one row back"
+    );
+
+    // `,` shows v2, diffed against v1: the pane starts at its top.
+    harness.key("pagedown");
+    harness.key(",");
+    let frame = harness.render();
+    assert!(
+        frame.contains("diff v1 \u{2192} v2") && frame.contains("--- implement v1"),
+        "`,` resets the scroll: {frame}"
+    );
+
+    // Off the row and back: the head's body, from its first line.
+    harness.key("pagedown");
+    harness.key("j");
+    harness.key("k");
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{2502}TOPLINE {{item}}"),
+        "moving resets the scroll: {frame}"
+    );
 }
 
 #[tokio::test]
