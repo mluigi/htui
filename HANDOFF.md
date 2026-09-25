@@ -97,6 +97,20 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   it lives (`agent` row, `app_setting`, or a new table), a refresh method (manual, scripted from
   named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
 
+- [ ] **ANA-22 - How a skill is stored and when it activates** (from MOD-9, PRD gate 2026-09-25).
+  `R-SKL-1`, `R-SKL-2`, `R-SKL-4`, `R-PRM-3`. Blocks MOD-9 milestones 3 and 4
+  (`.claude/prds/mod-9-skill-library-templates.prd.md`). Today a skill is a name, a description and
+  a versioned markdown body (`skill`, `skill_version`, `0001_init.sql:406-426`) that reaches a prompt
+  only through an explicit project or phase binding (`BoundSkill::collapse`). The maintainer wants
+  the frontmatter of an imported SKILL.md file to become real fields — when the skill activates, for
+  which language — and the prompt builder to inject the necessary skills. Survey how skill and rule
+  formats describe themselves and their activation (Claude Code / Agent Skills SKILL.md files, Cursor
+  rules, Copilot instructions, Windsurf rules and others), decide which fields htui stores (columns,
+  a JSON column, or a side table), whether activation is a filter over explicit bindings or a
+  selection of its own, what signals it reads (item kind, phase, repo languages, touched paths), how
+  it interacts with pinning and `max_skill_tokens`, and how import maps frontmatter onto the result.
+  Deliver the schema, the activation rule, the import mapping, and the MOD-9 milestone 3/4 changes.
+
 ### Next features
 - [ ] **MOD-38 - Requirements schema, seam and close-out resolution** (from ANA-11). `R-ENT-8`,
   `R-NF-4`, `R-STO-3`, `R-TUI-9`, proposed `R-ENT-14..15`. Migration `0005_requirements.sql`
@@ -313,7 +327,12 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   item owns only the writers `upsert_skill`, `add_skill_version` and `set_skill_binding`, plus the
   editor. `htui_core::prompt::defaults::DEFAULT_TEMPLATES` is the ten bodies to seed *from*; seeding
   them into a project's `prompt_template` rows **landed with MOD-15** (ANA-5 §4.6,
-  `docs/decisions/mod/mod-15.md`): `htui_core::seed` writes all ten at version 1 on create.
+  `docs/decisions/mod/mod-15.md`): `htui_core::seed` writes all ten at version 1 on create. **PRD:**
+  `.claude/prds/mod-9-skill-library-templates.prd.md` (2026-09-25) — everything in the Skills tab
+  (templates and skills views, no Settings section), in-app `TextArea` plus `$EDITOR`, bound skills
+  wired into engine and preview. Milestones 1 (templates editable) and 2 (skills reach the run) are
+  open; milestones 3 (skill writers, bindings) and 4 (SKILL.md import) are **blocked on ANA-22**.
+  Agent help while editing is MOD-50.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
@@ -476,7 +495,7 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   registered section**: MOD-15 added `hierarchy`, `kinds`, `prompt` and `connection` after it, so
   the strip is five titles wide (46 of the pinned 100 columns, `tests/settings.rs`) and
   `SettingsSection::captures_input` now exists for a section that takes typed input. MOD-7's box
-  profile and MOD-9's skills each add their own. MOD-2 built it read-only (`r` probe, `i` install, `a` authenticate, `o` open, `x` cancel)
+  profile adds its own; MOD-9 adds none (its editors live in the Skills tab, PRD D1). MOD-2 built it read-only (`r` probe, `i` install, `a` authenticate, `o` open, `x` cancel)
   and MOD-20/MOD-21 added the install and login actions, so what is missing is the **write** half
   that `R-AGT-4`'s field list and `R-AGT-6`'s "manual entries allowed" still owe. MOD-2 milestone 5
   **D45** already added `probe.source` (`probe` | `manual`) so that "a manual entry is never
@@ -598,6 +617,14 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   (`R-AGT-9` unchanged). **Open question for the maintainer:** `R-SEC-2` amendment only if the server,
   not the worker, resolves project secrets. Blocked on MOD-47, MOD-10.
 
+- [ ] **MOD-50 - Ask an agent for help while editing a template or skill** (from MOD-9, PRD gate
+  2026-09-25). `R-SKL-3`, `R-PRM-4`. MOD-9's editor (Skills tab, `TextArea` and `$EDITOR`,
+  `.claude/prds/mod-9-skill-library-templates.prd.md` D2) gains an action that sends the body being
+  edited, the role's placeholder table and the maintainer's request to a configured agent and offers
+  the reply as a proposed edit, shown as a diff and saved only through the same `parse` gate. Open:
+  which agent and model answer (the chat driver or a one-shot CLI call), whether the exchange is
+  recorded, and how secrets in a body are scrubbed before they leave. Blocked on MOD-9 milestone 1.
+
 ### Deferred backlog
 
 - [ ] **CLEAN-4 - `LoopStop::NoProgressReview` is unreachable** (from MOD-4, risk R-9). `R-ORCH-3`.
@@ -647,7 +674,7 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 2 (ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 35 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 3 (ANA-17 per-model prompt framing, ANA-21 per-model weights, ANA-22 skill storage and activation)                                 |
+| MOD-N   | 36 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 agent help in the editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
