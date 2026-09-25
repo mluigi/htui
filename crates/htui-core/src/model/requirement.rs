@@ -269,7 +269,10 @@ pub struct RequirementFilter {
     pub states: Option<Vec<RequirementState>>,
     /// `requirement.priority` in this list.
     pub priorities: Option<Vec<Priority>>,
-    /// Case-insensitive literal substring of `key` or `body`.
+    /// Literal substring of `key` or `body`, case-folded per backend as [`ItemFilter::text`] is,
+    /// so a non-ASCII needle can match differently in `MemStore`, the mirror and Postgres.
+    ///
+    /// [`ItemFilter::text`]: crate::model::item::ItemFilter::text
     pub text: Option<String>,
 }
 

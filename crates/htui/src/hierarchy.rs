@@ -320,12 +320,12 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .await?;
             reread(&writer, ws, this_box).await
         }
-        StoreRequest::DeleteReach(target) => {
-            Ok(StoreReply::DeleteReach(writer.delete_reach(*target).await?))
-        }
+        StoreRequest::DeleteReach(target) => Ok(StoreReply::DeleteReach(
+            writer.delete_reach(*target).await?.map(Box::new),
+        )),
         StoreRequest::DeleteWorkspace(id) => Ok(StoreReply::Deleted {
             target: DeleteTarget::Workspace(*id),
-            reach: writer.delete_workspace(*id).await?,
+            reach: Box::new(writer.delete_workspace(*id).await?),
             // `workspace` and `workspace_project` are full-table replaced on every refresh pass,
             // so the mirror cannot serve a workspace this just removed (D10).
             mirror: MirrorAfterDelete::NotNeeded,
@@ -344,7 +344,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             };
             Ok(StoreReply::Deleted {
                 target: DeleteTarget::Project(*id),
-                reach,
+                reach: Box::new(reach),
                 mirror,
             })
         }

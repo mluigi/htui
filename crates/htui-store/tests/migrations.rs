@@ -693,10 +693,12 @@ async fn item_resolution_iff_closed_rejects_both_halves() {
 }
 
 /// MOD-38 (plan D8): every item closed before 0005 closed through the old `-> closed` edges, which
-/// only a finished item took, so 0005 backfills `done` before it adds the iff constraint. Staged
-/// like the 0004 case: `run_to(4)`, plant a closed row, then the plain `run` applies 0005.
+/// only a finished item took, so 0005 backfills `done` before it adds the iff constraint, with
+/// `trg_item_updated_at` off so no row's `updated_at` moves. Staged like the 0004 case:
+/// `run_to(4)`, plant a closed row, then the plain `run` applies 0005.
 #[tokio::test]
 async fn closed_rows_backfill_to_done() {
+    const PLANTED_AT: &str = "2020-01-02T03:04:05Z";
     let Some(db) = common::bare_db().await else {
         return;
     };
@@ -717,7 +719,7 @@ async fn closed_rows_backfill_to_done() {
         let id = uuid::Uuid::now_v7();
         sqlx::query(
             "INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, title, status, \
-             created_by) VALUES ($1, $2, $3, 'RES', $4, 'r', $5, $6)",
+             created_by, updated_at) VALUES ($1, $2, $3, 'RES', $4, 'r', $5, $6, $7::timestamptz)",
         )
         .bind(id)
         .bind(project)
@@ -725,6 +727,7 @@ async fn closed_rows_backfill_to_done() {
         .bind(number)
         .bind(status)
         .bind(user)
+        .bind(PLANTED_AT)
         .execute(&db.pool)
         .await
         .expect("insert a pre-0005 item");
@@ -734,18 +737,35 @@ async fn closed_rows_backfill_to_done() {
     MIGRATOR.run(&db.pool).await.expect("apply 0005");
 
     for (id, status) in planted {
-        let resolution: Option<String> =
-            sqlx::query_scalar("SELECT resolution FROM item WHERE id = $1")
-                .bind(id)
-                .fetch_one(&db.pool)
-                .await
-                .expect("read item.resolution");
+        let (resolution, kept): (Option<String>, bool) = sqlx::query_as(
+            "SELECT resolution, updated_at = $2::timestamptz FROM item WHERE id = $1",
+        )
+        .bind(id)
+        .bind(PLANTED_AT)
+        .fetch_one(&db.pool)
+        .await
+        .expect("read item.resolution and updated_at");
         let expected = (status == "closed").then(|| "done".to_owned());
         assert_eq!(
             resolution, expected,
             "a pre-0005 `{status}` row backfills to {expected:?}"
         );
+        assert!(
+            kept,
+            "the backfill leaves a pre-0005 `{status}` row's updated_at at {PLANTED_AT}"
+        );
     }
+    let enabled: String = sqlx::query_scalar(
+        "SELECT tgenabled::text FROM pg_trigger \
+          WHERE tgrelid = 'item'::regclass AND tgname = 'trg_item_updated_at'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("read trg_item_updated_at");
+    assert_eq!(
+        enabled, "O",
+        "0005 re-enables trg_item_updated_at after the backfill"
+    );
 
     db.drop_db().await;
 }

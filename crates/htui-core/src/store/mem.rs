@@ -1410,6 +1410,8 @@ impl State {
         }
         item.status = to;
         item.updated_at = now;
+        // `legal_move` refuses every move to `closed` (MOD-38 PRD D1), so of the two terminal
+        // statuses only `done` gets here; the Postgres twin's `CASE` names just that one.
         item.closed_at = to.is_terminal().then_some(now);
         Ok(true)
     }
@@ -3047,7 +3049,7 @@ impl State {
     /// `item_link` goes when **either** end is the project's, tombstones included: that is what
     /// takes the fixture's cross-project edge from `agy:FEAT-1` to `htui:FEAT-2`, which no
     /// per-project predicate would have reached.
-    fn delete_project(&mut self, id: ProjectId) -> Result<DeleteReach> {
+    fn delete_project(&mut self, id: ProjectId, now: DateTime<Utc>) -> Result<DeleteReach> {
         let (reach, gone) = self.project_reach(id).ok_or_else(|| StoreError::NotFound {
             entity: "project",
             id: id.to_string(),
@@ -3071,12 +3073,23 @@ impl State {
         self.links.retain(|row| {
             !gone.items.contains(&row.from_item_id) && !gone.items.contains(&row.to_item_id)
         });
-        // MOD-38 blueprint §4.4: a citation goes with either end, as a link does; a revision goes
-        // with its requirement, and one that survives in another project loses a deciding item
-        // that did not (`amended_by_item_id ... ON DELETE SET NULL`).
+        // MOD-38 blueprint §4.4: a citation goes with either end, as a link does, and one that
+        // survives loses a proposing step that did not (`proposed_by_step_id ... ON DELETE SET
+        // NULL`, whose UPDATE fires `trg_item_requirement_updated_at`); a revision goes with its
+        // requirement, and one that survives in another project loses a deciding item that did
+        // not (`amended_by_item_id ... ON DELETE SET NULL`).
         self.item_requirements.retain(|row| {
             !gone.items.contains(&row.item_id) && !gone.requirements.contains(&row.requirement_id)
         });
+        for row in &mut self.item_requirements {
+            if row
+                .proposed_by_step_id
+                .is_some_and(|step| gone.steps.contains(&step))
+            {
+                row.proposed_by_step_id = None;
+                row.updated_at = now;
+            }
+        }
         self.requirement_revisions
             .retain(|row| !gone.requirements.contains(&row.requirement_id));
         for row in &mut self.requirement_revisions {
@@ -4808,6 +4821,8 @@ impl State {
     }
 
     /// Re-stamps a live citation at the requirement's current version, clearing suspect.
+    /// Refusals run citation, then withdrawn: an `addresses` / `reserves` citation of a withdrawn
+    /// requirement is not re-stamped, as `cite` would not stamp it (plan D10).
     fn reconfirm(
         &mut self,
         item: ItemId,
@@ -4815,9 +4830,19 @@ impl State {
         kind: CitationKind,
         now: DateTime<Utc>,
     ) -> Result<ItemRequirement> {
+        self.live_citation_mut(item, requirement, kind)?;
         // A live citation's requirement exists (`ON DELETE CASCADE`), so a missing one can only
-        // mean a missing citation, which the lookup below reports.
-        let stamp = self.requirements.get(&requirement).map(|row| row.version);
+        // mean a missing citation, which the lookup above reports.
+        let head = self.requirements.get(&requirement);
+        if let Some(head) = head
+            && head.state == RequirementState::Withdrawn
+            && matches!(kind, CitationKind::Addresses | CitationKind::Reserves)
+        {
+            return Err(StoreError::Constraint(withdrawn_requirement_cited(
+                &head.key, kind,
+            )));
+        }
+        let stamp = head.map(|row| row.version);
         let row = self.live_citation_mut(item, requirement, kind)?;
         if let Some(stamp) = stamp {
             row.requirement_version = stamp;
@@ -5273,7 +5298,8 @@ impl WriteStore for MemStore {
     }
 
     async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
-        self.write(|state| state.delete_project(id))
+        let now = Utc::now();
+        self.write(|state| state.delete_project(id, now))
     }
 
     // MOD-4 milestones 1 and 2, in ANA-2 §8's order. `create_run`, `claim_run`, `select_fanout`,
@@ -5568,13 +5594,13 @@ mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
     use crate::model::{
-        AgentBox, AgentId, BoxId, ChatRunSpec, Claim, DocumentId, GateOutcome, GraphSnapshot,
-        Isolation, ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject, NewRepo,
-        NewRequirement, NewRequirementArea, NewRun, NewRunStep, NoteId, OverlapRule, Priority,
-        ProjectId, RepoId, RequirementAreaId, RequirementId, RequirementPatch, RequirementUpdate,
-        Resolution, RunId, RunKind, RunMode, RunStatus, RunStepCommit, RunStepTree, Scope,
-        SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome, StepStatus, UserId,
-        VerifyOutcome,
+        AgentBox, AgentId, BoxId, ChatRunSpec, CitationKind, Claim, DocumentId, GateOutcome,
+        GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject,
+        NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NoteId, OverlapRule,
+        Priority, ProjectId, RepoId, RequirementAreaId, RequirementId, RequirementPatch,
+        RequirementUpdate, Resolution, RunId, RunKind, RunMode, RunStatus, RunStepCommit,
+        RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
+        StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -6724,6 +6750,76 @@ mod tests {
             store.requirement_coverage(minted.id).await.expect("a read"),
             Vec::new(),
             "the deleted item's citation went with it"
+        );
+    }
+
+    /// MOD-38: a citation between two surviving rows keeps itself and loses a proposing step of
+    /// the deleted project, as `ON DELETE SET NULL` does on
+    /// `item_requirement.proposed_by_step_id`, whose UPDATE also moves `updated_at`.
+    #[tokio::test]
+    async fn delete_project_nulls_a_surviving_citations_proposing_step() {
+        let store = MemStore::demo();
+        let area = store
+            .create_requirement_area(NewRequirementArea {
+                id: RequirementAreaId::new(),
+                project_id: ids::PROJECT_AGY,
+                code: "API".to_owned(),
+                title: "API".to_owned(),
+                description: String::new(),
+                position: 0,
+            })
+            .await
+            .expect("agy takes an area");
+        let minted = store
+            .mint_requirement(
+                area.id,
+                NewRequirement {
+                    id: RequirementId::new(),
+                    body: "Proposed by an htui step.".to_owned(),
+                    rationale: String::new(),
+                    priority: Priority::Must,
+                    created_by: ids::USER,
+                    box_id: None,
+                },
+            )
+            .await
+            .expect("the mint lands");
+        let cited = store
+            .cite(
+                ids::AGY_FEAT_1,
+                minted.id,
+                CitationKind::Addresses,
+                Some(ids::STEP_IMPL),
+            )
+            .await
+            .expect("the cite lands");
+        assert_eq!(
+            cited.proposed_by_step_id,
+            Some(ids::STEP_IMPL),
+            "precondition"
+        );
+
+        store
+            .delete_project(ids::PROJECT_HTUI)
+            .await
+            .expect("the delete lands");
+
+        let row = store
+            .write(|state| {
+                state
+                    .item_requirements
+                    .iter()
+                    .find(|row| row.item_id == ids::AGY_FEAT_1 && row.requirement_id == minted.id)
+                    .cloned()
+            })
+            .expect("the agy citation survives");
+        assert_eq!(
+            row.proposed_by_step_id, None,
+            "the citation no longer names the deleted step"
+        );
+        assert!(
+            row.updated_at > cited.updated_at,
+            "the SET NULL moved updated_at, as the Postgres trigger does"
         );
     }
 

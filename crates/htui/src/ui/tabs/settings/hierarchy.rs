@@ -168,9 +168,6 @@ struct Editor {
 
 /// What the section is doing. `Browse` is not a mode in the modal sense: it captures nothing.
 #[derive(Debug, Default)]
-// MOD-38: `DeleteStage` holds a `DeleteReach`, whose six requirement counts pushed `Deleting`
-// past clippy's variant-size threshold; there is one `Mode` per section, so it stays inline.
-#[allow(clippy::large_enum_variant)]
 enum Mode {
     /// The rows, the cursor and the tab's own `h`/`l`.
     #[default]
@@ -197,16 +194,16 @@ enum DeleteStage {
     /// `delete_reach` is in flight.
     Counting,
     /// The counts are on screen and `y` is the first confirmation.
-    Warn(DeleteReach),
+    Warn(Box<DeleteReach>),
     /// The slug is being typed — the second confirmation, and the one that deletes.
     Typed {
         /// What the warning listed.
-        reach: DeleteReach,
+        reach: Box<DeleteReach>,
         /// What has been typed so far.
         field: TextField,
     },
     /// The delete is in flight.
-    InFlight(DeleteReach),
+    InFlight(Box<DeleteReach>),
 }
 
 /// The workspace tree of the scope, with the keys that edit it.
@@ -702,7 +699,7 @@ impl HierarchySection {
             DeleteStage::Warn(reach) => match key.code {
                 KeyCode::Char('y') => {
                     *stage = DeleteStage::Typed {
-                        reach: *reach,
+                        reach: reach.clone(),
                         field: TextField::new(),
                     };
                 }
@@ -716,7 +713,7 @@ impl HierarchySection {
                             DeleteTarget::Workspace(id) => StoreRequest::DeleteWorkspace(id),
                             DeleteTarget::Project(id) => StoreRequest::DeleteProject(id),
                         };
-                        *stage = DeleteStage::InFlight(*reach);
+                        *stage = DeleteStage::InFlight(reach.clone());
                         self.notice = None;
                         self.send(request, ctx);
                     } else {
@@ -1147,7 +1144,7 @@ impl SettingsSection for HierarchySection {
                 if let Mode::Deleting { stage, .. } = &mut self.mode
                     && matches!(stage, DeleteStage::Counting)
                 {
-                    *stage = DeleteStage::Warn(*reach);
+                    *stage = DeleteStage::Warn(reach.clone());
                 }
             }
             // Nothing to count and nothing to delete: someone else got there first.
@@ -1210,7 +1207,7 @@ impl SettingsSection for HierarchySection {
                 // counts to go back to, so it leaves the tree, where `d` starts again.
                 if let Mode::Deleting { stage, .. } = &mut self.mode {
                     match stage {
-                        DeleteStage::InFlight(reach) => *stage = DeleteStage::Warn(*reach),
+                        DeleteStage::InFlight(reach) => *stage = DeleteStage::Warn(reach.clone()),
                         DeleteStage::Counting => self.mode = Mode::Browse,
                         DeleteStage::Warn(_) | DeleteStage::Typed { .. } => {}
                     }

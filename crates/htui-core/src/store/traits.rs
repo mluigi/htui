@@ -200,8 +200,8 @@ pub trait ReadStore: Send + Sync {
     async fn requirement_areas(&self, project: ProjectId) -> Result<Vec<RequirementArea>>;
 
     /// The project's requirements matching `filter` (plan D14), in `(area_code, number)` order,
-    /// area_code by bytes. The text filter is a case-insensitive literal substring of `key` or
-    /// `body` on every store.
+    /// area_code by bytes. The text filter is a literal substring of `key` or `body`, case-folded
+    /// per backend as [`items`](Self::items)' is ([`RequirementFilter::text`]).
     ///
     /// # Errors
     /// The backend's own failures only.
@@ -1232,7 +1232,9 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound)
     /// `{ entity: "item_requirement", id: citation_key(..) }` ([`citation_key`]) when no live row
-    /// matches.
+    /// matches; then [`StoreError::Constraint`](crate::store::StoreError::Constraint) for
+    /// `addresses`/`reserves` of a withdrawn requirement ([`withdrawn_requirement_cited`]), as
+    /// [`cite`](Self::cite) refuses it (plan D10).
     async fn reconfirm(
         &self,
         item: ItemId,

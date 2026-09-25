@@ -786,7 +786,9 @@ impl WriteStore for PgStore {
     ///
     /// `closed_at` follows the *current* status in both directions - set on a move to a terminal
     /// status, cleared on a move back to a live one (blueprint H.12), which is the MOD-1 errata
-    /// rule `closed_at = to.is_terminal().then_some(now)` written in SQL.
+    /// rule `closed_at = to.is_terminal().then_some(now)` written in SQL. [`legal_move`] refuses
+    /// every move to `closed` (MOD-38 PRD D1; close-out is the only way in), so the one terminal
+    /// status this `UPDATE` can reach is `done`.
     ///
     /// # Errors
     ///
@@ -810,7 +812,7 @@ impl WriteStore for PgStore {
         let moved = sqlx::query!(
             "UPDATE item \
                 SET status    = $3, \
-                    closed_at = CASE WHEN $3 IN ('done','closed') THEN clock_timestamp() ELSE NULL END \
+                    closed_at = CASE WHEN $3 = 'done' THEN clock_timestamp() ELSE NULL END \
               WHERE id = $1 AND status = $2",
             id.as_uuid(),
             from.as_str(),
@@ -4638,20 +4640,57 @@ impl WriteStore for PgStore {
         Ok(())
     }
 
-    /// Re-stamps a live citation at the requirement's current version, in one `UPDATE ... FROM`,
-    /// which clears `suspect` (plan D11).
+    /// Re-stamps a live citation at the requirement's current version, which clears `suspect`
+    /// (plan D11), one transaction.
+    ///
+    /// The requirement is read `FOR SHARE`, as in [`cite`](WriteStore::cite), so the withdrawn
+    /// rule is decided against the state the re-stamp commits beside.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "item_requirement", id: citation_key(..) }` when no
-    /// live row matches, a tombstone included.
+    /// live row matches, a tombstone included; then [`StoreError::Constraint`] for an
+    /// `addresses` / `reserves` citation of a withdrawn requirement
+    /// ([`withdrawn_requirement_cited`]), which `cite` would not stamp either (plan D10).
     async fn reconfirm(
         &self,
         item: ItemId,
         requirement: RequirementId,
         kind: CitationKind,
     ) -> Result<ItemRequirement> {
-        sqlx::query_as!(
+        let not_found = || StoreError::NotFound {
+            entity: "item_requirement",
+            id: citation_key(item, requirement, kind),
+        };
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let cited = sqlx::query!(
+            r#"
+            SELECT r.key   AS "key!",
+                   r.state AS "state: RequirementState"
+              FROM item_requirement ir
+              JOIN requirement r ON r.id = ir.requirement_id
+             WHERE ir.item_id = $1 AND ir.requirement_id = $2 AND ir.kind = $3
+               AND ir.deleted_at IS NULL
+               FOR SHARE OF r
+            "#,
+            item.as_uuid(),
+            requirement.as_uuid(),
+            kind.as_str(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(not_found)?;
+        if cited.state == RequirementState::Withdrawn
+            && matches!(kind, CitationKind::Addresses | CitationKind::Reserves)
+        {
+            return Err(StoreError::Constraint(withdrawn_requirement_cited(
+                &cited.key, kind,
+            )));
+        }
+
+        let row = sqlx::query_as!(
             ItemRequirement,
             r#"
             UPDATE item_requirement ir
@@ -4673,13 +4712,13 @@ impl WriteStore for PgStore {
             requirement.as_uuid(),
             kind.as_str(),
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_sqlx)?
-        .ok_or_else(|| StoreError::NotFound {
-            entity: "item_requirement",
-            id: citation_key(item, requirement, kind),
-        })
+        .ok_or_else(not_found)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(row)
     }
 }
 

@@ -17,9 +17,12 @@ ALTER TABLE item ADD COLUMN resolution TEXT CHECK (resolution IN
     ('done','concluded','rejected','withdrawn','superseded','duplicate'));
 
 -- Every item closed before this migration closed through the old blocked/failed/done -> closed
--- edges, which only a finished item took. The UPDATE fires trg_item_updated_at, which is
--- harmless: the mirror rebuilds on schema_version 5.
+-- edges, which only a finished item took. trg_item_updated_at is off for the backfill, so every
+-- closed item keeps the updated_at of its real last change (the mirror rebuilds on
+-- schema_version 5 regardless).
+ALTER TABLE item DISABLE TRIGGER trg_item_updated_at;
 UPDATE item SET resolution = 'done' WHERE status = 'closed';
+ALTER TABLE item ENABLE TRIGGER trg_item_updated_at;
 
 ALTER TABLE item ADD CONSTRAINT chk_item_resolution_iff_closed
     CHECK ((status = 'closed') = (resolution IS NOT NULL));
@@ -82,6 +85,7 @@ CREATE TABLE requirement (
     UNIQUE (project_id, area_code, number)
 );
 CREATE INDEX idx_requirement_updated_at ON requirement(project_id, updated_at);   -- cache cursor
+CREATE INDEX idx_requirement_area ON requirement(area_id);   -- FK check on area delete
 
 -- --------------------------------------------------------------------------------------------
 -- 6. requirement_revision: append-only, no updated_at, no trigger
@@ -101,6 +105,8 @@ CREATE TABLE requirement_revision (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (requirement_id, version)
 );
+-- ON DELETE SET NULL's lookup when an item is deleted
+CREATE INDEX idx_requirement_revision_amended_by ON requirement_revision(amended_by_item_id);
 
 -- --------------------------------------------------------------------------------------------
 -- 7. item_requirement: citations; tombstoned like item_link
@@ -118,6 +124,7 @@ CREATE TABLE item_requirement (
     PRIMARY KEY (item_id, requirement_id, kind)
 );
 CREATE INDEX idx_item_requirement_req ON item_requirement(requirement_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_item_requirement_updated_at ON item_requirement(updated_at);   -- cache cursor
 
 -- --------------------------------------------------------------------------------------------
 -- 8. updated_at triggers, 0001 §5.1's shape: BEFORE UPDATE only, so an INSERT that supplies

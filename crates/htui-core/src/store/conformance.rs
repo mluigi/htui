@@ -6350,6 +6350,34 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         "{CASE}: nor moved the item"
     );
 
+    // MOD-38's open -> closed edge: `queued -> open` leaves RUN_2 queued, and the law alone
+    // would close the now-`open` item as `withdrawn`; the live run still refuses it.
+    assert!(
+        store
+            .transition(ids::HTUI_FEAT_3, Status::Queued, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: FEAT-3 is un-queued, RUN_2 still live"
+    );
+    let reopened = store
+        .close_out(
+            ids::HTUI_FEAT_3,
+            Resolution::Withdrawn,
+            new_document(ids::HTUI_FEAT_3, "summary", None),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(&reopened, Err(StoreError::Constraint(sentence))
+            if sentence.contains(&ids::RUN_2.to_string())),
+        "{CASE}: an `open` item with a live run is not closed out either, got {reopened:?}"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
+        Status::Open,
+        "{CASE}: and stays open"
+    );
+
     for (item, resolution, summary, why) in [
         (
             ids::HTUI_ANA_2,
@@ -7232,10 +7260,19 @@ async fn requirement_amend_is_cas_and_names_the_item<S: WriteStore>(store: &S) {
 
 /// Plan D10: a withdraw is an amend to `state = withdrawn`, recorded with the deciding item's
 /// `withdraws` citation; afterwards the requirement takes no new `addresses` / `reserves`
-/// citation, and is neither amended nor withdrawn again.
+/// citation, has none re-stamped by `reconfirm`, and is neither amended nor withdrawn again.
 async fn requirement_withdraw_refuses_new_addresses<S: WriteStore>(store: &S) {
     const CASE: &str = "requirement_withdraw_refuses_new_addresses";
 
+    store
+        .cite(
+            ids::HTUI_FIX_1,
+            ids::REQ_ENT_2,
+            CitationKind::Addresses,
+            None,
+        )
+        .await
+        .expect(CASE);
     let head = requirement_updated(
         CASE,
         store
@@ -7310,6 +7347,33 @@ async fn requirement_withdraw_refuses_new_addresses<S: WriteStore>(store: &S) {
         Vec::new(),
         "{CASE}: the refused revival left the tombstone alone"
     );
+
+    let reconfirmed = store
+        .reconfirm(ids::HTUI_FIX_1, ids::REQ_ENT_2, CitationKind::Addresses)
+        .await;
+    assert!(
+        matches!(&reconfirmed, Err(StoreError::Constraint(sentence))
+            if *sentence == withdrawn_requirement_cited("R-ENT-2", CitationKind::Addresses)),
+        "{CASE}: nor has a live `addresses` from before the withdraw re-stamped, \
+         got {reconfirmed:?}"
+    );
+    assert_eq!(
+        store
+            .item_requirements(ids::HTUI_FIX_1)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .filter(|row| row.requirement.id == ids::REQ_ENT_2)
+            .collect::<Vec<_>>(),
+        vec![citation(CASE, store, ids::REQ_ENT_2, CitationKind::Addresses, 1).await],
+        "{CASE}: the refused reconfirm left the citation at v1, suspect"
+    );
+    store
+        .reconfirm(ids::HTUI_FEAT_3, ids::REQ_ENT_2, CitationKind::Withdraws)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{CASE}: the deciding `withdraws` still reconfirms, got {error:?}")
+        });
 
     let again = store
         .withdraw_requirement(

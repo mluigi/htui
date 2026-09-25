@@ -223,7 +223,8 @@ pub struct ItemFilter {
     /// item (§7.4, store-side half). The capability half is expressed through `tags` by the
     /// caller; MOD-4 owns matching against a real box.
     pub ready: Option<bool>,
-    /// Case-insensitive substring match on `key` and `title`.
+    /// Literal substring of `key` or `title`, case-insensitive as far as the backend folds case:
+    /// Unicode in `MemStore`, ASCII only in the SQLite mirror, the database's locale in Postgres.
     pub text: Option<String>,
 }
 

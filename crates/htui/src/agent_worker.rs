@@ -260,9 +260,6 @@ impl core::fmt::Debug for LiveAuth {
 pub type ChatTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// What [`AgentRuntime::serve`] decided about one request.
-// MOD-38: `StoreReply` carries a `DeleteReach` inline, which its six requirement counts pushed
-// past clippy's variant-size threshold; the reply is moved once per request, so it stays inline.
-#[allow(clippy::large_enum_variant)]
 pub enum Served {
     /// Answer with this reply, now.
     Reply(StoreReply),

@@ -551,8 +551,6 @@ const DEFAULT_COPY_MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// What `RunRuntime::serve` (and the runtime's event channel) decided about one request.
 #[derive(Debug)]
-// MOD-38: as `agent_worker::Served` - `StoreReply` grew with `DeleteReach`, and stays inline.
-#[allow(clippy::large_enum_variant)]
 pub enum RunServed {
     /// Answer with this reply, now.
     Reply(StoreReply),

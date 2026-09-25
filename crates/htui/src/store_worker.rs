@@ -508,8 +508,9 @@ pub enum StoreRequest {
     /// Remove the keyring entry and stop dialling. The live connection, if any, is kept until
     /// quit (D13).
     ClearDsn,
-    /// `CacheStore::rebuild()` on the current mirror: the seventeen mirrored tables and the cursor
-    /// go, the file and its `cache_meta` stay (D14).
+    /// `CacheStore::rebuild()` on the current mirror: the mirrored tables
+    /// (`htui_store::cache::MIRRORED_TABLES`) and the cursor go, the file and its `cache_meta`
+    /// stay (D14).
     RebuildCache,
     /// Request to fetch Qdrant connection info.
     QdrantInfo,
@@ -722,14 +723,14 @@ pub enum StoreReply {
     /// reload against (D7). Never a scope change — the editor is still open.
     HierarchyStale(Box<HierarchySnapshot>),
     /// Answer to [`StoreRequest::DeleteReach`]; `None` when the target is already gone.
-    DeleteReach(Option<DeleteReach>),
+    DeleteReach(Option<Box<DeleteReach>>),
     /// Answer to [`StoreRequest::DeleteWorkspace`] / [`StoreRequest::DeleteProject`]: what was
     /// removed, and what the mirror did about it (D10).
     Deleted {
         /// What was deleted.
         target: DeleteTarget,
         /// The rows it took, per table — the same counts the warning pane showed.
-        reach: DeleteReach,
+        reach: Box<DeleteReach>,
         /// What the worker did to the mirror afterwards.
         mirror: MirrorAfterDelete,
     },
