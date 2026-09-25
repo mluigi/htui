@@ -115,8 +115,9 @@ pub async fn snapshot(backend: &Backend, scope: &Scope) -> Result<TemplatesSnaps
 
 /// The two request names, in [`StoreRequest`] order.
 ///
-/// [`StoreRequest::name`]'s arms and the view's `Failed` match both read from here, so a third
-/// request cannot be named in one place and matched in the other.
+/// The view's `Failed` match reads from here. [`StoreRequest::name`]'s arms spell the same two as
+/// literals, and the `request_names_match_the_name_arms` test pins them to this list, so a name
+/// changed in one place and not the other fails there.
 pub const REQUEST_NAMES: [&str; 2] = ["templates", "save_template"];
 
 /// The **read**'s name: a refused read leaves the view with no tree, where a refused save leaves
