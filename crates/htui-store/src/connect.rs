@@ -422,11 +422,10 @@ pub async fn forget_dsn() -> Result<()> {
 
 /// Connects, logs what registration found, and persists a minted box id (MOD-7 D3).
 ///
-/// [`PgStore::connect`] does no file I/O of its own. The store comes back carrying the id
-/// registration answered, which differs from `box.toml`'s only for a copied file
-/// ([`Registration::Copied`]); this is where `box.toml` learns about it, so the next launch
-/// registers as the new box rather than as the one it was copied from. A rename is only logged:
-/// the id does not change. No field logged here is a fingerprint.
+/// [`PgStore::connect`] does no file I/O of its own; [`persist_registration`] is where
+/// `box.toml` learns what registration answered. With [`MigrationState::Pending`] nothing has
+/// registered yet and the call is a no-op; the store worker's `ApplyMigrations` path calls it
+/// again once [`PgStore::apply_migrations`] has.
 ///
 /// # Errors
 ///
@@ -439,7 +438,28 @@ pub async fn try_connect(
     connect_timeout: Duration,
 ) -> Result<Connected> {
     let connected = PgStore::connect_with(dsn, identity, connect_timeout).await?;
-    match connected.store.registration() {
+    persist_registration(root, identity, &connected.store)?;
+    Ok(connected)
+}
+
+/// Logs what registration answered and writes a minted box id back to `box.toml` (MOD-7 D3).
+///
+/// **Must run after every bootstrap** — [`try_connect`] after a connect over an up-to-date schema,
+/// and the store worker's `ApplyMigrations` path after [`PgStore::apply_migrations`] (MOD-7 T4) —
+/// because neither [`PgStore::connect`] nor [`PgStore::apply_migrations`] does file I/O, and a
+/// bootstrap whose answer is not persisted registers the next launch as the box it was copied from.
+///
+/// `presented` is the identity the store was connected with, i.e. what `box.toml` said. The store
+/// carries the id registration answered, which differs from it only for a copied file
+/// ([`Registration::Copied`]); only then is `box.toml` under `root` rewritten. A rename is only
+/// logged: the id does not change. No field logged here is a fingerprint. Before any bootstrap
+/// ([`PgStore::registration`] is `None`) there is nothing to log or write.
+///
+/// # Errors
+///
+/// [`htui_core::store::StoreError::Backend`] when the minted id cannot be written back.
+pub fn persist_registration(root: &Path, presented: &Identity, store: &PgStore) -> Result<()> {
+    match store.registration() {
         Some(Registration::Copied { previous, minted }) => tracing::warn!(
             previous = %previous,
             minted = %minted,
@@ -448,18 +468,18 @@ pub async fn try_connect(
         Some(Registration::Known {
             renamed_from: Some(old),
         }) => tracing::info!(
-            box_id = %identity.box_id,
+            box_id = %presented.box_id,
             from = %old,
-            to = %identity.hostname,
+            to = %presented.hostname,
             "this box was renamed"
         ),
         _ => {}
     }
-    let registered = connected.store.identity();
-    if registered.box_id != identity.box_id {
+    let registered = store.identity();
+    if registered.box_id != presented.box_id {
         identity::store(root, registered)?;
     }
-    Ok(connected)
+    Ok(())
 }
 
 /// Fills in what only a connected server knows: this box, this user and the two cache settings.
