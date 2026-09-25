@@ -261,6 +261,140 @@ async fn apply_migrations_then_persist_writes_a_minted_id_back() {
     db.drop_db().await;
 }
 
+/// Makes a directory writable again when dropped, so a read-only temporary root can be removed.
+#[cfg(unix)]
+struct Writable(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for Writable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// MOD-7 F1: a copied `box.toml` in a config root this process cannot write still goes online, and
+/// the session's later dials present the minted id instead of minting another.
+///
+/// The copy names this very host, so `load_or_mint` has no hostname to rewrite and reads the
+/// read-only root without writing; its row carries another machine's fingerprint, so registration
+/// answers `Copied` (never adopting the row by hostname, OQ-1). The write-back of the minted id then
+/// fails. The first dial must still report `Online`, and the second must present the id the first
+/// was answered with - registration answers `Known` - so the two dials add exactly one row.
+///
+/// Unix only (the root is made `0555`); returns early as root, which writes through `0555`, and on
+/// a machine with no readable identity, which cannot tell a copy apart.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unwritable_box_toml_goes_online_and_mints_once_per_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if htui_store::identity::machine_fingerprint().await.is_none() {
+        return;
+    }
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let copied = htui_store::identity::load_or_mint(root.path()).expect("mint box.toml");
+
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version, \
+                          machine_fingerprint) \
+         VALUES ($1, (SELECT id FROM app_user ORDER BY created_at, id LIMIT 1), $2, \
+                 'linux', '', 'x86_64', '0.0.0', repeat('a', 64))",
+    )
+    .bind(copied.box_id.as_uuid())
+    .bind(&copied.hostname)
+    .execute(&db.pool)
+    .await
+    .expect("plant the other machine's row, under this host's name, at the box.toml id");
+    let user: uuid::Uuid = sqlx::query_scalar("SELECT user_id FROM box WHERE id = $1")
+        .bind(copied.box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("the planted row's user");
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM box WHERE user_id = $1")
+            .bind(user)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count this user's boxes")
+    };
+    let before = count().await;
+
+    // The mirror still needs a writable directory; only the root itself - where `box.toml` is
+    // replaced through a temporary file - is read-only.
+    std::fs::create_dir(root.path().join("cache")).expect("create the mirror directory");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555))
+        .expect("make the config root read-only");
+    // Declared after `root`, so it drops first - on a panic too - and the directory can go.
+    let _writable_again = Writable(root.path().to_owned());
+    let probe = root.path().join("probe");
+    if std::fs::write(&probe, b"").is_ok() {
+        // Root writes through 0555: there is no unwritable root to test here.
+        let _ = std::fs::remove_file(&probe);
+        db.drop_db().await;
+        return;
+    }
+
+    let mut started = start(StartOptions {
+        dsn: Some(db.url.clone()),
+        offline: false,
+        ..StartOptions::new(root.path().to_owned())
+    })
+    .await
+    .expect("start over a read-only root");
+    let first = match next_event(&mut started, "a copied box.toml that cannot be rewritten").await {
+        ConnEvent::Online(pg) => pg,
+        other => panic!("a failed write-back is not a failed connection: {other:?}"),
+    };
+    assert_ne!(
+        first.this_box(),
+        copied.box_id,
+        "registration minted a new id for the copied box.toml"
+    );
+
+    let reconnect = started
+        .reconnect
+        .clone()
+        .expect("a stored DSN arms the ticker");
+    let second = match reconnect().await {
+        ConnEvent::Online(pg) => pg,
+        other => panic!("the second dial goes online too: {other:?}"),
+    };
+    assert_eq!(
+        second.this_box(),
+        first.this_box(),
+        "the second dial presents the id the first was answered with"
+    );
+    assert!(
+        matches!(
+            second.registration(),
+            Some(htui_store::Registration::Known { .. })
+        ),
+        "and registration knows it: {:?}",
+        second.registration()
+    );
+    assert_eq!(
+        htui_store::identity::load_or_mint(root.path())
+            .expect("re-read box.toml")
+            .box_id,
+        copied.box_id,
+        "box.toml still holds the copied id: the root was never writable"
+    );
+    assert_eq!(
+        count().await,
+        before + 1,
+        "two dials in one session add exactly one row for this user"
+    );
+
+    first.pool().close().await;
+    second.pool().close().await;
+    close(&started).await;
+    db.drop_db().await;
+}
+
 /// The server-side half of `error::is_unreachable`, which a unit test cannot reach.
 ///
 /// A `PgStore` that is already connected loses its server mid-session. Nothing here restarts
