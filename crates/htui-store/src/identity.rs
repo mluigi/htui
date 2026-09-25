@@ -444,10 +444,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn this_box_has_a_fingerprint_when_machine_id_is_readable() {
-        if std::fs::read_to_string("/etc/machine-id").is_ok() {
+        // Gated on what the reader itself accepts, not on the file merely being readable: an
+        // `uninitialized` or empty /etc/machine-id is readable and still no identity (D20).
+        if machine_id_under(std::path::Path::new("/")).is_some() {
             assert!(
                 super::machine_fingerprint().await.is_some(),
-                "a readable /etc/machine-id gives a fingerprint"
+                "a well-formed machine-id gives a fingerprint"
             );
         }
     }
