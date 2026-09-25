@@ -454,7 +454,7 @@ Where every risk MOD-4 did not close now lives.
 | R-50 | **MOD-11** | Production `approve`/`accept` are greyed until an agent can write its `output_kind` document. Every production judge fails until the same tool exists (M4 OQ-4). |
 | R-10 | **MOD-16** | A SIGKILLed orchestrator's agent survives. The child leads its own process group, and `ChildGuard::drop` cannot run in a killed process. Signalling a stale pid needs `unsafe` or a dependency. |
 | R-45 | **MOD-16** | `htui` now links `gix`, `process-wrap` and `walkdir` through `htui-orch`. |
-| R-6 | **MOD-15's phase editor** (the plans' owner) | Nothing writes `phase_agent` for an override graph copy, or `is_override`. **MOD-15 closed 2026-09-17**, so no open item holds this today. The next item that edits override graphs inherits it. |
+| R-6 | **MOD-37** (the plans named MOD-15's phase editor, closed 2026-09-17) | Nothing writes `phase_agent` for an override graph copy, or `is_override`. **MOD-15 closed 2026-09-17**, so MOD-37 holds it. |
 | R-43 | **MOD-13** | The close-out summary is generated, with no human prose. An editable summary is MOD-13's editor's. |
 | R-39 | accepted | One isolator per process: a repo added while a walk is live is refused by name until every walk rests (D202). |
 | R-11, R-13..R-20 | accepted | Recorded in the lease plan as design limits of milestone 5; not carried. |

@@ -107,6 +107,9 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
     Postgres; milestone 5's D96 closed its crash half. Nothing writes `gate_outcome = skipped`, so a
     `never`/`on_failure` pass leaves the gate NULL and the step list renders `—` (engine blueprint
     F-K, H-9, H-10; drive plan, "What this milestone touches").
+  - **R-6**: nothing writes `phase_agent` for an override graph copy, or `is_override`. The plans
+    named MOD-15's phase editor as its owner, but MOD-15 closed on 2026-09-17, so it lands here
+    (engine blueprint F-J; drive plan, "What this milestone touches").
   - **R-29**: Postgres stores `queued_at` in microseconds and `MemStore` in nanoseconds, so a
     sub-microsecond tie can name a different `Overlaps.with` (lease blueprint §21.2).
   - **R-30**: `recover::classify` counts a step as finished only when every `run_scope` repo has an
