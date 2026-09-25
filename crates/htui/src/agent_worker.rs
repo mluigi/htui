@@ -573,6 +573,15 @@ impl AgentRuntime {
                 tracing::warn!(?limit, "a background task did not finish and was aborted");
             }
         }
+        // MOD-7 D27: the box probe answers from a task of its own too, and a harness frame taken
+        // after this call has its report in it.
+        if let Some(task) = self.box_probe.take() {
+            let abort = task.abort_handle();
+            if tokio::time::timeout(limit, task).await.is_err() {
+                abort.abort();
+                tracing::warn!(?limit, "a box probe did not finish and was aborted");
+            }
+        }
         if let Some(LiveInstall { cancel, task, .. }) = self.install.take() {
             let abort = task.abort_handle();
             if tokio::time::timeout(limit, task).await.is_err() {
@@ -801,22 +810,7 @@ impl AgentRuntime {
         replies: &mpsc::UnboundedSender<ReplyEnvelope>,
         envelope: &RequestEnvelope,
     ) -> Served {
-        // A finished chat leaves its entry behind; sweep before anything looks one up, so a second
-        // chat on a finished step is a start and not a "no live chat".
-        self.live.retain(|_, chat| !chat.commands.is_closed());
-        // The same sweep for the tasks that answer their own request: a probe that has answered is
-        // not a probe still running, and `background_len` is what a test reads.
-        self.background.retain(|task| !task.is_finished());
-        // And for the right to cancel a preview, which must not outlive the task it names: an
-        // origin whose preview has answered has nothing left to supersede (review finding M3).
-        self.previews.retain(|_, preview| !preview.is_finished());
-        // And for the install claim, which is one deep: an install that has answered must not go
-        // on refusing the next `i` (blueprint H-10).
-        self.install.take_if(|live| live.task.is_finished());
-        // And for the login claim, which is one deep for the same reason. Dropping the value here
-        // is also what releases its `ReprobeClaim`: a finished flow must not go on excluding the
-        // chat re-probe of its own row (blueprint H-25).
-        self.auth.take_if(|live| live.task.is_finished());
+        self.sweep_finished();
 
         let addr = ReplyAddr {
             seq: envelope.seq,
@@ -939,6 +933,45 @@ impl AgentRuntime {
         }
     }
 
+    /// Forgets every task that has finished, so a finished one holds no claim (blueprint D27).
+    ///
+    /// Run before [`serve`](Self::serve) looks anything up and before
+    /// [`on_online`](Self::on_online) asks for the claim.
+    fn sweep_finished(&mut self) {
+        // A finished chat leaves its entry behind; sweep before anything looks one up, so a second
+        // chat on a finished step is a start and not a "no live chat".
+        self.live.retain(|_, chat| !chat.commands.is_closed());
+        // The same sweep for the tasks that answer their own request: a probe that has answered is
+        // not a probe still running, and `background_len` is what a test reads.
+        self.background.retain(|task| !task.is_finished());
+        // And for the right to cancel a preview, which must not outlive the task it names: an
+        // origin whose preview has answered has nothing left to supersede (review finding M3).
+        self.previews.retain(|_, preview| !preview.is_finished());
+        // And for the install claim, which is one deep: an install that has answered must not go
+        // on refusing the next `i` (blueprint H-10).
+        self.install.take_if(|live| live.task.is_finished());
+        // And for the login claim, which is one deep for the same reason. Dropping the value here
+        // is also what releases its `ReprobeClaim`: a finished flow must not go on excluding the
+        // chat re-probe of its own row (blueprint H-25).
+        self.auth.take_if(|live| live.task.is_finished());
+        // And for the box probe, one deep too (MOD-7 D27): a probe that has answered must not go on
+        // refusing an install, a login or the next registration probe.
+        self.box_probe.take_if(|task| task.is_finished());
+    }
+
+    /// The env and hardware a probe resolves through: the injected ones when a test gave them
+    /// (blueprint D35), else [`ProbeEnv::host`] over the working directory and
+    /// [`SystemHardware::host`].
+    fn probe_env(&self) -> Result<(ProbeEnv, Arc<dyn HardwareSource>), StoreError> {
+        if let (Some(env), Some(hardware)) = (&self.probe_env, &self.hardware) {
+            return Ok((env.clone(), Arc::clone(hardware)));
+        }
+        let cwd = std::env::current_dir().map_err(|err| {
+            StoreError::Backend(format!("this process has no working directory: {err}"))
+        })?;
+        Ok((ProbeEnv::host(cwd), Arc::new(SystemHardware::host())))
+    }
+
     /// Cancels every live chat and waits for it, then gives up on stragglers.
     ///
     /// Called when the UI is gone. Without it the runtime drops every session task at its first
@@ -991,6 +1024,11 @@ impl AgentRuntime {
         for task in std::mem::take(&mut self.background) {
             task.abort();
         }
+        // MOD-7 D27: the box probe is aborted like the agent probe; each version child dies with
+        // its `ChildGuard`, and a probe cut short recorded nothing, so the next launch retries.
+        if let Some(task) = self.box_probe.take() {
+            task.abort();
+        }
     }
 
     /// The [`StoreRequest::ProbeAgents`] path (MOD-2 D52, D53).
@@ -1024,6 +1062,10 @@ impl AgentRuntime {
                 live.agent_id
             )));
         }
+        // MOD-7 D27: a box probe is already probing every row on this box.
+        if self.box_probe_running() {
+            return Err(StoreError::Backend(BOX_PROBE_RUNNING.to_owned()));
+        }
         // Since MOD-25 an offline backend answers `None` here, so this closure fires where the
         // guard below used to; the guard is kept, unreachable, for the reversal.
         let writer = backend.writer().ok_or_else(|| {
@@ -1041,15 +1083,14 @@ impl AgentRuntime {
             })?
             .box_id;
         let agents = backend.agents().await?;
-        let cwd = std::env::current_dir().map_err(|err| {
-            StoreError::Backend(format!("this process has no working directory: {err}"))
-        })?;
+        // Blueprint D35: the injected env when a test gave one, else this process's own.
+        let (env, _) = self.probe_env()?;
 
         self.background.push(tokio::spawn(run_probe(ProbeArgs {
             writer,
             box_id,
             agents,
-            cwd,
+            env,
             frames: Frames::new(replies.clone(), addr),
         })));
         Ok(Served::Deferred)
@@ -1382,8 +1423,14 @@ impl AgentRuntime {
             .ok_or_else(|| StoreError::Backend("this runtime has no installer".to_owned()))
     }
 
-    /// `Ok` when no install, probe or login holds the claim (hazard H-10, MOD-21 D19).
+    /// `Ok` when no box probe, install, probe or login holds the claim (hazard H-10, MOD-21 D19,
+    /// MOD-7 D27).
     fn claim_is_free(&self) -> Result<(), StoreError> {
+        // MOD-7 D27, the fourth holder: a box probe ends by probing every agent row on this box,
+        // so it writes `agent_box` for every row, exactly as `ProbeAgents` does.
+        if self.box_probe_running() {
+            return Err(StoreError::Backend(BOX_PROBE_RUNNING.to_owned()));
+        }
         // MOD-21 D19: one claim, three holders. A login writes `agent_box` for its row at the end
         // of the flow, exactly as an install does, so the two exclude each other in both
         // directions and a second login is refused by the same line.
@@ -1809,7 +1856,7 @@ struct ProbeArgs {
     writer: Writer,
     box_id: BoxId,
     agents: Vec<htui_core::model::AgentSummary>,
-    cwd: std::path::PathBuf,
+    env: ProbeEnv,
     frames: Frames,
 }
 
@@ -1838,11 +1885,32 @@ async fn run_probe(args: ProbeArgs) {
     let ProbeArgs {
         writer,
         box_id,
-        mut agents,
-        cwd,
+        agents,
+        env,
         frames,
     } = args;
-    let env = ProbeEnv::host(cwd);
+    let reply = match probe_agents_on(&writer, box_id, agents, &env).await {
+        Ok(agents) => StoreReply::Agents(agents),
+        Err(err) => StoreReply::Failed {
+            request: "probe_agents",
+            message: err.to_string(),
+        },
+    };
+    frames.reply(&frames.addr(), reply);
+}
+
+/// [`run_probe`]'s loop, shared with the box probe (MOD-7 D11): every enabled row of `agents`
+/// probed on `box_id` through `env`, one at a time, each fresh row written through `writer`.
+///
+/// The rows come back as this probe left them: `on_box` replaced by what was written, and left
+/// as read for a disabled row or a hand-written one the probe kept (plan D51). The first write
+/// that fails ends the walk with its error.
+async fn probe_agents_on(
+    writer: &Writer,
+    box_id: BoxId,
+    mut agents: Vec<htui_core::model::AgentSummary>,
+    env: &ProbeEnv,
+) -> Result<Vec<htui_core::model::AgentSummary>, StoreError> {
     let tier2 = SpawnTier2::default();
 
     for summary in &mut agents {
@@ -1863,16 +1931,7 @@ async fn run_probe(args: ProbeArgs) {
         .await
         {
             ProbeOutcome::Row(row) => {
-                if let Err(err) = writer.upsert_agent_box(&row).await {
-                    frames.reply(
-                        &frames.addr(),
-                        StoreReply::Failed {
-                            request: "probe_agents",
-                            message: err.to_string(),
-                        },
-                    );
-                    return;
-                }
+                writer.upsert_agent_box(&row).await?;
                 summary.on_box = Some(row);
             }
             // Plan D51: a hand-written row the probe could not confirm is left exactly as it is,
@@ -1883,7 +1942,7 @@ async fn run_probe(args: ProbeArgs) {
         }
     }
 
-    frames.reply(&frames.addr(), StoreReply::Agents(agents));
+    Ok(agents)
 }
 
 /// Whether this box's row for an agent is worth re-probing (plan D55).
