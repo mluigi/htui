@@ -5024,6 +5024,44 @@ pub(crate) mod tests {
         assert!(on_box.probed_at.is_some());
     }
 
+    /// Blueprint D27: while a box probe runs, a chat start on a stale row spawns no staleness
+    /// re-probe. The box probe ends by probing every agent row on this box, so a second writer
+    /// of the same `agent_box` row would only race it.
+    #[tokio::test]
+    async fn a_chat_start_spawns_no_staleness_reprobe_while_a_box_probe_runs() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&acp_fake_row(agent_id))
+            .await
+            .expect("the acp row lands");
+        let backend = Backend::memory(store.clone());
+        let mut runtime =
+            AgentRuntime::new(acp_factory(Script::one_turn(vec![ScriptEvent::Emit(
+                DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            )])))
+            .with_grace(Duration::from_millis(0));
+        runtime.box_probe = Some(tokio::spawn(std::future::pending()));
+        assert!(runtime.box_probe_running());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+            .await;
+        assert!(
+            matches!(served, Served::Start { .. }),
+            "the chat still starts: {served:?}"
+        );
+        assert_eq!(
+            runtime.background_len(),
+            0,
+            "the box probe re-probes every row anyway"
+        );
+        runtime.box_probe.take().expect("still held").abort();
+    }
+
     /// A re-probe mid-chat leaves the latched quota standing, and since MOD-2 plan D74 it is the
     /// **store** that guarantees that rather than the probe.
     ///
