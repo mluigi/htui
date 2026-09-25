@@ -1234,7 +1234,7 @@ pub fn reserved_phase_name(name: &str) -> String {
 #[must_use]
 pub fn invalid_template_name(name: &str) -> String {
     format!(
-        "prompt_template.name `{}` must be non-empty, single-line and trimmed",
+        "prompt_template.name `{}` must be non-empty, single-line, trimmed and free of NUL",
         name.escape_debug()
     )
 }
@@ -1246,12 +1246,16 @@ pub fn prompt_template_key(project: ProjectId, name: &str) -> String {
 }
 
 /// MOD-9 D4, D17: why a template may not be saved, or `None` when it may. The name rule first,
-/// then [`parse`] in the name's role; the sentence is
-/// [`TemplateError`](crate::prompt::TemplateError)'s `Display`.
+/// then a body with U+0000 (which `parse` accepts and Postgres `text` cannot hold), then [`parse`]
+/// in the name's role; that last sentence is [`TemplateError`](crate::prompt::TemplateError)'s
+/// `Display`.
 #[must_use]
 pub fn prompt_template_refusal(name: &str, body: &str) -> Option<String> {
     if !PromptTemplate::name_is_valid(name) {
         return Some(invalid_template_name(name));
+    }
+    if body.contains('\0') {
+        return Some("prompt_template.body must not contain a NUL character".to_owned());
     }
     parse(TemplateRole::of_name(name), body)
         .err()

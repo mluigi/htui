@@ -2142,9 +2142,13 @@ impl WriteStore for PgStore {
     ) -> Result<CasOutcome<PromptTemplate>> {
         let key = prompt_template_key(new.project_id, &new.name);
         if let Some(refusal) = prompt_template_refusal(&new.name, &new.body) {
-            let head = self
-                .prompt_template(new.project_id, &new.name, None)
-                .await?;
+            // No row can be named with a NUL, and binding one is `22021`, not an empty read.
+            let head = if new.name.contains('\0') {
+                None
+            } else {
+                self.prompt_template(new.project_id, &new.name, None)
+                    .await?
+            };
             return match (head, expected) {
                 (Some(head), _) if Some(head.version) != expected => Ok(CasOutcome::Stale(head)),
                 (None, Some(_)) => Err(StoreError::NotFound {

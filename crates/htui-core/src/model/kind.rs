@@ -352,11 +352,12 @@ pub struct NewPromptTemplate {
 
 impl PromptTemplate {
     /// Whether `name` may name a template (plan D4): non-empty, no leading or trailing whitespace,
-    /// no `\n` or `\r`. Here rather than in either store for `ItemKind::prefix_is_valid`'s reason:
-    /// both stores refuse the same strings with the same sentence.
+    /// no `\n` or `\r`, and no U+0000, which Postgres `text` cannot hold. Here rather than in
+    /// either store for `ItemKind::prefix_is_valid`'s reason: both stores refuse the same strings
+    /// with the same sentence.
     #[must_use]
     pub fn name_is_valid(name: &str) -> bool {
-        !name.is_empty() && name.trim() == name && !name.contains(['\n', '\r'])
+        !name.is_empty() && name.trim() == name && !name.contains(['\n', '\r', '\0'])
     }
 }
 
