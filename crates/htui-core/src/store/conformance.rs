@@ -5303,8 +5303,9 @@ async fn prompt_template_new_name_starts_at_one<S: WriteStore>(store: &S) {
 }
 
 /// MOD-9 plan D4, blueprint D18: the store refuses what `parse` refuses, in the name's role, and
-/// an invalid name; a spent token answers `Stale` before any of that; an unknown project is a
-/// `Constraint`. A save at the head after the refusals lands at v2, so none of them wrote.
+/// an invalid name; a spent token answers `Stale` before any of that; an unknown project or
+/// author is a `Constraint`. A save at the head after the refusals lands at v2, so none of them
+/// wrote.
 async fn prompt_template_refuses_what_parse_refuses<S: WriteStore>(store: &S) {
     const CASE: &str = "prompt_template_refuses_what_parse_refuses";
     const TYPO: &str = "Implement {{itme}}.\n";
@@ -5366,6 +5367,22 @@ async fn prompt_template_refuses_what_parse_refuses<S: WriteStore>(store: &S) {
         "prompt_template.name",
         "a name with a NUL",
     );
+    // Under a token the head is read first (D18), and no row can be named with a NUL: the token's
+    // answer, `NotFound`, never the name's. `PgStore` skips that read rather than bind the NUL
+    // (`22021`).
+    let missing = store
+        .append_prompt_template(new_template(ids::PROJECT_HTUI, "a\0b", GOOD), Some(1))
+        .await;
+    assert!(
+        matches!(
+            missing,
+            Err(StoreError::NotFound {
+                entity: "prompt_template",
+                ..
+            })
+        ),
+        "{CASE}: a NUL name under a token is NotFound, got {missing:?}"
+    );
 
     let head = stale(
         CASE,
@@ -5399,6 +5416,24 @@ async fn prompt_template_refuses_what_parse_refuses<S: WriteStore>(store: &S) {
         matches!(unknown, Err(StoreError::Constraint(_))),
         "{CASE}: a project that names no row is Constraint, got {unknown:?}"
     );
+
+    // At the current head, so only the author can refuse it: `app_user`'s FK on Postgres,
+    // `require_user` on `MemStore`.
+    let mut stranger = new_template(ids::PROJECT_HTUI, "implement", GOOD);
+    stranger.created_by = UserId::new();
+    let unknown = store.append_prompt_template(stranger, Some(2)).await;
+    assert!(
+        matches!(unknown, Err(StoreError::Constraint(_))),
+        "{CASE}: a created_by that names no app_user is Constraint, got {unknown:?}"
+    );
+    let head = stale(
+        CASE,
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "implement", GOOD), Some(1))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(head.version, 2, "{CASE}: the unknown author wrote nothing");
 }
 
 /// Plan D89: `interrupt_step` is a compare-and-set on `running`. It writes `failed`, the note and

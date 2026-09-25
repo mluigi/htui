@@ -4,8 +4,9 @@
 //! `tests/templates.rs` proves the Templates view over a `MemStore`. What only this file can prove
 //! is that the save the view sends is one `PgStore` accepts: the worker's `SaveTemplate` goes
 //! through `Backend::writer()` to `append_prompt_template`'s compare-and-set on the server, the new
-//! head is v2 with the worker's `created_by`, the deferred preview (`htui::preview`) renders that
-//! head, and an offline backend refuses the save with nothing written.
+//! head is v2 with the worker's `created_by`, and the deferred preview (`htui::preview`) renders
+//! that head. The offline refusal needs no server and lives with the worker's own tests
+//! (`htui::templates`).
 //!
 //! Every case builds `runs_pg.rs`'s stack: a throwaway database with the demo world
 //! (`testkit::demo_db`), a throwaway mirror (`CacheStore`), a `testkit::mock_keyring` guard (the
@@ -26,14 +27,13 @@ use std::time::Duration;
 
 use htui::agent_worker::AgentRuntime;
 use htui::app::register_all;
-use htui::store_worker::{self, Origin, RequestEnvelope, StoreReply, StoreRequest};
-use htui::templates::TemplateBody;
+use htui::store_worker::{Origin, RequestEnvelope, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::tabs::SkillsTab;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
 use htui_core::model::{PromptTemplate, Scope};
-use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore, secret, testkit};
+use htui_store::{Backend, CacheStore, PgStore, secret, testkit};
 
 /// The line a save adds as `implement`'s new first line: in v2, never in v1.
 const MARKER: &str = "MOD9 MARKER LINE";
@@ -239,44 +239,5 @@ async fn the_preview_uses_the_new_head() {
         after.contains(MARKER),
         "the preview renders the v2 head:\n{after}"
     );
-    stack.finish().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_offline_save_is_refused_without_a_row() {
-    let Some(mut stack) = Stack::new().await else {
-        return;
-    };
-    let scope = stack.harness.app().scope.clone();
-    let offline = Backend::Offline {
-        cache: stack.cache.clone(),
-        since: None,
-    };
-
-    let reply = store_worker::serve(
-        &offline,
-        &StoreRequest::SaveTemplate {
-            scope,
-            project: ids::PROJECT_VULKAN,
-            name: NAME.to_owned(),
-            body: TemplateBody::new(format!("{MARKER}\n{{{{item}}}}\n")),
-            expected: Some(1),
-        },
-    )
-    .await;
-    match reply {
-        StoreReply::Failed { request, message } => {
-            assert_eq!(request, "save_template");
-            assert!(
-                message.contains(DATABASE_UNREACHABLE),
-                "the offline refusal names the unreachable database: {message}"
-            );
-        }
-        other => panic!("an offline save is refused, not {other:?}"),
-    }
-
-    let head = stack.head().await.expect("the seeded head");
-    assert_eq!(head.version, 1, "nothing reached the server");
-    assert!(!head.body.contains(MARKER));
     stack.finish().await;
 }

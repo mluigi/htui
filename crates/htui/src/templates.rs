@@ -185,7 +185,7 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::{ProjectId, Scope};
     use htui_core::store::{MemStore, StoreError};
-    use htui_store::{Backend, CacheStore, PROMPT_ON_SERVER_ONLY};
+    use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY};
 
     fn demo() -> Backend {
         Backend::memory(MemStore::demo())
@@ -433,6 +433,44 @@ mod tests {
         ];
         let names: Vec<&str> = samples.iter().map(StoreRequest::name).collect();
         assert_eq!(names, REQUEST_NAMES);
+    }
+
+    /// Offline there is no writer, so the save is refused before anything is sent: the worker
+    /// answers `Failed` for `save_template` with the unreachable-database sentence. There is no
+    /// server here to check for a row, and none is needed: nothing could have reached one.
+    #[tokio::test]
+    async fn an_offline_save_is_refused_with_the_unreachable_sentence() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "templates-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let backend = Backend::Offline { cache, since: None };
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        let request = save(
+            &scope,
+            ids::PROJECT_HTUI,
+            "implement",
+            "Implement {{item}}\n",
+            Some(1),
+        );
+
+        assert_eq!(
+            serve(&backend, &request).await.err(),
+            Some(StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))
+        );
+        match store_worker::serve(&backend, &request).await {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, "save_template");
+                assert!(
+                    message.contains(DATABASE_UNREACHABLE),
+                    "the refusal names the unreachable database: {message}"
+                );
+            }
+            other => panic!("an offline save is refused, not {other:?}"),
+        }
     }
 
     #[tokio::test]
