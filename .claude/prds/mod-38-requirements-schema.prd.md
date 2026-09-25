@@ -155,9 +155,9 @@ R-X, and which of them were written against an older text" is a query rather tha
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Resolution | Every closed item says how it ended; an early-withdrawn item can close; the orchestrator still cannot jump to `closed`. Migration (resolution part), `Resolution` type, `close_out` guard, orchestrator plumbing, FIX-1, cache column. | pending | — |
-| 2 | Requirements | Areas, requirements and revisions exist with minted keys, CAS amend and withdraw naming the deciding item, and the spec header; readable on both stores. | pending | — |
-| 3 | Citations and offline | Items cite requirements, suspect is derived and re-confirmable, coverage is a query, the cache mirrors all of it, project delete counts it, and the demo shows one suspect citation. | pending | — |
+| 1 | Resolution | Every closed item says how it ended; an early-withdrawn item can close; the orchestrator still cannot jump to `closed`. Migration (resolution part), `Resolution` type, `close_out` guard, orchestrator plumbing, FIX-1, cache column. | complete | [plan](../plans/mod-38-requirements-schema.plan.md) |
+| 2 | Requirements | Areas, requirements and revisions exist with minted keys, CAS amend and withdraw naming the deciding item, and the spec header; readable on both stores. | complete | [plan](../plans/mod-38-requirements-schema.plan.md) |
+| 3 | Citations and offline | Items cite requirements, suspect is derived and re-confirmable, coverage is a query, the cache mirrors all of it, project delete counts it, and the demo shows one suspect citation. | complete | [plan](../plans/mod-38-requirements-schema.plan.md) |
 
 Milestone 1 is independently useful (it is what MOD-34's `resolution` payload waits for) and
 touches the orchestrator; milestones 2 and 3 are store-only. All three ship in one branch because

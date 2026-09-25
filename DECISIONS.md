@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-38](docs/decisions/mod/mod-38.md)** - Requirements schema, seam and close-out resolution (done, 2026-09-25)
 - **[ANA-11](docs/decisions/ana/ana-11.md)** - Models for requirements and decisions (concluded, 2026-09-25)
 - **[MOD-4](docs/decisions/mod/mod-4.md)** - Orchestrator, manual mode: `htui-orch` walks step graphs with gates, the review loop, judged fan-out and four git isolation modes under a leased heartbeat and a recovery sweep, and the Runs pane drives it with promotion to chat and close-out (done, 2026-09-25)
 - **[ANA-16](docs/decisions/ana/ana-16.md)** - Research agent execution environments (Docker, remote shell) (done, 2026-09-24)

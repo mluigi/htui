@@ -14,24 +14,24 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-25):** **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`):
-requirements get dedicated tables with suspect-aware item citations; a decision is a closed item with
-a new `item.resolution` and its `summary` document. Spawned MOD-38 (schema; §7 applied to
-`docs/REQUIREMENTS.md` 2026-09-25, R-MCP-2 deferred to MOD-11) and MOD-39 (TUI).
-Before it, **ANA-16 was done** (2026-09-24, `docs/decisions/ana/ana-16.md`): remote and container
-execution is a headless `htui worker` per box on Postgres first (MOD-40..46), with a self-hosted
-control plane and config manager as trigger-gated phase 2 (MOD-47, MOD-48); requirement amendments
-are open questions inside those items.
+**Current status (2026-09-25):** **MOD-38 was done** (`docs/decisions/mod/mod-38.md`): migration
+`0005_requirements` adds `item.resolution` and the requirement tables behind new store methods on
+MemStore, PgStore and the cache; `closed` is now reachable only through `close_out`, which takes a
+resolution (amends ANA-2 §4.3). MOD-39 (Requirements tab) is unblocked.
+Before it, **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`): requirements get dedicated
+tables with suspect-aware item citations; a decision is a closed item with a resolution and its
+`summary` document (§7 applied to `docs/REQUIREMENTS.md` 2026-09-25, R-MCP-2 deferred to MOD-11).
 Before it, **MOD-4 was done** (`docs/decisions/mod/mod-4.md`): the
 orchestrator runs in manual mode across all six milestones. `htui-orch` walks step graphs with gates,
 the review loop, judged fan-out and four git isolation modes under a leased heartbeat and a recovery
 sweep, and `run_worker.rs` and the Runs pane let the maintainer drive it, promote a step to chat and
 close an item out. Its carried risks are **MOD-37** and **CLEAN-4**.
-**Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration` and
-`0004_max_agents_per_run_default` (cache: `0001`..`0003`), so **the next migration is `0005`**.
-`max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins at MOD-4's close
-(`22cfeea`): store conformance `CASES` 53, `READ_CASES` 9, `htui-orch` `CASES` 70, `StoreRequest`
-62 variants, 227 `.sqlx` files; `cargo doc --workspace --no-deps` shows exactly two baseline errors
+**Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
+`0004_max_agents_per_run_default` and `0005_requirements` (cache: `0001`..`0004`), so **the next
+migration is `0006`**.
+`max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins at MOD-38's close: store
+conformance `CASES` 65, `READ_CASES` 14, `htui-orch` `CASES` 70, `StoreRequest` unchanged since
+MOD-4, 256 `.sqlx` files, `MIRRORED_TABLES` 21; `cargo doc --workspace --no-deps` shows exactly two baseline errors
 (`htui-core` `MIRRORED_TABLES`, `htui-store` `step_exists`). `git` ≥ 2.33.0 is a runtime dependency
 of the `worktree` isolation mode and of reconciliation. **Production `approve` and `accept` are
 greyed and every production judge fails until MOD-11**, because no agent can write its phase's
@@ -96,18 +96,8 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
 
 ### Next features
-- [ ] **MOD-38 - Requirements schema, seam and close-out resolution** (from ANA-11). `R-ENT-8`,
-  `R-NF-4`, `R-STO-3`, `R-TUI-9`, `R-ENT-14..15`. Migration `0005_requirements.sql`
-  (`requirement_spec`, `requirement_area`, `requirement_key_counter`, `requirement`,
-  `requirement_revision`, `item_requirement` with a version stamp for derived suspect links, and
-  `item.resolution` with the closed-iff-resolved CHECK and a `done` backfill), cache migration
-  `0004_requirements.sql`, and the `ReadStore`/`WriteStore` methods of `docs/ANA-11.md` §5.1 on
-  `MemStore`, `PgStore` and the cache. `close_out` takes a resolution and allows `open` → `closed`
-  only for `rejected`/`withdrawn`/`superseded`/`duplicate`, which amends ANA-2 §4.3. The demo fixture
-  gains requirements with one suspect citation. Unblocked 2026-09-25: the maintainer applied
-  `docs/ANA-11.md` §7 to `docs/REQUIREMENTS.md`, deferring the optional `R-MCP-2`
-  `requirement_cite` amendment to MOD-11.
-- [ ] **MOD-39 - Requirements tab and item traceability** (from ANA-11; blocked on MOD-38).
+- [ ] **MOD-39 - Requirements tab and item traceability** (from ANA-11; MOD-38 done,
+  `docs/decisions/mod/mod-38.md`: the seam, `item.resolution` and `Resolution::default_for` exist).
   `R-TUI-1`, `R-TUI-9`, `R-ENT-14..15`. Requirements tab (areas, requirements, coverage by
   citing item with status and resolution, withdrawn rows dimmed, revision trail with the deciding
   item); cited requirements with suspect markers and a re-confirm action in item detail; a
@@ -574,9 +564,9 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 - [ ] **MOD-8 - Legacy markdown import.** `R-LATER-3`. Map old prefixes to kinds per project,
   preserve keys, build links. Later tier; MOD-6 landed (`docs/decisions/mod/mod-6.md`, importer
   mint variant per ANA-9 §7.1 still to write). Widened by ANA-11 (`docs/ANA-11.md` §6 phase 3): also import
-  `docs/REQUIREMENTS.md` into the MOD-38 requirement tables, map each `DECISIONS.md` status to
+  `docs/REQUIREMENTS.md` into the requirement tables MOD-38 added (`docs/decisions/mod/mod-38.md`), map each `DECISIONS.md` status to
   `item.resolution` (`shipped` → `done`), write-ups to `summary` documents and each analysis doc to
-  the `verdict` document, and scan body `R-` IDs once into `addresses` citations. Blocked on MOD-38.
+  the `verdict` document, and scan body `R-` IDs once into `addresses` citations.
 
 ### Tooling findings
 
@@ -607,6 +597,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 34 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 33 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
