@@ -135,8 +135,9 @@ impl BoxRecord {
     /// `htui`, or under another effective spec.
     #[must_use]
     pub fn needs_probe(&self, running: &str, spec_digest: &str) -> bool {
-        let _ = (running, spec_digest);
-        todo!("MOD-7 T0: needs_probe")
+        self.row.last_probed_at.is_none()
+            || self.row.htui_version != running
+            || self.probe_spec_digest.as_deref() != Some(spec_digest)
     }
 }
 
