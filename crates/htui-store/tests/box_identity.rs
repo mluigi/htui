@@ -493,3 +493,86 @@ async fn a_reconnect_leaves_htui_version_and_the_probe_columns_alone() {
 
     db.drop_db().await;
 }
+
+/// MOD-7 D37 (blueprint; a deferred T2 finding): `boxes()` lists only this user's boxes, by
+/// ascending id, each box's tools by name bytes (`COLLATE "C"`). The planted second box of this
+/// user sorts **before** the registered one, so insertion order cannot pass; another user's box
+/// and its tool never appear.
+#[tokio::test]
+async fn boxes_lists_only_this_user_s_boxes_in_id_order() {
+    use htui_core::store::WriteStore as _;
+
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    let me = db.store.this_user();
+    let registered = db.store.this_box();
+    let second = BoxId::from_uuid(uuid::Uuid::from_u128(1));
+    let foreign = BoxId::from_uuid(uuid::Uuid::from_u128(2));
+    assert!(
+        second < registered && foreign < registered,
+        "the planted ids sort before the registered one"
+    );
+    let stranger = UserId::new();
+    sqlx::query("INSERT INTO app_user (id, name) VALUES ($1, $2)")
+        .bind(stranger.as_uuid())
+        .bind(format!("stranger-{}", uuid::Uuid::now_v7().simple()))
+        .execute(&db.pool)
+        .await
+        .expect("plant another user");
+    for (id, owner, hostname) in [
+        (second, me, unique_hostname("SECOND")),
+        (foreign, stranger, unique_hostname("ELSEWHERE")),
+    ] {
+        sqlx::query(
+            "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+             VALUES ($1, $2, $3, 'linux', '', 'x86_64', '0.0.0')",
+        )
+        .bind(id.as_uuid())
+        .bind(owner.as_uuid())
+        .bind(&hostname)
+        .execute(&db.pool)
+        .await
+        .expect("plant a box");
+    }
+    for (box_id, name) in [
+        (second, "awk"),
+        (second, "Zig"),
+        (second, "_x"),
+        (foreign, "leak"),
+    ] {
+        sqlx::query("INSERT INTO box_tool (box_id, name, version, path) VALUES ($1, $2, '1', $3)")
+            .bind(box_id.as_uuid())
+            .bind(name)
+            .bind(format!("/usr/bin/{name}"))
+            .execute(&db.pool)
+            .await
+            .expect("plant a tool");
+    }
+
+    let records = db.store.boxes().await.expect("boxes answers");
+
+    let listed: Vec<BoxId> = records.iter().map(|record| record.row.id).collect();
+    assert_eq!(
+        listed,
+        [second, registered],
+        "this user's two boxes, by ascending id"
+    );
+    assert!(
+        records.iter().all(|record| record.row.user_id == me),
+        "no other user's box is listed: {records:?}"
+    );
+    let tools: Vec<&str> = records[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(tools, ["Zig", "_x", "awk"], "tools by name bytes");
+    assert!(
+        records[1].tools.is_empty(),
+        "the registered box was never probed"
+    );
+
+    db.drop_db().await;
+}
