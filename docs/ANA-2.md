@@ -550,6 +550,12 @@ by exactly one human action.**
 | `R-ORCH-10` capability refusal: `item.required_tags` is not a subset of the box's tags | an `item_note` whose body is the missing-tag list from `docs/ANA-9.md:960` | `unblock` (Backlog action) once tags are added or the target box changes |
 | `R-ORCH-3` escalation: the review loop exhausted its retry budget, or the judge could not decide | the run parks in `awaiting_approval`; the last review step keeps `gate_outcome = 'rejected'` | `retry` or `approve` on the Runs tab, or `unblock` |
 | `R-SEC-4` refusal: the secret provider is unreachable and the run needs its secrets | `run.failure` when a run row exists | `unblock` after the provider returns |
+| Stage-3 prompt refusal: `assemble()` refuses the step's prompt before a token is spent (amended by MOD-4 milestone 6, 2026-09-25; MOD-4 plan D162, D195) | the step `failed`, an `item_note` with the assembler's sentence, then `finish_run(Failed, PromptRefused)`; no session starts | `unblock` returns the item to `open` |
+
+*Amended by MOD-4 milestone 6, 2026-09-25:* the table above is no longer exactly three events. ANA-5
+criterion 3 asks only an unknown placeholder to block; MOD-4 plan D162 generalises that to every
+stage-3 prompt refusal, at both the single-step and the fan-out call site. MOD-4 milestone 4's
+no-candidate refusal (plan D62) also writes `blocked`.
 
 A `blocked` item is visible in the Backlog with its note, so the "invisible to the queue forever"
 failure the two designs would otherwise produce cannot happen: `docs/ANA-9.md` §7.4 still filters
@@ -581,12 +587,22 @@ makes `is_terminal()` true. No readiness change, no new state.
 | `awaiting_approval` | reject with note, terminal | no budget, or the phase has no predecessor to loop to | `failed` | user |
 | `awaiting_approval` | cancel | - | `open` | user |
 | `blocked` | unblock | - | `open` | user |
+| `blocked` | unblock | the item's run is parked `awaiting_approval` (an escalation); added by MOD-4 plan D161 (amended by MOD-4 milestone 6, 2026-09-25) | `awaiting_approval` | user |
 | `blocked` | close | - | `closed` | close-out |
 | `failed` | retry | - | `queued` | user |
 | `failed` | close | - | `closed` | close-out |
 | `done` | close-out | summary document written, commits recorded (`R-TUI-9`) | `closed` | close-out |
 | `done` | reopen | - | `open` | user |
 | `closed` | - | terminal | - | - |
+
+*Amended by MOD-4 milestone 6, 2026-09-25 (plan D161, R-42):* the `blocked → awaiting_approval`
+row is new. As first written, the table had no way back from `blocked` to a parked run, while
+verdict 1's escalation row is cleared by "`retry` or `approve`", which a `blocked` item cannot reach
+(MOD-4 risk R-4). `Unblock` now has three cases: a blocked item with no live run goes to `open`; a
+blocked item whose run is parked follows it to `awaiting_approval`, so the Runs tab's promote,
+approve, retry and cancel reach the run; and an `awaiting_approval` item whose run is parked by a
+refused reconcile or a crash is resumed (`Engine::resume`). `Status::can_move_to` and its
+`SANCTIONED` test pin the one added pair.
 
 Three notes on this table. **`queued` is exactly "a `run` row exists in status `queued` for this
 item"** - the two are written in one transaction, so the state is never a lie. **`done` and `closed`
@@ -868,7 +884,9 @@ same reason: its attempt statistics "only accumulate the states of the sub-agent
 *Bounds.* `fan_out` is capped at `app_setting.max_fan_out`, default **4**. The only shipped product
 with a human-select fan-out, Codex cloud, caps attempts at 4
 (https://help.openai.com/en/articles/11428266-codex-changelog). A run is additionally capped at
-`app_setting.max_agents_per_run`, default **6**, counting every candidate plus every judge plus every
+`app_setting.max_agents_per_run`, default **8** (was 6; raised by MOD-4 milestone 4's
+`0004_max_agents_per_run_default.sql`, because 6 refused the seeded `feature` graph's judged 3-way
+`implement`; amended by MOD-4 milestone 6, 2026-09-25), counting every candidate plus every judge plus every
 retry attempt planned so far. Both refusals are loud: the run is refused at admission naming the cap
 and the requested figure, never silently truncated, following Anthropic's stated reason for refusing
 an over-long parallel list rather than capping it ("A silent cap would drop part of the workload
@@ -1142,7 +1160,7 @@ Both are `Deserialize` with `#[serde(default)]` on every field, so a hand-edited
 which is what the `DEFAULT '{}'` on both columns already promises. The defaults come from
 `app_setting`, and MOD-4 extends `SEEDED_SETTINGS` (currently two cache keys) with:
 `max_concurrent_items` 2, `command_limits` `{"build":1,"test":4,"verify":1}`, `default_isolation`
-`"worktree"`, `step_deadline_seconds` 7200, `max_fan_out` 4, `max_agents_per_run` 6,
+`"worktree"`, `step_deadline_seconds` 7200, `max_fan_out` 4, `max_agents_per_run` 8 (6 until MOD-4's `0004`; amended by MOD-4 milestone 6, 2026-09-25),
 `copy_max_total_bytes`, and the two `R-AGT-7` caps as NULL. `max_concurrent_items = 2` matches the
 demo fixture (`crates/htui-core/src/fixtures.rs:375`) and is **Open for the maintainer 3**.
 
@@ -1194,6 +1212,13 @@ A promoted step that was `running` is cancelled first with the driver's grace wi
 `session/cancel` and every parked permission answer land before the chat attaches (ANA-4 §4.3 makes
 answering every outstanding request a MUST).
 
+*Amended by MOD-4 milestone 6, 2026-09-25 (plan OQ-5, D163, R-38):* as built, a `running` step is
+promoted by **preempting its walk**. The run's cancel token drops the walk, which kills the agent
+through `ChildGuard::drop`; the engine then moves the step `running → awaiting_approval` and calls
+`promote_step`. The grace window and the answers to parked permission requests are **not** honoured.
+The transcript is intact up to the kill. A graceful path needs a cancel seam inside the driver's
+pump and is carried in MOD-37.
+
 *Preserving the session context.* Two paths, chosen by `DriverCaps`:
 
 | Condition | Path |
@@ -1201,6 +1226,14 @@ answering every outstanding request a MUST).
 | `DriverCaps.follow_up_in_session` and the session is still live | send a `follow_up` into the running session; `turn` increments; nothing respawns |
 | the session ended, and `DriverCaps.resume` | query the step's first `other` row with `update = "session_started"` for the agent-side id, then `session/load` or `session/resume` (ACP) or `claude --resume <id>` (CLI); the driver replays or restores, and `htui` drops the replayed `user_message_chunk` rows as ANA-4 §6.1 specifies |
 | neither | ANA-5 builds a **handoff prompt** from the step's own stored transcript (a summary, the input documents, the diff so far, the failure reason) and starts a fresh agent session against the same `run_step`, same `isolation_path`, next `turn` |
+
+*Amended by MOD-4 milestone 6, 2026-09-25 (blueprint F-G, D192, D193, R-48):* as built, the first
+path is unreachable: a walk's session ends at its `done` before the step parks, and a preempted one
+was killed. The second path is taken only for a **CLI** agent with `DriverCaps.resume` and a
+`session_started` banner. The ACP driver never reads `SessionSpec.resume`, so every ACP step gets
+the handoff path, and ACP `session/load` is carried in MOD-37. A resumed session is opened with
+`htui`'s own one-sentence follow-up (`promote::RESUME_OPENING`), recorded as the `follow_up` at the
+next `turn`. Either way the step's `prompt_digest` and `trim_record` are never rewritten.
 
 The third path is what makes `R-ORCH-5` true for every agent rather than only for resumable ones.
 Claude Code's Explore and Plan agents "return no agent ID, so Claude can't resume them"
@@ -1233,6 +1266,14 @@ stage 5 and stage 6 exactly as if the session had ended normally:
 
 A promoted step can also be answered `retried` (discard and re-run the phase), `rejected` (fail it),
 or `cancel`. Promotion adds no new outcome vocabulary at all.
+
+*Amended by MOD-4 milestone 6, 2026-09-25 (plan D166, blueprint D194, D211, D212):* `accept
+artifact` is refused while a chat on the step is live, and it is refused when `verify_command`
+fails (the outcome is recorded and the step stays promoted), which the list above leaves open. An
+`unavailable` verify is recorded and noted, not refused. The verify's deadline is a fresh copy of
+the phase deadline, measured from the accept. `GateAnswer::Skipped` is not exposed as an accept
+shape: accept needs the document and lands `approved`. While a chat is live on any step of the run,
+approve, reject, retry, select and cancel are refused too.
 
 *Free-standing chat is untouched.* `run(kind='chat', item_id NULL)` remains what
 `crates/htui-store/src/cache/pending.rs` already writes offline, and MOD-4 neither reads nor writes
@@ -1469,7 +1510,7 @@ mirrored, which makes its shape load-bearing.
     "per_token_cap_run": null,
     "per_token_cap_batch": null,
     "max_fan_out": 4,
-    "max_agents_per_run": 6
+    "max_agents_per_run": 8
   }
 }
 ```
@@ -1513,7 +1554,7 @@ verification prefilter; anything else is a judge failure per §4.5.
 | `default_isolation` | string | `"worktree"` | §4.1 |
 | `step_deadline_seconds` | integer | 7200 | §4.1 |
 | `max_fan_out` | integer | 4 | §4.5 |
-| `max_agents_per_run` | integer | 6 | §4.5 |
+| `max_agents_per_run` | integer | 8 (6 until MOD-4's `0004`, amended by MOD-4 milestone 6, 2026-09-25) | §4.5 |
 | `copy_max_total_bytes` | integer | 20 GiB | §4.6 |
 | `lease_ttl_seconds` | integer | 120 | §4.9 |
 | `lease_refresh_seconds` | integer | 60 | §4.9 |
@@ -1561,14 +1602,20 @@ compare-and-set whose zero-row result renders the actual state rather than a gen
 | reject with note | `AnswerGate { step, Rejected, note }` | step `failed`; §4.4 loop if the phase is loopable and budget remains, else run `failed` | step `awaiting_approval` |
 | retry | `RetryStep { step }` | step `superseded` with `gate_outcome = 'retried'`, new step at `attempt + 1` | step `awaiting_approval` or `failed`, and `attempt <= retry_limit + 1` |
 | promote to chat | `PromoteStep { step }` | `promoted_at` set, run and item to `awaiting_approval`, chat tab opens bound to the step | step `running`, `awaiting_approval` or `failed`, and the run non-terminal |
-| cancel | `CancelRun { run }` or `CancelStep { step }` | driver `cancel(grace)`, non-terminal steps to `cancelled`, run `cancelled`, item back to `open`, trees cleaned | run non-terminal |
-| open artifact | `OpenArtifact { step }` | opens the step's `output_kind` document in the Documents sub-tab, read-only | a document produced by the step exists |
+| cancel | `CancelRun { run }` (`CancelStep` not built, MOD-4 plan D178; amended by MOD-4 milestone 6, 2026-09-25) | driver `cancel(grace)`, non-terminal steps to `cancelled`, run `cancelled`, item back to `open`, trees cleaned | run non-terminal |
+| open artifact | a `StoreRequest::Document` read, not a command (MOD-4 plan D173) | opens the step's `output_kind` document read-only in a view inside the Runs pane, not the Documents sub-tab, which a sibling sub-tab cannot switch to (MOD-4 plan OQ-9; amended by MOD-4 milestone 6, 2026-09-25) | a document produced by the step exists |
 | select fan-out result | `SelectFanout { run, position, attempt, winner }` | §4.5's bookkeeping transaction, then the walk resumes | more than one candidate at `(position, attempt)` and none is `selected` yet |
 
 Three actions beyond the seven are needed by verdicts above and are added in the same registry:
 `AcceptArtifact { step }` (§4.8), `Unblock { item }` (§4.3) and `CloseOut { item, summary }`
 (`R-TUI-9`, which is also `R-TUI-2`'s `close`). `R-TUI-2`'s `run` and `queue` are `StartRun { item,
 mode }` with `mode` `manual` or `auto`.
+
+*Amended by MOD-4 milestone 6, 2026-09-25:* the Runs pane binds twelve keys: the seven above, the
+three verbs just named, `run`, and a manual retry of a terminal run's failed cleanup. Each key is
+greyed by the same admission function the engine refuses with, evaluated by the run worker over real
+rows (`StoreRequest::RunActions`). In production, `approve` and `accept artifact` stay greyed until
+MOD-11 lets an agent write its phase's `output_kind` document (MOD-4 blueprint F-R, R-50).
 
 **Projection changes `R-TUI-4` forces.** `RunStepSummary` today carries `id`, `position`, `attempt`,
 `fanout_index`, `phase_name`, `agent_id`, `model`, `status`, `gate_outcome` and the two timestamps.
@@ -1989,7 +2036,7 @@ INSERT INTO app_setting (key, value) VALUES
   ('default_isolation',     '"worktree"'::jsonb),
   ('step_deadline_seconds', '7200'::jsonb),
   ('max_fan_out',           '4'::jsonb),
-  ('max_agents_per_run',    '6'::jsonb),
+  ('max_agents_per_run',    '8'::jsonb),  -- 8 since MOD-4's 0004 (0003 shipped '6'); amended by MOD-4 milestone 6, 2026-09-25
   ('copy_max_total_bytes',  '21474836480'::jsonb),
   ('lease_ttl_seconds',     '120'::jsonb),
   ('lease_refresh_seconds', '60'::jsonb),
@@ -2047,7 +2094,7 @@ verdict could reasonably have gone the other way on.
 | # | Question | Default adopted |
 |---|---|---|
 | 1 | Task fan-out (N sessions, N different prompts, disjoint declared file sets, every result merged, no judge) is the maintainer's own practice and is not what `R-ORCH-7` describes. Should `htui` build both fan-out kinds? | **Rival fan-out only in v1.** `docs/REQUIREMENTS.md` is the contract; adding a second kind is a requirement change, and the isolation and overlap machinery of §4.6 and §4.7 is the half both would share, so nothing is foreclosed. |
-| 2 | `max_fan_out` and `max_agents_per_run` | **4 and 6.** Four matches the only shipped human-select fan-out (Codex cloud); six matches the maintainer's own standing cap on subagents per run, adopted after a run spawned 56 agents and exhausted a five-hour quota in about a minute. |
+| 2 | `max_fan_out` and `max_agents_per_run` | **4 and 6.** Four matches the only shipped human-select fan-out (Codex cloud); six matches the maintainer's own standing cap on subagents per run, adopted after a run spawned 56 agents and exhausted a five-hour quota in about a minute. **Amended (MOD-4 milestone 4, maintainer; recorded here as amended by MOD-4 milestone 6, 2026-09-25):** `max_agents_per_run` is **8**. Six refused the seeded `feature` graph, whose judged 3-way `implement` needs 7 agents; `0004_max_agents_per_run_default.sql` moves an untouched seeded 6 to 8. |
 | 3 | `max_concurrent_items` default | **2**, matching the demo fixture. A CPU-derived default (Claude Code caps at 16 concurrent agents, "fewer when Claude Code has fewer CPUs available") is the alternative and would be a better default for a large box. |
 | 4 | Is `copy` isolation offered by default on Windows, where it is a full byte-for-byte copy with no reflink on stock NTFS? | **Offered, with the measured size shown and a refusal above `copy_max_total_bytes`.** |
 | 5 | Which seeded phases carry `gate_hard`, since a graph containing a hard gate is not fully unattended in auto mode | **`prd` and `plan` on the feature graph, `verdict` on the analysis graph, none elsewhere.** This mirrors the maintainer's own never-disappearing gates (route confirm, PRD open questions, plan CONFIRM, deliberate push) minus the two that have no htui analogue. It makes the `FIX`, `CLEAN` and `TOOL` graphs the first fully unattended targets for MOD-12. |
@@ -2138,12 +2185,19 @@ verdict could reasonably have gone the other way on.
 19. A run whose box goes offline mid-step stays `running` with an expiring lease, its events land in
     `pending/<project_id>.<run_id>.jsonl`, and on reconnect `upload_pending` plus the sweep resolve
     the step with no duplicate events.
+    *Amended by MOD-4 milestone 6, 2026-09-25 (plan OQ-11, D175):* MOD-25 made `htui` online-only,
+    so nothing is buffered and there is no `pending/` file. The criterion is re-scoped and proved as:
+    a store outage mid-step fences the walk before its lease lapses, and after the store returns
+    this process's sweep adopts and adjudicates the run.
 20. Close-out on a `done` item writes one `summary` document whose body contains one row per
     `(repo, step)` with `before_hash..after_hash`, moves the item to `closed`, sets `closed_at`, and
     is refused while any run of the item is non-terminal.
 21. All seven `R-TUI-4` actions are reachable from `runs.rs::on_key` and each renders the actual
     state on a compare-and-set miss; the step list renders agent, model, gate state, usage and
     duration, which requires the `RunStepSummary` additions of §6.2.
+    *Amended by MOD-4 milestone 6, 2026-09-25 (blueprint F-R):* every action is reachable. In
+    production `approve` is greyed with the guard's sentence until MOD-11, because no step writes
+    its `output_kind` document before then.
 
 **For MOD-12 (auto mode).**
 

@@ -42,6 +42,10 @@ impl Status {
     /// [`WriteStore::transition`](crate::store::WriteStore::transition) refuses it before it
     /// reaches the row. Note that `is_terminal` and "reaches nothing" are **not** the same set
     /// here: `done` is terminal for the readiness rule and still reaches `closed` and `open`.
+    ///
+    /// `blocked → awaiting_approval` is MOD-4 plan D161's one deviation from
+    /// `docs/ANA-2.md:583-584`. `Unblock` uses it to let an escalated item follow its parked run
+    /// back (R-4).
     #[must_use]
     pub const fn can_move_to(self, to: Self) -> bool {
         match self {
@@ -52,7 +56,7 @@ impl Status {
                 Self::AwaitingApproval | Self::Done | Self::Failed | Self::Blocked | Self::Open
             ),
             Self::AwaitingApproval => matches!(to, Self::InProgress | Self::Failed | Self::Open),
-            Self::Blocked => matches!(to, Self::Open | Self::Closed),
+            Self::Blocked => matches!(to, Self::Open | Self::AwaitingApproval | Self::Closed),
             Self::Failed => matches!(to, Self::Queued | Self::Closed),
             Self::Done => matches!(to, Self::Closed | Self::Open),
             Self::Closed => false,
@@ -258,7 +262,8 @@ mod tests {
 
     /// Every row of ANA-2 §4.3's item transition table (`docs/ANA-2.md:565-589`), transcribed
     /// from the document rather than from [`Status::can_move_to`], so a pair added to or dropped
-    /// from the `match` fails here.
+    /// from the `match` fails here. The one row not in the document is `blocked →
+    /// awaiting_approval`, MOD-4 plan D161's deviation.
     const SANCTIONED: &[(Status, Status)] = &[
         // `open`
         (Status::Open, Status::Queued),
@@ -279,6 +284,7 @@ mod tests {
         (Status::AwaitingApproval, Status::Open),
         // `blocked`
         (Status::Blocked, Status::Open),
+        (Status::Blocked, Status::AwaitingApproval),
         (Status::Blocked, Status::Closed),
         // `failed`
         (Status::Failed, Status::Queued),

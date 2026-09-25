@@ -10,10 +10,10 @@
 > `R-TUI-9`, `R-STO-3`, `R-PRM-1`, `R-LATER-3`. Proposes new requirements (§7) for maintainer
 > decision.
 >
-> **Status (2026-09-24): concluded.** Implementation spawned as MOD-37 (schema, seam, close-out
-> resolution) and MOD-38 (Requirements tab and item traceability in the TUI). MOD-8's importer scope
+> **Status (2026-09-25): concluded.** Implementation spawned as MOD-38 (schema, seam, close-out
+> resolution) and MOD-39 (Requirements tab and item traceability in the TUI). MOD-8's importer scope
 > is widened to fill the new tables. Requirement amendments in §7 are a maintainer decision and gate
-> MOD-37.
+> MOD-38.
 
 ---
 
@@ -121,7 +121,7 @@ for an analysis, and the "replaced by" relationship.
 | **`item.resolution TEXT NULL` with a CHECK, set only by `close_out`** | **Adopted.** Jira's split. The value set is `done`, `concluded`, `rejected`, `withdrawn`, `superseded`, `duplicate`. `shipped` folds into `done`: the corpus uses it for two tooling items with no distinction a query needs. A table CHECK enforces `(status = 'closed') = (resolution IS NOT NULL)`. |
 
 **A consequence that must be fixed with it.** `close_out` accepts only `blocked`, `failed` or
-`done` (ANA-2 §4.3, `item.rs:47-60`). An item withdrawn or rejected before it ever ran, like
+`done` (ANA-2 §4.3, `item.rs:50-63`). An item withdrawn or rejected before it ever ran, like
 MOD-17..19 under MOD-25, or an ANA rejected at triage, has no legal path to `closed`. The fix is an
 ANA-2 §4.3 amendment. `open` → `closed` becomes legal **only** through `close_out` and **only**
 with resolution in `rejected`, `withdrawn`, `superseded` or `duplicate`. `done` and `concluded`
@@ -263,7 +263,7 @@ consistent with `item_revision`. `R-STO-3`'s content list gains "requirements an
 
 - **Prompt:** an item's `addresses` citations are the natural source for a `requirements` section,
   the exact text of each cited `R-ID`, placed between Item and Documents in ANA-5's trim order.
-  That is an ANA-5 contract amendment and belongs to MOD-9 or a follow-up, not to MOD-37.
+  That is an ANA-5 contract amendment and belongs to MOD-9 or a follow-up, not to MOD-38.
 - **MCP:** `R-MCP-2` would gain `requirement_cite` (propose an `addresses` or `reserves`
   citation, scoped like `item_link`). Agents never get `amend_requirement` (invariant 2). This is
   an addition to MOD-11's tool list once the requirement is amended (§7).
@@ -280,18 +280,19 @@ Decisions get **no new entity**: a decision is a closed item with a `resolution`
 (or `verdict`) document, and `DECISIONS.md` becomes a query. The markdown workflow files become
 import sources (MOD-8) and nothing more for any `htui`-managed project.
 
-1. **MOD-37 - Requirements schema, seam and close-out resolution** (from ANA-11).
+1. **MOD-38 - Requirements schema, seam and close-out resolution** (from ANA-11).
    - Migration `0005_requirements.sql` per §5, and cache migration per §5.2.
    - Trait methods of §5.1 on `MemStore`, `PgStore` and the cache read path.
    - `close_out` takes a resolution and gains the `open` → `closed` guard; ANA-2 §4.3 is amended by
      this item's write-up.
    - Demo fixture gains a small requirement set with one suspect citation.
    - **Gated on the maintainer applying §7** to `docs/REQUIREMENTS.md`.
-2. **MOD-38 - Requirements tab and item traceability** (from ANA-11; blocked on MOD-37).
+2. **MOD-39 - Requirements tab and item traceability** (from ANA-11; blocked on MOD-38).
    - A **Requirements** tab: areas, then requirements, with coverage (citing items, their
      status and resolution), withdrawn rows dimmed, and the revision trail with its deciding item.
    - Item detail shows cited requirements with suspect markers and a re-confirm action.
-   - The close-out flow picks a resolution.
+   - The close-out flow picks a resolution. That flow is MOD-4's Runs-pane two-step confirmation
+     (`htui-orch/src/closeout.rs`), so the picker goes into its first confirmation.
    - Requirement create, amend and withdraw are maintainer-only human actions, and amend asks for
      the deciding item.
 3. **MOD-8 (widened, still later tier).**
@@ -301,7 +302,8 @@ import sources (MOD-8) and nothing more for any `htui`-managed project.
    - Write-ups become `summary` documents, and `docs/ANA-N.md` becomes the `verdict` document.
    - Scan `R-` IDs in item bodies once into `item_requirement(addresses)`, deterministically,
      skipping unknown IDs with a report.
-   - Cut `htui`'s *own* repo over from markdown only after MOD-4, MOD-13 and MOD-38 exist, so the
+   - Cut `htui`'s *own* repo over from markdown only after MOD-13 and MOD-39 exist (MOD-4, the
+     orchestrator, is done), so the
      tool can run its own lifecycle. Until then the markdown workflow stays authoritative for this
      repo.
 
@@ -334,5 +336,5 @@ analysis proposes the text and does not apply it:
 | Requirement sets are small (about 100 rows), so a dedicated table set looks heavy | It is five small tables with no new crate, following existing patterns. The alternative is a `REQ` kind that every orchestration query must filter out forever (§4.1 A). |
 | Suspect flags pile up after a broad amendment | Suspect is derived and re-confirm is one keystroke. The Requirements tab lists suspects per requirement for batch re-confirm. |
 | The resolution vocabulary is wrong for a future project | The CHECK is a migration away. Six values cover every resolution in this repo's 35-line archive. |
-| Opening `open` → `closed` weakens the ANA-2 status law | Only through `close_out`, only for non-success resolutions, and still refused while a run is live. |
+| Opening `open` → `closed` weakens the ANA-2 status law (already amended once, by MOD-4 plan D161's `blocked` → `awaiting_approval`) | Only through `close_out`, only for non-success resolutions, and still refused while a run is live. |
 | A dogfooding cutover strands this repo's markdown workflow mid-way | Phase 3 cuts over only after the TUI can run the lifecycle. The markdown files remain the authority for `htui`'s own repo until then. |

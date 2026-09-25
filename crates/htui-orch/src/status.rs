@@ -88,6 +88,15 @@ pub enum RunFailure {
         /// `run_step.attempt` of the failed step, the last the budget allowed.
         attempt: i32,
     },
+    /// MOD-4 plan D162 (blueprint D195, ANA-5 criterion 3): stage 3's assembler refused the
+    /// phase's own prompt, so the step failed before a token was spent and the item is `blocked`.
+    /// A missing required input is [`RunFailure::MissingInput`], not this.
+    PromptRefused {
+        /// `step_graph_phase.name` of the phase whose prompt was refused.
+        phase: String,
+        /// The assembler's own sentence (`htui_core::prompt::AssembleError`'s `Display`).
+        reason: String,
+    },
 }
 
 impl fmt::Display for RunFailure {
@@ -118,6 +127,9 @@ impl fmt::Display for RunFailure {
                     f,
                     "retry budget spent: step `{phase}` attempt {attempt} failed"
                 )
+            }
+            Self::PromptRefused { phase, reason } => {
+                write!(f, "prompt refused at `{phase}`: {reason}")
             }
         }
     }
@@ -284,6 +296,21 @@ pub fn cursor(snapshot: &GraphSnapshot, steps: &[RunStep]) -> Cursor {
     Cursor::Finished
 }
 
+/// Whether a parked run's cursor is one a resume may walk on from (plan D132, blueprint D196).
+///
+/// `Create`, `Run` and `Finished` under an `awaiting_approval` run are a command that crashed
+/// between its first write and its unpark: every step the run is parked over is `done`,
+/// `superseded` or `selected`, and no gate is waiting on a human. `Rest`, `Fan` and `Select` are
+/// real parks a human has to answer. `Engine::resume`'s own walk and `Unblock`'s third case
+/// (plan D161) both read this one predicate, so the two cannot drift.
+#[must_use]
+pub fn resumable_park(cursor: &Cursor) -> bool {
+    matches!(
+        cursor,
+        Cursor::Create { .. } | Cursor::Run(_) | Cursor::Finished
+    )
+}
+
 /// Plan D59 for one fanned-out position; `None` when the slot is complete and the walk goes on.
 ///
 /// The order is load-bearing (blueprint §9.3, H-14): a `selected` `done` candidate completes the
@@ -347,7 +374,7 @@ mod tests {
 
     use crate::status::{
         Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt,
-        winner_at,
+        resumable_park, winner_at,
     };
 
     /// The four `RUN_1` steps, the one `RUN_2` step, or whatever the fixture holds for a run.
@@ -462,6 +489,48 @@ mod tests {
             "retry budget spent: step `plan` attempt 2 failed",
             "plan D131: the sweep ends a run whose settle crashed before its `finish_run`"
         );
+        assert_eq!(
+            RunFailure::PromptRefused {
+                phase: "prd".to_owned(),
+                reason: "unknown prompt placeholder: {{no_such_placeholder}}".to_owned(),
+            }
+            .to_string(),
+            "prompt refused at `prd`: unknown prompt placeholder: {{no_such_placeholder}}",
+            "MOD-4 plan D162: ANA-5 criterion 3's stage-3 refusal"
+        );
+    }
+
+    /// Blueprint D196: exactly the three cursors a crashed command leaves under a parked run are
+    /// resumable, and the three a human has to answer are not.
+    #[test]
+    fn only_a_crashed_command_s_park_is_resumable() {
+        let step = ids::STEP_R2_PRD;
+        for cursor in [
+            Cursor::Create {
+                position: 1,
+                attempt: 1,
+            },
+            Cursor::Run(step),
+            Cursor::Finished,
+        ] {
+            assert!(resumable_park(&cursor), "{cursor:?} is a crashed command's");
+        }
+        for cursor in [
+            Cursor::Rest {
+                step,
+                status: StepStatus::AwaitingApproval,
+            },
+            Cursor::Fan {
+                position: 0,
+                attempt: 1,
+            },
+            Cursor::Select {
+                position: 0,
+                attempt: 1,
+            },
+        ] {
+            assert!(!resumable_park(&cursor), "{cursor:?} waits on a human");
+        }
     }
 
     /// `RUN_3`'s two `research` candidates with the selection moved to index 1: the winner is

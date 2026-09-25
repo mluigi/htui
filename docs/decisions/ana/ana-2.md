@@ -57,7 +57,8 @@ place.
    least two survive; the judge sees documents, diffs and verification results, never transcripts,
    and is called twice with reversed order; disagreement, an unparseable verdict or an out-of-range
    index escalates to a human. Losers keep their documents and trees and are invisible downstream.
-   Caps `max_fan_out = 4`, `max_agents_per_run = 6`, refused loudly. Task fan-out (the maintainer's
+   Caps `max_fan_out = 4`, `max_agents_per_run = 8` (6 as concluded; raised by MOD-4 milestone 4's
+   `0004` migration, amended by MOD-4 milestone 6, 2026-09-25), refused loudly. Task fan-out (the maintainer's
    own practice) is not `R-ORCH-7` and is left open.
 6. **Isolation (§4.6).** Per repo through a new `run_step_tree(run_step_id, repo_id, mode, path,
    base_ref, dirty)` table. `worktree` branches from the primary repo's HEAD into a scratch root
@@ -104,7 +105,8 @@ place.
 ## Open for the maintainer (defaults adopted, MOD-4 not blocked on any)
 
 Listed in `docs/ANA-2.md` §10: rival fan-out only in v1 (task fan-out is a requirement change);
-`max_fan_out = 4` and `max_agents_per_run = 6`; `max_concurrent_items = 2`; `copy` offered on
+`max_fan_out = 4` and `max_agents_per_run = 8` (6 as concluded; raised by MOD-4 milestone 4's `0004`
+migration, amended by MOD-4 milestone 6, 2026-09-25); `max_concurrent_items = 2`; `copy` offered on
 Windows with the size shown; `gate_hard` seeded on `prd`, `plan` and `verdict`; lease 120 s / 60 s;
 `gix` over `git2`; close-out allowed on a `failed` item.
 

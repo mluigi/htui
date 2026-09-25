@@ -18,21 +18,23 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::path::PathBuf;
 
 use futures::future::Either;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
-use htui_agent::event::DoneEvent;
+use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
-    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, EventKind, Gate, GateOutcome,
-    GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId,
-    Project, ProjectSettings, PromptScope, RepoId, Run, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome,
-    StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, DocumentId, EventKind, Gate,
+    GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
+    NewRunStep, NoteId, Project, ProjectSettings, PromptScope, Repo, RepoId, Run, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase,
+    SnapshotTemplate, Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId,
+    VerifyOutcome,
 };
-use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet};
+use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoRoot, RootSource};
 use htui_core::prompt::{
     AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PromptSpec, SectionName,
     TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
@@ -42,8 +44,10 @@ use htui_core::store::{StoreError, WriteStore};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::closeout;
 use crate::command::{
-    Command, CommandOutcome, EngineError, GateAnswer, Rest, stale_run, stale_step,
+    Command, CommandOutcome, EngineError, GateAnswer, Opening, OpeningPath, Rest, UnblockCase,
+    stale_run, stale_step,
 };
 use crate::fanout::{
     AUTO_WIN_REASON, CandidateView, HUMAN_PICK_REASON, HumanReason, JUDGE_KIND, JudgeFailure,
@@ -53,10 +57,12 @@ use crate::fanout::{
 use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{Clock, FanoutSlot, Isolator};
+use crate::promote::{self, OpeningKind};
 use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
 use crate::select::{self, SelectInput, Skipped, Walk};
 use crate::status::{
-    Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt, winner_at,
+    Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt,
+    resumable_park, winner_at,
 };
 use crate::verify::{Verifier, VerifyReport, VerifyRequest};
 
@@ -71,6 +77,14 @@ const REVIEW_PHASE: &str = "review";
 /// The `prompt_template.name` of the judge role (`crates/htui-core/src/prompt/template.rs:54`),
 /// read when the snapshot pinned no judge template (plan D53).
 const JUDGE_TEMPLATE: &str = "judge";
+
+/// The `prompt_template.name` of the handoff role, which a promoted step's fresh chat opens with
+/// (MOD-4 plan D163, `crates/htui-core/src/prompt/defaults.rs`).
+const HANDOFF_TEMPLATE: &str = "handoff";
+
+/// A handoff's `failure_reason` when neither the run nor the step recorded one: the maintainer
+/// promoted a step that was waiting at its gate (blueprint §7.5).
+const PROMOTED_AT_A_GATE: &str = "promoted by the maintainer at a gate";
 
 /// `run_step.fanout_index` of a slot's judge row (`docs/ANA-2.md` §4.5, plan D51).
 const JUDGE_FANOUT_INDEX: i32 = -1;
@@ -261,16 +275,25 @@ pub type DriverFor<'a> =
 /// process.
 ///
 /// A run enters it when its walk ended on [`Heartbeat::Expired`] (plan D122: the store stopped
-/// answering, so the lease could not be given back), or when a release of its lease failed.
+/// answering, so the lease could not be given back), when a release of its lease failed, or when
+/// its walk task panicked ([`DeadWalks::mark`], MOD-4 plan D158), or when a fenced sweep adopted
+/// it and skipped it for the command holding it ([`Engine::sweep_fenced`], plan D189).
 /// [`Heartbeat::Abandoned`] never enters it: another process holds that lease. [`Engine::sweep`]
 /// first retries the release of every run in it and drops each one the store answers, so
 /// `adopt_runs` then sees the run as free. Plan D88 still keeps the sweep off every lease a live
-/// walk of this process holds, and a run this process takes again leaves the set. Commands in one
-/// process are not fenced against each other yet (R-27). A sweep that reads the set, and then
-/// races a resume of the same run, may give back the resumed walk's lease. The same sweep's
-/// `adopt_runs` then takes that lease for this process again, so the resumed walk's refresh
-/// still matches. The run is then walked twice at once, which plan D88 exists to prevent. That
-/// race is part of R-27; nothing reaches it until commands run concurrently.
+/// walk of this process holds, and a run this process takes again leaves the set.
+///
+/// MOD-4 plan D210 (review H1): a dead walk's `shared_serialized` guards live in the isolator,
+/// not on the walk's stack, so a panic does not drop them. Wherever a run leaves the set its
+/// guards are released through `Isolator::release` (as plan D188's [`Engine::abandoned`] does):
+/// by the sweep's pre-pass before it gives the lease back, and by `Engine::renew_lease` when a
+/// command of this process takes the lease first. Both hold the run's fence, so no walk of the run
+/// is live in this process and every guard still held for it is stale. A release that finds none
+/// (the `Expired` arm already released them, or a skipped adopted run never took any) does
+/// nothing. Milestone 6's
+/// worker fences commands of one process against each other with a lock per run (MOD-4 plan
+/// D157), and [`Engine::sweep_fenced`] asks that fence before it gives a dead walk's lease back or
+/// recovers a run (plan D189), so a sweep can no longer race a resume of the same run (R-27).
 ///
 /// It belongs to the process, not to an [`Engine`]: an engine is built per command (plan D16)
 /// and only borrows it. A restarted process starts with an empty set, and its old owner's leases
@@ -297,12 +320,21 @@ impl DeadWalks {
         self.lock().iter().copied().collect()
     }
 
+    /// A walk task of this process died (a panic), so the next sweep releases its guards and its
+    /// lease and adopts it (MOD-4 plan D158, R-12, D210). `pub` because the task's supervisor in `run_worker` is the one
+    /// place that sees the `JoinError`.
+    pub fn mark(&self, run: RunId) {
+        self.insert(run);
+    }
+
     fn insert(&self, run: RunId) {
         self.lock().insert(run);
     }
 
-    fn remove(&self, run: RunId) {
-        self.lock().remove(&run);
+    /// Whether `run` was in the set (MOD-4 plan D210: a run leaving it in
+    /// [`Engine::renew_lease`] has its guards released there).
+    fn remove(&self, run: RunId) -> bool {
+        self.lock().remove(&run)
     }
 
     /// A poisoned lock is recovered: every change is one set operation, so a panic elsewhere
@@ -311,6 +343,32 @@ impl DeadWalks {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// MOD-4 plan D189 (blueprint F-E): the per-run fence a sweep has to respect.
+///
+/// Milestone 6's worker holds one lock per run across every command and walk of it (plan D157).
+/// [`Engine::sweep_fenced`] asks the fence before it touches a run: a run whose `hold` answers
+/// `None` is held by a live command of this process, so the sweep neither gives its lease back
+/// nor recovers it. The guard is held for as long as the sweep works on the run.
+pub trait RunFence: Sync {
+    /// What holding a run is; dropping it frees the run again.
+    type Guard: Send;
+
+    /// The run's fence when nobody holds it, or `None` when a command or walk does.
+    fn hold(&self, run: RunId) -> Option<Self::Guard>;
+}
+
+/// The fence of a caller that runs one command at a time: every run is free.
+#[derive(Debug, Default, Clone, Copy)]
+struct NoFence;
+
+impl RunFence for NoFence {
+    type Guard = ();
+
+    fn hold(&self, _run: RunId) -> Option<()> {
+        Some(())
     }
 }
 
@@ -443,8 +501,9 @@ pub struct Adopted {
 /// What the sweep's adjudication left an adopted run owing (plan D98, blueprint A-4).
 ///
 /// The sweep **walks nothing**: a [`Next::Walk`] run is walked by the caller through
-/// [`Engine::resume`], which is criterion 3's topology check and D86's heartbeat, and which
-/// milestone 6's `run_worker` calls once per run so one run's sessions never wait on another's.
+/// [`Engine::resume`], which is criterion 3's topology check and D86's heartbeat. `htui`'s
+/// `run_worker` is that caller: it resumes each `Walk` run on its own task, under the run's lock,
+/// so one run's sessions never wait on another's (MOD-4 plan D157, D158).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
     /// The run is `running` with its rows adjudicated: walk it on through [`Engine::resume`].
@@ -504,16 +563,37 @@ where
                 attempt,
                 winner,
             } => self.select_fanout(run, position, attempt, winner).await,
+            Command::PromoteStep {
+                run,
+                step,
+                chat_open,
+            } => self.promote(run, step, chat_open).await,
+            Command::AcceptArtifact {
+                run,
+                step,
+                chat_live,
+            } => self.accept_artifact(run, step, chat_live).await,
+            Command::Unblock { item } => self.unblock(item).await,
+            Command::CloseOut { item } => self.close_out(item).await,
         }
     }
 
-    /// §6.2's `run`/`queue`: resolve, create, claim, walk.
-    async fn start_run(
+    /// §6.2's `run`/`queue` up to the claim (MOD-4 plan D186, blueprint F-I): resolve the item's
+    /// graph, refuse rung 4 onto the item, and create the run `queued`. `create_run` moves the
+    /// item `open | failed -> queued` in its own transaction, so it admits one run per item and
+    /// no item lock is needed.
+    ///
+    /// `pub` so milestone 6's `run_worker` can take the run's lock between this and
+    /// [`Self::claim`]: `StartRun` is exactly the two, in that order.
+    ///
+    /// # Errors
+    /// [`EngineError::Resolve`] (rung 4, after its note on the item), and the store's refusals.
+    pub async fn enqueue(
         &self,
         item: ItemId,
         mode: htui_core::model::RunMode,
         repo_scope: Option<Vec<RepoId>>,
-    ) -> Result<CommandOutcome, EngineError> {
+    ) -> Result<RunId, EngineError> {
         let item = self.item(item).await?;
         let resolved = match graph::resolve(
             self.parts.store,
@@ -552,13 +632,24 @@ where
                 queued_at: now,
             })
             .await?;
+        Ok(id)
+    }
 
+    /// §6.2's `run`/`queue`: [`Self::enqueue`], then [`Self::claim`] (MOD-4 plan D186).
+    async fn start_run(
+        &self,
+        item: ItemId,
+        mode: htui_core::model::RunMode,
+        repo_scope: Option<Vec<RepoId>>,
+    ) -> Result<CommandOutcome, EngineError> {
+        let id = self.enqueue(item, mode, repo_scope).await?;
         self.claim(id).await
     }
 
     /// Plan D84: `claim_run`, then the leased walk — `start_run`'s tail, factored out so a run a
     /// refusal left `queued` can be re-attempted. No [`Command`] variant carries it (ANA-2 §6.2
-    /// has none); milestone 6 decides the verb that calls it.
+    /// has none): `htui`'s `run_worker` calls it after [`Self::enqueue`] for `StartRun`, and again
+    /// for a run a refusal left `queued` once a walk of that process rests (MOD-4 plan D186).
     ///
     /// The walk runs under the lease's heartbeat, which sleeps on `tokio::time`: the caller needs
     /// a Tokio runtime with the time driver enabled (blueprint H-3).
@@ -626,6 +717,7 @@ where
         crate::command::answer_gate_enabled(&step, &phase, has_output, &answer)?;
         self.answer_guarded(&run, &snapshot, &step, &phase, answer)
             .await
+            .map(|rest| CommandOutcome::Answered { rest })
     }
 
     /// [`Self::answer_gate`] past its guard, over the rows the guard read: the lease, the answer,
@@ -637,7 +729,7 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
         answer: GateAnswer,
-    ) -> Result<CommandOutcome, EngineError> {
+    ) -> Result<Rest, EngineError> {
         // Plan D108: after the pure guard and before the first write, so a live lease elsewhere
         // refuses with the gate still unanswered (blueprint F-N).
         let until = self.take_lease(run.id).await?;
@@ -693,8 +785,7 @@ where
                 None => self.run_to_rest(run.id).await,
             }
         };
-        let rest = self.walk_leased(run.id, until, tail).await?;
-        Ok(CommandOutcome::Answered { rest })
+        self.walk_leased(run.id, until, tail).await
     }
 
     /// What a human's rejection means: the review loop when the phase can loop, the end of the run
@@ -778,37 +869,24 @@ where
     /// attempt.
     async fn retry_step(&self, run: RunId, step: StepId) -> Result<CommandOutcome, EngineError> {
         let run = self.run(run).await?;
-        // `command::retry_enabled` is a pure function of the step row and says so: the run's own
-        // status is "the engine's, at dispatch" (`command.rs:266-268`). This is that check. On a
-        // terminal run every write below is a no-op that still creates a step — `unpark`'s two
-        // compare-and-sets find a stale `from` and answer `Ok(false)`, while `create_step` refuses
-        // no terminal run on either backend — so the run would gain an orphan `pending` step it can
-        // never walk, and the command would report success (ANA-2 §4.3's run table has no edge out
-        // of `done`, `failed` or `cancelled`, `docs/ANA-2.md:614`).
-        if !matches!(run.status, RunStatus::Running | RunStatus::AwaitingApproval) {
-            return Err(EngineError::RunStatus {
-                run: run.id,
-                status: run.status,
-                expected: "running | awaiting_approval",
-            });
-        }
         let snapshot = Self::snapshot_of(&run)?;
         let row = self.step(run.id, step).await?;
         let phase = Self::phase_at(run.id, &snapshot, row.position)?;
         let item = self.item(Self::item_of(&run)?).await?;
-
-        // Blueprint F-J / R-4: `Status::can_move_to` has no `blocked -> in_progress` edge, so a
-        // blocked item cannot be resumed until milestone 6 ships `Unblock`.
-        if item.status == Status::Blocked {
-            return Err(EngineError::ItemBlocked { item: item.id });
-        }
-        // Plan D65, blueprint F-D: any member of a fanned-out slot retries the whole group, and
-        // before `retry_enabled` — a parked group's candidates are `done`, which that guard refuses.
-        if phase.fan_out > 1 {
-            return self.retry_group(&run, &snapshot, &row, &phase).await;
-        }
         let steps = self.parts.store.run_steps(run.id).await?;
-        crate::command::retry_enabled(&steps, &row, &phase)?;
+        // Blueprint D184: the whole order — the run's status (a terminal run would gain an orphan
+        // `pending` step, `docs/ANA-2.md:614`), the blocked item (F-J, R-4), the fan-out route
+        // (plan D65) and `retry_enabled` — is `command::retry_admitted`, which the Runs tab's
+        // greying read calls over the same rows.
+        crate::command::retry_admitted(&run, item.status, &steps, &row, &phase)?;
+        // Plan D65, blueprint F-D: any member of a fanned-out slot retries the whole group: every
+        // member of the slot is retired (candidates and judge, plan D66's `retire_slot`), the run
+        // unparks, and stage 1 admits the whole group at `attempt + 1`.
+        if phase.fan_out > 1 {
+            return self
+                .retry_group_guarded(&run, &snapshot, &row, &phase, &steps)
+                .await;
+        }
         self.retry_guarded(&run, &snapshot, &row, &phase).await
     }
 
@@ -884,39 +962,7 @@ where
         Ok(CommandOutcome::Retried { step: row.id, rest })
     }
 
-    /// Plan D65's group retry: every member of the slot `row` belongs to is retired (candidates
-    /// and judge, plan D66's `retire_slot`), the run unparks, and stage 1 admits the whole group
-    /// at `attempt + 1` before the walk resumes.
-    async fn retry_group(
-        &self,
-        run: &Run,
-        snapshot: &GraphSnapshot,
-        row: &RunStep,
-        phase: &SnapshotPhase,
-    ) -> Result<CommandOutcome, EngineError> {
-        let steps = self.parts.store.run_steps(run.id).await?;
-        // A member of a slot already retired names nothing a retry could replace: `retire_slot`
-        // retires the position's **latest** slot, so only a member of that one is admitted.
-        let latest = steps
-            .iter()
-            .filter(|step| step.position == row.position)
-            .map(|step| step.attempt)
-            .max()
-            .unwrap_or(row.attempt);
-        if row.attempt != latest {
-            return Err(EngineError::StaleSlot {
-                step: row.id,
-                attempt: row.attempt,
-                latest,
-            });
-        }
-        let slot = group_at(&steps, row.position, row.attempt);
-        crate::command::retry_group_enabled(run, &slot, phase)?;
-        self.retry_group_guarded(run, snapshot, row, phase, &steps)
-            .await
-    }
-
-    /// [`Self::retry_group`] past its guards, over the `steps` they read: the lease, the slot's
+    /// [`Self::retry_step`]'s group route past its guards, over the `steps` they read: the lease, the slot's
     /// retirement, the unpark and the leased walk.
     async fn retry_group_guarded(
         &self,
@@ -1038,6 +1084,420 @@ where
             .collect()
     }
 
+    /// §4.8's `promote to chat` (MOD-4 plan D163, blueprint D191, D192).
+    ///
+    /// The guard ([`crate::command::promote_enabled`]) over the rows read, the lease, then in
+    /// its window: a `running` step (reached only after the worker preempted its walk) moves to
+    /// `awaiting_approval`, `promote_step` stamps `promoted_at` and parks the run and the item in
+    /// one transaction, and a note says so. The lease is given back — a parked run holds none
+    /// (plan D87) — and the answer says how the chat opens ([`Self::opening`]). No
+    /// `run(kind = 'chat')` row is written, and the step's `prompt_digest` and `trim_record` are
+    /// never touched.
+    async fn promote(
+        &self,
+        run: RunId,
+        step: StepId,
+        chat_open: bool,
+    ) -> Result<CommandOutcome, EngineError> {
+        let run = self.run(run).await?;
+        let snapshot = Self::snapshot_of(&run)?;
+        let row = self.step(run.id, step).await?;
+        let phase = Self::phase_at(run.id, &snapshot, row.position)?;
+        let item = self.item(Self::item_of(&run)?).await?;
+        let steps = self.parts.store.run_steps(run.id).await?;
+        crate::command::promote_enabled(&run, item.status, &steps, &row, &phase, chat_open)?;
+
+        // Plan D108's order: after the pure guard and before the first write.
+        self.take_lease(run.id).await?;
+        let now = self.now();
+        self.leased_window(run.id, async {
+            if row.status == StepStatus::Running {
+                self.move_step(
+                    run.id,
+                    row.id,
+                    StepStatus::Running,
+                    StepStatus::AwaitingApproval,
+                    now,
+                )
+                .await?;
+            }
+            self.parts.store.promote_step(row.id, now).await?;
+            self.note(
+                item.id,
+                format!(
+                    "step {} (`{}` attempt {}) promoted to chat",
+                    row.id, phase.name, row.attempt
+                ),
+                Some(row.id),
+                now,
+            )
+            .await
+        })
+        .await?;
+        // A parked run holds no lease (plan D87).
+        self.release_lease(run.id).await;
+
+        let rest = self.resting(&self.run(run.id).await?).await?;
+        // The promotion is written by now: an opening that cannot be built is raised with the
+        // step promoted, and the chat is simply not opened (the worker reports the sentence).
+        let opening = self.opening(&run, &snapshot, &row, &phase, item.id).await?;
+        Ok(CommandOutcome::Promoted {
+            step: row.id,
+            rest,
+            opening: Box::new(opening),
+        })
+    }
+
+    /// How a promoted step's chat opens (MOD-4 plan D163, blueprint D192, D193).
+    ///
+    /// The step's agent row decides with [`promote::opening_kind`]: its own session is resumed
+    /// only on the CLI transport, with `resume` in its caps and a `session_started` banner in its
+    /// log (R-48); otherwise a fresh session opens with the `handoff` role's prompt, built from
+    /// the phase's own spec ([`Self::phase_spec`]) with the step's summary, its diff so far and
+    /// why it stopped. `cwd` is the step's primary tree, else its first; every other tree is an
+    /// extra directory (ANA-2 `:1208-1213`). Nothing here writes.
+    async fn opening(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        item: ItemId,
+    ) -> Result<Opening, EngineError> {
+        let candidate = Self::candidate_of(step, phase)?;
+        let agent = self
+            .parts
+            .graphs
+            .agent(candidate.agent_id)
+            .await?
+            .ok_or_else(|| EngineError::Snapshot {
+                run: run.id,
+                reason: format!(
+                    "step {} names agent {}, which has no row",
+                    step.id, candidate.agent_id
+                ),
+            })?;
+        let events = self
+            .parts
+            .store
+            .step_events(step.id)
+            .await?
+            .unwrap_or_default();
+        let trees = self.parts.store.step_trees(step.id).await?;
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let (cwd, extra_dirs) = chat_dirs(&trees, &repos).ok_or_else(|| EngineError::Snapshot {
+            run: run.id,
+            reason: "the step has no tree to chat in".to_owned(),
+        })?;
+
+        let caps = htui_agent::registry::caps_for(&agent);
+        let path = match promote::opening_kind(caps, agent.transport, &events) {
+            OpeningKind::Resume(session_ref) => OpeningPath::Resume {
+                session_ref,
+                text: promote::RESUME_OPENING.to_owned(),
+            },
+            OpeningKind::Handoff => {
+                let spec = match self
+                    .phase_spec(run, snapshot, step, phase, item, false)
+                    .await?
+                {
+                    Ok(spec) => spec,
+                    // Not reachable with `strict = false`: a missing input is a note there.
+                    Err(kind) => {
+                        return Err(EngineError::Snapshot {
+                            run: run.id,
+                            reason: format!("the handoff prompt found no `{kind}` document"),
+                        });
+                    }
+                };
+                let template = self
+                    .parts
+                    .graphs
+                    .prompt_template(run.project_id, HANDOFF_TEMPLATE, None)
+                    .await?
+                    .ok_or_else(|| ResolveError::NoTemplate {
+                        phase: phase.name.clone(),
+                        name: HANDOFF_TEMPLATE.to_owned(),
+                        project: run.project_id,
+                    })?;
+                let roots: Vec<RepoRoot> = trees
+                    .iter()
+                    .map(|tree| RepoRoot {
+                        repo: repos
+                            .iter()
+                            .find(|repo| repo.id == tree.repo_id)
+                            .map_or_else(|| tree.repo_id.to_string(), |repo| repo.name.clone()),
+                        root: PathBuf::from(&tree.path),
+                        source: RootSource::RunStepTree,
+                    })
+                    .collect();
+                let commits = self.parts.store.step_commits(step.id).await?;
+                // The diff is advisory (plan D55): a failed one opens the chat without it.
+                let diff_so_far = match self.parts.isolator.diff(&trees, &commits).await {
+                    Ok(diff) => diff,
+                    Err(err) => {
+                        tracing::warn!(step = %step.id, %err, "the handoff opens without a diff");
+                        None
+                    }
+                };
+                let failure_reason = run
+                    .failure
+                    .clone()
+                    .or_else(|| step.gate_note.clone())
+                    .unwrap_or_else(|| PROMOTED_AT_A_GATE.to_owned());
+                let spec = promote::handoff_spec(
+                    spec,
+                    &template,
+                    &events,
+                    &roots,
+                    diff_so_far,
+                    failure_reason,
+                );
+                let assembled = assemble(&spec, self.parts.scrubber)?;
+                OpeningPath::Handoff {
+                    text: assembled.text,
+                    digest: assembled.digest,
+                }
+            }
+        };
+        Ok(Opening {
+            agent_id: agent.id,
+            agent_name: agent.name,
+            model: step.model.clone(),
+            phase: step.phase_name.clone(),
+            cwd,
+            extra_dirs,
+            path,
+        })
+    }
+
+    /// §4.8's `accept artifact` (MOD-4 plan D166, blueprint D194, `docs/ANA-2.md:1223-1233`).
+    ///
+    /// The guard ([`crate::command::accept_enabled`]), the lease, then the promoted step's stage
+    /// 5 in the lease's window, under the heartbeat ([`Self::heartbeaten`], plan D86): the verify,
+    /// as after a session that ended `EndTurn`; the capture and its commits; the settle columns.
+    /// MOD-4 plan D211 (review H2): the verify's deadline is a fresh copy of the phase's, measured
+    /// from the accept — a promoted step's `started_at` is its agent attempt's, often hours before
+    /// the human accepts, and measured from it the verify would be `unavailable` without running.
+    /// A `fail` verify refuses with [`EngineError::AcceptVerifyFailed`] — the outcome is recorded,
+    /// a note says so, and the step stays promoted and parked. An `unavailable` one is not refused
+    /// (plan D30: it never fails a step, and some of its causes are permanent); it is recorded and
+    /// a note `accept: verify unavailable: <reason>` says the merge goes in unverified (D211).
+    /// Otherwise the `AnswerGate(Approved)` tail: the step `done` with `approved`, the unpark,
+    /// the merge, and the walk from `position + 1`.
+    async fn accept_artifact(
+        &self,
+        run: RunId,
+        step: StepId,
+        chat_live: bool,
+    ) -> Result<CommandOutcome, EngineError> {
+        let run = self.run(run).await?;
+        let snapshot = Self::snapshot_of(&run)?;
+        let row = self.step(run.id, step).await?;
+        let phase = Self::phase_at(run.id, &snapshot, row.position)?;
+        let item = Self::item_of(&run)?;
+        let has_output = self.output_of(item, &phase, row.id).await?.is_some();
+        let steps = self.parts.store.run_steps(run.id).await?;
+        crate::command::accept_enabled(&steps, &row, &phase, has_output, chat_live)?;
+
+        // Plan D108's order: after the pure guard and before the first write.
+        let until = self.take_lease(run.id).await?;
+        let now = self.now();
+        // Plan D86: the verify is unbounded when the phase has no deadline, so the window runs
+        // under the heartbeat. A lease lost mid-verify drops the window before its capture and
+        // settle writes, and the caller reads `LeaseLost`; any other `Err` of the window gives the
+        // lease back (plan D149).
+        let window = self.leased_window(run.id, async {
+            let trees = self.parts.store.step_trees(row.id).await?;
+            let repos = self.parts.store.repos(run.project_id).await?;
+            let cwd = chat_dirs(&trees, &repos)
+                .map(|(cwd, _)| cwd)
+                .unwrap_or_default();
+            // The chat's session ended as a session does: `EndTurn`. A verify runs only after a
+            // `Done` (blueprint A-3), and this one's is the human's. MOD-4 plan D211: its deadline
+            // is measured from the accept, not from the step's own start (review H2).
+            let verify = self
+                .verify(VerifyStage {
+                    run: &run,
+                    step: &row,
+                    phase: &phase,
+                    trees: &trees,
+                    started_at: now,
+                    session_cwd: &cwd,
+                    result: &Ok(DoneEvent {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                })
+                .await?;
+            let after = self.parts.isolator.capture(row.id, &trees).await?;
+            self.parts.store.record_commits(row.id, &after).await?;
+            let verify_outcome = verify.as_ref().map(|report| report.outcome);
+            let verify_exit_code = verify.as_ref().and_then(|report| report.exit_code);
+            self.parts
+                .store
+                .finish_step(
+                    row.id,
+                    StepOutcome {
+                        exit_code: None,
+                        usage: None,
+                        trim_record: None,
+                        verify_outcome,
+                        verify_exit_code,
+                        finished_at: now,
+                    },
+                )
+                .await?;
+            // Blueprint D194: a failed verify is recorded and refused; the step stays promoted,
+            // and the window gives the lease back.
+            if verify_outcome == Some(VerifyOutcome::Fail) {
+                let refusal = EngineError::AcceptVerifyFailed {
+                    step: row.id,
+                    exit_code: verify_exit_code,
+                };
+                self.note(
+                    item,
+                    format!("accept refused: {refusal}"),
+                    Some(row.id),
+                    now,
+                )
+                .await?;
+                return Err(refusal);
+            }
+            // MOD-4 plan D211: `unavailable` is not refused, but a human reads that the merge
+            // goes in unverified, and why. Only the reason: `ShellVerifier` writes it on the first
+            // line and the command's captured tail after it, and that tail is already in
+            // `command_run.output`.
+            if let Some(report) = verify
+                .as_ref()
+                .filter(|report| report.outcome == VerifyOutcome::Unavailable)
+            {
+                let reason = report.output.lines().next().unwrap_or_default();
+                self.note(
+                    item,
+                    format!("accept: verify unavailable: {reason}"),
+                    Some(row.id),
+                    now,
+                )
+                .await?;
+            }
+            Ok(())
+        });
+        self.heartbeaten(run.id, until, window).await??;
+
+        // `AnswerGate(Approved)`'s tail: its lease take is a renewal of the one held here. Every
+        // `Err` past that take already gave the lease back; one of the take itself (a store
+        // error) did not, so the lease this command took is released here rather than left to
+        // its TTL. The release is owner-guarded, so a second one, or one of a lease another
+        // process holds, answers `Ok(false)`. A lost lease is never ours to give back (plan D128).
+        match self
+            .answer_guarded(&run, &snapshot, &row, &phase, GateAnswer::Approved)
+            .await
+        {
+            Ok(rest) => Ok(CommandOutcome::Accepted { rest }),
+            Err(err) => {
+                if !matches!(err, EngineError::LeaseLost { .. }) {
+                    self.release_lease(run.id).await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// §4.3 verdict 1's `unblock` (MOD-4 plan D161): one human action clears a held item.
+    ///
+    /// [`Self::unblock_case`] decides, then: [`UnblockCase::Reopen`] moves the item
+    /// `blocked -> open`; [`UnblockCase::FollowRun`] moves it `blocked -> awaiting_approval`
+    /// beside its parked run, so the run's gate verbs reach it (R-4); [`UnblockCase::Resume`]
+    /// resumes the parked run through [`Self::resume`] (R-7). Each writes a note first.
+    async fn unblock(&self, item: ItemId) -> Result<CommandOutcome, EngineError> {
+        let case = self.unblock_case(item).await?;
+        let now = self.now();
+        let rest = match case {
+            UnblockCase::Reopen => {
+                if !self
+                    .parts
+                    .store
+                    .transition(item, Status::Blocked, Status::Open)
+                    .await?
+                {
+                    // Another writer moved the item after it was read, so it is no longer
+                    // blocked: the refusal names where it is now.
+                    let row = self.item(item).await?;
+                    return Err(EngineError::NotBlocked {
+                        item,
+                        status: row.status,
+                        why: crate::command::nothing_is_blocked(),
+                    });
+                }
+                self.note(item, "unblocked: back to `open`".to_owned(), None, now)
+                    .await?;
+                None
+            }
+            UnblockCase::FollowRun(run) => {
+                // Plan D161's one deviation from ANA-2's item table (`blocked ->
+                // awaiting_approval`, T1): the item follows its parked run back.
+                if !self
+                    .parts
+                    .store
+                    .transition(item, Status::Blocked, Status::AwaitingApproval)
+                    .await?
+                {
+                    return Err(EngineError::StaleWrite {
+                        run,
+                        row: format!("item {item}"),
+                        from: Status::Blocked.to_string(),
+                        to: Status::AwaitingApproval.to_string(),
+                    });
+                }
+                self.note(
+                    item,
+                    format!("unblocked: follows run {run}, parked at `awaiting_approval`"),
+                    None,
+                    now,
+                )
+                .await?;
+                None
+            }
+            UnblockCase::Resume(run) => {
+                self.note(item, format!("unblocked: resuming run {run}"), None, now)
+                    .await?;
+                Some(match self.resume(run).await? {
+                    Resume::Walked(rest) | Resume::TopologyChanged { rest, .. } => rest,
+                })
+            }
+        };
+        Ok(CommandOutcome::Unblocked { item, case, rest })
+    }
+
+    /// `R-TUI-9`'s close-out (MOD-4 plan D167, blueprint D208, ANA-2 §4.10).
+    ///
+    /// The reads [`Self::close_out_preview`] counts over, the guard
+    /// ([`crate::command::close_out_enabled`]), then one `summary` document built by
+    /// [`closeout::summary`] and written by `WriteStore::close_out` with the item's move to
+    /// `closed`, in one transaction. No run lease is involved: the store re-checks a live run and
+    /// the item's status inside that transaction, so a run started since is refused there with
+    /// nothing written. The commit rows already exist, so none are passed.
+    async fn close_out(&self, item: ItemId) -> Result<CommandOutcome, EngineError> {
+        let reads = self.close_out_reads(item).await?;
+        crate::command::close_out_enabled(&reads.item, &reads.runs)?;
+        let repos = self.parts.store.repos(reads.item.project_id).await?;
+        let summary = closeout::summary(
+            &reads.item,
+            &reads.summaries,
+            &reads.commits,
+            &repos,
+            DocumentId::new(),
+            self.parts.user,
+            self.now(),
+        );
+        let written = self.parts.store.close_out(item, summary, &[]).await?;
+        Ok(CommandOutcome::ClosedOut {
+            item,
+            summary: written.id,
+            version: written.version,
+        })
+    }
+
     /// §6.2's `cancel run` (plan D45, ANA-2 §12 criterion 13).
     ///
     /// Every step that has not settled moves to `cancelled` — `pending`, `running`,
@@ -1050,35 +1510,55 @@ where
     /// for `cursor` to name and a caller would be told `None` — "the run finished" — about a run
     /// that was stopped at position 2.
     ///
-    /// `pub` for the same reason [`cleanup_run`](Self::cleanup_run) is: milestone 6's Runs tab is
-    /// the caller ANA-2 §6.2 writes this row for.
+    /// `pub` for the same reason [`cleanup_run`](Self::cleanup_run) is: `htui`'s `run_worker`, on
+    /// the Runs tab's behalf, is the caller ANA-2 §6.2 writes this row for. It preempts a live
+    /// walk of the run before it cancels (MOD-4 plan D157).
+    ///
+    /// Since MOD-4 plan D179 (R-28) a `running` or parked run's lease is taken first, as every
+    /// other command's is, and given back once the run is cancelled and cleaned up.
     ///
     /// # Errors
-    /// [`EngineError::RunStatus`] for a run that has already finished; the store's own refusals.
+    /// [`EngineError::RunStatus`] for a run that has already finished; [`EngineError::LeaseHeld`]
+    /// for a live lease another process holds, with nothing written; the store's own refusals.
     pub async fn cancel_run(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         let row = self.run(run).await?;
         crate::command::cancel_enabled(&row)?;
         let position = self.resting(&row).await?.position;
 
-        let now = self.now();
-        let steps = self.parts.store.run_steps(run).await?;
-        for step in &steps {
-            if step.status.is_terminal() {
-                continue;
+        // MOD-4 plan D179 (R-28): a `running` or parked run's lease is taken after the guard and
+        // before the first write, so a live stranger's lease refuses the cancel with nothing
+        // written (`LeaseHeld`). A `queued` run was never claimed and has no lease to take.
+        let leased = matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval);
+        if leased {
+            self.take_lease(run).await?;
+        }
+        let window = async {
+            let now = self.now();
+            let steps = self.parts.store.run_steps(run).await?;
+            for step in &steps {
+                if step.status.is_terminal() {
+                    continue;
+                }
+                self.parts
+                    .store
+                    .transition_step(step.id, step.status, StepStatus::Cancelled, now)
+                    .await?;
             }
+            // `finish_run` mirrors the item `queued | in_progress | awaiting_approval -> open`
+            // (`store/traits.rs`), which is what frees it for a second run; `failure` stays NULL
+            // because a cancel is a human's decision and not a failure.
             self.parts
                 .store
-                .transition_step(step.id, step.status, StepStatus::Cancelled, now)
+                .finish_run(run, RunStatus::Cancelled, None, now)
                 .await?;
+            self.cleanup_run(run).await
+        };
+        if leased {
+            self.leased_window(run, window).await?;
+            self.release_lease(run).await;
+        } else {
+            window.await?;
         }
-        // `finish_run` mirrors the item `queued | in_progress | awaiting_approval -> open`
-        // (`store/traits.rs`), which is what frees it for a second run; `failure` stays NULL
-        // because a cancel is a human's decision and not a failure.
-        self.parts
-            .store
-            .finish_run(run, RunStatus::Cancelled, None, now)
-            .await?;
-        self.cleanup_run(run).await?;
         Ok(CommandOutcome::Cancelled {
             rest: Rest {
                 run: RunStatus::Cancelled,
@@ -1123,6 +1603,35 @@ where
     where
         F: Future<Output = Result<T, EngineError>>,
     {
+        let out = match self.heartbeaten(run, until, walk).await? {
+            Ok(out) => out,
+            Err(err) => {
+                // Plan D127/D139: nothing else is written, but the lease is given back,
+                // best-effort, so any process's sweep adopts the run, this one's too. A
+                // release that fails is warned and the lease lapses.
+                self.release_lease(run).await;
+                return Err(err);
+            }
+        };
+        self.release_after_walk(run, self.run(run).await).await;
+        Ok(out)
+    }
+
+    /// [`Self::walk_leased`]'s race of `walk` against the heartbeat, without its releases: the
+    /// outer `Err` is the heartbeat's [`EngineError::LeaseLost`], with the walk already dropped,
+    /// [`DeadWalks`] and the guards handled as `walk_leased` documents; the inner `Result` is the
+    /// walk's own answer, which the caller settles. `AcceptArtifact`'s window uses it directly
+    /// (plan D86): its run is parked, so a walk's release on `Ok` would give back the lease its
+    /// `AnswerGate(Approved)` tail is about to renew.
+    async fn heartbeaten<T, F>(
+        &self,
+        run: RunId,
+        until: DateTime<Utc>,
+        walk: F,
+    ) -> Result<Result<T, EngineError>, EngineError>
+    where
+        F: Future<Output = Result<T, EngineError>>,
+    {
         let times = self.lease_times();
         let (store, owner) = (self.parts.store, self.parts.owner);
         let beat = recover::heartbeat(
@@ -1136,17 +1645,6 @@ where
         match futures::future::select(Box::pin(walk), Box::pin(beat)).await {
             Either::Left((out, beat)) => {
                 drop(beat);
-                let out = match out {
-                    Ok(out) => out,
-                    Err(err) => {
-                        // Plan D127/D139: nothing else is written, but the lease is given back,
-                        // best-effort, so any process's sweep adopts the run, this one's too. A
-                        // release that fails is warned and the lease lapses.
-                        self.release_lease(run).await;
-                        return Err(err);
-                    }
-                };
-                self.release_after_walk(run, self.run(run).await).await;
                 Ok(out)
             }
             // Plan D122: a heartbeat that fenced itself is treated exactly as a taken lease.
@@ -1220,6 +1718,11 @@ where
     ///
     /// Plan D140: a run taken here is about to be walked, so it leaves [`DeadWalks`]. The sweep
     /// must not give back the lease of a live walk.
+    ///
+    /// MOD-4 plan D210 (review H1): a run that leaves the set here has its guards released
+    /// first, best-effort (a `warn`), since no later pre-pass will. Every caller holds the run's
+    /// lock (a command, MOD-4 plan D157) or the sweep's fence (plan D189), so no walk of the run is
+    /// live in this process and the guards are a dead walk's.
     async fn renew_lease(&self, run: RunId) -> Result<Option<DateTime<Utc>>, EngineError> {
         let now = self.now();
         let until = now + self.lease_times().ttl;
@@ -1228,10 +1731,19 @@ where
             .store
             .take_lease(run, self.parts.box_id, self.parts.owner, now, until)
             .await?;
-        if taken {
-            self.parts.dead_walks.remove(run);
+        if taken && self.parts.dead_walks.remove(run) {
+            self.release_guards(run, "releasing a dead walk's guards at a lease take failed")
+                .await;
         }
         Ok(taken.then_some(until))
+    }
+
+    /// `Isolator::release(run)`, best-effort: a failure is a `warn` saying `what`, and nothing
+    /// raises (MOD-4 plan D188, D210).
+    async fn release_guards(&self, run: RunId, what: &'static str) {
+        if let Err(err) = self.parts.isolator.release(run).await {
+            tracing::warn!(%run, %err, "{what}");
+        }
     }
 
     /// Plan D149 (R-34): a command's window between its lease take and its
@@ -1241,8 +1753,9 @@ where
     /// otherwise keep it off while its lease names this process. Plan D133's `StaleWrite` on a
     /// command's first compare-and-set is one such `Err`.
     ///
-    /// Two commands on one run in one process share the owner, so one's window error can release
-    /// the other's live lease; that is R-27 (milestone 6).
+    /// Two commands on one run in one process share the owner, so one's window error could release
+    /// the other's live lease (R-27); `run_worker`'s per-run lock keeps two commands of one
+    /// process off one run at once (MOD-4 plan D157).
     async fn leased_window<T>(
         &self,
         run: RunId,
@@ -1260,6 +1773,20 @@ where
     #[cfg(test)]
     fn fresh_until(&self) -> DateTime<Utc> {
         self.now() + self.lease_times().ttl
+    }
+
+    /// MOD-4 plan D188 (blueprint F-D): a walk the worker dropped mid-flight — a preempting
+    /// `CancelRun` or `PromoteStep`, or a token cancelled while it walked — ran neither of
+    /// `walk_leased`'s release arms. This is what they would have done: the run's
+    /// `shared_serialized` guards dropped through `Isolator::release`, then the lease given back.
+    ///
+    /// Best-effort, and it never raises: a failed guard release is a `warn`, and a failed lease
+    /// release puts the run in [`DeadWalks`] as every lease release of the engine does.
+    pub async fn abandoned(&self, run: RunId) {
+        if let Err(err) = self.parts.isolator.release(run).await {
+            tracing::warn!(%run, %err, "releasing an abandoned walk's guards failed");
+        }
+        self.release_lease(run).await;
     }
 
     /// Plan D87/D139: the store's `release_lease(run, owner, now)`. The lease reads as expired at
@@ -1280,7 +1807,9 @@ where
             .await
         {
             // `false`: the lease is no longer ours, so there is nothing of ours to give back.
-            Ok(_) => self.parts.dead_walks.remove(run),
+            Ok(_) => {
+                self.parts.dead_walks.remove(run);
+            }
             Err(err @ StoreError::NotFound { entity: "run", .. }) => {
                 tracing::warn!(%run, %err, "releasing the lease found no run; nothing to give back");
                 self.parts.dead_walks.remove(run);
@@ -1316,6 +1845,8 @@ where
     /// Plan D140: before adopting, the sweep gives back the lease of every run in [`DeadWalks`].
     /// Those runs' walks died in this process, and the release clears the owner, so
     /// `adopt_runs` sees them as free. A release that fails again leaves the run in the set.
+    /// MOD-4 plan D210: each such run's `shared_serialized` guards are released first
+    /// (`Isolator::release`, best-effort), as plan D188's [`Self::abandoned`] does.
     ///
     /// The heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
     /// driver enabled (blueprint H-3).
@@ -1323,7 +1854,33 @@ where
     /// # Errors
     /// Only `adopt_runs`' own store error: nothing was adopted then.
     pub async fn sweep(&self) -> Result<Vec<Adopted>, EngineError> {
+        self.sweep_fenced(&NoFence).await
+    }
+
+    /// [`Self::sweep`] under a [`RunFence`] (MOD-4 plan D189, blueprint F-E): the dead-walk
+    /// pre-pass releases no guard and gives back no lease of a run the fence holds (plan D210), and an adopted run the fence holds
+    /// is skipped with a `debug!` — the adopted lease is this owner's, and the holder's own
+    /// `take_lease` renews it. The skipped run also enters [`DeadWalks`], so a holder that never
+    /// takes the lease does not strand the run under it: the next sweep whose fence is free gives
+    /// it back and adopts the run. Every other run is recovered as [`Self::sweep`] does, with its
+    /// fence held through the recovery.
+    ///
+    /// # Errors
+    /// As [`Self::sweep`].
+    pub async fn sweep_fenced<F: RunFence>(&self, fence: &F) -> Result<Vec<Adopted>, EngineError> {
         for run in self.parts.dead_walks.runs() {
+            // Plan D189: a run a live command of this process holds keeps its lease; it is that
+            // command's.
+            let Some(_held) = fence.hold(run) else {
+                tracing::debug!(%run, "the sweep leaves a held dead walk's lease alone");
+                continue;
+            };
+            // MOD-4 plan D210 (review H1): the dead walk's guards first, as plan D188's
+            // `abandoned` does. Under the fence no walk of the run is live here, so any guard
+            // still held for it is stale; once the lease is given back another box's sweep may
+            // take the run, and this is the last place of this process that can free them.
+            self.release_guards(run, "releasing a dead walk's guards in the sweep failed")
+                .await;
             self.release_lease(run).await;
         }
         let now = self.now();
@@ -1335,6 +1892,18 @@ where
             .await?;
         let mut swept = Vec::with_capacity(adopted.len());
         for run in adopted {
+            // Plan D189: a run a command of this process holds is that command's to walk. The
+            // lease the adoption took is this owner's, and the holder's own `take_lease` renews it.
+            // A holder may never take it, though: a command its guard refuses, or a walk past its
+            // release. Plan D88 would then keep every later sweep of this process off the lapsed
+            // lease, so the run joins the dead walks: the next pre-pass gives the lease back once
+            // the fence is free, and a holder that took it meanwhile left the set in
+            // `renew_lease`.
+            let Some(_held) = fence.hold(run.id) else {
+                tracing::debug!(run = %run.id, "the sweep skips an adopted run a command holds");
+                self.parts.dead_walks.insert(run.id);
+                continue;
+            };
             // Plan D126: `adopt_runs` leased every run at once, and only the one being recovered
             // is heartbeaten, so a later run's lease may have lapsed and been taken meanwhile.
             // Renew it first; a run that is no longer ours is skipped, with nothing written.
@@ -1378,6 +1947,65 @@ where
             swept.push(Adopted { run: run.id, next });
         }
         Ok(swept)
+    }
+
+    /// MOD-4 plan D161: which of `Unblock`'s three cases `item` is in, read-only — the item, then
+    /// each of its active runs with its cursor, handed to [`crate::command::unblock_enabled`].
+    ///
+    /// # Errors
+    /// [`EngineError::NotBlocked`], and the store's and the snapshot's own.
+    pub async fn unblock_case(&self, item: ItemId) -> Result<UnblockCase, EngineError> {
+        let row = self.item(item).await?;
+        let mut active = Vec::new();
+        for summary in self.parts.store.runs(item).await? {
+            let run = self.run(summary.id).await?;
+            if !run.status.is_active() {
+                continue;
+            }
+            let snapshot = Self::snapshot_of(&run)?;
+            let steps = self.parts.store.run_steps(run.id).await?;
+            let at = cursor(&snapshot, &steps);
+            active.push((run, at));
+        }
+        crate::command::unblock_enabled(&row, &active)
+    }
+
+    /// MOD-4 plan D167's first confirmation, read-only: [`crate::command::close_out_enabled`],
+    /// then [`closeout::preview`] over exactly the rows `CloseOut` would write the summary from.
+    ///
+    /// # Errors
+    /// [`EngineError::RunStatus`] or [`EngineError::NotClosable`], and the store's own.
+    pub async fn close_out_preview(&self, item: ItemId) -> Result<closeout::Preview, EngineError> {
+        let reads = self.close_out_reads(item).await?;
+        crate::command::close_out_enabled(&reads.item, &reads.runs)?;
+        let heads = self.parts.store.documents(item).await?;
+        Ok(closeout::preview(
+            &reads.item,
+            &reads.summaries,
+            &reads.commits,
+            &heads,
+        ))
+    }
+
+    /// Close-out's reads, shared by the preview and the command so both count the same rows: the
+    /// item, its runs as summaries and as rows, and every step's commit rows.
+    async fn close_out_reads(&self, item: ItemId) -> Result<CloseOutReads, EngineError> {
+        let row = self.item(item).await?;
+        let summaries = self.parts.store.runs(item).await?;
+        let mut runs = Vec::with_capacity(summaries.len());
+        let mut commits = Vec::new();
+        for summary in &summaries {
+            runs.push(self.run(summary.id).await?);
+            for step in &summary.steps {
+                commits.push((step.id, self.parts.store.step_commits(step.id).await?));
+            }
+        }
+        Ok(CloseOutReads {
+            item: row,
+            summaries,
+            runs,
+            commits,
+        })
     }
 
     /// Blueprint A-4: one run's recovery failed. Warned, noted on the item, and the lease given
@@ -1939,7 +2567,9 @@ where
     /// before the walk gives that lease back (plan D149). The walk itself runs under the
     /// heartbeat, and first unparks a run a command left parked over an answered step (plan D132,
     /// `walk_resumed`). Milestone 5's sweep adopts and adjudicates but does not walk; this is the
-    /// walk it hands a `Walk` run off to, and milestone 6's `run_worker` is the caller that does.
+    /// walk it hands a `Walk` run off to, and `htui`'s `run_worker` is the caller that does, on
+    /// the run's own task under its lock (MOD-4 plan D157, D158). `Unblock`'s third case calls it
+    /// too (plan D161).
     /// That heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
     /// driver enabled (blueprint H-3).
     ///
@@ -1952,8 +2582,8 @@ where
         // Plan D149: the reads, the live graph's resolve and both notes give the lease back on
         // any error. `Some` is the topology mismatch, which walks nothing.
         if let Some(changed) = self.leased_window(run, self.resume_window(run)).await? {
-            // Plan D150: so the lease just taken is given back whatever the run's status. A
-            // `running` run is then adopted again by the next sweep of any process (R-36).
+            // Plan D150: the lease just taken is given back whatever the run's status. A run that
+            // was `running` was parked first (MOD-4 plan D159), so no sweep adopts it again.
             self.release_lease(run).await;
             return Ok(changed);
         }
@@ -2016,6 +2646,20 @@ where
                     created_at: now,
                 })
                 .await?;
+            // MOD-4 plan D159 (R-36, criterion 3): a `running` run parks for the human the
+            // mismatch is addressed to — run, then item — rather than being handed back to every
+            // sweep as a `running` run. A run already parked is left as it is.
+            let row = if row.status == RunStatus::Running {
+                self.move_run(run, RunStatus::Running, RunStatus::AwaitingApproval, now)
+                    .await?;
+                self.parts
+                    .store
+                    .transition(item.id, Status::InProgress, Status::AwaitingApproval)
+                    .await?;
+                self.run(run).await?
+            } else {
+                row
+            };
             let rest = self.resting(&row).await?;
             return Ok(Some(Resume::TopologyChanged {
                 snapshot: snapshot.topology,
@@ -2035,14 +2679,26 @@ where
     /// (`Fan`, `Select`), is left where it is.
     async fn walk_resumed(&self, run: RunId) -> Result<Rest, EngineError> {
         let row = self.run(run).await?;
+        self.walk_resumed_from(&row).await
+    }
+
+    /// [`Self::walk_resumed`] over the run row it read.
+    async fn walk_resumed_from(&self, row: &Run) -> Result<Rest, EngineError> {
+        let run = row.id;
         if row.status == RunStatus::AwaitingApproval {
-            let snapshot = Self::snapshot_of(&row)?;
+            let snapshot = Self::snapshot_of(row)?;
             let steps = self.parts.store.run_steps(run).await?;
-            if matches!(
-                cursor(&snapshot, &steps),
-                Cursor::Create { .. } | Cursor::Run(_) | Cursor::Finished
-            ) {
-                self.unpark(&row, self.now()).await?;
+            // Blueprint D196: the one predicate `Unblock`'s third case reads too.
+            if resumable_park(&cursor(&snapshot, &steps)) {
+                // MOD-4 plan D180 (R-31): the unpark is this walk's first compare-and-set, and a
+                // run another command unparked first is not this walk's to merge or walk.
+                if !self.unpark(row, self.now()).await? {
+                    return Err(stale_run(
+                        run,
+                        RunStatus::AwaitingApproval,
+                        RunStatus::Running,
+                    ));
+                }
                 if let Some(winner) = recover::frontier(&snapshot, &steps)
                     && let Some(done) = steps.iter().find(|step| step.id == winner)
                 {
@@ -2389,11 +3045,15 @@ where
             .await?
         {
             Ok(prompt) => prompt,
-            Err(missing) => {
+            Err(StageThree::MissingInput(missing)) => {
                 return self
                     .fail_before_a_token(run, step, phase, missing)
                     .await
                     .map(Some);
+            }
+            // MOD-4 plan D162: the step fails before a token and the item is blocked.
+            Err(StageThree::Refused(err)) => {
+                return self.refuse_prompt(run, step, phase, &err).await.map(Some);
             }
         };
         // `unwrap_or(Value::Null)` here wrote a **null** `trim_record` and said nothing: the row
@@ -2540,7 +3200,7 @@ where
             .verifier
             .run(VerifyRequest {
                 command: phase.verify_command.clone(),
-                cwd: primary.map(|tree| std::path::PathBuf::from(&tree.path)),
+                cwd: primary.map(|tree| PathBuf::from(&tree.path)),
                 remaining: Self::remaining(phase, started_at, self.now()),
                 step: step.id,
             })
@@ -2706,9 +3366,27 @@ where
             .await?
         {
             Ok(prompt) => prompt,
-            Err(missing) => {
+            Err(StageThree::MissingInput(missing)) => {
                 return self
-                    .fail_group_before_a_token(run, phase, &pending, missing)
+                    .fail_group_before_a_token(
+                        run,
+                        phase,
+                        &pending,
+                        RunFailure::MissingInput(missing),
+                        false,
+                    )
+                    .await
+                    .map(Some);
+            }
+            // MOD-4 plan D162 at `drive_group` (blueprint D195): no candidate is live yet, so the
+            // whole group fails before a token and the item is blocked.
+            Err(StageThree::Refused(err)) => {
+                let failure = RunFailure::PromptRefused {
+                    phase: phase.name.clone(),
+                    reason: err.to_string(),
+                };
+                return self
+                    .fail_group_before_a_token(run, phase, &pending, failure, true)
                     .await
                     .map(Some);
             }
@@ -2822,9 +3500,9 @@ where
         run: &Run,
         phase: &SnapshotPhase,
         pending: &[&RunStep],
-        kind: String,
+        failure: RunFailure,
+        block: bool,
     ) -> Result<Rest, EngineError> {
-        let failure = RunFailure::MissingInput(kind);
         let now = self.now();
         for step in pending {
             // Plan D125: a candidate another writer moved stops the walk before the run is failed.
@@ -2839,11 +3517,15 @@ where
             self.fail_candidate(run, phase, step, &failure.to_string())
                 .await?;
         }
-        self.parts
-            .store
-            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
-            .await?;
-        self.cleanup_run(run.id).await?;
+        if block {
+            self.block_and_fail(run, &failure, None, now).await?;
+        } else {
+            self.parts
+                .store
+                .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+                .await?;
+            self.cleanup_run(run.id).await?;
+        }
         Ok(Rest {
             run: RunStatus::Failed,
             position: Some(phase.position),
@@ -3908,9 +4590,9 @@ where
     /// gate a human answered hours later is reconciled by a different call than the one that
     /// prepared it.
     ///
-    /// **A parked run has no resume verb this milestone** (blueprint F-G, R-7): `AnswerGate` needs
-    /// a step at `awaiting_approval` and every step here is `done`. Milestone 6's `Unblock`-shaped
-    /// verb is where a retry of `reconcile` belongs.
+    /// **A parked run's resume verb is `Unblock`** (blueprint F-G, R-7): `AnswerGate` needs a step
+    /// at `awaiting_approval` and every step here is `done`, so `Unblock`'s third case (`u`, MOD-4
+    /// plan D161) resumes the run and retries the `reconcile`.
     ///
     /// `siblings` are the other candidates of a fan-out winner's slot, handed to the isolator so a
     /// `shared_serialized` checkout left at a sibling's commit may be moved to the winner's (plan
@@ -3999,9 +4681,11 @@ where
     ///
     /// Cleanup failures are `warn`ed and never raised (plan D36): the run is already terminal when
     /// this runs, and a failed `rm` must not un-terminate it. No sweep retries a terminal run's
-    /// cleanup, because the sweep adopts only `running` runs: milestone 6 owns that retry (R-25).
+    /// cleanup, because the sweep adopts only `running` runs: `run_worker`'s manual `Cleanup`
+    /// request is that retry (R-25, MOD-4 plan D177, admitted by
+    /// [`crate::command::cleanup_enabled`]).
     ///
-    /// `pub` because milestone 6's Runs tab calls it directly for a run the worker did not end.
+    /// `pub` because `htui`'s `run_worker` calls it directly for a run the worker did not end.
     ///
     /// # Errors
     /// The store's own refusals only. The isolator's are logged.
@@ -4051,11 +4735,75 @@ where
         })
     }
 
-    /// Stage 3: the inputs, the pinned template and `assemble`.
+    /// MOD-4 plan D162 (blueprint D195, ANA-5 criterion 3): stage 3's assembler refused the
+    /// phase's own prompt, so the step fails before a token is spent and the item is `blocked`.
     ///
-    /// `Err(kind)` is the missing required input, which the caller turns into the hard failure —
-    /// an inner `Result` rather than an [`EngineError`] variant because a missing input is not an
-    /// engine fault, it is the run's own outcome.
+    /// The step goes `running -> failed` with **no** `gate_note`: the one writer of a note on that
+    /// edge is the sweep's `interrupt_step`, whose `interrupted` prefix `retry_enabled` keys on, so
+    /// the sentence lives in `run.failure` and the item's note. Then [`Self::block_and_fail`]. No
+    /// recorder is opened: stage 4 is never reached. A step another writer moved first is plan
+    /// D125's `StaleWrite`, and nothing else is written.
+    async fn refuse_prompt(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        err: &htui_core::prompt::AssembleError,
+    ) -> Result<Rest, EngineError> {
+        let failure = RunFailure::PromptRefused {
+            phase: phase.name.clone(),
+            reason: err.to_string(),
+        };
+        let now = self.now();
+        self.move_step(
+            run.id,
+            step.id,
+            StepStatus::Running,
+            StepStatus::Failed,
+            now,
+        )
+        .await?;
+        self.block_and_fail(run, &failure, Some(step.id), now)
+            .await?;
+        Ok(Rest {
+            run: RunStatus::Failed,
+            position: Some(step.position),
+            failure: Some(failure),
+        })
+    }
+
+    /// Plan D162's tail at both call sites, in `refuse_no_candidate`'s actual order (blueprint
+    /// F-J): the item `in_progress -> blocked`, the failure as its note, then `finish_run(Failed)`
+    /// — whose item mirror finds a `blocked` item and leaves it — and plan D36's cleanup.
+    async fn block_and_fail(
+        &self,
+        run: &Run,
+        failure: &RunFailure,
+        via: Option<StepId>,
+        now: DateTime<Utc>,
+    ) -> Result<(), EngineError> {
+        if let Some(item) = run.item_id {
+            self.parts
+                .store
+                .transition(item, Status::InProgress, Status::Blocked)
+                .await?;
+            self.note(item, failure.to_string(), via, now).await?;
+        }
+        self.parts
+            .store
+            .finish_run(run.id, RunStatus::Failed, Some(&failure.to_string()), now)
+            .await?;
+        self.cleanup_run(run.id).await
+    }
+
+    /// Stage 3: the phase's spec ([`Self::phase_spec`]) and `assemble`.
+    ///
+    /// The inner `Err` is the run's own outcome rather than an engine fault (blueprint D195):
+    /// [`StageThree::MissingInput`] is a required input that resolved to no document, which the
+    /// caller turns into the hard failure, and [`StageThree::Refused`] is `assemble`'s own refusal
+    /// of the phase's prompt, which blocks the item (MOD-4 plan D162). A store error and a phase
+    /// whose pinned template is gone (`ResolveError::NoTemplate`) stay outer: they are not about
+    /// this prompt.
     async fn assemble_prompt(
         &self,
         run: &Run,
@@ -4063,7 +4811,31 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
         item: ItemId,
-    ) -> Result<Result<AssembledPrompt, String>, EngineError> {
+    ) -> Result<Result<AssembledPrompt, StageThree>, EngineError> {
+        let spec = match self
+            .phase_spec(run, snapshot, step, phase, item, true)
+            .await?
+        {
+            Ok(spec) => spec,
+            Err(missing) => return Ok(Err(StageThree::MissingInput(missing))),
+        };
+        Ok(assemble(&spec, self.parts.scrubber).map_err(StageThree::Refused))
+    }
+
+    /// The phase's [`PromptSpec`] for `step`: its resolved inputs, its pinned template, its
+    /// upstream summaries and, from attempt 2, the loop's forwarded sections (plan D67).
+    ///
+    /// `Err(kind)` is a required input that resolved to no document, when `strict`. A promoted
+    /// step's handoff (plan D163) is not strict: its chat opens with the gap noted instead.
+    async fn phase_spec(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        item: ItemId,
+        strict: bool,
+    ) -> Result<Result<PromptSpec, String>, EngineError> {
         let row = self.item(item).await?;
         let project = self.project(row.project_id).await?;
         let resolved = self
@@ -4081,9 +4853,13 @@ where
                     version: document.version,
                     body: document.body,
                 }),
-                None if required.contains(&input.kind) => {
+                None if strict && required.contains(&input.kind) => {
                     return Ok(Err(input.kind));
                 }
+                None if required.contains(&input.kind) => notes.push(format!(
+                    "input `{}` resolves to no document; the handoff opens without it",
+                    input.kind
+                )),
                 None => notes.push(format!(
                     "input `{}` is produced at a later position and has not run yet; \
                      it is optional on this attempt (plan D21)",
@@ -4169,7 +4945,7 @@ where
             estimator: TokenEstimator::DEFAULT,
             notes,
         };
-        Ok(Ok(assemble(&spec, self.parts.scrubber)?))
+        Ok(Ok(spec))
     }
 
     /// Plan D67 (M3 D32's forward): the loop's two sections for a phase step at `attempt > 1`,
@@ -4252,8 +5028,8 @@ where
         step: &RunStep,
         phase: &SnapshotPhase,
         prompt: &AssembledPrompt,
-        cwd: std::path::PathBuf,
-        extra_dirs: Vec<std::path::PathBuf>,
+        cwd: PathBuf,
+        extra_dirs: Vec<PathBuf>,
     ) -> Result<(SessionResult, Option<htui_agent::record::CapBreach>), EngineError> {
         let mut recorder = self.open_recorder(run, step, prompt).await?;
         // A spawn failure is folded in rather than propagated straight out of the `?`: the
@@ -4338,8 +5114,8 @@ where
         phase: &SnapshotPhase,
         key: &SessionKey<'_>,
         text: &str,
-        cwd: std::path::PathBuf,
-        extra_dirs: Vec<std::path::PathBuf>,
+        cwd: PathBuf,
+        extra_dirs: Vec<PathBuf>,
         recorder: &mut Recorder<'a, S>,
     ) -> Result<SessionResult, EngineError> {
         let project = self.project(run.project_id).await?;
@@ -4355,7 +5131,8 @@ where
             // `shared_serialized` or `local` step, which lives in its own checkout somewhere else
             // on the box. An agent that cannot read it cannot work in it.
             extra_dirs,
-            // `R-SEC-2`: ANA-7 resolves secrets and milestone 6 wires them; the walk invents none.
+            // `R-SEC-2`: no secret provider exists yet; MOD-10 (secret provider, from ANA-7) owns
+            // wiring one. The walk invents none.
             env: BTreeMap::new(),
             model: Some(candidate.model.clone()),
             tools: ToolExposure::default(),
@@ -4502,27 +5279,11 @@ where
     /// at all, or one whose blob does not decode, used to be reported as `v: 0` — a version the
     /// snapshot never had, with the serde error thrown away, so the operator was told the engine
     /// was too old to read a run it could in fact read nothing of.
+    ///
+    /// [`crate::command::snapshot_of`] since milestone 6 (blueprint D184), kept here for the
+    /// walk's many call sites.
     fn snapshot_of(run: &Run) -> Result<GraphSnapshot, EngineError> {
-        let value = run
-            .graph_snapshot
-            .clone()
-            .ok_or_else(|| EngineError::Snapshot {
-                run: run.id,
-                reason: "the run carries no `graph_snapshot`; a graph run is created with one"
-                    .to_owned(),
-            })?;
-        let snapshot: GraphSnapshot =
-            serde_json::from_value(value).map_err(|err| EngineError::Snapshot {
-                run: run.id,
-                reason: format!("`graph_snapshot` does not decode: {err}"),
-            })?;
-        if snapshot.v != GraphSnapshot::V {
-            return Err(EngineError::SnapshotVersion {
-                run: run.id,
-                v: snapshot.v,
-            });
-        }
-        Ok(snapshot)
+        crate::command::snapshot_of(run)
     }
 
     /// A graph run always has an item; a chat run (`item_id IS NULL`) is MOD-2's and never reaches
@@ -4545,15 +5306,7 @@ where
         snapshot: &GraphSnapshot,
         position: i32,
     ) -> Result<SnapshotPhase, EngineError> {
-        snapshot
-            .phases
-            .iter()
-            .find(|phase| phase.position == position)
-            .cloned()
-            .ok_or_else(|| EngineError::Snapshot {
-                run,
-                reason: format!("no phase at position {position}"),
-            })
+        crate::command::phase_at(run, snapshot, position)
     }
 
     /// The candidate a step was created for, denormalised back out of the row and the phase.
@@ -4684,6 +5437,28 @@ where
     }
 }
 
+/// What close-out reads (MOD-4 plan D167), once, for the preview and the command alike.
+#[derive(Debug)]
+struct CloseOutReads {
+    /// The item row.
+    item: Item,
+    /// `ReadStore::runs(item)`: what the summary lists.
+    summaries: Vec<RunSummary>,
+    /// The same runs as rows, for [`crate::command::close_out_enabled`].
+    runs: Vec<Run>,
+    /// Every step's `run_step_commit` rows.
+    commits: Vec<(StepId, Vec<RunStepCommit>)>,
+}
+
+/// Stage 3's two outcomes that are the run's own rather than an engine fault (blueprint D195).
+#[derive(Debug)]
+enum StageThree {
+    /// A required input resolved to no document (`docs/ANA-2.md:412-414`).
+    MissingInput(String),
+    /// `assemble` refused the phase's own prompt (MOD-4 plan D162, ANA-5 criterion 3).
+    Refused(htui_core::prompt::AssembleError),
+}
+
 /// One fan-out candidate's inputs to [`Engine::run_candidate`]: everything its stages 2 to 5 read
 /// that the group shares (plan D58).
 #[derive(Debug, Clone, Copy)]
@@ -4812,6 +5587,27 @@ fn min_budget(app: &BTreeMap<String, Value>) -> i64 {
         .and_then(Value::as_i64)
         .filter(|micros| *micros > 0)
         .unwrap_or(0)
+}
+
+/// A promoted step's chat directories (ANA-2 `:1208-1213`): the primary repo's tree as `cwd`,
+/// else the first tree, and every other tree beside it. `None` for a step with no tree.
+fn chat_dirs(trees: &[RunStepTree], repos: &[Repo]) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let primary = trees
+        .iter()
+        .position(|tree| {
+            repos
+                .iter()
+                .any(|repo| repo.id == tree.repo_id && repo.is_primary)
+        })
+        .unwrap_or(0);
+    let cwd = PathBuf::from(&trees.get(primary)?.path);
+    let extra_dirs = trees
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != primary)
+        .map(|(_, tree)| PathBuf::from(&tree.path))
+        .collect();
+    Some((cwd, extra_dirs))
 }
 
 /// An excerpt set with no files whose audit records the caps a pass *would* have run under.
@@ -7615,7 +8411,13 @@ mod tests {
         harness_engine!(harness.orch, engine);
 
         let refused = engine
-            .fail_group_before_a_token(&row, &snapshot.phases[0], &[&stale], "spec".to_owned())
+            .fail_group_before_a_token(
+                &row,
+                &snapshot.phases[0],
+                &[&stale],
+                RunFailure::MissingInput("spec".to_owned()),
+                false,
+            )
             .await
             .expect_err("the candidate's compare-and-set found the row moved");
         let EngineError::StaleWrite {
@@ -9533,38 +10335,6 @@ mod tests {
         }
     }
 
-    /// Plan D150 (R-34): the graph moved under a `running` run, so `resume` walks nothing and
-    /// gives back the lease it took whatever the run's status. The same process's next sweep then
-    /// adopts the run, which plan D88 would keep it off while the lease named this process.
-    #[tokio::test]
-    async fn a_topology_mismatch_on_a_running_run_leaves_it_adoptable_by_the_same_process() {
-        let (harness, run) = parked_run_with_a_moved_graph().await;
-        let now = harness.orch.clock.now();
-        assert!(
-            harness
-                .orch
-                .store
-                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
-                .await
-                .expect("MemStore moves the run"),
-            "the run is `running` again, as a crash between an unpark and a walk leaves it"
-        );
-
-        let resumed = harness.resume(run).await.expect("the run is readable");
-        assert!(
-            matches!(resumed, Resume::TopologyChanged { .. }),
-            "{resumed:?}"
-        );
-
-        harness_engine!(harness.orch, engine);
-        let swept = engine.sweep().await.expect("the sweep runs");
-        assert_eq!(
-            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
-            [run],
-            "the lease was given back, so this process's sweep adopts the run"
-        );
-    }
-
     /// `FEAT-3` started and parked at `prd`, then `prd`'s `input_kinds` edited, so the live
     /// graph's topology digest no longer matches the run's snapshot (ANA-2 §12 criterion 3).
     async fn parked_run_with_a_moved_graph() -> (Harness, htui_core::model::RunId) {
@@ -10013,6 +10783,916 @@ mod tests {
             .into_iter()
             .find(|step| step.run_id == ids::RUN_1 && step.position == 0)
             .expect("RUN_1 has a step at position 0")
+    }
+
+    /// MOD-4 plan D163 (ANA-2 `:1208-1213`): the promoted step's chat opens in the step's own
+    /// trees — the primary repo's as `cwd`, wherever it sits in the scope, and every other one as
+    /// an extra directory.
+    #[tokio::test]
+    async fn the_opening_uses_the_step_s_own_trees_as_cwd() {
+        let harness = Harness::new().await;
+        let primary = harness.add_primary_repo().await;
+        let docs = RepoId::new();
+        harness
+            .orch
+            .store
+            .create_repo(NewRepo {
+                id: docs,
+                project_id: ids::PROJECT_HTUI,
+                name: "docs".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            })
+            .await
+            .expect("the demo project has no `docs` repo yet");
+        harness.free_feat_3().await;
+        let CommandOutcome::Started { run, .. } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: Some(vec![docs, primary]),
+            })
+            .await
+            .expect("an explicit scope of the project's repos")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        let prd = harness.orch.steps(run).await.remove(0);
+        let trees = harness
+            .orch
+            .store
+            .step_trees(prd.id)
+            .await
+            .expect("MemStore never fails a read");
+        let path_of = |repo: RepoId| {
+            std::path::PathBuf::from(
+                &trees
+                    .iter()
+                    .find(|tree| tree.repo_id == repo)
+                    .expect("stage 2 recorded a tree per repo of the scope")
+                    .path,
+            )
+        };
+
+        let CommandOutcome::Promoted { opening, .. } = harness
+            .dispatch(Command::PromoteStep {
+                run,
+                step: prd.id,
+                chat_open: false,
+            })
+            .await
+            .expect("a parked step")
+        else {
+            panic!("`PromoteStep` answers `Promoted`");
+        };
+        assert_eq!(
+            opening.cwd,
+            path_of(primary),
+            "the primary repo's tree, though it is second in the scope"
+        );
+        assert_eq!(opening.extra_dirs, vec![path_of(docs)]);
+    }
+
+    /// Plan D134 at `PromoteStep`: a `failed` attempt a retry replaced stays `failed` for good
+    /// (`retry_guarded` leaves it alone), and it is not the position's latest. Promoting it would
+    /// park a second step beside the real one, and `AcceptArtifact` would then merge the old tree
+    /// and leave the run `running` with nothing walking it. The promotion is refused as
+    /// `StaleSlot`, and nothing is written.
+    #[tokio::test]
+    async fn promote_refuses_an_attempt_a_retry_replaced() {
+        let harness = Harness::new().await;
+        harness.add_primary_repo().await;
+        let (run, first) = started(&harness).await;
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(
+                    first,
+                    GateOutcome::Rejected,
+                    Some("not this".to_owned()),
+                    harness.orch.clock.now(),
+                )
+                .await
+                .expect("MemStore takes the answer"),
+            "attempt 1 is `failed` under the parked run"
+        );
+        harness
+            .dispatch(Command::RetryStep { run, step: first })
+            .await
+            .expect("`retry_limit = 1` permits a second attempt");
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step.attempt, step.status))
+                .collect::<Vec<_>>(),
+            [(1, StepStatus::Failed), (2, StepStatus::AwaitingApproval)]
+        );
+        let (before, notes) = (
+            (harness.orch.run(run).await, steps),
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+        );
+
+        let refused = harness
+            .dispatch(Command::PromoteStep {
+                run,
+                step: first,
+                chat_open: false,
+            })
+            .await
+            .expect_err("attempt 2 replaced attempt 1");
+        assert!(
+            matches!(
+                refused,
+                EngineError::StaleSlot {
+                    step,
+                    attempt: 1,
+                    latest: 2,
+                } if step == first
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            (harness.orch.run(run).await, harness.orch.steps(run).await),
+            before,
+            "nothing was written"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            notes
+        );
+    }
+
+    /// Plan D86 at `AcceptArtifact`: the promoted step's verify outlasts the lease, and another
+    /// process takes it once it lapses. The accept's window runs under the heartbeat, so the
+    /// window is dropped where it stands and the caller reads `LeaseLost`: no capture, no commit
+    /// row, no settle columns, and the step stays promoted and parked for the new holder.
+    #[tokio::test(start_paused = true)]
+    async fn an_accept_whose_lease_is_taken_mid_verify_writes_nothing_after_it() {
+        /// A verify that outlasts the lease: the clock passes its expiry, a stranger takes it,
+        /// and the command runs on for another 150 s before it passes.
+        #[derive(Debug)]
+        struct Outlasting<'a> {
+            orch: &'a FakeOrchestrator,
+            run: htui_core::model::RunId,
+            stranger: uuid::Uuid,
+        }
+
+        impl crate::verify::Verifier for Outlasting<'_> {
+            fn run<'b>(
+                &'b self,
+                _request: crate::verify::VerifyRequest,
+            ) -> crate::verify::VerifierFuture<'b, Option<crate::verify::VerifyReport>>
+            {
+                Box::pin(async move {
+                    let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+                    self.orch.clock.advance(ttl + TimeDelta::seconds(1));
+                    let now = self.orch.clock.now();
+                    assert!(
+                        self.orch
+                            .store
+                            .take_lease(
+                                self.run,
+                                ids::BOX,
+                                self.stranger,
+                                now,
+                                now + TimeDelta::days(1)
+                            )
+                            .await
+                            .expect("MemStore takes the lease"),
+                        "the accept's lease lapsed, so another process takes it"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(150)).await;
+                    Some(crate::fake::FakeVerifier::pass())
+                })
+            }
+        }
+
+        let harness = Harness::new().await;
+        harness.add_primary_repo().await;
+        let (run, prd) = started(&harness).await;
+        harness
+            .dispatch(Command::PromoteStep {
+                run,
+                step: prd,
+                chat_open: false,
+            })
+            .await
+            .expect("a parked step is promotable");
+        let (step_before, commits_before) = (
+            harness.orch.steps(run).await,
+            harness
+                .orch
+                .store
+                .step_commits(prd)
+                .await
+                .expect("MemStore never fails a read"),
+        );
+
+        let verifier = Outlasting {
+            orch: &harness.orch,
+            run,
+            stranger: uuid::Uuid::now_v7(),
+        };
+        let graphs = harness.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        let engine = super::Engine::new(super::EngineParts {
+            store: parts.store,
+            graphs: parts.graphs,
+            isolator: parts.isolator,
+            verifier: &verifier,
+            clock: parts.clock,
+            selector: parts.selector,
+            sink: parts.sink,
+            driver: parts.driver,
+            scrubber: parts.scrubber,
+            app: parts.app,
+            box_profile: parts.box_profile,
+            box_id: parts.box_id,
+            owner: parts.owner,
+            dead_walks: parts.dead_walks,
+            user: parts.user,
+        });
+
+        let refused = engine
+            .dispatch(Command::AcceptArtifact {
+                run,
+                step: prd,
+                chat_live: false,
+            })
+            .await
+            .expect_err("the lease was taken mid-verify");
+        assert!(
+            matches!(refused, EngineError::LeaseLost { run: lost } if lost == run),
+            "{refused}"
+        );
+        assert_eq!(
+            harness.orch.steps(run).await,
+            step_before,
+            "no settle columns were written to the step"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .step_commits(prd)
+                .await
+                .expect("MemStore never fails a read"),
+            commits_before,
+            "no capture, so no commit row"
+        );
+    }
+
+    /// MOD-4 plan D180 (R-31): `walk_resumed`'s unpark is its first compare-and-set. A run another
+    /// command unparked between the read and the write stops the walk with `StaleWrite`: nothing
+    /// is merged again and nothing is walked twice.
+    #[tokio::test]
+    async fn walk_resumed_stops_on_a_stale_unpark() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        let now = harness.orch.clock.now();
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(prd, GateOutcome::Approved, None, now)
+                .await
+                .expect("MemStore takes the answer"),
+            "a crash between the answer and the unpark: a resumable park"
+        );
+        let stale = harness.orch.run(run).await;
+        assert!(
+            harness
+                .orch
+                .store
+                .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, now)
+                .await
+                .expect("MemStore takes the move"),
+            "another command unparked the run first"
+        );
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .walk_resumed_from(&stale)
+            .await
+            .expect_err("the unpark found the run moved");
+        let EngineError::StaleWrite { row, from, to, .. } = &refused else {
+            panic!("a stale unpark is a `StaleWrite`, not {refused}");
+        };
+        assert_eq!(
+            (row.as_str(), from.as_str(), to.as_str()),
+            ("the run", "awaiting_approval", "running")
+        );
+        assert!(
+            harness.orch.isolator.reconciles().is_empty(),
+            "nothing was merged"
+        );
+        assert_eq!(harness.orch.steps(run).await.len(), 1, "nothing was walked");
+    }
+
+    /// Plan D132's retry path (MOD-4 plan D180): `RetryStep` superseded the parked step and the
+    /// process died before its unpark. The cursor asks for the next attempt, which is a
+    /// resumable park, so `resume` unparks the run and walks attempt 2 to its gate.
+    #[tokio::test]
+    async fn a_crash_between_a_retry_and_the_unpark_is_resumed() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(prd, GateOutcome::Retried, None, harness.orch.clock.now())
+                .await
+                .expect("MemStore takes the answer"),
+            "the retry's first write landed and its unpark did not"
+        );
+
+        let resumed = harness.resume(run).await.expect("the walk resumes");
+        assert_eq!(
+            resumed,
+            Resume::Walked(crate::command::Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(0),
+                failure: None,
+            })
+        );
+        let steps = harness.orch.steps(run).await;
+        assert!(
+            steps.iter().any(|step| step.position == 0
+                && step.attempt == 2
+                && step.status == StepStatus::AwaitingApproval),
+            "attempt 2 ran and parked: {steps:?}"
+        );
+        assert!(
+            harness.orch.isolator.reconciles().is_empty(),
+            "a superseded step is not merged"
+        );
+    }
+
+    /// Plan D132's group-retry path (MOD-4 plan D180): `retire_slot` retired the parked group and
+    /// the process died before the unpark. A slot retired whole asks for the next attempt, which
+    /// is a resumable park, so `resume` unparks the run and drives the group again.
+    #[tokio::test]
+    async fn a_crash_between_a_group_retry_and_the_unpark_is_resumed() {
+        let harness = Harness::new().await;
+        let (run, [first, second]) = parked_group(&harness).await;
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let steps = harness.orch.steps(run).await;
+        harness_engine!(harness.orch, engine);
+        crate::gate::retire_slot(
+            &engine.gate_context(&row, &snapshot),
+            &steps,
+            0,
+            harness.orch.clock.now(),
+        )
+        .await
+        .expect("the retry's first write landed and its unpark did not");
+
+        let resumed = harness.resume(run).await.expect("the walk resumes");
+        assert_eq!(
+            resumed,
+            Resume::Walked(crate::command::Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(0),
+                failure: None,
+            }),
+            "attempt 2's group was driven and parked for a human again"
+        );
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.attempt == 2 && step.fanout_index >= 0)
+                .count(),
+            2,
+            "the whole group was admitted again: {steps:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .filter(|step| step.id == first || step.id == second)
+                .all(|step| step.attempt == 1),
+        );
+    }
+
+    /// Plan D132's selection path (MOD-4 plan D180): `select_fanout` settled the slot and the
+    /// process died before the unpark. The next position is uncreated, a resumable park, so
+    /// `resume` unparks, merges the winner with its sibling once, and walks on to `plan`.
+    #[tokio::test]
+    async fn a_crash_between_a_selection_and_the_unpark_is_resumed() {
+        let harness = Harness::new().await;
+        let (run, [first, second]) = parked_group(&harness).await;
+        harness
+            .orch
+            .store
+            .select_fanout(run, 0, 1, first, Some("picked by a human".to_owned()))
+            .await
+            .expect("the selection's first write landed and its unpark did not");
+
+        let resumed = harness.resume(run).await.expect("the walk resumes");
+        assert_eq!(
+            resumed,
+            Resume::Walked(crate::command::Rest {
+                run: RunStatus::AwaitingApproval,
+                position: Some(1),
+                failure: None,
+            })
+        );
+        assert_eq!(
+            harness.orch.isolator.reconciles(),
+            [(first, vec![second])],
+            "the winner is merged once, with its sibling"
+        );
+    }
+
+    /// A [`super::RunFence`] holding exactly the runs it names, as the worker's `RunLocks` would
+    /// for a run whose command is live.
+    struct Held(Vec<htui_core::model::RunId>);
+
+    impl super::RunFence for Held {
+        type Guard = ();
+
+        fn hold(&self, run: htui_core::model::RunId) -> Option<()> {
+            (!self.0.contains(&run)).then_some(())
+        }
+    }
+
+    /// MOD-4 plan D186: `StartRun` is `enqueue` then `claim`, and nothing walks in between — the
+    /// window the worker takes the run's lock in.
+    #[tokio::test]
+    async fn enqueue_then_claim_is_start_run() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness_engine!(harness.orch, engine);
+
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect("the graph resolves");
+        assert_eq!(harness.orch.run(run).await.status, RunStatus::Queued);
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Queued,
+            "`create_run` moved the item"
+        );
+        assert!(harness.orch.steps(run).await.is_empty(), "nothing walked");
+
+        let refused = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect_err("`create_run`'s compare-and-set admits one run per item");
+        assert!(matches!(refused, EngineError::Store(_)), "{refused}");
+
+        let CommandOutcome::Started { run: claimed, rest } =
+            engine.claim(run).await.expect("the box has a slot")
+        else {
+            panic!("`claim` answers `Started`");
+        };
+        assert_eq!(claimed, run);
+        assert_eq!(
+            (rest.run, rest.position, rest.failure),
+            (RunStatus::AwaitingApproval, Some(0), None),
+            "`StartRun`'s own first rest"
+        );
+    }
+
+    /// MOD-4 plan D158 (R-12): a walk task of this process that died leaves its run `running`
+    /// under a live lease naming this process, which plan D88 keeps the sweep off. `mark` puts
+    /// it in the dead-walk set, so the next sweep gives the lease back and adopts it.
+    #[tokio::test]
+    async fn a_marked_dead_walk_is_adopted_by_the_next_sweep() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let run = leased_run(&harness).await;
+        assert!(
+            engine
+                .sweep()
+                .await
+                .expect("the sweep runs")
+                .iter()
+                .all(|adopted| adopted.run != run),
+            "plan D88: a live walk's lease is not this process's sweep's"
+        );
+
+        harness.orch.dead_walks.mark(run);
+        assert!(harness.orch.dead_walks.contains(run));
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            swept,
+            [super::Adopted {
+                run,
+                next: super::Next::Walk
+            }],
+            "the dead walk's lease was given back, so this process adopts the run"
+        );
+        assert!(!harness.orch.dead_walks.contains(run));
+    }
+
+    /// MOD-4 plan D189 (blueprint F-E): a run the fence holds is neither released by the
+    /// dead-walk pre-pass nor recovered; an adopted one it holds keeps the lease the adoption
+    /// took, which is this owner's, and nothing is written to it.
+    #[tokio::test]
+    async fn a_fenced_sweep_skips_a_held_run_and_keeps_its_lease() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let run = leased_run(&harness).await;
+        harness.orch.dead_walks.mark(run);
+        let before = harness.orch.run(run).await;
+
+        let swept = engine
+            .sweep_fenced(&Held(vec![run]))
+            .await
+            .expect("the sweep runs");
+        assert!(swept.is_empty(), "{swept:?}");
+        assert!(
+            harness.orch.dead_walks.contains(run),
+            "the pre-pass gave back no lease of a held run"
+        );
+        assert_eq!(harness.orch.run(run).await, before, "the run is untouched");
+
+        // A second process, past the first one's lease: its sweep adopts the run, and its fence
+        // holds it, so the recovery is skipped and the adopted lease stays this owner's.
+        let other = Harness {
+            orch: harness.orch.restarted(),
+        };
+        harness_engine!(other.orch, second);
+        let swept = second
+            .sweep_fenced(&Held(vec![run]))
+            .await
+            .expect("the sweep runs");
+        assert!(swept.is_empty(), "a held run is not recovered: {swept:?}");
+        assert!(
+            other.orch.steps(run).await.is_empty(),
+            "no recovery wrote to it"
+        );
+        second
+            .take_lease(run)
+            .await
+            .expect("the adopted lease is this owner's, so the holder's take renews it");
+        let refused = engine
+            .take_lease(run)
+            .await
+            .expect_err("and no longer the first process's");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { .. }),
+            "{refused}"
+        );
+
+        let swept = second
+            .sweep_fenced(&Held(Vec::new()))
+            .await
+            .expect("the sweep runs");
+        assert!(
+            swept.is_empty(),
+            "plan D88: once live, the lease is never this process's sweep's: {swept:?}"
+        );
+    }
+
+    /// MOD-4 plan D189 with D88: the holder of a run a fenced sweep skipped may never take the
+    /// adopted lease (a command its guard refuses, or a walk past its release). Once the fence is
+    /// free and that lease has lapsed unused, this process's next sweep still adopts the run: the
+    /// skip put it in the dead-walk set, so the pre-pass gives the lease back first.
+    #[tokio::test]
+    async fn a_skipped_adopted_run_is_adopted_once_its_fence_is_free() {
+        let harness = Harness::new().await;
+        let run = leased_run(&harness).await;
+        let other = Harness {
+            orch: harness.orch.restarted(),
+        };
+        harness_engine!(other.orch, second);
+        let swept = second
+            .sweep_fenced(&Held(vec![run]))
+            .await
+            .expect("the sweep runs");
+        assert!(swept.is_empty(), "a held run is not recovered: {swept:?}");
+
+        // The holder gives the run up without taking the lease, which then lapses unused.
+        let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+        other.orch.clock.advance(ttl + TimeDelta::seconds(1));
+        let swept = second
+            .sweep_fenced(&Held(Vec::new()))
+            .await
+            .expect("the sweep runs");
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [run],
+            "the run is not stranded under this process's own lapsed lease"
+        );
+        assert!(!other.orch.dead_walks.contains(run));
+    }
+
+    /// MOD-4 plan D188 (blueprint F-D): an abandoned walk's guards are dropped and its lease is
+    /// given back, so this process's own sweep adopts the run at once; a release the store cannot
+    /// answer is remembered for the sweep, and nothing raises.
+    #[tokio::test]
+    async fn abandoned_releases_the_guards_and_the_lease() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let run = leased_run(&harness).await;
+
+        engine.abandoned(run).await;
+        assert_eq!(harness.orch.isolator.releases(), 1, "the run's guards");
+        assert_eq!(
+            harness.orch.run(run).await.lease_expires_at,
+            Some(harness.orch.clock.now()),
+            "the lease is given back"
+        );
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [run]
+        );
+
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let run = leased_run(&harness).await;
+        harness.orch.store.set_fault(MemFault::ReleaseLease, true);
+        engine.abandoned(run).await;
+        assert_eq!(
+            harness.orch.dead_walks.runs(),
+            [run],
+            "an unanswered release waits for the sweep"
+        );
+    }
+
+    /// How long a case waits on a walk or a `prepare` that must not queue behind a stale
+    /// `shared_serialized` guard; nothing it waits on sleeps, so reaching it is the hang.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// `FEAT-3` on `shared_serialized` isolation, started, and its walk dropped inside `prd`'s
+    /// session: after `prepare` took the phase's guard and before `capture` would free it. A
+    /// panicked walk task leaves exactly this — the guard lives in the isolator's map, not on the
+    /// walk's stack, so no unwind drops it — and neither of `walk_leased`'s release arms nor
+    /// [`super::Engine::abandoned`] runs. `prd` wrote no document, so its recovery walks it
+    /// again. Answers the `running` run.
+    async fn dead_serialized_walk(harness: &Harness) -> htui_core::model::RunId {
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                phase.isolation = Some(htui_core::model::Isolation::SharedSerialized);
+            })
+            .await;
+        let stalled = harness.orch.stall_after_done("prd", 1, None, false);
+        let walk = harness.dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        });
+        match futures::future::select(Box::pin(walk), Box::pin(stalled.notified())).await {
+            futures::future::Either::Left((outcome, _)) => {
+                panic!("the walk finished instead of stalling: {outcome:?}")
+            }
+            futures::future::Either::Right(((), walk)) => drop(walk),
+        }
+        let run = harness
+            .orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|run| run.id != ids::RUN_2)
+            .expect("the dead walk's run exists")
+            .id;
+        assert_eq!(harness.orch.run(run).await.status, RunStatus::Running);
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            0,
+            "nothing freed the guard"
+        );
+        run
+    }
+
+    /// MOD-4 plan D210 (review H1): the sweep's dead-walk pre-pass releases the dead walk's
+    /// `shared_serialized` guards (`Isolator::release`, as plan D188's `abandoned` does) before it
+    /// gives the lease back, so the adopted run walks on instead of queueing behind its own
+    /// stale guard for as long as the process lives.
+    #[tokio::test]
+    async fn a_dead_shared_serialized_walk_is_adopted_and_walks_on() {
+        let harness = Harness::new().await;
+        let run = dead_serialized_walk(&harness).await;
+        harness.orch.dead_walks.mark(run);
+        harness_engine!(harness.orch, engine);
+
+        let swept = engine.sweep().await.expect("the sweep runs");
+        assert_eq!(
+            swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+            [run],
+            "the dead walk's lease was given back, so this process adopts the run"
+        );
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            1,
+            "the pre-pass released the dead walk's guards"
+        );
+        let resumed = tokio::time::timeout(PATIENCE, harness.resume(run))
+            .await
+            .expect("the resumed walk does not queue behind the dead walk's guard")
+            .expect("the walk resumes");
+        assert!(
+            matches!(
+                resumed,
+                Resume::Walked(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(0),
+                    ..
+                })
+            ),
+            "`prd` was walked again and parked at its gate: {resumed:?}"
+        );
+    }
+
+    /// MOD-4 plan D210 (review H1), the window before the sweep: a command that takes a dead
+    /// walk's lease first — `Resume`'s `take_lease` — takes the run out of the dead-walk set, so
+    /// no pre-pass would ever release its guards. The take releases them itself, and another
+    /// run's `shared_serialized` step on the repository no longer queues behind them.
+    #[tokio::test]
+    async fn a_resume_before_the_sweep_releases_a_dead_walks_guards() {
+        use crate::isolate::Isolator as _;
+
+        let harness = Harness::new().await;
+        let run = dead_serialized_walk(&harness).await;
+        harness.orch.dead_walks.mark(run);
+        harness_engine!(harness.orch, engine);
+
+        engine
+            .take_lease(run)
+            .await
+            .expect("the dead walk's lease is this process's");
+        assert!(!harness.orch.dead_walks.contains(run));
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            1,
+            "the take released the dead walk's guards"
+        );
+
+        let other = htui_core::model::RunId::new();
+        tokio::time::timeout(
+            PATIENCE,
+            harness.orch.isolator.prepare(
+                other,
+                StepId::new(),
+                &[],
+                htui_core::model::Isolation::SharedSerialized,
+                None,
+            ),
+        )
+        .await
+        .expect("another run's step does not queue behind the dead walk's guard")
+        .expect("the fake prepares");
+        harness
+            .orch
+            .isolator
+            .release(other)
+            .await
+            .expect("the fake releases");
+
+        tokio::time::timeout(PATIENCE, harness.resume(run))
+            .await
+            .expect("the resumed walk does not queue behind the dead walk's guard")
+            .expect("the walk resumes");
+    }
+
+    /// Blueprint D204 (R-52, H-3): milestone 6 spawns engine futures onto tokio tasks, so the
+    /// entries a task awaits are `Send` over the worker's own part shapes — `dyn Isolator`,
+    /// `dyn Verifier` and `dyn Clock`. A compile-time check: nothing is polled.
+    #[tokio::test]
+    async fn a_dispatch_future_is_send() {
+        fn assert_send<F: Send>(_: &F) {}
+
+        let orch = FakeOrchestrator::demo();
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let parts = super::fake_parts(&orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        let isolator: &dyn crate::isolate::Isolator = &orch.isolator;
+        let verifier: &dyn crate::verify::Verifier = &orch.verifier;
+        let clock: &dyn crate::isolate::Clock = &orch.clock;
+        let engine = super::Engine::new(super::EngineParts {
+            store: parts.store,
+            graphs: parts.graphs,
+            isolator,
+            verifier,
+            clock,
+            selector: parts.selector,
+            sink: &NoSink,
+            driver: parts.driver,
+            scrubber: parts.scrubber,
+            app: parts.app,
+            box_profile: parts.box_profile,
+            box_id: parts.box_id,
+            owner: parts.owner,
+            dead_walks: parts.dead_walks,
+            user: parts.user,
+        });
+
+        assert_send(&engine.dispatch(Command::CancelRun { run: ids::RUN_2 }));
+        assert_send(&engine.resume(ids::RUN_2));
+        assert_send(&engine.sweep_fenced(&Held(Vec::new())));
+    }
+
+    /// MOD-4 plan D161's read-only half: the item and its active runs, each with its cursor.
+    #[tokio::test]
+    async fn unblock_case_reads_the_item_and_its_active_runs() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness_engine!(harness.orch, engine);
+        let refused = engine
+            .unblock_case(ids::HTUI_FEAT_3)
+            .await
+            .expect_err("an open item");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { status: Status::Open, why, .. } if *why == crate::command::nothing_is_blocked()),
+            "{refused}"
+        );
+
+        let CommandOutcome::Started { run, .. } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        let refused = engine
+            .unblock_case(ids::HTUI_FEAT_3)
+            .await
+            .expect_err("a real gate is answered, not unblocked");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { why, .. } if *why == crate::command::run_waits_at_a_gate(run)),
+            "{refused}"
+        );
+    }
+
+    /// MOD-4 plan D167's first confirmation counts what `CloseOut` would write, and is refused
+    /// while a run of the item is live.
+    #[tokio::test]
+    async fn close_out_preview_counts_what_close_out_writes() {
+        let harness = Harness::new().await;
+        harness.add_primary_repo().await;
+        harness_engine!(harness.orch, engine);
+        let (run, _) = started(&harness).await;
+        let refused = engine
+            .close_out_preview(ids::HTUI_FEAT_3)
+            .await
+            .expect_err("a live run");
+        assert!(
+            matches!(refused, EngineError::RunStatus { run: live, .. } if live == run),
+            "{refused}"
+        );
+
+        for _ in 0..4 {
+            let parked = harness
+                .orch
+                .steps(run)
+                .await
+                .into_iter()
+                .find(|step| step.status == StepStatus::AwaitingApproval)
+                .expect("a parked step");
+            harness
+                .dispatch(Command::AnswerGate {
+                    run,
+                    step: parked.id,
+                    answer: GateAnswer::Approved,
+                })
+                .await
+                .expect("the artefact is there");
+        }
+        let preview = engine
+            .close_out_preview(ids::HTUI_FEAT_3)
+            .await
+            .expect("a done item with no live run");
+        assert_eq!(
+            (preview.status, preview.runs, preview.rows, preview.version),
+            (Status::Done, 2, 4, 1),
+            "the seeded `RUN_2` and this one; one row per step, each committed to the primary"
+        );
     }
 
     async fn phase_of(orch: &FakeOrchestrator) -> SnapshotPhase {

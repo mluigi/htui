@@ -18,11 +18,14 @@
 //!    flush the store refuses **commits nothing**: `seq` does not advance, and the rows it
 //!    numbered stay owed inside the recorder until a later flush writes them at exactly those
 //!    numbers. Gaplessness is therefore a property of the log, not merely of the counter.
+//!    [`Recorder::continuing`] starts past a log's last row, at its last `turn`, so a promoted step
+//!    continued by a chat is still one gapless log with one writer at a time (MOD-4 plan D164).
 //! 3. **The prompt digest.** `sha256` over the assembled prompt text, computed once, written both
 //!    as the `digest` key of the `prompt` payload and through
 //!    [`WriteStore::set_step_usage`]`(step, usage, Some(digest))`. Later usage writes for the same
 //!    step pass `None`, as that method's contract says. Passing `Some` rather than ANA-5 §4.4's
-//!    `None` is the plan's X8 ruling, and it stands until milestone 9.
+//!    `None` is the plan's X8 ruling, and it stands until milestone 9. A continuing recorder owes
+//!    no digest: it records no prompt, so `run_step.prompt_digest` stays the original prompt's.
 //! 4. **Scrub, then persist, then the UI.** Every payload and every `raw` blob goes through the
 //!    [`Scrubber`] at capture, and every payload goes through it a **second** time over the
 //!    assembled row at the flush - the pass that catches a secret no single chunk carried
@@ -484,6 +487,44 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             residue: None,
             dropped: 0,
             rows: 0,
+        }
+    }
+
+    /// A recorder over a step whose log already has rows (MOD-4 plan D164, ANA-5 criterion 18): a
+    /// promoted graph step, continued by a chat. `tail` is the step's persisted rows
+    /// ([`ReadStore::step_events`](htui_core::store::ReadStore::step_events)), in any order.
+    ///
+    /// - `seq` continues at `max(tail.seq) + 1` (item 2 of the module doc: gapless, one writer).
+    /// - `turn` is the highest `turn` of `tail`, and `turns = turn + 1`.
+    ///   [`Recorder::record_follow_up`] then opens `turn + 1`.
+    /// - `prompt_digest` and the owed digest are `None`, so every `set_step_usage` passes `None`
+    ///   and `run_step.prompt_digest` is left as the original prompt wrote it (item 3).
+    /// - `usage` is seeded with [`UsageTotals::from_rows`]`(tail)`: the recorder writes the whole
+    ///   `run_step.usage` document from its own running total on every usage write, so a
+    ///   continuation that started from zero would erase the step's pre-promotion spend.
+    ///
+    /// Never call [`Recorder::record_prompt`] on it: that is what would rewrite the digest.
+    pub fn continuing(
+        store: &'a S,
+        scrubber: &'a dyn Scrubber,
+        step: StepId,
+        retain_raw: bool,
+        ui: Option<mpsc::Sender<DriverEnvelope>>,
+        tail: &[SessionEvent],
+    ) -> Self {
+        let next_seq = tail
+            .iter()
+            .map(|row| row.seq)
+            .max()
+            .map_or(0, |last| last + 1);
+        let turn = tail.iter().map(|row| row.turn).max().unwrap_or(0);
+        let turns = if tail.is_empty() { 0 } else { turn + 1 };
+        Self {
+            next_seq,
+            turn,
+            turns,
+            usage: UsageTotals::from_rows(tail),
+            ..Self::new(store, scrubber, step, retain_raw, ui)
         }
     }
 
@@ -1755,4 +1796,362 @@ pub async fn enforce_breach<S: WriteStore>(
     Ok(DoneEvent {
         stop_reason: StopReason::Cancelled,
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Unit tests: a recorder that continues a step's log (MOD-4 plan D164)
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use chrono::{DateTime, Utc};
+    use htui_core::fixtures::ids;
+    use htui_core::model::{
+        ChatRunSpec, EventKind, EventRole, RunStep, SessionEvent, StepId, UsageTotals,
+    };
+    use htui_core::scrub::MinimalScrubber;
+    use htui_core::store::{MemStore, ReadStore, WriteStore};
+    use serde_json::{Value, json};
+
+    use super::{Recorder, RecorderSummary};
+    use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason, TextChunk, UsageEvent};
+
+    /// A fixed capture time, so a persisted row is a function of the script alone.
+    fn at() -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(1_788_393_600_000)
+            .expect("the demo epoch is a valid instant")
+    }
+
+    fn scrubber() -> MinimalScrubber {
+        MinimalScrubber::new(["fake-secret-9f8e7d".to_owned()])
+    }
+
+    fn env(event: DriverEvent) -> DriverEnvelope {
+        DriverEnvelope {
+            event,
+            raw: None,
+            at: at(),
+        }
+    }
+
+    fn chunk(text: &str) -> DriverEnvelope {
+        env(DriverEvent::AssistantChunk(TextChunk {
+            text: text.to_owned(),
+            message_id: Some("m-continued".to_owned()),
+        }))
+    }
+
+    fn done() -> DriverEnvelope {
+        env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        }))
+    }
+
+    fn usage(input: i64) -> DriverEnvelope {
+        env(DriverEvent::Usage(UsageEvent {
+            input_tokens: Some(input),
+            ..UsageEvent::default()
+        }))
+    }
+
+    /// A demo store with one run and one step minted: the step a promotion continues.
+    async fn open_step() -> (MemStore, ChatRunSpec) {
+        let chat = ChatRunSpec::mint(
+            ids::PROJECT_HTUI,
+            ids::BOX,
+            ids::USER,
+            Some(ids::AGENT_CLAUDE),
+            Some("sonnet".to_owned()),
+        );
+        let store = MemStore::demo();
+        store
+            .start_chat_run(&chat)
+            .await
+            .expect("the run and its step must mint");
+        (store, chat)
+    }
+
+    fn row(step: StepId, seq: i32, turn: i32, kind: EventKind, payload: Value) -> SessionEvent {
+        let role = match kind {
+            EventKind::Prompt => EventRole::Htui,
+            EventKind::FollowUp => EventRole::User,
+            _ => EventRole::Agent,
+        };
+        SessionEvent {
+            run_step_id: step,
+            seq,
+            turn,
+            kind,
+            role,
+            tool_call_id: None,
+            payload,
+            raw: None,
+            at: at(),
+        }
+    }
+
+    /// The pre-promotion log of a graph step: seq `0..=5`, turns 0 and 1.
+    fn earlier_log(step: StepId) -> Vec<SessionEvent> {
+        vec![
+            row(
+                step,
+                0,
+                0,
+                EventKind::Prompt,
+                json!({ "text": "implement it", "digest": "d0" }),
+            ),
+            row(
+                step,
+                1,
+                0,
+                EventKind::AssistantText,
+                json!({ "text": "on it" }),
+            ),
+            row(
+                step,
+                2,
+                0,
+                EventKind::Done,
+                json!({ "stop_reason": "end_turn" }),
+            ),
+            row(
+                step,
+                3,
+                1,
+                EventKind::FollowUp,
+                json!({ "text": "and the tests" }),
+            ),
+            row(
+                step,
+                4,
+                1,
+                EventKind::AssistantText,
+                json!({ "text": "added" }),
+            ),
+            row(
+                step,
+                5,
+                1,
+                EventKind::Done,
+                json!({ "stop_reason": "end_turn" }),
+            ),
+        ]
+    }
+
+    /// Writes `rows` as the step's log and reads it back the way a caller would: through
+    /// `ReadStore::step_events`.
+    async fn seed(store: &MemStore, step: StepId, rows: &[SessionEvent]) -> Vec<SessionEvent> {
+        store
+            .append_events(rows)
+            .await
+            .expect("the earlier log must land");
+        log(store, step).await
+    }
+
+    async fn log(store: &MemStore, step: StepId) -> Vec<SessionEvent> {
+        store
+            .step_events(step)
+            .await
+            .expect("reading the log must not fail")
+            .expect("the step has a log")
+    }
+
+    async fn step_row(store: &MemStore, chat: &ChatRunSpec) -> RunStep {
+        store
+            .run_steps(chat.run_id)
+            .await
+            .expect("reading the steps must not fail")
+            .into_iter()
+            .find(|step| step.id == chat.step_id)
+            .expect("the minted step is there")
+    }
+
+    async fn finish(recorder: Recorder<'_, MemStore>) -> RecorderSummary {
+        recorder
+            .finish()
+            .await
+            .expect("the recorder must close cleanly")
+    }
+
+    /// `seq` resumes past the last persisted row and `turn` stays the last turn's: the log stays
+    /// gapless with one writer (module doc item 2).
+    #[tokio::test]
+    async fn a_continued_recorder_starts_after_the_last_seq_and_turn() {
+        let (store, chat) = open_step().await;
+        let scrubber = scrubber();
+        let tail = seed(&store, chat.step_id, &earlier_log(chat.step_id)).await;
+
+        let mut recorder =
+            Recorder::continuing(&store, &scrubber, chat.step_id, false, None, &tail);
+        recorder
+            .record(chunk("one more thing"))
+            .await
+            .expect("recording must land");
+        let summary = finish(recorder).await;
+
+        let rows = log(&store, chat.step_id).await;
+        assert_eq!(
+            rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            (0..=6).collect::<Vec<_>>(),
+            "the continuation's first row is seq 6, with no gap and no overwrite"
+        );
+        assert_eq!(rows[6].kind, EventKind::AssistantText);
+        assert_eq!(
+            rows[6].turn, 1,
+            "a row before any follow-up is the last turn's"
+        );
+        assert_eq!(summary.seq, 7, "the next unused seq");
+        assert_eq!(summary.turns, 2, "turns is the last turn plus one");
+    }
+
+    /// `record_follow_up` on a continued recorder opens the turn after the log's last one, and the
+    /// rows that answer it carry that turn.
+    #[tokio::test]
+    async fn a_continued_follow_up_opens_the_next_turn() {
+        let (store, chat) = open_step().await;
+        let scrubber = scrubber();
+        let tail = seed(&store, chat.step_id, &earlier_log(chat.step_id)).await;
+
+        let mut recorder =
+            Recorder::continuing(&store, &scrubber, chat.step_id, false, None, &tail);
+        recorder
+            .record_follow_up("keep going", at())
+            .await
+            .expect("the follow-up row must land");
+        recorder
+            .record(chunk("continuing"))
+            .await
+            .expect("recording must land");
+        recorder.record(done()).await.expect("recording must land");
+        let summary = finish(recorder).await;
+
+        let rows = log(&store, chat.step_id).await;
+        let new: Vec<&SessionEvent> = rows.iter().filter(|row| row.seq > 5).collect();
+        assert_eq!(new.len(), 3, "follow-up, answer, done");
+        assert_eq!(new[0].kind, EventKind::FollowUp);
+        assert_eq!(new[0].role, EventRole::User);
+        assert_eq!(new[0].seq, 6);
+        assert_eq!(new[0].turn, 2, "the turn after the log's last");
+        assert_eq!(
+            new.iter().map(|row| row.turn).collect::<Vec<_>>(),
+            vec![2, 2, 2],
+            "every row of the new turn carries its number"
+        );
+        assert_eq!(new[1].kind, EventKind::AssistantText);
+        assert_eq!(summary.turns, 3);
+    }
+
+    /// A continued recorder owes no digest: its usage writes pass `None`, so the digest the
+    /// original prompt wrote survives `finish` (module doc item 3).
+    #[tokio::test]
+    async fn a_continued_recorder_never_writes_prompt_digest() {
+        let (store, chat) = open_step().await;
+        let scrubber = scrubber();
+        store
+            .set_step_prompt(chat.step_id, "d0", &json!({}))
+            .await
+            .expect("the original prompt's digest must land");
+        let tail = seed(&store, chat.step_id, &earlier_log(chat.step_id)).await;
+
+        let mut recorder =
+            Recorder::continuing(&store, &scrubber, chat.step_id, false, None, &tail);
+        recorder
+            .record(usage(5))
+            .await
+            .expect("recording must land");
+        recorder.record(done()).await.expect("recording must land");
+        let summary = finish(recorder).await;
+
+        let step = step_row(&store, &chat).await;
+        assert!(step.usage.is_some(), "a usage write did happen");
+        assert_eq!(
+            step.prompt_digest.as_deref(),
+            Some("d0"),
+            "the continuation leaves run_step.prompt_digest as the prompt wrote it"
+        );
+        assert_eq!(summary.prompt_digest, None, "no prompt was recorded here");
+    }
+
+    /// With nothing to continue, a continued recorder starts where a new one would.
+    #[tokio::test]
+    async fn continuing_an_empty_log_is_seq_zero_turn_zero() {
+        let (store, chat) = open_step().await;
+        let scrubber = scrubber();
+
+        let mut recorder = Recorder::continuing(&store, &scrubber, chat.step_id, false, None, &[]);
+        recorder
+            .record(chunk("first words"))
+            .await
+            .expect("recording must land");
+        recorder.record(done()).await.expect("recording must land");
+        let summary = finish(recorder).await;
+
+        let rows = log(&store, chat.step_id).await;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.seq, row.turn))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 0)],
+            "seq from 0, turn 0"
+        );
+        assert_eq!(summary.seq, 2);
+        assert_eq!(
+            summary.turns, 0,
+            "no turn was opened: no prompt, no follow-up"
+        );
+    }
+
+    /// The recorder writes `run_step.usage` whole from its own running total, so a continuation
+    /// must start from the step's earlier spend rather than from zero (plan D164, amended at
+    /// fact-check).
+    #[tokio::test]
+    async fn a_continued_recorder_keeps_the_step_s_earlier_usage() {
+        let (store, chat) = open_step().await;
+        let scrubber = scrubber();
+        let mut earlier = earlier_log(chat.step_id);
+        earlier.push(row(
+            chat.step_id,
+            6,
+            1,
+            EventKind::Usage,
+            json!({ "input_tokens": 10, "output_tokens": 5, "cost_micros": 40 }),
+        ));
+        earlier.push(row(
+            chat.step_id,
+            7,
+            1,
+            EventKind::Usage,
+            json!({ "input_tokens": 20, "output_tokens": 7, "cost_micros": 60 }),
+        ));
+        let tail = seed(&store, chat.step_id, &earlier).await;
+        // The pre-promotion recorder left the column at the earlier spend.
+        store
+            .set_step_usage(chat.step_id, UsageTotals::from_rows(&tail).to_value(), None)
+            .await
+            .expect("the earlier spend must land");
+
+        let mut recorder =
+            Recorder::continuing(&store, &scrubber, chat.step_id, false, None, &tail);
+        recorder
+            .record(usage(5))
+            .await
+            .expect("recording must land");
+        recorder.record(done()).await.expect("recording must land");
+        let summary = finish(recorder).await;
+
+        let expected = json!({
+            "input_tokens": 35,
+            "output_tokens": 12,
+            "cache_read_tokens": Value::Null,
+            "cache_write_tokens": Value::Null,
+            "cost_micros": 100,
+        });
+        let step = step_row(&store, &chat).await;
+        assert_eq!(
+            step.usage.as_ref(),
+            Some(&expected),
+            "run_step.usage is the earlier spend plus the continuation's"
+        );
+        assert_eq!(summary.usage, expected, "the summary carries the same sum");
+    }
 }

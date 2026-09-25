@@ -14,22 +14,34 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-24):** **ANA-11 was concluded**
-(`docs/decisions/ana/ana-11.md`): requirements get dedicated tables with suspect-aware item
-citations; a decision is a closed item with a new `item.resolution` and its `summary` document.
-Spawned MOD-37 (schema, blocked on the maintainer applying `docs/ANA-11.md` §7) and MOD-38 (TUI).
-Before it, **MOD-30 was done**
-(`docs/decisions/mod/mod-30.md`): the detail sub-tab strip separates titles by one space and a test
-pins its width against the pane, so MOD-4 milestone 6 (PRD D5) is unblocked.
-Before it, **MOD-35 was done**
-(`docs/decisions/mod/mod-35.md`): Added Qdrant connection settings to mirror Postgres DSN configuration.
-**Live coordinates.** Migrations `0001`..`0004` exist (`0003_orchestration.sql` landed with MOD-4),
-so the **next migration is `0005`**, which MOD-37 claims as `0005_requirements.sql`; the next cache
-migration is `0004`. Adapters install under `HTUI_AGENTS_ROOT`, default
+**Current status (2026-09-25):** **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`):
+requirements get dedicated tables with suspect-aware item citations; a decision is a closed item with
+a new `item.resolution` and its `summary` document. Spawned MOD-38 (schema, blocked on the
+maintainer applying `docs/ANA-11.md` §7) and MOD-39 (TUI).
+Before it, **MOD-4 was done** (`docs/decisions/mod/mod-4.md`): the
+orchestrator runs in manual mode across all six milestones. `htui-orch` walks step graphs with gates,
+the review loop, judged fan-out and four git isolation modes under a leased heartbeat and a recovery
+sweep, and `run_worker.rs` and the Runs pane let the maintainer drive it, promote a step to chat and
+close an item out. Its carried risks are **MOD-37** and **CLEAN-4**.
+Before it, **MOD-30 was done** (`docs/decisions/mod/mod-30.md`): the detail sub-tab strip separates
+titles by one space and a test pins its width against the pane.
+**Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration` and
+`0004_max_agents_per_run_default` (cache: `0001`..`0003`), so **the next migration is `0005`**.
+`max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins at MOD-4's close
+(`22cfeea`): store conformance `CASES` 53, `READ_CASES` 9, `htui-orch` `CASES` 70, `StoreRequest`
+62 variants, 227 `.sqlx` files; `cargo doc --workspace --no-deps` shows exactly two baseline errors
+(`htui-core` `MIRRORED_TABLES`, `htui-store` `step_exists`). `git` ≥ 2.33.0 is a runtime dependency
+of the `worktree` isolation mode and of reconciliation. **Production `approve` and `accept` are
+greyed and every production judge fails until MOD-11**, because no agent can write its phase's
+`output_kind` document yet, so production fan-outs go to the human (`s` in the Runs pane).
+Adapters install under `HTUI_AGENTS_ROOT`, default
 `dirs::data_local_dir()/htui/agents`; `HTUI_TOOL_<NAME>` still overrides everything. Dev Postgres
 via `compose.yaml` (port 5439); tests need
 `HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres` and the
-`USERNAME=htui-ci` prefix of TOOL-2 (`docs/decisions/mod/mod-6.md`).
+`USERNAME=htui-ci` prefix of TOOL-2 (`docs/decisions/mod/mod-6.md`). Under load the dev Postgres
+goes into recovery (`57P03`) and a failure seen then is re-run alone before it is believed;
+`htui-store` `tests/cache.rs::the_spawned_refresher_passes_and_follows_the_scope` has timed out
+once that way.
 **Live coordinates the agent work left, kept here because open items depend on them.** `claude` on
 this box is **2.1.267** (2.1.272 at the last estimator re-measure); the seed passes no `--bare`;
 `--permission-prompts none` is the deterministic way to provoke a policy denial, and
@@ -37,10 +49,8 @@ this box is **2.1.267** (2.1.272 at the last estimator re-measure); the seed pas
 reports `claude_code_version` on `system/init` (there is no `version` key), re-emits `system/init`
 on **every turn** of a multi-turn session, and emits a `system/status` row per turn that
 `docs/ANA-4.md` §6.2 does not name. This box's live quota blob is `status: "allowed_warning"` at
-0.77 utilization and `available()` skips every status that is not exactly `"allowed"`, so the
-`claude-cli` row will report `Skip(Status("allowed_warning"))` the moment **MOD-4** has a selection
-loop — deliberately MOD-4's to loosen (`quota.rs:403-408`), and a live fact about a real row rather
-than a hypothesis. `agy_acp_server` **1.1.1** is installed here and emits **no `usage_update`
+0.77 utilization; MOD-4 milestone 4 (D61) made `allowed_warning` selectable, so the `claude-cli`
+row is no longer skipped for it. `agy_acp_server` **1.1.1** is installed here and emits **no `usage_update`
 whatsoever**, which is why its seed keeps `quota.source: "none"` and why the GPT/Gemini estimator
 row cannot be measured on this box (MOD-2 F-17). `--uid=` is **mandatory** for it. Its credentials
 live in `$GEMINI_HOME/antigravity-acp/acp_token.json`, a sibling of and separate from the `agy`
@@ -50,8 +60,8 @@ verdict is withdrawn**, see MOD-25 (`docs/decisions/mod/mod-25.md`); the documen
 as the analysis that was done and not taken, and anything leaning on its local-only half is stale;
 ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration;
 ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
-`htui-orch`. MOD-4, MOD-7, MOD-9, MOD-13 and MOD-14 can start now (MOD-15 is done,
-`docs/decisions/mod/mod-15.md`).
+`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-7, MOD-9, MOD-11, MOD-12, MOD-13
+and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 
 ---
 
@@ -74,7 +84,8 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   every golden snapshot in `crates/htui-core/tests/snapshots/` is re-recorded on each change. Leave
   the current blank line in place until this concludes.
 - [ ] **ANA-21 - Per-model weights for agent assignment, derived from public sources** (from MOD-4
-  milestone 4, OQ-7; maintainer-requested 2026-09-23). `R-AGT-8`, `R-ORCH-7`. Blocks MOD-36.
+  milestone 4, OQ-7; maintainer-requested 2026-09-23; MOD-4 is done, `docs/decisions/mod/mod-4.md`).
+  `R-AGT-8`, `R-ORCH-7`. Blocks MOD-36.
   Research how to give each configured agent/model a weight (e.g. Gemini Flash 30, Claude Opus 5.5
   60) that MOD-36 uses to choose which models run a phase's fan-out candidates. Survey public signals
   (coding and reasoning benchmarks, leaderboards, published pricing and latency), decide whether
@@ -84,7 +95,7 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
 
 ### Next features
-- [ ] **MOD-37 - Requirements schema, seam and close-out resolution** (from ANA-11). `R-ENT-8`,
+- [ ] **MOD-38 - Requirements schema, seam and close-out resolution** (from ANA-11). `R-ENT-8`,
   `R-NF-4`, `R-STO-3`, `R-TUI-9`, proposed `R-ENT-14..15`. Migration `0005_requirements.sql`
   (`requirement_spec`, `requirement_area`, `requirement_key_counter`, `requirement`,
   `requirement_revision`, `item_requirement` with a version stamp for derived suspect links, and
@@ -94,14 +105,82 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   only for `rejected`/`withdrawn`/`superseded`/`duplicate`, which amends ANA-2 §4.3. The demo fixture
   gains requirements with one suspect citation. **Blocked on a maintainer decision:** apply or
   amend the requirement text proposed in `docs/ANA-11.md` §7 to `docs/REQUIREMENTS.md` first.
-- [ ] **MOD-38 - Requirements tab and item traceability** (from ANA-11; blocked on MOD-37).
+- [ ] **MOD-39 - Requirements tab and item traceability** (from ANA-11; blocked on MOD-38).
   `R-TUI-1`, `R-TUI-9`, proposed `R-ENT-14..15`. Requirements tab (areas, requirements, coverage by
   citing item with status and resolution, withdrawn rows dimmed, revision trail with the deciding
   item); cited requirements with suspect markers and a re-confirm action in item detail; a
-  resolution picker in close-out; maintainer-only create/amend/withdraw, where amend names the
-  deciding item (`docs/ANA-11.md` §6).
+  resolution picker in MOD-4's Runs-pane close-out confirmation; maintainer-only
+  create/amend/withdraw, where amend names the deciding item (`docs/ANA-11.md` §6).
+- [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
+  `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
+  no other item owns them. Each is small, known and recorded; none blocks a manual run today. Pick
+  them off singly or in batches. Sources are under `.claude/plans/mod-4-orch-*`, and the context is
+  in the MOD-4 write-up's "Carried" section (`docs/decisions/mod/mod-4.md`).
+  - **R-3**: a parked run's `run.failure` stays NULL. The reason lives only in the step's
+    `gate_note` and the `item_note`, and the Runs pane shows `awaiting_approval` without it, because
+    adding `gate_note` to `RunStepSummary` touches three builders and the mirror (engine blueprint
+    F-I; drive plan, "What this milestone touches").
+  - **R-5**: the gate park is three compare-and-sets (step, run, item), not one transaction on
+    Postgres; milestone 5's D96 closed its crash half. Nothing writes `gate_outcome = skipped`, so a
+    `never`/`on_failure` pass leaves the gate NULL and the step list renders `—` (engine blueprint
+    F-K, H-9, H-10; drive plan, "What this milestone touches").
+  - **R-6**: nothing writes `phase_agent` for an override graph copy, or `is_override`. The plans
+    named MOD-15's phase editor as its owner, but MOD-15 closed on 2026-09-17, so it lands here
+    (engine blueprint F-J; drive plan, "What this milestone touches").
+  - **R-29**: Postgres stores `queued_at` in microseconds and `MemStore` in nanoseconds, so a
+    sub-microsecond tie can name a different `Overlaps.with` (lease blueprint §21.2).
+  - **R-30**: `recover::classify` counts a step as finished only when every `run_scope` repo has an
+    `after_hash`. A step that changed only some repos and crashed after capture is retried rather
+    than adopted. The failure is safe, a retry and never a wrong merge (lease blueprint §21.2).
+  - **R-31, the rejected-crash remainder**: a crash right after `AnswerGate(Rejected)` stays parked
+    on a failed step with no resume path. The rest of R-31 was closed by milestone 6's D180 (lease
+    blueprint §22.3; drive plan D180).
+  - **R-32**: D131's not-reset park loses its labelled detail, and D138's `part_way` turns an `Io`
+    error into a `Git` error. Both are diagnostics only (lease blueprint §22.3).
+  - **R-37**: `git::reconcile_parent` opens the checkout up to six times per diff row, and `merge_of`
+    walks the primary's first-parent history back to the step's base. This costs speed only. The
+    fix is to open the repository once and pass `&gix::Repository` to private `*_in` variants (lease
+    blueprint §23.4).
+  - **R-38**: preempting a running step (`cancel`, `promote`) kills the agent without ANA-4 §4.3's
+    grace window and without answering parked permission requests. A graceful path needs a cancel
+    seam inside `pump` (drive plan, Risks).
+  - **R-40**: `RunStream` frames are sent at session end and at rest only, so a step's
+    `pending → running` is not signalled to the Runs pane. The next frame, or re-selecting the item,
+    shows it. The fix is a step-start hook (drive plan, Risks).
+  - **R-41**: an `Orch` reply can arrive hours after its request, and a newer `Orch` request from
+    the same origin makes it stale, so it is dropped (`App::is_fresh`). The walk's result still
+    reaches the pane as a `RunStream` frame and through the rows (drive plan, Risks).
+  - **R-44**: step rows at 43 columns truncate `agent/model` for long model ids. `…` marks the cut
+    and the width test keeps it from clipping silently (drive plan, Risks).
+  - **R-46**: a walk task keeps the `Backend` clone it started with. After an `Online → Offline`
+    swap its `PgStore` handle keeps failing until the heartbeat fences, and the sweep after reconnect
+    adopts the run (drive plan, Risks).
+  - **R-48**: the ACP driver ignores `SessionSpec.resume` (only `cli/mod.rs` reads it), so a
+    promoted ACP step always gets the handoff prompt and a fresh model context. It needs ACP
+    `session/load`. The blueprint named "a MOD-2 follow-up" as the owner, and MOD-2 is closed (drive
+    blueprint §18).
+  - **R-49**: a promoted chat works in the step's tree without the `shared_serialized` `(box, repo)`
+    guard. The guard was released at `capture` or by `abandoned`, so another run may `prepare` the
+    same checkout meanwhile. The fix is to take the guard again in `attach_promoted` (drive
+    blueprint §18).
+  - **R-51**: a command on a run with a live walk waits for the whole walk (D157), and the pane shows
+    nothing while it waits. The fix is a "waiting" frame (drive blueprint §18).
+  - **R-53**: `ItemActions` is as of the last `Runs` reply, so a verdict can flip before the key is
+    pressed. The engine re-checks with the same admission function (D184) and the pane re-reads
+    (D171) (drive blueprint §18).
+  - **R-55**: `box.settings.command_limits` is read once per process, per server, so an edit does not
+    reach a running process's verifier until a restart or a server switch. Nothing edits it today;
+    whoever adds an editor re-reads the limits or rebuilds the verifier when no walk is live (drive
+    blueprint §21.3).
+  - **T7's residual window**: a promoted chat first streams at the promotion's `Orch` address and
+    moves to its own once the Chat tab's `ChatFollow` is served. Between the chat's `ChatAccepted`
+    and that `ChatFollow`, a second `Orch` request from the Chat tab supersedes the address, so the
+    frames sent in between are dropped from the view as stale while the store keeps recording them.
+    A promotion refused at the bind is already handed the stream (blueprint D185); the interval
+    before the follow is served is not covered (T7 repair `9f7cc5c`, `agent_worker.rs` `Stream`).
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
-  OQ-7; blocked on ANA-21). `R-AGT-8`, `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
+  OQ-7; blocked on ANA-21 only, since MOD-4 is done, `docs/decisions/mod/mod-4.md`). `R-AGT-8`,
+  `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
   one agent the walk selects (rival sampling). This item spreads candidates across the eligible
   agents by weight: a weighted `AgentSelector` (the seam milestone 4 leaves per-candidate) picks each
   `fanout_index`'s agent from the walk's eligible list using ANA-21's weights, so the judge compares
@@ -117,8 +196,9 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   **(1) the hostname stops being a digest input.** Today an identical `PromptSpec` assembled on two
   boxes produces different bytes and therefore a different `prompt_digest`, so a digest can only be
   compared within one machine — which defeats MOD-4's criterion 11 (comparing a real step's digest
-  against the preview's) the moment the two run on different boxes. The hostname stays *in the text
-  the model sees*; it is excluded from the bytes that are hashed. That split does not exist yet:
+  against the preview's; MOD-4 is done, `docs/decisions/mod/mod-4.md`) the moment the two run on
+  different boxes. The hostname stays *in the text the model sees*; it is excluded from the bytes
+  that are hashed. That split does not exist yet:
   §4.7's pipeline hashes exactly what it renders, so this needs a "rendered but not digested" span
   concept, and the `trim_record` must say the prompt carried one.
   **(2) a setting decides whether it is rendered at all.** The maintainer's case for keeping it:
@@ -156,233 +236,17 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 - [ ] **MOD-28 - rataflow execution view (from ANA-12).** Add `rataflow` dependency, implement `ExecutionGraph` widget mapping `RunStep` and `SessionEvent` lists to a node graph, add view toggle to Runs tab (`R-TUI-4`), and wire mouse/keyboard events for standard run actions.
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
-- [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees.
-- [ ] **MOD-4 - Orchestrator, manual mode** (from ANA-2). `R-ORCH-1..5`, `R-ORCH-7..11`,
-  `R-TUI-4`, `R-TUI-9`. Step graphs per kind, gates, retries, review loop, fan-out with isolation
-  modes and selection, capability check, promotion to chat, run records, Runs tab actions, and
-  close-out (summary document, status, commit hashes). The `run` and `close` actions of `R-TUI-2`.
-  Design concluded in `docs/ANA-2.md` (ANA-2, `docs/decisions/ana/ana-2.md`): new crate
-  `htui-orch` plus `crates/htui/src/run_worker.rs` (§8), migration `0003_orchestration.sql` and
-  `cache_migrations/0003_orchestration.sql` (§9; never applied before MOD-2's `0002`, **which
-  landed 2026-09-08 in `fb626a8`, so this constraint is now satisfied**. **The cache
-  migration is `0003`, not the `0002` ANA-2 §9 reserved:** MOD-2 milestone 4 spent
-  `cache_migrations/0002_agent_mirror.sql` mirroring the registry so an offline chat can start), plus
-  **`local_migrations/0002_orchestration_local.sql` in the same commit** (ANA-10 §5.3's Set B — a
-  `0003` landing alone leaves the local schema a generation behind, and SQLite makes catching up
-  expensive), **eighteen** `WriteStore` methods (ANA-2 §8's table is 17 rows and `docs/ANA-2.md:1744`
-  names two; §1760's "sixteen" undercounts its own table) plus the six `ReadStore` reads of
-  `:1730-1733` and the fifteen new inherent reads of `:1711-1724`, each now obliging **three** stores
-  — `MemStore`, `PgStore` and ANA-10's `LocalStore` — with conformance cases, `can_move_to` on the
-  three status enums (§4.3), typed `BoxSettings`/`ProjectSettings` (§4.7), projection additions
-  (§6.2), fixture corrections (`attempt` 1-based, non-NULL `graph_snapshot`, `review` in
-  `implement.input_kinds`, `gate_hard` seed), `gix` as the git dependency; build order in §9,
-  steps 1 to 4 need nothing from MOD-2. Per ANA-5 (`docs/ANA-5.md` §4.6, §8): calls `assemble()`
-  for the judge and handoff prompts, supplies `verify_failure`/`previous_diff` for the review loop,
-  `RunStepSummary` gains `prompt_tokens` and `trimmed`; the pre-flight digest write is MOD-2's
-  `set_step_prompt`, not `finish_step`. **ANA-10's M8 is struck from this item** (MOD-25 closed
-  2026-09-16, `docs/decisions/mod/mod-25.md`): `htui` is online-only, so there is no `LocalStore`,
-  no local-only graph parity, no four SQL ports and **no
-  `local_migrations/0002_orchestration_local.sql`** — the migration set is `0003_orchestration.sql`
-  plus `cache_migrations/0003_orchestration.sql` and nothing else. Two stores oblige the seam,
-  `MemStore` and `PgStore`, not three. The `PgStore`-inherent reads of ANA-2 §8 become
-  `Backend`-inherent with a `match self` (`agents()` precedent, `backend.rs:292-298`); §8's split
-  rule itself is unchanged. One prohibition survives: never `CHECK (fanout_index >= 0)` on either
-  schema (ANA-2 risk 12); ANA-10 §10.17's local `shared_serialized` question is moot.
-  **Not blocked** — MOD-2 is done (`docs/decisions/mod/mod-2.md`), MOD-6 landed
-  (`docs/decisions/mod/mod-6.md`), and MOD-25 removed the MOD-17 M3 ordering rule by withdrawing
-  MOD-17 (not by satisfying it). **Three things MOD-2 handed over by name.** (1) ANA-5 §12
-  **criterion 18's persistence half** is this item's (MOD-2 D107): a handoff prompt must be
-  persisted as a `follow_up` event at the next `turn`, not as a second `prompt` row, leaving
-  `run_step.prompt_digest` unchanged — it needs a promotion, which is `R-ORCH-5`. The assembler half
-  is proved by `prompt_digest.rs::a_handoff_summary_carries_only_the_windowed_tail`. (2) ANA-5 §12
-  **criterion 3's `blocked` transition** and **criterion 16's front-matter parser** are likewise
-  MOD-2-adjacent and this item's. (3) MOD-2 finding **F-104**: `excerpt::select`'s `vetted()` refuses
-  any provider candidate the reader's listing never offered, and a listing truncated by `scan_cap` is
-  only a prefix — so on a very large repository a legitimate provider candidate is refused and noted.
-  That is the conservative direction and the price of not leaning on `htui-agent` for a security
-  property; loosening it (a per-candidate stat under the same symlink discipline) is this item's
-  call, not the assembler's. Also inherited: `available()` skips every quota status that is not
-  exactly `"allowed"`, so this box's `claude-cli` row reports `Skip(Status("allowed_warning"))` the
-  moment there is a selection loop (`quota.rs:403-408`).
-  **Milestone 1 landed (`33277b1`..`e3163ca`, 2026-09-18): the seam knows what a run is.** 37
-  commits, 120 files; workspace green at `--test-threads=1` (1304 passed), `sqlx prepare --check`
-  clean. `WriteStore` 42 → 60, `ReadStore` +5 (including ANA-2 §4.2's `resolve_inputs`, which
-  `documents_of_kinds` deliberately is not), 11 `Backend`-inherent reads, the three §4.3 tables as
-  `can_move_to` with the refusal in the seam, `MemStore` + `PgStore` over
-  `0003_orchestration.sql` and its `cache_migrations/0003` companion, `run_step_tree` as the
-  seventeenth mirrored table, `CASES` 36 → 47 and `READ_CASES` 6 → 9. **Six milestones, not the
-  seven PRD D1 approved**: the traits carry no default bodies, so PRD milestones 1 and 2 cannot
-  each close on a green workspace and are one milestone (plan D0); ANA-2 §9's build order is
-  unchanged. **Two fixture corrections of this item's list are now applied** (`attempt` 1-based, a
-  real `graph_snapshot` on both graph runs); the other two were already MOD-15's. **Two seam
-  questions the review gate raised are deferred to milestone 2**, recorded in
-  `.claude/plans/mod-4-orch-seam.blueprint.md` §4.6 R-1/R-2: a terminal `transition_run`/`fail_run`
-  does not write the item mirror in the same transaction, which ANA-2 §4.3:543 asks for and ANA-2
-  §8's writer table does not provide; and `claim_run`'s overlap predicate is repo-set-on-one-box,
-  so §4.7's isolation-aware rules I and P cannot be evaluated inside the admission critical
-  section — two worktree-isolated runs on one repo are refused, which is safe but narrower than
-  `R-ORCH-9`. Plan: `.claude/plans/mod-4-orch-seam.plan.md`; blueprint:
-  `.claude/plans/mod-4-orch-seam.blueprint.md`.
-  **Milestone 2 landed (`cacab31`..`0a53d9c`, 2026-09-19; close-out round `f87c2b7`..`1cbddc5`,
-  2026-09-22): a graph walks.** 22 implementation commits over 37 files, plus eight close-out
-  commits. `crates/htui-orch` is the fifth workspace crate — `lib.rs`, `graph.rs`, `status.rs`,
-  `command.rs`, `isolate.rs`, `engine.rs`, `gate.rs`, and `fake.rs` + `conformance.rs` behind
-  `test-support` — depending on `htui-core` and `htui-agent` and never on `htui-store` (ANA-2
-  invariant 10). It runs `prd -> plan -> implement -> review` against `FakeDriver`, a new
-  `FakeIsolator` and `MemStore`: the six-stage walk, the gate table, the review loop and its
-  no-progress predicate, with no git, no Postgres, no agent and no second migration.
-  **Milestone 1's deferred R-1 is answered**: `finish_run` is the nineteenth writer and moves the
-  run and mirrors its item in one transaction on both stores (`PgStore` takes `run` then `item`
-  `FOR UPDATE`, the order every other two-row writer already uses). **R-2 is still deferred to
-  milestone 5** — the engine adds no overlap reasoning of its own. `CASES` 47 -> 48; `htui-orch`'s
-  own case list is 15.
-  **Three decisions the implementation corrected, all recorded in the plan**: D5 retires a `failed`
-  step by cancelling it rather than leaving it alone (a `failed` latest attempt reads as a rest, so
-  the walk would stop forever); D10 records an unexpected review verdict as an `item_note` carrying
-  `via_step_id`, not in `gate_note`; D19 resolves the graph through a `GraphSource` trait
-  `htui-orch` defines itself, because eleven of milestone 1's reads are store-inherent and not on
-  any trait.
-  **The review gate found three HIGH and five MEDIUM; every finding was verified against the tree
-  and every one was applied** (`9acb166`, `106671b`, `23fef33`, `9870673`, `60120c7`, `6345a4a`,
-  `ed7756c`, `c83ae97`, `cf2f08a`, `5d4582a`, `1cbddc5`). The two that change behaviour a later
-  milestone must know about: (1) a step that errors *after* the `pending -> running` move used to
-  leave the run running forever, because `cursor` rests on `running` and every command refuses a
-  running step — the walk now delegates to `walk_live_step` and hard-fails through `fail_hard`
-  (`running -> failed` + `finish_run`), and **a spawn failure lands in `failed` under every gate**,
-  never parking, per ANA-2 `:639`; (2) `RetryStep` on a terminal run created an orphan `pending`
-  step and reported success — neither store refuses a step on a terminal run, so the refusal is the
-  engine's (`EngineError::RunStatus`). ANA-2's `failed -> retry -> queued` row (`:585`) is the
-  *item* table and remains unimplemented. `EngineError` also gained `Snapshot` and `Stalled` so the
-  walk's own invariants stop arriving as `Store(Constraint)` — milestone 6's `run_worker.rs` is the
-  first consumer that would have been misled.
-  **A second §4.2/§4.3 disagreement is now recorded in the plan's risks, beside D2's**: ANA-2
-  `:450` says a `never` gate with an exhausted `failed` settle ends the run `awaiting_approval`,
-  while `:575`/`:608` and the shipped code end it `failed`. Milestone 5 must not re-read `:450`
-  literally. Two known warts, both deliberate: an engine-side encode failure of the trim record is
-  reported as `EngineError::Record(RecordError::Encode)`, whose sentence says "recorder"; and
-  `Rest.failure` is populated only by the transition that caused the stop, with `run.failure` as
-  the durable record (documented rather than parsed back, so D12's one-way grammar keeps one home).
-  Plan: `.claude/plans/mod-4-orch-engine.plan.md`; blueprint:
-  `.claude/plans/mod-4-orch-engine.blueprint.md`.
-  **Milestone 3 landed (`6307a3d`..`1b78753`, 2026-09-22): work happens in a real tree.** 22
-  implementation commits plus a seven-commit review round, 39 files; workspace green at
-  `--test-threads=1` (1445 passed), `sqlx prepare --check` clean. `htui-orch` gains
-  `isolate/git.rs`, `isolate/real.rs` (`GixIsolator`, all four `R-ORCH-8` modes), `isolate/copy.rs`
-  and `verify.rs` (`verify_command` through the platform shell, three outcomes, deadline, tail cap,
-  scrubbed output); the engine calls the verify hook between stages 4 and 5, reconciles the winner
-  into the primary tree and cleans up, and `Command` gains `CancelRun`. The seam gains
-  `record_command_run`/`command_runs` and `upsert_step_tree` now also writes
-  `run_step.isolation_path`; `CASES` 48 -> 49. ANA-2 criteria 11, 12 and 13 are proved over a real
-  repository (`tests/gix_isolator.rs`, `pg_criteria.rs`).
-  **OQ-1 was resolved to the `git` CLI, and that has a cost.** `gix` 0.87.1 ships no worktree
-  mutation, so `isolate/git.rs` shells out for exactly five verbs — `worktree add --lock`,
-  `worktree remove`, `merge --no-ff`, `merge --abort` and `reset --hard` (D47) — with a floor of
-  git 2.33.0, checked once when the isolator is built; `gix` keeps every read and every ref write,
-  and its sync calls run on the blocking pool. `docs/ANA-2.md:1777` and `:2055` are amended. **`git`
-  is therefore a runtime dependency of the `worktree` mode and of reconciliation**, and one more
-  fact for MOD-16's Windows verification. **`git worktree prune` is never run** (D46): a pruned
-  admin entry is instead detected when a tree's HEAD cannot be read, and the tree is re-made onto
-  its existing branch.
-  **The review gate found three HIGH, four MEDIUM and five LOW; every finding was verified against
-  the tree and every one was applied** (`892fcf3`, `ff47431`, `085fb79`, `2392031`, `a7e929f`,
-  `70bc276`, `1b78753`). The behaviours a later milestone must know: (1) **a no-commit `worktree`
-  tree is kept, not removed, when it holds untracked work** — `is_dirty` deliberately ignores
-  untracked files (D24, which the dirty-tree refusals rely on), so the step-end removal also asks
-  `has_untracked_files`; (2) **the `shared_serialized` guard lives from `prepare` to that step's
-  capture, and `cleanup(run, _)` drops every guard of the run whether or not it has `step_trees`
-  rows** — a failure between `prepare` and `upsert_step_tree` used to leak the guard until restart;
-  guards are taken in `RepoId` order so milestone 4's siblings cannot deadlock; (3) a failed merge
-  always runs `merge --abort`, even when its conflicted paths cannot be read; (4) a copy never
-  carries a `*.lock` out of the source's `.git`; (5) lock retries fire only on the exact lock
-  wordings, never on a message that merely names `Cargo.lock` or a ref-name conflict.
-  **Still carried**: R-3..R-6 from milestone 2; **R-7** — a run parked by a reconcile refusal
-  (`park_run`) has no resume verb, so milestone 5's sweep or milestone 6's `Unblock`-shaped verb
-  must provide one; **R-8** — `after_hash` becomes the merge commit after reconcile (H-19), so
-  milestone 4's no-progress predicate may need the pre-merge hash. Plan:
-  `.claude/plans/mod-4-orch-tree.plan.md`; blueprint: `.claude/plans/mod-4-orch-tree.blueprint.md`.
-  **Milestone 4 landed (`fa03782`..`7ee0ac6`, 2026-09-23): three candidates, one winner.** 36
-  implementation commits plus a thirteen-commit review round, 29 files; workspace green at
-  `--test-threads=1` (1554 passed, 0 failed, 26 ignored), `sqlx prepare --check` clean. `htui-orch` gains `select.rs`
-  (`R-AGT-8`'s candidate walk, D60) and `fanout.rs` (the pure half of selection); the engine drives a
-  fan-out group concurrently, prefilters on `verify_command`, runs the two-order judge as one step
-  with two sessions, and selects one winner in one transaction, with `Command::SelectFanout` for the
-  human path and `RetryStep` retrying a parked group as a whole. The `Isolator` seam widens for
-  fan-out (a slot on `prepare`, `base`, `diff`, a sibling list on `reconcile`); `git diff` is the
-  sixth CLI verb, and `worktree add`/`remove` are serialised per repository (D70) because concurrent
-  adds race on `.git/worktrees/<id>/commondir`. `htui-core`'s quota predicate treats
-  `allowed_warning` as selectable (D61). ANA-2 criteria 7 (real-tree half, via R-8), 8, 9 and 10
-  are proved; `htui-orch`'s case list is 36. **R-8 is closed with no predicate change** (D66).
-  **The review gate found one HIGH, three MEDIUM and six LOW; every finding was verified against the
-  tree and every one was applied** (`20cb2fa`, `8438406`, `86058a9`, `a40b831`, `ad60554`,
-  `375123b`, `87ec1d4`, plus doc repairs `a19e633`, `ffe86c0`, `1fa37e2`, `7ee0ac6`). The
-  behaviours a later milestone must know: (1) **a candidate's deadline and verify budget start when
-  its `prepare` answers**, not at `run_step.started_at` — in a `shared_serialized` group the later
-  siblings were being charged for the earlier ones' whole sessions; (2) **a retried group starts
-  from the base its retired attempt recorded** (`before_hash`), not from HEAD, which in
-  `shared_serialized` is the last loser's commit — a retired slot that names two bases, or none for
-  a repo in scope, is refused with `EngineError::GroupBase`; an attempt with no rows at all is
-  skipped, and a slot with a selected winner (the review loop) still starts from `Isolator::base`;
-  (3) a store error after the judge went `running` now fails the judge and parks the run instead of
-  leaving both `running`; (4) **`resume` keeps walking the snapshot when the live graph no longer
-  resolves** under lowered caps (`FanOutCap`, `AgentCap`, `ReviewFanOut`, `NoCandidate`) and writes a
-  note — invariant 2; (5) **`drive_group` is not cancel-safe**: dropping it leaves candidates
-  `running` and shared locks held until `cleanup_run`/`cancel_run` or milestone 5's sweep; (6) a
-  stale-member `RetryStep` is `EngineError::StaleSlot`.
-  **The plan's "no migration" held until the review gate, then deliberately did not**: the
-  maintainer raised `max_agents_per_run`'s default from 6 to 8 (OQ-1 revisited), because the literal
-  reading refused the seeded `feature` graph with a judged 3-way `implement` (7 agents).
-  `0004_max_agents_per_run_default.sql` moves an untouched seeded `6` to `8` and leaves any other
-  value alone (`0003` is on `main` and cannot be edited); `graph.rs`'s fallback follows (`b86b62c`,
-  `bcce4b9`). A judged
-  4-way `implement` (8) sits exactly at the cap. **`docs/ANA-2.md:871`, `:1472`, `:1516` and
-  `:1992` and `docs/decisions/ana/ana-2.md:60`, `:107` still say 6** and are not amended.
-  **Still carried**: R-3..R-7 from milestones 2 and 3; **R-9** — `LoopStop::NoProgressReview` has
-  been unreachable since milestone 2, because `reviews_are_identical` reads the latest-only
-  `documents_of_kinds` (blueprint F-B; the plan's risk row was corrected in `e2986f2`), so only the
-  `after_hash` half of the no-progress predicate can fire. Every production judge still fails until
-  MOD-11 gives an agent a way to write the `judge` document (OQ-4), so production fan-outs go to the
-  human. Plan: `.claude/plans/mod-4-orch-fanout.plan.md`; blueprint:
-  `.claude/plans/mod-4-orch-fanout.blueprint.md`.
-  **Milestone 4 OQ-7 follow-up: MOD-36** — milestone 4 runs every fan-out candidate on one agent;
-  spreading candidates across agents by weight is MOD-36's (weights from ANA-21). Milestone 4 leaves
-  `AgentSelector::select` called once per candidate with its `fanout_index` so MOD-36 plugs in there.
-  **Milestone 5 landed (`a1fb291`..`8dc4755`, 2026-09-23): two runs do not collide, and a crash is
-  survivable.** Eight tasks (T1–T8), then two review rounds. Workspace green at
-  `--test-threads=1` (1700 passed, 0 failed, 26 ignored), `sqlx prepare --check` clean (227 files),
-  store conformance 53 cases, `htui-orch` case list 52. `htui-core` gains `model/overlap.rs` (the
-  scope predicate, D80); `htui-orch` gains `overlap.rs` (scope resolution at `StartRun`) and
-  `recover.rs` (the heartbeat and the sweep's adjudication). `claim_run` answers a `Claim`, and new
-  store verbs are `take_lease`, `interrupt_step` and `release_lease`. Every walk runs under a
-  leased heartbeat that fences itself before the lease lapses (D122, D143); every compare-and-set on
-  a walk path honours `Ok(false)` as `EngineError::StaleWrite` (D125, D144, exemptions named on
-  `Engine::move_step`); the sweep adopts expired runs one at a time, and a process takes back its
-  own dead walks through an in-process `DeadWalks` set (D139, D140). `reconcile_isolated` merges
-  onto a primary another run moved, under the repo's admin lock (D136). No migration.
-  **Round 1 (D122–D138) fixed four HIGH, four MEDIUM and several LOW; round 2 (D139–D145) fixed one
-  HIGH, two MEDIUM and three LOW** — blueprint §21–§22. The final reviewer approved with fixes; two
-  LOWs were applied (`ced0808`, `8dc4755`) and three MEDIUMs are carried. **Carried to milestone 6**:
-  R-26..R-35 (blueprint §21.2, §22.3), chiefly R-27 (no per-run mutex between commands in one
-  process), R-33 (D141 recognises htui's reconcile merge by its message only, spoofable by an agent
-  and missed under `merge.log=true`), R-34 (a command failing between `take_lease` and
-  `walk_leased` keeps its live lease, so its own sweep skips the run until restart) and R-25 (a
-  failed terminal cleanup is never retried). About six intermediate commits fail `clippy -D
-  warnings` on their own; HEAD is clean. Plan: `.claude/plans/mod-4-orch-lease.plan.md`;
-  blueprint: `.claude/plans/mod-4-orch-lease.blueprint.md`.
-  **Milestone 5 follow-up landed (`0ea3744`..`1d598f1`, branch `mod-4-m5-fixups`, 2026-09-24): R-33,
-  R-34 and R-35 closed** (blueprint §23, D146–D152). `git::reconcile_parent` accepts a reconcile
-  merge only on the primary's first-parent line, for `worktree`/`copy` rows, by subject, and
-  `merge_no_ff` runs with `merge.log=false`; every command's window between its lease take and its
-  walk gives the lease back on error (`Engine::leased_window`), as does a topology-mismatch resume;
-  a dead walk whose run is gone leaves `DeadWalks`, told apart from an outage by a `test-support`
-  `MemFault` hook on `MemStore`. Workspace green at `--test-threads=1`, pins unchanged (store 53,
-  orch 52, `.sqlx` 227). Final review approve-with-fixes, all applied but L7, carried as R-37 with
-  R-36 (a mismatched `running` run is re-adopted each sweep). `0e61f08` alone fails clippy.
+- [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
   per-box paths, agent autodiscovery hook. Not blocked (MOD-6 landed,
   `docs/decisions/mod/mod-6.md`: `register_box` writes the minimal row, the probe fills the rest).
-  MOD-4 and MOD-12 need `probed_tags`/`declared_tags` from a real probe, `repo_box_path` rows for
-  every isolation mode, and `agent_box.probe.status` (`docs/ANA-2.md` §4.10, §7). `repo_box_path`
+  MOD-12 needs `probed_tags`/`declared_tags` from a real probe, `repo_box_path` rows for every
+  isolation mode, and `agent_box.probe.status` (`docs/ANA-2.md` §4.10, §7). MOD-4 is done
+  (`docs/decisions/mod/mod-4.md`) and shipped without them: `R-ORCH-10`'s capability refusal, and
+  therefore ANA-2 criterion 14's capability half, are this item's (MOD-4 proved criterion 14's
+  `Unblock` half over a no-candidate refusal instead), and the production isolator reads
+  `repo_box_path` through `Backend::repo_paths(box)`. `repo_box_path`
   rows and a real probe turn ANA-5's excerpt fallback root and box profile projection
   (`docs/ANA-5.md` §4.2, §4.5) from degraded into complete. **MOD-20 landed**
   (`docs/decisions/mod/mod-20.md`): `docs/ANA-4.md` §4.6 named this item as the possible owner of
@@ -418,7 +282,9 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   blocked** — MOD-2 is done (`docs/decisions/mod/mod-2.md`) and shipped the `Scrubber` seam with the
   fail-closed `MinimalScrubber` this item replaces *behind an unchanged trait*. Its call sites are
   already fail-closed on every digested byte (MOD-2 D100 as corrected by that milestone's CRITICAL);
-  the one **missing** call site is **MOD-32**, not this item.
+  the one **missing** call site is **MOD-32**, not this item. **MOD-4 wired no secrets** (done,
+  `docs/decisions/mod/mod-4.md`, plan D176): `htui-orch`'s `drive_once` builds every graph
+  `SessionSpec` with an empty `env`, and its comment names this item as the one that fills it.
 - [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
   `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
   per-box class limits; per-phase exposure. Per ANA-2 (`docs/ANA-2.md` §4.2, §8, risk 11):
@@ -427,9 +293,14 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `item_note` with `via_step_id`, never a transition. The `box_profile` read tool returns ANA-5's
   box profile projection (`docs/ANA-5.md` §4.2) so the tool and the prompt section agree — MOD-2
   shipped that projection as `htui_core::prompt::BoxProfile::project`, which drops `box_tool.path`
-  (ANA-5 §4.2 rule 5), so the tool must not re-add it. **Blocked on MOD-4 only** now that MOD-2 is
-  done (`docs/decisions/mod/mod-2.md`); MOD-2's own `permission_request` gap over the CLI transport
-  stays declared until this item lands, since the `--permission-prompt-tool` contract is its route.
+  (ANA-5 §4.2 rule 5), so the tool must not re-add it. **Not blocked**: MOD-2 and MOD-4 are done
+  (`docs/decisions/mod/mod-2.md`, `docs/decisions/mod/mod-4.md`). MOD-2's own `permission_request`
+  gap over the CLI transport stays declared until this item lands, since the
+  `--permission-prompt-tool` contract is its route. **MOD-4 left two things waiting here**: every
+  production judge fails until an agent can write the `judge` document (MOD-4 milestone 4, OQ-4),
+  and production `approve`/`accept` are greyed in the Runs pane because production's `SessionSink`
+  is `NoSink`, so no step writes its `output_kind` document outside a test (MOD-4 risk R-50). Both
+  clear once `document_write` exists.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
@@ -440,7 +311,8 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   unattended, so `FIX`/`CLEAN`/`TOOL` are the first targets. Per ANA-10 (`docs/ANA-10.md` §4.8):
   `ready_items` must be **rewritten** for SQLite as well as implemented for Postgres — `<@` and
   `= ANY($projects)` have no SQLite spelling — which is why auto mode is not part of MOD-4's M8.
-  Blocked on MOD-4.
+  **Not blocked**: MOD-4 is done (`docs/decisions/mod/mod-4.md`); `claim_run`'s admission, the
+  overlap predicate, the lease, the sweep and `run_worker.rs` are there to reuse.
 - [ ] **MOD-13 - Backlog filters and item editing** (from MOD-1). `R-TUI-2`, `R-ENT-5`,
   `R-ENT-10..12`. Filters by status, project, capability and readiness; `new` and `edit` actions
   with the compare-and-set on `version` and the three-way divergence view (`docs/ANA-9.md` §4.2,
@@ -455,7 +327,8 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   `Offline`, any local `mint_item` or `item_key_counter`, or a compare-and-set view backed by
   anything but `PgStore`/`MemStore`. An offline box browses read-only and says so.
   **The scope line "mint per §7.1" above means ANA-9 §7.1's Postgres statement**, which is now the
-  only mint.
+  only mint. MOD-4's close-out writes a generated `summary` document with no human prose (MOD-4 risk
+  R-43, `docs/decisions/mod/mod-4.md`); an editable summary is this item's editor's.
 - [ ] **MOD-14 - Graph tab** (from MOD-1). `R-TUI-5`, `R-ENT-9`. Item neighbourhood one to N hops
   across projects through `ReadStore::links` (`docs/ANA-9.md` §6.1), status and link kind per
   edge, keyboard navigation that re-roots the Backlog selection; the `open graph` action of
@@ -503,6 +376,13 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   (`ShellExecuteW` is unsafe FFI the workspace forbids, which is why the URL travels in the child's
   environment); and that the job object reaps the auth child **with its loopback listener** — MOD-2
   §11 criterion 11, now with a socket and a child that lives for minutes rather than seconds.
+  **MOD-4 handed over two more** (`docs/decisions/mod/mod-4.md`). **R-10**: a SIGKILLed orchestrator's
+  agent survives, because the child leads its own process group and `ChildGuard::drop` cannot run in
+  a killed process; signalling a stale pid needs `unsafe` or a dependency, so the design (a pid in
+  `session_started` plus a signal on adoption, or a death signal, with the reused-pid hazard stated)
+  is this item's. **R-45**: `htui` now links `gix`, `process-wrap` and `walkdir` through `htui-orch`.
+  MOD-4 also made the `git` CLI (≥ 2.33.0) a runtime dependency of the `worktree` mode and of
+  reconciliation, and none of those `git` calls has run on Windows.
 
 - [ ] **MOD-22 - Complete a loopback OAuth login from a box the browser cannot reach** (from MOD-21).
   `R-AGT-9`, `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent's own login flow redirects to a
@@ -569,6 +449,14 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 ### Deferred backlog
 
+- [ ] **CLEAN-4 - `LoopStop::NoProgressReview` is unreachable** (from MOD-4, risk R-9). `R-ORCH-3`.
+  The review loop's no-progress predicate has two halves, and only the `after_hash` half can fire.
+  `gate::reviews_are_identical` reads through the latest-only `documents_of_kinds`, so it can never
+  hold two review documents to compare, and `LoopStop::NoProgressReview` has been unreachable since
+  milestone 2. No test reaches it; only its `Display` is tested. Fix it through `documents()` heads,
+  in a change that first pins which stop reason each shipped loop case reaches, because the fix can
+  change that. Source: `.claude/plans/mod-4-orch-fanout.blueprint.md` F-B and §11, carried unchanged
+  through milestones 5 and 6 (`docs/decisions/mod/mod-4.md`, "Carried").
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -576,9 +464,9 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 - [ ] **MOD-8 - Legacy markdown import.** `R-LATER-3`. Map old prefixes to kinds per project,
   preserve keys, build links. Later tier; MOD-6 landed (`docs/decisions/mod/mod-6.md`, importer
   mint variant per ANA-9 §7.1 still to write). Widened by ANA-11 (`docs/ANA-11.md` §6 phase 3): also import
-  `docs/REQUIREMENTS.md` into the MOD-37 requirement tables, map each `DECISIONS.md` status to
-  `item.resolution` (`shipped` → `done`), write-ups to `summary` documents and each analysis doc to the
-  `verdict` document, and scan body `R-` IDs once into `addresses` citations. Blocked on MOD-37.
+  `docs/REQUIREMENTS.md` into the MOD-38 requirement tables, map each `DECISIONS.md` status to
+  `item.resolution` (`shipped` → `done`), write-ups to `summary` documents and each analysis doc to
+  the `verdict` document, and scan body `R-` IDs once into `addresses` citations. Blocked on MOD-38.
 
 ### Tooling findings
 
@@ -609,6 +497,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-16 execution environments, ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 25 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 requirements schema, MOD-38 requirements tab; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 0                                                                                        |
+| MOD-N   | 25 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

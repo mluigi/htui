@@ -1,4 +1,4 @@
-# ANA-11 - Models for requirements and decisions (concluded, 2026-09-24)
+# ANA-11 - Models for requirements and decisions (concluded, 2026-09-25)
 
 Evaluate database schema models to track product requirements (`R-<AREA>-<N>`) and architectural
 decisions (resolved MOD/ANA items) inside `htui`'s Postgres store instead of `docs/REQUIREMENTS.md`,
@@ -25,11 +25,11 @@ one missing field is added as `item.resolution` (`done`, `concluded`, `rejected`
 `close_out` gains a guarded `open` → `closed` path for non-success resolutions: today an item
 withdrawn before it ran cannot close at all. This amends ANA-2 §4.3.
 
-Spawned **MOD-37** (schema `0005_requirements.sql`, seam, cache, close-out resolution). It is gated
+Spawned **MOD-38** (schema `0005_requirements.sql`, seam, cache, close-out resolution). It is gated
 on the maintainer applying the requirement amendments proposed in §7 (`R-ENT-14`, `R-ENT-15`, and
-amendments to `R-ENT-8`, `R-NF-4`, `R-STO-3`, `R-TUI-1`, `R-MCP-2`). Also spawned **MOD-38**
+amendments to `R-ENT-8`, `R-NF-4`, `R-STO-3`, `R-TUI-1`, `R-MCP-2`). Also spawned **MOD-39**
 (Requirements tab, item traceability, resolution picker), and widened **MOD-8** to import the
-markdown corpus into the new tables. `htui`'s own repo stays on markdown until MOD-4, MOD-13 and
-MOD-38 let it run its own lifecycle.
+markdown corpus into the new tables. `htui`'s own repo stays on markdown until MOD-13 and MOD-39
+let it run its own lifecycle (MOD-4 is done).
 
 See `docs/ANA-11.md` for the full analysis.

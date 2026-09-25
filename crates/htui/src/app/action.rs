@@ -3,7 +3,7 @@
 //! A view never mutates the shell: it emits an [`Action`] through
 //! [`Ctx::emit`](crate::app::Ctx::emit) and `App::update` is the single place that applies it.
 
-use htui_core::model::{StepId, WorkspaceSummary};
+use htui_core::model::{RunId, StepId, WorkspaceSummary};
 
 use crate::store_worker::{ReplyEnvelope, StoreRequest};
 use crate::ui::overlay::OverlayId;
@@ -38,6 +38,15 @@ pub enum Action {
     Replay {
         /// The step whose persisted rows are to be replayed.
         step_id: StepId,
+    },
+    /// Promote a step to a chat (MOD-4 plan D165). Emitted by the Runs pane; the shell focuses the
+    /// tab that drives chats (`App::replay_tab`) and asks for the promotion on its behalf, so the
+    /// promotion's replies land in that tab.
+    Promote {
+        /// The step's run.
+        run: RunId,
+        /// The step to promote.
+        step: StepId,
     },
     /// Show or hide the key help.
     ToggleHelp,

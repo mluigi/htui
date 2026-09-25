@@ -10,24 +10,39 @@
 //! snapshot here depends on a process being installed.
 #![cfg(feature = "testkit")]
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use htui::agent_worker::AgentRuntime;
+use htui::app::{Action, TabAction};
+use htui::run_worker::{OrchReply, OrchRequest, RunRuntime, StepAuthor};
+use htui::store_worker::{Origin, RequestEnvelope, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::tabs::ChatTab;
+use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::conformance::{Script, ScriptEvent};
-use htui_agent::driver::{DriverCaps, PermissionRequestId};
-use htui_agent::event::{
-    DoneEvent, DriverEvent, EditProposalEvent, PermissionOption, PermissionOptionKind,
-    PermissionRequestEvent, StopReason, TextChunk, ToolCallEvent, ToolKind, ToolResultEvent,
-    ToolResultStatus,
+use htui_agent::driver::{
+    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, PermissionAnswer,
+    PermissionRequestId, SessionSpec,
 };
-use htui_agent::fake::FakeAdapter;
+use htui_agent::event::{
+    DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, PermissionOption,
+    PermissionOptionKind, PermissionRequestEvent, StopReason, TextChunk, ToolCallEvent, ToolKind,
+    ToolResultEvent, ToolResultStatus,
+};
+use htui_agent::fake::{FakeAdapter, FakeDriver};
 use htui_agent::registry::DriverFactory;
-use htui_core::model::{Agent, AgentBox, AgentId, Billing, EventKind, Transport};
+use htui_core::fixtures::ids;
+use htui_core::model::{
+    Agent, AgentBox, AgentId, Billing, DocumentId, EventKind, ItemId, NewDocument, NewRepo, RepoId,
+    RunId, RunMode, RunStatus, RunStep, SessionEvent, SnapshotPhase, StepId, StepStatus, Transport,
+};
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use htui_orch::fake::{FakeIsolator, FakeVerifier};
+use htui_orch::{Command, GateAnswer};
 use serde_json::json;
+use tokio::sync::{Notify, mpsc};
 
 /// The fake mints a fresh session id per session, so a snapshot that showed it would differ on
 /// every run. The id itself is asserted where it matters (the store's `session_started` row);
@@ -66,7 +81,7 @@ impl htui_agent::registry::TransportBuilder for SharedAdapter {
         agent: &Agent,
         on_box: Option<&AgentBox>,
         caps: DriverCaps,
-    ) -> Result<Box<dyn htui_agent::driver::AgentDriver>, htui_agent::error::DriverError> {
+    ) -> Result<Box<dyn AgentDriver>, htui_agent::error::DriverError> {
         self.0.build(agent, on_box, caps)
     }
 }
@@ -350,8 +365,8 @@ async fn esc_esc_ends_the_chat_and_closes_its_run() {
     stable().bind(|| insta::assert_snapshot!("chat_ended", harness.render()));
 
     let scope = htui_core::model::Scope {
-        workspace_id: htui_core::fixtures::ids::WORKSPACE_PLATFORM,
-        project_ids: vec![htui_core::fixtures::ids::PROJECT_HTUI],
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI],
     };
     assert_eq!(
         store.active_runs(&scope).await.expect("count"),
@@ -408,7 +423,7 @@ async fn scripted_id(store: &MemStore) -> AgentId {
 fn probed(agent_id: AgentId, probed_at: chrono::DateTime<chrono::Utc>) -> AgentBox {
     AgentBox {
         agent_id,
-        box_id: htui_core::fixtures::ids::BOX,
+        box_id: ids::BOX,
         enabled: true,
         version: Some("0.48.0".to_owned()),
         path: None,
@@ -557,8 +572,8 @@ async fn replay_only() -> Harness {
 }
 
 /// Opens a step's log in the Chat tab through the action the Runs pane emits (D39).
-async fn replay(harness: &mut Harness, step_id: htui_core::model::StepId) {
-    harness.app().update(htui::app::Action::Replay { step_id });
+async fn replay(harness: &mut Harness, step_id: StepId) {
+    harness.app().update(Action::Replay { step_id });
     harness.drive().await;
 }
 
@@ -568,10 +583,10 @@ async fn replay(harness: &mut Harness, step_id: htui_core::model::StepId) {
 #[tokio::test]
 async fn a_recorded_step_replays_through_the_live_transcript() {
     let mut harness = replay_only().await;
-    replay(&mut harness, htui_core::fixtures::ids::STEP_PLAN).await;
+    replay(&mut harness, ids::STEP_PLAN).await;
 
     let rendered = harness.render();
-    let id = htui_core::fixtures::ids::STEP_PLAN.to_string();
+    let id = ids::STEP_PLAN.to_string();
     let tail = &id[id.len() - 8..];
     assert!(
         rendered.contains(&format!("replay · step …{tail} · 7 rows · read-only")),
@@ -585,7 +600,7 @@ async fn a_recorded_step_replays_through_the_live_transcript() {
 #[tokio::test]
 async fn a_step_that_is_not_on_this_box_says_so() {
     let mut harness = replay_only().await;
-    replay(&mut harness, htui_core::fixtures::ids::STEP_PRD).await;
+    replay(&mut harness, ids::STEP_PRD).await;
     insta::assert_snapshot!("replay_missing", harness.render());
 }
 
@@ -770,6 +785,903 @@ async fn an_unanswered_permission_replays_parked_but_answers_nothing() {
         opened,
         "a finished step answers nothing, however parked its last row looks"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// A promoted graph step (MOD-4 plan D164, D165, blueprint §10): the Chat tab drives the step the
+// walk parked, on that step's own log.
+// -------------------------------------------------------------------------------------------
+
+/// The graph walk's transport: every session plays one turn and ends it, unless a stall is armed
+/// for the next one.
+#[derive(Debug, Default)]
+struct Walks {
+    stall: Mutex<Option<Stall>>,
+}
+
+impl Walks {
+    /// The next walk session waits on `stall` before its first event.
+    fn stall_next(&self, stall: Stall) {
+        *self.stall.lock().expect("the slot") = Some(stall);
+    }
+}
+
+/// A stalled session's three signals.
+#[derive(Debug, Clone, Default)]
+struct Stall {
+    reached: Arc<Notify>,
+    release: Arc<Notify>,
+    dropped: Arc<AtomicBool>,
+}
+
+/// Lets the test keep the walk transport it arms stalls on.
+#[derive(Debug)]
+struct SharedWalks(Arc<Walks>);
+
+impl htui_agent::registry::TransportBuilder for SharedWalks {
+    fn build(
+        &self,
+        agent: &Agent,
+        _on_box: Option<&AgentBox>,
+        caps: DriverCaps,
+    ) -> Result<Box<dyn AgentDriver>, htui_agent::error::DriverError> {
+        Ok(Box::new(WalkDriver {
+            inner: FakeDriver::new(agent.name.clone(), caps, Script::one_turn(vec![done()])),
+            stall: self.0.stall.lock().expect("the slot").take(),
+        }))
+    }
+}
+
+/// One walk session's driver.
+#[derive(Debug)]
+struct WalkDriver {
+    inner: FakeDriver,
+    stall: Option<Stall>,
+}
+
+impl AgentDriver for WalkDriver {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn caps(&self) -> DriverCaps {
+        self.inner.caps()
+    }
+
+    fn start<'a>(
+        &'a self,
+        spec: SessionSpec,
+        prompt: String,
+    ) -> DriverFuture<'a, Box<dyn AgentSession>> {
+        let inner = self.inner.start(spec, prompt);
+        let stall = self.stall.clone();
+        Box::pin(async move {
+            let session = inner.await?;
+            Ok(match stall {
+                None => session,
+                Some(stall) => Box::new(Stalled {
+                    inner: session,
+                    stall,
+                    released: false,
+                }) as Box<dyn AgentSession>,
+            })
+        })
+    }
+}
+
+/// A session that waits on its [`Stall`] before its first event, and says when it is dropped.
+#[derive(Debug)]
+struct Stalled {
+    inner: Box<dyn AgentSession>,
+    stall: Stall,
+    released: bool,
+}
+
+impl Drop for Stalled {
+    fn drop(&mut self) {
+        self.stall.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl AgentSession for Stalled {
+    fn session_ref(&self) -> Option<&AgentSessionRef> {
+        self.inner.session_ref()
+    }
+
+    fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<DriverEnvelope>> {
+        Box::pin(async move {
+            if !self.released {
+                self.stall.reached.notify_one();
+                self.stall.release.notified().await;
+                self.released = true;
+            }
+            self.inner.next_event().await
+        })
+    }
+
+    fn send_follow_up<'a>(&'a mut self, text: String) -> DriverFuture<'a, ()> {
+        self.inner.send_follow_up(text)
+    }
+
+    fn answer_permission<'a>(
+        &'a mut self,
+        request_id: PermissionRequestId,
+        answer: PermissionAnswer,
+    ) -> DriverFuture<'a, ()> {
+        self.inner.answer_permission(request_id, answer)
+    }
+
+    fn cancel<'a>(&'a mut self, grace: Duration) -> DriverFuture<'a, ()> {
+        self.inner.cancel(grace)
+    }
+}
+
+/// Blueprint D203's author: one document of the phase's `output_kind` per step, so a parked gate
+/// has the output an accept needs.
+#[derive(Debug)]
+struct OutputAuthor;
+
+impl StepAuthor for OutputAuthor {
+    fn document(&self, item: ItemId, step: &RunStep, phase: &SnapshotPhase) -> Option<NewDocument> {
+        Some(NewDocument {
+            id: DocumentId::new(),
+            item_id: item,
+            kind: phase.output_kind.clone(),
+            title: format!("{} (attempt {})", phase.output_kind, step.attempt),
+            body: "authored".to_owned(),
+            produced_by_step_id: Some(step.id),
+            created_by: ids::USER,
+            created_at: chrono::Utc::now(),
+        })
+    }
+}
+
+/// Blueprint F-O: the demo with its own agents disabled, the scripted `acp` row probed ready on
+/// the demo box (the candidate chain's rung 3), and a primary repo for the demo project, whose
+/// tree the promoted step chats in.
+async fn graph_store() -> MemStore {
+    let store = MemStore::demo();
+    for summary in store.agents().await.expect("the fixture's agents") {
+        let mut row = summary.agent;
+        row.enabled = false;
+        store.upsert_agent(&row).await.expect("the row is disabled");
+    }
+    let agent_id = AgentId::new();
+    store
+        .upsert_agent(&scripted_row(agent_id, Transport::Acp))
+        .await
+        .expect("the scripted row lands");
+    store
+        .upsert_agent_box(&probed(agent_id, chrono::Utc::now()))
+        .await
+        .expect("the agent_box row lands");
+    store
+        .create_repo(NewRepo {
+            id: RepoId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: "htui".to_owned(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            is_primary: true,
+        })
+        .await
+        .expect("the demo project has no repo yet");
+    store
+}
+
+/// The run runtime over the fakes, walking with `walks`.
+fn run_runtime(walks: &Arc<Walks>) -> RunRuntime {
+    let mut factory = DriverFactory::new();
+    factory.register("acp", Box::new(SharedWalks(Arc::clone(walks))));
+    RunRuntime::with_parts(
+        Arc::new(FakeIsolator::new()),
+        Arc::new(FakeVerifier::new()),
+        factory,
+    )
+    .with_author(Arc::new(OutputAuthor))
+}
+
+/// The chat runtime, whose sessions play `chat`.
+fn chat_runtime(chat: Script) -> AgentRuntime {
+    let adapter = Arc::new(FakeAdapter::new());
+    adapter.load(chat);
+    let mut factory = DriverFactory::new();
+    factory.register("acp", Box::new(SharedAdapter(adapter)));
+    AgentRuntime::new(factory).with_grace(Duration::ZERO)
+}
+
+/// A shell with a Chat tab, both runtimes, and the graph fixture behind them.
+async fn promotion_harness(chat: Script) -> (Harness, MemStore) {
+    let store = graph_store().await;
+    let mut harness = Harness::over(store.clone())
+        .with_tab(Box::new(ChatTab::new()))
+        .with_replay_tab(ChatTab::ID)
+        .with_agent_runtime(chat_runtime(chat))
+        .with_run_runtime(run_runtime(&Arc::new(Walks::default())));
+    harness.drive().await;
+    (harness, store)
+}
+
+/// `R` for the demo's open `ANA-2`: manual, default scope.
+fn start_run() -> StoreRequest {
+    StoreRequest::Orch(OrchRequest::Command(Command::StartRun {
+        item: ids::HTUI_ANA_2,
+        mode: RunMode::Manual,
+        repo_scope: None,
+    }))
+}
+
+/// The latest step at `position` of `run`.
+async fn step_at(store: &MemStore, run: RunId, position: i32) -> RunStep {
+    store
+        .run_steps(run)
+        .await
+        .expect("the read answers")
+        .into_iter()
+        .filter(|step| step.position == position)
+        .max_by_key(|step| step.attempt)
+        .expect("a step at the position")
+}
+
+/// Starts `ANA-2` through the shell and returns its run and the step the walk parked at.
+async fn parked(harness: &mut Harness, store: &MemStore) -> (RunId, RunStep) {
+    harness.app().update(Action::Store(start_run()));
+    harness.drive().await;
+    let runs = store.runs(ids::HTUI_ANA_2).await.expect("the read answers");
+    assert_eq!(runs.len(), 1, "one run of the item: {runs:?}");
+    let step = step_at(store, runs[0].id, 0).await;
+    assert_eq!(
+        step.status,
+        StepStatus::AwaitingApproval,
+        "the first phase gates"
+    );
+    (runs[0].id, step)
+}
+
+/// The Runs pane's `p`, as the shell receives it (D165).
+async fn promote(harness: &mut Harness, run: RunId, step: StepId) {
+    harness.app().update(Action::Promote { run, step });
+    harness.drive().await;
+}
+
+/// The step's persisted log.
+async fn log_of(store: &MemStore, step: StepId) -> Vec<SessionEvent> {
+    store
+        .step_events(step)
+        .await
+        .expect("the log reads")
+        .expect("the step has a log")
+}
+
+/// Plan D165: promoting a parked step opens the Chat tab on **that** step — the session the
+/// runtime starts records against the step's own id — and the header says it is a promotion,
+/// which phase, and how it opened (an `acp` row always opens with the handoff prompt, R-48).
+#[tokio::test]
+async fn promotion_opens_the_chat_on_the_same_step() {
+    let (mut harness, store) = promotion_harness(Script::one_turn(vec![
+        chunk("Picking the step back up."),
+        done(),
+    ]))
+    .await;
+    let (run, step) = parked(&mut harness, &store).await;
+
+    promote(&mut harness, run, step.id).await;
+
+    assert_eq!(harness.app().status, None, "nothing was refused");
+    assert_eq!(
+        harness.app().tabs.active_id(),
+        Some(ChatTab::ID),
+        "the shell focused the tab that drives chats"
+    );
+    assert_eq!(
+        harness.chat_steps(),
+        vec![step.id],
+        "the chat's session is the promoted step's"
+    );
+    let rendered = harness.render();
+    assert!(
+        rendered.contains(&format!(
+            "promoted · {} · handoff · scripted · sonnet",
+            step.phase_name
+        )),
+        "the header names the promotion: {rendered}"
+    );
+    // The session ref is the one field of the header that exists to be read back (a later
+    // `session/load`), so it is never the one the border cuts: all 36 characters of the fake's id
+    // are on screen, and the snapshot's filter matches the whole of it.
+    let shown = rendered.split_once("fake-").map(|(_, tail)| {
+        tail.chars()
+            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+            .count()
+    });
+    assert_eq!(
+        shown,
+        Some(36),
+        "the header shows the whole session ref: {rendered}"
+    );
+    stable().bind(|| insta::assert_snapshot!("chat_promoted", rendered));
+}
+
+/// ANA-5 criterion 17: a message composed in the promoted chat is a `follow_up` on the step's own
+/// log, and every turn the chat opens comes after the ones the walk wrote.
+#[tokio::test]
+async fn a_follow_up_lands_at_the_next_turn_of_the_step() {
+    let (mut harness, store) = promotion_harness(Script::turns(vec![
+        vec![chunk("Picking the step back up."), done()],
+        vec![chunk("Done as asked."), done()],
+    ]))
+    .await;
+    let (run, step) = parked(&mut harness, &store).await;
+    let walked = log_of(&store, step.id).await;
+    let last_turn = walked
+        .iter()
+        .map(|row| row.turn)
+        .max()
+        .expect("the walk wrote rows");
+
+    promote(&mut harness, run, step.id).await;
+    compose(&mut harness, "tighten the summary");
+    harness.drive().await;
+
+    let log = log_of(&store, step.id).await;
+    assert!(
+        log.iter().all(|row| row.run_step_id == step.id),
+        "one log, one step"
+    );
+    let follow_ups: Vec<i32> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::FollowUp)
+        .map(|row| row.turn)
+        .collect();
+    assert_eq!(
+        follow_ups,
+        vec![last_turn + 1, last_turn + 2],
+        "the opening, then the composed message, each opening the step's next turn"
+    );
+    let seqs: Vec<i32> = log.iter().map(|row| row.seq).collect();
+    assert_eq!(
+        seqs,
+        (0..i32::try_from(log.len()).expect("a short log")).collect::<Vec<_>>(),
+        "the log stays gapless across the promotion"
+    );
+    assert!(
+        log.iter()
+            .any(|row| row.kind == EventKind::AssistantText && row.turn == last_turn + 2),
+        "the agent's answer is on the composed message's turn"
+    );
+}
+
+/// Blueprint D205: a promotion mints no `run(kind='chat')`. The run count is the same with the
+/// promoted chat live as before it — a fresh chat would have added a running one.
+#[tokio::test]
+async fn promotion_writes_no_chat_run() {
+    let (mut harness, store) =
+        promotion_harness(Script::one_turn(vec![chunk("Here."), done()])).await;
+    let (run, step) = parked(&mut harness, &store).await;
+    let scope = htui_core::model::Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI],
+    };
+    let before = store.active_runs(&scope).await.expect("count");
+
+    promote(&mut harness, run, step.id).await;
+
+    assert_eq!(harness.chat_steps(), vec![step.id], "a chat is live");
+    assert_eq!(
+        store.active_runs(&scope).await.expect("count"),
+        before,
+        "and no run was minted for it"
+    );
+    assert_eq!(
+        store
+            .runs(ids::HTUI_ANA_2)
+            .await
+            .expect("the read answers")
+            .len(),
+        1,
+        "the item still has its one graph run"
+    );
+}
+
+/// Plan D165: ending the promoted chat (`Esc Esc`) ends the session only. The step stays parked
+/// and promoted, and the run stays `awaiting_approval`, for the Runs pane's `A`.
+#[tokio::test]
+async fn a_promoted_session_end_leaves_the_step_awaiting() {
+    let (mut harness, store) =
+        promotion_harness(Script::one_turn(vec![chunk("Here."), done()])).await;
+    let (run, step) = parked(&mut harness, &store).await;
+    promote(&mut harness, run, step.id).await;
+
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+
+    let after = step_at(&store, run, 0).await;
+    assert_eq!(after.id, step.id);
+    assert_eq!(after.status, StepStatus::AwaitingApproval);
+    assert!(after.promoted_at.is_some(), "the step is still promoted");
+    assert_eq!(
+        store
+            .run(run)
+            .await
+            .expect("the read answers")
+            .expect("the run")
+            .status,
+        RunStatus::AwaitingApproval
+    );
+    assert!(
+        harness.render().contains("this chat has ended"),
+        "the tab shows the session over"
+    );
+}
+
+/// ANA-5 criterion 18: the handoff opening is **one** `follow_up` row at the step's next turn —
+/// not a second `prompt` — and the step's `prompt_digest` stays the original prompt's.
+#[tokio::test]
+async fn the_handoff_opening_is_one_follow_up_row() {
+    let (mut harness, store) =
+        promotion_harness(Script::one_turn(vec![chunk("Here."), done()])).await;
+    let (run, step) = parked(&mut harness, &store).await;
+    let walked = log_of(&store, step.id).await;
+    let last_seq = walked
+        .iter()
+        .map(|row| row.seq)
+        .max()
+        .expect("the walk wrote rows");
+    let last_turn = walked
+        .iter()
+        .map(|row| row.turn)
+        .max()
+        .expect("the walk wrote rows");
+
+    promote(&mut harness, run, step.id).await;
+
+    let log = log_of(&store, step.id).await;
+    let prompts: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::Prompt)
+        .collect();
+    assert_eq!(prompts.len(), 1, "one prompt row: the walk's");
+    assert_eq!(prompts[0].seq, 0);
+    let follow_ups: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::FollowUp)
+        .collect();
+    assert_eq!(follow_ups.len(), 1, "one follow_up row: the opening");
+    assert_eq!(
+        follow_ups[0].seq,
+        last_seq + 1,
+        "right after the walk's last row"
+    );
+    assert_eq!(follow_ups[0].turn, last_turn + 1);
+    let text = follow_ups[0]
+        .payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .expect("the opening carries its text");
+    assert!(
+        !text.is_empty() && text != htui_orch::promote::RESUME_OPENING,
+        "the handoff prompt, not the resume sentence: {text}"
+    );
+    assert_eq!(
+        step_at(&store, run, 0).await.prompt_digest,
+        step.prompt_digest,
+        "the step's digest is the walk's prompt's"
+    );
+}
+
+/// Blueprint D185: the runtime overwrites `chat_live` with what the process knows, so accepting
+/// the artefact while its chat is live is refused with `ChatLive(Some)`'s sentence; once the chat
+/// has ended the same command accepts, and the walk goes on to the next phase.
+#[tokio::test]
+async fn accept_is_refused_while_the_promoted_chat_is_live() {
+    let (mut harness, store) =
+        promotion_harness(Script::one_turn(vec![chunk("Here."), done()])).await;
+    let (run, step) = parked(&mut harness, &store).await;
+    promote(&mut harness, run, step.id).await;
+    let accept = || {
+        Action::Store(StoreRequest::Orch(OrchRequest::Command(
+            Command::AcceptArtifact {
+                run,
+                step: step.id,
+                chat_live: false,
+            },
+        )))
+    };
+
+    harness.app().update(accept());
+    harness.drive().await;
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some(
+            format!(
+                "accept_artifact: step {} is being chatted with; end that chat first (Chat tab, \
+                 Esc Esc)",
+                step.id
+            )
+            .as_str()
+        )
+    );
+
+    // The Chat tab kept the focus the promotion gave it: `Esc Esc` ends its session.
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+    harness.app().status = None;
+    harness.app().update(accept());
+    harness.drive().await;
+
+    assert_eq!(harness.app().status, None, "the accept went through");
+    assert_eq!(
+        step_at(&store, run, 0).await.status,
+        StepStatus::Done,
+        "the promoted step is accepted"
+    );
+    let next = step_at(&store, run, 1).await;
+    assert_ne!(
+        next.phase_name, step.phase_name,
+        "and the walk moved on: {next:?}"
+    );
+}
+
+/// Blueprint D212 (review H3): while a step of the run is chatted with, every verb that would move
+/// the run under the chat — approve, reject, retry, select and cancel — is refused with
+/// `ChatLive(Some)`'s sentence and nothing moves; the chat stays live, because cancel does not end
+/// it. Once the chat has ended (`Esc Esc`) the same approve goes through.
+#[tokio::test]
+async fn the_run_s_verbs_are_refused_while_the_promoted_chat_is_live() {
+    let (mut harness, store) =
+        promotion_harness(Script::one_turn(vec![chunk("Here."), done()])).await;
+    let (run, step) = parked(&mut harness, &store).await;
+    promote(&mut harness, run, step.id).await;
+    let approve = || {
+        Action::Store(StoreRequest::Orch(OrchRequest::Command(
+            Command::AnswerGate {
+                run,
+                step: step.id,
+                answer: GateAnswer::Approved,
+            },
+        )))
+    };
+    let refusal = format!(
+        "step {} is being chatted with; end that chat first (Chat tab, Esc Esc)",
+        step.id
+    );
+
+    let verbs = [
+        ("answer_gate", approve()),
+        (
+            "answer_gate",
+            Action::Store(StoreRequest::Orch(OrchRequest::Command(
+                Command::AnswerGate {
+                    run,
+                    step: step.id,
+                    answer: GateAnswer::Rejected {
+                        note: "not yet".to_owned(),
+                    },
+                },
+            ))),
+        ),
+        (
+            "retry_step",
+            Action::Store(StoreRequest::Orch(OrchRequest::Command(
+                Command::RetryStep { run, step: step.id },
+            ))),
+        ),
+        (
+            "select_fanout",
+            Action::Store(StoreRequest::Orch(OrchRequest::Command(
+                Command::SelectFanout {
+                    run,
+                    position: step.position,
+                    attempt: step.attempt,
+                    winner: step.id,
+                },
+            ))),
+        ),
+        (
+            "cancel_run",
+            Action::Store(StoreRequest::Orch(OrchRequest::Command(
+                Command::CancelRun { run },
+            ))),
+        ),
+    ];
+    for (name, verb) in verbs {
+        harness.app().status = None;
+        harness.app().update(verb);
+        harness.drive().await;
+        assert_eq!(
+            harness.app().status.as_deref(),
+            Some(format!("{name}: {refusal}").as_str()),
+            "{name} is refused while the chat is live"
+        );
+    }
+    let after = step_at(&store, run, 0).await;
+    assert_eq!(
+        (after.id, after.status),
+        (step.id, StepStatus::AwaitingApproval),
+        "the step did not move"
+    );
+    assert_eq!(
+        store
+            .run(run)
+            .await
+            .expect("the read answers")
+            .expect("the run")
+            .status,
+        RunStatus::AwaitingApproval,
+        "nor did the run"
+    );
+    assert_eq!(
+        harness.chat_steps(),
+        vec![step.id],
+        "and the chat is still live: a refused cancel does not end it"
+    );
+
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+    harness.app().status = None;
+    harness.app().update(approve());
+    harness.drive().await;
+
+    assert_eq!(harness.app().status, None, "the approve went through");
+    assert_eq!(
+        step_at(&store, run, 0).await.status,
+        StepStatus::Done,
+        "the promoted step is approved"
+    );
+}
+
+/// Blueprint D212, through the Runs pane's keys: the pane greys the run's verbs while the promoted
+/// chat is live, and ungreys them once `Esc Esc` has ended it. The pane refuses a greyed key
+/// itself and sends nothing, so its verdicts have to be read again when the chat ends: the loop
+/// publishes a `Changed` frame for the item then, and the pane re-reads its runs and verdicts.
+#[tokio::test]
+async fn the_runs_pane_ungreys_the_run_s_verbs_when_the_chat_ends() {
+    let store = graph_store().await;
+    let mut harness = Harness::over(store.clone())
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_tab(Box::new(ChatTab::new()))
+        .with_replay_tab(ChatTab::ID)
+        .with_agent_runtime(chat_runtime(Script::one_turn(vec![chunk("Here."), done()])))
+        .with_run_runtime(run_runtime(&Arc::new(Walks::default())));
+    harness.drive().await;
+    let platform = MemStore::demo()
+        .workspaces()
+        .await
+        .expect("the memory store never fails")
+        .into_iter()
+        .find(|workspace| workspace.slug == "platform")
+        .expect("the demo fixture holds the `platform` workspace");
+    harness.app().update(Action::SetScope {
+        workspace: platform,
+    });
+    harness.drive().await;
+    // htui `ANA-2`, one row below the arrival row, on the Runs sub-tab.
+    harness.key("j");
+    harness.drive().await;
+    harness.key("l");
+    harness.key("R");
+    harness.drive().await;
+    let runs = store.runs(ids::HTUI_ANA_2).await.expect("the read answers");
+    assert_eq!(runs.len(), 1, "`R` started one run: {runs:?}");
+    let run = runs[0].id;
+    let step = step_at(&store, run, 0).await;
+    assert_eq!(
+        step.status,
+        StepStatus::AwaitingApproval,
+        "parked at the gate"
+    );
+
+    harness.key("p");
+    harness.drive().await;
+    assert_eq!(
+        harness.chat_steps(),
+        vec![step.id],
+        "the promoted chat is live"
+    );
+    let backlog = || Action::Tab(TabAction::Focus(BacklogTab::ID));
+    harness.app().update(backlog());
+    harness.app().status = None;
+    harness.key("a");
+    harness.drive().await;
+    assert_eq!(
+        harness.app().status,
+        Some(format!(
+            "step {} is being chatted with; end that chat first (Chat tab, Esc Esc)",
+            step.id
+        )),
+        "the pane greys `a` while the chat is live"
+    );
+
+    harness
+        .app()
+        .update(Action::Tab(TabAction::Focus(ChatTab::ID)));
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+    harness.app().update(backlog());
+    harness.app().status = None;
+    harness.key("a");
+    harness.drive().await;
+
+    assert_eq!(
+        harness.app().status,
+        None,
+        "the pane sent `a` once the chat had ended"
+    );
+    assert_eq!(
+        step_at(&store, run, 0).await.status,
+        StepStatus::Done,
+        "the promoted step is approved"
+    );
+}
+
+/// Blueprint D185: the tab holds one session, so a second promotion while a chat is open is
+/// refused with `ChatLive(None)`'s sentence.
+///
+/// The refused request is an `Orch` one from the Chat tab, like the promotion that opened the
+/// chat, so it is the newest of that kind in the shell's staleness index. The live chat's frames
+/// must go on reaching the tab regardless: the next answer renders, and `Esc Esc` still ends it.
+#[tokio::test]
+async fn a_second_promotion_is_refused_while_a_chat_is_open() {
+    let (mut harness, store) = promotion_harness(Script::turns(vec![
+        vec![chunk("Here."), done()],
+        vec![chunk("Done as asked."), done()],
+    ]))
+    .await;
+    let (run, step) = parked(&mut harness, &store).await;
+    promote(&mut harness, run, step.id).await;
+
+    promote(&mut harness, run, step.id).await;
+
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("promote_step: end the open chat first (Chat tab, Esc Esc)")
+    );
+    assert_eq!(harness.chat_steps(), vec![step.id], "no second session");
+
+    compose(&mut harness, "tighten the summary");
+    harness.drive().await;
+    let rendered = harness.render();
+    assert!(
+        rendered.contains("Done as asked."),
+        "the live chat's answer still reaches the tab: {rendered}"
+    );
+
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+    let rendered = harness.render();
+    assert!(
+        rendered.contains("this chat has ended"),
+        "and its end does too: {rendered}"
+    );
+}
+
+/// Blueprint D185, for the race the run runtime's guard cannot see: two promotions sent before
+/// either is bound both find no chat live, so both pass `chat_open`. The chat runtime is the last
+/// place to refuse the second: one session is started on the step, its opening is one
+/// `follow_up`, and the tab is left driving it with the refusal on the status line.
+#[tokio::test]
+async fn two_promotions_before_a_bind_start_one_session() {
+    let (mut harness, store) = promotion_harness(Script::one_turn(vec![
+        chunk("Picking the step back up."),
+        done(),
+    ]))
+    .await;
+    let (run, step) = parked(&mut harness, &store).await;
+
+    harness.app().update(Action::Promote { run, step: step.id });
+    harness.app().update(Action::Promote { run, step: step.id });
+    harness.drive().await;
+
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("promote_step: end the open chat first (Chat tab, Esc Esc)")
+    );
+    assert_eq!(harness.chat_steps(), vec![step.id], "one session");
+    let openings = log_of(&store, step.id)
+        .await
+        .into_iter()
+        .filter(|row| row.kind == EventKind::FollowUp)
+        .count();
+    assert_eq!(openings, 1, "one session opened the step");
+    let rendered = harness.render();
+    assert!(
+        rendered.contains("Picking the step back up."),
+        "the tab drives the one session: {rendered}"
+    );
+
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+    let rendered = harness.render();
+    assert!(
+        rendered.contains("this chat has ended"),
+        "and can end it: {rendered}"
+    );
+}
+
+/// Blueprint §10.4 step 4: promoting a step whose walk is live on this process preempts the walk
+/// — its session is dropped, which kills the agent — and the chat opens on the same step.
+///
+/// Through the store loop rather than the harness: the harness settles every walk before it
+/// renders (H-5), and this walk only ends by being preempted.
+#[tokio::test]
+async fn promoting_a_running_step_preempts_its_walk() {
+    let store = graph_store().await;
+    let walks = Arc::new(Walks::default());
+    let stall = Stall::default();
+    walks.stall_next(stall.clone());
+    let (requests, requests_rx) = mpsc::unbounded_channel();
+    let (replies_tx, mut replies) = mpsc::unbounded_channel();
+    let _worker = htui::store_worker::spawn_with_runtimes(
+        htui_store::Started::detached(htui_store::Backend::memory(store.clone())),
+        requests_rx,
+        replies_tx,
+        chat_runtime(Script::one_turn(vec![chunk("Taking over."), done()])),
+        run_runtime(&walks),
+    );
+    let send = |seq, origin, request| {
+        requests
+            .send(RequestEnvelope {
+                seq,
+                origin,
+                request,
+            })
+            .expect("the worker is running");
+    };
+
+    send(1, Origin::App, start_run());
+    tokio::time::timeout(Duration::from_secs(20), stall.reached.notified())
+        .await
+        .expect("the walk's session started");
+    let runs = store.runs(ids::HTUI_ANA_2).await.expect("the read answers");
+    let run = runs[0].id;
+    let step = step_at(&store, run, 0).await;
+    assert_eq!(step.status, StepStatus::Running, "the walk is mid-session");
+
+    let chat = Origin::Tab(ChatTab::ID);
+    send(
+        2,
+        chat.clone(),
+        StoreRequest::Orch(OrchRequest::Command(Command::PromoteStep {
+            run,
+            step: step.id,
+            chat_open: false,
+        })),
+    );
+    let mut at_two = Vec::new();
+    while at_two.len() < 2 {
+        let envelope = tokio::time::timeout(Duration::from_secs(20), replies.recv())
+            .await
+            .expect("the worker answers")
+            .expect("the worker is running");
+        if envelope.seq == 2 {
+            at_two.push(envelope.reply);
+        }
+    }
+
+    assert!(
+        matches!(&at_two[0], StoreReply::Orch(OrchReply::Promoted { step: promoted, .. }) if *promoted == step.id),
+        "{:?}",
+        at_two[0]
+    );
+    assert!(
+        matches!(&at_two[1], StoreReply::ChatAccepted { step_id, .. } if *step_id == step.id),
+        "the chat opens on the step the walk was running: {:?}",
+        at_two[1]
+    );
+    assert!(
+        stall.dropped.load(Ordering::SeqCst),
+        "the walk's session was dropped, and its agent with it"
+    );
+    let after = step_at(&store, run, 0).await;
+    assert_eq!(after.id, step.id);
+    assert_eq!(after.status, StepStatus::AwaitingApproval);
+    assert!(after.promoted_at.is_some());
 }
 
 #[tokio::test]

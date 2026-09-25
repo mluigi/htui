@@ -19,6 +19,12 @@
 //! thing this tab is not allowed to know (`R-NF-3`). Since MOD-25 no backend hands out the
 //! (`BUFFERED_LABEL` / `BUFFERED_NOTE`, and the comparison that uses them) is kept compiling
 //! for the reversal and is never taken; a later CLEAN item removes it.
+//!
+//! Since MOD-4 milestone 6 the tab also drives a **promoted graph step** (plan D165): the Runs
+//! pane's `p` asks the shell to promote on this tab's behalf, the `Orch(Promoted)` reply names
+//! the step, and the session the chat runtime binds to it answers at the same address. The header
+//! then reads `promoted · <phase> · <resumed | handoff> · …`, and every command is keyed by the
+//! step's own id as it is for any chat. `Esc Esc` ends the session and leaves the step promoted.
 
 pub mod composer;
 pub mod permission;
@@ -32,6 +38,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
+use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::tabs::registry::{Tab, TabId};
 use composer::{Composer, ComposerOutcome};
@@ -55,6 +62,10 @@ const STEP_TAIL: usize = 8;
 
 /// The last line while a replay is open: the three keys that do anything, and the way out.
 const REPLAY_HINT: &str = "Esc leave replay · t thoughts · j/k scroll";
+
+/// `StoreRequest::name` of a promotion (blueprint D209): its refusal is this tab's to show, since
+/// the shell asked for it on the tab's behalf.
+const PROMOTE_STEP: &str = crate::run_worker::ORCH_NAMES[5];
 
 /// [`crate::store_worker::StoreReply::ChatAccepted::writer_label`] of the offline sink.
 ///
@@ -81,6 +92,22 @@ pub struct ChatSessionState {
     pub ended: Option<htui_agent::event::StopReason>,
 }
 
+/// The graph step the live chat drives, when it was opened by a promotion (MOD-4 plan D165)
+/// rather than by a prompt: what the header names instead of the agent picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotedHeader {
+    /// The promoted step, which the session records against.
+    pub step: StepId,
+    /// `run_step.phase_name`.
+    pub phase: String,
+    /// The step's agent.
+    pub agent: String,
+    /// The step's model.
+    pub model: Option<String>,
+    /// Whether the chat resumed the step's session or opened with the handoff prompt.
+    pub via: Via,
+}
+
 /// A past step, reopened read-only (D40, `R-HIS-2`).
 ///
 /// "Read-only" is a property of what the tab can **send**, not of what it draws greyed out: while
@@ -96,6 +123,33 @@ pub struct ReplayState {
     /// The reply carried `None`: this box has no rows for the step (D38). Distinct from a step
     /// that recorded nothing, which is a conversation that happened and said nothing.
     pub missing: bool,
+}
+
+/// How many columns `text` takes.
+fn columns(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// `text` cut to `room` columns, its last one an ellipsis when anything was cut.
+fn clip(text: &str, room: usize) -> String {
+    if columns(text) <= room {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let width = columns(ch.encode_utf8(&mut [0; 4]));
+        // One column stays free for the ellipsis.
+        if used + width + 1 > room {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    if room > 0 {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 /// The one line a replay shows instead of a transcript, or `None` when it has rows to show.
@@ -138,6 +192,8 @@ pub struct ChatTab {
     refusal: Option<String>,
     /// A past step open over the top of all of it, or `None` for the live view (D40).
     replay: Option<ReplayState>,
+    /// The promoted step the chat drives, or `None` for a chat the tab started itself (D165).
+    promoted: Option<PromotedHeader>,
 }
 
 impl Default for ChatTab {
@@ -163,6 +219,7 @@ impl ChatTab {
             cancel_armed: false,
             refusal: None,
             replay: None,
+            promoted: None,
         }
     }
 
@@ -182,6 +239,12 @@ impl ChatTab {
     #[must_use]
     pub const fn replay(&self) -> Option<&ReplayState> {
         self.replay.as_ref()
+    }
+
+    /// The promoted step the chat drives, for assertions.
+    #[must_use]
+    pub const fn promoted(&self) -> Option<&PromotedHeader> {
+        self.promoted.as_ref()
     }
 
     /// Every key while a replay is open — the whole of D40's read-only guarantee.
@@ -283,7 +346,40 @@ impl ChatTab {
     }
 
     /// The header: who is talking, about which project, in which session.
-    fn header(&self, ctx: &Ctx<'_>) -> Line<'static> {
+    ///
+    /// A promoted step's chat names the step instead (D165): `promoted · <phase> · <resumed |
+    /// handoff> · <agent> · <model> · session <ref>`, fitted to `width`. Every other chat's header
+    /// is unchanged.
+    fn header(&self, ctx: &Ctx<'_>, width: u16) -> Line<'static> {
+        let session = self
+            .session
+            .as_ref()
+            .and_then(|state| state.session_ref.as_ref())
+            .map_or(NONE.to_owned(), |reference| reference.as_str().to_owned());
+        if let Some(promoted) = &self.promoted {
+            let via = match promoted.via {
+                Via::Resumed => "resumed",
+                Via::Handoff => "handoff",
+            };
+            let model = promoted.model.as_deref().unwrap_or("default");
+            // The session ref is the one field here that exists to be read back (a later
+            // `session/load`), so the border never cuts it: a line too wide drops the `session `
+            // label first, then cuts the fields before the ref with an ellipsis.
+            let width = usize::from(width);
+            let lead = format!("promoted · {}", promoted.phase);
+            let middle = format!(" · {via} · {} · {model}", promoted.agent);
+            let mut tail = format!(" · session {session}");
+            if columns(&lead) + columns(&middle) + columns(&tail) > width {
+                tail = format!(" · {session}");
+            }
+            let room = width.saturating_sub(columns(&tail));
+            let lead = clip(&lead, room);
+            let middle = clip(&middle, room.saturating_sub(columns(&lead)));
+            return Line::from(vec![
+                Span::styled(lead, ctx.theme.accent),
+                Span::styled(format!("{middle}{tail}"), ctx.theme.dim),
+            ]);
+        }
         let agent = self
             .agent()
             .map_or(NONE.to_owned(), |summary| summary.agent.name.clone());
@@ -295,11 +391,6 @@ impl ChatTab {
             .projects
             .first()
             .map_or(NONE.to_owned(), |project| project.name.clone());
-        let session = self
-            .session
-            .as_ref()
-            .and_then(|state| state.session_ref.as_ref())
-            .map_or(NONE.to_owned(), |reference| reference.as_str().to_owned());
         Line::from(vec![
             Span::styled(agent, ctx.theme.accent),
             Span::styled(
@@ -447,7 +538,7 @@ impl Tab for ChatTab {
         handled
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Agents(agents) => {
                 self.agents = agents
@@ -465,6 +556,22 @@ impl Tab for ChatTab {
             } => {
                 self.pending_start = false;
                 self.refusal = None;
+                // Blueprint D185: a promotion's chat streams at the promotion's address, an `Orch`
+                // one, and the next `Orch` request from this tab (a refused second promotion)
+                // would make every frame after it stale. Its frames follow this tab to a chat
+                // request's address instead, which nothing else it sends supersedes.
+                if self.promoted.is_some() {
+                    ctx.request(StoreRequest::ChatFollow { step_id: *step_id });
+                }
+                // A chat the tab started itself, after a promoted one has ended, is not the
+                // promoted step's: its header goes back to naming the agent picker.
+                if self
+                    .promoted
+                    .as_ref()
+                    .is_some_and(|promoted| promoted.step != *step_id)
+                {
+                    self.promoted = None;
+                }
                 self.session = Some(ChatSessionState {
                     step_id: *step_id,
                     session_ref: session_ref.clone(),
@@ -507,7 +614,36 @@ impl Tab for ChatTab {
                 self.pending_start = false;
                 self.refusal = Some(message.clone());
             }
-            StoreReply::Failed { request, message } if request.starts_with("chat_") => {
+            // MOD-4 plan D165: the shell asked for the promotion on this tab's behalf, and the
+            // engine's writes are done. The chat opens on the promoted step: its acceptance and
+            // every frame after it arrive at this reply's address. No chat of this process is
+            // live, because the promotion's `chat_open` guard refused otherwise (D185), so the
+            // old conversation is history and is cleared here.
+            StoreReply::Orch(OrchReply::Promoted {
+                step,
+                phase,
+                agent,
+                model,
+                via,
+                ..
+            }) => {
+                self.promoted = Some(PromotedHeader {
+                    step: *step,
+                    phase: phase.clone(),
+                    agent: agent.clone(),
+                    model: model.clone(),
+                    via: *via,
+                });
+                self.transcript = Transcript::new();
+                self.session = None;
+                self.pending_start = true;
+                self.refusal = None;
+                self.cancel_armed = false;
+                self.replay = None;
+            }
+            StoreReply::Failed { request, message }
+                if request.starts_with("chat_") || *request == PROMOTE_STEP =>
+            {
                 self.pending_start = false;
                 self.refusal = Some(message.clone());
             }
@@ -539,7 +675,7 @@ impl Tab for ChatTab {
 
         let header_line = match replay {
             Some(replay) => Self::replay_header(replay, ctx),
-            None => self.header(ctx),
+            None => self.header(ctx, header.width),
         };
         frame.render_widget(Paragraph::new(header_line), header);
         if let Some(text) = banner {
@@ -918,6 +1054,97 @@ mod tests {
                 message_id: Some("m1".to_owned()),
             }]
         );
+    }
+
+    /// MOD-4 plan D165: a promotion clears the finished conversation and waits for the promoted
+    /// step's acceptance; a refused promotion is the tab's to show; and a chat the tab starts
+    /// itself afterwards is not the promoted step's.
+    #[test]
+    fn a_promotion_opens_on_its_step_and_a_later_chat_forgets_it() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        let promoted = StepId::new();
+        tab.on_reply(
+            &StoreReply::Orch(OrchReply::Promoted {
+                step: promoted,
+                run: htui_core::model::RunId::new(),
+                phase: "research".to_owned(),
+                agent: "scripted".to_owned(),
+                model: None,
+                via: Via::Resumed,
+            }),
+            &mut shell.ctx(),
+        );
+        assert!(tab.session().is_none(), "the old conversation is history");
+        assert!(tab.transcript.is_empty());
+        assert!(
+            tab.pending_start,
+            "the promoted step's acceptance is awaited"
+        );
+        assert_eq!(tab.promoted().map(|header| header.step), Some(promoted));
+
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: PROMOTE_STEP,
+                message: "the step's log is not on this box".to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        assert!(!tab.pending_start);
+        assert_eq!(
+            tab.refusal.as_deref(),
+            Some("the step's log is not on this box")
+        );
+
+        let fresh = live(&shell);
+        tab.on_reply(
+            &StoreReply::ChatAccepted {
+                step_id: fresh.session().expect("a session").step_id,
+                session_ref: None,
+                caps: fresh.session().expect("a session").caps,
+                writer_label: "memory",
+            },
+            &mut shell.ctx(),
+        );
+        assert!(
+            tab.promoted().is_none(),
+            "a chat on another step is the tab's own, and its header names the agent again"
+        );
+    }
+
+    /// Verifier finding (D165): the session ref is what a later `session/load` reads back, so a
+    /// header too wide for its line drops the `session ` label, then cuts the fields before the
+    /// ref — never the ref itself.
+    #[test]
+    fn a_narrow_promoted_header_keeps_the_whole_session_ref() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        tab.promoted = Some(PromotedHeader {
+            step: StepId::new(),
+            phase: "implementation".to_owned(),
+            agent: "scripted".to_owned(),
+            model: Some("sonnet".to_owned()),
+            via: Via::Handoff,
+        });
+        let text = |width: u16| -> String {
+            tab.header(&shell.ctx(), width)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+
+        assert_eq!(
+            text(200),
+            "promoted · implementation · handoff · scripted · sonnet · session live-1"
+        );
+        assert_eq!(
+            text(66),
+            "promoted · implementation · handoff · scripted · sonnet · live-1",
+            "the label goes first"
+        );
+        assert_eq!(text(40), "promoted · implementation · ha\u{2026} · live-1");
+        assert_eq!(columns(&text(40)), 40, "and the line fits");
     }
 
     /// D38's two answers are two different facts and must not read as one.

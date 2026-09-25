@@ -39,7 +39,9 @@ pub const MIN_GIT: (u32, u32, u32) = (2, 33, 0);
 /// One verb's wall-clock budget; on expiry the process group is killed and nothing is retried.
 pub const VERB_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The bound on `git --version` inside [`Cli::probe`], which runs synchronously at worker start.
+/// The bound on `git --version` inside [`Cli::probe`], which runs synchronously inside
+/// `GixIsolator::new`, on a blocking thread when the run runtime builds its isolator (MOD-4 plan
+/// D213).
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a killed child gets to be reaped before it is abandoned.
@@ -604,10 +606,24 @@ impl Cli {
     /// survive unless `target` tracks their path, which is written over them without a word; a
     /// caller that must not lose one asks [`untracked_paths_base_tracks`] first (plan D121).
     ///
+    /// Plan D160: the verb runs on a task of its own through `detached`, so a caller whose
+    /// future is dropped mid-reset (a preempted or abandoned walk) lets `git` finish rather than
+    /// SIGKILLing it with `index.lock` held.
+    ///
     /// # Errors
     /// [`IsolateError::Git`] for a non-zero exit — a held `index.lock` among them, which
     /// [`with_retry`] sleeps over — or for a post-condition that does not hold.
     pub async fn reset_hard(&self, tree: &Path, target: &str) -> Result<(), IsolateError> {
+        let cli = self.clone();
+        let (tree, target) = (tree.to_path_buf(), target.to_owned());
+        detached("reset --hard", async move {
+            cli.reset_hard_attached(&tree, &target).await
+        })
+        .await
+    }
+
+    /// [`reset_hard`](Cli::reset_hard) on the caller's own task: the body [`detached`] runs.
+    async fn reset_hard_attached(&self, tree: &Path, target: &str) -> Result<(), IsolateError> {
         let exited = self
             .run(
                 "reset --hard",
@@ -653,6 +669,11 @@ impl Cli {
     /// `merge --abort` produced, if the abort is what failed — the primary is then mid-merge and
     /// the operator has to be told so; [`IsolateError::Git`] from the conflicted-paths read when
     /// that read failed and the abort after it succeeded.
+    ///
+    /// Plan D160: the whole merge, its own abort included, runs on a task of its own through
+    /// `detached`, so a caller whose future is dropped mid-merge — inside a hook, say — lets
+    /// `git` conclude or abort the merge rather than SIGKILLing it and leaving the primary
+    /// half-done.
     pub async fn merge_no_ff(
         &self,
         primary: &Path,
@@ -660,12 +681,19 @@ impl Cli {
         before: &str,
         after: &str,
     ) -> Result<Merged, IsolateError> {
-        self.merge_no_ff_reading(primary, step, before, after, conflicted_paths)
-            .await
+        let cli = self.clone();
+        let (primary, before, after) = (primary.to_path_buf(), before.to_owned(), after.to_owned());
+        detached("merge", async move {
+            cli.merge_no_ff_reading(&primary, step, &before, &after, conflicted_paths)
+                .await
+        })
+        .await
     }
 
     /// [`merge_no_ff`](Cli::merge_no_ff) with the conflicted-paths read passed in: the only seam
     /// through which a test can make that read fail while leaving the index `--abort` needs intact.
+    /// It runs on the caller's own task — it is the body [`detached`] runs — so its abort is the
+    /// attached one.
     async fn merge_no_ff_reading(
         &self,
         primary: &Path,
@@ -723,7 +751,7 @@ impl Cli {
         } else {
             Vec::new()
         };
-        with_retry("merge --abort", || self.abort_merge(primary)).await?;
+        with_retry("merge --abort", || self.abort_merge_attached(primary)).await?;
 
         if let Some(err) = read_failed {
             Err(err)
@@ -739,7 +767,21 @@ impl Cli {
     /// # Errors
     /// [`IsolateError::Git`] for any other non-zero exit, which leaves the primary mid-merge and
     /// is never swallowed (blueprint H-7).
+    ///
+    /// Plan D160: on a task of its own through `detached`, as [`merge_no_ff`](Cli::merge_no_ff)
+    /// is, so a dropped caller cannot leave the abort half-done either.
     pub async fn abort_merge(&self, primary: &Path) -> Result<(), IsolateError> {
+        let cli = self.clone();
+        let primary = primary.to_path_buf();
+        detached("merge --abort", async move {
+            cli.abort_merge_attached(&primary).await
+        })
+        .await
+    }
+
+    /// [`abort_merge`](Cli::abort_merge) on the caller's own task: the body [`detached`] runs, and
+    /// what [`merge_no_ff_reading`](Cli::merge_no_ff_reading), already detached, calls.
+    async fn abort_merge_attached(&self, primary: &Path) -> Result<(), IsolateError> {
         let exited = self
             .run(
                 "merge --abort",
@@ -840,6 +882,24 @@ where
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Plan D160 (R-26): a verb that changes the primary runs on its own task and is awaited through
+/// the handle, so dropping the caller's future (a preempted or abandoned walk) drops only the
+/// `JoinHandle` and lets the child finish: its `kill_on_drop` handle lives on the task.
+///
+/// `worktree add` and `worktree remove` stay attached; they touch only scratch trees and the
+/// administrative area.
+///
+/// # Errors
+/// Whatever `work` returned, or [`IsolateError::Git`] when its task panicked or was cancelled.
+async fn detached<T: Send + 'static>(
+    verb: &'static str,
+    work: impl Future<Output = Result<T, IsolateError>> + Send + 'static,
+) -> Result<T, IsolateError> {
+    tokio::spawn(work)
+        .await
+        .map_err(|join| IsolateError::Git(format!("git {verb}: its task failed: {join}")))?
 }
 
 /// Runs one synchronous `gix` or filesystem call on the blocking pool.
@@ -2911,8 +2971,8 @@ mod tests {
         );
     }
 
-    /// `GixIsolator::new` runs the probe synchronously at worker start, so a `git` that hangs on
-    /// `--version` must be refused within a bound rather than hang the worker with it.
+    /// `GixIsolator::new` runs the probe synchronously, so a `git` that hangs on `--version` must
+    /// be refused within a bound rather than hang the thread that builds the isolator with it.
     #[cfg(unix)]
     #[test]
     fn a_probe_that_hangs_is_refused_within_its_bound() {
