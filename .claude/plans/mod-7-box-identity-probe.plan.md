@@ -42,8 +42,8 @@ maintainer review); the PRD's gate decisions are always cited as **PRD D0…PRD 
 re-used. Risks start at **R-1**, open questions at **OQ-1**, tasks at **T0**. Later MOD-7 milestones
 continue from **D19**, **R-12** and **OQ-13** (amended at maintainer review; was D17 and R-9).
 
-**Status**: **fact-checked twice (2026-09-25): 172 + 38 claims; maintainer-review amendments
-re-checked; awaiting CONFIRM.** Branch `mod-7-box-registry` at `1475b17`. The first pass (172
+**Status**: **confirmed** (2026-09-25) by the maintainer with OQ-11 and OQ-12's defaults, after two
+fact-check passes (172 + 38 claims; maintainer-review amendments re-checked). Branch `mod-7-box-registry` at `1475b17`. The first pass (172
 claims, six verifiers: 153 verified, 8 partial, 11 falsified) checked the draft; the maintainer then
 answered every open question (OQ-1, OQ-3…OQ-8, OQ-10 as written; OQ-2 reversed to `sysinfo`; OQ-9
 changed to a stored, overlayable probe spec); the second pass (38 claims) checked those amendments.
