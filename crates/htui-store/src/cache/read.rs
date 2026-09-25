@@ -32,8 +32,8 @@ use htui_core::model::{
     Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, Document, DocumentHead, DocumentId,
     EventKind, EventRole, GateOutcome, Isolation, Item, ItemFilter, ItemId, ItemSummary, LinkEdge,
     LinkGraph, LinkKind, LinkNode, Note, NoteId, OsFamily, Project, ProjectId, ProjectRef,
-    PromptScope, RepoId, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
+    PromptScope, RepoId, Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus,
+    RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
     StepGraphId, StepId, StepStatus, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceId,
     WorkspaceSummary,
 };
@@ -176,9 +176,7 @@ fn item_of(row: &SqliteRow) -> Result<Item> {
         created_at: ts_col("item.created_at", get(row, "created_at")?)?,
         updated_at: ts_col("item.updated_at", get(row, "updated_at")?)?,
         closed_at: opt_ts_col("item.closed_at", get(row, "closed_at")?)?,
-        // MOD-38 T1: the cache mirrors `item.resolution` from T5; until then an offline read
-        // answers `None`.
-        resolution: None,
+        resolution: get::<Option<Resolution>>(row, "resolution")?,
     })
 }
 
@@ -336,7 +334,7 @@ impl ReadStore for CacheStore {
         let row = sqlx::query(
             "SELECT id, project_id, kind_id, key_prefix, key_number, key, title, body, status, \
              priority, required_tags, touched_paths, step_graph_id, version, created_by, \
-             created_at, updated_at, closed_at FROM item WHERE id = ?",
+             created_at, updated_at, closed_at, resolution FROM item WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)

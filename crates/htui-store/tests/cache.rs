@@ -18,10 +18,10 @@ use htui_store::testkit as common;
 use chrono::{SubsecRound as _, TimeDelta, Utc};
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
-    EventKind, EventRole, ItemFilter, LinkGraph, ProjectId, PromptScope, RunId, Scope,
-    SessionEvent, StepId, UserId, WorkspaceSummary,
+    DocumentId, EventKind, EventRole, ItemFilter, LinkGraph, NewDocument, ProjectId, PromptScope,
+    Resolution, RunId, Scope, SessionEvent, Status, StepId, UserId, WorkspaceSummary,
 };
-use htui_core::store::{MemStore, ReadStore as _, StoreError};
+use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
 use htui_store::{Backend, CacheStore, identity};
 use serde_json::json;
@@ -252,7 +252,7 @@ async fn documents_agree(cache: &CacheStore, mem: &MemStore) {
     }
     assert_eq!(
         cache
-            .document(htui_core::model::DocumentId::new())
+            .document(DocumentId::new())
             .await
             .expect("cache document of an unknown id"),
         None,
@@ -324,7 +324,7 @@ async fn mirror_reads_equal_the_reference_store() {
     for filter in [
         ItemFilter::default(),
         ItemFilter {
-            statuses: Some(vec![htui_core::model::Status::Open]),
+            statuses: Some(vec![Status::Open]),
             ..ItemFilter::default()
         },
         ItemFilter {
@@ -1360,6 +1360,89 @@ async fn a_tombstoned_link_disappears_from_the_mirror() {
     .await
     .expect("count the mirrored row");
     assert_eq!(remaining, 0, "the row itself is deleted, not flagged");
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-38 T5 (blueprint §6.3): `item.resolution` reaches the mirror, and so do the four
+/// requirement tables' names.
+///
+/// `FIX-1` is the fixture's closed item, backfilled to `done`; `agy` `FIX-1` is closed on Postgres
+/// between two passes as `withdrawn`, which is the value only `close_out` can write and the
+/// status-derived default would never produce.
+#[tokio::test]
+async fn a_closed_item_mirrors_its_resolution() {
+    assert_eq!(
+        htui_store::cache::MIRRORED_TABLES.len(),
+        21,
+        "MOD-38 adds requirement_spec, requirement_area, requirement and item_requirement",
+    );
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let settings = settings(&db, 20);
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the first pass");
+    let fix = cache
+        .item(ids::HTUI_FIX_1)
+        .await
+        .expect("read the mirror")
+        .expect("FIX-1 is mirrored");
+    assert_eq!(fix.status, Status::Closed);
+    assert_eq!(
+        fix.resolution,
+        Some(Resolution::Done),
+        "the fixture's closed item"
+    );
+    let open = cache
+        .item(ids::AGY_FIX_1)
+        .await
+        .expect("read the mirror")
+        .expect("agy FIX-1 is mirrored");
+    assert_eq!(open.resolution, None, "an open item has no resolution");
+
+    db.store
+        .close_out(
+            ids::AGY_FIX_1,
+            Resolution::Withdrawn,
+            NewDocument {
+                id: DocumentId::new(),
+                item_id: ids::AGY_FIX_1,
+                kind: "summary".to_owned(),
+                title: "Withdrawn".to_owned(),
+                body: String::new(),
+                produced_by_step_id: None,
+                created_by: ids::USER,
+                created_at: Utc::now(),
+            },
+            &[],
+        )
+        .await
+        .expect("close agy FIX-1 out as withdrawn");
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the pass that sees the close-out");
+
+    let closed = cache
+        .item(ids::AGY_FIX_1)
+        .await
+        .expect("read the mirror")
+        .expect("agy FIX-1 is still mirrored");
+    assert_eq!(closed.status, Status::Closed);
+    assert_eq!(closed.resolution, Some(Resolution::Withdrawn));
+    let raw: Option<String> = sqlx::query_scalar("SELECT resolution FROM item WHERE id = ?")
+        .bind(ids::AGY_FIX_1.to_string())
+        .fetch_one(cache.pool())
+        .await
+        .expect("read the mirrored column");
+    assert_eq!(
+        raw.as_deref(),
+        Some("withdrawn"),
+        "stored as its Postgres text"
+    );
 
     teardown(db, &[&cache]).await;
 }
