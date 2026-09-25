@@ -171,6 +171,58 @@ pub fn os_user_name() -> String {
     "htui".to_owned()
 }
 
+/// The compiled message of the box fingerprint's HMAC (plan D1): the domain separator that keeps
+/// the value uncorrelated with any other program's use of the same machine identity.
+pub const FINGERPRINT_APP_ID: &[u8] = b"htui/box-fingerprint/v1";
+
+/// HMAC-SHA256 keyed by the normalised OS machine identity over [`FINGERPRINT_APP_ID`] (PRD D1).
+///
+/// No `Display`, no `Serialize`; `Debug` prints `Fingerprint(<redacted>)`.
+/// [`Fingerprint::as_hex`] exists only to bind `box.machine_fingerprint`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Fingerprint([u8; 32]);
+
+impl core::fmt::Debug for Fingerprint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Fingerprint(<redacted>)")
+    }
+}
+
+impl Fingerprint {
+    /// Trims and ASCII-lowercases `raw`; an empty identity is `None`, anything else the keyed hash.
+    #[must_use]
+    pub fn from_machine_identity(raw: &str) -> Option<Self> {
+        let _ = raw;
+        todo!("MOD-7 T1 (c)")
+    }
+
+    /// Lowercase hex, 64 characters: what the column stores.
+    #[must_use]
+    pub fn as_hex(&self) -> String {
+        todo!("MOD-7 T1 (c)")
+    }
+}
+
+/// This machine's fingerprint, read from the OS once per process; `None` when no identity is
+/// readable.
+pub async fn machine_fingerprint() -> Option<Fingerprint> {
+    todo!("MOD-7 T1 (c)")
+}
+
+/// `<root>/etc/machine-id`, then `<root>/var/lib/dbus/machine-id` (plan D20).
+#[cfg(any(target_os = "linux", test))]
+fn machine_id_under(root: &Path) -> Option<zeroize::Zeroizing<String>> {
+    let _ = root;
+    todo!("MOD-7 T1 (c)")
+}
+
+/// The value of the `"IOPlatformUUID" = "…"` line of `ioreg -rd1 -c IOPlatformExpertDevice`.
+#[cfg(any(target_os = "macos", test))]
+fn ioreg_platform_uuid(text: &str) -> Option<&str> {
+    let _ = text;
+    todo!("MOD-7 T1 (c)")
+}
+
 /// This machine's host name, or `unknown-host` when the OS will not say.
 fn hostname() -> String {
     let raw = gethostname::gethostname().to_string_lossy().into_owned();
@@ -183,8 +235,129 @@ fn hostname() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Identity, db_fingerprint, load_or_mint, store};
+    use super::{
+        Fingerprint, Identity, db_fingerprint, ioreg_platform_uuid, load_or_mint, machine_id_under,
+        store,
+    };
     use htui_core::model::BoxId;
+
+    /// A synthetic machine identity: 32 hex characters, never this machine's.
+    const SYNTHETIC: &str = "0123456789abcdef0123456789abcdef";
+
+    /// HMAC-SHA256(key = [`SYNTHETIC`], message = `htui/box-fingerprint/v1`), computed outside
+    /// this crate (Python's `hmac`), so the test pins the construction and not just itself.
+    const SYNTHETIC_FINGERPRINT: &str =
+        "a2e8a0ed177cf8b655e4a8c2d16f745209325966a8339fd26e7c6437dae364df";
+
+    #[test]
+    fn the_fingerprint_is_hmac_sha256_known_answer() {
+        let fp = Fingerprint::from_machine_identity(SYNTHETIC).expect("a fingerprint");
+        assert_eq!(fp.as_hex(), SYNTHETIC_FINGERPRINT);
+    }
+
+    #[test]
+    fn the_fingerprint_ignores_case_and_surrounding_whitespace() {
+        let upper = format!("  {}\n", SYNTHETIC.to_ascii_uppercase());
+        assert_eq!(
+            Fingerprint::from_machine_identity(&upper),
+            Fingerprint::from_machine_identity(SYNTHETIC),
+        );
+    }
+
+    #[test]
+    fn an_empty_identity_is_no_fingerprint() {
+        assert_eq!(Fingerprint::from_machine_identity(""), None);
+        assert_eq!(Fingerprint::from_machine_identity(" \n"), None);
+    }
+
+    #[test]
+    fn debug_never_prints_the_fingerprint() {
+        let fp = Fingerprint::from_machine_identity(SYNTHETIC).expect("a fingerprint");
+        assert_eq!(format!("{fp:?}"), "Fingerprint(<redacted>)");
+    }
+
+    #[test]
+    fn linux_reads_machine_id_then_the_dbus_copy() {
+        const ETC: &str = "11111111111111111111111111111111";
+        const DBUS: &str = "22222222222222222222222222222222";
+        let write = |root: &std::path::Path, rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        };
+        let read = |root: &std::path::Path| machine_id_under(root).map(|id| id.to_string());
+
+        let none = tempfile::tempdir().expect("temp root");
+        assert_eq!(read(none.path()), None, "neither file: no identity");
+
+        let dbus_only = tempfile::tempdir().expect("temp root");
+        write(
+            dbus_only.path(),
+            "var/lib/dbus/machine-id",
+            &format!("{DBUS}\n"),
+        );
+        assert_eq!(
+            read(dbus_only.path()).as_deref(),
+            Some(DBUS),
+            "the dbus copy alone"
+        );
+
+        let both = tempfile::tempdir().expect("temp root");
+        write(both.path(), "etc/machine-id", &format!("{ETC}\n"));
+        write(both.path(), "var/lib/dbus/machine-id", &format!("{DBUS}\n"));
+        assert_eq!(read(both.path()).as_deref(), Some(ETC), "/etc wins");
+
+        let uninitialized = tempfile::tempdir().expect("temp root");
+        write(uninitialized.path(), "etc/machine-id", "uninitialized\n");
+        write(
+            uninitialized.path(),
+            "var/lib/dbus/machine-id",
+            &format!("{DBUS}\n"),
+        );
+        assert_eq!(
+            read(uninitialized.path()).as_deref(),
+            Some(DBUS),
+            "`uninitialized` falls through to the dbus copy (D20)"
+        );
+
+        let empty = tempfile::tempdir().expect("temp root");
+        write(empty.path(), "etc/machine-id", "");
+        assert_eq!(
+            read(empty.path()),
+            None,
+            "an empty file is no identity (D20)"
+        );
+    }
+
+    #[test]
+    fn the_ioreg_line_is_parsed() {
+        let sample = r#"+-o J316sAP  <class IOPlatformExpertDevice, id 0x100000223, registered, matched, active, busy 0 (1234 ms), retain 42>
+    {
+      "IOPlatformSerialNumber" = "C02XXXXXXXXX"
+      "IOPlatformUUID" = "0A1B2C3D-4E5F-6A7B-8C9D-0E1F2A3B4C5D"
+      "model" = <"MacBookPro18,1">
+    }
+"#;
+        assert_eq!(
+            ioreg_platform_uuid(sample),
+            Some("0A1B2C3D-4E5F-6A7B-8C9D-0E1F2A3B4C5D")
+        );
+        assert_eq!(
+            ioreg_platform_uuid("  \"IOPlatformSerialNumber\" = \"C02XXXXXXXXX\"\n"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn this_box_has_a_fingerprint_when_machine_id_is_readable() {
+        if std::fs::read_to_string("/etc/machine-id").is_ok() {
+            assert!(
+                super::machine_fingerprint().await.is_some(),
+                "a readable /etc/machine-id gives a fingerprint"
+            );
+        }
+    }
 
     #[test]
     fn a_hostname_change_keeps_the_box_id() {

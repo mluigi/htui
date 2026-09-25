@@ -10,7 +10,8 @@ use htui_store::testkit as common;
 use std::time::Duration;
 
 use htui_core::store::StoreError;
-use htui_store::connect::{ConnEvent, StartOptions, Started, refresh_settings, start};
+use htui_store::connect::{ConnEvent, StartOptions, Started, refresh_settings, start, try_connect};
+use htui_store::pg::CONNECT_TIMEOUT;
 use htui_store::{Backend, MigrationState, map_sqlx};
 
 /// How long a `ConnEvent` may take. The connect pool's own acquire timeout is ten seconds, so this
@@ -92,7 +93,7 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(4),
+        MigrationState::Pending(5),
         "the harness left the schema unapplied"
     );
     let root = tempfile::tempdir().expect("temp root");
@@ -107,13 +108,72 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
 
     match next_event(&mut started, "a bare database").await {
         ConnEvent::MigrationsPending(_, pending) => assert_eq!(
-            pending, 4,
-            "all four embedded migrations are waiting (R-STO-5: nothing is applied unasked)"
+            pending, 5,
+            "all five embedded migrations are waiting (R-STO-5: nothing is applied unasked)"
         ),
         other => panic!("expected MigrationsPending, got {other:?}"),
     }
 
     close(&started).await;
+    db.drop_db().await;
+}
+
+/// MOD-7 D3 end to end: a `box.toml` whose id another machine registered is rewritten to the id
+/// this machine was minted, and the other machine's row is left alone.
+///
+/// The planted row's fingerprint is `repeat('a', 64)`, which the keyed hash of this machine's
+/// identity is not; a machine with no readable identity cannot tell a copy apart, so the case
+/// returns early there.
+#[tokio::test]
+async fn a_copied_box_toml_is_rewritten_to_the_minted_id() {
+    if htui_store::identity::machine_fingerprint().await.is_none() {
+        return;
+    }
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let identity = htui_store::identity::load_or_mint(root.path()).expect("mint box.toml");
+
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version, \
+                          machine_fingerprint) \
+         VALUES ($1, (SELECT id FROM app_user ORDER BY created_at, id LIMIT 1), 'elsewhere', \
+                 'linux', '', 'x86_64', '0.0.0', repeat('a', 64))",
+    )
+    .bind(identity.box_id.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant the other machine's row under the box.toml id");
+    let before: String = sqlx::query_scalar("SELECT row_to_json(box)::text FROM box WHERE id = $1")
+        .bind(identity.box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the planted row");
+
+    let connected = try_connect(&db.url, &identity, root.path(), CONNECT_TIMEOUT)
+        .await
+        .expect("connect");
+    let store = connected.store;
+
+    let rewritten = htui_store::identity::load_or_mint(root.path()).expect("re-read box.toml");
+    assert_ne!(
+        rewritten.box_id, identity.box_id,
+        "box.toml no longer names the other machine's box"
+    );
+    assert_eq!(
+        rewritten.box_id,
+        store.this_box(),
+        "box.toml holds the id this machine was minted"
+    );
+    let after: String = sqlx::query_scalar("SELECT row_to_json(box)::text FROM box WHERE id = $1")
+        .bind(identity.box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("re-read the planted row");
+    assert_eq!(after, before, "the other machine's row is untouched");
+
+    store.pool().close().await;
     db.drop_db().await;
 }
 

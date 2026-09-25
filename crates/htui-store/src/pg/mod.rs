@@ -21,7 +21,7 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 use crate::MIGRATOR;
 use crate::error::{checksum_drift, map_migrate, map_sqlx, schema_is_newer};
-use crate::identity::Identity;
+use crate::identity::{Fingerprint, Identity};
 
 /// The ten `capability_tag` rows ANA-9 §5.10 seeds.
 const SEEDED_TAGS: [&str; 10] = [
@@ -49,6 +49,39 @@ const SEEDED_SETTINGS: [(&str, i32); 2] = [
     ("cache_overlap_seconds", 300),
 ];
 
+/// The `htui` version this build records (plan D5): inserted at first registration, rewritten by
+/// the probe writer, compared by `BoxRecord::needs_probe`.
+pub const HTUI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What [`PgStore::register_box`] found (plan D2, D3, blueprint D19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Registration {
+    /// The id was new: one row inserted.
+    New,
+    /// The id was known and belongs to this machine; `renamed_from` is the old hostname on a rename.
+    Known {
+        /// The hostname the row carried before this registration, when it changed.
+        renamed_from: Option<String>,
+    },
+    /// `box.toml` was carried from another machine or another user: `previous` is left untouched
+    /// and this machine registered as `minted`.
+    Copied {
+        /// The row the copied `box.toml` named.
+        previous: BoxId,
+        /// The id this machine now has.
+        minted: BoxId,
+    },
+}
+
+impl Registration {
+    /// The id this box has after registering `presented`.
+    #[must_use]
+    pub const fn box_id(&self, presented: BoxId) -> BoxId {
+        let _ = presented;
+        todo!()
+    }
+}
+
 /// The Postgres store: the only `WriteStore` in the product (ANA-9 §6.1).
 #[derive(Debug, Clone)]
 pub struct PgStore {
@@ -56,6 +89,7 @@ pub struct PgStore {
     identity: Identity,
     this_box: BoxId,
     this_user: UserId,
+    registration: Option<Registration>,
 }
 
 /// What [`PgStore::connect`] found: a usable store plus the state of its schema.
@@ -147,6 +181,7 @@ impl PgStore {
             identity: identity.clone(),
             this_box: BoxId::default(),
             this_user: UserId::default(),
+            registration: None,
         };
         if migrations == MigrationState::UpToDate {
             store.bootstrap().await?;
@@ -180,6 +215,7 @@ impl PgStore {
             identity: identity.clone(),
             this_box: BoxId::default(),
             this_user: UserId::default(),
+            registration: None,
         })
     }
 
@@ -334,46 +370,18 @@ impl PgStore {
         Ok(row.id)
     }
 
-    /// Upserts this box on `(user_id, hostname)` and bumps `last_seen_at`.
-    ///
-    /// Writes what `std::env::consts` and `gethostname` know: `os_family` from
-    /// `std::env::consts::OS`, `arch` from `std::env::consts::ARCH`, `htui_version` from the crate
-    /// version, `os_version` empty. The full probe (`box_tool`, tags, RAM, GPU) is MOD-7's and must
-    /// not be attempted here.
-    ///
-    /// **Adopt-DB-id rule**: the returned id is the row's, which is `identity.box_id` on a first
-    /// registration but the *existing* id when this hostname already has a row under a different
-    /// one. [`PgStore::connect`] keeps it in [`PgStore::identity`]; writing it back to `box.toml`
-    /// through [`identity::store`](crate::identity::store) is the caller's job, since only the
-    /// caller knows the config root (plan D6).
+    /// Registers this box by its `box.toml` id, checked by the machine fingerprint (PRD D1-D5).
     ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
-    pub async fn register_box(&self, identity: &Identity) -> Result<BoxId> {
-        let row = sqlx::query!(
-            r#"
-            INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version)
-            VALUES ($1, $2, $3, $4, '', $5, $6)
-            ON CONFLICT (user_id, hostname) DO UPDATE
-                SET last_seen_at = clock_timestamp(),
-                    htui_version = EXCLUDED.htui_version,
-                    os_family    = EXCLUDED.os_family,
-                    arch         = EXCLUDED.arch
-            RETURNING id as "id!: BoxId"
-            "#,
-            identity.box_id.as_uuid(),
-            self.this_user.as_uuid(),
-            identity.hostname,
-            this_os_family().as_str(),
-            std::env::consts::ARCH,
-            env!("CARGO_PKG_VERSION"),
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-
-        Ok(row.id)
+    pub async fn register_box(
+        &self,
+        identity: &Identity,
+        fingerprint: Option<&Fingerprint>,
+    ) -> Result<Registration> {
+        let _ = (identity, fingerprint, this_os_family());
+        todo!("MOD-7 T1 (c)")
     }
 
     /// The pool, for the refresh task (`cache::refresh`) and for the tests.
@@ -411,15 +419,26 @@ impl PgStore {
         self.this_user
     }
 
+    /// What registration answered at the last bootstrap; `None` until one has run.
+    #[must_use]
+    pub const fn registration(&self) -> Option<&Registration> {
+        self.registration.as_ref()
+    }
+
     /// Seeds, registers this box and adopts the database's id for it (plan D5, D6).
     ///
     /// No file I/O: persisting an adopted id back to `box.toml` is the caller's job, because only
     /// the caller knows which config root it read the identity from.
     async fn bootstrap(&mut self) -> Result<()> {
         self.this_user = self.seed_if_empty().await?;
-        let registered = self.register_box(&self.identity).await?;
-        self.identity.box_id = registered;
-        self.this_box = registered;
+        let fingerprint = crate::identity::machine_fingerprint().await;
+        let registration = self
+            .register_box(&self.identity, fingerprint.as_ref())
+            .await?;
+        let id = registration.box_id(self.identity.box_id);
+        self.identity.box_id = id;
+        self.this_box = id;
+        self.registration = Some(registration);
         Ok(())
     }
 }
