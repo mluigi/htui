@@ -934,10 +934,16 @@ impl WriteStore for PgStore {
     /// Two reads rather than a `query_as!(BoxRow, ..)`: the digest is not a [`BoxRow`] field, so
     /// the rows are mapped by hand.
     ///
+    /// Both reads share one snapshot: they run in one `begin_repeatable_read` transaction, so a
+    /// box inserted or a probe committed between them cannot hand back a box whose tools are
+    /// missing or a tool list from after the box row was read. Read-only, so no `40001` can arise
+    /// and nothing is retried.
+    ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     async fn boxes(&self) -> Result<Vec<BoxRecord>> {
+        let mut tx = begin_repeatable_read(&self.pool).await?;
         let rows = sqlx::query!(
             r#"
             SELECT id AS "id: BoxId", user_id AS "user_id: htui_core::model::UserId", hostname,
@@ -949,30 +955,33 @@ impl WriteStore for PgStore {
             "#,
             self.this_user().as_uuid(),
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(map_sqlx)?;
 
         let ids: Vec<Uuid> = rows.iter().map(|row| row.id.as_uuid()).collect();
-        let mut tools = sqlx::query!(
+        let tools = sqlx::query!(
             r#"
             SELECT box_id AS "box_id: BoxId", name, version, path, probed_at
               FROM box_tool WHERE box_id = ANY($1) ORDER BY box_id, name COLLATE "C"
             "#,
             &ids,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(map_sqlx)?
-        .into_iter()
-        .map(|tool| BoxTool {
-            box_id: tool.box_id,
-            name: tool.name,
-            version: tool.version,
-            path: tool.path,
-            probed_at: tool.probed_at,
-        })
-        .peekable();
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+
+        let mut tools = tools
+            .into_iter()
+            .map(|tool| BoxTool {
+                box_id: tool.box_id,
+                name: tool.name,
+                version: tool.version,
+                path: tool.path,
+                probed_at: tool.probed_at,
+            })
+            .peekable();
 
         Ok(rows
             .into_iter()
