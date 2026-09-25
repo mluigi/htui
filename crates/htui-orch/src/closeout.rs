@@ -7,8 +7,8 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    DocumentHead, DocumentId, Item, NewDocument, Repo, RepoId, RunId, RunStepCommit, RunSummary,
-    Status, StepId, UserId,
+    DocumentHead, DocumentId, Item, NewDocument, Repo, RepoId, Resolution, RunId, RunStepCommit,
+    RunSummary, Status, StepId, UserId,
 };
 
 /// `document.kind` of the close-out summary (ANA-2 §4.10).
@@ -23,6 +23,8 @@ pub struct Preview {
     pub title: String,
     /// `item.status` now.
     pub status: Status,
+    /// What the close-out closes as: `Resolution::default_for(status)` until MOD-39.
+    pub resolution: Resolution,
     /// Runs of the item the summary lists.
     pub runs: usize,
     /// `(repo, step)` rows with an `after_hash`: the commit table's length.
@@ -33,10 +35,12 @@ pub struct Preview {
 
 /// The first confirmation's figures, counted over exactly what [`summary`] would write.
 ///
-/// `version` reads only `heads` of this item whose kind is `summary`.
+/// `version` reads only `heads` of this item whose kind is `summary`; `resolution` is the
+/// caller's, carried through so the confirmation and the command name the same one.
 #[must_use]
 pub fn preview(
     item: &Item,
+    resolution: Resolution,
     runs: &[RunSummary],
     commits: &[(StepId, Vec<RunStepCommit>)],
     heads: &[DocumentHead],
@@ -51,6 +55,7 @@ pub fn preview(
         key: item.key.clone(),
         title: item.title.clone(),
         status: item.status,
+        resolution,
         runs: runs.len(),
         rows: rows(runs, commits, &[]).len(),
         version,
@@ -588,13 +593,14 @@ mod tests {
         let repos = [repo(1, "htui"), repo(2, "docs")];
         let doc = write(&runs, &commits, &repos);
 
-        let first = preview(&item(), &runs, &commits, &[]);
+        let first = preview(&item(), Resolution::Done, &runs, &commits, &[]);
         assert_eq!(
             first,
             Preview {
                 key: "FEAT-1".to_owned(),
                 title: "Close me".to_owned(),
                 status: Status::Done,
+                resolution: Resolution::Done,
                 runs: 1,
                 rows: table_rows(&doc.body).len(),
                 version: 1,
@@ -604,6 +610,9 @@ mod tests {
 
         // Another kind's versions are not the summary's.
         let heads = [head(1, "summary"), head(2, "summary"), head(7, "plan")];
-        assert_eq!(preview(&item(), &runs, &commits, &heads).version, 3);
+        assert_eq!(
+            preview(&item(), Resolution::Done, &runs, &commits, &heads).version,
+            3
+        );
     }
 }

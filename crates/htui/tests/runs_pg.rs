@@ -756,7 +756,12 @@ async fn close_out_is_one_transaction_on_postgres() {
     assert_eq!(stack.run(run).await.status, RunStatus::AwaitingApproval);
 
     let documents_before = stack.documents(item).await;
-    stack.command(Command::CloseOut { item }).await;
+    stack
+        .command(Command::CloseOut {
+            item,
+            resolution: Resolution::Done,
+        })
+        .await;
     let refused = stack.take_status().expect("the close-out was refused");
     assert!(
         refused.starts_with("close_out: ") && refused.contains(&run.to_string()),
@@ -838,7 +843,12 @@ async fn close_out_is_one_transaction_on_postgres() {
     );
 
     let documents_before = documents_before.len();
-    stack.command(Command::CloseOut { item }).await;
+    stack
+        .command(Command::CloseOut {
+            item,
+            resolution: Resolution::Done,
+        })
+        .await;
     assert_eq!(stack.take_status(), None, "the close-out was accepted");
     let summaries = stack.summaries(item).await;
     assert_eq!(summaries.len(), 1, "exactly one summary: {summaries:?}");
