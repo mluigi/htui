@@ -27,8 +27,10 @@ orchestrator runs in manual mode across all six milestones. `htui-orch` walks st
 the review loop, judged fan-out and four git isolation modes under a leased heartbeat and a recovery
 sweep, and `run_worker.rs` and the Runs pane let the maintainer drive it, promote a step to chat and
 close an item out. Its carried risks are **MOD-37** and **CLEAN-4**.
-**Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration` and
-`0004_max_agents_per_run_default` (cache: `0001`..`0003`), so **the next migration is `0005`**.
+**Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
+`0004_max_agents_per_run_default` and `0005_box_identity` (MOD-7 milestone 1; cache: `0001`..`0003`),
+so **the next migration is `0006`**. Pins moved by MOD-7 milestone 1: store `CASES` 56,
+`StoreRequest` 64, `StoreReply` 35, 234 `.sqlx` files.
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins at MOD-4's close
 (`22cfeea`): store conformance `CASES` 53, `READ_CASES` 9, `htui-orch` `CASES` 70, `StoreRequest`
 62 variants, 227 `.sqlx` files; `cargo doc --workspace --no-deps` shows exactly two baseline errors
@@ -273,6 +275,20 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   the text above: `repo_box_path` **does** have a writer, MOD-15's `SetRepoPath`
   (`crates/htui/src/hierarchy.rs`), which canonicalises the root and so honours F-102; what is
   missing is automatic inference (D5), now in scope with a manual text box as fallback.
+  **Milestone 1 landed (`27c4318`..`670c108`, 2026-09-25), "a box knows itself"**
+  (`.claude/plans/mod-7-box-identity-probe.plan.md`, `.claude/plans/mod-7-box-identity-probe.blueprint.md`): migration `0005_box_identity`
+  drops `UNIQUE (user_id, hostname)` and adds `machine_fingerprint`, `edit_version` (milestone 2's
+  CAS token, unused yet) and `probe_spec_digest`; `register_box` keys on the `box.toml` id, insert
+  first, and a stored keyed-HMAC fingerprint that disagrees mints a new box (`Registration::Copied`,
+  never adoption); a failed `box.toml` write-back stays online under the minted id for the session.
+  `htui_agent::box_probe` fills hardware (`sysinfo`; GPU per OS), `box_tool` and `probed_tags` from a
+  seed `spec.json` (39 tools, 14 tag rules) overlaid by name from `app_setting.box_probe_spec`; it runs
+  after an `Online` swap when never probed, on an `htui` version change or a spec digest change, then
+  probes the agents and names installable `missing` ones on the status line (never installs);
+  `StoreRequest::ProbeBox` exists, bound to no key. `WriteStore` gained `record_box_probe` and
+  `boxes`. **Open at milestone 1's close:** R-18, macOS `xcode-select` stubs (`/usr/bin/git` and
+  others) open an install dialog when probed on a Mac without the Command Line Tools — deferred until
+  someone verifies macOS, guard sketched in the blueprint §11; the Windows facts moved to MOD-16.
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails. Replace the typed fallback with a popup window that browses the box's
@@ -411,6 +427,15 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   is this item's. **R-45**: `htui` now links `gix`, `process-wrap` and `walkdir` through `htui-orch`.
   MOD-4 also made the `git` CLI (≥ 2.33.0) a runtime dependency of the `worktree` mode and of
   reconciliation, and none of those `git` calls has run on Windows.
+  **MOD-7 milestone 1 added a fourth body** (`.claude/plans/mod-7-box-identity-probe.blueprint.md`
+  §11), unlinted for the TOOL-3 reason and reviewed by eye: the `MachineGuid` fingerprint reader
+  (`htui-store/src/identity.rs`, `windows-registry`); `sysinfo`'s OS, CPU and RAM facts; the GPU
+  scan through an absolute-path `powershell.exe` CIM query (`htui-agent/src/box_probe/hardware.rs`);
+  and two box-probe behaviours only a Windows box shows — the seed's `bash` resolving to the WSL
+  launcher `%SystemRoot%\System32\bash.exe`, which boots the WSL VM and records the distro's bash
+  (documented, turned off by `{"tools":{"bash":{"disabled":true}}}` in `box_probe_spec`; a code fix
+  that names no tool is this item's call), and the Microsoft Store `python3` stub, which the probe now
+  skips by trying each name until one prints a version (verify it holds).
 
 - [ ] **MOD-22 - Complete a loopback OAuth login from a box the browser cannot reach** (from MOD-21).
   `R-AGT-9`, `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent's own login flow redirects to a
