@@ -75,6 +75,24 @@ impl TerminalGuard {
     }
 }
 
+impl crate::editor::Suspend for TerminalGuard {
+    /// Show the cursor (every draw hid it), then `ratatui::try_restore` (MOD-9 D22). `restored` is
+    /// not touched: this is a pause, not the end.
+    fn leave(&mut self) -> std::io::Result<()> {
+        self.terminal.show_cursor()?;
+        ratatui::try_restore()
+    }
+
+    /// Raw mode and the alternate screen back, then `Terminal::clear`, which resets the back
+    /// buffer so the next draw is whole (`ratatui-core-0.1.2/src/terminal/buffers.rs:147-173`).
+    /// Not `ratatui::init()`: that would stack another panic hook (`init.rs:397-403`).
+    fn enter(&mut self) -> std::io::Result<()> {
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        self.terminal.clear()
+    }
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         self.restore();

@@ -5,9 +5,11 @@
 //! [`ExternalEdit`]; the event loop takes it, calls [`run_suspended`] with the real terminal, and
 //! hands the [`ExternalEditOutcome`] back to the tab (MOD-9 D10).
 
-use std::io;
+use std::io::{self, Write as _};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use htui_core::prompt::render::normalise_newlines;
 
 /// Below this, an unchanged return is reported as "quick" (MOD-9 blueprint D24): the shape of a
 /// GUI editor started without `--wait`, which returns at once and leaves the file untouched.
@@ -36,8 +38,20 @@ impl EditorCommand {
     /// `VISUAL`, then `EDITOR` (first non-blank after trim), else `vi` (unix) / `notepad`
     /// (windows) with `fallback: true`.
     pub fn resolve(lookup: impl Fn(&str) -> Option<String>) -> Self {
-        let _ = lookup;
-        todo!()
+        ["VISUAL", "EDITOR"]
+            .into_iter()
+            .filter_map(lookup)
+            .find_map(|value| {
+                let value = value.trim();
+                (!value.is_empty()).then(|| Self {
+                    value: value.to_owned(),
+                    fallback: false,
+                })
+            })
+            .unwrap_or_else(|| Self {
+                value: FALLBACK.to_owned(),
+                fallback: true,
+            })
     }
 
     /// [`resolve`](Self::resolve) over `std::env::var`.
@@ -56,12 +70,27 @@ impl EditorCommand {
     ///
     /// Unix: `sh -c "<value> \"$1\"" htui-editor <file>`, so the shell parses `value` as the
     /// user's own shell would (git runs `$EDITOR` the same way) and the file is a positional
-    /// argument, never spliced into the script. Windows: `cmd /S /C ""<value>" "<file>""` as one raw
-    /// argument; `/S` makes `cmd` strip exactly the outer pair of quotes.
+    /// argument, never spliced into the script. Windows: `cmd /S /C "<value> "<file>""` as one
+    /// raw argument; `/S` makes `cmd` strip exactly the outer pair of quotes.
     #[must_use]
     pub fn command(&self, file: &Path) -> std::process::Command {
-        let _ = file;
-        todo!()
+        #[cfg(not(windows))]
+        {
+            let mut command = std::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(format!("{} \"$1\"", self.value))
+                .arg("htui-editor")
+                .arg(file);
+            command
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            let mut command = std::process::Command::new("cmd");
+            command.raw_arg(format!("/S /C \"{} \"{}\"\"", self.value, file.display()));
+            command
+        }
     }
 }
 
@@ -122,8 +151,67 @@ pub trait Suspend {
 /// temp file is removed on every path out, a dropped future included, and the editor child is
 /// killed if the future is dropped (D25).
 pub async fn run(cmd: &EditorCommand, text: &str, stem: &str) -> ExternalEditOutcome {
-    let _ = (cmd, text, stem);
-    todo!()
+    use ExternalEditOutcome::{Edited, Failed, Unchanged};
+
+    let stem = sanitise(stem);
+    let mut file = match tempfile::Builder::new()
+        .prefix(&format!("htui-{stem}-"))
+        .suffix(".md")
+        .tempfile()
+    {
+        Ok(file) => file,
+        Err(err) => return Failed(format!("could not create a temp file: {err}")),
+    };
+    if let Err(err) = file.write_all(text.as_bytes()) {
+        return Failed(format!("could not write the temp file: {err}"));
+    }
+    // Closes the handle (a Windows editor could not write over it otherwise); the path is removed
+    // when `path` drops, on every path out of here, the dropped-future one included.
+    let path = file.into_temp_path();
+
+    let started = Instant::now();
+    let status = tokio::process::Command::from(cmd.command(&path))
+        .kill_on_drop(true)
+        .status()
+        .await;
+    let elapsed = started.elapsed();
+    let status = match status {
+        Ok(status) => status,
+        Err(err) => return Failed(start_failure(cmd, &err.to_string())),
+    };
+    if !status.success() {
+        // The platform shell started and could not start the editor (F-D, D23).
+        if status.code().is_some_and(is_start_failure) {
+            return Failed(start_failure(cmd, "not found or not executable"));
+        }
+        let code = status
+            .code()
+            .map_or_else(|| "a signal".to_owned(), |code| code.to_string());
+        return Failed(format!(
+            "`{}` exited with {code}; nothing was changed",
+            cmd.value()
+        ));
+    }
+
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return Failed(format!(
+                "could not read the edited file back ({err}); nothing was changed"
+            ));
+        }
+    };
+    let Ok(read) = String::from_utf8(bytes) else {
+        return Failed("the edited file is not UTF-8; nothing was changed".to_owned());
+    };
+    let edited = normalise_newlines(&read);
+    if edited == normalise_newlines(text) {
+        Unchanged {
+            quick: elapsed < QUICK_EXIT,
+        }
+    } else {
+        Edited(edited)
+    }
 }
 
 /// [`run`] with the terminal given to the editor and taken back (D9, D21).
@@ -141,21 +229,84 @@ pub async fn run_suspended<S: Suspend>(
     cmd: &EditorCommand,
     edit: &ExternalEdit,
 ) -> io::Result<ExternalEditOutcome> {
-    let _ = (term, cmd, edit);
-    todo!()
+    if let Err(err) = term.leave() {
+        // Undo a half-leave: `try_restore` may have left raw mode and failed on the screen (F-O).
+        term.enter()?;
+        return Ok(ExternalEditOutcome::Failed(format!(
+            "could not leave the TUI: {err}"
+        )));
+    }
+    let resume = Resume { term, armed: true };
+    let outcome = run(cmd, &edit.text, &edit.stem).await;
+    resume.finish()?;
+    Ok(outcome)
+}
+
+/// Re-enters the TUI if [`run_suspended`]'s future is dropped while the editor runs (D21).
+struct Resume<'a, S: Suspend> {
+    /// The terminal that was left.
+    term: &'a mut S,
+    /// Whether `Drop` still owes an `enter`.
+    armed: bool,
+}
+
+impl<S: Suspend> Resume<'_, S> {
+    /// The normal path: disarm, then `enter` with its error reported (F-I).
+    fn finish(mut self) -> io::Result<()> {
+        self.armed = false;
+        self.term.enter()
+    }
+}
+
+impl<S: Suspend> Drop for Resume<'_, S> {
+    fn drop(&mut self) {
+        // A dropped future: nothing can report the error, so the best effort is to re-enter. Not
+        // while panicking: both hooks and `TerminalGuard::drop` restore on that path, and
+        // re-entering here would leave the alternate screen up behind the panic message.
+        if self.armed && !std::thread::panicking() {
+            let _ = self.term.enter();
+        }
+    }
+}
+
+/// Whether an exit code is the platform shell saying the editor could not start (D23): `sh`'s 127
+/// (not found) and 126 (not executable), `cmd`'s 9009.
+fn is_start_failure(code: i32) -> bool {
+    if cfg!(windows) {
+        code == 9009
+    } else {
+        code == 127 || code == 126
+    }
 }
 
 /// The temp-file stem: `[A-Za-z0-9_-]`, anything else `_`, at most [`STEM_MAX`] chars (D25).
 fn sanitise(stem: &str) -> String {
-    let _ = stem;
-    todo!()
+    stem.chars()
+        .take(STEM_MAX)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// The sentence for an editor that could not start (D23): it names `$VISUAL`/`$EDITOR`, and says
 /// neither is set when `cmd` is the platform fallback (F-M).
 fn start_failure(cmd: &EditorCommand, why: &str) -> String {
-    let _ = (cmd, why);
-    todo!()
+    if cmd.fallback {
+        format!(
+            "no $VISUAL or $EDITOR is set and `{}` could not start ({why})",
+            cmd.value
+        )
+    } else {
+        format!(
+            "could not start `{}` ({why}) — set $VISUAL or $EDITOR",
+            cmd.value
+        )
+    }
 }
 
 #[cfg(test)]
@@ -549,7 +700,7 @@ mod tests {
             // `exec`, so the child `kill_on_drop` reaps is the `sleep` itself.
             let cmd = script(&dir, "slow", "exec sleep 5");
             let mut term = FakeTerminal::default();
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let result = tokio::time::timeout(
                 Duration::from_millis(50),
                 run_suspended(&mut term, &cmd, &edit()),
