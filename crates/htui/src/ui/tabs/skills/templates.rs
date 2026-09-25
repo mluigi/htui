@@ -24,6 +24,7 @@ use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplatesSnapshot};
+use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{AreaOutcome, FieldOutcome, TextArea, TextField, Theme, diff};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -73,6 +74,9 @@ const WAIT_FLAG: &str = " \u{2014} a GUI editor needs its wait flag, e.g. `code 
 const BROWSE_HINT: &str = "j/k move  ,/. version  b base  d diff  D default  e edit  E $EDITOR  \
                            n new  r reload  h/l view";
 
+/// The pane's bottom border while its lines overflow it.
+const SCROLL_HINT: &str = " J/K PgUp/PgDn scroll ";
+
 /// The hint row while naming a new template.
 const NAMING_HINT: &str = "Enter create  Esc cancel";
 
@@ -111,6 +115,12 @@ pub(super) struct TemplatesView {
     base: Option<DiffBase>,
     /// Which pane the Browse layout shows.
     pane: Pane,
+    /// The pane's first drawn row (`J`/`K`, `PageDown`/`PageUp`). Back to the top whenever the
+    /// pane shows something else: another row, another version, the other pane.
+    scroll: Scroll,
+    /// The pane's rows at the last draw, what [`scroll`](TemplatesView::scroll) clamps against. A
+    /// `Cell` for [`page`](TemplatesView::page)'s reason.
+    pane_rows: Cell<usize>,
     /// Browsing, naming a new template, or editing one.
     mode: Mode,
     /// The write in flight, by `StoreRequest::name`. One at a time (`settings/prompt.rs`'s rule):
@@ -443,6 +453,9 @@ impl TemplatesView {
                 ctx.request(StoreRequest::Templates(ctx.scope.clone()));
             }
             KeyCode::Char('n') => self.open_naming(),
+            KeyCode::Char('J' | 'K') | KeyCode::PageDown | KeyCode::PageUp => {
+                return self.scroll.on_key(key, self.pane_rows.get());
+            }
             KeyCode::Char(c @ (',' | '.' | 'b' | 'd' | 'D' | 'e' | 'E')) => {
                 self.notice = None;
                 match self.selected_template() {
@@ -491,6 +504,7 @@ impl TemplatesView {
                 };
                 let version = versions.get(index).map_or(head, |row| row.version);
                 self.shown = (version != head).then_some(version);
+                self.scroll.reset();
             }
             'b' => {
                 self.base = Some(DiffBase::Version(shown_version));
@@ -499,18 +513,21 @@ impl TemplatesView {
             'd' => {
                 if self.pane == Pane::Diff {
                     self.pane = Pane::Body;
+                    self.scroll.reset();
                 } else if self.base.is_none() && !has_earlier {
                     self.notice = Some(Notice::Info(format!(
                         "v{shown_version} has no earlier version"
                     )));
                 } else {
                     self.pane = Pane::Diff;
+                    self.scroll.reset();
                 }
             }
             'D' => {
                 if body_of(&name).is_some() {
                     self.base = Some(DiffBase::Default);
                     self.pane = Pane::Diff;
+                    self.scroll.reset();
                 } else {
                     self.notice = Some(Notice::Info(format!("`{name}` has no compiled default")));
                 }
@@ -542,6 +559,7 @@ impl TemplatesView {
             return;
         };
         self.notice = None;
+        self.scroll.reset();
         self.mode = Mode::Naming {
             project,
             field: TextField::new(),
@@ -747,7 +765,8 @@ impl TemplatesView {
             .or_else(|| snapshot.head(project, name))
     }
 
-    /// `j`/`k`: one row, no wrap; the version, the base and the pane go back to the head's body.
+    /// `j`/`k`: one row, no wrap; the version, the base and the pane go back to the head's body,
+    /// from its top.
     fn move_cursor(&mut self, down: bool) {
         let last = self.rows().len().saturating_sub(1);
         self.cursor = if down {
@@ -758,6 +777,7 @@ impl TemplatesView {
         self.shown = None;
         self.base = None;
         self.pane = Pane::Body;
+        self.scroll.reset();
         self.notice = None;
     }
 
@@ -802,6 +822,7 @@ impl TemplatesView {
         self.shown = None;
         self.base = None;
         self.pane = Pane::Body;
+        self.scroll.reset();
         if let Some(index) = self.rows().iter().position(|row| *row == saved) {
             self.cursor = index;
         }
@@ -869,15 +890,33 @@ impl TemplatesView {
             inner,
         );
 
-        let (title, lines) = self.pane(pane_area.width.saturating_sub(2), ctx);
-        let block = Block::new().borders(Borders::ALL).title(title);
+        // The body and the diff wrap: a default body's lines run to 150-200 columns, and a change
+        // past the pane's edge would be off screen. The row count is a character wrap's, a lower
+        // bound on the word wrap's (`Scroll`'s rule), so the clamp never scrolls the pane blank.
+        let width = pane_area.width.saturating_sub(2);
+        let (title, lines) = self.pane(width, ctx);
+        let rows: usize = lines
+            .iter()
+            .map(|line| line.width().div_ceil(usize::from(width).max(1)).max(1))
+            .sum();
+        self.pane_rows.set(rows);
+        let mut block = Block::new().borders(Borders::ALL).title(title);
+        let visible = usize::from(pane_area.height.saturating_sub(2));
+        if rows > visible || self.scroll.offset() > 0 {
+            block = block.title_bottom(Line::styled(SCROLL_HINT, theme.dim).right_aligned());
+        }
         let inner = block.inner(pane_area);
         frame.render_widget(block, pane_area);
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((self.scroll.offset(), 0)),
+            inner,
+        );
     }
 
     /// The right-hand pane's title and lines: the name prompt, a refusal, the empty states, the
-    /// shown body, or the diff.
+    /// shown body, or the diff. The caller wraps and scrolls them.
     fn pane(&self, width: u16, ctx: &Ctx<'_>) -> (String, Vec<Line<'static>>) {
         let theme = ctx.theme;
         if let Mode::Naming { project, field } = &self.mode {
