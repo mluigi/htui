@@ -83,6 +83,70 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
 
 ### Next features
+- [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
+  `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
+  no other item owns them. Each is small, known and recorded; none blocks a manual run today. Pick
+  them off singly or in batches. Sources are under `.claude/plans/mod-4-orch-*`, and the context is
+  in the MOD-4 write-up's "Carried" section (`docs/decisions/mod/mod-4.md`).
+  - **R-3**: a parked run's `run.failure` stays NULL. The reason lives only in the step's
+    `gate_note` and the `item_note`, and the Runs pane shows `awaiting_approval` without it, because
+    adding `gate_note` to `RunStepSummary` touches three builders and the mirror (engine blueprint
+    F-I; drive plan, "What this milestone touches").
+  - **R-5**: the gate park is three compare-and-sets (step, run, item), not one transaction on
+    Postgres; milestone 5's D96 closed its crash half. Nothing writes `gate_outcome = skipped`, so a
+    `never`/`on_failure` pass leaves the gate NULL and the step list renders `—` (engine blueprint
+    F-K, H-9, H-10; drive plan, "What this milestone touches").
+  - **R-29**: Postgres stores `queued_at` in microseconds and `MemStore` in nanoseconds, so a
+    sub-microsecond tie can name a different `Overlaps.with` (lease blueprint §21.2).
+  - **R-30**: `recover::classify` counts a step as finished only when every `run_scope` repo has an
+    `after_hash`. A step that changed only some repos and crashed after capture is retried rather
+    than adopted. The failure is safe, a retry and never a wrong merge (lease blueprint §21.2).
+  - **R-31, the rejected-crash remainder**: a crash right after `AnswerGate(Rejected)` stays parked
+    on a failed step with no resume path. The rest of R-31 was closed by milestone 6's D180 (lease
+    blueprint §22.3; drive plan D180).
+  - **R-32**: D131's not-reset park loses its labelled detail, and D138's `part_way` turns an `Io`
+    error into a `Git` error. Both are diagnostics only (lease blueprint §22.3).
+  - **R-37**: `git::reconcile_parent` opens the checkout up to six times per diff row, and `merge_of`
+    walks the primary's first-parent history back to the step's base. This costs speed only. The
+    fix is to open the repository once and pass `&gix::Repository` to private `*_in` variants (lease
+    blueprint §23.4).
+  - **R-38**: preempting a running step (`cancel`, `promote`) kills the agent without ANA-4 §4.3's
+    grace window and without answering parked permission requests. A graceful path needs a cancel
+    seam inside `pump` (drive plan, Risks).
+  - **R-40**: `RunStream` frames are sent at session end and at rest only, so a step's
+    `pending → running` is not signalled to the Runs pane. The next frame, or re-selecting the item,
+    shows it. The fix is a step-start hook (drive plan, Risks).
+  - **R-41**: an `Orch` reply can arrive hours after its request, and a newer `Orch` request from
+    the same origin makes it stale, so it is dropped (`App::is_fresh`). The walk's result still
+    reaches the pane as a `RunStream` frame and through the rows (drive plan, Risks).
+  - **R-44**: step rows at 43 columns truncate `agent/model` for long model ids. `…` marks the cut
+    and the width test keeps it from clipping silently (drive plan, Risks).
+  - **R-46**: a walk task keeps the `Backend` clone it started with. After an `Online → Offline`
+    swap its `PgStore` handle keeps failing until the heartbeat fences, and the sweep after reconnect
+    adopts the run (drive plan, Risks).
+  - **R-48**: the ACP driver ignores `SessionSpec.resume` (only `cli/mod.rs` reads it), so a
+    promoted ACP step always gets the handoff prompt and a fresh model context. It needs ACP
+    `session/load`. The blueprint named "a MOD-2 follow-up" as the owner, and MOD-2 is closed (drive
+    blueprint §18).
+  - **R-49**: a promoted chat works in the step's tree without the `shared_serialized` `(box, repo)`
+    guard. The guard was released at `capture` or by `abandoned`, so another run may `prepare` the
+    same checkout meanwhile. The fix is to take the guard again in `attach_promoted` (drive
+    blueprint §18).
+  - **R-51**: a command on a run with a live walk waits for the whole walk (D157), and the pane shows
+    nothing while it waits. The fix is a "waiting" frame (drive blueprint §18).
+  - **R-53**: `ItemActions` is as of the last `Runs` reply, so a verdict can flip before the key is
+    pressed. The engine re-checks with the same admission function (D184) and the pane re-reads
+    (D171) (drive blueprint §18).
+  - **R-55**: `box.settings.command_limits` is read once per process, per server, so an edit does not
+    reach a running process's verifier until a restart or a server switch. Nothing edits it today;
+    whoever adds an editor re-reads the limits or rebuilds the verifier when no walk is live (drive
+    blueprint §21.3).
+  - **T7's residual window**: a promoted chat first streams at the promotion's `Orch` address and
+    moves to its own once the Chat tab's `ChatFollow` is served. Between the chat's `ChatAccepted`
+    and that `ChatFollow`, a second `Orch` request from the Chat tab supersedes the address, so the
+    frames sent in between are dropped from the view as stale while the store keeps recording them.
+    A promotion refused at the bind is already handed the stream (blueprint D185); the interval
+    before the follow is served is not covered (T7 repair `9f7cc5c`, `agent_worker.rs` `Stream`).
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
   OQ-7; blocked on ANA-21). `R-AGT-8`, `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
   one agent the walk selects (rival sampling). This item spreads candidates across the eligible
@@ -552,6 +616,14 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 
 ### Deferred backlog
 
+- [ ] **CLEAN-4 - `LoopStop::NoProgressReview` is unreachable** (from MOD-4, risk R-9). `R-ORCH-3`.
+  The review loop's no-progress predicate has two halves, and only the `after_hash` half can fire.
+  `gate::reviews_are_identical` reads through the latest-only `documents_of_kinds`, so it can never
+  hold two review documents to compare, and `LoopStop::NoProgressReview` has been unreachable since
+  milestone 2. No test reaches it; only its `Display` is tested. Fix it through `documents()` heads,
+  in a change that first pins which stop reason each shipped loop case reaches, because the fix can
+  change that. Source: `.claude/plans/mod-4-orch-fanout.blueprint.md` F-B and §11, carried unchanged
+  through milestones 5 and 6 (`docs/decisions/mod/mod-4.md`, "Carried").
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -589,6 +661,6 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-11 requirements/decisions models, ANA-16 execution environments, ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 23 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 0                                                                                        |
+| MOD-N   | 24 (MOD-4 orchestrator, MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
