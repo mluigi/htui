@@ -1744,7 +1744,11 @@ impl AgentRuntime {
         // arguments **move** into whichever trigger gets them — the staleness one consumes them
         // here, and D60's arm below is the only other place they can go, so neither path clones
         // what the other threw away.
-        let stale = needs_reprobe(&summary.agent, summary.on_box.as_ref(), Utc::now());
+        //
+        // MOD-7 blueprint D27: nor while a box probe runs, which ends by re-probing every agent
+        // row on this box anyway; a staleness re-probe beside it would race it for this row.
+        let stale = needs_reprobe(&summary.agent, summary.on_box.as_ref(), Utc::now())
+            && !self.box_probe_running();
         let reprobe = match (stale, reprobe) {
             (true, Some(args)) => {
                 self.background.push(tokio::spawn(run_reprobe(args)));
