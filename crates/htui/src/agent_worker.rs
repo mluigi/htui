@@ -27,6 +27,8 @@ use htui_agent::auth::{
     AUTH_IDLE_CAP, AuthChoice, AuthEvent, AuthFlow, AuthOutcome, BrowserPolicy, OpenerCommand,
     open_url,
 };
+use htui_agent::box_probe;
+use htui_agent::box_probe::hardware::{HardwareSource, SystemHardware};
 use htui_agent::driver::{
     AgentDriver, AgentSession, DriverCaps, PermissionAnswer, PermissionPolicy, PermissionRequestId,
     SessionSpec,
@@ -60,7 +62,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::store_worker::{
     AuthFrame, ChatFrame, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply,
-    StoreRequest,
+    StoreRequest, UNSOLICITED,
 };
 
 /// How long a cancelled session may take the graceful path before its tree is killed.
@@ -84,6 +86,43 @@ pub const PROBE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// `project.settings.keep_raw_events` is the real source and has no reader until MOD-15; this is
 /// the stand-in, and the default is `false`.
 pub const KEEP_RAW_ENV: &str = "HTUI_KEEP_RAW_EVENTS";
+
+/// What `claim_is_free`, `probe` and `ProbeBox` refuse with while a box probe holds the slot
+/// (MOD-7 blueprint D27).
+pub const BOX_PROBE_RUNNING: &str =
+    "a box probe is running on this box; try again once it has finished";
+
+/// What one box probe did (MOD-7 D13, blueprint D25): the only thing the box probe task ever
+/// sends.
+///
+/// A failure is a field here rather than a [`StoreReply::Failed`], because the registration probe
+/// answers at [`UNSOLICITED`] and the shell surfaces a `Failed` only below its freshness gate,
+/// which drops that address (blueprint F-D). `observe_reply` sits above the gate and renders
+/// [`status_line`](Self::status_line) whatever the address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoxProbeReport {
+    /// `box_tool` rows written.
+    pub tools: usize,
+    /// `box.probed_tags` written.
+    pub probed_tags: Vec<String>,
+    /// Enabled agents whose fresh row is `missing` and whose launch declares `discovery.install`.
+    pub installable: Vec<String>,
+    /// The agent half's failure, when it had one.
+    pub agents_failed: Option<String>,
+    /// `EffectiveSpec::error`: why a stored `box_probe_spec` was ignored.
+    pub spec_error: Option<String>,
+    /// The box half's failure (no box, a read or the write); nothing was written.
+    pub box_failed: Option<String>,
+}
+
+impl BoxProbeReport {
+    /// The status-line sentence (blueprint D25): the head, then the install offer, the agent
+    /// half's failure and the ignored spec, each only when there is one.
+    #[must_use]
+    pub fn status_line(&self) -> String {
+        todo!("MOD-7 T4 (c)")
+    }
+}
 
 /// Where a reply goes: the request that asked, by `seq` and origin.
 #[derive(Debug, Clone)]
@@ -345,6 +384,23 @@ pub struct AgentRuntime {
     /// [`OpenerCommand::Platform`] in production. The injected seam a login case needs: `set_var`
     /// is forbidden here, so a test that must not launch the maintainer's browser says so as data.
     opener: OpenerCommand,
+    /// The box probe running right now, if any (MOD-7 D11, blueprint D27).
+    ///
+    /// One deep, and it holds the same claim as the install, the login and the agent probe: it
+    /// ends by probing every agent row on this box, which writes `agent_box`. Swept when finished,
+    /// awaited by [`finish_background`](Self::finish_background), aborted by
+    /// [`shutdown`](Self::shutdown); its version children die with their `ChildGuard`s.
+    box_probe: Option<JoinHandle<()>>,
+    /// Whether [`on_online`](Self::on_online) probes at all (MOD-7 D11). Only the binary's entry
+    /// point opts in, through [`with_registration_probe`](Self::with_registration_probe): a test
+    /// or harness that drives an `Online` swap never probes the maintainer's box by accident.
+    registration_probe: bool,
+    /// The env every box probe and `ProbeAgents` resolve through when a test injected one
+    /// (blueprint D35); `None` is [`ProbeEnv::host`] over the working directory.
+    probe_env: Option<ProbeEnv>,
+    /// The hardware seam the box probe reads when a test injected one; `None` is
+    /// [`SystemHardware::host`].
+    hardware: Option<Arc<dyn HardwareSource>>,
 }
 
 impl core::fmt::Debug for AgentRuntime {
@@ -352,6 +408,7 @@ impl core::fmt::Debug for AgentRuntime {
         f.debug_struct("AgentRuntime")
             .field("adapters", &self.factory.adapter_ids())
             .field("live", &self.live.len())
+            .field("box_probe", &self.box_probe.is_some())
             .finish()
     }
 }
@@ -372,7 +429,49 @@ impl AgentRuntime {
             install: None,
             auth: None,
             opener: OpenerCommand::Platform,
+            box_probe: None,
+            registration_probe: false,
+            probe_env: None,
+            hardware: None,
         }
+    }
+
+    /// Opts in to the registration probe (MOD-7 D11): only the binary's entry point does.
+    #[must_use]
+    pub fn with_registration_probe(mut self) -> Self {
+        self.registration_probe = true;
+        self
+    }
+
+    /// The env and hardware every box probe and `ProbeAgents` use (MOD-7 D11, blueprint D35).
+    ///
+    /// The injected seam H-7 needs: a test hands in a fake `PATH` and fixed facts, so no case
+    /// spawns a real host tool or reads this box's hardware.
+    #[must_use]
+    pub fn with_probe_env(mut self, env: ProbeEnv, hardware: Arc<dyn HardwareSource>) -> Self {
+        self.probe_env = Some(env);
+        self.hardware = Some(hardware);
+        self
+    }
+
+    /// Whether a box probe is still running.
+    #[must_use]
+    pub fn box_probe_running(&self) -> bool {
+        self.box_probe
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
+    /// Called by the store loop right after each `go_online` (MOD-7 D11, blueprint D26). Awaits
+    /// nothing: at most it spawns the registration probe into the box probe slot, whose task
+    /// decides whether this box needs one.
+    ///
+    /// It refuses nothing by backend kind: the two call sites are the `--demo` guard, because
+    /// `--demo` and the harness never reach a `go_online`. A claim held elsewhere skips the probe
+    /// until the next swap (R-12); nothing was recorded, so the next launch retries.
+    pub fn on_online(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
+        let _ = (backend, replies);
+        todo!("MOD-7 T4 (c)")
     }
 
     /// The production runtime: every transport this build ships, which is whatever
@@ -780,6 +879,10 @@ impl AgentRuntime {
                 Ok(served) => served,
                 Err(err) => Served::Reply(failed("probe_agents", &err)),
             },
+            StoreRequest::ProbeBox => match self.probe_box(backend, replies, addr).await {
+                Ok(served) => served,
+                Err(err) => Served::Reply(failed("probe_box", &err)),
+            },
             StoreRequest::PromptPreview {
                 item,
                 template_name,
@@ -950,6 +1053,22 @@ impl AgentRuntime {
             frames: Frames::new(replies.clone(), addr),
         })));
         Ok(Served::Deferred)
+    }
+
+    /// The [`StoreRequest::ProbeBox`] path (MOD-7 D11): the registration probe without the
+    /// "needs a probe" decision.
+    ///
+    /// Every refusal is here, **before anything is spawned**, and answered as a `Failed` at the
+    /// requester's own address (blueprint D25): no writer (offline), no box row, a claim held, no
+    /// env. From the spawn on, the task answers once with [`StoreReply::BoxProbed`].
+    async fn probe_box(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+    ) -> Result<Served, StoreError> {
+        let _ = (backend, replies, addr);
+        todo!("MOD-7 T4 (c)")
     }
 
     /// The [`StoreRequest::PromptPreview`] path (MOD-2 D102, D103, D109).
@@ -5017,6 +5136,12 @@ pub(crate) mod tests {
     /// reports `missing` and **nothing is spawned**.
     pub(crate) async fn unresolvable_registry() -> MemStore {
         let store = MemStore::demo();
+        make_unresolvable(&store).await;
+        store
+    }
+
+    /// Rewrites every registry row of `store` to [`unresolvable_registry`]'s launch (H-7).
+    pub(crate) async fn make_unresolvable(store: &MemStore) {
         for summary in store.agents().await.expect("the memory store never fails") {
             let mut agent = summary.agent;
             agent.launch = json!({
@@ -5032,7 +5157,6 @@ pub(crate) mod tests {
             });
             store.upsert_agent(&agent).await.expect("the row updates");
         }
-        store
     }
 
     /// Plan D52: with no writable registry the request is refused **before** anything is spawned.
@@ -7135,5 +7259,731 @@ done
                 opened(tmp.path())
             );
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-7: the box probe (blueprint §6.5, §6.6; H-7, F-T)
+    //
+    // Every case runs over a fake `PATH` (`fake_env`) and fixed hardware (`fake_hardware`), and
+    // every registry row is rewritten to the unresolvable launch first: nothing here spawns a
+    // real host tool or agent, and nothing reads this box's hardware.
+    // -----------------------------------------------------------------------------------------
+
+    /// A box made of directories under `tmp`: `cwd` is `tmp`, `tmp/bin` is the whole `PATH`, and
+    /// `home` is `None`, so no `~` pattern reaches the maintainer's home (blueprint F-T).
+    pub(crate) fn fake_env(tmp: &std::path::Path) -> ProbeEnv {
+        std::fs::create_dir_all(tmp.join("bin")).expect("the fixture bin");
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert(
+            "PATH".to_owned(),
+            tmp.join("bin").to_string_lossy().into_owned(),
+        );
+        ProbeEnv {
+            cwd: tmp.to_path_buf(),
+            platform: htui_agent::probe::platform_key(),
+            home: None,
+            vars,
+            versions: true,
+            version_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// Writes an executable `sh` script `name` into `tmp/bin`.
+    ///
+    /// Every script of a case is written before that case's first probe: a `fork` elsewhere while
+    /// a write handle is open makes `execve` answer `ETXTBSY` (the gate runs `--test-threads=1`).
+    #[cfg(unix)]
+    pub(crate) fn script(tmp: &std::path::Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(tmp.join("bin")).expect("the fixture bin");
+        let path = tmp.join("bin").join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// The two seeded tools every probing case finds: `cargo` (the `rust` tag) and `git`.
+    #[cfg(unix)]
+    fn standard_tools(tmp: &std::path::Path) {
+        script(tmp, "git", "echo 'git version 2.43.0'");
+        script(tmp, "cargo", "echo 'cargo 1.80.0 (376290515 2024-07-16)'");
+    }
+
+    /// Fixed facts: an AMD display device, so the seed names the GPU `amd` and derives `gpu`.
+    pub(crate) fn fake_hardware() -> Arc<dyn HardwareSource> {
+        Arc::new(box_probe::hardware::FixedHardware(
+            box_probe::hardware::Hardware {
+                os_version: "Test OS 1".to_owned(),
+                cpu: "Test CPU".to_owned(),
+                ram_mb: Some(2048),
+                display_vendors: vec!["0x1002".to_owned()],
+            },
+        ))
+    }
+
+    /// The runtime every registration case drives: opted in, over the fake env and hardware.
+    fn box_runtime(tmp: &std::path::Path) -> AgentRuntime {
+        AgentRuntime::new(DriverFactory::production())
+            .with_registration_probe()
+            .with_probe_env(fake_env(tmp), fake_hardware())
+    }
+
+    /// The demo world with this box never probed, and every registry row unresolvable (H-7).
+    pub(crate) async fn never_probed() -> MemStore {
+        let mut data = htui_core::fixtures::demo_data();
+        let this_box = data.this_box;
+        for row in &mut data.boxes {
+            if Some(row.id) == this_box {
+                row.last_probed_at = None;
+            }
+        }
+        let store = MemStore::from_demo(data);
+        make_unresolvable(&store).await;
+        store
+    }
+
+    /// This box's record, as `boxes()` answers it.
+    async fn this_box_record(store: &MemStore) -> htui_core::model::BoxRecord {
+        store
+            .boxes()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|record| record.row.id == ids::BOX)
+            .expect("this box is listed")
+    }
+
+    /// One `Online` swap as the store loop makes it: `on_online`, then the box task to its end.
+    async fn swap(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+    ) {
+        runtime.on_online(backend, tx);
+        runtime.finish_background(Duration::from_secs(10)).await;
+    }
+
+    /// Every reply sent so far.
+    fn sent(rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>) -> Vec<ReplyEnvelope> {
+        let mut replies = Vec::new();
+        while let Ok(reply) = rx.try_recv() {
+            replies.push(reply);
+        }
+        replies
+    }
+
+    /// The one `BoxProbed` among `replies`, at `UNSOLICITED` and `Origin::App`.
+    fn the_report(replies: &[ReplyEnvelope]) -> BoxProbeReport {
+        assert_eq!(replies.len(), 1, "exactly one reply: {replies:?}");
+        assert_eq!(replies[0].seq, UNSOLICITED);
+        assert_eq!(replies[0].origin, Origin::App);
+        let StoreReply::BoxProbed(report) = &replies[0].reply else {
+            panic!("the box task answers BoxProbed: {:?}", replies[0].reply)
+        };
+        report.clone()
+    }
+
+    /// The seed's digest.
+    fn seed_digest() -> String {
+        box_probe::spec::digest(box_probe::spec::seed())
+    }
+
+    /// A probe recorded as `record` shows it, to plant in another store.
+    fn as_probe(record: &htui_core::model::BoxRecord) -> htui_core::model::BoxProbe {
+        htui_core::model::BoxProbe {
+            box_id: record.row.id,
+            os_version: record.row.os_version.clone(),
+            cpu: record.row.cpu.clone(),
+            ram_mb: record.row.ram_mb,
+            gpu_present: record.row.gpu_present,
+            gpu_vendor: record.row.gpu_vendor.clone(),
+            tools: record
+                .tools
+                .iter()
+                .map(|tool| htui_core::model::ProbedTool {
+                    name: tool.name.clone(),
+                    version: tool.version.clone(),
+                    path: tool.path.clone(),
+                })
+                .collect(),
+            probed_tags: record.row.probed_tags.clone(),
+            htui_version: record.row.htui_version.clone(),
+            spec_digest: record
+                .probe_spec_digest
+                .clone()
+                .expect("the record was probed"),
+            probed_at: record.row.last_probed_at.expect("the record was probed"),
+        }
+    }
+
+    /// A stored overlay adding `terraform`, whose script `tool_scripts` writes.
+    fn terraform_spec() -> Value {
+        json!({
+            "tools": {
+                "terraform": {
+                    "kind": "path",
+                    "names": ["terraform"],
+                    "version": { "args": ["version"], "pattern": "^Terraform v(\\S+)" }
+                }
+            }
+        })
+    }
+
+    /// Plan D11: the first `Online` swap probes a box that was never probed, then its agents.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_online_swap_probes_a_box_that_was_never_probed() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        standard_tools(tmp.path());
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        swap(&mut runtime, &backend, &tx).await;
+
+        let record = this_box_record(&store).await;
+        assert_eq!(record.row.os_version, "Test OS 1");
+        assert_eq!(record.row.cpu, "Test CPU");
+        assert_eq!(record.row.ram_mb, Some(2048));
+        assert!(record.row.gpu_present);
+        assert_eq!(record.row.gpu_vendor.as_deref(), Some("amd"));
+        assert_eq!(record.row.htui_version, htui_store::HTUI_VERSION);
+        assert!(record.row.last_probed_at.is_some());
+        assert_eq!(record.probe_spec_digest, Some(seed_digest()));
+        let tools: Vec<(&str, &str)> = record
+            .tools
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool.version.as_str()))
+            .collect();
+        assert_eq!(tools, [("cargo", "1.80.0"), ("git", "2.43.0")]);
+        assert_eq!(record.row.probed_tags, ["gpu", "rust"]);
+
+        let agents = store.agents().await.expect("the memory store never fails");
+        assert!(agents.iter().any(|summary| summary.agent.enabled));
+        for summary in agents.iter().filter(|summary| summary.agent.enabled) {
+            let status = summary
+                .on_box
+                .as_ref()
+                .and_then(ProbeSnapshot::from_row)
+                .map(|snapshot| snapshot.status);
+            assert!(
+                matches!(status, Some(ProbeStatus::Missing)),
+                "{} was probed on this box: {status:?}",
+                summary.agent.name
+            );
+        }
+
+        let report = the_report(&sent(&mut rx));
+        assert_eq!(report.tools, 2);
+        assert_eq!(report.probed_tags, ["gpu", "rust"]);
+        assert_eq!(report.box_failed, None);
+        assert_eq!(report.agents_failed, None);
+        assert_eq!(report.spec_error, None);
+    }
+
+    /// Plan D5, D18: a reconnect at the same version and spec costs reads, not a probe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_online_swap_skips_a_box_probed_at_this_version_and_spec() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        standard_tools(tmp.path());
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        swap(&mut runtime, &backend, &tx).await;
+        the_report(&sent(&mut rx));
+        let first = this_box_record(&store).await;
+
+        swap(&mut runtime, &backend, &tx).await;
+        let replies = sent(&mut rx);
+        assert!(replies.is_empty(), "no probe, no reply: {replies:?}");
+        let second = this_box_record(&store).await;
+        assert_eq!(second.row.last_probed_at, first.row.last_probed_at);
+        assert_eq!(second.row.updated_at, first.row.updated_at);
+    }
+
+    /// Plan D5: a box probed by another `htui` is probed again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_online_swap_reprobes_after_a_version_change() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        standard_tools(tmp.path());
+        let store = never_probed().await;
+        store
+            .record_box_probe(&htui_core::model::BoxProbe {
+                box_id: ids::BOX,
+                os_version: "Old OS".to_owned(),
+                cpu: "Old CPU".to_owned(),
+                ram_mb: None,
+                gpu_present: false,
+                gpu_vendor: None,
+                tools: Vec::new(),
+                probed_tags: Vec::new(),
+                htui_version: "0.0.0".to_owned(),
+                spec_digest: seed_digest(),
+                probed_at: Utc::now() - chrono::TimeDelta::hours(1),
+            })
+            .await
+            .expect("the old probe lands");
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        swap(&mut runtime, &backend, &tx).await;
+
+        the_report(&sent(&mut rx));
+        let record = this_box_record(&store).await;
+        assert_eq!(record.row.htui_version, htui_store::HTUI_VERSION);
+        assert_eq!(record.row.os_version, "Test OS 1");
+        assert_eq!(record.tools.len(), 2);
+    }
+
+    /// Blueprint D25: `ProbeBox` is refused before anything spawns, offline and unregistered.
+    #[tokio::test]
+    async fn probe_box_is_refused_offline_before_spawning_anything() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "box-probe-test", 1)
+            .await
+            .expect("mirror");
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: None,
+        };
+        let tmp = tempfile::tempdir().expect("temp box");
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let served = runtime
+            .serve(&backend, &tx, &envelope(1, StoreRequest::ProbeBox))
+            .await;
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "probe_box");
+                assert!(
+                    message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
+                    "the offline sentence: {message}"
+                );
+            }
+            other => panic!("an offline backend refuses the box probe: {other:?}"),
+        }
+        assert!(!runtime.box_probe_running());
+        assert_eq!(runtime.background_len(), 0);
+        cache.close().await;
+
+        let backend = Backend::memory(MemStore::new());
+        let served = runtime
+            .serve(&backend, &tx, &envelope(2, StoreRequest::ProbeBox))
+            .await;
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "probe_box");
+                assert!(message.contains("not registered"), "{message}");
+            }
+            other => panic!("an unregistered box refuses the box probe: {other:?}"),
+        }
+        assert!(!runtime.box_probe_running());
+        assert_eq!(runtime.background_len(), 0);
+    }
+
+    /// Blueprint D25: the `ProbeBox` task answers once, at the request's own address.
+    #[tokio::test]
+    async fn the_probe_box_task_answers_once_at_the_request_s_address() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request = RequestEnvelope {
+            seq: 7,
+            origin: Origin::Tab(crate::ui::tabs::TabId("settings")),
+            request: StoreRequest::ProbeBox,
+        };
+
+        let served = runtime.serve(&backend, &tx, &request).await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        assert!(runtime.box_probe_running());
+        runtime.finish_background(Duration::from_secs(10)).await;
+
+        let replies = sent(&mut rx);
+        assert_eq!(replies.len(), 1, "exactly one reply: {replies:?}");
+        assert_eq!(replies[0].seq, 7);
+        assert!(
+            matches!(&replies[0].origin, Origin::Tab(id) if id.0 == "settings"),
+            "{:?}",
+            replies[0].origin
+        );
+        let StoreReply::BoxProbed(report) = &replies[0].reply else {
+            panic!("the box task answers BoxProbed: {:?}", replies[0].reply)
+        };
+        assert_eq!(report.box_failed, None);
+        assert!(this_box_record(&store).await.row.last_probed_at.is_some());
+    }
+
+    /// PRD D7: a `missing` agent that declares an install source is named, never installed.
+    #[tokio::test]
+    async fn a_missing_agent_with_an_install_source_is_named_and_not_installed() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = never_probed().await;
+        let agent = Agent {
+            name: "installable".to_owned(),
+            transport: Transport::Acp,
+            launch: json!({
+                "command": "${gone}",
+                "args": [],
+                "env": {},
+                "discovery": {
+                    "tools": {
+                        "gone": { "kind": "path", "names": ["htui-no-such-binary-2f8e"] }
+                    },
+                    "handshake": true,
+                    "install": { "source": "acp_registry", "id": INSTALL_ID, "tool": "gone" }
+                }
+            }),
+            settings: json!({}),
+            ..fake_row(AgentId::new())
+        };
+        store.upsert_agent(&agent).await.expect("the row lands");
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        swap(&mut runtime, &backend, &tx).await;
+
+        let replies = sent(&mut rx);
+        assert!(
+            replies
+                .iter()
+                .all(|reply| !matches!(reply.reply, StoreReply::Install(_))),
+            "no install frame: {replies:?}"
+        );
+        let report = the_report(&replies);
+        assert_eq!(report.installable, ["installable"]);
+        assert!(!runtime.install_running());
+    }
+
+    /// Blueprint D27: an install is refused while the registration probe holds the claim.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_install_is_refused_while_the_registration_probe_runs() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        script(
+            tmp.path(),
+            "cmake",
+            "/bin/sleep 2; echo 'cmake version 3.28.0'",
+        );
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path()).with_installer(InstallConfig::new(
+            "http://127.0.0.1:1".to_owned(),
+            Some(tmp.path().join("agents")),
+        ));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runtime.on_online(&backend, &tx);
+        assert!(runtime.box_probe_running());
+        let served = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(
+                    1,
+                    StoreRequest::InstallPlan {
+                        agent_id: AgentId::new(),
+                    },
+                ),
+            )
+            .await;
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "install_plan");
+                assert_eq!(message, BOX_PROBE_RUNNING);
+            }
+            other => panic!("the install is refused while the box probe runs: {other:?}"),
+        }
+        assert!(!runtime.install_running());
+        runtime.finish_background(Duration::from_secs(10)).await;
+    }
+
+    /// Blueprint D27: `ProbeAgents` is refused while the registration probe holds the claim.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_agents_is_refused_while_the_registration_probe_runs() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        script(
+            tmp.path(),
+            "cmake",
+            "/bin/sleep 2; echo 'cmake version 3.28.0'",
+        );
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runtime.on_online(&backend, &tx);
+        assert!(runtime.box_probe_running());
+        let served = runtime
+            .serve(&backend, &tx, &envelope(1, StoreRequest::ProbeAgents))
+            .await;
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "probe_agents");
+                assert_eq!(message, BOX_PROBE_RUNNING);
+            }
+            other => panic!("the agent probe is refused while the box probe runs: {other:?}"),
+        }
+        assert_eq!(runtime.background_len(), 0);
+        runtime.finish_background(Duration::from_secs(10)).await;
+    }
+
+    /// MOD-2 D51: a hand-written `agent_box` row survives the registration probe byte for byte.
+    #[tokio::test]
+    async fn a_manual_agent_row_survives_the_registration_probe() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = never_probed().await;
+        let agent_id = store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|summary| summary.agent.enabled)
+            .expect("an enabled demo row")
+            .agent
+            .id;
+        let old = Utc::now() - chrono::TimeDelta::days(3);
+        store
+            .upsert_agent_box(&AgentBox {
+                agent_id,
+                box_id: ids::BOX,
+                enabled: true,
+                version: Some("hand-written".to_owned()),
+                path: Some("/opt/agent".to_owned()),
+                probed_at: Some(old),
+                quota: None,
+                quota_at: None,
+                updated_at: old,
+                probe: Some(json!({
+                    "transport": "acp",
+                    "resolved": null,
+                    "tools": {},
+                    "handshake": null,
+                    "status": "ready",
+                    "stderr_tail": null,
+                    "source": "manual",
+                })),
+            })
+            .await
+            .expect("the manual row lands");
+        let on_box = |agents: Vec<htui_core::model::AgentSummary>| {
+            agents
+                .into_iter()
+                .find(|summary| summary.agent.id == agent_id)
+                .and_then(|summary| summary.on_box)
+                .expect("the manual row is there")
+        };
+        let before = on_box(store.agents().await.expect("the memory store never fails"));
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        swap(&mut runtime, &backend, &tx).await;
+
+        the_report(&sent(&mut rx));
+        let after = on_box(store.agents().await.expect("the memory store never fails"));
+        assert_eq!(
+            after, before,
+            "the probe found nothing, so it wrote nothing"
+        );
+    }
+
+    /// Blueprint D27: a finished background task (a preview, a chat re-probe) does not hold the
+    /// claim: `sweep_finished` clears it before `on_online` asks.
+    #[tokio::test]
+    async fn a_finished_background_task_does_not_stop_the_registration_probe() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runtime.background.push(tokio::spawn(async {}));
+        while !runtime.background.iter().all(JoinHandle::is_finished) {
+            tokio::task::yield_now().await;
+        }
+        runtime.on_online(&backend, &tx);
+        assert!(runtime.box_probe_running());
+        assert_eq!(runtime.background_len(), 0, "the finished task was swept");
+        runtime.finish_background(Duration::from_secs(10)).await;
+        assert!(this_box_record(&store).await.row.last_probed_at.is_some());
+    }
+
+    /// Plan D11 and the `connection.rs` shape: a runtime that did not opt in never probes.
+    #[tokio::test]
+    async fn production_runtime_does_not_auto_probe_without_opt_in() {
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = AgentRuntime::production();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        runtime.on_online(&backend, &tx);
+
+        assert!(!runtime.box_probe_running());
+        assert_eq!(runtime.background_len(), 0);
+        runtime.finish_background(Duration::from_secs(1)).await;
+        assert!(sent(&mut rx).is_empty());
+        assert_eq!(this_box_record(&store).await.row.last_probed_at, None);
+    }
+
+    /// Blueprint F-E: the install pre-flight and the Settings section ask one function.
+    #[test]
+    fn the_install_pre_flight_and_the_section_share_declares_install() {
+        let declared = install_row(AgentId::new(), "declared", true).launch;
+        let undeclared = install_row(AgentId::new(), "undeclared", false).launch;
+        for (launch, expected) in [
+            (declared, true),
+            (undeclared, false),
+            (json!("this is not a launch document"), false),
+        ] {
+            let agent = Agent {
+                launch,
+                ..fake_row(AgentId::new())
+            };
+            assert_eq!(
+                declares_a_source(&agent).is_ok(),
+                htui_agent::launch::declares_install(&agent.launch)
+            );
+            assert_eq!(declares_a_source(&agent).is_ok(), expected);
+        }
+    }
+
+    /// Plan D18: a stored spec that adds a tool changes the digest, so the next swap probes it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stored_spec_adds_a_tool_and_reprobes_at_the_next_swap() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        standard_tools(tmp.path());
+        script(tmp.path(), "terraform", "echo 'Terraform v1.9.0'");
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        swap(&mut runtime, &backend, &tx).await;
+        the_report(&sent(&mut rx));
+        let first = this_box_record(&store).await;
+        assert!(first.tools.iter().all(|tool| tool.name != "terraform"));
+
+        store.set_app_setting(box_probe::spec::SETTING_KEY, terraform_spec());
+        swap(&mut runtime, &backend, &tx).await;
+
+        let report = the_report(&sent(&mut rx));
+        assert_eq!(report.tools, 3);
+        let second = this_box_record(&store).await;
+        let terraform = second
+            .tools
+            .iter()
+            .find(|tool| tool.name == "terraform")
+            .expect("the overlay's tool was probed");
+        assert_eq!(terraform.version, "1.9.0");
+        assert_ne!(second.probe_spec_digest, first.probe_spec_digest);
+        let overlay = terraform_spec();
+        assert_eq!(
+            second.probe_spec_digest,
+            Some(box_probe::spec::effective(box_probe::spec::seed(), Some(&overlay)).digest)
+        );
+    }
+
+    /// Plan D18: a stored spec that has not changed does not probe again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unchanged_spec_does_not_reprobe() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        standard_tools(tmp.path());
+        script(tmp.path(), "terraform", "echo 'Terraform v1.9.0'");
+        let store = never_probed().await;
+        store.set_app_setting(box_probe::spec::SETTING_KEY, terraform_spec());
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        swap(&mut runtime, &backend, &tx).await;
+        the_report(&sent(&mut rx));
+        let first = this_box_record(&store).await;
+        swap(&mut runtime, &backend, &tx).await;
+
+        assert!(sent(&mut rx).is_empty(), "one probe for one spec");
+        let second = this_box_record(&store).await;
+        assert_eq!(second.row.last_probed_at, first.row.last_probed_at);
+        assert_eq!(second.probe_spec_digest, first.probe_spec_digest);
+    }
+
+    /// Plan D18: removing the stored spec takes the digest back to the seed's, which probes.
+    ///
+    /// `MemStore` has no way to remove an `app_setting` row, and `mem.rs` is not T4's to change,
+    /// so the "after" store is rebuilt from the "before" store's recorded probe with no setting
+    /// (blueprint §6.6).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removing_the_stored_spec_reprobes_with_the_seed() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        standard_tools(tmp.path());
+        script(tmp.path(), "terraform", "echo 'Terraform v1.9.0'");
+        let before = never_probed().await;
+        before.set_app_setting(box_probe::spec::SETTING_KEY, terraform_spec());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        swap(&mut runtime, &Backend::memory(before.clone()), &tx).await;
+        the_report(&sent(&mut rx));
+        let recorded = this_box_record(&before).await;
+        assert_ne!(recorded.probe_spec_digest, Some(seed_digest()));
+
+        let after = never_probed().await;
+        after
+            .record_box_probe(&as_probe(&recorded))
+            .await
+            .expect("the recorded probe lands");
+        swap(&mut runtime, &Backend::memory(after.clone()), &tx).await;
+
+        let report = the_report(&sent(&mut rx));
+        assert_eq!(report.tools, 2);
+        let record = this_box_record(&after).await;
+        assert_eq!(record.probe_spec_digest, Some(seed_digest()));
+        assert!(record.tools.iter().all(|tool| tool.name != "terraform"));
+    }
+
+    /// Plan D17: an overlay that does not merge is ignored, the seed probed, and the report says
+    /// why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_invalid_stored_spec_probes_the_seed_and_the_report_says_so() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        standard_tools(tmp.path());
+        let store = never_probed().await;
+        store.set_app_setting(box_probe::spec::SETTING_KEY, json!(42));
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        swap(&mut runtime, &backend, &tx).await;
+
+        let report = the_report(&sent(&mut rx));
+        let error = report
+            .spec_error
+            .clone()
+            .expect("the ignored overlay is named");
+        assert!(error.starts_with(box_probe::spec::SPEC_IGNORED), "{error}");
+        assert!(report.status_line().contains(&error));
+        let record = this_box_record(&store).await;
+        assert_eq!(record.probe_spec_digest, Some(seed_digest()));
+        assert_eq!(record.tools.len(), 2);
+        assert_eq!(report.tools, 2);
+    }
+
+    /// Blueprint D28: the version a probe records is the binary's own.
+    #[test]
+    fn htui_version_is_the_binary_s_version() {
+        assert_eq!(htui_store::HTUI_VERSION, env!("CARGO_PKG_VERSION"));
     }
 }
