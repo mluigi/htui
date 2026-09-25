@@ -39,13 +39,13 @@ Read at `d966413` (main) during routing. Paths are relative to `crates/`.
   `legal_move(status, Closed)` (`pg/write.rs:3957`, `mem.rs:4096`), i.e. `Status::can_move_to`
   (`htui-core/src/model/item.rs:50-64`): blocked/failed/done → closed, nothing else. The same rule
   lets the **generic** `WriteStore::transition` reach `closed` too, and three existing cases rely on
-  it (`conformance.rs:724` `no_delete_path`, `:6388` `illegal_transitions_are_constraint`,
-  `htui/tests/pg_criteria.rs:553`). Under ANA-11's `item_resolution_iff_closed` CHECK those would
-  fail on Postgres and pass on MemStore. See Q1.
+  it (`conformance.rs:724` `no_delete_path`, `:6388` `illegal_transitions_are_constraint`, and the stale-`from` check at
+  `htui-store/tests/pg_criteria.rs:553`). Under ANA-11's `item_resolution_iff_closed` CHECK those would
+  fail on Postgres and pass on MemStore. See D1.
 - **Callers.** Production reaches the store once, `htui-orch/src/engine.rs:1493`, from
   `Command::CloseOut { item }` (`command.rs:130`), which the TUI sends from
   `htui/src/ui/tabs/backlog/detail/runs.rs:716` and `htui/src/run_worker.rs:2055`.
-  `close_out_enabled` (`command.rs:1165`) is the UI-side mirror of the guard. See Q2.
+  `close_out_enabled` (`command.rs:1165`) is the UI-side mirror of the guard. See D2.
 - **Key minting precedent.** `item.key` is a `GENERATED ALWAYS … STORED` column
   (`migrations/0001_init.sql:315`), and `mint_item` (`pg/write.rs:398-461`) is one
   `INSERT … ON CONFLICT DO UPDATE … RETURNING` CTE over `item_key_counter`, with the counter row
@@ -113,7 +113,7 @@ R-X, and which of them were written against an older text" is a query rather tha
 - A `Resolution` `str_enum!` with a DDL-agreement test like `status_matches_check_list`, and
   `Item.resolution: Option<Resolution>` through every `Item` select and literal.
 - `close_out(item, resolution, summary, commits)` on the trait and every implementor, with its
-  own guard (below), and the orchestrator plumbing of Q2.
+  own guard (below), and the orchestrator plumbing of D2.
 - Requirement models and the §5.1 methods: reads on MemStore, PgStore and the cache; writes on
   MemStore and PgStore (no offline write, per MOD-25).
 - Conformance cases for all of the above on both stores, plus cache read cases.
@@ -163,31 +163,26 @@ Milestone 1 is independently useful (it is what MOD-34's `resolution` payload wa
 touches the orchestrator; milestones 2 and 3 are store-only. All three ship in one branch because
 they share one migration.
 
-## Open Questions
+## Decisions taken at the PRD gate
 
-- **Q1 — How does the generic `transition()` treat `closed`?** Options: (a) `closed` becomes
-  reachable **only** through `close_out`; `transition(_, _, Closed)` is refused, and the three
-  cases that use it to reach `closed` switch to `close_out`. (b) `transition` into `closed` stamps
-  `resolution = 'done'` implicitly. **Recommended: (a).** It matches `R-ENT-8` ("driven … by
-  close-out") and ANA-11's invariant that resolution is set only by close-out; (b) would let an
-  item close as `done` from `failed`.
-- **Q2 — Where does the resolution come from before MOD-39's picker exists?** Options:
-  (a) `Command::CloseOut { item, resolution }`; the Runs pane and `run_worker` send a default
-  derived from status (`done` → `done`, `blocked`/`failed` → `withdrawn`) until MOD-39 replaces
-  it. (b) `Command::CloseOut` unchanged and the engine derives the same default, so MOD-39 changes
-  the command later. (c) Pull a minimal resolution picker into MOD-38. **Recommended: (a).** The
-  command shape is settled once, MOD-39 only swaps the source, and the TUI change is one argument.
-- **Q3 — Does amending or withdrawing a requirement also record the citation?** Options: (a)
-  `amend_requirement`/`withdraw_requirement` write the revision **and** upsert the deciding item's
-  `amends`/`withdraws` citation, stamped at the new version, in one transaction. (b) The caller
-  cites separately. **Recommended: (a).** The revision already names the item; a separate call can
-  be forgotten and leaves coverage and history disagreeing.
+Answered by the maintainer on 2026-09-25 ("all recommended"), before planning. They are decisions,
+not proposals: the plan implements them.
+
+- **D1 — `closed` is reachable only through `close_out`.** `WriteStore::transition` into `closed`
+  is refused on every store; the three existing cases that used it to reach `closed` switch to
+  `close_out`. This is the ANA-2 §4.3 amendment the close-out write-up records.
+- **D2 — `Command::CloseOut` carries a resolution now.** Until MOD-39's picker, the Runs pane and
+  `run_worker` send a default derived from status (`done` → `done`, `blocked`/`failed` →
+  `withdrawn`); MOD-39 only swaps the source.
+- **D3 — Amend and withdraw record the deciding item's citation.** `amend_requirement` and
+  `withdraw_requirement` write the revision and upsert the `amends`/`withdraws` citation, stamped at
+  the new version, in one transaction.
 
 ## Risks
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| The CHECK makes Postgres and MemStore disagree on paths into `closed` | High without Q1 | High | Q1's rule enforced in shared Rust code and asserted by one conformance case on both stores |
+| The CHECK makes Postgres and MemStore disagree on paths into `closed` | High without D1 | High | D1's rule enforced in shared Rust code and asserted by one conformance case on both stores |
 | Migration collision with MOD-7 (run in parallel) | Medium | Low | One migration pair; renumber at merge; the pins in `migrations.rs` make a collision loud |
 | The cache rebuild on 0005 surprises a user with a large cache | Low | Low | Existing behaviour on every PG migration; nothing new |
 | Wide mechanical change (≈9 files for `close_out`, 6-8 per new method, sqlx data) invites a missed implementor | Medium | Medium | No default trait bodies, so the compiler finds every one; ultracode implement phase fans out by file set |
