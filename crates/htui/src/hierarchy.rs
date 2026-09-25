@@ -607,6 +607,38 @@ mod tests {
         assert!(reach_parts(&DeleteReach::default()).is_empty());
     }
 
+    /// MOD-38 (blueprint F1): the six requirement tables a project delete cascades are named in
+    /// the warning, after `documents` and in field order, with `item_requirement` read as
+    /// citations.
+    #[test]
+    fn reach_parts_names_the_requirement_tables() {
+        let reach = DeleteReach {
+            items: 12,
+            documents: 2,
+            requirement_specs: 1,
+            requirement_areas: 2,
+            requirement_key_counters: 2,
+            requirements: 3,
+            requirement_revisions: 4,
+            item_requirements: 6,
+            ..DeleteReach::default()
+        };
+        assert_eq!(
+            reach_parts(&reach),
+            vec![
+                "12 items".to_owned(),
+                "2 documents".to_owned(),
+                "1 requirement specs".to_owned(),
+                "2 requirement areas".to_owned(),
+                "2 requirement key counters".to_owned(),
+                "3 requirements".to_owned(),
+                "4 requirement revisions".to_owned(),
+                "6 citations".to_owned(),
+            ]
+        );
+        assert_eq!(reach_totals(&reach), (32, 8));
+    }
+
     #[test]
     fn reach_totals_counts_rows_and_tables() {
         let reach = DeleteReach {

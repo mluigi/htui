@@ -1272,6 +1272,12 @@ async fn load_demo_round_trips_a_count_per_table() {
         "run",
         "run_step",
         "session_event",
+        "requirement_spec",
+        "requirement_area",
+        "requirement_key_counter",
+        "requirement",
+        "requirement_revision",
+        "item_requirement",
     ];
     let mut before = Vec::new();
     for table in tables {
@@ -1281,7 +1287,7 @@ async fn load_demo_round_trips_a_count_per_table() {
     let data = htui_core::fixtures::demo_data();
     db.store.load_demo(&data).await.expect("load the fixture");
 
-    let expected: [(&str, usize); 19] = [
+    let expected: [(&str, usize); 25] = [
         ("app_user", data.users.len()),
         ("box", data.boxes.len()),
         ("workspace", data.workspaces.len()),
@@ -1301,7 +1307,30 @@ async fn load_demo_round_trips_a_count_per_table() {
         ("run", data.runs.len()),
         ("run_step", data.steps.len()),
         ("session_event", data.events.len()),
+        ("requirement_spec", data.requirement_specs.len()),
+        ("requirement_area", data.requirement_areas.len()),
+        (
+            "requirement_key_counter",
+            data.requirement_key_counter.len(),
+        ),
+        ("requirement", data.requirements.len()),
+        ("requirement_revision", data.requirement_revisions.len()),
+        ("item_requirement", data.item_requirements.len()),
     ];
+    // MOD-38 blueprint §8: the requirement set's own sizes, pinned so a fixture edit that drops a
+    // row is loud here and not only a smaller delta. The citation tombstone is a row too.
+    assert_eq!(
+        [
+            data.requirement_specs.len(),
+            data.requirement_areas.len(),
+            data.requirement_key_counter.len(),
+            data.requirements.len(),
+            data.requirement_revisions.len(),
+            data.item_requirements.len(),
+        ],
+        [1, 2, 2, 3, 4, 5],
+        "spec, areas, counters, requirements, revisions, citations"
+    );
 
     for (i, (table, len)) in expected.iter().enumerate() {
         let after = common::count(&db.pool, table).await;

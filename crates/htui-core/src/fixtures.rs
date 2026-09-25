@@ -7,7 +7,9 @@
 //! row would show up in a rendered frame.
 //!
 //! The data set is the one `docs/ANA-9.md` §5.10 seeds, filled out with two workspaces, three
-//! projects and thirteen items covering all eight `Status` values.
+//! projects and thirteen items covering all eight `Status` values. MOD-38 adds `htui`'s
+//! requirement set (ANA-11 §5): a spec header, two areas, three requirements and five citations,
+//! one of them suspect and one a tombstone.
 
 use std::collections::HashMap;
 
@@ -1989,7 +1991,7 @@ fn item_requirements() -> Vec<ItemRequirement> {
 #[cfg(test)]
 mod tests {
     use super::{DemoData, demo_at, demo_data, demo_uuid, ids};
-    use crate::model::{Status, StepGraphId};
+    use crate::model::{Resolution, Status, StepGraphId};
     use std::collections::HashSet;
 
     #[test]
@@ -2094,6 +2096,65 @@ mod tests {
             10,
             "one counter row per (project, prefix) in use"
         );
+    }
+
+    /// MOD-38 blueprint §8: the requirement mint continues from the fixture's counters, so no
+    /// counter sits below a number a fixture requirement already holds.
+    #[test]
+    fn requirement_counters_sit_above_every_minted_number() {
+        let data: DemoData = demo_data();
+        for requirement in &data.requirements {
+            let last = data
+                .requirement_key_counter
+                .get(&requirement.area_id)
+                .copied()
+                .unwrap_or(0);
+            assert!(
+                last >= requirement.number,
+                "counter for {} is {last}, below {}",
+                requirement.area_code,
+                requirement.number
+            );
+        }
+        assert_eq!(
+            data.requirement_key_counter.len(),
+            data.requirement_areas.len(),
+            "one counter row per area"
+        );
+    }
+
+    /// Plan D11: `R-ENT-1` is at v2 after `ANA-2` amended it, so `ANA-1`'s citation stamped at v1
+    /// is the demo's one suspect citation. The tombstoned `FEAT-2` row does not count.
+    #[test]
+    fn the_fixture_has_one_suspect_citation() {
+        let data = demo_data();
+        let suspect: Vec<_> = data
+            .item_requirements
+            .iter()
+            .filter(|citation| citation.deleted_at.is_none())
+            .filter(|citation| {
+                data.requirements
+                    .iter()
+                    .find(|row| row.id == citation.requirement_id)
+                    .expect("every citation names a fixture requirement")
+                    .makes_suspect(citation.requirement_version)
+            })
+            .map(|citation| (citation.item_id, citation.requirement_id))
+            .collect();
+        assert_eq!(suspect, [(ids::HTUI_ANA_1, ids::REQ_ENT_1)]);
+    }
+
+    /// ANA-11 §4.2: the one closed demo item closed through close-out as `done` (MOD-38 T1).
+    #[test]
+    fn fix_1_is_closed_as_done() {
+        let data = demo_data();
+        let fix = data
+            .items
+            .iter()
+            .find(|item| item.id == ids::HTUI_FIX_1)
+            .expect("FIX-1 is a fixture item");
+        assert_eq!(fix.status, Status::Closed);
+        assert_eq!(fix.resolution, Some(Resolution::Done));
     }
 
     #[test]
