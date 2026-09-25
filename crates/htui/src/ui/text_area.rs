@@ -13,6 +13,9 @@ use ratatui::text::{Line, Span};
 
 use crate::ui::Theme;
 
+/// Columns between tab stops.
+const TAB_STOP: usize = 4;
+
 /// What one key did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AreaOutcome {
@@ -667,6 +670,58 @@ mod tests {
         // No room, no lines.
         assert!(area.lines(0, 3, true, &theme).is_empty());
         assert!(area.lines(3, 0, true, &theme).is_empty());
+    }
+
+    /// A `\t` from `$EDITOR` draws as spaces to the next tab stop; `ratatui` would drop it and
+    /// shift the rest of the line left of where the cursor is counted.
+    #[test]
+    fn a_tab_draws_as_spaces_to_the_next_stop() {
+        let mut area = TextArea::with_text("a\tb\n\tc\nabcd\te");
+        assert_eq!(TAB_STOP, 4, "the expectations below are for a stop of four");
+        assert_eq!(window(&area, 10, 3), ["a   b", "    c", "abcd    e"]);
+
+        // The cursor is drawn where the text is: on `b`, after the tab's three cells.
+        area.set_cursor(2);
+        let theme = Theme::default();
+        let drawn = area.lines(10, 1, true, &theme);
+        let cursor: Vec<&str> = drawn[0]
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(cursor, ["b"]);
+        assert_eq!(plain(&drawn[0]), "a   b");
+
+        // On the tab itself, the cursor is the tab's first cell.
+        area.set_cursor(1);
+        let drawn = area.lines(10, 1, true, &theme);
+        assert_eq!(drawn[0].spans[1].content, " ");
+        assert!(
+            drawn[0].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(plain(&drawn[0]), "a   b");
+
+        // The viewport follows the drawn column: `b` is column 4, so a three-wide window starts
+        // at column 2 and shows `b` last.
+        area.set_cursor(2);
+        assert_eq!(window(&area, 3, 1), ["  b"]);
+
+        // The hint's column is still in chars (D20): `b` is the third char.
+        assert_eq!(area.cursor_line_col(), (0, 2));
+    }
+
+    /// Any other control char draws as a visible stand-in, one column wide.
+    #[test]
+    fn other_control_chars_draw_visibly() {
+        let mut area = TextArea::with_text("a\u{1}b\u{7f}\u{9b}c");
+        area.set_cursor(2);
+        assert_eq!(window(&area, 10, 1), ["a\u{2401}b\u{2421}\u{fffd}c"]);
+        let drawn = area.lines(10, 1, true, &Theme::default());
+        assert_eq!(drawn[0].spans[1].content, "b", "the cursor is on `b`");
     }
 
     /// D19: `lines` scrolls through `&self`, because `Tab::render` is `&self` (F-C).
