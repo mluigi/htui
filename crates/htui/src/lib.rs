@@ -24,6 +24,7 @@ pub mod prompt_settings;
 pub mod qdrant_settings_info;
 pub mod run_worker;
 pub mod store_worker;
+pub mod templates;
 pub mod terminal;
 pub mod ui;
 
