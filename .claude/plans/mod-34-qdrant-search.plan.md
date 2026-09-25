@@ -6,7 +6,7 @@ Design authority: `docs/ANA-19.md` (Qdrant, `VectorStore` seam) and `docs/ANA-20
 embeddings via `fastembed-rs`, hybrid Dense + BM25, one collection with a `type` payload index,
 no optimizer tuning, no quantization).
 
-Revision 2 (2026-09-25). The first revision of this plan was written before any code existed and
+Revision 3 (2026-09-25; revision 2 the same day planned a filesystem sync the maintainer then ruled out). The first revision of this plan was written before any code existed and
 was never confirmed. A first-pass implementation has since landed in the tree (inside the import
 commit `2698f0b`, not labelled as MOD-34): `compose.yaml` has a `qdrant` service, the workspace
 and `htui-store` depend on `qdrant-client 1.19.0`, `fastembed 3.14.1` and `ort =2.0.0-rc.4`,
@@ -38,29 +38,41 @@ route on 2026-09-25.
 | `htui-store` builds without network | **False** | `ort-sys 2.0.0-rc.4` `download-binaries` fetches `parcel.pyke.io/.../msort_static-v1.18.1` at build time; it failed here behind the proxy. It built with `ORT_LIB_LOCATION` pointing at `libonnxruntime.so.1.18.0` taken from the `onnxruntime-node@1.18.0` npm package |
 | Pg items can be read without new SQL | **True** | `htui-core/src/store/traits.rs:68` `ReadStore::items`, `:70` `ReadStore::item` |
 | ANA-19/ANA-20's requirement IDs cover this work | **False** | Both cite `R-AGT-6` (agent autodiscovery) and `R-ID-7` (secret scrubbing); neither is about search, and the MOD-34 line cites none |
-| Tasks T1 and T2 are independent | **True** | T1 touches `embed.rs`, `Cargo.toml` (both), `crates/htui/Cargo.toml`; T2 touches `bm25.rs` and the `lib.rs` module list. Intersection empty except `lib.rs`, which T1 does not touch |
+| Tasks T1 and T2 are independent | **True** | T1 touches `embed.rs`, `Cargo.toml` (both), `crates/htui/Cargo.toml`; T2 touches `bm25.rs` and the `lib.rs` module list. Intersection empty |
+| Items carry what an incremental sync needs | **True** | `htui-core/src/model/item.rs:131` `ItemSummary` has `id`, `project_id`, `key`, `title`, `updated_at`; `Item` adds `body` |
+| The in-memory store can drive offline tests | **True** | `htui-core/src/store/mem.rs:4238` implements `ReadStore::items` / `item` |
+
+## Maintainer answers (2026-09-25)
+
+- **Sources:** index **Postgres items only**. That is the objective; local files would only serve
+  htui's own development and there is no shared Qdrant for that yet. The filesystem sync
+  (`HANDOFF.md`, `docs/`) is removed, not extended.
+- **Requirement:** add one. Proposed **R-STO-8** (T6).
+- **fastembed stays** for the dense vectors (BGE-small-en-v1.5). The question was only which
+  sparse vector sits beside it: SPLADE or BM25 (D1).
 
 ## Decisions (for CONFIRM)
 
-- **D1 - BM25 is computed in htui, IDF by Qdrant.** Drop the SPLADE model. A new `bm25.rs`
-  tokenises text (lowercase; keeps item IDs such as `MOD-34` and `R-STO-1` whole as well as their
-  parts), maps each term to a stable `u32` (first four bytes of its SHA-256) and weights it by
-  BM25 term frequency (k1 = 1.2, b = 0.75). The collection's sparse vector gets
-  `Modifier::Idf`, so Qdrant supplies the corpus statistics. This is ANA-20's BM25 without a
-  second model download, and it is what makes exact identifiers retrievable.
-- **D2 - `fastembed`/`ort` move behind an optional `local-embed` feature** on `htui-store`,
-  enabled by the `htui` crate. Today every workspace build fetches onnxruntime from
-  `parcel.pyke.io`; with the feature off, `cargo test -p htui-store` builds offline and uses a
-  test embedder. The binary still ships local embeddings.
-- **D3 - Entry point is a CLI pair until MOD-11**: `htui --index-concepts [PATH]` and
-  `htui --search-concepts <QUERY>`, in the style of `--set-dsn`. The `search_concepts` MCP tool
-  moves to MOD-11 as a cross-link note, because it needs MOD-11's server.
-- **D4 - Sources are the repo's files for now**: each HANDOFF.md checklist item becomes one point
-  keyed by its ID; each `docs/**/*.md` file is split at `##` headings. Pg items through
-  `ReadStore` are left for a follow-up (ANA-19 §3.2 names Postgres as the source of truth, and the
-  rev-1 plan already called the filesystem sync a bootstrap).
-- **D5 - Pin the compose image** to `qdrant/qdrant:v1.19.1`, matching the client, as Postgres is
-  pinned to 16.
+- **D1 - BM25 sparse vectors computed in htui, IDF applied by Qdrant; SPLADE dropped.**
+  fastembed stays for dense. fastembed 3.14.1 offers no BM25 (its only sparse model is SPLADE++),
+  so `bm25.rs` tokenises text (lowercase; keeps keys such as `MOD-34` whole as well as their parts),
+  maps each term to a stable `u32` (first four bytes of its SHA-256) and weights it by BM25 term
+  frequency (k1 = 1.2, b = 0.75). The collection's sparse vector gets `Modifier::Idf`. Reason:
+  ANA-20 §3.3 wants the sparse side for exact identifiers; dense already covers meaning, SPLADE's
+  learned expansion overlaps it, and SPLADE costs a second transformer pass per item and per query
+  plus a second model download.
+- **D2 - `fastembed`/`ort` behind an optional `local-embed` feature** on `htui-store`, enabled by
+  the `htui` crate. Every workspace build today fetches onnxruntime from `parcel.pyke.io`; with the
+  feature off, `cargo test -p htui-store` builds offline and uses a test embedder.
+- **D3 - Entry point is a CLI pair**: `htui --index-items` (incremental sync of every project the
+  connection sees) and `htui --search-items <QUERY> [--project <KEY>]`, in the style of
+  `--set-dsn`. Automatic sync belongs with the headless worker's background jobs (MOD-41) and the
+  `search_concepts` agent tool with MOD-11; both get a cross-link note at close-out.
+- **D4 - One point per item, keyed by the item's UUID.** Text = key, title and body. Payload:
+  `item_id`, `key`, `project_id`, `kind_id`, `status`, `updated_at`. Keyword payload index on
+  `project_id` (ANA-20 §3.4's single collection, with the project as the tenant) so a search is
+  always scoped to projects. Item documents are not indexed in this item.
+- **D5 - Pin the compose image** to `qdrant/qdrant:v1.19.1`, matching the client.
 
 ## Tasks
 
@@ -76,41 +88,49 @@ route on 2026-09-25.
 ### T2 - BM25 sparse vectors
 - **Files:** `crates/htui-store/src/bm25.rs` (new), `crates/htui-store/src/lib.rs`
 - Tests first: tokenizer keeps `MOD-34` whole and also yields `mod`, `34`; term index is stable
-  across runs (golden values); repeated terms saturate per k1; longer documents weigh a term less
-  per b.
+  (golden values); repeated terms saturate per k1; longer texts weigh a term less per b.
 
-### T3 - QdrantStore corrections
+### T3 - Item vector store
 - **Files:** `crates/htui-store/src/vector.rs`
-- `QdrantStore::connect(&QdrantSettings, embedder)` (settings passed in, not read from the
-  keyring inside, so tests can point it anywhere); collection name versioned
-  (`htui_concepts_v1`) so an existing SPLADE-shaped collection is never reused.
-- Hybrid query: `query_points` with two prefetches (`dense`, `sparse`) fused by RRF; optional
-  `type` filter (`doc` / `item`) per ANA-20 §3.4.
-- Point ID = UUID built from SHA-256 of the source ID. Payload carries `source` (path or item ID),
-  `chunk`, `hash`, `type`.
-- `search_concepts` returns hits (`source`, `chunk`, `score`, `type`), not bare strings.
-- Offline tests cover ID stability and payload shape; live tests run when
-  `HTUI_TEST_QDRANT_URL` is set (skip otherwise, as `HTUI_TEST_DATABASE_URL` does).
+- `VectorStore` becomes item-only: `upsert_items`, `delete_items`, `indexed(project) -> (ItemId,
+  updated_at)` pairs, `search(query, projects, limit) -> Vec<ItemHit>` (`item_id`, `key`,
+  `score`). `upsert_document` goes.
+- `QdrantStore::connect(&QdrantSettings, embedder)`; collection `htui_items_v1` (never reuses the
+  first pass's SPLADE-shaped collection); point ID = item UUID.
+- Hybrid query: `query_points` with `dense` and `sparse` prefetches fused by RRF, filtered on
+  `project_id`.
+- Offline tests: point ID and payload shape. Live tests when `HTUI_TEST_QDRANT_URL` is set (skip
+  otherwise, as `HTUI_TEST_DATABASE_URL` does), using `HashEmbedder` so no model download.
 
-### T4 - Sync correctness
-- **Files:** `crates/htui-store/src/vector_sync.rs`, `crates/htui-store/src/vector.rs` (trait
-  gains `delete_source` and `source_hash`)
-- HANDOFF split per checklist item; docs split per `##` section.
-- Unchanged `hash` for a source → skip; changed → delete that source's points, then upsert;
-  source gone → delete.
-- Tests first against an in-memory `VectorStore` fake: skip, replace, delete, per-item split.
+### T4 - Item indexer (replaces the filesystem sync)
+- **Files:** `crates/htui-store/src/vector_sync.rs` (rewritten), `crates/htui-store/src/lib.rs`
+  only if the module is renamed
+- `ItemIndexer::sync(read: &impl ReadStore, projects, store: &impl VectorStore)`: list
+  `ItemSummary` per project, compare `updated_at` with what is indexed, fetch bodies (`item()`)
+  only for new or changed items, upsert them, delete indexed items no longer listed.
+- Tests first against `htui-core`'s in-memory store and an in-memory `VectorStore` fake: first
+  sync indexes all; a second sync with no change fetches nothing; an edited item is re-indexed; a
+  removed item is deleted; other projects are untouched.
 
 ### T5 - CLI entry point and graceful failure
 - **Files:** `crates/htui/src/cli.rs`, `crates/htui/src/lib.rs`
-- `--index-concepts [PATH]` (default: current directory) and `--search-concepts <QUERY>`.
-  No Qdrant URL stored, or server unreachable → one clear line on stderr and a non-zero exit;
-  the TUI start path is untouched (ANA-19 §2 invariant 3).
-- Tests: argument parsing; the no-URL message.
+- `--index-items` and `--search-items <QUERY> [--project <KEY>]` per D3. No Qdrant URL stored,
+  Qdrant unreachable, or Postgres unreachable → one clear line on stderr and a non-zero exit; the
+  TUI start path is untouched (ANA-19 §2 invariant 3).
+- Tests: argument parsing and conflicts; the no-URL message.
 
-### T6 - Compose pin and bookkeeping
-- **Files:** `compose.yaml`, `HANDOFF.md`
-- Image pinned per D5. At close-out: MOD-11 gains the `search_concepts` note (D3); the Pg-items
-  follow-up is recorded per D4.
+### T6 - Requirement, compose pin and bookkeeping
+- **Files:** `docs/REQUIREMENTS.md`, `compose.yaml`, `HANDOFF.md`
+- New requirement, section 4:
+  > **R-STO-8 (must).** Semantic search over items. `htui` indexes each item's key, title and
+  > body into a Qdrant collection (local dense embeddings plus BM25 sparse vectors, ranked
+  > together) and answers searches scoped to projects. The index is derived from Postgres and
+  > rebuildable from it (R-STO-1); when Qdrant or the embedding model is unavailable, search fails
+  > with a clear error and nothing else is affected.
+- MOD-34's line rescoped to Postgres items and citing `R-STO-8`; the file-sync wording goes.
+- At close-out: MOD-11 gains the `search_concepts` note, MOD-41 the automatic-sync note (D3).
+  ANA-19/ANA-20 keep their `R-AGT-6`/`R-ID-7` citations (ANA edits are maintainer-only); the
+  write-up records that `R-STO-8` is the requirement they serve.
 
 ## Independence
 
@@ -120,18 +140,20 @@ T5 needs T3 and T4. T6 is last. No ultracode: six tasks, mostly serial.
 ## Overlap with MOD-7 (running in parallel)
 
 MOD-7 works in `htui-orch`, `htui-agent`, the Settings tab and the store's box rows. This plan does
-not touch the Settings tab, `store_worker.rs` or any SQL. Shared files are the module list in
-`crates/htui-store/src/lib.rs`, `Cargo.toml`/`Cargo.lock`, `crates/htui/src/cli.rs` and `lib.rs` if
-MOD-7 adds flags, and HANDOFF.md at close-out. All are additive hunks.
+not touch the Settings tab, `store_worker.rs` or any SQL, and reads items only through the existing
+`ReadStore` trait. Shared files are the module list in `crates/htui-store/src/lib.rs`,
+`Cargo.toml`/`Cargo.lock`, `crates/htui/src/cli.rs` and `lib.rs` if MOD-7 adds flags,
+`docs/REQUIREMENTS.md` if MOD-7 amends a requirement, and HANDOFF.md at close-out. All are
+additive hunks.
 
 ## Validation
 
 `cargo fmt --check`, `cargo clippy -p htui-store -p htui --all-targets -- -D warnings`,
-`cargo test -p htui-store --features test-support` (offline), `cargo test -p htui`. Live Qdrant and
-model-download tests run on the maintainer's box (`docker compose up -d qdrant`,
-`HTUI_TEST_QDRANT_URL=http://localhost:6334`). In the cloud box, builds need
-`ORT_LIB_LOCATION` (see Verified claims) only when `local-embed` is on.
+`cargo test -p htui-store --features test-support` (offline), `cargo test -p htui`, the handoff-run
+validator. Live Qdrant and model-download tests run on the maintainer's box
+(`docker compose up -d qdrant`, `HTUI_TEST_QDRANT_URL=http://localhost:6334`). In the cloud box,
+builds with `local-embed` need `ORT_LIB_LOCATION` (see Verified claims).
 
 ## Status
 
-Awaiting maintainer CONFIRM (revision 2).
+Awaiting maintainer CONFIRM (revision 3).
