@@ -194,7 +194,7 @@ writers.
 - [x] Editor — both `TextArea` and `$EDITOR`; agent help is MOD-50 (D2).
 - [x] Skills as files — no; database only (D3).
 - [x] Engine wiring — in scope (D4).
-- [x] How a skill is stored and when it activates — ANA-22 concluded (`docs/decisions/ana/ana-22.md`): activation rule per version, `always` or `glob`; §7 schema and import mapping.
+- [x] How a skill is stored and when it activates — ANA-22 concluded (`docs/decisions/ana/ana-22.md`): a skill is library content attached at global, project or phase level; the attachment carries activation (`always`, `glob`, `off`); §7 schema and import mapping.
 - [ ] How `$EDITOR` is chosen and invoked on Windows (`notepad` fallback?) — plan's call.
 - [ ] Whether the Templates view follows the scope selector's project or has its own picker — plan's call.
 

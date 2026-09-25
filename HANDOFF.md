@@ -15,8 +15,8 @@
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
 **Current status (2026-09-25):** **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
-keeps its bindings as scope and gains an activation rule per version (`always` or `glob`, language
-compiled to globs), with frontmatter kept in `source`; it unblocks MOD-9 milestones 3 and 4. MOD-9's
+is pure library content attached at global, project or phase level, and the attachment carries the
+activation (`always`, `glob`, `off`; language compiled to globs); it unblocks MOD-9 milestones 3 and 4. MOD-9's
 PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-50.
 Before it, **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`):
 requirements get dedicated tables with suspect-aware item citations; a decision is a closed item with
@@ -317,8 +317,8 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   (templates and skills views, no Settings section), in-app `TextArea` plus `$EDITOR`, bound skills
   wired into engine and preview. Milestones 1 (templates editable) and 2 (skills reach the run) are
   open; milestones 3 (skill writers, bindings) and 4 (SKILL.md import) follow ANA-22's verdict
-  (`docs/decisions/ana/ana-22.md`, concluded 2026-09-25: activation rule per version, §7 schema and
-  import mapping, §8 phasing).
+  (`docs/decisions/ana/ana-22.md`, concluded 2026-09-25: skills attached at global, project or phase
+  level with the activation on the attachment, §7 schema and import mapping, §8 phasing).
   Agent help while editing is MOD-50.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and

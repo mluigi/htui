@@ -7,15 +7,16 @@
 >
 > **Requirements addressed:** `R-SKL-1`, `R-SKL-2`, `R-SKL-4`, `R-PRM-1`, `R-PRM-3`, `R-ID-5`.
 >
-> **Status (2026-09-25): concluded.** Verdict: a skill keeps its explicit bindings as the **scope**
-> (which project and phase may see it), and gains an **activation rule stored on each version** as
-> the **filter** inside that scope: `always` (today's behaviour) or `glob` (injected only when a file
-> the step is about matches). Language is authored as a convenience and compiled to globs at save.
-> Everything else in a frontmatter block is kept verbatim in a `source` JSON column and never read by
-> the prompt builder. Model-decided activation (a catalog in the prompt, body fetched on demand) is
-> deferred: it breaks `R-ID-5`'s inlining and needs MOD-11's MCP server. Import reads the Agent
-> Skills / Claude Code `SKILL.md` format and the common rules formats through one hand-written
-> frontmatter reader.
+> **Status (2026-09-25): concluded, amended the same day after a maintainer challenge (§10).**
+> Verdict: a **skill is pure library content** — name, description, versioned body — with no
+> activation and no dependency on any project, repo or language. It is **attached** at one of three
+> levels, **global, project or phase**, and the **attachment carries the activation**: `always`,
+> `glob` (with globs, languages compiled to globs at save, repo-qualified globs allowed where the
+> attachment knows the repos) or `off`. The most specific attachment of a skill wins. Frontmatter is
+> kept verbatim in a `source` column and only **prefills** the attachment form. Model-decided
+> activation is deferred: it breaks `R-ID-5`'s inlining and needs MOD-11's MCP server. Import reads
+> the Agent Skills / Claude Code SKILL.md format and the common rules formats through one
+> hand-written frontmatter reader.
 
 Code citations are against HEAD `6592d78`.
 
@@ -150,7 +151,8 @@ from the primary docs or the tool's own source on GitHub.
 | Option | For | Against |
 |---|---|---|
 | On `skill` | One place, simple editor | Changing a glob changes what a **pinned** binding does, so a pin no longer pins behaviour — `R-ID-5` in spirit |
-| **On `skill_version`** | A pin pins the body *and* the rule; import of a new SKILL.md with new `paths` is a new version, as it should be; history shows when a rule changed | The editor edits body and rule together (it already saves a new version for either) |
+| On `skill_version` | A pin pins the body *and* the rule; import of a new SKILL.md with new `paths` is a new version, as it should be; history shows when a rule changed | The editor edits body and rule together (it already saves a new version for either) |
+| **On the attachment** (`skill_binding`), added at amendment | The skill stays independent of every project, repo and language; the place that knows the repos (a project or phase attachment) is the place that names them; the same skill can be `always` in one project and Rust-only in another | Attachment rows are mutable, so what ran is audited from the recorded choice (§6 item 8), not the current row |
 
 ### 5.3 How language is expressed
 
@@ -195,41 +197,52 @@ The prompt is assembled before the agent runs, so `htui` chooses the files.
 
 ## 6. Verdict
 
-1. **A1 — bindings stay the scope, activation is a filter.** `collapse` is unchanged; after it, each
-   bound skill's version-in-force is kept or dropped by its activation rule. "The prompt builder
-   injects the necessary skills" is realised by binding a skill once at project level with a glob
-   rule: from then on each step gets it only when it is about matching files. A2 and A3 are
-   rejected: a global candidate set leaks conventions across projects.
-2. **Activation lives on `skill_version`** (5.2). A pin pins behaviour.
-3. **Two activation modes now: `always` and `glob`.** `always` is today's behaviour and the default,
-   so every existing row and binding behaves exactly as before the migration. `glob` requires a
-   non-empty glob list.
-4. **Language is authoring sugar (L3).** `languages text[]` is kept as typed; at save the editor and
-   the importer expand it through a language→globs map (data, not code — the same pattern as MOD-7's
-   probe spec), union it with the typed globs, and store the result in `globs`. The matcher reads
-   `globs` only. A saved version never changes when the map does.
-5. **Glob matching reads F2**: the files the excerpt walk enumerates under the step's resolved repo
-   roots, restricted to `touched_paths` prefixes when the item has any, plus the previous attempt's
-   changed paths. Glob syntax: `*`, `**`, `?`, `{a,b}`, `[...]`, matched against repo-relative paths
-   with `/` separators, optionally repo-qualified as `<repo>:<glob>` exactly like `touched_paths`.
-   With no resolvable root, a glob skill is **not activated** and the reason is recorded; the step
-   proceeds (an unmatched rule is not an error).
-6. **Record the selection.** The trim record's `skills` section gains the list of candidates with
-   `(skill, version, activation, active, reason)` — `always`, `matched: <path>`, `no match`,
-   `no_path`. The digest already covers the injected bytes; the record makes the *choice* auditable,
-   which `R-ID-5` needs once selection depends on the tree.
-7. **The cap still refuses.** Activation only narrows the set; `SkillsExceedCap` is unchanged.
-8. **Model-decided activation is deferred (M3).** Import maps a description-only skill (the Agent
-   Skills default) to `always` and records `"activation_hint": "model"` in `source`. A catalog with
-   on-demand fetch becomes possible once MOD-11's MCP server exists; it must record every fetch in
-   the step's history to keep `R-ID-5`. Opened as an idea in §8, not an item yet.
-9. **Frontmatter is kept whole in `source`** (5.6), alongside `format`, `path` and `imported_at`.
-   The prompt builder never reads it.
-10. **Import uses a hand-written reader** (5.7) and maps formats as in §7. Names follow the Agent
-    Skills rule (`[a-z0-9-]`, 1-64, no edge or double hyphen) for new skills, checked by the writer,
-    not by a constraint, so existing rows are untouched. Bundled `scripts/`, `references/` and
-    `assets/` are not imported; the importer lists what it skipped. A same-name import appends a
-    version only when body or activation differs, and updates `skill.description`.
+*Amended 2026-09-25 (§10): the first conclusion put activation on the skill version; the maintainer
+moved it to the attachment and added a global level.*
+
+1. **A skill has no dependency on anything.** `skill` and `skill_version` hold name, description,
+   versioned body and the import `source`; nothing on them names a project, repo, phase, language or
+   activation rule. The library is global, as it already is (`skill.name UNIQUE`).
+2. **Attachments carry scope and activation.** Today's `skill_binding` becomes the attachment, at
+   one of three levels: **global** (`project_id` NULL — every project), **project**, or **phase**
+   (a project's phase). Workspaces are not a level: `workspace_project` is many-to-many, so a
+   workspace-level attachment would be ambiguous for a project in two workspaces, and MOD-15's
+   settings resolve App → Project for the same reason.
+3. **The most specific attachment of a skill wins** — phase over project over global — and its
+   pin, position and activation are the ones used. This extends `R-SKL-2`'s "a phase binding
+   overrides a project binding" by one level; `collapse` gains the global list.
+4. **Activation modes on the attachment:** `always` (today's behaviour and the migration default, so
+   every existing binding is unchanged), `glob` (requires globs) and `off` (the skill is attached
+   more broadly but not here — a project switching off a global skill, a phase switching off a
+   project one).
+5. **Language is authoring sugar.** `languages` is kept as typed; at save it is expanded through a
+   language→globs map (data, not code, like MOD-7's probe spec) and unioned with the typed globs
+   into `globs`. The matcher reads only `globs`, so a later map change never changes a saved
+   attachment.
+6. **Per-repo activation is a repo-qualified glob on a project or phase attachment.** Those know
+   the project's repos, so `htui:**/*.rs` means "Rust files in the `htui` repo" — the same
+   `<repo>:<glob>` syntax `touched_paths` uses; a bare glob matches in any repo in the step's scope.
+   A global attachment cannot name a repo (the writer refuses a qualified glob there). The editor
+   offers a repo picker that writes the qualifier.
+7. **Glob matching reads F2** (§5.4): the files the excerpt walk enumerates under the step's resolved
+   repo roots, narrowed to `touched_paths` prefixes when the item has any, plus the previous
+   attempt's changed paths. Syntax `*`, `**`, `?`, `{a,b}`, `[...]` over repo-relative `/` paths.
+   With no resolvable root a glob attachment is not activated and `no_path` is recorded; the step
+   proceeds.
+8. **Record the selection.** Each step records every candidate skill with `(skill, version, level,
+   activation, active, reason)` — `always`, `matched: <path>`, `no match`, `off`, `no_path` — beside
+   the trim record's `skills` section. Attachments are mutable rows, so the recorded choice, not the
+   current row, is what `R-ID-5` audits; the digest already covers the injected bytes.
+9. **The cap still refuses.** Activation only narrows the set; `SkillsExceedCap` is unchanged.
+10. **Model-decided activation is deferred.** A catalog with on-demand fetch needs MOD-11 and must
+    record every fetch to keep `R-ID-5`. Not opened as an item yet (§8).
+11. **Frontmatter is kept whole in `skill_version.source`** with `format`, `path`, `imported_at`.
+    The prompt builder never reads it; the attachment form reads it once, to prefill activation,
+    globs and languages from the version being attached.
+12. **Import uses a hand-written reader** (§5.7) and the mapping of §7.3. New skill names follow the
+    Agent Skills rule (`[a-z0-9-]`, 1-64, no edge or double hyphen), checked by the writer, not a
+    constraint. Bundled `scripts/`, `references/`, `assets/` are skipped and listed. A same-name
+    import appends a version only when the body differs, and updates `skill.description`.
 
 ## 7. Schema and mapping
 
@@ -237,86 +250,110 @@ The prompt is assembled before the agent runs, so `htui` chooses the files.
 
 ```sql
 ALTER TABLE skill_version
+    ADD COLUMN source JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE skill_binding
+    ALTER COLUMN project_id DROP NOT NULL,
     ADD COLUMN activation TEXT   NOT NULL DEFAULT 'always'
-        CHECK (activation IN ('always', 'glob')),
+        CHECK (activation IN ('always', 'glob', 'off')),
     ADD COLUMN globs      TEXT[] NOT NULL DEFAULT '{}',
     ADD COLUMN languages  TEXT[] NOT NULL DEFAULT '{}',
-    ADD COLUMN source     JSONB  NOT NULL DEFAULT '{}'::jsonb,
-    ADD CONSTRAINT skill_version_glob_needs_globs
+    ADD CONSTRAINT skill_binding_phase_needs_project
+        CHECK (phase_id IS NULL OR project_id IS NOT NULL),
+    ADD CONSTRAINT skill_binding_glob_needs_globs
         CHECK (activation <> 'glob' OR cardinality(globs) > 0);
 
-COMMENT ON COLUMN skill_version.activation IS
-    'always = injected wherever bound; glob = injected where bound and a step file matches globs (ANA-22)';
-COMMENT ON COLUMN skill_version.globs IS
-    'effective globs, typed globs plus languages expanded at save; the only field the matcher reads';
-COMMENT ON COLUMN skill_version.languages IS 'languages as authored; display only';
 COMMENT ON COLUMN skill_version.source IS
-    'import provenance and raw frontmatter; never read by the prompt builder';
+    'import provenance and raw frontmatter; prefills an attachment, never read by the prompt builder';
+COMMENT ON COLUMN skill_binding.project_id IS 'NULL = global attachment (every project)';
+COMMENT ON COLUMN skill_binding.activation IS
+    'always | glob | off; the most specific attachment of a skill wins (ANA-22)';
+COMMENT ON COLUMN skill_binding.globs IS
+    'effective globs: typed plus languages expanded at save; <repo>:<glob> only on project or phase rows';
+COMMENT ON COLUMN skill_binding.languages IS 'languages as authored; display only';
 ```
 
-`skill.description` stays on `skill` (it is the library's display line and, once model activation
-exists, the catalog line). `tests/migrations.rs`' pinned applied list, table count (unchanged) and
-commented-column count (+4) move with it.
+The existing `UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)` already allows exactly one
+global row per skill. `project_id`'s `ON DELETE CASCADE` stays. `tests/migrations.rs`' applied list
+and commented-column count (+5) move with it; the table count does not.
 
 ### 7.2 Model
 
-`SkillVersion` gains `activation: Activation { Always, Glob }`, `globs: Vec<String>`,
-`languages: Vec<String>`, `source: serde_json::Value`. `BoundSkill` gains `activation` and `globs`
-so the assembler can filter; a new pure function
-`select(bound: Vec<BoundSkill>, files: &StepFiles) -> (Vec<BoundSkill>, Vec<SkillChoice>)` runs
-after `collapse`, where `StepFiles` is `Resolved(paths) | NoPath`. `collapse` itself is unchanged.
+`SkillVersion` gains `source: serde_json::Value`. `SkillBinding.project_id` becomes
+`Option<ProjectId>` and gains `activation: Activation { Always, Glob, Off }`, `globs`, `languages`.
+`BoundSkill` gains `level` and the winning attachment's `activation` and `globs`.
+`BoundSkill::collapse(global, project, phase)` takes three lists, most specific first. A new pure
+`select(bound, &StepFiles) -> (Vec<BoundSkill>, Vec<SkillChoice>)` runs after it, where `StepFiles`
+is `Resolved(paths by repo) | NoPath`. `bound_skills(project, phase)` reads the global rows too.
 
 ### 7.3 Import mapping
+
+Import writes only `skill` and `skill_version`. The activation keys land in `source` and prefill the
+attachment form; nothing is attached by import.
 
 | Source key | → `htui` field |
 |---|---|
 | `name` (or directory name, or file stem) | `skill.name` (validated) |
 | `description` (+ `when_to_use` appended after a blank line) | `skill.description` |
 | body after the closing `---` | `skill_version.body` |
-| `paths` (Claude), `globs` (Cursor, Windsurf, Continue), `applyTo` (Copilot), `fileMatchPattern` (Kiro) | `globs` (comma strings split, lists taken as is); non-empty → `activation = glob` |
-| `alwaysApply: true`, `trigger: always_on`, `inclusion: always`, `applyTo: "**"` | `activation = always` |
-| `languages` (htui's own key, for round-tripping) | `languages` |
-| description only, `trigger: model_decision`, `inclusion: manual`, `disable-model-invocation`, `trigger: manual` | `activation = always`; the hint kept in `source.activation_hint` |
-| everything else (`license`, `compatibility`, `metadata`, `allowed-tools`, `model`, `hooks`, …) | `source.frontmatter`, verbatim |
+| `paths` (Claude), `globs` (Cursor, Windsurf, Continue), `applyTo` (Copilot), `fileMatchPattern` (Kiro) | prefill: `activation = glob`, `globs` (comma strings split, lists as is) |
+| `alwaysApply: true`, `trigger: always_on`, `inclusion: always`, `applyTo: "**"` | prefill: `activation = always` |
+| `languages` (htui's own key) | prefill: `languages` |
+| description only, `trigger: model_decision`, `inclusion: manual`, `disable-model-invocation` | prefill: `activation = always`; the hint shown beside it |
+| everything, verbatim | `skill_version.source.frontmatter` |
 
 ## 8. Phasing
 
 All of it lands in **MOD-9 milestones 3 and 4**, which this verdict unblocks. No new item is needed.
 
-- **Milestone 3 (skills editable and bindable)** adds: the migration of §7.1; `Activation`,
-  `globs`, `languages`, `source` on the model and both stores; `add_skill_version` taking the
-  activation fields; the language→globs map as data; the editor's activation, languages and globs
-  fields with the expanded globs shown before save; `select` and the trim-record choice list; the
-  glob matcher over F2's file set. The phase-binding clone gap in `graph.rs` (§2) is fixed there.
+- **Milestone 3 (skills editable and attachable)** adds: the migration of §7.1; the model changes
+  of §7.2 on both stores and every `WriteStore`; `upsert_skill`, `add_skill_version` and
+  `set_skill_binding` (attach, detach, pin, position, activation, globs, languages) as
+  compare-and-set writers; the language→globs map as data; the attachments matrix in the Skills tab
+  with a **global** row above the projects and phases (`R-TUI-7`), the expanded globs shown before
+  save, and a repo picker for qualified globs; `select`, the glob matcher over F2's file set and the
+  recorded choice list. The phase-binding clone gap in `graph.rs` (§2) is fixed there.
 - **Milestone 4 (import)** adds the hand-written frontmatter reader and §7.3's mapping, file or
-  directory input (`*/SKILL.md`, and `*.md`/`*.mdc` under a rules directory), skip list for bundled
-  files, and the same-name version rule.
+  directory input (`*/SKILL.md`, and `*.md`/`*.mdc` under a rules directory), the skip list for
+  bundled files, and the same-name version rule.
 - **Dependency**: glob activation needs a resolved repo root. Until MOD-7 milestone 4 writes
-  `repo_box_path` rows, a glob skill activates only in steps that run in a worktree
+  `repo_box_path` rows, a glob attachment activates only in steps that run in a worktree
   (`run_step_tree.path`); elsewhere it records `no_path`. MOD-9 milestone 3 does not wait on MOD-7.
 - **Glob matcher**: the plan decides between `globset` (the matcher behind ripgrep; a new
-  dependency, justified in the plan per MOD-7's rule for new crates) and a small hand-written
-  matcher over the §6.5 syntax. Either is tested against the same table.
-- **Later, not opened**: model-decided activation (M1) once MOD-11 exists; content `regex`
-  activation if a real need appears; activation by item kind (a `kinds` filter) if phase bindings
-  prove too coarse.
+  dependency, justified in the plan) and a small hand-written matcher over the syntax of §6 item 7.
+  Either is tested against the same table.
+- **Later, not opened**: model-decided activation once MOD-11 exists; content `regex` activation if
+  a real need appears; activation by item kind if phase attachments prove too coarse.
 
 ## 9. Risks and open questions
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| A glob skill silently never fires because no root resolves | High until MOD-7 M4 | Medium | `no_path` recorded in the trim record and shown in the preview; the editor warns when the scoped project has repos with no path row |
+| A glob attachment silently never fires because no root resolves | High until MOD-7 M4 | Medium | `no_path` recorded in the trim record and shown in the preview; the editor warns when the scoped project has repos with no path row |
 | The walk for activation slows assembly | Low | Low | It is the excerpt walk, done once per step and shared |
 | A same-file skill fires on an unrelated item in a mixed repo | Medium | Low | F2 restricts to `touched_paths` prefixes when the item declares them |
 | Frontmatter reader rejects a real file | Medium | Low | Per-key error with line number; the body still imports if the maintainer accepts `always` |
 | The language map misses a language | Medium | Low | Map is data; typed globs always work |
+| A repo rename orphans a qualified glob | Low | Medium | Same exposure as `touched_paths`; the editor flags qualified globs naming no current repo |
+| A global attachment surprises a project that never asked for it | Medium | Low | The Skills tab shows global rows in every project's matrix; `off` at project level opts out |
 | Recording choices bloats the trim record | Low | Low | One short row per bound skill |
 
 **Open for the MOD-9 milestone 3 plan:** `globset` vs hand-written matcher; the exact language map
 seed (at least `rust`, `c`, `cpp`, `python`, `typescript`, `javascript`, `go`, `java`, `csharp`,
 `shell`, `sql`, `markdown`, `toml`, `yaml`); whether `SkillChoice` rides the trim record's existing
-`skills` section or a sibling field.
+`skills` section or a sibling field; whether `R-SKL-2`'s wording is amended to name the global level
+(a maintainer decision — `docs/REQUIREMENTS.md` is never edited at close-out).
 
 ## 10. Amendment record
 
-- 2026-09-25 — concluded at authoring.
+- 2026-09-25 — concluded at authoring with activation stored on `skill_version` and repo-qualified
+  globs allowed on it.
+- 2026-09-25 — **amended after a maintainer challenge.** A shared skill cannot know a project's repo
+  names, so a qualified glob on the version coupled a global skill to one project; and the
+  maintainer's model is that "the skill per se shouldn't have a dependency to anything" — it lives
+  in global storage and is added, with the activation wanted, where it is used. Activation, globs
+  and languages moved from `skill_version` to the attachment (`skill_binding`); a global level
+  (`project_id` NULL) was added; `off` was added so a narrower attachment can opt out of a broader
+  one. A workspace level was considered and rejected because `workspace_project` is many-to-many
+  (maintainer's choice: global, project, phase). §5.2's comparison is kept as it was argued; its
+  conclusion is superseded by §6 items 1-4.
