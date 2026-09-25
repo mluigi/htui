@@ -42,7 +42,7 @@ use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::PlanError;
 use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
 use htui_agent::registry::caps_for;
-use htui_agent::{AgentLaunch, InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
+use htui_agent::{InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
 use htui_core::model::{AgentId, AgentSummary, Scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -1300,10 +1300,8 @@ impl SettingsSection for AgentsSection {
 /// the answer, and `R-AGT-10` is about the user being told before anything is fetched — including
 /// being told that there is nothing to fetch.
 fn declares_a_source(launch: &Value) -> bool {
-    serde_json::from_value::<AgentLaunch>(launch.clone())
-        .ok()
-        .and_then(|launch| launch.discovery)
-        .is_some_and(|discovery| discovery.install.is_some())
+    // MOD-7 blueprint F-E: the one reading the install pre-flight and the box probe share.
+    htui_agent::launch::declares_install(launch)
 }
 
 /// The `quota` column of one row (`R-TUI-8`, MOD-2 D73).

@@ -259,6 +259,9 @@ impl App {
             StoreReply::MigrationsApplied { applied } => {
                 self.status = Some(format!("applied {applied} migration(s)"));
             }
+            // MOD-7 D13, blueprint D25: the registration probe answers at `UNSOLICITED`, which the
+            // freshness gate drops, so its report is rendered here, above the gate.
+            StoreReply::BoxProbed(report) => self.status = Some(report.status_line()),
             _ => {}
         }
     }

@@ -93,7 +93,7 @@ pub enum Origin {
 pub enum StoreRequest {
     /// Every workspace with its projects (switcher, startup scope).
     Workspaces,
-    /// This box's row for the top bar. No probe: that is MOD-7.
+    /// This box's row for the top bar.
     BoxInfo,
     /// How many runs of the scope are active (top bar).
     ActiveRuns {

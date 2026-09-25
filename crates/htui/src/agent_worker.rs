@@ -39,7 +39,7 @@ use htui_agent::install::{
     InstallConfig, InstallError, InstallJob, InstallOutcome, InstallPlan, InstallProgress,
     Installer, PlanError, install, plan as plan_install,
 };
-use htui_agent::launch::{AgentLaunch, AgentSettings};
+use htui_agent::launch::AgentSettings;
 use htui_agent::probe::{
     ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeStatus, SpawnTier2, probe_agent,
 };
@@ -2388,11 +2388,8 @@ async fn row_for(
 /// costs no request at all. A `launch` that does not parse declares nothing, source included —
 /// the pre-flight reaches the same conclusion from the same document, and this is its sentence.
 fn declares_a_source(agent: &Agent) -> Result<(), StoreError> {
-    let declared = serde_json::from_value::<AgentLaunch>(agent.launch.clone())
-        .ok()
-        .and_then(|launch| launch.discovery)
-        .and_then(|discovery| discovery.install);
-    if declared.is_some() {
+    // MOD-7 blueprint F-E: the one reading the Settings section and the box probe share.
+    if htui_agent::launch::declares_install(&agent.launch) {
         return Ok(());
     }
     Err(StoreError::Backend(
