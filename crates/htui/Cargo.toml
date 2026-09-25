@@ -52,6 +52,8 @@ sentry-tracing = { workspace = true }
 # MOD-9 D9: the $EDITOR temp file (removed on drop); already in the lock (was dev-only). The store
 # worker's swap tests also open a throwaway `cache.sqlite` with it, never the user's.
 tempfile = "3"
+# MOD-9 D12: the Templates view's line diff; 3.2.0 is already compiled for htui-agent.
+similar            = { workspace = true }
 
 [dev-dependencies]
 # The chat tab's snapshots drive the fake transport through the same registry the ACP one uses.
