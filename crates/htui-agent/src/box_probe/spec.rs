@@ -25,6 +25,11 @@
 //!
 //! An overlay may add only `kind: "path"` tools whose `names` are bare file names (no separator,
 //! no `..`): `node_package` and `glob` stay agent-row mechanisms (plan D9, R-11).
+//!
+//! On Windows with WSL installed, the seed's `bash` resolves to `%SystemRoot%\System32\bash.exe`,
+//! the WSL launcher: probing it boots the WSL VM and records the distribution's `bash`, not a
+//! Windows one. `{"tools": {"bash": {"disabled": true}}}` in `box_probe_spec` turns it off; the
+//! real fix belongs to MOD-16's verification.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
