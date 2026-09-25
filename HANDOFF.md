@@ -459,11 +459,26 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   the cheaper shape than more columns. Out of scope: the caps editor (MOD-12), box-profile capability
   edits (MOD-7), and anything keyed on an agent's name (`R-AGT-5`). Raised by the maintainer on
   2026-09-10 while MOD-2 milestone 7 was in flight.
-- [ ] **MOD-24 - Fault Tolerance of Agent Processes.** Implement agent memory checkpointing to Postgres. If the daemon or TUI crashes mid-run, `htui` should be able to read the last `SessionEvent` from Postgres, re-hydrate the agent's context window, and resume the exact step it was on so that multi-hour runs can survive process restarts.
-  **Relates to ANA-16** (`docs/ANA-16.md` §8): **conflict flagged for a maintainer decision, not
-  resolved here.** This item presupposes a daemon and re-attach/re-hydration, which conflicts with
-  ANA-2 §4.9's reset-and-retry resume (a lost lease resets the tree and the step starts again).
-  MOD-41 (headless worker) gives it the daemon but not the re-attach or re-hydration.
+- [ ] **MOD-24 - Crash recovery of runs under the headless worker.** `R-HIS-1`, `R-ORCH-11`.
+  **Rescoped by maintainer decision, 2026-09-25:** a run survives a crash through ANA-2 §4.9's
+  reset-and-retry resume, not by re-hydrating the agent's context and continuing the exact step. The
+  original ask (checkpoint agent memory to Postgres, re-hydrate from the last `SessionEvent`, resume
+  mid-step) is **dropped**: after a crash the child process, the ACP connection and the parked
+  permission responders are gone, the step may have half-mutated its tree (ANA-2 §4.9 options table),
+  and `session_event` holds the transcript, not the agent's context window. What §4.9 already gives,
+  as built by MOD-4 M6 (`crates/htui-orch/src/engine.rs` `sweep`/`recover_step`, conformance cases in
+  `crates/htui-orch/src/conformance.rs`): a crash costs at most the interrupted step, which is reset
+  to `before_hash` and retried, or marked `done` when its `after_hash` and output document exist.
+  **What is left for this item:** once MOD-41 hosts run supervision, (1) a TUI exit or crash no
+  longer interrupts a run the worker owns, and (2) an end-to-end test kills the `htui worker`
+  process mid-step and after a step's artefacts are written, restarts it, and checks that the sweep
+  resets-and-retries the first and marks the second `done`. **Not in scope:** continuing an
+  interrupted step inside the agent's own session (`claude --resume <id>`, ACP `session/load` once
+  MOD-37 carries it) on the unreset tree; it would need an ANA-2 §4.9 amendment, works only on the
+  box that holds the agent's transcript, and can be raised again after MOD-37. Continuing across a
+  worker-to-TUI re-attach of a live agent is MOD-46/MOD-47 territory, not this item's.
+  Blocked on MOD-41. Relates to ANA-16 (`docs/ANA-16.md` §8), which flagged the conflict this
+  decision settles.
 
 - [ ] **MOD-40 - Multi-writer store hardening** (from ANA-16, `docs/ANA-16.md` §6.1, §8 item 1). `R-ID-3`, `R-HIS-1`.
   Close the gaps C1-C8 that apply with or without a server. C1: step writes (`append_events`,
@@ -591,6 +606,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 34 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 34 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
