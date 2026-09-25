@@ -5348,6 +5348,24 @@ async fn prompt_template_refuses_what_parse_refuses<S: WriteStore>(store: &S) {
             "a blank or untrimmed name",
         );
     }
+    // Postgres `text` cannot hold U+0000 (`22021`), so both stores refuse it by rule, not by column.
+    constraint(
+        store
+            .append_prompt_template(
+                new_template(ids::PROJECT_HTUI, "implement", "Implement {{item}}.\0\n"),
+                Some(1),
+            )
+            .await,
+        "prompt_template.body",
+        "a body with a NUL",
+    );
+    constraint(
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "a\0b", GOOD), None)
+            .await,
+        "prompt_template.name",
+        "a name with a NUL",
+    );
 
     let head = stale(
         CASE,

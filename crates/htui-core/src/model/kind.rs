@@ -400,7 +400,7 @@ mod tests {
                 "`{good}` names a template"
             );
         }
-        for bad in ["", " plan", "plan ", "a\nb", "a\rb", "\t"] {
+        for bad in ["", " plan", "plan ", "a\nb", "a\rb", "\t", "a\0b"] {
             assert!(
                 !PromptTemplate::name_is_valid(bad),
                 "`{}` does not name a template",
