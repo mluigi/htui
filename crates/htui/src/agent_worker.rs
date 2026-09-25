@@ -113,6 +113,9 @@ pub struct BoxProbeReport {
     pub spec_error: Option<String>,
     /// The box half's failure (no box, a read or the write); nothing was written.
     pub box_failed: Option<String>,
+    /// This box was left alone, already probed by this `htui` under this spec, and the report
+    /// exists only to say [`spec_error`](Self::spec_error): every other field is empty.
+    pub unchanged: bool,
 }
 
 impl BoxProbeReport {
@@ -7991,6 +7994,12 @@ done
             "box probed: 2 tools · tags gpu, rust · a is missing and can be installed: \
              Settings > Agents, i · agent probe failed: y · z"
         );
+
+        let unchanged = BoxProbeReport {
+            unchanged: true,
+            ..all
+        };
+        assert_eq!(unchanged.status_line(), "box probe unchanged · z");
     }
 
     /// Blueprint D27: an install is refused while the registration probe holds the claim.
@@ -8308,6 +8317,51 @@ done
         assert_eq!(record.probe_spec_digest, Some(seed_digest()));
         assert_eq!(record.tools.len(), 2);
         assert_eq!(report.tools, 2);
+    }
+
+    /// Plan D17: an ignored overlay is named at every swap, even one that leaves the box alone.
+    ///
+    /// `json!(42)` does not merge, so the effective spec is the seed's and its digest matches the
+    /// first probe's: the box is not probed again, and exactly one `unchanged` report says why
+    /// the stored spec was ignored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_invalid_stored_spec_is_named_on_a_swap_that_does_not_probe() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        standard_tools(tmp.path());
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        swap(&mut runtime, &backend, &tx).await;
+        assert_eq!(the_report(&sent(&mut rx)).spec_error, None);
+        let first = this_box_record(&store).await;
+
+        store.set_app_setting(box_probe::spec::SETTING_KEY, json!(42));
+        swap(&mut runtime, &backend, &tx).await;
+
+        let report = the_report(&sent(&mut rx));
+        assert!(report.unchanged, "the box was not probed again: {report:?}");
+        let error = report
+            .spec_error
+            .clone()
+            .expect("the ignored overlay is named");
+        assert!(error.starts_with(box_probe::spec::SPEC_IGNORED), "{error}");
+        assert_eq!(
+            report,
+            BoxProbeReport {
+                unchanged: true,
+                spec_error: Some(error.clone()),
+                ..BoxProbeReport::default()
+            }
+        );
+        assert_eq!(
+            report.status_line(),
+            format!("box probe unchanged · {error}")
+        );
+        let second = this_box_record(&store).await;
+        assert_eq!(second.row.last_probed_at, first.row.last_probed_at);
+        assert_eq!(second.probe_spec_digest, Some(seed_digest()));
     }
 
     /// Blueprint D28: the version a probe records is the binary's own.
