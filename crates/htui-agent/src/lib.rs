@@ -35,6 +35,11 @@
 //! ranker, the tiers and every value type stay in `htui-core`, which names no `std::fs` — this
 //! crate is where the disk is.
 //!
+//! [`box_probe`] is MOD-7's answer to "what *is* this box": its hardware through a
+//! [`HardwareSource`](box_probe::hardware::HardwareSource) seam, and its tools and derived tags
+//! through a data spec ([`box_probe::spec`]) that [`probe`]'s resolver walks. It never writes; the
+//! [`BoxProbe`](htui_core::model::BoxProbe) it returns is what the store records.
+//!
 //! Deliberately absent in milestones 1–2 (plan D16): any wire protocol (`acp/`, `cli/`), the chat
 //! tab, and quota. Each is a named seam, not a plan.
 #![warn(missing_docs)]
@@ -91,6 +96,7 @@ macro_rules! wire_enum {
 
 pub mod acp;
 pub mod auth;
+pub mod box_probe;
 pub mod cli;
 #[cfg(feature = "test-support")]
 pub mod conformance;
