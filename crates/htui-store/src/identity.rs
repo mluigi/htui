@@ -1,18 +1,23 @@
-//! The box identity file and the cache directory name (plan D6, ANA-9 §4.4).
+//! The box identity file, the machine fingerprint and the cache directory name (plan D6, ANA-9
+//! §4.4, MOD-7 PRD D1).
 //!
 //! `box.toml` is what makes `box.id` survive a hostname change (`R-BOX-4`): the id is minted once,
-//! as a UUIDv7, and the hostname is rewritten around it. The full box probe (`box_tool`, tags,
-//! RAM, GPU) is MOD-7's; nothing here talks to a database.
+//! as a UUIDv7, and the hostname is rewritten around it. The `box` row is keyed on that id; the
+//! [`Fingerprint`], a keyed hash of the OS machine identity, is what tells a `box.toml` copied
+//! onto another machine apart from the machine that minted it. The raw identity is read here and
+//! never leaves: no field, column, log line or file holds it. Nothing here talks to a database.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
+use hmac::{Hmac, Mac};
 use htui_core::model::BoxId;
 use htui_core::store::{Result, StoreError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use sqlx::postgres::PgConnectOptions;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// File name under [`config_root`] holding [`Identity`].
 pub const BOX_FILE: &str = "box.toml";
@@ -93,7 +98,8 @@ pub fn load_or_mint(root: &Path) -> Result<Identity> {
     }
 }
 
-/// Overwrites `<root>/box.toml`; used by the adopt-DB-id rule of [`crate::PgStore::register_box`].
+/// Overwrites `<root>/box.toml`; used when registration minted a new id for a copied `box.toml`
+/// ([`crate::Registration::Copied`], [`crate::connect::try_connect`]).
 ///
 /// The write goes to a uniquely named temporary file and is then renamed over the target, so a
 /// second process reading the file concurrently never sees a half-written one.
@@ -190,37 +196,124 @@ impl core::fmt::Debug for Fingerprint {
 
 impl Fingerprint {
     /// Trims and ASCII-lowercases `raw`; an empty identity is `None`, anything else the keyed hash.
+    ///
+    /// `raw` is the HMAC **key** and [`FINGERPRINT_APP_ID`] the message, so the stored value says
+    /// nothing about the identity without it, and two programs keying the same identity with
+    /// different messages produce unrelated values. The normalised copy of the identity lives only
+    /// in a [`Zeroizing`] local.
     #[must_use]
     pub fn from_machine_identity(raw: &str) -> Option<Self> {
-        let _ = raw;
-        todo!("MOD-7 T1 (c)")
+        let key = Zeroizing::new(raw.trim().to_ascii_lowercase());
+        if key.is_empty() {
+            return None;
+        }
+        // HMAC accepts a key of any length, so this never fails; `ok()?` keeps it panic-free.
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes()).ok()?;
+        mac.update(FINGERPRINT_APP_ID);
+        Some(Self(mac.finalize().into_bytes().into()))
     }
 
     /// Lowercase hex, 64 characters: what the column stores.
     #[must_use]
     pub fn as_hex(&self) -> String {
-        todo!("MOD-7 T1 (c)")
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
+/// Read once per process: the machine identity does not change under a running `htui`.
+static MACHINE_FINGERPRINT: tokio::sync::OnceCell<Option<Fingerprint>> =
+    tokio::sync::OnceCell::const_new();
+
 /// This machine's fingerprint, read from the OS once per process; `None` when no identity is
 /// readable.
+///
+/// Linux reads `/etc/machine-id` (then the dbus copy), macOS the `IOPlatformUUID` of `ioreg`, and
+/// Windows `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`. The raw text is only ever a
+/// [`Zeroizing`] local of the reader, and only the keyed hash leaves this function.
 pub async fn machine_fingerprint() -> Option<Fingerprint> {
-    todo!("MOD-7 T1 (c)")
+    MACHINE_FINGERPRINT
+        .get_or_init(|| async {
+            let raw = read_os_identity().await?;
+            Fingerprint::from_machine_identity(&raw)
+        })
+        .await
+        .clone()
 }
 
 /// `<root>/etc/machine-id`, then `<root>/var/lib/dbus/machine-id` (plan D20).
+///
+/// A file counts only when its trimmed content is 32 hex characters: `uninitialized` (systemd's
+/// first-boot placeholder) and an empty file fall through to the next one.
 #[cfg(any(target_os = "linux", test))]
-fn machine_id_under(root: &Path) -> Option<zeroize::Zeroizing<String>> {
-    let _ = root;
-    todo!("MOD-7 T1 (c)")
+fn machine_id_under(root: &Path) -> Option<Zeroizing<String>> {
+    ["etc/machine-id", "var/lib/dbus/machine-id"]
+        .iter()
+        .find_map(|relative| {
+            let text = Zeroizing::new(std::fs::read_to_string(root.join(relative)).ok()?);
+            let trimmed = text.trim();
+            (trimmed.len() == 32 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| Zeroizing::new(trimmed.to_owned()))
+        })
 }
 
 /// The value of the `"IOPlatformUUID" = "…"` line of `ioreg -rd1 -c IOPlatformExpertDevice`.
 #[cfg(any(target_os = "macos", test))]
 fn ioreg_platform_uuid(text: &str) -> Option<&str> {
-    let _ = text;
-    todo!("MOD-7 T1 (c)")
+    let line = text
+        .lines()
+        .find(|line| line.contains("\"IOPlatformUUID\""))?;
+    let (_, value) = line.split_once('=')?;
+    let value = value.trim().strip_prefix('"')?;
+    let uuid = &value[..value.find('"')?];
+    (!uuid.is_empty()).then_some(uuid)
+}
+
+/// The OS machine identity, raw (Linux: `/etc/machine-id`, then the dbus copy).
+#[cfg(target_os = "linux")]
+async fn read_os_identity() -> Option<Zeroizing<String>> {
+    tokio::task::spawn_blocking(|| machine_id_under(Path::new("/")))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The OS machine identity, raw (macOS: `ioreg`'s `IOPlatformUUID`, bounded at five seconds).
+#[cfg(target_os = "macos")]
+async fn read_os_identity() -> Option<Zeroizing<String>> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("/usr/sbin/ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let stdout = Zeroizing::new(output.stdout);
+    let text = std::str::from_utf8(&stdout).ok()?;
+    ioreg_platform_uuid(text).map(|uuid| Zeroizing::new(uuid.to_owned()))
+}
+
+/// The OS machine identity, raw (Windows: the registry's `MachineGuid`).
+#[cfg(windows)]
+async fn read_os_identity() -> Option<Zeroizing<String>> {
+    tokio::task::spawn_blocking(|| {
+        windows_registry::LOCAL_MACHINE
+            .open(r"SOFTWARE\Microsoft\Cryptography")
+            .and_then(|key| key.get_string("MachineGuid"))
+            .ok()
+            .map(Zeroizing::new)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// No machine identity reader on this platform: registration goes by `box.toml`'s id alone.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+async fn read_os_identity() -> Option<Zeroizing<String>> {
+    None
 }
 
 /// This machine's host name, or `unknown-host` when the OS will not say.

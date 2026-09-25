@@ -77,8 +77,10 @@ impl Registration {
     /// The id this box has after registering `presented`.
     #[must_use]
     pub const fn box_id(&self, presented: BoxId) -> BoxId {
-        let _ = presented;
-        todo!()
+        match self {
+            Self::New | Self::Known { .. } => presented,
+            Self::Copied { minted, .. } => *minted,
+        }
     }
 }
 
@@ -135,11 +137,12 @@ impl PgStore {
     /// [`identity::load_or_mint`](crate::identity::load_or_mint) over
     /// [`identity::config_root`](crate::identity::config_root).
     ///
-    /// **Adopt-DB-id rule (plan D6)**: when this hostname already has a `box` row under a different
-    /// id, the database's id wins and [`PgStore::this_box`] answers it, not `identity.box_id`. The
-    /// caller persists that back by comparing the two and, when they differ, writing
-    /// [`PgStore::identity`] through [`identity::store`](crate::identity::store) - `PgStore` never
-    /// writes `box.toml` itself.
+    /// **Registration (MOD-7 D1-D3)**: the `box` row is keyed on `identity.box_id` and checked by
+    /// this machine's [`Fingerprint`] ([`PgStore::register_box`]). [`PgStore::this_box`] answers
+    /// the id registration answered, which differs from `box.toml`'s only for a copied file
+    /// ([`Registration::Copied`]). The caller persists that back by comparing the two and, when
+    /// they differ, writing [`PgStore::identity`] through
+    /// [`identity::store`](crate::identity::store) - `PgStore` never writes `box.toml` itself.
     ///
     /// # Errors
     ///
@@ -370,18 +373,110 @@ impl PgStore {
         Ok(row.id)
     }
 
-    /// Registers this box by its `box.toml` id, checked by the machine fingerprint (PRD D1-D5).
+    /// Registers this box under its `box.toml` id, checked by the machine fingerprint (MOD-7 PRD
+    /// D1-D5, blueprint D19, D31).
+    ///
+    /// The row is keyed on `identity.box_id`, never on the hostname: a rename is the same box, and
+    /// two boxes may share a hostname. One transaction, three statements:
+    ///
+    /// 1. **Insert first**, `ON CONFLICT (id) DO NOTHING`: the only statement that can create the
+    ///    row, so two first registrations of one id cannot both insert, and neither fails
+    ///    ([`Registration::New`] for the one that inserted).
+    /// 2. When it inserted nothing, the row exists: **lock** it (`FOR UPDATE`) and read its owner,
+    ///    hostname and fingerprint.
+    /// 3. A row under another user, or a stored fingerprint that differs from `fingerprint`, is a
+    ///    `box.toml` carried from somewhere else: the row is left untouched and this machine is
+    ///    inserted under a freshly minted id with statement 1's text ([`Registration::Copied`]).
+    ///    Otherwise it is this box: the display fields and `last_seen_at` are refreshed, a missing
+    ///    fingerprint is recorded and a stored one never cleared ([`Registration::Known`]).
+    ///
+    /// No fingerprint on either side decides by the id alone. `htui_version` is written only by the
+    /// insert; it, the probe columns, the tags, `quirks`, `settings` and `edit_version` are never
+    /// written by a reconnect (plan D5): the probe writer owns them.
+    ///
+    /// [`PgStore::connect`] keeps the answered id in [`PgStore::identity`]; writing a minted one
+    /// back to `box.toml` through [`identity::store`](crate::identity::store) is the caller's job,
+    /// since only the caller knows the config root.
     ///
     /// # Errors
     ///
-    /// Whatever the driver reports, through [`map_sqlx`].
+    /// Whatever the driver reports, through [`map_sqlx`], and [`StoreError::Backend`] in the
+    /// astronomically unlikely case that a freshly minted id already has a row.
     pub async fn register_box(
         &self,
         identity: &Identity,
         fingerprint: Option<&Fingerprint>,
     ) -> Result<Registration> {
-        let _ = (identity, fingerprint, this_os_family());
-        todo!("MOD-7 T1 (c)")
+        let presented = fingerprint.map(Fingerprint::as_hex);
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        // (a) Insert first.
+        let new_row = NewBoxRow {
+            user_id: self.this_user,
+            identity,
+            os_family: this_os_family(),
+            fingerprint: presented.as_deref(),
+        };
+        if new_row.insert(&mut tx, identity.box_id).await? {
+            tx.commit().await.map_err(map_sqlx)?;
+            return Ok(Registration::New);
+        }
+
+        // (lock) The row exists, committed, and is now ours until the transaction ends.
+        let row = sqlx::query!(
+            r#"
+            SELECT user_id AS "user_id: UserId", hostname, machine_fingerprint
+              FROM box WHERE id = $1 FOR UPDATE
+            "#,
+            identity.box_id.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        let copied = row.user_id != self.this_user
+            || matches!(
+                (row.machine_fingerprint.as_deref(), presented.as_deref()),
+                (Some(stored), Some(this)) if stored != this
+            );
+
+        let answer = if copied {
+            // Statement (a) again, under a minted id (D31); the copied row is never touched.
+            let minted = BoxId::new();
+            if !new_row.insert(&mut tx, minted).await? {
+                return Err(StoreError::Backend(
+                    "a fresh box id already exists".to_owned(),
+                ));
+            }
+            Registration::Copied {
+                previous: identity.box_id,
+                minted,
+            }
+        } else {
+            // (c) The same machine: display fields and `last_seen_at` only.
+            sqlx::query!(
+                r#"
+                UPDATE box
+                   SET hostname = $2, os_family = $3, arch = $4, last_seen_at = clock_timestamp(),
+                       machine_fingerprint = COALESCE(machine_fingerprint, $5)
+                 WHERE id = $1
+                "#,
+                identity.box_id.as_uuid(),
+                identity.hostname,
+                new_row.os_family.as_str(),
+                std::env::consts::ARCH,
+                new_row.fingerprint,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            Registration::Known {
+                renamed_from: (row.hostname != identity.hostname).then_some(row.hostname),
+            }
+        };
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(answer)
     }
 
     /// The pool, for the refresh task (`cache::refresh`) and for the tests.
@@ -398,16 +493,18 @@ impl PgStore {
         MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0)
     }
 
-    /// `box.id` of this box, as the database knows it after the adopt-DB-id rule.
+    /// `box.id` of this box: the id registration answered, which differs from `box.toml`'s only
+    /// for a copied file.
     #[must_use]
     pub const fn this_box(&self) -> BoxId {
         self.this_box
     }
 
-    /// The identity this store registered under, with `box_id` already adopted from the database.
+    /// The identity this store registered under, with `box_id` the id registration answered, which
+    /// differs from `box.toml`'s only for a copied file.
     ///
     /// This is what a caller writes back to `box.toml` when it differs from what it passed to
-    /// [`PgStore::connect`] (plan D6).
+    /// [`PgStore::connect`] (MOD-7 D3).
     #[must_use]
     pub const fn identity(&self) -> &Identity {
         &self.identity
@@ -425,9 +522,9 @@ impl PgStore {
         self.registration.as_ref()
     }
 
-    /// Seeds, registers this box and adopts the database's id for it (plan D5, D6).
+    /// Seeds, reads this machine's fingerprint and registers this box (plan D5, MOD-7 D1-D3).
     ///
-    /// No file I/O: persisting an adopted id back to `box.toml` is the caller's job, because only
+    /// No file I/O: persisting a minted id back to `box.toml` is the caller's job, because only
     /// the caller knows which config root it read the identity from.
     async fn bootstrap(&mut self) -> Result<()> {
         self.this_user = self.seed_if_empty().await?;
@@ -440,6 +537,43 @@ impl PgStore {
         self.this_box = id;
         self.registration = Some(registration);
         Ok(())
+    }
+}
+
+/// The values statement (a) of [`PgStore::register_box`] inserts, whichever id they go under.
+///
+/// One statement text for both inserts, the first registration and the minted `Copied` one
+/// (blueprint D31), so the two cannot drift apart and share one `.sqlx` entry.
+struct NewBoxRow<'a> {
+    user_id: UserId,
+    identity: &'a Identity,
+    os_family: OsFamily,
+    fingerprint: Option<&'a str>,
+}
+
+impl NewBoxRow<'_> {
+    /// Inserts the row under `id` unless one exists; `true` when it inserted.
+    async fn insert(&self, conn: &mut sqlx::PgConnection, id: BoxId) -> Result<bool> {
+        let inserted = sqlx::query!(
+            r#"
+            INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version,
+                             machine_fingerprint)
+            VALUES ($1, $2, $3, $4, '', $5, $6, $7)
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id AS "id!: BoxId"
+            "#,
+            id.as_uuid(),
+            self.user_id.as_uuid(),
+            self.identity.hostname,
+            self.os_family.as_str(),
+            std::env::consts::ARCH,
+            HTUI_VERSION,
+            self.fingerprint,
+        )
+        .fetch_optional(conn)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(inserted.is_some())
     }
 }
 
