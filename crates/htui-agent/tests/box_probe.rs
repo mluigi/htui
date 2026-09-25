@@ -466,6 +466,33 @@ async fn a_shim_that_prints_no_version_is_absent() {
     assert!(probe.tools.is_empty(), "{:?}", probe.tools);
 }
 
+/// The Windows Store stub (`python3.exe` under `WindowsApps`) answers `--version` with a sentence
+/// that starts with `Python`: the digit-anchored pattern captures nothing from it, and the probe
+/// moves on to the next name, whose version it keeps.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_python_stub_that_prints_no_version_falls_through_to_the_next_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let env = env(tmp.path());
+    let bin = tmp.path().join("bin");
+    script(
+        tmp.path(),
+        "python3",
+        "echo 'Python was not found; run without arguments to install from the Microsoft Store, \
+         or disable this shortcut from Settings > Manage App Execution Aliases.'; exit 9009",
+    );
+    script(tmp.path(), "python", "echo 'Python 3.12.1'");
+
+    let probe = probe(&env, &seeded()).await;
+    assert_eq!(found(&probe), vec![("python3", "3.12.1")]);
+    assert_eq!(
+        PathBuf::from(&probe.tools[0].path),
+        bin.join("python"),
+        "the name whose version was captured"
+    );
+    assert_eq!(probe.probed_tags, vec!["python"]);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_presence_only_tool_counts_when_found() {
