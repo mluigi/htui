@@ -584,6 +584,48 @@ mod tests {
             let name = path.file_name().and_then(|name| name.to_str()).unwrap();
             assert!(name.starts_with("htui-___a_b_c-"), "{name}");
         }
+
+        /// Ctrl-C or Ctrl-\ at an editor that keeps the tty cooked (`code --wait`, `ed`) signals
+        /// the whole foreground group, htui included. The script stands in for the terminal by
+        /// signalling this process by pid: never the group, which holds `cargo` too.
+        #[tokio::test]
+        async fn an_interrupt_while_the_editor_runs_does_not_kill_htui() {
+            let dir = TempDir::new().unwrap();
+            let me = std::process::id();
+            let cmd = script(
+                &dir,
+                "interrupt",
+                &format!("kill -INT {me}\nkill -QUIT {me}\nexit 0"),
+            );
+            let outcome = run(&cmd, "hello\n", "implement").await;
+            assert!(
+                matches!(
+                    outcome,
+                    ExternalEditOutcome::Unchanged { .. } | ExternalEditOutcome::Failed(_)
+                ),
+                "{outcome:?}"
+            );
+            // Still here: the default disposition would have ended this process above.
+            let outcome = run(&cmd, "hello\n", "implement").await;
+            assert!(
+                matches!(outcome, ExternalEditOutcome::Unchanged { .. }),
+                "{outcome:?}"
+            );
+        }
+
+        /// htui catches the interrupt; it does not ignore it. A caught signal is back at its
+        /// default in an `exec`ed child, so the editor still gets Ctrl-C (a `SIG_IGN` would be
+        /// inherited, and the script below would live on to `exit 0`).
+        #[tokio::test]
+        async fn the_editor_still_gets_the_interrupt() {
+            let dir = TempDir::new().unwrap();
+            let cmd = script(&dir, "self", "kill -INT $$\nexit 0");
+            let outcome = run(&cmd, "hello\n", "implement").await;
+            let ExternalEditOutcome::Failed(message) = outcome else {
+                panic!("expected Failed, got {outcome:?}");
+            };
+            assert!(message.contains("exited with a signal"), "{message}");
+        }
     }
 
     /// Suspension over a recording fake: the real terminal is never touched.
