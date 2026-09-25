@@ -1306,6 +1306,8 @@ The live check is the plan's (§Validation), unchanged.
 | R-15 | `boxes()` per swap reads every box and tool of the user; this grows with fleet size. | Low | Milestone 1 has one to three boxes. A one-box read is milestone 2's if needed. |
 | R-16 | An edited `0005` after the first scratch migrate breaks `sqlx migrate run` on that database. | Medium | F-S: recreate `htui_prepare_mod7` before every prepare. |
 | R-17 | `hmac`'s internal ipad/opad buffers are derived from the raw identity and are not zeroized. | Low | They are XOR-derived, not the raw text, and live for one call on the stack of a process that already read the file. Accepted. |
+| R-18 | On a Mac without the Command Line Tools, `/usr/bin/{git,clang,gcc,make,python3,java,javac}` are `xcode-select` stubs; running their version child opens the "install developer tools" (or JDK) dialog, so a registration probe there can raise GUI prompts, and each tool still reads absent. Found by T3's round-2 verifier (2026-09-25). | Medium on such Macs; none on Linux/Windows | Not fixed in milestone 1 (macOS is unverified, R-3). Candidate guard naming no tools: under `cfg(target_os = "macos")`, run `/usr/bin/xcode-select -p` once; if it fails, treat any resolved path under `/usr/bin/` as absent without spawning. Routed to the maintainer. |
+| R-19 | The seeded `gcc` pattern was anchored at end of line, so Fedora and Arch `gcc` read absent. **Fixed in T3** (`250b29c`, amends §5.5): unanchored, the greedy match takes the last dotted version; `the_gcc_version_is_read_whatever_follows_it` pins three distributions' first lines. | — | Fixed. |
 
 ---
 
