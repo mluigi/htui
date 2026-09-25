@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use htui_core::model::{BoxId, OsFamily};
 use htui_core::store::StoreError;
-use htui_store::{MIGRATOR, MigrationState, PgStore, identity};
+use htui_store::{MIGRATOR, MigrationState, PgStore, Registration, identity};
 use sqlx::Row as _;
 
 /// The 33 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
@@ -71,10 +71,10 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4],
+        vec![1, 2, 3, 4, 5],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
-         0003_orchestration.sql and MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, in \
-         ordinal order"
+         0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql and \
+         MOD-7 milestone 1's 0005_box_identity.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -325,6 +325,41 @@ const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The four `COMMENT ON COLUMN` texts of `0005_box_identity.sql` (MOD-7 blueprint §3.1, D30),
+/// verbatim, for the same reason as [`ANA_COLUMN_COMMENTS`]: a forward-only migration cannot be
+/// corrected afterwards, so a paraphrase must fail here first.
+const MOD7_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "box",
+        "machine_fingerprint",
+        "MOD-7 D1: HMAC-SHA256 keyed by the OS machine identity (/etc/machine-id, \
+         IOPlatformUUID, MachineGuid) over the constant htui/box-fingerprint/v1, lowercase hex. \
+         NULL means no identity was readable. It checks a box.toml id and never keys the row: a \
+         mismatch means a copied box.toml, and a new box is minted.",
+    ),
+    (
+        "box",
+        "edit_version",
+        "MOD-7 D14: compare-and-set token of the declared_tags, quirks and settings editors, \
+         bumped by them only. Registration and the probe never write it, so a reconnect cannot \
+         stale an open editor.",
+    ),
+    (
+        "box",
+        "probe_spec_digest",
+        "MOD-7 D18: sha256 hex of the effective box probe spec (the compiled seed overlaid by \
+         app_setting.box_probe_spec) at the last successful probe. Another digest re-probes at \
+         the next connect. NULL means never probed since 0005.",
+    ),
+    (
+        "box",
+        "htui_version",
+        "MOD-7 D5: the htui version at the last successful probe, and the re-probe trigger \
+         (R-BOX-2). Inserted at first registration; rewritten only by the probe writer, never by \
+         a reconnect.",
+    ),
+];
+
 /// The one `COMMENT ON TABLE` of `0003_orchestration.sql` (ANA-2 §9), verbatim. Kept beside
 /// [`ANA_COLUMN_COMMENTS`] rather than in it: `col_description` cannot read it, because a table
 /// comment is `objsubid = 0`.
@@ -340,7 +375,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         return;
     };
 
-    for (table, column, expected) in ANA_COLUMN_COMMENTS {
+    for (table, column, expected) in ANA_COLUMN_COMMENTS.iter().chain(MOD7_COLUMN_COMMENTS) {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
              FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -356,7 +391,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(*expected),
-            "{table}.{column}'s comment is the ANA text byte for byte"
+            "{table}.{column}'s comment is the ANA (or MOD-7) text byte for byte"
         );
     }
 
@@ -378,7 +413,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     );
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
-    // twenty-five contracts the three ANAs wrote and no half-finished twenty-sixth.
+    // twenty-nine contracts the three ANAs and MOD-7 wrote and no half-finished thirtieth.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -390,6 +425,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     .bind(
         ANA_COLUMN_COMMENTS
             .iter()
+            .chain(MOD7_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -401,12 +437,13 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
 
     let mut expected: Vec<(String, String)> = ANA_COLUMN_COMMENTS
         .iter()
+        .chain(MOD7_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
     assert_eq!(
         commented, expected,
-        "exactly the twenty-five commented columns, and no others"
+        "exactly the twenty-nine commented columns, and no others"
     );
 
     db.drop_db().await;
@@ -583,12 +620,16 @@ async fn the_0004_bump_moves_only_an_untouched_six() {
         .execute(&db.pool)
         .await
         .expect("a user lowers the cap to 5");
-    MIGRATOR.run(&db.pool).await.expect("apply 0004");
+    MIGRATOR.run(&db.pool).await.expect("apply 0004 and 0005");
     let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY 1")
         .fetch_all(&db.pool)
         .await
         .expect("read _sqlx_migrations");
-    assert_eq!(applied, vec![1, 2, 3, 4], "0004 ran");
+    assert_eq!(
+        applied,
+        vec![1, 2, 3, 4, 5],
+        "0004 ran, and 0005_box_identity.sql after it"
+    );
     assert_eq!(
         read().await,
         serde_json::json!(5),
@@ -620,8 +661,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(4),
-        "four embedded migrations, none applied"
+        MigrationState::Pending(5),
+        "five embedded migrations, none applied"
     );
 
     db.drop_db().await;
@@ -1013,8 +1054,10 @@ async fn two_overlapping_first_connects_seed_one_app_user() {
     db.drop_db().await;
 }
 
+/// MOD-7 D2: the row is keyed on the `box.toml` id. The hostname is a display field, so a second
+/// id on the same hostname is a second box rather than the first one's row (ANA-16 C4).
 #[tokio::test]
-async fn register_box_upserts_and_adopts() {
+async fn register_box_keys_on_the_id() {
     let Some(db) = common::fresh_db().await else {
         return;
     };
@@ -1024,12 +1067,21 @@ async fn register_box_upserts_and_adopts() {
         box_id: BoxId::new(),
         hostname: hostname.clone(),
     };
-    let adopted = db
+    let registered = db
         .store
-        .register_box(&first)
+        .register_box(&first, None)
         .await
         .expect("register a new box");
-    assert_eq!(adopted, first.box_id, "a first registration keeps its id");
+    assert_eq!(
+        registered,
+        Registration::New,
+        "a first registration inserts"
+    );
+    assert_eq!(
+        registered.box_id(first.box_id),
+        first.box_id,
+        "and keeps its id"
+    );
 
     let second = identity::Identity {
         box_id: BoxId::new(),
@@ -1037,18 +1089,19 @@ async fn register_box_upserts_and_adopts() {
     };
     let again = db
         .store
-        .register_box(&second)
+        .register_box(&second, None)
         .await
         .expect("register the same hostname under another id");
     assert_eq!(
-        again, first.box_id,
-        "the hostname already has a row, so its id wins (D6 adopt-DB-id)"
+        again,
+        Registration::New,
+        "another id is another box, whatever its hostname (MOD-7 D2)"
     );
 
     assert_eq!(
         db.store.identity().box_id,
         db.store.this_box(),
-        "the store carries the adopted id, for the caller to write back"
+        "the store carries the id registration answered"
     );
 
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM box WHERE hostname = $1")
@@ -1056,10 +1109,10 @@ async fn register_box_upserts_and_adopts() {
         .fetch_one(&db.pool)
         .await
         .expect("count box rows");
-    assert_eq!(rows, 1, "the upsert never adds a second row for a hostname");
+    assert_eq!(rows, 2, "two ids on one hostname are two rows");
 
     let family: String = sqlx::query("SELECT os_family, htui_version FROM box WHERE id = $1")
-        .bind(adopted.as_uuid())
+        .bind(second.box_id.as_uuid())
         .fetch_one(&db.pool)
         .await
         .expect("read the box row")
@@ -1069,12 +1122,13 @@ async fn register_box_upserts_and_adopts() {
         "os_family is one of the three CHECK values, got {family}"
     );
 
-    // The caller-side half of D6: `box.toml` is rewritten to the id the database handed back.
+    // The caller-side half: `box.toml` is rewritten to the id registration answered.
     let root = tempfile::tempdir().expect("a temp config root");
+    let answered = again.box_id(second.box_id);
     identity::store(
         root.path(),
         &identity::Identity {
-            box_id: again,
+            box_id: answered,
             hostname,
         },
     )
@@ -1083,9 +1137,69 @@ async fn register_box_upserts_and_adopts() {
         identity::load_or_mint(root.path())
             .expect("read box.toml")
             .box_id,
-        again,
-        "the adopted id is what the next launch reads"
+        answered,
+        "the answered id is what the next launch reads"
     );
+
+    db.drop_db().await;
+}
+
+/// MOD-7 blueprint §3.1: `0005_box_identity.sql` drops the hostname key and adds three columns,
+/// the two hashes guarded by a lowercase-hex `CHECK`.
+#[tokio::test]
+async fn the_0005_migration_drops_the_hostname_key_and_adds_three_columns() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    let key: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_constraint WHERE conname = 'box_user_id_hostname_key'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("read pg_constraint");
+    assert_eq!(key, 0, "the (user_id, hostname) key is gone");
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'box' \
+           AND column_name IN ('machine_fingerprint', 'edit_version', 'probe_spec_digest') \
+         ORDER BY 1",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("read information_schema.columns");
+    assert_eq!(
+        columns,
+        vec!["edit_version", "machine_fingerprint", "probe_spec_digest"],
+        "the three MOD-7 columns exist"
+    );
+
+    for column in ["machine_fingerprint", "probe_spec_digest"] {
+        let err = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE box SET {column} = 'RAW' WHERE id = $1"
+        )))
+        .bind(db.store.this_box().as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect_err("a value that is not 64 lowercase hex is refused");
+        let code = err
+            .as_database_error()
+            .and_then(|e| e.code())
+            .map(|c| c.into_owned());
+        assert_eq!(
+            code.as_deref(),
+            Some("23514"),
+            "{column}'s CHECK refuses it: {err}"
+        );
+    }
+
+    let edit_version: i32 = sqlx::query_scalar("SELECT edit_version FROM box WHERE id = $1")
+        .bind(db.store.this_box().as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read edit_version");
+    assert_eq!(edit_version, 0, "edit_version defaults to 0");
 
     db.drop_db().await;
 }

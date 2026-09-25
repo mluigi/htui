@@ -19,20 +19,20 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProfile,
-    BoxRow, BoxSettings, BoxTool, ChatRunSpec, Claim, CommandRun, CommandRunId,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, GateOutcome, Item,
-    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRevision,
-    ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
-    Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
-    PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
-    ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
-    SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, overlaps,
-    prompt_summary, scope_of,
+    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProbe,
+    BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec, Claim, CommandRun,
+    CommandRunId, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, GateOutcome,
+    Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch,
+    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
+    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
+    NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId,
+    RepoPatch, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -113,6 +113,9 @@ struct State {
     skill_bindings: Vec<SkillBinding>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
     box_tools: Vec<BoxTool>,
+    /// `box.probe_spec_digest`, which `BoxRow` does not carry (D14). Written by
+    /// [`WriteStore::record_box_probe`]; no fixture loads it.
+    box_probe_digests: HashMap<BoxId, String>,
     /// `app_setting`, the last rung of the prompt's settings chain (`docs/ANA-5.md` §4.4), each
     /// value paired with the `updated_at` the `App` rung's compare-and-set compares against.
     ///
@@ -227,6 +230,7 @@ impl MemStore {
             skill_versions: data.skill_versions,
             skill_bindings: data.skill_bindings,
             box_tools: data.box_tools,
+            box_probe_digests: HashMap::new(),
             app_settings: BTreeMap::new(),
             agents: data.agents.into_iter().map(|row| (row.id, row)).collect(),
             agent_boxes: HashMap::new(),
@@ -1570,6 +1574,100 @@ impl State {
         row.quota_at = Some(quota_at);
         row.updated_at = now;
         Ok(())
+    }
+
+    /// One box probe (MOD-7 D10): the nine probe columns, the whole `box_tool` set and the spec
+    /// digest, or nothing. The checks run before any write, so a refusal leaves the store as it
+    /// stood, as `PgStore`'s transaction rolls back.
+    ///
+    /// The box is looked up first, then the digest, then the tool names: `PgStore`'s
+    /// `UPDATE .. WHERE id` answers an unknown box before any `CHECK` or key is consulted, so
+    /// `NotFound` wins over every `Constraint` here too.
+    fn record_box_probe(&mut self, probe: &BoxProbe, now: DateTime<Utc>) -> Result<()> {
+        let id = probe.box_id;
+        if !self.boxes.contains_key(&id) {
+            return Err(StoreError::NotFound {
+                entity: "box",
+                id: id.to_string(),
+            });
+        }
+        let digest = &probe.spec_digest;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(StoreError::Constraint(format!(
+                "box.probe_spec_digest `{digest}` is not a lowercase sha256 hex digest"
+            )));
+        }
+        let mut names = HashSet::new();
+        if let Some(name) = probe
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .find(|name| !names.insert(*name))
+        {
+            return Err(StoreError::Constraint(format!(
+                "box_tool `{name}` is listed twice for box `{}`",
+                probe.box_id
+            )));
+        }
+        let row = self
+            .boxes
+            .get_mut(&id)
+            .expect("the box was looked up above, under the same lock");
+        row.os_version.clone_from(&probe.os_version);
+        row.cpu.clone_from(&probe.cpu);
+        row.ram_mb = probe.ram_mb;
+        row.gpu_present = probe.gpu_present;
+        row.gpu_vendor.clone_from(&probe.gpu_vendor);
+        row.probed_tags.clone_from(&probe.probed_tags);
+        row.htui_version.clone_from(&probe.htui_version);
+        row.last_probed_at = Some(probe.probed_at);
+        row.updated_at = now;
+        self.box_tools.retain(|tool| tool.box_id != id);
+        self.box_tools
+            .extend(probe.tools.iter().map(|tool| BoxTool {
+                box_id: id,
+                name: tool.name.clone(),
+                version: tool.version.clone(),
+                path: tool.path.clone(),
+                probed_at: probe.probed_at,
+            }));
+        self.box_probe_digests.insert(id, digest.clone());
+        Ok(())
+    }
+
+    /// Every box of `user` with its tools and recorded digest (MOD-7 D10, D18): boxes by id,
+    /// tools by name bytes, the order `PgStore`'s `COLLATE "C"` gives. `None` (an empty store) has
+    /// no boxes.
+    fn box_records(&self, user: Option<UserId>) -> Vec<BoxRecord> {
+        let Some(user) = user else {
+            return Vec::new();
+        };
+        let mut rows: Vec<&BoxRow> = self
+            .boxes
+            .values()
+            .filter(|row| row.user_id == user)
+            .collect();
+        rows.sort_by_key(|row| row.id);
+        rows.into_iter()
+            .map(|row| {
+                let mut tools: Vec<BoxTool> = self
+                    .box_tools
+                    .iter()
+                    .filter(|tool| tool.box_id == row.id)
+                    .cloned()
+                    .collect();
+                tools.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+                BoxRecord {
+                    row: row.clone(),
+                    tools,
+                    probe_spec_digest: self.box_probe_digests.get(&row.id).cloned(),
+                }
+            })
+            .collect()
     }
 
     /// The `run` / `run_step` pair of a free-standing chat, both a no-op when the id is already
@@ -4377,6 +4475,16 @@ impl WriteStore for MemStore {
         self.write(|state| state.set_agent_box_quota(agent_id, box_id, quota, quota_at, now))
     }
 
+    async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.record_box_probe(probe, now))
+    }
+
+    async fn boxes(&self) -> Result<Vec<BoxRecord>> {
+        let user = self.this_user();
+        Ok(self.read(|state| state.box_records(user)))
+    }
+
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
         self.write(|state| state.start_chat_run(chat))
     }
@@ -4778,11 +4886,11 @@ mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
     use crate::model::{
-        AgentBox, AgentId, BoxId, ChatRunSpec, Claim, DocumentId, GateOutcome, GraphSnapshot,
-        Isolation, ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject, NewRepo,
-        NewRun, NewRunStep, NoteId, OverlapRule, ProjectId, RepoId, RunId, RunKind, RunMode,
-        RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status,
-        StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+        AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, Claim, DocumentId, GateOutcome,
+        GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject,
+        NewRepo, NewRun, NewRunStep, NoteId, OverlapRule, ProbedTool, ProjectId, RepoId, RunId,
+        RunKind, RunMode, RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph,
+        SnapshotSettings, Status, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -5373,6 +5481,51 @@ mod tests {
             ),
             "a row that has never been probed has no columns to latch into, got {missing:?}"
         );
+    }
+
+    /// MOD-7 D32: `MemStore` refuses a spec digest that is not 64 lowercase hex, as Postgres's
+    /// `CHECK` on `box.probe_spec_digest` does, and writes nothing. The Postgres half is T1's
+    /// `CHECK` test in `htui-store`.
+    #[tokio::test]
+    async fn a_probe_digest_that_is_not_hex_is_a_constraint() {
+        let store = MemStore::demo();
+        let before = store.boxes().await.expect("boxes must not fail");
+        let good = crate::prompt::digest::sha256_hex("spec");
+        for digest in [
+            String::new(),
+            "abc".to_owned(),
+            good.to_uppercase(),
+            format!("{good}0"),
+            format!("{}g", &good[..63]),
+        ] {
+            let probe = BoxProbe {
+                box_id: ids::BOX,
+                os_version: "11".to_owned(),
+                cpu: "cpu".to_owned(),
+                ram_mb: Some(1024),
+                gpu_present: false,
+                gpu_vendor: None,
+                tools: vec![ProbedTool {
+                    name: "git".to_owned(),
+                    version: "2.0".to_owned(),
+                    path: "/usr/bin/git".to_owned(),
+                }],
+                probed_tags: vec!["x".to_owned()],
+                htui_version: "0.0.0".to_owned(),
+                spec_digest: digest.clone(),
+                probed_at: Utc::now(),
+            };
+            let refused = store.record_box_probe(&probe).await;
+            assert!(
+                matches!(refused, Err(StoreError::Constraint(_))),
+                "digest {digest:?} must be a Constraint, got {refused:?}"
+            );
+            assert_eq!(
+                store.boxes().await.expect("boxes must not fail"),
+                before,
+                "a refused probe writes nothing"
+            );
+        }
     }
 
     /// MOD-2 plan D70: `project.settings` is readable per project, because the per-run token cap

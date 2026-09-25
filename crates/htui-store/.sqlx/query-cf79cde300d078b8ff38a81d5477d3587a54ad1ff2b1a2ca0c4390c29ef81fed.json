@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO box_tool (box_id, name, version, path, probed_at)\n            SELECT $1, t.name, t.version, t.path, $5\n              FROM UNNEST($2::text[], $3::text[], $4::text[]) AS t(name, version, path)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cf79cde300d078b8ff38a81d5477d3587a54ad1ff2b1a2ca0c4390c29ef81fed"
+}

@@ -27,7 +27,7 @@ use crate::cache::refresh::RefreshSettings;
 use crate::dsn::Dsn;
 use crate::error::map_sqlx;
 use crate::identity::{self, Identity};
-use crate::pg::{Connected, MigrationState, PgStore};
+use crate::pg::{Connected, MigrationState, PgStore, Registration};
 use crate::secret;
 
 /// How often an offline worker retries (plan D10).
@@ -248,7 +248,8 @@ const EVENT_QUEUE: usize = 4;
 pub async fn start(opts: StartOptions) -> Result<Started> {
     let root = opts.config_root.clone();
     // Minted here so the failure is reported to the caller rather than swallowed by the spawned
-    // attempt, which re-reads the file per try to pick up an adopted id (plan D6).
+    // attempt, which re-reads the file per try to pick up an id registration minted for a copied
+    // `box.toml` (MOD-7 D3).
     identity::load_or_mint(&root)?;
     // Zeroizing from the keyring read onwards (D3): the buffer the DSN lands in is wiped when it
     // goes, and `attempt` gets a fresh plain copy per dial that it consumes and drops.
@@ -328,8 +329,8 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
 ///
 /// Never returns an error: every failure is a [`ConnEvent::Failed`] whose text the status line
 /// shows, because "no DSN" and "server down" are states the shell renders rather than crashes on.
-/// The identity is re-read from `root` per attempt, so an id adopted by an earlier attempt
-/// (plan D6) is the one the next one registers under.
+/// The identity is re-read from `root` per attempt, so an id an earlier attempt minted for a
+/// copied `box.toml` (MOD-7 D3) is the one the next one registers under.
 pub async fn attempt(dsn: Option<String>, root: PathBuf, connect_timeout: Duration) -> ConnEvent {
     let Some(dsn) = dsn else {
         return ConnEvent::Failed(NO_DSN.to_owned());
@@ -419,16 +420,17 @@ pub async fn forget_dsn() -> Result<()> {
         .map_err(|err| StoreError::Backend(format!("keyring task failed: {err}")))?
 }
 
-/// Connects and persists an adopted box id (plan D6).
+/// Connects, logs what registration found, and persists a minted box id (MOD-7 D3).
 ///
-/// [`PgStore::connect`] does no file I/O of its own; when this hostname already had a `box` row
-/// under another id, the store comes back carrying the database's id and this is where `box.toml`
-/// learns about it.
+/// [`PgStore::connect`] does no file I/O of its own; [`persist_registration`] is where
+/// `box.toml` learns what registration answered. With [`MigrationState::Pending`] nothing has
+/// registered yet and the call is a no-op; the store worker's `ApplyMigrations` path calls it
+/// again once [`PgStore::apply_migrations`] has.
 ///
 /// # Errors
 ///
 /// Whatever [`PgStore::connect`] reports — an unreachable server, a refused schema — and
-/// [`htui_core::store::StoreError::Backend`] when the adopted id cannot be written back.
+/// [`htui_core::store::StoreError::Backend`] when the minted id cannot be written back.
 pub async fn try_connect(
     dsn: &str,
     identity: &Identity,
@@ -436,16 +438,48 @@ pub async fn try_connect(
     connect_timeout: Duration,
 ) -> Result<Connected> {
     let connected = PgStore::connect_with(dsn, identity, connect_timeout).await?;
-    let adopted = connected.store.identity();
-    if adopted.box_id != identity.box_id {
-        tracing::info!(
-            adopted = %adopted.box_id.as_uuid(),
-            minted  = %identity.box_id.as_uuid(),
-            "this hostname already had a box row; adopting the database's id"
-        );
-        identity::store(root, adopted)?;
-    }
+    persist_registration(root, identity, &connected.store)?;
     Ok(connected)
+}
+
+/// Logs what registration answered and writes a minted box id back to `box.toml` (MOD-7 D3).
+///
+/// **Must run after every bootstrap** — [`try_connect`] after a connect over an up-to-date schema,
+/// and the store worker's `ApplyMigrations` path after [`PgStore::apply_migrations`] (MOD-7 T4) —
+/// because neither [`PgStore::connect`] nor [`PgStore::apply_migrations`] does file I/O, and a
+/// bootstrap whose answer is not persisted registers the next launch as the box it was copied from.
+///
+/// `presented` is the identity the store was connected with, i.e. what `box.toml` said. The store
+/// carries the id registration answered, which differs from it only for a copied file
+/// ([`Registration::Copied`]); only then is `box.toml` under `root` rewritten. A rename is only
+/// logged: the id does not change. No field logged here is a fingerprint. Before any bootstrap
+/// ([`PgStore::registration`] is `None`) there is nothing to log or write.
+///
+/// # Errors
+///
+/// [`htui_core::store::StoreError::Backend`] when the minted id cannot be written back.
+pub fn persist_registration(root: &Path, presented: &Identity, store: &PgStore) -> Result<()> {
+    match store.registration() {
+        Some(Registration::Copied { previous, minted }) => tracing::warn!(
+            previous = %previous,
+            minted = %minted,
+            "box.toml was carried from another machine; this machine registered as a new box"
+        ),
+        Some(Registration::Known {
+            renamed_from: Some(old),
+        }) => tracing::info!(
+            box_id = %presented.box_id,
+            from = %old,
+            to = %presented.hostname,
+            "this box was renamed"
+        ),
+        _ => {}
+    }
+    let registered = store.identity();
+    if registered.box_id != presented.box_id {
+        identity::store(root, registered)?;
+    }
+    Ok(())
 }
 
 /// Fills in what only a connected server knows: this box, this user and the two cache settings.

@@ -30,9 +30,9 @@ use htui_agent::record::{
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, Claim, CommandRun, Document,
-    DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item, ItemFilter, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun,
+    Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRecord, ChatRunSpec, Claim, CommandRun,
+    Document, DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item, ItemFilter,
+    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun,
     NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep,
     NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
     PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run,
@@ -398,6 +398,12 @@ impl WriteStore for SpyStore {
     }
     async fn upsert_agent_box(&self, row: &AgentBox) -> StoreResult<()> {
         self.inner.upsert_agent_box(row).await
+    }
+    async fn record_box_probe(&self, probe: &BoxProbe) -> StoreResult<()> {
+        self.inner.record_box_probe(probe).await
+    }
+    async fn boxes(&self) -> StoreResult<Vec<BoxRecord>> {
+        self.inner.boxes().await
     }
     async fn set_agent_box_quota(
         &self,

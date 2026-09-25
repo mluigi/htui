@@ -1,0 +1,37 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE box\n               SET os_version = $2, cpu = $3, ram_mb = $4, gpu_present = $5, gpu_vendor = $6,\n                   probed_tags = $7, htui_version = $8, last_probed_at = $9, probe_spec_digest = $10\n             WHERE id = $1\n            RETURNING id AS \"id!: BoxId\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Int4",
+        "Bool",
+        "Text",
+        "TextArray",
+        "Text",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "da739a97e01d39f5c38e9e78f316c427f36bcbd2e9ccd1fdab9b61f49afd7585"
+}

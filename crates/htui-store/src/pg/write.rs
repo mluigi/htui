@@ -8,7 +8,9 @@
 //! MOD-2's chat-run pair, which writes one `run` and one `run_step` and therefore takes an explicit
 //! transaction, exactly as the pending-buffer upload does (`crate::cache::pending`), and MOD-15's
 //! two deletes, which count and delete in one transaction **at `REPEATABLE READ`** so that the two
-//! statements share a snapshot as well (review M1; see [`begin_repeatable_read`]).
+//! statements share a snapshot as well (review M1; see [`begin_repeatable_read`]). MOD-7's
+//! `record_box_probe` is one more: it updates the `box` row and replaces its `box_tool` set, so it
+//! takes a transaction too (plan D10).
 //!
 //! There is **no `DELETE FROM item`** in this file and none may be added: §4.1's "keys are never
 //! reused" is enforced by the absence of the path, and the conformance case `no_delete_path` is
@@ -17,15 +19,16 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, BoxSettings, ChatRunSpec, Claim, CommandRun, CommandRunId,
-    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
-    NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptTemplateId,
-    Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, overlaps, scope_of,
+    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
+    ChatRunSpec, Claim, CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS,
+    Document, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo,
+    NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId,
+    VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -846,6 +849,165 @@ impl WriteStore for PgStore {
             });
         }
         Ok(())
+    }
+
+    /// One box probe in one transaction (MOD-7 D10): the nine probe columns of the row, then the
+    /// whole `box_tool` set deleted and re-inserted.
+    ///
+    /// The `UPDATE` names no column a person or registration owns, and not `updated_at`: the
+    /// `BEFORE UPDATE` trigger moves it. A tool name listed twice is the `box_tool` primary key's
+    /// `23505` and a malformed digest is `0005`'s `CHECK` (`23514`); [`map_sqlx`] makes both a
+    /// [`StoreError::Constraint`], and the dropped transaction rolls the row back with them.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] with `entity: "box"` when no row has `probe.box_id`;
+    /// [`StoreError::Constraint`] as above.
+    async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let updated = sqlx::query!(
+            r#"
+            UPDATE box
+               SET os_version = $2, cpu = $3, ram_mb = $4, gpu_present = $5, gpu_vendor = $6,
+                   probed_tags = $7, htui_version = $8, last_probed_at = $9, probe_spec_digest = $10
+             WHERE id = $1
+            RETURNING id AS "id!: BoxId"
+            "#,
+            probe.box_id.as_uuid(),
+            probe.os_version,
+            probe.cpu,
+            probe.ram_mb,
+            probe.gpu_present,
+            probe.gpu_vendor.as_deref(),
+            &probe.probed_tags,
+            probe.htui_version,
+            probe.probed_at,
+            probe.spec_digest,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if updated.is_none() {
+            return Err(StoreError::NotFound {
+                entity: "box",
+                id: probe.box_id.to_string(),
+            });
+        }
+
+        sqlx::query!(
+            "DELETE FROM box_tool WHERE box_id = $1",
+            probe.box_id.as_uuid()
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        let names: Vec<String> = probe.tools.iter().map(|tool| tool.name.clone()).collect();
+        let versions: Vec<String> = probe
+            .tools
+            .iter()
+            .map(|tool| tool.version.clone())
+            .collect();
+        let paths: Vec<String> = probe.tools.iter().map(|tool| tool.path.clone()).collect();
+        sqlx::query!(
+            r#"
+            INSERT INTO box_tool (box_id, name, version, path, probed_at)
+            SELECT $1, t.name, t.version, t.path, $5
+              FROM UNNEST($2::text[], $3::text[], $4::text[]) AS t(name, version, path)
+            "#,
+            probe.box_id.as_uuid(),
+            &names,
+            &versions,
+            &paths,
+            probe.probed_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)
+    }
+
+    /// Every box of this user, by id, each with its `box_tool` rows in name byte order
+    /// (`COLLATE "C"`, the order `MemStore` sorts by) and `probe_spec_digest` (MOD-7 D10, D18).
+    ///
+    /// Two reads rather than a `query_as!(BoxRow, ..)`: the digest is not a [`BoxRow`] field, so
+    /// the rows are mapped by hand.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    async fn boxes(&self) -> Result<Vec<BoxRecord>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id AS "id: BoxId", user_id AS "user_id: htui_core::model::UserId", hostname,
+                   os_family AS "os_family: htui_core::model::OsFamily", os_version, arch, cpu,
+                   ram_mb, gpu_present, gpu_vendor, htui_version, probed_tags, declared_tags,
+                   quirks, settings, registered_at, last_seen_at, last_probed_at, updated_at,
+                   probe_spec_digest
+              FROM box WHERE user_id = $1 ORDER BY id
+            "#,
+            self.this_user().as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let ids: Vec<Uuid> = rows.iter().map(|row| row.id.as_uuid()).collect();
+        let mut tools = sqlx::query!(
+            r#"
+            SELECT box_id AS "box_id: BoxId", name, version, path, probed_at
+              FROM box_tool WHERE box_id = ANY($1) ORDER BY box_id, name COLLATE "C"
+            "#,
+            &ids,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .into_iter()
+        .map(|tool| BoxTool {
+            box_id: tool.box_id,
+            name: tool.name,
+            version: tool.version,
+            path: tool.path,
+            probed_at: tool.probed_at,
+        })
+        .peekable();
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let mut own = Vec::new();
+                while let Some(tool) = tools.next_if(|tool| tool.box_id == row.id) {
+                    own.push(tool);
+                }
+                BoxRecord {
+                    row: BoxRow {
+                        id: row.id,
+                        user_id: row.user_id,
+                        hostname: row.hostname,
+                        os_family: row.os_family,
+                        os_version: row.os_version,
+                        arch: row.arch,
+                        cpu: row.cpu,
+                        ram_mb: row.ram_mb,
+                        gpu_present: row.gpu_present,
+                        gpu_vendor: row.gpu_vendor,
+                        htui_version: row.htui_version,
+                        probed_tags: row.probed_tags,
+                        declared_tags: row.declared_tags,
+                        quirks: row.quirks,
+                        settings: row.settings,
+                        registered_at: row.registered_at,
+                        last_seen_at: row.last_seen_at,
+                        last_probed_at: row.last_probed_at,
+                        updated_at: row.updated_at,
+                    },
+                    tools: own,
+                    probe_spec_digest: row.probe_spec_digest,
+                }
+            })
+            .collect())
     }
 
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both

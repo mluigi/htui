@@ -163,8 +163,8 @@ pub async fn fresh_db() -> Option<TestDb> {
 /// `apply_migrations` seeds an `app_user` named after this OS user and registers this box under
 /// it; the fixture then brings its own, whose `created_at` is the epoch. Two rows is exactly what
 /// `R-USR-2` forbids, and `PgStore::seed_if_empty_as` answers with the oldest of them - so a
-/// second `PgStore::connect` against such a database would register this hostname under the
-/// fixture's user while the row already exists under the seeded one, and collide on `box_pkey`.
+/// second connect would find its `box.toml` id under a user that is no longer the oldest and mint
+/// a new box (`Registration::Copied`).
 /// The seeded pair therefore goes, leaving the fixture's world as the only one. `db.store` needs
 /// no reconnect: `load_demo` repoints `this_box` / `this_user` at the fixture itself.
 pub async fn demo_db() -> Option<TestDb> {
