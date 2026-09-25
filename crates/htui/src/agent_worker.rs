@@ -7649,11 +7649,13 @@ done
     }
 
     /// The seed's digest.
+    #[cfg(unix)]
     fn seed_digest() -> String {
         box_probe::spec::digest(box_probe::spec::seed())
     }
 
     /// A probe recorded as `record` shows it, to plant in another store.
+    #[cfg(unix)]
     fn as_probe(record: &htui_core::model::BoxRecord) -> htui_core::model::BoxProbe {
         htui_core::model::BoxProbe {
             box_id: record.row.id,
@@ -7682,6 +7684,7 @@ done
     }
 
     /// A stored overlay adding `terraform`, whose script `tool_scripts` writes.
+    #[cfg(unix)]
     fn terraform_spec() -> Value {
         json!({
             "tools": {
