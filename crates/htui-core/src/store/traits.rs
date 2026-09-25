@@ -31,18 +31,18 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow,
-    Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary,
-    LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note,
-    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, ChatRunSpec, CitationKind, Claim,
+    CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
+    ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind,
+    NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::store::error::Result;
@@ -367,6 +367,28 @@ pub trait WriteStore: ReadStore {
         quota: Value,
         quota_at: DateTime<Utc>,
     ) -> Result<()>;
+
+    /// Writes one box probe (MOD-7 D10): the hardware columns, `probed_tags`, `htui_version`,
+    /// `last_probed_at` and `probe_spec_digest`, and replaces this box's `box_tool` set, in one
+    /// transaction. A narrow machine writer (MOD-2 D74): never `hostname`, `declared_tags`, `quirks`,
+    /// `settings`, `machine_fingerprint`, `edit_version` or `last_seen_at`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "box"` when no
+    /// row has `probe.box_id`; [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// when a tool name repeats or `spec_digest` is not 64 lowercase hex. `NotFound` for an
+    /// unknown box wins over any `Constraint` the same probe would also hit. Either way nothing is
+    /// written.
+    async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()>;
+
+    /// Every box of this user with its tools and recorded spec digest (MOD-7 D10, D18): boxes by
+    /// id, tools by name byte order (`COLLATE "C"`), so every store answers byte for byte.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the backend's read fails with.
+    async fn boxes(&self) -> Result<Vec<BoxRecord>>;
 
     /// Mints the `run` / `run_step` pair of a free-standing chat, both `ON CONFLICT (id) DO
     /// NOTHING` (MOD-2 plan D4).

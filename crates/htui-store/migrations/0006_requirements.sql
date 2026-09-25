@@ -1,4 +1,4 @@
--- 0005_requirements.sql - MOD-38: ANA-11 (requirements) docs/ANA-11.md §5, and the §4.2 close-out
+-- 0006_requirements.sql - MOD-38: ANA-11 (requirements) docs/ANA-11.md §5, and the §4.2 close-out
 -- resolution. Forward-only (R-STO-5): 0001-0004 are never edited. Depends on 0001_init.sql
 -- (project, app_user, box, item, run_step, set_updated_at()).
 -- The cache-mirror companion is cache_migrations/0004_requirements.sql (plan D12).

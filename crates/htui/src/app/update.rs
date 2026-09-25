@@ -259,6 +259,9 @@ impl App {
             StoreReply::MigrationsApplied { applied } => {
                 self.status = Some(format!("applied {applied} migration(s)"));
             }
+            // MOD-7 D13, blueprint D25: the registration probe answers at `UNSOLICITED`, which the
+            // freshness gate drops, so its report is rendered here, above the gate.
+            StoreReply::BoxProbed(report) => self.status = Some(report.status_line()),
             _ => {}
         }
     }
@@ -701,5 +704,24 @@ mod tests {
             reply: StoreReply::MigrationsApplied { applied: 2 },
         }));
         assert_eq!(app.status.as_deref(), Some("applied 2 migration(s)"));
+    }
+
+    /// MOD-7 D13, blueprint D25: the registration probe answers at `UNSOLICITED`, which the
+    /// freshness gate drops, so the report is rendered above it, and no view sees the reply.
+    #[test]
+    fn a_box_probed_reply_lands_on_the_status_line_whatever_its_seq() {
+        let (mut app, _rx, seen) = shell();
+        let report = crate::agent_worker::BoxProbeReport {
+            tools: 3,
+            probed_tags: vec!["rust".to_owned()],
+            ..Default::default()
+        };
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: crate::store_worker::UNSOLICITED,
+            origin: Origin::App,
+            reply: StoreReply::BoxProbed(report.clone()),
+        }));
+        assert_eq!(app.status, Some(report.status_line()));
+        assert!(seen.borrow().is_empty(), "no tab saw it");
     }
 }

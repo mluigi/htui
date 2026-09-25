@@ -10,7 +10,10 @@ use htui_store::testkit as common;
 use std::time::Duration;
 
 use htui_core::store::StoreError;
-use htui_store::connect::{ConnEvent, StartOptions, Started, refresh_settings, start};
+use htui_store::connect::{
+    ConnEvent, StartOptions, Started, persist_registration, refresh_settings, start, try_connect,
+};
+use htui_store::pg::CONNECT_TIMEOUT;
 use htui_store::{Backend, MigrationState, map_sqlx};
 
 /// How long a `ConnEvent` may take. The connect pool's own acquire timeout is ten seconds, so this
@@ -63,7 +66,11 @@ async fn start_opens_the_mirror_offline_and_reports_online_over_a_migrated_datab
 
     match next_event(&mut started, "a migrated database").await {
         ConnEvent::Online(pg) => {
-            assert_eq!(pg.identity().box_id, pg.this_box(), "the id is adopted");
+            assert_eq!(
+                pg.identity().box_id,
+                pg.this_box(),
+                "the store carries the id registration answered"
+            );
             let settings = refresh_settings(&pg, started.settings).await;
             assert_eq!(
                 settings.interval,
@@ -92,7 +99,7 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(5),
+        MigrationState::Pending(6),
         "the harness left the schema unapplied"
     );
     let root = tempfile::tempdir().expect("temp root");
@@ -107,12 +114,283 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
 
     match next_event(&mut started, "a bare database").await {
         ConnEvent::MigrationsPending(_, pending) => assert_eq!(
-            pending, 5,
-            "all five embedded migrations are waiting (R-STO-5: nothing is applied unasked)"
+            pending, 6,
+            "all six embedded migrations are waiting (R-STO-5: nothing is applied unasked)"
         ),
         other => panic!("expected MigrationsPending, got {other:?}"),
     }
 
+    close(&started).await;
+    db.drop_db().await;
+}
+
+/// MOD-7 D3 end to end: a `box.toml` whose id another machine registered is rewritten to the id
+/// this machine was minted, and the other machine's row is left alone.
+///
+/// The planted row's fingerprint is `repeat('a', 64)`, which the keyed hash of this machine's
+/// identity is not; a machine with no readable identity cannot tell a copy apart, so the case
+/// returns early there.
+#[tokio::test]
+async fn a_copied_box_toml_is_rewritten_to_the_minted_id() {
+    if htui_store::identity::machine_fingerprint().await.is_none() {
+        return;
+    }
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let identity = htui_store::identity::load_or_mint(root.path()).expect("mint box.toml");
+
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version, \
+                          machine_fingerprint) \
+         VALUES ($1, (SELECT id FROM app_user ORDER BY created_at, id LIMIT 1), 'elsewhere', \
+                 'linux', '', 'x86_64', '0.0.0', repeat('a', 64))",
+    )
+    .bind(identity.box_id.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant the other machine's row under the box.toml id");
+    let before: String = sqlx::query_scalar("SELECT row_to_json(box)::text FROM box WHERE id = $1")
+        .bind(identity.box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the planted row");
+
+    let connected = try_connect(&db.url, &identity, root.path(), CONNECT_TIMEOUT)
+        .await
+        .expect("connect");
+    let store = connected.store;
+
+    let rewritten = htui_store::identity::load_or_mint(root.path()).expect("re-read box.toml");
+    assert_ne!(
+        rewritten.box_id, identity.box_id,
+        "box.toml no longer names the other machine's box"
+    );
+    assert_eq!(
+        rewritten.box_id,
+        store.this_box(),
+        "box.toml holds the id this machine was minted"
+    );
+    let after: String = sqlx::query_scalar("SELECT row_to_json(box)::text FROM box WHERE id = $1")
+        .bind(identity.box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("re-read the planted row");
+    assert_eq!(after, before, "the other machine's row is untouched");
+
+    store.pool().close().await;
+    db.drop_db().await;
+}
+
+/// MOD-7 D3 over the other bootstrap: a store that connected to a pending schema registers only
+/// when `apply_migrations` runs, and `persist_registration` is what writes a minted id back then.
+///
+/// This is the store worker's `ApplyMigrations` path (MOD-7 T4), which never passes through
+/// `try_connect`. The planted row is the one [`a_copied_box_toml_is_rewritten_to_the_minted_id`]
+/// plants, with the same early return on a machine with no readable identity.
+#[tokio::test]
+async fn apply_migrations_then_persist_writes_a_minted_id_back() {
+    if htui_store::identity::machine_fingerprint().await.is_none() {
+        return;
+    }
+    let Some(mut db) = common::bare_db().await else {
+        return;
+    };
+    assert_eq!(
+        db.migrations_at_connect,
+        MigrationState::Pending(6),
+        "the store was handed back before any registration"
+    );
+
+    // The schema and the single `app_user` exist before this store registers, so the other
+    // machine's row can be planted under the `box.toml` id first.
+    htui_store::MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("apply the schema under the store");
+    db.store.seed_if_empty().await.expect("seed the app_user");
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version, \
+                          machine_fingerprint) \
+         VALUES ($1, (SELECT id FROM app_user ORDER BY created_at, id LIMIT 1), 'elsewhere', \
+                 'linux', '', 'x86_64', '0.0.0', repeat('a', 64))",
+    )
+    .bind(db.identity.box_id.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant the other machine's row under the box.toml id");
+    let before: String = sqlx::query_scalar("SELECT row_to_json(box)::text FROM box WHERE id = $1")
+        .bind(db.identity.box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the planted row");
+
+    db.store
+        .apply_migrations()
+        .await
+        .expect("apply_migrations bootstraps");
+    assert_ne!(
+        db.store.this_box(),
+        db.identity.box_id,
+        "registration minted a new id for the copied box.toml"
+    );
+    assert_eq!(
+        htui_store::identity::load_or_mint(&db.config_root)
+            .expect("re-read box.toml")
+            .box_id,
+        db.identity.box_id,
+        "apply_migrations does no file I/O of its own"
+    );
+
+    persist_registration(&db.config_root, &db.identity, &db.store).expect("persist");
+
+    let rewritten = htui_store::identity::load_or_mint(&db.config_root).expect("re-read box.toml");
+    assert_eq!(
+        rewritten.box_id,
+        db.store.this_box(),
+        "box.toml holds the id this machine was minted"
+    );
+    let after: String = sqlx::query_scalar("SELECT row_to_json(box)::text FROM box WHERE id = $1")
+        .bind(db.identity.box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("re-read the planted row");
+    assert_eq!(after, before, "the other machine's row is untouched");
+
+    db.drop_db().await;
+}
+
+/// Makes a directory writable again when dropped, so a read-only temporary root can be removed.
+#[cfg(unix)]
+struct Writable(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for Writable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// MOD-7 F1: a copied `box.toml` in a config root this process cannot write still goes online, and
+/// the session's later dials present the minted id instead of minting another.
+///
+/// The copy names this very host, so `load_or_mint` has no hostname to rewrite and reads the
+/// read-only root without writing; its row carries another machine's fingerprint, so registration
+/// answers `Copied` (never adopting the row by hostname, OQ-1). The write-back of the minted id then
+/// fails. The first dial must still report `Online`, and the second must present the id the first
+/// was answered with - registration answers `Known` - so the two dials add exactly one row.
+///
+/// Unix only (the root is made `0555`); returns early as root, which writes through `0555`, and on
+/// a machine with no readable identity, which cannot tell a copy apart.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unwritable_box_toml_goes_online_and_mints_once_per_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if htui_store::identity::machine_fingerprint().await.is_none() {
+        return;
+    }
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let copied = htui_store::identity::load_or_mint(root.path()).expect("mint box.toml");
+
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version, \
+                          machine_fingerprint) \
+         VALUES ($1, (SELECT id FROM app_user ORDER BY created_at, id LIMIT 1), $2, \
+                 'linux', '', 'x86_64', '0.0.0', repeat('a', 64))",
+    )
+    .bind(copied.box_id.as_uuid())
+    .bind(&copied.hostname)
+    .execute(&db.pool)
+    .await
+    .expect("plant the other machine's row, under this host's name, at the box.toml id");
+    let user: uuid::Uuid = sqlx::query_scalar("SELECT user_id FROM box WHERE id = $1")
+        .bind(copied.box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("the planted row's user");
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM box WHERE user_id = $1")
+            .bind(user)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count this user's boxes")
+    };
+    let before = count().await;
+
+    // The mirror still needs a writable directory; only the root itself - where `box.toml` is
+    // replaced through a temporary file - is read-only.
+    std::fs::create_dir(root.path().join("cache")).expect("create the mirror directory");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555))
+        .expect("make the config root read-only");
+    // Declared after `root`, so it drops first - on a panic too - and the directory can go.
+    let _writable_again = Writable(root.path().to_owned());
+    let probe = root.path().join("probe");
+    if std::fs::write(&probe, b"").is_ok() {
+        // Root writes through 0555: there is no unwritable root to test here.
+        let _ = std::fs::remove_file(&probe);
+        db.drop_db().await;
+        return;
+    }
+
+    let mut started = start(StartOptions {
+        dsn: Some(db.url.clone()),
+        offline: false,
+        ..StartOptions::new(root.path().to_owned())
+    })
+    .await
+    .expect("start over a read-only root");
+    let first = match next_event(&mut started, "a copied box.toml that cannot be rewritten").await {
+        ConnEvent::Online(pg) => pg,
+        other => panic!("a failed write-back is not a failed connection: {other:?}"),
+    };
+    assert_ne!(
+        first.this_box(),
+        copied.box_id,
+        "registration minted a new id for the copied box.toml"
+    );
+
+    let reconnect = started
+        .reconnect
+        .clone()
+        .expect("a stored DSN arms the ticker");
+    let second = match reconnect().await {
+        ConnEvent::Online(pg) => pg,
+        other => panic!("the second dial goes online too: {other:?}"),
+    };
+    assert_eq!(
+        second.this_box(),
+        first.this_box(),
+        "the second dial presents the id the first was answered with"
+    );
+    assert!(
+        matches!(
+            second.registration(),
+            Some(htui_store::Registration::Known { .. })
+        ),
+        "and registration knows it: {:?}",
+        second.registration()
+    );
+    assert_eq!(
+        htui_store::identity::load_or_mint(root.path())
+            .expect("re-read box.toml")
+            .box_id,
+        copied.box_id,
+        "box.toml still holds the copied id: the root was never writable"
+    );
+    assert_eq!(
+        count().await,
+        before + 1,
+        "two dials in one session add exactly one row for this user"
+    );
+
+    first.pool().close().await;
+    second.pool().close().await;
     close(&started).await;
     db.drop_db().await;
 }

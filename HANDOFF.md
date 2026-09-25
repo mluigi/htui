@@ -15,9 +15,10 @@
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
 **Current status (2026-09-25):** **MOD-38 was done** (`docs/decisions/mod/mod-38.md`): migration
-`0005_requirements` adds `item.resolution` and the requirement tables behind new store methods on
+`0006_requirements` adds `item.resolution` and the requirement tables behind new store methods on
 MemStore, PgStore and the cache; `closed` is now reachable only through `close_out`, which takes a
-resolution (amends ANA-2 §4.3). MOD-39 (Requirements tab) is unblocked.
+resolution (amends ANA-2 §4.3). MOD-39 (Requirements tab) is unblocked. MOD-7 milestone 1 (box
+identity, migration `0005_box_identity`) landed just before it; see MOD-7 below.
 Before it, **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`): requirements get dedicated
 tables with suspect-aware item citations; a decision is a closed item with a resolution and its
 `summary` document (§7 applied to `docs/REQUIREMENTS.md` 2026-09-25, R-MCP-2 deferred to MOD-11).
@@ -27,11 +28,11 @@ the review loop, judged fan-out and four git isolation modes under a leased hear
 sweep, and `run_worker.rs` and the Runs pane let the maintainer drive it, promote a step to chat and
 close an item out. Its carried risks are **MOD-37** and **CLEAN-4**.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
-`0004_max_agents_per_run_default` and `0005_requirements` (cache: `0001`..`0004`), so **the next
-migration is `0006`**.
-`max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins at MOD-38's close: store
-conformance `CASES` 65, `READ_CASES` 14, `htui-orch` `CASES` 70, `StoreRequest` unchanged since
-MOD-4, 256 `.sqlx` files, `MIRRORED_TABLES` 21; `cargo doc --workspace --no-deps` shows exactly two baseline errors
+`0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1) and `0006_requirements`
+(MOD-38; cache: `0001`..`0004`), so **the next migration is `0007`** (cache: `0005`).
+`max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
+milestone 1 and MOD-38: store conformance `CASES` 68, `READ_CASES` 14, `htui-orch` `CASES` 70,
+`StoreRequest` 64, `StoreReply` 35, 263 `.sqlx` files, `MIRRORED_TABLES` 21; `cargo doc --workspace --no-deps` shows exactly two baseline errors
 (`htui-core` `MIRRORED_TABLES`, `htui-store` `step_exists`). `git` ≥ 2.33.0 is a runtime dependency
 of the `worktree` isolation mode and of reconciliation. **Production `approve` and `accept` are
 greyed and every production judge fails until MOD-11**, because no agent can write its phase's
@@ -258,6 +259,34 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   **Relates to ANA-16** (`docs/ANA-16.md` §6.1 C4, §8): box registration is keyed on the `box.toml`
   id, not the hostname (C4, owned by MOD-40); under phase 2, registration is by enrolment with a
   server-minted box id (MOD-47). Container boxes are child boxes of their host (MOD-44).
+  **Routed PRD 2026-09-25** (`.claude/prds/mod-7-box-registry.prd.md`, decisions D0-D7). MOD-40 is
+  not a dependency. **ANA-16 C4's re-key moves here** (D1): registration keys on the `box.toml` id,
+  checked by a keyed hash of the OS machine identity; MOD-40 keeps the heartbeat half. Correction to
+  the text above: `repo_box_path` **does** have a writer, MOD-15's `SetRepoPath`
+  (`crates/htui/src/hierarchy.rs`), which canonicalises the root and so honours F-102; what is
+  missing is automatic inference (D5), now in scope with a manual text box as fallback.
+  **Milestone 1 landed (`27c4318`..`670c108`, 2026-09-25), "a box knows itself"**
+  (`.claude/plans/mod-7-box-identity-probe.plan.md`, `.claude/plans/mod-7-box-identity-probe.blueprint.md`): migration `0005_box_identity`
+  drops `UNIQUE (user_id, hostname)` and adds `machine_fingerprint`, `edit_version` (milestone 2's
+  CAS token, unused yet) and `probe_spec_digest`; `register_box` keys on the `box.toml` id, insert
+  first, and a stored keyed-HMAC fingerprint that disagrees mints a new box (`Registration::Copied`,
+  never adoption); a failed `box.toml` write-back stays online under the minted id for the session.
+  `htui_agent::box_probe` fills hardware (`sysinfo`; GPU per OS), `box_tool` and `probed_tags` from a
+  seed `spec.json` (39 tools, 14 tag rules) overlaid by name from `app_setting.box_probe_spec`; it runs
+  after an `Online` swap when never probed, on an `htui` version change or a spec digest change, then
+  probes the agents and names installable `missing` ones on the status line (never installs);
+  `StoreRequest::ProbeBox` exists, bound to no key. `WriteStore` gained `record_box_probe` and
+  `boxes`. **Open at milestone 1's close:** R-18, macOS `xcode-select` stubs (`/usr/bin/git` and
+  others) open an install dialog when probed on a Mac without the Command Line Tools — deferred until
+  someone verifies macOS, guard sketched in the blueprint §11; the Windows facts moved to MOD-16.
+- [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
+  `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
+  when inference fails. Replace the typed fallback with a popup window that browses the box's
+  filesystem and selects a directory, reusable wherever the Settings tab asks for a path (repo paths
+  in the box section, workspace roots in the hierarchy section). The chosen path goes through the
+  same canonicalisation as the text box (`htui_core::root_path::canonical_root`, F-102). Listing runs
+  off the UI task (`R-NF-3`). Blocked on MOD-7 milestone 4. Raised by the maintainer at MOD-7's PRD
+  gate, 2026-09-25.
 - [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
   project and phase bindings, template rows, Skills tab editor with version diff, import of
   existing skill markdown files. Per ANA-5 (`docs/ANA-5.md` §4.1, §5.4): template save validation
@@ -388,6 +417,15 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   is this item's. **R-45**: `htui` now links `gix`, `process-wrap` and `walkdir` through `htui-orch`.
   MOD-4 also made the `git` CLI (≥ 2.33.0) a runtime dependency of the `worktree` mode and of
   reconciliation, and none of those `git` calls has run on Windows.
+  **MOD-7 milestone 1 added a fourth body** (`.claude/plans/mod-7-box-identity-probe.blueprint.md`
+  §11), unlinted for the TOOL-3 reason and reviewed by eye: the `MachineGuid` fingerprint reader
+  (`htui-store/src/identity.rs`, `windows-registry`); `sysinfo`'s OS, CPU and RAM facts; the GPU
+  scan through an absolute-path `powershell.exe` CIM query (`htui-agent/src/box_probe/hardware.rs`);
+  and two box-probe behaviours only a Windows box shows — the seed's `bash` resolving to the WSL
+  launcher `%SystemRoot%\System32\bash.exe`, which boots the WSL VM and records the distro's bash
+  (documented, turned off by `{"tools":{"bash":{"disabled":true}}}` in `box_probe_spec`; a code fix
+  that names no tool is this item's call), and the Microsoft Store `python3` stub, which the probe now
+  skips by trying each name until one prints a version (verify it holds).
 
 - [ ] **MOD-22 - Complete a loopback OAuth login from a box the browser cannot reach** (from MOD-21).
   `R-AGT-9`, `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent's own login flow redirects to a
@@ -480,6 +518,9 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   C5: a headless connect never migrates; `htui_version` compared against a target. **Open question
   for the maintainer:** `R-STO-5` amendment ("a headless worker never migrates; it refuses and
   reports"). No dependencies; blocks MOD-41.
+  **C4's re-key moved to MOD-7** (MOD-7 PRD D1, 2026-09-25): registration keyed on the `box.toml` id
+  with a machine-fingerprint check lands there. This item keeps C4's box heartbeat bumping
+  `last_seen_at`.
   **MOD-4 M6 landed** (MOD-4 done, `docs/decisions/mod/mod-4.md`): C1 and C8 now guard shipped
   code, the step write paths `run_worker.rs` and the engine drive in production.
 - [ ] **MOD-41 - Headless worker (`htui worker`)** (from ANA-16, §8 item 2). `R-ORCH-12`, `R-ID-2`,
@@ -597,6 +638,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 33 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 34 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

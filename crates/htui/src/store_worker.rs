@@ -47,6 +47,10 @@ use crate::ui::tabs::TabId;
 /// Monotonic request counter, minted by `App::dispatch` (blueprint C.2).
 pub type Seq = u64;
 
+/// The address of a reply nobody asked for: `App::dispatch` counts up from 0 and never reaches
+/// it, so the freshness gate drops it after `observe_reply` (MOD-7 D13).
+pub const UNSOLICITED: Seq = Seq::MAX;
+
 /// [`StoreRequest::name`] of the preview, named once so the deferred task's `Failed` replies carry
 /// the same string the request does (`preview::run_preview` cannot call `name()` — it no longer has
 /// the request).
@@ -89,7 +93,7 @@ pub enum Origin {
 pub enum StoreRequest {
     /// Every workspace with its projects (switcher, startup scope).
     Workspaces,
-    /// This box's row for the top bar. No probe: that is MOD-7.
+    /// This box's row for the top bar.
     BoxInfo,
     /// How many runs of the scope are active (top bar).
     ActiveRuns {
@@ -198,6 +202,11 @@ pub enum StoreRequest {
     /// [`StoreReply::Agents`] — the reply the Settings section already renders, so the probe needs
     /// no second arm there — or with [`StoreReply::Failed`].
     ProbeAgents,
+    /// Probe this box, then its agents, now (MOD-7 D11): the registration probe's path without the
+    /// "needs a probe" decision. Served by the agent runtime's own task; answered once with
+    /// [`StoreReply::BoxProbed`], or refused with [`StoreReply::Failed`] before anything spawns
+    /// (offline: `REGISTRY_ON_SERVER_ONLY`; a claim held). Milestone 1 binds it to no key (plan D15).
+    ProbeBox,
     /// Pre-flight an adapter install for one registry row (MOD-20 D13, D18).
     ///
     /// One registry read, one `HEAD`, **no archive byte**: what this box would fetch and how it
@@ -558,6 +567,7 @@ impl StoreRequest {
             Self::ChatCancel { .. } => "chat_cancel",
             Self::ChatFollow { .. } => "chat_follow",
             Self::ProbeAgents => "probe_agents",
+            Self::ProbeBox => "probe_box",
             Self::InstallPlan { .. } => "install_plan",
             Self::InstallConfirm { .. } => "install_confirm",
             Self::InstallCancel => "install_cancel",
@@ -769,6 +779,9 @@ pub enum StoreReply {
     Document(Box<Option<Document>>),
     /// Answer to [`StoreRequest::RunActions`].
     RunActions(Box<crate::run_worker::ItemActions>),
+    /// What one box probe did (MOD-7 D13): one per box probe, at the requester's address or
+    /// [`UNSOLICITED`].
+    BoxProbed(crate::agent_worker::BoxProbeReport),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -983,10 +996,10 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             events: backend.step_events(*step).await?,
         },
         // The five chat requests need the worker loop's own state (the live sessions), and the
-        // probe, the preview, the three install requests and MOD-21's four login ones need the
-        // runtime that owns their tasks, so all fourteen are served ahead of this function, exactly
-        // as `ApplyMigrations` is. One of them that reaches here at all belongs to a caller with no
-        // runtime — the test harness without one — and saying so is more use than a panic.
+        // two probes, the preview, the three install requests and MOD-21's four login ones need
+        // the runtime that owns their tasks, so all fifteen are served ahead of this function,
+        // exactly as `ApplyMigrations` is. One of them that reaches here at all belongs to a caller
+        // with no runtime — the test harness without one — and saying so is more use than a panic.
         StoreRequest::PromptPreview { .. }
         | StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
@@ -994,6 +1007,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::ChatCancel { .. }
         | StoreRequest::ChatFollow { .. }
         | StoreRequest::ProbeAgents
+        | StoreRequest::ProbeBox
         | StoreRequest::InstallPlan { .. }
         | StoreRequest::InstallConfirm { .. }
         | StoreRequest::InstallCancel
@@ -1275,24 +1289,48 @@ pub fn spawn_with_runtimes(
                             // `if held.is_some()` above, so this cannot be the `None` arm; the
                             // store has to be moved out to be applied (`&mut self`).
                             match held.take() {
-                                Some(mut pg) => match pg.apply_migrations().await {
-                                    Ok(()) => {
-                                        let applied = pending.take().unwrap_or(0);
-                                        tracing::info!(applied, "schema migrations applied");
-                                        go_online(
-                                            &mut backend, pg, &mut refresher, &mut health,
-                                            &projects, settings,
-                                        ).await;
-                                        // D190: an `Online` swap sweeps, whichever path made it.
-                                        runs.sweep(&backend, &tx);
-                                        StoreReply::MigrationsApplied { applied }
+                                Some(mut pg) => {
+                                    // What `box.toml` said: this store connected to a pending
+                                    // schema, so nothing has registered it yet (MOD-7 D3).
+                                    let presented = pg.identity().clone();
+                                    match pg.apply_migrations().await {
+                                        Ok(()) => {
+                                            let applied = pending.take().unwrap_or(0);
+                                            tracing::info!(applied, "schema migrations applied");
+                                            // MOD-7 D3: this bootstrap registered the box, so
+                                            // a minted id is written back here, as
+                                            // `try_connect` does over an up-to-date schema.
+                                            // F1: and remembered for the session's later dials,
+                                            // which present it while `box.toml` cannot be
+                                            // rewritten instead of minting one row per tick.
+                                            if let Some(ctx) = connect.as_ref() {
+                                                if let Err(err) = connect::persist_registration(
+                                                    &ctx.config_root, &presented, &pg,
+                                                ) {
+                                                    tracing::warn!(
+                                                        %err,
+                                                        "the registered box id was not written back to box.toml"
+                                                    );
+                                                }
+                                                ctx.registered.record(&presented, &pg);
+                                            }
+                                            go_online(
+                                                &mut backend, pg, &mut refresher, &mut health,
+                                                &projects, settings,
+                                            ).await;
+                                            // MOD-7 D11: the registration probe, then D190's sweep.
+                                            runtime.on_online(&backend, &tx);
+                                            runs.sweep(&backend, &tx);
+                                            StoreReply::MigrationsApplied { applied }
+                                        }
+                                        Err(err) => {
+                                            // Still pending, still held: `y` can be answered
+                                            // again.
+                                            held = Some(pg);
+                                            failed("apply_migrations", &err)
+                                        }
                                     }
-                                    Err(err) => {
-                                        // Still pending, still held: `y` can be answered again.
-                                        held = Some(pg);
-                                        failed("apply_migrations", &err)
-                                    }
-                                },
+                                }
                                 None => StoreReply::MigrationsApplied { applied: 0 },
                             }
                         }
@@ -1479,7 +1517,7 @@ pub fn spawn_with_runtimes(
                             }
                         }
                         // The chat requests need this loop's own state - the live sessions - and
-                        // the probe, the installs and the logins need the runtime that owns their
+                        // the probes, the installs and the logins need the runtime that owns their
                         // tasks, so all of them go to the runtime before `try_serve`, like
                         // `ApplyMigrations` above. An install reads the registry over the network
                         // and streams hundreds of megabytes, and a login waits on a human in a
@@ -1493,6 +1531,7 @@ pub fn spawn_with_runtimes(
                         | StoreRequest::ChatCancel { .. }
                         | StoreRequest::ChatFollow { .. }
                         | StoreRequest::ProbeAgents
+                        | StoreRequest::ProbeBox
                         | StoreRequest::InstallPlan { .. }
                         | StoreRequest::InstallConfirm { .. }
                         | StoreRequest::InstallCancel
@@ -1572,6 +1611,8 @@ pub fn spawn_with_runtimes(
                         .await;
                         last_attempt = Some(Attempt { at: Utc::now(), outcome: AttemptOutcome::Online });
                         tracing::info!(label = backend.label(), "store online");
+                        // MOD-7 D11: the registration probe decides on its own task.
+                        runtime.on_online(&backend, &tx);
                         // D190: every `Online` sweeps, so a run a dead process left is adopted.
                         runs.sweep(&backend, &tx);
                     }
@@ -2356,6 +2397,157 @@ mod tests {
             }
             other => panic!("a probe with no runtime is refused, not served: {other:?}"),
         }
+    }
+
+    /// The box probe is named like every other request, and a build with no runtime says so
+    /// rather than dropping the reply (MOD-7 D11).
+    #[tokio::test]
+    async fn probe_box_is_named_and_refused_without_a_runtime() {
+        assert_eq!(StoreRequest::ProbeBox.name(), "probe_box");
+        match serve(&demo(), &StoreRequest::ProbeBox).await {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, "probe_box");
+                assert_eq!(message, "no agent runtime in this build");
+            }
+            other => panic!("a box probe with no runtime is refused, not served: {other:?}"),
+        }
+    }
+
+    /// `R-NF-3` for the box probe: its version children may each take `version_timeout`, and the
+    /// loop must serve everything else while they run. The fake tool sleeps, so the probe is
+    /// provably still in flight when `BoxInfo` is answered (H-7: a fake `PATH`, fixed hardware).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_loop_answers_box_info_while_a_box_probe_is_in_flight() {
+        use crate::agent_worker::tests::{fake_env, fake_hardware, never_probed, script};
+
+        let tmp = tempfile::tempdir().expect("temp box");
+        script(
+            tmp.path(),
+            "cmake",
+            "/bin/sleep 1; echo 'cmake version 3.28.0'",
+        );
+        let runtime = AgentRuntime::new(htui_agent::registry::DriverFactory::production())
+            .with_probe_env(fake_env(tmp.path()), fake_hardware());
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn_with(
+            Started::detached(Backend::memory(never_probed().await)),
+            req_rx,
+            rep_tx,
+            runtime,
+        );
+
+        for (seq, request) in [(1, StoreRequest::ProbeBox), (2, StoreRequest::BoxInfo)] {
+            req_tx
+                .send(RequestEnvelope {
+                    seq,
+                    origin: Origin::App,
+                    request,
+                })
+                .expect("the worker is alive");
+        }
+
+        let first = rep_rx.recv().await.expect("the worker answers");
+        assert_eq!(
+            first.seq, 2,
+            "the loop is free the instant the box probe is deferred: {:?}",
+            first.reply
+        );
+        assert!(matches!(first.reply, StoreReply::BoxInfo(Some(_))));
+        let second = rep_rx.recv().await.expect("the box probe answers itself");
+        assert_eq!(second.seq, 1);
+        let StoreReply::BoxProbed(report) = &second.reply else {
+            panic!("the box probe answers BoxProbed: {:?}", second.reply)
+        };
+        assert_eq!(report.box_failed, None);
+        assert_eq!(
+            report.tools, 1,
+            "the sleeping tool answered within its timeout"
+        );
+
+        drop(req_tx);
+        let _ = worker.await;
+    }
+
+    /// MOD-7 D3 over the loop's other bootstrap: a store that connected to a pending schema
+    /// registers only when `ApplyMigrations` runs, and the loop then writes a minted id back to
+    /// `box.toml` through `connect::persist_registration`, as `try_connect` does after a connect
+    /// over an up-to-date schema.
+    ///
+    /// The planted row is `htui-store`'s `apply_migrations_then_persist_writes_a_minted_id_back`
+    /// one, with the same early return on a machine with no readable identity.
+    #[tokio::test]
+    async fn apply_migrations_writes_a_minted_box_id_back_to_box_toml() {
+        if htui_store::identity::machine_fingerprint().await.is_none() {
+            return;
+        }
+        let Some(db) = htui_store::testkit::bare_db().await else {
+            return;
+        };
+        htui_store::MIGRATOR
+            .run(&db.pool)
+            .await
+            .expect("apply the schema under the store");
+        db.store.seed_if_empty().await.expect("seed the app_user");
+        sqlx::query(
+            "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version, \
+                              machine_fingerprint) \
+             VALUES ($1, (SELECT id FROM app_user ORDER BY created_at, id LIMIT 1), 'elsewhere', \
+                     'linux', '', 'x86_64', '0.0.0', repeat('a', 64))",
+        )
+        .bind(db.identity.box_id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("plant the other machine's row under the box.toml id");
+
+        let mut started = Started::detached(demo());
+        started.connect = Some(connect::ConnectContext {
+            config_root: db.config_root.clone(),
+            connect_timeout: std::time::Duration::from_secs(5),
+            offline: true,
+            registered: connect::Registered::default(),
+        });
+        let events = started.events_tx.clone();
+        let (tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn(started, req_rx, rep_tx);
+        events
+            .send((
+                connect::LAUNCH_GENERATION,
+                ConnEvent::MigrationsPending(db.store.clone(), 5),
+            ))
+            .await
+            .expect("the worker is listening");
+        // The event and the requests race in the loop's `select!`: ask until the store is held.
+        loop {
+            let StoreReply::StoreState {
+                migrations_pending, ..
+            } = round_trip(&tx, &mut rep_rx, StoreRequest::StoreState).await
+            else {
+                panic!("wrong reply variant")
+            };
+            if migrations_pending == Some(5) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let reply = round_trip(&tx, &mut rep_rx, StoreRequest::ApplyMigrations).await;
+        assert!(
+            matches!(reply, StoreReply::MigrationsApplied { applied: 5 }),
+            "{reply:?}"
+        );
+        let rewritten =
+            htui_store::identity::load_or_mint(&db.config_root).expect("re-read box.toml");
+        assert_ne!(
+            rewritten.box_id, db.identity.box_id,
+            "box.toml holds the id this machine was minted, not the copied one"
+        );
+
+        drop(tx);
+        let _ = worker.await;
+        db.drop_db().await;
     }
 
     /// The three install requests are named like every other, and a build with no runtime says so

@@ -271,6 +271,7 @@ impl Harness {
                         | StoreRequest::ChatCancel { .. }
                         | StoreRequest::ChatFollow { .. }
                         | StoreRequest::ProbeAgents
+                        | StoreRequest::ProbeBox
                         | StoreRequest::InstallPlan { .. }
                         | StoreRequest::InstallConfirm { .. }
                         | StoreRequest::InstallCancel

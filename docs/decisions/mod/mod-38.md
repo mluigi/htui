@@ -31,7 +31,8 @@ The maintainer applied ANA-11 §7 to `docs/REQUIREMENTS.md` on 2026-09-25 (`86c5
 **Requirements** (milestone 2):
 - Tables: `requirement_spec`, `requirement_area`, `requirement_key_counter`, `requirement`
   (generated key `R-<AREA>-<N>`) and `requirement_revision`, all in migration
-  `0005_requirements.sql`.
+  `0006_requirements.sql` (written as `0005`, renumbered at the merge with MOD-7 milestone 1,
+  whose `0005_box_identity.sql` landed first).
 - Writes: `set_requirement_spec` (CAS), `create_requirement_area`, `mint_requirement`,
   `amend_requirement` (CAS, returning `RequirementUpdate::Diverged` with the ancestor revision) and
   `withdraw_requirement`. They are implemented on MemStore and PgStore.
@@ -83,7 +84,8 @@ The maintainer applied ANA-11 §7 to `docs/REQUIREMENTS.md` on 2026-09-25 (`86c5
   clean.
 - `cargo sqlx prepare --check` is clean.
 - Pins: store conformance `CASES` 65 and `READ_CASES` 14; `htui-orch` `CASES` 70 (unchanged);
-  256 `.sqlx` files.
+  256 `.sqlx` files. After the merge with MOD-7 milestone 1 (migration renumbered to `0006`):
+  `CASES` 68 and 263 `.sqlx` files; `migrations.rs` and `connect.rs` pin six migrations.
 - The `rust-reviewer` gate found no blocking or major findings. All nine minor findings and nits
   were fixed in `f5842a1`.
 

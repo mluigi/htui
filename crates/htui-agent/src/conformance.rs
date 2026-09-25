@@ -30,13 +30,13 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, CitationKind, Claim, CommandRun,
-    CoverageRow, Document, DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item,
-    ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind,
-    NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRecord, ChatRunSpec, CitationKind,
+    Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, EventKind, EventRole,
+    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
+    ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+    NewRunStep, NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project,
+    ProjectId, ProjectPatch, PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch,
     Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
     RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
     ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
@@ -749,6 +749,12 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     }
     async fn upsert_agent_box(&self, row: &AgentBox) -> StoreResult<()> {
         self.inner.upsert_agent_box(row).await
+    }
+    async fn record_box_probe(&self, probe: &BoxProbe) -> StoreResult<()> {
+        self.inner.record_box_probe(probe).await
+    }
+    async fn boxes(&self) -> StoreResult<Vec<BoxRecord>> {
+        self.inner.boxes().await
     }
     async fn set_agent_box_quota(
         &self,

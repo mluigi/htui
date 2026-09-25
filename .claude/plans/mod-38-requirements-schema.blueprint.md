@@ -94,10 +94,10 @@ before T1; they drift as tasks land, so find by symbol when a line has moved.
 
 ---
 
-## 1. `htui-store/migrations/0005_requirements.sql` (T2, whole)
+## 1. `htui-store/migrations/0006_requirements.sql` (T2, whole)
 
 ```sql
--- 0005_requirements.sql - MOD-38: ANA-11 (requirements) docs/ANA-11.md §5, and the §4.2 close-out
+-- 0006_requirements.sql - MOD-38: ANA-11 (requirements) docs/ANA-11.md §5, and the §4.2 close-out
 -- resolution. Forward-only (R-STO-5): 0001-0004 are never edited. Depends on 0001_init.sql
 -- (project, app_user, box, item, run_step, set_updated_at()).
 -- The cache-mirror companion is cache_migrations/0004_requirements.sql (plan D12).
@@ -1436,9 +1436,9 @@ requirement reads (plan D12)"). These cases run on Mem, Pg and the mirror (`test
   - `htui-store/src/cache/read.rs:178` (`resolution: None` for now).
 - [ ] Gate: `cargo test -p htui-core --lib`. The conformance suites stay red until T3.
 
-### T2: Migration 0005 and item selects
+### T2: Migration 0006 and item selects
 
-- [ ] `htui-store/migrations/0005_requirements.sql`: §1, verbatim.
+- [ ] `htui-store/migrations/0006_requirements.sql`: §1, verbatim.
 - [ ] `pg/read.rs:130-158`: add `resolution AS "resolution: htui_core::model::Resolution"`.
   Check the other `FROM item` selects in `pg/read.rs` that build `Item`.
 - [ ] `pg/write.rs:398-461` `mint_item`: CTE `i` RETURNING gains `resolution`; the SELECT gains

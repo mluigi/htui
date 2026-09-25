@@ -1307,7 +1307,9 @@ impl CacheStore {
     /// This box's row, projected for the top bar.
     ///
     /// The mirror holds the own `box` row and no other (§4.4), so this needs no `this_box`
-    /// argument: there is at most one row to find.
+    /// argument: there is at most one row to find. That stays true for a config directory copied
+    /// from another machine, whose mirror arrives holding the other box: every refresh pass prunes
+    /// the `box` table to this box's id (`cache::refresh`, MOD-7 D3).
     ///
     /// # Errors
     ///

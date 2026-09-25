@@ -259,6 +259,7 @@ fn context(root: &tempfile::TempDir, connect_timeout: Duration, offline: bool) -
         config_root: root.path().to_owned(),
         connect_timeout,
         offline,
+        registered: htui_store::connect::Registered::default(),
     }
 }
 

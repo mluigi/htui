@@ -57,6 +57,9 @@ fs4                   = { workspace = true }
 # `htui_core::model::ids` makes; the workspace pins `v7` + `serde` and this crate needs no other
 # feature.
 uuid                  = { workspace = true }
+# MOD-7 D6: the box probe's OS version, CPU brand and total RAM on all three platforms (`system`
+# only, set at the workspace).
+sysinfo               = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

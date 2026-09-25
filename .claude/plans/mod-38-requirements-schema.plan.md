@@ -2,7 +2,7 @@
 
 **Source PRD**: `.claude/prds/mod-38-requirements-schema.prd.md`. The maintainer answered the gate
 decisions D1–D3 on 2026-09-25; this plan implements them and does not re-open them.
-**Selected milestones**: all three. They share one migration pair (`0005_requirements.sql`,
+**Selected milestones**: all three. They share one migration pair (`0006_requirements.sql`,
 cache `0004_requirements.sql`) and one branch.
 **Numbering**: the PRD owns **D1–D3**. This plan's decisions start at **D4**, and tasks at **T1**.
 
@@ -62,7 +62,7 @@ live citations and the spec header. The demo fixture shows one suspect citation.
   - `closeout::Preview` gains `resolution`, and the Runs pane sends exactly that value in
     `Command::CloseOut { item, resolution }`.
 - **D7 — Resolution is a column, not text.** The `summary` document's body does not change.
-- **D8 — One `0005_requirements.sql`, written whole in T2.** It follows ANA-11 §5, with these
+- **D8 — One `0006_requirements.sql`, written whole in T2.** It follows ANA-11 §5, with these
   deltas:
   - the counter is minted with `mint_item`'s `INSERT … ON CONFLICT DO UPDATE … RETURNING` CTE
     (`pg/write.rs:398-461`), not the "`UPDATE … RETURNING`" of §5.1;
@@ -125,7 +125,7 @@ Paths relative to `crates/`.
 |---|---|---|
 | `htui-core/src/model/item.rs`, `model/mod.rs` | T1 | `Resolution`, `Item.resolution`, D4 tables, `check_enum` test |
 | `htui-core/src/fixtures.rs`, `store/mem.rs`, `htui-orch/src/closeout.rs`, `htui-store/src/cache/read.rs`, `htui-core/src/prompt/{fixtures,render}.rs` | T1 | `Item` literal sites gain `resolution` (the compiler enumerates them; FIX-1 → `Done`) |
-| `htui-store/migrations/0005_requirements.sql` | T2 | new, whole (D8) |
+| `htui-store/migrations/0006_requirements.sql` | T2 | new, whole (D8) |
 | `htui-store/src/pg/read.rs`, `pg/write.rs` (item selects), `pg/demo.rs` (item insert) | T2 | `resolution` through every item select and the demo insert |
 | `htui-store/tests/migrations.rs`, `htui-store/.sqlx/*` | T2 | version vecs → `[1..=5]`, `TABLES` 33 → 39, the 0004 test runs to 4 explicitly; regenerated query data |
 | `htui-core/src/store/traits.rs` (`close_out`), `pg/write.rs` (`close_out`), `mem.rs` (`close_out`, tests), `htui-store/src/writer.rs`, `htui-agent/src/conformance.rs`, `htui-agent/tests/recorder.rs` | T3 | new signature, D4/D5 guard |
@@ -165,7 +165,7 @@ Order: T1 → T2 → T3 → (T4 ∥ T5) → T6 → (T7 ∥ T8 ∥ T9) → T10 �
 
 ### T1: `Resolution` and the close-out law (M1; first, alone)
 - **Tests first:**
-  - `check_enum` for `Resolution` against the 0005 CHECK list. It is transcribed in the test,
+  - `check_enum` for `Resolution` against the 0006 CHECK list. It is transcribed in the test,
     because the migration lands in T2.
   - `SANCTIONED` without the three `→ closed` rows.
   - New `CLOSE_OUT_SANCTIONED` (status × resolution).
@@ -178,18 +178,18 @@ Order: T1 → T2 → T3 → (T4 ∥ T5) → T6 → (T7 ∥ T8 ∥ T9) → T10 �
 - **Known red after T1:** the conformance cases that `transition` into `closed`. T3 fixes them.
   T1 runs `cargo test -p htui-core --lib`, not the suites.
 
-### T2: Migration 0005 and item selects (M1; needs T1)
+### T2: Migration 0006 and item selects (M1; needs T1)
 - **Tests first:**
   - `migrations.rs`: applied `[1,2,3,4,5]`, `TABLES` +6.
   - `resolution_iff_closed` rejects `closed` with a NULL resolution and non-closed with a value.
-  - The backfill sets `done` on a pre-0005 closed row (`run_to(4)`, insert, `MIGRATOR.run`).
+  - The backfill sets `done` on a pre-0006 closed row (`run_to(5)`, insert, `MIGRATOR.run`).
   - The 0004 test pins `run_to(4)` rather than "latest".
 - **Code:**
-  - `0005_requirements.sql` (D8), complete, including the requirement tables.
+  - `0006_requirements.sql` (D8), complete, including the requirement tables.
   - `resolution` in the three item `query_as!` selects and the cache-free reads.
   - `pg/demo.rs` inserts `resolution`.
   - `cargo sqlx prepare -- --all-targets --all-features`.
-- **Files:** `migrations/0005_requirements.sql`, `pg/read.rs`, `pg/write.rs` (item selects only),
+- **Files:** `migrations/0006_requirements.sql`, `pg/read.rs`, `pg/write.rs` (item selects only),
   `pg/demo.rs`, `tests/migrations.rs`, `.sqlx/*`.
 
 ### T3: `close_out(item, resolution, …)` on the seam (M1; needs T2)
@@ -245,7 +245,7 @@ Order: T1 → T2 → T3 → (T4 ∥ T5) → T6 → (T7 ∥ T8 ∥ T9) → T10 �
     `RequirementState`, `Priority`, `CitationKind`, `ItemCitation { requirement, kind,
     requirement_version, suspect }`, `CoverageRow { item: ItemSummary, kind, resolution, suspect }`,
     `RequirementFilter`, `RequirementUpdate`.
-  - `check_enum` for the four new enums against 0005.
+  - `check_enum` for the four new enums against 0006.
 - **Trait (D9–D15):**
   - `ReadStore`:
     - `requirement_spec(project)`

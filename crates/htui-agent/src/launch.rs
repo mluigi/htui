@@ -146,6 +146,17 @@ pub struct Install {
     pub tool: String,
 }
 
+/// Whether an `agent.launch` document declares `discovery.install` (MOD-20 D12). One rule for the
+/// Settings section, the install pre-flight and the box probe's report (MOD-7 D13). A document
+/// that does not parse declares nothing.
+#[must_use]
+pub fn declares_install(launch: &serde_json::Value) -> bool {
+    serde_json::from_value::<AgentLaunch>(launch.clone())
+        .ok()
+        .and_then(|launch| launch.discovery)
+        .is_some_and(|discovery| discovery.install.is_some())
+}
+
 wire_enum!(
     /// `install.source` (plan MOD-20 D12): one value today.
     ///

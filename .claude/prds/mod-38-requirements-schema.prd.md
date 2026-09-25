@@ -52,12 +52,12 @@ Read at `d966413` (main) during routing. Paths are relative to `crates/`.
   created lazily. ANA-11 §5.1 says "`UPDATE … RETURNING`"; the requirement mint follows the real
   pattern instead.
 - **Triggers.** `set_updated_at` is attached by a loop over 20 tables in `0001_init.sql:574-580`,
-  BEFORE UPDATE only. Migrations 0002-0004 add none; 0005 attaches its own.
+  BEFORE UPDATE only. Migrations 0002-0005 add none; 0006 attaches its own.
 - **Migration pins.** `htui-store/tests/migrations.rs` asserts `vec![1, 2, 3, 4]` (`:72-78`,
   `:591`), `TABLES.len() == 33` (`:95`), and exactly 25 commented columns (`:380-409`). sqlx runs
   offline (227 files in `htui-store/.sqlx/`), so changed queries need `cargo sqlx prepare`.
 - **Cache.** `CacheStore::open` rebuilds when `cache_meta.schema_version` differs from the
-  **Postgres** `schema_version` (`htui-store/src/cache/mod.rs:127-160`), so 0005 alone rebuilds
+  **Postgres** `schema_version` (`htui-store/src/cache/mod.rs:127-160`), so 0006 alone rebuilds
   every cache. The refresher (`cache/refresh.rs:232`, spawned from `htui/src/store_worker.rs:1787`)
   walks a hardcoded table list with one match arm per table; `refresh_item_link` (`:903-963`) is
   the tombstone-becomes-delete precedent. `MIRRORED_TABLES` has 17 entries (`cache/mod.rs:40`).
@@ -103,7 +103,7 @@ R-X, and which of them were written against an older text" is a query rather tha
 
 **In scope**
 
-- `migrations/0005_requirements.sql` per ANA-11 §5: `requirement_spec`, `requirement_area`,
+- `migrations/0006_requirements.sql` per ANA-11 §5: `requirement_spec`, `requirement_area`,
   `requirement_key_counter`, `requirement` (generated key), `requirement_revision`,
   `item_requirement`, `item.resolution` with the backfill `closed → done` before
   `item_resolution_iff_closed`, and `set_updated_at` triggers on the four mutable tables.
@@ -143,8 +143,8 @@ R-X, and which of them were written against an older text" is a query rather tha
   stored.
 - **Citing a withdrawn requirement** is refused for `addresses` and `reserves`; `amends` and
   `withdraws` remain legal as history.
-- **One migration pair.** 0005 and cache 0004 ship together. If MOD-7 lands a migration first,
-  this item renumbers at merge.
+- **One migration pair.** 0006 and cache 0004 ship together. MOD-7 landed `0005` first, so this
+  item renumbered from 0005 at merge.
 - **Forward-only, sqlx offline data regenerated, migration pins updated rather than deleted.**
 - `unsafe_code = "forbid"`, workspace lints unchanged, TDD per repo convention; reviewer is
   `rust-reviewer` (`.claude/workflow-config.json`).
@@ -184,6 +184,6 @@ not proposals: the plan implements them.
 |---|---|---|---|
 | The CHECK makes Postgres and MemStore disagree on paths into `closed` | High without D1 | High | D1's rule enforced in shared Rust code and asserted by one conformance case on both stores |
 | Migration collision with MOD-7 (run in parallel) | Medium | Low | One migration pair; renumber at merge; the pins in `migrations.rs` make a collision loud |
-| The cache rebuild on 0005 surprises a user with a large cache | Low | Low | Existing behaviour on every PG migration; nothing new |
+| The cache rebuild on 0006 surprises a user with a large cache | Low | Low | Existing behaviour on every PG migration; nothing new |
 | Wide mechanical change (≈9 files for `close_out`, 6-8 per new method, sqlx data) invites a missed implementor | Medium | Medium | No default trait bodies, so the compiler finds every one; ultracode implement phase fans out by file set |
 | Merge churn with MOD-34 in `HANDOFF.md`, `REQUIREMENTS.md`, `Cargo` files | High | Low | Small textual merges; MOD-34 consumes `item.resolution` rather than defining it |
