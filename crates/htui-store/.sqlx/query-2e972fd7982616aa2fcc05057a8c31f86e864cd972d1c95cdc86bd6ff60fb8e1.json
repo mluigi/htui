@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT key     AS \"key!\",\n                   state   AS \"state: RequirementState\",\n                   version\n              FROM requirement WHERE id = $1 FOR SHARE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "state: RequirementState",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "2e972fd7982616aa2fcc05057a8c31f86e864cd972d1c95cdc86bd6ff60fb8e1"
+}

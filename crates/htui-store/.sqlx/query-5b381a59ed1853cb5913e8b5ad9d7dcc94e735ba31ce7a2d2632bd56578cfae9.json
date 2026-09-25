@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT item_id, requirement_id, kind, requirement_version, proposed_by_step_id, created_at, updated_at, deleted_at FROM item_requirement WHERE (item_id IN (SELECT id FROM item WHERE project_id = $1) OR requirement_id IN (SELECT id FROM requirement WHERE project_id = $1)) AND updated_at > $2 ORDER BY updated_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "requirement_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "requirement_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "requirement_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "requirement_version"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "proposed_by_step_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "proposed_by_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "deleted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "5b381a59ed1853cb5913e8b5ad9d7dcc94e735ba31ce7a2d2632bd56578cfae9"
+}

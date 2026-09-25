@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE item_requirement SET deleted_at = clock_timestamp() WHERE item_id = $1 AND requirement_id = $2 AND kind = $3 AND deleted_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f5883d29d84eec4c6f600905a4166611f83ca1873b0835eb52e16ceda4d23e82"
+}
