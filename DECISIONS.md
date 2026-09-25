@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[ANA-11](docs/decisions/ana/ana-11.md)** - Models for requirements and decisions (concluded, 2026-09-25)
 - **[MOD-4](docs/decisions/mod/mod-4.md)** - Orchestrator, manual mode: `htui-orch` walks step graphs with gates, the review loop, judged fan-out and four git isolation modes under a leased heartbeat and a recovery sweep, and the Runs pane drives it with promotion to chat and close-out (done, 2026-09-25)
 - **[MOD-30](docs/decisions/mod/mod-30.md)** - The detail sub-tab strip overflows at the pinned width (done, 2026-09-24)
 - **[MOD-35](docs/decisions/mod/mod-35.md)** - Add Qdrant connection settings (done, 2026-09-20)
