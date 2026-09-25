@@ -48,6 +48,9 @@ zeroize            = { workspace = true }
 sentry = { workspace = true }
 sentry-anyhow = { workspace = true }
 sentry-tracing = { workspace = true }
+# MOD-9 D9: the $EDITOR temp file (removed on drop); already in the lock (was dev-only). The store
+# worker's swap tests also open a throwaway `cache.sqlite` with it, never the user's.
+tempfile = "3"
 
 [dev-dependencies]
 # The chat tab's snapshots drive the fake transport through the same registry the ACP one uses.
@@ -67,8 +70,6 @@ insta    = { workspace = true, features = ["filters"] }
 sqlx     = { workspace = true }
 # `net` for the loopback fixture servers the MOD-20 install cases answer from (blueprint P-5).
 tokio    = { workspace = true, features = ["test-util", "net"] }
-# The store worker's swap tests open a throwaway `cache.sqlite`, never the user's.
-tempfile = "3"
 
 [lints]
 workspace = true

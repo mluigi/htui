@@ -12,12 +12,17 @@ use std::cell::RefCell;
 use tokio::sync::mpsc;
 
 use crate::app::action::{Action, Handled};
+use crate::editor::{ExternalEdit, ExternalEditOutcome};
 use crate::keymap::{KeyChord, KeyScope, Keymap};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, layout, top_bar};
 use crossterm::event::{Event, KeyEvent, KeyEventKind};
+
+/// What the status line says when anything but a tab asks for `$EDITOR` (MOD-9 D10): the outcome
+/// is handed back through `Tab::on_external_edit`, so there would be no one to hand it to.
+pub const EDITOR_NEEDS_A_TAB: &str = "only a tab can open the editor";
 
 /// How many rounds of "apply an action, collect what it emitted" one drain may take before the
 /// shell gives up. A view that emits on every drain round is a bug, not a reason to hang.
@@ -188,6 +193,13 @@ pub struct App {
     /// empty keyring would be dragged back to `Settings > Connection` from wherever the user had
     /// moved on to — the defect `migration_prompt_shown` exists to prevent, one reply across.
     pub(super) connection_redirect_done: bool,
+    /// The `$EDITOR` handoff a tab asked for, and which tab (MOD-9 D10).
+    ///
+    /// Set by `drain` from an `Action::EditExternally` a tab emitted; taken by the event loop,
+    /// which suspends the terminal, runs the editor and hands the outcome back through
+    /// [`App::finish_external_edit`]. One slot: a second ask before the loop comes round replaces
+    /// the first.
+    pub(super) pending_edit: Option<(TabId, ExternalEdit)>,
 }
 
 impl App {
@@ -223,6 +235,7 @@ impl App {
             replay_tab: None,
             migration_prompt_shown: false,
             connection_redirect_done: false,
+            pending_edit: None,
         }
     }
 
@@ -319,6 +332,15 @@ impl App {
             for action in actions {
                 match action {
                     Action::Store(request) => self.dispatch(origin.clone(), request),
+                    // Stamped like `Store` (MOD-9 D10): the outcome goes back to the tab that
+                    // asked, and nothing but a tab can be handed one.
+                    Action::EditExternally(edit) => match origin {
+                        Origin::Tab(id) => {
+                            self.pending_edit = Some((*id, edit));
+                            self.dirty = true;
+                        }
+                        _ => self.update(Action::Error(EDITOR_NEEDS_A_TAB.to_owned())),
+                    },
                     other => self.update(other),
                 }
             }
@@ -327,6 +349,45 @@ impl App {
             tracing::warn!("emit queue did not settle; dropping the rest");
             let _ = self.emit.take();
         }
+    }
+
+    /// The edit a tab asked for, taken by the event loop (MOD-9 D10).
+    pub fn take_external_edit(&mut self) -> Option<(TabId, ExternalEdit)> {
+        self.pending_edit.take()
+    }
+
+    /// Routes the editor's outcome to the tab that asked, with a [`Ctx`], then drains what it
+    /// emitted, as `on_reply` does. A tab that is no longer registered drops it. Sets `dirty`.
+    pub fn finish_external_edit(&mut self, tab: TabId, outcome: ExternalEditOutcome) {
+        self.dirty = true;
+        let origin = Origin::Tab(tab);
+        {
+            let Self {
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                emit,
+                tabs,
+                ..
+            } = self;
+            let Some(view) = tabs.by_id_mut(tab) else {
+                tracing::debug!(%tab, "the tab that asked for the editor is gone");
+                return;
+            };
+            let mut ctx = Ctx::new(
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                origin.clone(),
+                emit,
+            );
+            view.on_external_edit(outcome, &mut ctx);
+        }
+        self.drain(&origin);
     }
 
     /// A terminal event. Only key presses reach views; a resize just asks for a redraw.

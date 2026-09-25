@@ -14,6 +14,7 @@ pub mod app;
 pub mod catalogue;
 pub mod cli;
 pub mod connection;
+pub mod editor;
 pub mod event_loop;
 pub mod hierarchy;
 pub mod keymap;
