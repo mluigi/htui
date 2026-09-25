@@ -413,6 +413,25 @@ async fn an_ask_runs_the_resolved_tool() {
     }
 }
 
+/// The seeded `gcc` pattern reads the version on distributions whose first line does not end in
+/// it: Fedora and Arch append a date or a vendor note after the version.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_gcc_version_is_read_whatever_follows_it() {
+    for (line, version) in [
+        ("gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0", "13.3.0"),
+        ("gcc (GCC) 14.2.1 20240912 (Red Hat 14.2.1-3)", "14.2.1"),
+        ("gcc (GCC) 15.1.1 20250425", "15.1.1"),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env = env(tmp.path());
+        script(tmp.path(), "gcc", &format!("echo '{line}'"));
+
+        let probe = probe(&env, &seeded()).await;
+        assert_eq!(found(&probe), vec![("gcc", version)], "{line}");
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_hanging_tool_is_bounded_and_absent() {

@@ -10,7 +10,7 @@
     "docker":     {"kind": "path", "names": ["docker"],     "version": {"args": ["--version"], "pattern": "^Docker version ([^,\\s]+)"}},
     "dotnet":     {"kind": "path", "names": ["dotnet"],     "version": {"args": ["--version"], "pattern": "^(\\d+(?:\\.\\d+)+\\S*)$"}},
     "fish":       {"kind": "path", "names": ["fish"],       "version": {"args": ["--version"], "pattern": "^fish, version (\\S+)"}},
-    "gcc":        {"kind": "path", "names": ["gcc"],        "version": {"args": ["--version"], "pattern": "^gcc\\S*\\s.*\\s(\\d+(?:\\.\\d+)+)$"}},
+    "gcc":        {"kind": "path", "names": ["gcc"],        "version": {"args": ["--version"], "pattern": "^gcc\\S*\\s.*\\s(\\d+(?:\\.\\d+)+)"}},
     "git":        {"kind": "path", "names": ["git"],        "version": {"args": ["--version"], "pattern": "^git version (\\S+)"}},
     "git-lfs":    {"kind": "path", "names": ["git-lfs"],    "version": {"args": ["version"], "pattern": "^git-lfs/(\\S+)"}},
     "go":         {"kind": "path", "names": ["go"],         "version": {"args": ["version"], "pattern": "^go version go(\\S+)"}},
