@@ -508,9 +508,13 @@ impl AgentRuntime {
     /// nothing: at most it spawns the registration probe into the box probe slot, whose task
     /// decides whether this box needs one.
     ///
-    /// It refuses nothing by backend kind: the two call sites are the `--demo` guard, because
-    /// `--demo` and the harness never reach a `go_online`. A claim held elsewhere skips the probe
-    /// until the next swap (R-12); nothing was recorded, so the next launch retries.
+    /// It checks no backend kind, and neither call site guards it: the store loop's
+    /// `ConnEvent::Online` arm and its `ApplyMigrations` arm each call it right after a
+    /// `go_online`, and `--demo` and the harness run on [`Backend::Memory`], which never reaches
+    /// one. Opting in is the other half: only the binary turns
+    /// [`with_registration_probe`](Self::with_registration_probe) on. A claim held elsewhere (a
+    /// box probe, a login, an install or a background probe) skips the probe until the next swap
+    /// (R-12); nothing was recorded, so the next launch retries.
     pub fn on_online(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
         if !self.registration_probe {
             return;
@@ -8214,6 +8218,30 @@ done
         assert_eq!(runtime.background_len(), 0, "the finished task was swept");
         runtime.finish_background(Duration::from_secs(10)).await;
         assert!(this_box_record(&store).await.row.last_probed_at.is_some());
+    }
+
+    /// R-12: a claim held elsewhere skips the registration probe until the next swap, and says
+    /// nothing: no box probe starts and no reply is sent.
+    #[tokio::test]
+    async fn a_held_claim_skips_the_registration_probe_without_a_reply() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        runtime
+            .background
+            .push(tokio::spawn(std::future::pending::<()>()));
+        runtime.on_online(&backend, &tx);
+
+        assert!(!runtime.box_probe_running());
+        assert_eq!(runtime.background_len(), 1, "the held task is still there");
+        assert!(sent(&mut rx).is_empty(), "a skipped probe says nothing");
+        for task in std::mem::take(&mut runtime.background) {
+            task.abort();
+        }
+        assert_eq!(this_box_record(&store).await.row.last_probed_at, None);
     }
 
     /// Plan D11 and the `connection.rs` shape: a runtime that did not opt in never probes.
