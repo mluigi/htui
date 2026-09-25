@@ -45,8 +45,9 @@ use crate::store::traits::{
     failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     graph_not_in_project, invalid_prefix, item_has_a_live_run, item_kind_is_held,
     item_not_in_project, legal_move, not_a_fanout_candidate, not_a_terminal_status,
-    references_no_row, reserved_phase_name, row_names_another_step, run_is_terminal,
-    step_is_not_promotable, step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
+    prompt_template_key, prompt_template_refusal, references_no_row, reserved_phase_name,
+    row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
+    summary_names_another_item, winner_is_not_settled,
 };
 use uuid::Uuid;
 
@@ -103,7 +104,8 @@ struct State {
     graphs: HashMap<StepGraphId, StepGraph>,
     /// `step_graph_phase`, read by [`WriteStore::phases`] since MOD-15 (plan D1).
     phases: Vec<StepGraphPhase>,
-    /// `prompt_template`, read by the inherent [`MemStore::prompt_templates`] (MOD-2 plan D102).
+    /// `prompt_template`, read by the inherent [`MemStore::prompt_templates`] (MOD-2 plan D102) and
+    /// appended to only by [`WriteStore::append_prompt_template`] and the project seed (MOD-9 D1).
     templates: Vec<PromptTemplate>,
     /// `skill`, read by the inherent [`MemStore::bound_skills`] (MOD-2 plan D105).
     skills: HashMap<SkillId, Skill>,
@@ -2624,6 +2626,62 @@ impl State {
         rows
     }
 
+    /// MOD-9 D1/D4/D18: the head of `(project, name)` is the token; token, then input, then keys.
+    fn append_prompt_template(
+        &mut self,
+        new: NewPromptTemplate,
+        expected: Option<i32>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<PromptTemplate>> {
+        let head = self
+            .templates
+            .iter()
+            .filter(|row| row.project_id == new.project_id && row.name == new.name)
+            .max_by_key(|row| row.version)
+            .cloned();
+        match (head, expected) {
+            (Some(head), _) if Some(head.version) != expected => {
+                return Ok(CasOutcome::Stale(head));
+            }
+            (None, Some(_)) => {
+                return Err(StoreError::NotFound {
+                    entity: "prompt_template",
+                    id: prompt_template_key(new.project_id, &new.name),
+                });
+            }
+            _ => {}
+        }
+        if let Some(refusal) = prompt_template_refusal(&new.name, &new.body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.require_user(new.created_by, "prompt_template.created_by")?;
+        if !self.projects.contains_key(&new.project_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "prompt_template.project_id",
+                new.project_id,
+                "project",
+            )));
+        }
+        if self.templates.iter().any(|row| row.id == new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "prompt_template",
+                new.id,
+            )));
+        }
+        let row = PromptTemplate {
+            id: new.id,
+            project_id: new.project_id,
+            name: new.name,
+            version: expected.unwrap_or(0) + 1,
+            body: new.body,
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        self.templates.push(row.clone());
+        Ok(CasOutcome::Applied(row))
+    }
+
     /// The value one rung currently holds for a key, for [`validate`]'s `not_above` peer.
     fn setting_value(&self, rung: SettingRung, key: SettingKey) -> Option<Value> {
         self.stored_setting(rung, key).and_then(|row| row.value)
@@ -4662,8 +4720,8 @@ impl WriteStore for MemStore {
         new: NewPromptTemplate,
         expected: Option<i32>,
     ) -> Result<CasOutcome<PromptTemplate>> {
-        let _ = (new, expected);
-        todo!("MOD-9 T1: append_prompt_template on MemStore")
+        let now = Utc::now();
+        self.write(|state| state.append_prompt_template(new, expected, now))
     }
 
     async fn set_setting(
