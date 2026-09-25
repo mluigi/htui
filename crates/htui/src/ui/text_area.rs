@@ -1,6 +1,9 @@
 //! A small multi-line editor (MOD-9 D7; PRD D2): insert, delete, newline, arrows, Home/End,
 //! PgUp/PgDn and a byte-offset cursor, so a `parse` error lands on its byte. No wrap, undo,
-//! selection or paste (PRD risk row 5). Width in `char`s, as `TextField` (no `unicode-width`).
+//! selection or paste (PRD risk row 5). Width in `char`s, as `TextField` (no `unicode-width`),
+//! except that a `\t` draws as spaces to the next tab stop (every four columns) and any other
+//! control char as a one-column stand-in: `ratatui` drops control chars when it draws, and a body
+//! from `$EDITOR` can hold them.
 //!
 //! The viewport (`top`, `left`) lives in `Cell`s (D19): [`TextArea::lines`] scrolls it to keep the
 //! cursor in view and remembers where it left it, and it does so through `&self`, because a tab
@@ -13,7 +16,8 @@ use ratatui::text::{Line, Span};
 
 use crate::ui::Theme;
 
-/// Columns between tab stops.
+/// Columns between tab stops, for a `\t` that came back from `$EDITOR` (typing one is out of scope,
+/// PRD risk row 5).
 const TAB_STOP: usize = 4;
 
 /// What one key did.
@@ -175,8 +179,9 @@ impl TextArea {
         AreaOutcome::Consumed
     }
 
-    /// At most `height` lines, each the `width`-char window of its line that keeps the cursor in
-    /// view, for the caller to place in its own `Rect`.
+    /// At most `height` lines, each the `width`-column window of its line that keeps the cursor in
+    /// view, for the caller to place in its own `Rect`. A line is drawn with its tabs as spaces and
+    /// its other control chars as one-column stand-ins.
     ///
     /// The viewport moves only as far as it must to show the cursor, and is remembered (D19), so a
     /// cursor moving inside the window does not scroll it. Every line is `theme.base`; while
@@ -194,7 +199,10 @@ impl TextArea {
         if width == 0 || height == 0 {
             return Vec::new();
         }
-        let (line, col) = self.cursor_line_col();
+        let (line, _) = self.cursor_line_col();
+        // The drawn column, not the char column: the viewport and the highlight both count a tab
+        // as the cells it draws as.
+        let col = drawn(&self.text[line_start(&self.text, self.cursor)..self.cursor]).count();
         let top = follow(self.top.get(), line, height);
         let left = follow(self.left.get(), col, width);
         self.top.set(top);
@@ -206,7 +214,7 @@ impl TextArea {
             .skip(top)
             .take(height)
             .map(|(index, text)| {
-                let mut chars = text.chars().skip(left);
+                let mut chars = drawn(text).skip(left);
                 if !(focused && index == line) {
                     let window: String = chars.take(width).collect();
                     return Line::from(Span::styled(window, theme.base));
@@ -291,6 +299,28 @@ fn line_end(text: &str, at: usize) -> usize {
     text[at..]
         .find('\n')
         .map_or(text.len(), |newline| at + newline)
+}
+
+/// `line` as drawn, one char per column: a `\t` is spaces to the next [`TAB_STOP`], any other
+/// control char its stand-in (a Control Pictures glyph for C0 and `DEL`, `U+FFFD` for C1). A
+/// prefix of a line draws as a prefix of its cells, so the cursor's column is the count of the
+/// text before it.
+fn drawn(line: &str) -> impl Iterator<Item = char> + '_ {
+    let mut col = 0;
+    line.chars().flat_map(move |c| {
+        let (cell, count) = match c {
+            '\t' => (' ', TAB_STOP - col % TAB_STOP),
+            '\0'..='\u{1f}' => (
+                char::from_u32(0x2400 + u32::from(c)).unwrap_or('\u{fffd}'),
+                1,
+            ),
+            '\u{7f}' => ('\u{2421}', 1),
+            c if c.is_control() => ('\u{fffd}', 1),
+            c => (c, 1),
+        };
+        col += count;
+        core::iter::repeat_n(cell, count)
+    })
 }
 
 /// The first visible index of a `span`-wide window that was at `first` and must now show `at`.
