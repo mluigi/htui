@@ -10,7 +10,9 @@ use htui_store::testkit as common;
 use std::time::Duration;
 
 use htui_core::store::StoreError;
-use htui_store::connect::{ConnEvent, StartOptions, Started, refresh_settings, start, try_connect};
+use htui_store::connect::{
+    ConnEvent, StartOptions, Started, persist_registration, refresh_settings, start, try_connect,
+};
 use htui_store::pg::CONNECT_TIMEOUT;
 use htui_store::{Backend, MigrationState, map_sqlx};
 
@@ -178,6 +180,84 @@ async fn a_copied_box_toml_is_rewritten_to_the_minted_id() {
     assert_eq!(after, before, "the other machine's row is untouched");
 
     store.pool().close().await;
+    db.drop_db().await;
+}
+
+/// MOD-7 D3 over the other bootstrap: a store that connected to a pending schema registers only
+/// when `apply_migrations` runs, and `persist_registration` is what writes a minted id back then.
+///
+/// This is the store worker's `ApplyMigrations` path (MOD-7 T4), which never passes through
+/// `try_connect`. The planted row is the one [`a_copied_box_toml_is_rewritten_to_the_minted_id`]
+/// plants, with the same early return on a machine with no readable identity.
+#[tokio::test]
+async fn apply_migrations_then_persist_writes_a_minted_id_back() {
+    if htui_store::identity::machine_fingerprint().await.is_none() {
+        return;
+    }
+    let Some(mut db) = common::bare_db().await else {
+        return;
+    };
+    assert_eq!(
+        db.migrations_at_connect,
+        MigrationState::Pending(5),
+        "the store was handed back before any registration"
+    );
+
+    // The schema and the single `app_user` exist before this store registers, so the other
+    // machine's row can be planted under the `box.toml` id first.
+    htui_store::MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("apply the schema under the store");
+    db.store.seed_if_empty().await.expect("seed the app_user");
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version, \
+                          machine_fingerprint) \
+         VALUES ($1, (SELECT id FROM app_user ORDER BY created_at, id LIMIT 1), 'elsewhere', \
+                 'linux', '', 'x86_64', '0.0.0', repeat('a', 64))",
+    )
+    .bind(db.identity.box_id.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant the other machine's row under the box.toml id");
+    let before: String = sqlx::query_scalar("SELECT row_to_json(box)::text FROM box WHERE id = $1")
+        .bind(db.identity.box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the planted row");
+
+    db.store
+        .apply_migrations()
+        .await
+        .expect("apply_migrations bootstraps");
+    assert_ne!(
+        db.store.this_box(),
+        db.identity.box_id,
+        "registration minted a new id for the copied box.toml"
+    );
+    assert_eq!(
+        htui_store::identity::load_or_mint(&db.config_root)
+            .expect("re-read box.toml")
+            .box_id,
+        db.identity.box_id,
+        "apply_migrations does no file I/O of its own"
+    );
+
+    persist_registration(&db.config_root, &db.identity, &db.store).expect("persist");
+
+    let rewritten = htui_store::identity::load_or_mint(&db.config_root).expect("re-read box.toml");
+    assert_eq!(
+        rewritten.box_id,
+        db.store.this_box(),
+        "box.toml holds the id this machine was minted"
+    );
+    let after: String = sqlx::query_scalar("SELECT row_to_json(box)::text FROM box WHERE id = $1")
+        .bind(db.identity.box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("re-read the planted row");
+    assert_eq!(after, before, "the other machine's row is untouched");
+
     db.drop_db().await;
 }
 
