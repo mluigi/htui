@@ -64,7 +64,11 @@ async fn start_opens_the_mirror_offline_and_reports_online_over_a_migrated_datab
 
     match next_event(&mut started, "a migrated database").await {
         ConnEvent::Online(pg) => {
-            assert_eq!(pg.identity().box_id, pg.this_box(), "the id is adopted");
+            assert_eq!(
+                pg.identity().box_id,
+                pg.this_box(),
+                "the store carries the id registration answered"
+            );
             let settings = refresh_settings(&pg, started.settings).await;
             assert_eq!(
                 settings.interval,
