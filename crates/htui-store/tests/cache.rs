@@ -18,8 +18,8 @@ use htui_store::testkit as common;
 use chrono::{SubsecRound as _, TimeDelta, Utc};
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
-    DocumentId, EventKind, EventRole, ItemFilter, LinkGraph, NewDocument, ProjectId, PromptScope,
-    Resolution, RunId, Scope, SessionEvent, Status, StepId, UserId, WorkspaceSummary,
+    CitationKind, DocumentId, EventKind, EventRole, ItemFilter, LinkGraph, NewDocument, ProjectId,
+    PromptScope, Resolution, RunId, Scope, SessionEvent, Status, StepId, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
@@ -166,6 +166,9 @@ async fn a_pass_mirrors_the_demo_projects() {
         "run_step",
         "run_step_commit",
         "session_event",
+        "requirement_spec",
+        "requirement_area",
+        "requirement",
     ] {
         assert_eq!(
             mirror_count(cache.pool(), table).await,
@@ -190,8 +193,21 @@ async fn a_pass_mirrors_the_demo_projects() {
         live_links,
         "a tombstone is a deletion in the mirror, not a row"
     );
+    let live_citations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_requirement WHERE deleted_at IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count live citations");
+    assert_eq!(
+        mirror_count(cache.pool(), "item_requirement").await,
+        live_citations,
+        "a tombstoned citation is a deletion in the mirror too (MOD-38 plan D12)"
+    );
 
-    assert_eq!(report.tombstones, 1, "the fixture has one tombstoned link");
+    assert_eq!(
+        report.tombstones, 2,
+        "the fixture has one tombstoned link and one tombstoned citation"
+    );
     assert_eq!(
         report.rows("agent"),
         3,
@@ -1442,6 +1458,167 @@ async fn a_closed_item_mirrors_its_resolution() {
         raw.as_deref(),
         Some("withdrawn"),
         "stored as its Postgres text"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-38 T9 (blueprint §6.3): an `uncite` is a tombstone on Postgres and a deletion in the
+/// mirror, as `item_link`'s is (plan D12).
+///
+/// The tombstone is written in SQL, the way [`a_tombstoned_link_disappears_from_the_mirror`]
+/// writes its own: what is under test is the refresh arm, not `PgStore::uncite`, and the
+/// `BEFORE UPDATE` trigger bumps `updated_at` either way.
+#[tokio::test]
+async fn the_mirror_drops_a_tombstoned_citation() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let settings = settings(&db, 20);
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the first pass");
+    assert_eq!(
+        cache
+            .item_requirements(ids::HTUI_FIX_1)
+            .await
+            .expect("item_requirements")
+            .iter()
+            .map(|row| (row.requirement.id, row.kind))
+            .collect::<Vec<_>>(),
+        vec![(ids::REQ_STO_1, CitationKind::Addresses)],
+        "the live citation is mirrored first",
+    );
+
+    sqlx::query(
+        "UPDATE item_requirement SET deleted_at = now() \
+          WHERE item_id = $1 AND requirement_id = $2 AND kind = 'addresses'",
+    )
+    .bind(ids::HTUI_FIX_1.as_uuid())
+    .bind(ids::REQ_STO_1.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("tombstone the citation");
+
+    let report = run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the pass that sees the tombstone");
+    assert!(report.tombstones >= 1);
+
+    assert_eq!(
+        cache
+            .item_requirements(ids::HTUI_FIX_1)
+            .await
+            .expect("item_requirements"),
+        Vec::new(),
+        "the tombstoned citation is gone from the item's reads",
+    );
+    assert!(
+        !cache
+            .requirement_coverage(ids::REQ_STO_1)
+            .await
+            .expect("requirement_coverage")
+            .iter()
+            .any(|row| row.item.id == ids::HTUI_FIX_1),
+        "and from the requirement's coverage",
+    );
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_requirement WHERE item_id = ? AND requirement_id = ?",
+    )
+    .bind(ids::HTUI_FIX_1.to_string())
+    .bind(ids::REQ_STO_1.to_string())
+    .fetch_one(cache.pool())
+    .await
+    .expect("count the mirrored row");
+    assert_eq!(remaining, 0, "the row itself is deleted, not flagged");
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-38 T9 (blueprint §6.3): plan D11's `suspect` is computed on the mirror's read, so a newer
+/// requirement version that reaches the mirror makes an unchanged citation suspect offline, and a
+/// re-stamped citation clears it again.
+///
+/// The amend and the re-stamp are written in SQL: the two refresh arms under test are
+/// `requirement`'s and `item_requirement`'s, and both ride the `updated_at` the trigger bumps.
+#[tokio::test]
+async fn a_suspect_citation_reads_offline() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    let settings = settings(&db, 20);
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the first pass");
+    let before = cache
+        .item_requirements(ids::HTUI_FEAT_1)
+        .await
+        .expect("item_requirements");
+    assert_eq!(
+        before
+            .iter()
+            .map(|row| (row.requirement.id, row.requirement_version, row.suspect))
+            .collect::<Vec<_>>(),
+        vec![(ids::REQ_STO_1, 1, false)],
+        "FEAT-1 cites R-STO-1 at its current version",
+    );
+
+    sqlx::query("UPDATE requirement SET version = version + 1, body = $2 WHERE id = $1")
+        .bind(ids::REQ_STO_1.as_uuid())
+        .bind("Postgres is the source of truth; the cache mirrors it.")
+        .execute(&db.pool)
+        .await
+        .expect("amend R-STO-1 on Postgres");
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the pass that sees the amend");
+
+    let after = cache
+        .item_requirements(ids::HTUI_FEAT_1)
+        .await
+        .expect("item_requirements");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].requirement.version, 2, "the requirement moved on");
+    assert_eq!(after[0].requirement_version, 1, "the stamp did not");
+    assert!(after[0].suspect, "so the citation is suspect offline");
+    assert!(
+        cache
+            .requirement_coverage(ids::REQ_STO_1)
+            .await
+            .expect("requirement_coverage")
+            .iter()
+            .all(|row| row.suspect),
+        "every citation of R-STO-1 is stamped at v1, so coverage is all suspect",
+    );
+
+    sqlx::query(
+        "UPDATE item_requirement SET requirement_version = 2 \
+          WHERE item_id = $1 AND requirement_id = $2 AND kind = 'addresses'",
+    )
+    .bind(ids::HTUI_FEAT_1.as_uuid())
+    .bind(ids::REQ_STO_1.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("re-stamp the citation on Postgres");
+    run_pass(&db.pool, &cache, &all_projects(), &settings)
+        .await
+        .expect("the pass that sees the re-stamp");
+
+    let reconfirmed = cache
+        .item_requirements(ids::HTUI_FEAT_1)
+        .await
+        .expect("item_requirements");
+    assert_eq!(
+        reconfirmed
+            .iter()
+            .map(|row| (row.requirement_version, row.suspect))
+            .collect::<Vec<_>>(),
+        vec![(2, false)],
+        "a re-stamped citation is not suspect",
     );
 
     teardown(db, &[&cache]).await;
