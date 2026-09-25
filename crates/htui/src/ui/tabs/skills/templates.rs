@@ -1023,6 +1023,72 @@ mod tests {
             .unwrap_or_else(|err| panic!("the template request failed: {err}"))
     }
 
+    /// The requests `emit` holds, drained.
+    fn sent(emit: &Emit) -> Vec<StoreRequest> {
+        emit.take()
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Store(request) => Some(request),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `Ctrl+S` on a body `parse` refuses dispatches nothing: the store would refuse it too, so
+    /// only a count of the requests tells the local refusal from a sent-and-refused save.
+    #[tokio::test]
+    async fn a_refused_save_dispatches_no_request() {
+        let backend = Backend::memory(MemStore::demo());
+        let scope = vulkan();
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::default_global(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let mut ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        let mut view = TemplatesView::default();
+        let read = serve(&backend, StoreRequest::Templates(scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        for _ in 0..3 {
+            view.on_key(
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+                &mut ctx,
+            );
+        }
+        view.on_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut ctx,
+        );
+        for c in "{{itme}}".chars() {
+            view.on_key(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut ctx,
+            );
+        }
+        assert!(sent(&emit).is_empty(), "typing sends nothing");
+        view.on_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut ctx,
+        );
+        let requests = sent(&emit);
+        assert!(requests.is_empty(), "the refused save sent {requests:?}");
+        assert_eq!(view.busy, None);
+        assert!(
+            matches!(&view.notice, Some(Notice::Error(text)) if text.starts_with("unknown prompt placeholder")),
+            "{:?}",
+            view.notice
+        );
+    }
+
     /// D27 (F-J): a `Templates` read served while a save is in flight — `Tab` away and back, `2`,
     /// or `r` — must not be taken for the save's answer. `settle` serves in queue order, save
     /// first, so only a direct drive can put a read's reply ahead of the save's.

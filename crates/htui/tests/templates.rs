@@ -350,13 +350,168 @@ async fn a_refused_save_sends_no_request() {
         Some(1)
     );
     let frame = harness.render();
+    // The store runs the same `parse` behind its compare-and-set, so the head alone cannot tell
+    // "nothing was sent" from "sent and refused": a sent save would come back as a `Failed` whose
+    // message is `StoreError::Constraint`'s "constraint violated: …", and would leave the cursor
+    // where the typing left it (L1:C9). Only the local refusal starts with the parse error and
+    // moves the cursor to the `{{`.
     assert!(
-        notice(&frame).contains("unknown prompt placeholder"),
+        notice(&frame).starts_with("unknown prompt placeholder `{{itme}}` at byte 0"),
         "the parse error, not a store failure: {frame}"
     );
     assert!(
+        !notice(&frame).contains("constraint violated"),
+        "no `Failed` reply landed: {frame}"
+    );
+    assert!(
+        hint(&frame).ends_with("Ctrl+S save  Ctrl+E $EDITOR  Esc cancel  L1:C1"),
+        "the editor is still open, the cursor on the `{{`: {frame}"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_role_placeholder_puts_the_cursor_on_its_braces() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "implement");
+    harness.key("e");
+    harness.key("down");
+    harness.key("down");
+    type_text(&mut harness, "{{candidates}}");
+    assert!(hint(&harness.render()).ends_with("L3:C15"), "after typing");
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        notice(&frame).starts_with("placeholder `{{candidates}}` is not available to a Phase"),
+        "{frame}"
+    );
+    assert!(
+        hint(&frame).ends_with("L3:C1"),
+        "the cursor is on the `{{`: {frame}"
+    );
+    assert_eq!(
+        head(&store, "implement").await.map(|row| row.version),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn an_unterminated_opener_puts_the_cursor_on_its_braces() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "implement");
+    harness.key("e");
+    // Line 2 is empty, so nothing after the opener on its line closes it.
+    harness.key("down");
+    type_text(&mut harness, "{{item");
+    assert!(hint(&harness.render()).ends_with("L2:C7"), "after typing");
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        notice(&frame).starts_with("unterminated `{{` at byte"),
+        "{frame}"
+    );
+    assert!(
+        hint(&frame).ends_with("L2:C1"),
+        "the cursor is on the `{{`: {frame}"
+    );
+    assert_eq!(
+        head(&store, "implement").await.map(|row| row.version),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn keys_typed_while_a_save_is_in_flight_are_kept() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "implement");
+    harness.key("e");
+    type_text(&mut harness, "A");
+    harness.key("ctrl-s");
+    // The save is queued, not served: these keys land while it is in flight.
+    type_text(&mut harness, "B");
+    harness.settle().await;
+    let default = body_of("implement").expect("a default");
+    assert_eq!(
+        head(&store, "implement").await.map(|row| row.body),
+        Some(format!("A{default}")),
+        "v2 is the body that was sent"
+    );
+    let frame = harness.render();
+    assert!(
+        frame.contains("ABYou are running"),
+        "the later edit is kept: {frame}"
+    );
+    assert!(
         hint(&frame).contains("Ctrl+S save"),
-        "the editor is still open"
+        "the editor stays open: {frame}"
+    );
+    assert!(
+        notice(&frame).contains("saved v2") && notice(&frame).contains("Ctrl+S saves them as v3"),
+        "{frame}"
+    );
+    assert!(frame.contains("saves v3"), "the token moved to v2: {frame}");
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let row = head(&store, "implement").await.expect("a head");
+    assert_eq!((row.version, row.body), (3, format!("AB{default}")));
+    let frame = harness.render();
+    assert!(notice(&frame).contains("saved v3"), "{frame}");
+    assert!(
+        !hint(&frame).contains("Ctrl+S save"),
+        "back in Browse: {frame}"
+    );
+}
+
+#[tokio::test]
+async fn another_session_s_version_is_not_taken_for_the_save() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "implement");
+    harness.key("e");
+    type_text(&mut harness, "MINE ");
+    // `Tab` away and `2` back queues a `Templates` read ahead of the save.
+    harness.key("tab");
+    harness.key("2");
+    harness.key("ctrl-s");
+    // Another session appends v2 before either request is served.
+    let elsewhere = store
+        .append_prompt_template(
+            NewPromptTemplate {
+                id: PromptTemplateId::new(),
+                project_id: ids::PROJECT_VULKAN,
+                name: "implement".to_owned(),
+                body: "saved elsewhere {{item}}\n".to_owned(),
+                created_by: ids::USER,
+            },
+            Some(1),
+        )
+        .await
+        .expect("the direct write");
+    assert!(matches!(elsewhere, CasOutcome::Applied(ref row) if row.version == 2));
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !notice(&frame).contains("saved v2"),
+        "the other session's v2 is not our save: {frame}"
+    );
+    assert!(
+        notice(&frame)
+            .contains("v2 is now the latest; your draft is kept and Ctrl+S saves it as v3"),
+        "the save's own stale reply landed: {frame}"
+    );
+    assert!(
+        frame.contains("MINE You are running"),
+        "the draft is kept: {frame}"
+    );
+    assert!(frame.contains("saves v3"), "{frame}");
+    assert_eq!(
+        head(&store, "implement").await.map(|row| row.body),
+        Some("saved elsewhere {{item}}\n".to_owned()),
+        "the stale save wrote nothing"
     );
 }
 
@@ -470,6 +625,29 @@ async fn an_edited_external_result_opens_the_editor_validated() {
         head(&store, "implement").await.map(|row| row.version),
         Some(1),
         "validated, not sent"
+    );
+
+    // A body the store would accept: only the view's not sending it keeps the head at v1.
+    harness.key("esc");
+    harness.key("esc");
+    select(&mut harness, "implement");
+    harness.key("E");
+    assert!(harness.app().take_external_edit().is_some());
+    harness.app().finish_external_edit(
+        SkillsTab::ID,
+        ExternalEditOutcome::Edited("x {{item}}\n".to_owned()),
+    );
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(notice(&frame).contains("edited in $EDITOR"), "{frame}");
+    assert!(
+        hint(&frame).contains("Ctrl+S save"),
+        "the editor is open on it: {frame}"
+    );
+    assert_eq!(
+        head(&store, "implement").await.map(|row| row.version),
+        Some(1),
+        "an accepted body is validated, not sent"
     );
 }
 
