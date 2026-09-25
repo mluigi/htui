@@ -29,14 +29,15 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, CoverageRow, Document, DocumentHead,
-    DocumentId, EventKind, EventRole, GateOutcome, Isolation, Item, ItemCitation, ItemFilter,
-    ItemId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, Note, NoteId, OsFamily, Project,
-    ProjectId, ProjectRef, PromptScope, RepoId, Requirement, RequirementArea, RequirementFilter,
-    RequirementId, RequirementRevision, RequirementSpec, Resolution, ResolvedInput, Run, RunId,
-    RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
-    Scope, SessionEvent, Status, StepGraphId, StepId, StepStatus, Transport, UpstreamEntry, UserId,
-    VerifyOutcome, WorkspaceId, WorkspaceSummary,
+    Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, CitationKind, CoverageRow, Document,
+    DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Isolation, Item, ItemCitation,
+    ItemFilter, ItemId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, Note, NoteId,
+    OsFamily, Priority, Project, ProjectId, ProjectRef, PromptScope, RepoId, Requirement,
+    RequirementArea, RequirementFilter, RequirementId, RequirementRevision, RequirementSpec,
+    RequirementState, Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
+    StepGraphId, StepId, StepStatus, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceId,
+    WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -214,6 +215,31 @@ fn document_of(row: &SqliteRow) -> Result<Document> {
         )?,
         created_by: uuid_col::<UserId>("document.created_by", &text(row, "created_by")?)?,
         created_at: ts_col("document.created_at", get(row, "created_at")?)?,
+    })
+}
+
+/// Every `requirement` column, aliased `r`, in [`requirement_of`]'s names: shared by the three
+/// reads that build a [`Requirement`] so a column added to one cannot be missed by another.
+const REQUIREMENT_SELECT: &str = "r.id, r.project_id, r.area_id, r.area_code, r.number, r.key, \
+     r.body, r.rationale, r.priority, r.state, r.version, r.created_by, r.created_at, r.updated_at";
+
+/// One `requirement` row (MOD-38), every column of `cache_migrations/0004_requirements.sql`.
+fn requirement_of(row: &SqliteRow) -> Result<Requirement> {
+    Ok(Requirement {
+        id: uuid_col("requirement.id", &text(row, "id")?)?,
+        project_id: uuid_col("requirement.project_id", &text(row, "project_id")?)?,
+        area_id: uuid_col("requirement.area_id", &text(row, "area_id")?)?,
+        area_code: text(row, "area_code")?,
+        number: get(row, "number")?,
+        key: text(row, "key")?,
+        body: text(row, "body")?,
+        rationale: text(row, "rationale")?,
+        priority: get::<Priority>(row, "priority")?,
+        state: get::<RequirementState>(row, "state")?,
+        version: get(row, "version")?,
+        created_by: uuid_col::<UserId>("requirement.created_by", &text(row, "created_by")?)?,
+        created_at: ts_col("requirement.created_at", get(row, "created_at")?)?,
+        updated_at: ts_col("requirement.updated_at", get(row, "updated_at")?)?,
     })
 }
 
@@ -1034,41 +1060,189 @@ impl ReadStore for CacheStore {
             .collect())
     }
 
-    // ---- ANA-11 §5.1 (MOD-38): stubs until T9 makes them real ----
+    // ---- ANA-11 §5.1: requirements (MOD-38) ----------------------------------------------------
+    //
+    // Four of the six tables are mirrored (`cache_migrations/0004_requirements.sql`, plan D12), so
+    // six of the seven reads answer off the mirror and `requirement_revisions` says "not cached".
+    // `item_requirement` holds live rows only (the file's rule 3), and `suspect` is plan D11's
+    // comparison, made here on read exactly as Postgres makes it. Every `ORDER BY` over text is
+    // byte order, which is SQLite's default `BINARY` collation and the seam's contract.
 
-    async fn requirement_spec(&self, _project: ProjectId) -> Result<Option<RequirementSpec>> {
-        unimplemented!("MOD-38 T9")
+    async fn requirement_spec(&self, project: ProjectId) -> Result<Option<RequirementSpec>> {
+        let row = sqlx::query(
+            "SELECT project_id, owner_id, preamble, version, updated_at \
+               FROM requirement_spec WHERE project_id = ?",
+        )
+        .bind(project.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let Some(row) = row else { return Ok(None) };
+        Ok(Some(RequirementSpec {
+            project_id: uuid_col("requirement_spec.project_id", &text(&row, "project_id")?)?,
+            owner_id: uuid_col::<UserId>("requirement_spec.owner_id", &text(&row, "owner_id")?)?,
+            preamble: text(&row, "preamble")?,
+            version: get(&row, "version")?,
+            updated_at: ts_col("requirement_spec.updated_at", get(&row, "updated_at")?)?,
+        }))
     }
 
-    async fn requirement_areas(&self, _project: ProjectId) -> Result<Vec<RequirementArea>> {
-        unimplemented!("MOD-38 T9")
+    async fn requirement_areas(&self, project: ProjectId) -> Result<Vec<RequirementArea>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, code, title, description, position, updated_at \
+               FROM requirement_area WHERE project_id = ? ORDER BY position, code",
+        )
+        .bind(project.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| {
+                Ok(RequirementArea {
+                    id: uuid_col("requirement_area.id", &text(row, "id")?)?,
+                    project_id: uuid_col("requirement_area.project_id", &text(row, "project_id")?)?,
+                    code: text(row, "code")?,
+                    title: text(row, "title")?,
+                    description: text(row, "description")?,
+                    position: get(row, "position")?,
+                    updated_at: ts_col("requirement_area.updated_at", get(row, "updated_at")?)?,
+                })
+            })
+            .collect()
     }
 
     async fn requirements(
         &self,
-        _project: ProjectId,
-        _filter: &RequirementFilter,
+        project: ProjectId,
+        filter: &RequirementFilter,
     ) -> Result<Vec<Requirement>> {
-        unimplemented!("MOD-38 T9")
+        let mut sql =
+            format!("SELECT {REQUIREMENT_SELECT} FROM requirement r WHERE r.project_id = ?");
+        // Plan D14: every field is a conjunct and `None` does not filter; an empty list is
+        // `IN (NULL)`, which matches nothing, as `items` reads it.
+        if let Some(codes) = &filter.area_codes {
+            sql.push_str(" AND r.area_code IN (");
+            sql.push_str(&placeholders(codes.len()));
+            sql.push(')');
+        }
+        if let Some(states) = &filter.states {
+            sql.push_str(" AND r.state IN (");
+            sql.push_str(&placeholders(states.len()));
+            sql.push(')');
+        }
+        if let Some(priorities) = &filter.priorities {
+            sql.push_str(" AND r.priority IN (");
+            sql.push_str(&placeholders(priorities.len()));
+            sql.push(')');
+        }
+        if filter.text.is_some() {
+            // `items`' case-insensitive literal substring, over the key and the body.
+            sql.push_str(
+                " AND (instr(lower(r.key), lower(?)) > 0 OR instr(lower(r.body), lower(?)) > 0)",
+            );
+        }
+        sql.push_str(" ORDER BY r.area_code, r.number");
+
+        let mut query = sqlx::query(AssertSqlSafe(sql)).bind(project.to_string());
+        if let Some(codes) = &filter.area_codes {
+            for code in codes {
+                query = query.bind(code.clone());
+            }
+        }
+        if let Some(states) = &filter.states {
+            for state in states {
+                query = query.bind(state.as_str());
+            }
+        }
+        if let Some(priorities) = &filter.priorities {
+            for priority in priorities {
+                query = query.bind(priority.as_str());
+            }
+        }
+        if let Some(needle) = &filter.text {
+            query = query.bind(needle.clone()).bind(needle.clone());
+        }
+
+        let rows = query.fetch_all(&self.pool).await.map_err(map_sqlx)?;
+        rows.iter().map(requirement_of).collect()
     }
 
-    async fn requirement(&self, _id: RequirementId) -> Result<Option<Requirement>> {
-        unimplemented!("MOD-38 T9")
+    async fn requirement(&self, id: RequirementId) -> Result<Option<Requirement>> {
+        let row = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {REQUIREMENT_SELECT} FROM requirement r WHERE r.id = ?"
+        )))
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.as_ref().map(requirement_of).transpose()
     }
 
+    /// Always `None`: `requirement_revision` is not mirrored (plan D12), and `None` is the seam's
+    /// "not cached", as [`step_events`](ReadStore::step_events) answers for an uncached step.
     async fn requirement_revisions(
         &self,
         _id: RequirementId,
     ) -> Result<Option<Vec<RequirementRevision>>> {
-        unimplemented!("MOD-38 T9")
+        Ok(None)
     }
 
-    async fn item_requirements(&self, _item: ItemId) -> Result<Vec<ItemCitation>> {
-        unimplemented!("MOD-38 T9")
+    async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {REQUIREMENT_SELECT}, ir.kind, ir.requirement_version, \
+                    ir.proposed_by_step_id, (r.version > ir.requirement_version) AS suspect \
+               FROM item_requirement ir \
+               JOIN requirement r ON r.id = ir.requirement_id \
+              WHERE ir.item_id = ? \
+              ORDER BY r.area_code, r.number, ir.kind"
+        )))
+        .bind(item.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| {
+                Ok(ItemCitation {
+                    requirement: requirement_of(row)?,
+                    kind: get::<CitationKind>(row, "kind")?,
+                    requirement_version: get(row, "requirement_version")?,
+                    proposed_by_step_id: opt_uuid_col::<StepId>(
+                        "item_requirement.proposed_by_step_id",
+                        opt_text(row, "proposed_by_step_id")?.as_deref(),
+                    )?,
+                    suspect: bool_col(get::<i64>(row, "suspect")?),
+                })
+            })
+            .collect()
     }
 
-    async fn requirement_coverage(&self, _requirement: RequirementId) -> Result<Vec<CoverageRow>> {
-        unimplemented!("MOD-38 T9")
+    async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {
+        let rows = sqlx::query(
+            "SELECT i.id, i.project_id, i.kind_id, i.key, i.key_prefix, i.key_number, i.title, \
+                    i.status, i.priority, i.required_tags, i.updated_at, i.touched_paths, \
+                    i.resolution, ir.kind, ir.requirement_version, \
+                    (r.version > ir.requirement_version) AS suspect \
+               FROM item_requirement ir \
+               JOIN item i        ON i.id = ir.item_id \
+               JOIN requirement r ON r.id = ir.requirement_id \
+              WHERE ir.requirement_id = ? \
+              ORDER BY i.key_prefix, i.key_number, i.id, ir.kind",
+        )
+        .bind(requirement.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| {
+                Ok(CoverageRow {
+                    item: item_summary_of(row)?,
+                    kind: get::<CitationKind>(row, "kind")?,
+                    resolution: get::<Option<Resolution>>(row, "resolution")?,
+                    requirement_version: get(row, "requirement_version")?,
+                    suspect: bool_col(get::<i64>(row, "suspect")?),
+                })
+            })
+            .collect()
     }
 }
 
