@@ -18,13 +18,15 @@
 requirements get dedicated tables with suspect-aware item citations; a decision is a closed item with
 a new `item.resolution` and its `summary` document. Spawned MOD-38 (schema, blocked on the
 maintainer applying `docs/ANA-11.md` §7) and MOD-39 (TUI).
+Before it, **ANA-16 was done** (2026-09-24, `docs/decisions/ana/ana-16.md`): remote and container
+execution is a headless `htui worker` per box on Postgres first (MOD-40..46), with a self-hosted
+control plane and config manager as trigger-gated phase 2 (MOD-47, MOD-48); requirement amendments
+are open questions inside those items.
 Before it, **MOD-4 was done** (`docs/decisions/mod/mod-4.md`): the
 orchestrator runs in manual mode across all six milestones. `htui-orch` walks step graphs with gates,
 the review loop, judged fan-out and four git isolation modes under a leased heartbeat and a recovery
 sweep, and `run_worker.rs` and the Runs pane let the maintainer drive it, promote a step to chat and
 close an item out. Its carried risks are **MOD-37** and **CLEAN-4**.
-Before it, **MOD-30 was done** (`docs/decisions/mod/mod-30.md`): the detail sub-tab strip separates
-titles by one space and a test pins its width against the pane.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration` and
 `0004_max_agents_per_run_default` (cache: `0001`..`0003`), so **the next migration is `0005`**.
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins at MOD-4's close
@@ -70,7 +72,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 ### Analyses
 
 
-- [ ] **ANA-16 - Research agent execution environments (Docker, remote shell).** Research how to implement ways to run an agent in a Docker container (local and remote) and in a remote shell. Note this would require a central server with htui as just the interface.
 - [ ] **ANA-17 - Per-model calibration of the prompt's section framing** (from MOD-2, finding F-37).
   `R-PRM-1`, `R-PRM-2`. ANA-5 fixes the `<section name="...">` wrapper but never fixes what separates
   the N blocks a single placeholder expands to — `{{documents}}` renders one block per document,
@@ -210,6 +211,8 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   (rule 8's "no machine identifier" becomes true of the digest rather than of the prompt) — the
   amendment is maintainer-approved and recorded here per the milestone-5 precedent that an ANA edit
   is maintainer-only. Its write-up should carry the ANA-5 sections it touches.
+  **Relates to ANA-16** (`docs/ANA-16.md` §5.3, §8): a container child box has its own hostname,
+  distinct from its parent's (MOD-44), so the switch and the digest split also cover child boxes.
 - [ ] **MOD-31 - A running prompt preview makes an adapter install refuse** (from MOD-2, finding
   F-121). `R-AGT-10`, `R-TUI-8`, `R-NF-3`. `AgentRuntime::serve` pushes the deferred preview task
   into `self.background` (`agent_worker.rs:824`), and the install guard refuses whenever
@@ -236,6 +239,8 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 
 - [ ] **MOD-28 - rataflow execution view (from ANA-12).** Add `rataflow` dependency, implement `ExecutionGraph` widget mapping `RunStep` and `SessionEvent` lists to a node graph, add view toggle to Runs tab (`R-TUI-4`), and wire mouse/keyboard events for standard run actions.
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
+  **Relates to ANA-16** (`docs/ANA-16.md` §6.2, §8): personas should be registry rows rather than a
+  per-box directory, so they are distributed like the rest of the config (MOD-48).
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
 - [ ] **MOD-7 - Box registry + capabilities.** `R-BOX-1..4`, `R-ORCH-10`, `R-AGT-6`, `R-TUI-8`.
   Probe, registration, capability tags and quirks editor (Settings tab box profile section),
@@ -259,6 +264,9 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   `repo_box_path` — which is this item — and nothing writes it yet. Whatever writes those rows must
   canonicalise or refuse a root that is a link, or the excerpt walk's symlink discipline starts one
   component too late.
+  **Relates to ANA-16** (`docs/ANA-16.md` §6.1 C4, §8): box registration is keyed on the `box.toml`
+  id, not the hostname (C4, owned by MOD-40); under phase 2, registration is by enrolment with a
+  server-minted box id (MOD-47). Container boxes are child boxes of their host (MOD-44).
 - [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
   project and phase bindings, template rows, Skills tab editor with version diff, import of
   existing skill markdown files. Per ANA-5 (`docs/ANA-5.md` §4.1, §5.4): template save validation
@@ -285,6 +293,8 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   the one **missing** call site is **MOD-32**, not this item. **MOD-4 wired no secrets** (done,
   `docs/decisions/mod/mod-4.md`, plan D176): `htui-orch`'s `drive_once` builds every graph
   `SessionSpec` with an empty `env`, and its comment names this item as the one that fills it.
+  **Relates to ANA-16** (`docs/ANA-16.md` §8, §9): open question on where secrets resolve, on the
+  worker or on the server; MOD-48 owns it, with `R-SEC-2` amended only if the server resolves them.
 - [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
   `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
   per-box class limits; per-phase exposure. Per ANA-2 (`docs/ANA-2.md` §4.2, §8, risk 11):
@@ -301,6 +311,8 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   and production `approve`/`accept` are greyed in the Runs pane because production's `SessionSink`
   is `NoSink`, so no step writes its `output_kind` document outside a test (MOD-4 risk R-50). Both
   clear once `document_write` exists.
+  **Relates to ANA-16** (`docs/ANA-16.md` §8): the MCP server must be reachable inside a container
+  or on a remote box, and a stdio `McpServerSpec` must be launchable there (MOD-44, MOD-41).
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
@@ -313,6 +325,8 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   `= ANY($projects)` have no SQLite spelling — which is why auto mode is not part of MOD-4's M8.
   **Not blocked**: MOD-4 is done (`docs/decisions/mod/mod-4.md`); `claim_run`'s admission, the
   overlap predicate, the lease, the sweep and `run_worker.rs` are there to reuse.
+  **Relates to ANA-16** (`docs/ANA-16.md` §8): target-box selection in auto mode is MOD-43's, which
+  depends on this item for its auto-mode half.
 - [ ] **MOD-13 - Backlog filters and item editing** (from MOD-1). `R-TUI-2`, `R-ENT-5`,
   `R-ENT-10..12`. Filters by status, project, capability and readiness; `new` and `edit` actions
   with the compare-and-set on `version` and the three-way divergence view (`docs/ANA-9.md` §4.2,
@@ -446,6 +460,86 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   edits (MOD-7), and anything keyed on an agent's name (`R-AGT-5`). Raised by the maintainer on
   2026-09-10 while MOD-2 milestone 7 was in flight.
 - [ ] **MOD-24 - Fault Tolerance of Agent Processes.** Implement agent memory checkpointing to Postgres. If the daemon or TUI crashes mid-run, `htui` should be able to read the last `SessionEvent` from Postgres, re-hydrate the agent's context window, and resume the exact step it was on so that multi-hour runs can survive process restarts.
+  **Relates to ANA-16** (`docs/ANA-16.md` §8): **conflict flagged for a maintainer decision, not
+  resolved here.** This item presupposes a daemon and re-attach/re-hydration, which conflicts with
+  ANA-2 §4.9's reset-and-retry resume (a lost lease resets the tree and the step starts again).
+  MOD-41 (headless worker) gives it the daemon but not the re-attach or re-hydration.
+
+- [ ] **MOD-40 - Multi-writer store hardening** (from ANA-16, `docs/ANA-16.md` §6.1, §8 item 1). `R-ID-3`, `R-HIS-1`.
+  Close the gaps C1-C8 that apply with or without a server. C1: step writes (`append_events`,
+  `set_step_usage`, `finish_step`) are checked against the run's `lease_owner`. C8: an error on a short
+  insert outside replay. C2: lease times from SQL `clock_timestamp()`. C3: quota writes ordered by
+  `quota_at`. C6: an `updated_at` CAS on `upsert_agent`. C7: any box-settings writer is a CAS. C4: box
+  keyed on the `box.toml` id instead of the hostname, plus a box heartbeat bumping `last_seen_at`.
+  C5: a headless connect never migrates; `htui_version` compared against a target. **Open question
+  for the maintainer:** `R-STO-5` amendment ("a headless worker never migrates; it refuses and
+  reports"). No dependencies; blocks MOD-41.
+  **MOD-4 M6 landed** (MOD-4 done, `docs/decisions/mod/mod-4.md`): C1 and C8 now guard shipped
+  code, the step write paths `run_worker.rs` and the engine drive in production.
+- [ ] **MOD-41 - Headless worker (`htui worker`)** (from ANA-16, §8 item 2). `R-ORCH-12`, `R-ID-2`,
+  `R-STO-1`, `R-NF-2`, `R-NF-3`. A ratatui-free entry point hosting MOD-4 M6's run supervision (lease
+  refresh, sweep, one engine task per claimed run, claims only `target_box_id = self`). Reaches the
+  store only through a narrow worker-store trait so a later control-plane client (MOD-47) can
+  implement it. Per-worker pool size setting for the connection budget. Asks MOD-4 M6 to put
+  `run_worker` in a library both binaries link. **Open questions for the maintainer (requirement
+  amendments):** `R-ID-2` (as `R-ORCH-12` foresees); `R-ORCH-12` moves from later to must; `R-STO-1`
+  headless DSN source (keyring `linux-native` or a systemd credential, `Cargo.toml:45-46` compiles
+  only `sync-secret-service`). Blocked on MOD-40, MOD-4 (M6), MOD-7.
+  **MOD-4 M6 landed without these asks, so they are this item's** (MOD-4 done,
+  `docs/decisions/mod/mod-4.md`): `run_worker` still lives in the TUI crate
+  (`crates/htui/src/run_worker.rs`, whose crate depends on `ratatui` and `crossterm`), so moving it
+  into a library crate the TUI and `htui worker` both link is part of this item; no worker-store
+  trait exists yet either. The MOD-4 (M6) dependency is met.
+- [ ] **MOD-42 - Permission and control relay through Postgres** (from ANA-16, §8 item 3).
+  `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`record.rs:1684-1703`) cannot answer a
+  parked ACP request, so engine-driven ACP steps fail on their first permission request today. The
+  worker records `permission_request`, waits on a `permission_answer` row, then answers the session;
+  cancel and follow-up become command rows. Answers from another box go through the relay, never
+  `take_lease`. Blocked on MOD-4 (M6); MOD-41 consumes it.
+  **MOD-4 M6 landed without closing this gap** (MOD-4 done, `docs/decisions/mod/mod-4.md`): the
+  engine still drives a graph step through `pump` (`crates/htui-orch/src/engine.rs:5146`, `pump` now
+  at `crates/htui-agent/src/record.rs:1725-1743`) with the default `PermissionPolicy`, so engine-driven
+  ACP steps still fail on their first permission request. The MOD-4 (M6) dependency is met.
+- [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
+  `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
+  until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
+  hints and a poll backstop, and shows worker liveness. Blocked on MOD-41, MOD-42, and MOD-12 for
+  auto mode.
+- [ ] **MOD-44 - Container execution environment** (from ANA-16, §8 item 5). `R-BOX-1..3`,
+  `R-AGT-5`, `R-AGT-6`, `R-AGT-9`, `R-SEC-2`, `R-MCP-1`, `R-NF-1`, `R-NF-2`. A child `box` of kind
+  `container` with its own id and hostname; probe, install and auth inside the image; one container
+  per session as host UID/GID; trees bind-mounted at identical paths; a launch decorator under
+  `TransportBuilder` (`docker exec -i`), adapters unchanged; kill-tree is container removal; agent
+  credentials on a named volume; the container never holds the DSN. Linux and macOS first (Windows
+  via MOD-16). **Open question for the maintainer:** `R-NF-2` amendment (`dockerd` as an opt-in,
+  per-box dependency). Blocked on MOD-7; needs MOD-41 to survive TUI exit.
+- [ ] **MOD-45 - Remote box provisioning over SSH** (from ANA-16, §8 item 6). `R-BOX-1`, `R-BOX-4`,
+  `R-AGT-9`, `R-STO-1`. System `ssh` to install the matching `htui` build and a user service running
+  `htui worker`; credential passed on the worker's stdin, never argv or a file; the worker
+  self-registers. Agent login via MOD-22's paste-back. SSH is not used after provisioning. Under
+  phase 2 (MOD-47) it installs an enrolment token instead of a DSN. Blocked on MOD-41, MOD-22.
+- [ ] **MOD-46 - Live streaming via `NOTIFY` (optional)** (from ANA-16, §8 item 7). `R-HIS-1`,
+  `R-NF-3`. Transient `NOTIFY` deltas under 8000 bytes between recorder flushes, droppable, superseded
+  by durable `session_event` rows. Start only if 16 KiB flush bursts prove unusable; replaced by
+  MOD-47's relay if phase 2 is already open. Blocked on MOD-43.
+- [ ] **MOD-47 - `htui server` control plane (phase 2)** (from ANA-16, §7, §8 item 8). `R-NF-2`,
+  `R-ID-2`, `R-ORCH-12`, `R-STO-1`, `R-STO-5`, `R-USR-3`, `R-SEC-1..4`, `R-ID-7`. **Trigger-gated:**
+  start only when a worker runs outside the trusted network or behind NAT, team use (`R-USR-3`)
+  starts, worker count exceeds the Postgres connection budget, or MOD-46 proves inadequate. The only
+  worker-facing DSN holder, no durable state (`R-ID-3` stands); enrolment with server-minted box ids,
+  box-scoped auth, versioned worker protocol accepting N-1, worker-initiated WebSocket for dispatch,
+  event ingest, live and permission relay; a decision on server-down behaviour. The TUI keeps
+  talking to Postgres. **Open questions for the maintainer (requirement amendments):** `R-NF-2`
+  (optional self-hosted server), `R-ID-2` (self-hosted control plane is not a cloud service),
+  `R-ORCH-12` ("polling Postgres or the control plane"), `R-STO-1` (worker holds a box-scoped
+  revocable key), `R-STO-5` (server owns migrations for workers), `R-USR-3` (roles enforced in the
+  server). Blocked on MOD-40, MOD-41, MOD-42.
+- [ ] **MOD-48 - Config manager and secret distribution (phase 2)** (from ANA-16, §6.2, §8 item 9).
+  `R-ID-3`, `R-AGT-9`, `R-AGT-10`, `R-SEC-1`, `R-SEC-2`. `GetManifest`/`WatchManifest` over agent
+  registry, box profiles, settings, images, target build and digest; full resync on a stale cursor;
+  worker-side cache; worker self-update. Targeted per-run secrets, never agent credentials
+  (`R-AGT-9` unchanged). **Open question for the maintainer:** `R-SEC-2` amendment only if the server,
+  not the worker, resolves project secrets. Blocked on MOD-47, MOD-10.
 
 ### Deferred backlog
 
@@ -496,7 +590,7 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-16 execution environments, ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 25 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 2 (ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
+| MOD-N   | 34 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 fault tolerance, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
