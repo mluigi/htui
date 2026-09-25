@@ -1,0 +1,47 @@
+index:
+  languages:
+    - rust
+  exclude:
+    - "vendor/**"
+    - "dist/**"
+    - "env"
+    - ".git"
+    - ".claude/**"
+    - "target/**"
+    - ".serena/**"
+    - "docs/**"
+    - ".remember/**"
+    - "**/target/**"
+    - "**/*.snap"
+    - "**/tests/fixtures/**"
+    - "**/benches/**"
+    - "**/generated/**"
+    - "**/bindings.rs"
+    - "results/**"
+  workers: 8
+
+watch:
+  enabled: true
+  paths:
+    - "."
+  debounce_ms: 150
+  exclude:
+    - "vendor/**"
+    - "dist/**"
+    - "env"
+    - ".git"
+    - ".claude/**"
+    - "target/**"
+    - ".serena/**"
+    - "docs/**"
+    - ".remember/**"
+    - "**/target/**"
+    - "**/*.snap"
+    - "**/tests/fixtures/**"
+    - "**/benches/**"
+    - "**/generated/**"
+    - "**/bindings.rs"
+    - "results/**"
+query:
+  default_depth: 3
+  max_depth: 10
