@@ -17,15 +17,16 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, BoxSettings, ChatRunSpec, Claim, CommandRun, CommandRunId,
-    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
-    NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptTemplateId,
-    Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, overlaps, scope_of,
+    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, BoxSettings, ChatRunSpec, Claim,
+    CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document,
+    GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo,
+    NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId,
+    VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -846,6 +847,15 @@ impl WriteStore for PgStore {
             });
         }
         Ok(())
+    }
+
+    async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
+        let _ = probe;
+        todo!("MOD-7 T2")
+    }
+
+    async fn boxes(&self) -> Result<Vec<BoxRecord>> {
+        todo!("MOD-7 T2")
     }
 
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both

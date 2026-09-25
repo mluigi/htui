@@ -19,20 +19,20 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProfile,
-    BoxRow, BoxSettings, BoxTool, ChatRunSpec, Claim, CommandRun, CommandRunId,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, GateOutcome, Item,
-    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRevision,
-    ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
-    Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
-    PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
-    ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
-    SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, overlaps,
-    prompt_summary, scope_of,
+    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProbe,
+    BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec, Claim, CommandRun,
+    CommandRunId, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, GateOutcome,
+    Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch,
+    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
+    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
+    NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId,
+    RepoPatch, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -4377,6 +4377,15 @@ impl WriteStore for MemStore {
         self.write(|state| state.set_agent_box_quota(agent_id, box_id, quota, quota_at, now))
     }
 
+    async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
+        let _ = probe;
+        todo!("MOD-7 T2")
+    }
+
+    async fn boxes(&self) -> Result<Vec<BoxRecord>> {
+        todo!("MOD-7 T2")
+    }
+
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
         self.write(|state| state.start_chat_run(chat))
     }
@@ -4778,11 +4787,11 @@ mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
     use crate::model::{
-        AgentBox, AgentId, BoxId, ChatRunSpec, Claim, DocumentId, GateOutcome, GraphSnapshot,
-        Isolation, ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject, NewRepo,
-        NewRun, NewRunStep, NoteId, OverlapRule, ProjectId, RepoId, RunId, RunKind, RunMode,
-        RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status,
-        StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+        AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, Claim, DocumentId, GateOutcome,
+        GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject,
+        NewRepo, NewRun, NewRunStep, NoteId, OverlapRule, ProbedTool, ProjectId, RepoId, RunId,
+        RunKind, RunMode, RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph,
+        SnapshotSettings, Status, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -5373,6 +5382,51 @@ mod tests {
             ),
             "a row that has never been probed has no columns to latch into, got {missing:?}"
         );
+    }
+
+    /// MOD-7 D32: `MemStore` refuses a spec digest that is not 64 lowercase hex, as Postgres's
+    /// `CHECK` on `box.probe_spec_digest` does, and writes nothing. The Postgres half is T1's
+    /// `CHECK` test in `htui-store`.
+    #[tokio::test]
+    async fn a_probe_digest_that_is_not_hex_is_a_constraint() {
+        let store = MemStore::demo();
+        let before = store.boxes().await.expect("boxes must not fail");
+        let good = crate::prompt::digest::sha256_hex("spec");
+        for digest in [
+            String::new(),
+            "abc".to_owned(),
+            good.to_uppercase(),
+            format!("{good}0"),
+            format!("{}g", &good[..63]),
+        ] {
+            let probe = BoxProbe {
+                box_id: ids::BOX,
+                os_version: "11".to_owned(),
+                cpu: "cpu".to_owned(),
+                ram_mb: Some(1024),
+                gpu_present: false,
+                gpu_vendor: None,
+                tools: vec![ProbedTool {
+                    name: "git".to_owned(),
+                    version: "2.0".to_owned(),
+                    path: "/usr/bin/git".to_owned(),
+                }],
+                probed_tags: vec!["x".to_owned()],
+                htui_version: "0.0.0".to_owned(),
+                spec_digest: digest.clone(),
+                probed_at: Utc::now(),
+            };
+            let refused = store.record_box_probe(&probe).await;
+            assert!(
+                matches!(refused, Err(StoreError::Constraint(_))),
+                "digest {digest:?} must be a Constraint, got {refused:?}"
+            );
+            assert_eq!(
+                store.boxes().await.expect("boxes must not fail"),
+                before,
+                "a refused probe writes nothing"
+            );
+        }
     }
 
     /// MOD-2 plan D70: `project.settings` is readable per project, because the per-run token cap

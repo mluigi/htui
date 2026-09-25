@@ -30,9 +30,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, Claim, CommandRun, Document,
-    DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item, ItemFilter, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun,
+    Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRecord, ChatRunSpec, Claim, CommandRun,
+    Document, DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item, ItemFilter,
+    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun,
     NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep,
     NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project, ProjectId,
     ProjectPatch, PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch,
@@ -714,6 +714,13 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     }
     async fn upsert_agent_box(&self, row: &AgentBox) -> StoreResult<()> {
         self.inner.upsert_agent_box(row).await
+    }
+    async fn record_box_probe(&self, probe: &BoxProbe) -> StoreResult<()> {
+        let _ = probe;
+        todo!("MOD-7 T2")
+    }
+    async fn boxes(&self) -> StoreResult<Vec<BoxRecord>> {
+        todo!("MOD-7 T2")
     }
     async fn set_agent_box_quota(
         &self,
