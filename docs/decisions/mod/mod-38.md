@@ -97,8 +97,8 @@ The maintainer applied ANA-11 §7 to `docs/REQUIREMENTS.md` on 2026-09-25 (`86c5
 - Cross-project citations whose other end is not mirrored are absent offline, as `links` already
   are.
 - MOD-39 builds the Requirements tab and the resolution picker. MOD-8 imports into these tables.
-  MOD-11 owns `requirement_cite`. MOD-34 can add `resolution` to its payload and index
-  `requirement` rows.
+  MOD-11 owns `requirement_cite`. MOD-50 adds `resolution` to MOD-34's point payload and
+  indexes `requirement` rows.
 
 ## Commits
 
