@@ -540,6 +540,7 @@ async fn boxes_lists_only_this_user_s_boxes_in_id_order() {
         (second, "awk"),
         (second, "Zig"),
         (second, "_x"),
+        (registered, "git"),
         (foreign, "leak"),
     ] {
         sqlx::query("INSERT INTO box_tool (box_id, name, version, path) VALUES ($1, $2, '1', $3)")
@@ -569,10 +570,12 @@ async fn boxes_lists_only_this_user_s_boxes_in_id_order() {
         .map(|tool| tool.name.as_str())
         .collect();
     assert_eq!(tools, ["Zig", "_x", "awk"], "tools by name bytes");
-    assert!(
-        records[1].tools.is_empty(),
-        "the registered box was never probed"
-    );
+    let own: Vec<&str> = records[1]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(own, ["git"], "the registered box keeps only its own tool");
 
     db.drop_db().await;
 }
