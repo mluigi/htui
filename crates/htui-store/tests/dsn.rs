@@ -56,6 +56,7 @@ fn context(root: &Path) -> ConnectContext {
         config_root: root.to_owned(),
         connect_timeout: Duration::from_millis(50),
         offline: false,
+        registered: connect::Registered::default(),
     }
 }
 

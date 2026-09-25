@@ -1299,15 +1299,19 @@ pub fn spawn_with_runtimes(
                                             // MOD-7 D3: this bootstrap registered the box, so
                                             // a minted id is written back here, as
                                             // `try_connect` does over an up-to-date schema.
-                                            if let Some(ctx) = connect.as_ref()
-                                                && let Err(err) = connect::persist_registration(
+                                            // F1: and remembered for the session's later dials,
+                                            // which present it while `box.toml` cannot be
+                                            // rewritten instead of minting one row per tick.
+                                            if let Some(ctx) = connect.as_ref() {
+                                                if let Err(err) = connect::persist_registration(
                                                     &ctx.config_root, &presented, &pg,
-                                                )
-                                            {
-                                                tracing::warn!(
-                                                    %err,
-                                                    "the registered box id was not written back to box.toml"
-                                                );
+                                                ) {
+                                                    tracing::warn!(
+                                                        %err,
+                                                        "the registered box id was not written back to box.toml"
+                                                    );
+                                                }
+                                                ctx.registered.record(&presented, &pg);
                                             }
                                             go_online(
                                                 &mut backend, pg, &mut refresher, &mut health,
@@ -2501,6 +2505,7 @@ mod tests {
             config_root: db.config_root.clone(),
             connect_timeout: std::time::Duration::from_secs(5),
             offline: true,
+            registered: connect::Registered::default(),
         });
         let events = started.events_tx.clone();
         let (tx, req_rx) = mpsc::unbounded_channel();

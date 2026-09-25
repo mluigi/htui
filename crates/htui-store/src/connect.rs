@@ -12,11 +12,11 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::Utc;
-use htui_core::model::ProjectId;
+use htui_core::model::{BoxId, ProjectId};
 use htui_core::store::{Result, StoreError};
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
@@ -84,6 +84,71 @@ pub const LAUNCH_GENERATION: u64 = 0;
 /// `R-STO-1` keeps the secret in the keyring and in the connect path, not in the shell.
 pub type Reconnect = Arc<dyn Fn() -> ConnFuture + Send + Sync>;
 
+/// The id registration answered this session for a copied `box.toml`, kept in memory (MOD-7 F1).
+///
+/// [`persist_registration`] writes a minted id back to `box.toml`, but a config root this process
+/// cannot write leaves the copied id on disk. Every later dial would present it again, registration
+/// would answer [`Registration::Copied`] again, and each 30 s reconnect would mint one more `box`
+/// row. This remembers the pair instead: while `box.toml` still holds the copied id, a dial presents
+/// the minted one, whose row carries this machine's fingerprint, and registration answers
+/// [`Registration::Known`]. At most one extra row per launch, never one per reconnect.
+///
+/// Nothing here looks a row up: the substitution is keyed on the id `box.toml` holds and the id
+/// this process was answered with, never on a hostname or a fingerprint (OQ-1, D3). Once
+/// `box.toml` holds anything else - the write-back succeeded, or the user replaced the file - the
+/// override no longer matches and the file wins.
+///
+/// Cloning shares the one slot: [`start`]'s dials, the reconnect closure, a `SetDsn`'s new closure
+/// and the store worker's `ApplyMigrations` path all read and write the same pair.
+#[derive(Debug, Clone, Default)]
+pub struct Registered(Arc<Mutex<Option<Override>>>);
+
+/// The copied id `box.toml` holds and the id this process presents in its place.
+#[derive(Debug, Clone, Copy)]
+struct Override {
+    /// What `box.toml` still says.
+    on_disk: BoxId,
+    /// What registration answered for it.
+    minted: BoxId,
+}
+
+impl Registered {
+    /// `identity` as read from `box.toml`, with the minted id in place of a copied one this
+    /// session was already answered for.
+    #[must_use]
+    pub fn present(&self, mut identity: Identity) -> Identity {
+        let slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(pair) = *slot
+            && pair.on_disk == identity.box_id
+        {
+            identity.box_id = pair.minted;
+        }
+        identity
+    }
+
+    /// Remembers the id `store` registered as when it differs from the one it presented.
+    ///
+    /// `presented` is the identity the store connected with. It differs from the registered id
+    /// only when registration answered [`Registration::Copied`]; any other answer leaves the slot
+    /// alone. A presented id that was itself a substitution keeps the `box.toml` side of the pair,
+    /// so the next dial still recognises the file's id.
+    pub fn record(&self, presented: &Identity, store: &PgStore) {
+        let registered = store.identity().box_id;
+        if registered == presented.box_id {
+            return;
+        }
+        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let on_disk = match *slot {
+            Some(pair) if pair.minted == presented.box_id => pair.on_disk,
+            _ => presented.box_id,
+        };
+        *slot = Some(Override {
+            on_disk,
+            minted: registered,
+        });
+    }
+}
+
 /// What [`apply_dsn`] needs from the session [`start`] set up (MOD-15 M6 D20).
 ///
 /// Carried on [`Started`] rather than re-derived in the store worker: calling
@@ -97,6 +162,8 @@ pub struct ConnectContext {
     pub connect_timeout: Duration,
     /// `--offline`: the DSN is stored and the mirror re-opened, but nothing dials (D12).
     pub offline: bool,
+    /// The session's in-memory box id override (MOD-7 F1), shared with every dial.
+    pub registered: Registered,
 }
 
 /// What a stored DSN produced, for the worker to install (D1, D11).
@@ -285,16 +352,23 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
     let (events_tx, events) = mpsc::channel(EVENT_QUEUE);
     let (projects, _) = watch::channel(Vec::new());
     let timeout = opts.connect_timeout;
+    let registered = Registered::default();
     let reconnect: Option<Reconnect> = if connecting {
-        Some(reconnect_over(dsn.clone(), root.clone(), timeout))
+        Some(reconnect_over(
+            dsn.clone(),
+            root.clone(),
+            timeout,
+            registered.clone(),
+        ))
     } else {
         None
     };
 
     if connecting {
         let sender = events_tx.clone();
+        let registered = registered.clone();
         tokio::spawn(async move {
-            let event = attempt(dsn.as_deref().cloned(), root, timeout).await;
+            let event = dial(dsn.as_deref().cloned(), root, timeout, &registered).await;
             // `LAUNCH_GENERATION`, not a counter: this dial was spawned before the worker and its
             // `dials` existed. The worker drops it if a `SetDsn` has moved on since - which is a
             // ten-second window here, because a blackholed SYN burns the whole `CONNECT_TIMEOUT`
@@ -321,29 +395,48 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
             config_root: opts.config_root,
             connect_timeout: timeout,
             offline: opts.offline,
+            registered,
         }),
     })
 }
 
-/// One connection attempt, spawned by [`start`] and re-run by the worker's 30 s ticker.
+/// One connection attempt with no memory of earlier ones.
 ///
 /// Never returns an error: every failure is a [`ConnEvent::Failed`] whose text the status line
 /// shows, because "no DSN" and "server down" are states the shell renders rather than crashes on.
-/// The identity is re-read from `root` per attempt, so an id an earlier attempt minted for a
-/// copied `box.toml` (MOD-7 D3) is the one the next one registers under.
+/// The identity is re-read from `root`, so an id an earlier attempt minted for a copied `box.toml`
+/// (MOD-7 D3) and managed to write back is the one this one registers under.
+///
+/// [`start`] and the reconnect closure do not call this: they dial through a [`Registered`] shared
+/// across the session, so an id that could **not** be written back is still presented next time.
+/// This entry point starts from an empty one.
 pub async fn attempt(dsn: Option<String>, root: PathBuf, connect_timeout: Duration) -> ConnEvent {
+    dial(dsn, root, connect_timeout, &Registered::default()).await
+}
+
+/// [`attempt`] through the session's [`Registered`]: `box.toml`'s id, or the minted id this
+/// session presents in place of a copied one, and the answer recorded for the next dial.
+async fn dial(
+    dsn: Option<String>,
+    root: PathBuf,
+    connect_timeout: Duration,
+    registered: &Registered,
+) -> ConnEvent {
     let Some(dsn) = dsn else {
         return ConnEvent::Failed(NO_DSN.to_owned());
     };
     let identity = match identity::load_or_mint(&root) {
-        Ok(identity) => identity,
+        Ok(identity) => registered.present(identity),
         Err(err) => return ConnEvent::Failed(err.to_string()),
     };
     match try_connect(&dsn, &identity, &root, connect_timeout).await {
-        Ok(Connected { store, migrations }) => match migrations {
-            MigrationState::UpToDate => ConnEvent::Online(store),
-            MigrationState::Pending(n) => ConnEvent::MigrationsPending(store, n),
-        },
+        Ok(Connected { store, migrations }) => {
+            registered.record(&identity, &store);
+            match migrations {
+                MigrationState::UpToDate => ConnEvent::Online(store),
+                MigrationState::Pending(n) => ConnEvent::MigrationsPending(store, n),
+            }
+        }
         Err(err) => ConnEvent::Failed(err.to_string()),
     }
 }
@@ -354,25 +447,34 @@ pub async fn attempt(dsn: Option<String>, root: PathBuf, connect_timeout: Durati
 /// life of the session does not park a bare `String` on the heap; [`attempt`]'s signature is
 /// deliberately unchanged (blueprint flag C), because `--set-dsn` may have stored a DSN that
 /// [`Dsn::parse`] would now refuse and M1's startup behaviour must not change.
+///
+/// Every call dials through `registered`, the slot [`start`]'s own dial and the store worker share
+/// (MOD-7 F1).
 fn reconnect_over(
     dsn: Option<Zeroizing<String>>,
     root: PathBuf,
     connect_timeout: Duration,
+    registered: Registered,
 ) -> Reconnect {
     Arc::new(move || {
         let dsn = dsn.as_deref().cloned();
         let root = root.clone();
-        Box::pin(attempt(dsn, root, connect_timeout)) as ConnFuture
+        let registered = registered.clone();
+        Box::pin(async move { dial(dsn, root, connect_timeout, &registered).await }) as ConnFuture
     })
 }
 
-/// `reconnect_over` for a validated DSN (D20): what the worker arms after a `SetDsn`.
+/// `reconnect_over` for a validated DSN (D20), starting from an empty [`Registered`].
+///
+/// [`apply_dsn`] does not use it: it passes the session's own slot, so a `SetDsn` does not forget
+/// an id this session could not write back.
 #[must_use]
 pub fn reconnect_for(dsn: &Dsn, root: PathBuf, connect_timeout: Duration) -> Reconnect {
     reconnect_over(
         Some(Zeroizing::new(dsn.as_str().to_owned())),
         root,
         connect_timeout,
+        Registered::default(),
     )
 }
 
@@ -399,7 +501,12 @@ pub async fn apply_dsn(dsn: Dsn, ctx: &ConnectContext) -> Result<Applied> {
 
     let fingerprint = dsn.fingerprint();
     let cache = CacheStore::open(&ctx.config_root, &fingerprint, PgStore::schema_version()).await?;
-    let reconnect = reconnect_for(&dsn, ctx.config_root.clone(), ctx.connect_timeout);
+    let reconnect = reconnect_over(
+        Some(Zeroizing::new(dsn.as_str().to_owned())),
+        ctx.config_root.clone(),
+        ctx.connect_timeout,
+        ctx.registered.clone(),
+    );
     let summary = dsn.summary();
     Ok(Applied {
         cache,
@@ -427,10 +534,15 @@ pub async fn forget_dsn() -> Result<()> {
 /// registered yet and the call is a no-op; the store worker's `ApplyMigrations` path calls it
 /// again once [`PgStore::apply_migrations`] has.
 ///
+/// A write-back that fails is a `warn!`, not a failed connection, exactly as on the
+/// `ApplyMigrations` path (MOD-7 F1): the server has already registered this box under the minted
+/// id, and refusing the session over a file would leave it offline while every reconnect minted
+/// another row. The session goes online under the minted id; [`Registered`] is what keeps the
+/// next dial presenting it while `box.toml` still holds the copied one.
+///
 /// # Errors
 ///
-/// Whatever [`PgStore::connect`] reports — an unreachable server, a refused schema — and
-/// [`htui_core::store::StoreError::Backend`] when the minted id cannot be written back.
+/// Whatever [`PgStore::connect`] reports — an unreachable server, a refused schema.
 pub async fn try_connect(
     dsn: &str,
     identity: &Identity,
@@ -438,7 +550,12 @@ pub async fn try_connect(
     connect_timeout: Duration,
 ) -> Result<Connected> {
     let connected = PgStore::connect_with(dsn, identity, connect_timeout).await?;
-    persist_registration(root, identity, &connected.store)?;
+    if let Err(err) = persist_registration(root, identity, &connected.store) {
+        tracing::warn!(
+            %err,
+            "the registered box id could not be written to box.toml; continuing under it for this session"
+        );
+    }
     Ok(connected)
 }
 
