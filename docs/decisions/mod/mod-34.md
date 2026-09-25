@@ -8,6 +8,8 @@ actually serve. The ANA text is left as written, since ANA edits are maintainer-
 
 Artifact: plan `.claude/plans/mod-34-qdrant-search.plan.md`, revision 4 (routed **plan**, C2 fired;
 no PRD). The revision-1 blueprint next to it predates the code and is superseded by the plan.
+Commits: `601e5f8` (the build, R-STO-8, close-out) and `3e616f0` (review fixes), on top of the plan
+revisions `bfd0b9f`, `5c55de7` and `9c3969c`.
 
 ## Starting point
 
