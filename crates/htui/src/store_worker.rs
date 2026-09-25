@@ -41,7 +41,7 @@ use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::run_worker::{LiveChats, RunRuntime, RunServed};
-use crate::templates::{self, TemplatesSnapshot};
+use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
 
@@ -520,8 +520,9 @@ pub enum StoreRequest {
         project: ProjectId,
         /// The template's name; its role is `TemplateRole::of_name(name)`.
         name: String,
-        /// The whole new body, which the store refuses if `parse` does.
-        body: String,
+        /// The whole new body, which the store refuses if `parse` does. Its `Debug` is its
+        /// length.
+        body: TemplateBody,
         /// The head version the editor opened on: the CAS token, `None` for a name with no row.
         expected: Option<i32>,
     },

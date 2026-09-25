@@ -27,6 +27,7 @@ use std::time::Duration;
 use htui::agent_worker::AgentRuntime;
 use htui::app::register_all;
 use htui::store_worker::{self, Origin, RequestEnvelope, StoreReply, StoreRequest};
+use htui::templates::TemplateBody;
 use htui::testkit::Harness;
 use htui::ui::tabs::SkillsTab;
 use htui_agent::registry::DriverFactory;
@@ -258,7 +259,7 @@ async fn an_offline_save_is_refused_without_a_row() {
             scope,
             project: ids::PROJECT_VULKAN,
             name: NAME.to_owned(),
-            body: format!("{MARKER}\n{{{{item}}}}\n"),
+            body: TemplateBody::new(format!("{MARKER}\n{{{{item}}}}\n")),
             expected: Some(1),
         },
     )

@@ -121,8 +121,8 @@ impl core::fmt::Debug for ExternalEdit {
     }
 }
 
-/// What came back (D9, D24).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What came back (D9, D24). The edited text is never `Debug`ged.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ExternalEditOutcome {
     /// The file changed; the normalised text ([`normalise_newlines`]).
     Edited(String),
@@ -134,6 +134,20 @@ pub enum ExternalEditOutcome {
     },
     /// Nothing changed and why, one sentence for the notice line.
     Failed(String),
+}
+
+/// `Edited` prints its length, as [`ExternalEdit`] does; the other two carry no body.
+impl core::fmt::Debug for ExternalEditOutcome {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Edited(text) => f
+                .debug_struct("Edited")
+                .field("text_len", &text.len())
+                .finish(),
+            Self::Unchanged { quick } => f.debug_struct("Unchanged").field("quick", quick).finish(),
+            Self::Failed(message) => f.debug_tuple("Failed").field(message).finish(),
+        }
+    }
 }
 
 /// Leaving and re-entering the TUI's terminal state (D9). `TerminalGuard` is the real one; tests

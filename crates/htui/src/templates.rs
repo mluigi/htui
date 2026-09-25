@@ -28,6 +28,34 @@ pub struct TemplatesSnapshot {
     pub projects: Vec<ProjectTemplates>,
 }
 
+/// A body on its way to the store in [`StoreRequest::SaveTemplate`]. `StoreRequest` derives
+/// `Debug`, and a template body is user text, so this prints its length only (the rule of
+/// [`crate::editor::ExternalEdit`] and [`crate::ui::TextArea`]).
+#[derive(Clone, PartialEq, Eq)]
+pub struct TemplateBody(String);
+
+impl TemplateBody {
+    /// Wraps `text`.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// The text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for TemplateBody {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TemplateBody")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
 /// One project's rows, `(name, version)` byte order as `Backend::prompt_templates` returns them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectTemplates {
@@ -125,7 +153,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                         id: PromptTemplateId::new(),
                         project_id: *project,
                         name: name.clone(),
-                        body: body.clone(),
+                        body: body.as_str().to_owned(),
                         created_by,
                     },
                     *expected,
@@ -152,7 +180,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_NAME, REQUEST_NAMES, TemplatesSnapshot, serve};
+    use super::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot, serve};
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use htui_core::fixtures::ids;
     use htui_core::model::{ProjectId, Scope};
@@ -195,7 +223,7 @@ mod tests {
             scope: scope.clone(),
             project,
             name: name.to_owned(),
-            body: body.to_owned(),
+            body: TemplateBody::new(body),
             expected,
         }
     }

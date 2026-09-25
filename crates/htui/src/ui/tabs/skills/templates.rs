@@ -23,7 +23,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome};
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::templates::{READ_NAME, REQUEST_NAMES, TemplatesSnapshot};
+use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{AreaOutcome, FieldOutcome, TextArea, TextField, Theme, diff};
@@ -194,8 +194,7 @@ enum Mode {
     Editing(Editor),
 }
 
-/// An open editor.
-#[derive(Debug)]
+/// An open editor. Never `Debug`s a body.
 struct Editor {
     /// The template's project.
     project: ProjectId,
@@ -238,6 +237,24 @@ impl Editor {
             esc_armed: false,
             sent: None,
         }
+    }
+}
+
+/// Lengths, never the text: `original` and `sent` are the body, as the draft is (`TextArea`'s
+/// rule).
+impl core::fmt::Debug for Editor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Editor")
+            .field("project", &self.project)
+            .field("name", &self.name)
+            .field("token", &self.token)
+            .field("from", &self.from)
+            .field("area", &self.area)
+            .field("original_len", &self.original.len())
+            .field("confirm_item", &self.confirm_item)
+            .field("esc_armed", &self.esc_armed)
+            .field("sent_len", &self.sent.as_ref().map(String::len))
+            .finish()
     }
 }
 
@@ -691,7 +708,7 @@ impl TemplatesView {
                     scope: ctx.scope.clone(),
                     project: editor.project,
                     name: editor.name.clone(),
-                    body,
+                    body: TemplateBody::new(body),
                     expected: editor.token,
                 });
             }
