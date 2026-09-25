@@ -1,6 +1,6 @@
 # Blueprint: MOD-7 milestone 1, "a box knows itself"
 
-**Status**: **draft, for maintainer acceptance.** Findings F-A to F-T (§0) and decisions D19–D38 (§12) are proposed here. Where a finding says **Blocker**, the plan read literally either does not compile, fails its own named test, breaks the workspace gate, or leaves a hidden coupling between parallel tasks. The Fix column is what the implementer builds.
+**Status**: **accepted** (2026-09-25) by the maintainer as written. Findings F-A to F-T (§0) and decisions D19–D38 (§12) are proposed here. Where a finding says **Blocker**, the plan read literally either does not compile, fails its own named test, breaks the workspace gate, or leaves a hidden coupling between parallel tasks. The Fix column is what the implementer builds.
 
 **Plan**: `.claude/plans/mod-7-box-identity-probe.plan.md`, confirmed 2026-09-25 with every OQ default, OQ-11 and OQ-12 included. It covers D1–D18 and R-1 to R-11. Its "(amended at fact-check)", "(amended at maintainer review)" and "(amended at re-check)" notes, and its Verified-claims table, take precedence over its earlier prose, and this blueprint follows them. **PRD**: `.claude/prds/mod-7-box-registry.prd.md`, milestone 1. PRD D0–D7 win over this blueprint where they disagree.
 
