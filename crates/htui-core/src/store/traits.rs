@@ -314,7 +314,8 @@ pub trait WriteStore: ReadStore {
     ///
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "box"` when no
     /// row has `probe.box_id`; [`StoreError::Constraint`](crate::store::StoreError::Constraint)
-    /// when a tool name repeats or `spec_digest` is not 64 lowercase hex. Either way nothing is
+    /// when a tool name repeats or `spec_digest` is not 64 lowercase hex. `NotFound` for an
+    /// unknown box wins over any `Constraint` the same probe would also hit. Either way nothing is
     /// written.
     async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()>;
 

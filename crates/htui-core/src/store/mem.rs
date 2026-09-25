@@ -1579,7 +1579,18 @@ impl State {
     /// One box probe (MOD-7 D10): the nine probe columns, the whole `box_tool` set and the spec
     /// digest, or nothing. The checks run before any write, so a refusal leaves the store as it
     /// stood, as `PgStore`'s transaction rolls back.
+    ///
+    /// The box is looked up first, then the digest, then the tool names: `PgStore`'s
+    /// `UPDATE .. WHERE id` answers an unknown box before any `CHECK` or key is consulted, so
+    /// `NotFound` wins over every `Constraint` here too.
     fn record_box_probe(&mut self, probe: &BoxProbe, now: DateTime<Utc>) -> Result<()> {
+        let id = probe.box_id;
+        if !self.boxes.contains_key(&id) {
+            return Err(StoreError::NotFound {
+                entity: "box",
+                id: id.to_string(),
+            });
+        }
         let digest = &probe.spec_digest;
         if digest.len() != 64
             || !digest
@@ -1602,14 +1613,10 @@ impl State {
                 probe.box_id
             )));
         }
-        let id = probe.box_id;
         let row = self
             .boxes
             .get_mut(&id)
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "box",
-                id: id.to_string(),
-            })?;
+            .expect("the box was looked up above, under the same lock");
         row.os_version.clone_from(&probe.os_version);
         row.cpu.clone_from(&probe.cpu);
         row.ram_mb = probe.ram_mb;
