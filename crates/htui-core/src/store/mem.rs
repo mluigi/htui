@@ -24,10 +24,10 @@ use crate::model::{
     CommandRunId, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, GateOutcome,
     Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch,
     ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
-    NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId,
-    RepoPatch, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
+    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRun, NewRunStep,
+    NewStepGraph, NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath,
+    RepoId, RepoPatch, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
     RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
     SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
     StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
@@ -4655,6 +4655,15 @@ impl WriteStore for MemStore {
 
     async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
         Ok(self.read(|state| state.phase_rows(graph)))
+    }
+
+    async fn append_prompt_template(
+        &self,
+        new: NewPromptTemplate,
+        expected: Option<i32>,
+    ) -> Result<CasOutcome<PromptTemplate>> {
+        let _ = (new, expected);
+        todo!("MOD-9 T1: append_prompt_template on MemStore")
     }
 
     async fn set_setting(

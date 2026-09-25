@@ -36,12 +36,12 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, ChatRunSpec, Claim, CommandRun, Document,
     DocumentHead, DocumentId, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
     ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
-    Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath,
-    RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject,
+    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRun, NewRunStep, NewStepGraph,
+    NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
+    PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -618,6 +618,17 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.phases(graph).await,
             Self::Online(pg) => pg.phases(graph).await,
+        }
+    }
+
+    async fn append_prompt_template(
+        &self,
+        new: NewPromptTemplate,
+        expected: Option<i32>,
+    ) -> Result<CasOutcome<PromptTemplate>> {
+        match self {
+            Self::Memory(store) => store.append_prompt_template(new, expected).await,
+            Self::Online(pg) => pg.append_prompt_template(new, expected).await,
         }
     }
 

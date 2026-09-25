@@ -22,13 +22,13 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
     ChatRunSpec, Claim, CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS,
     Document, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo,
-    NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId,
-    VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    overlaps, scope_of,
+    ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
+    NewPromptTemplate, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -2125,6 +2125,15 @@ impl WriteStore for PgStore {
     /// Whatever the driver reports, through [`map_sqlx`].
     async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
         self.phase_rows(graph).await
+    }
+
+    async fn append_prompt_template(
+        &self,
+        new: NewPromptTemplate,
+        expected: Option<i32>,
+    ) -> Result<CasOutcome<PromptTemplate>> {
+        let _ = (new, expected);
+        todo!("MOD-9 T1: append_prompt_template on PgStore")
     }
 
     // settings (D7, D8)

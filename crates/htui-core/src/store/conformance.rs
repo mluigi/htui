@@ -18,13 +18,14 @@ use crate::model::{
     CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId,
     EventKind, EventRole, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemFilter, ItemId,
     ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
-    NewWorkspace, NoteId, OverlapRule, PhaseId, PhasePatch, ProbedTool, ProjectId, ProjectPatch,
-    PromptScope, RepoBoxPath, RepoId, RepoPatch, RepoScope, Run, RunId, RunKind, RunMode, RunScope,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph,
-    SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome,
-    StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRun, NewRunStep,
+    NewStepGraph, NewWorkspace, NoteId, OverlapRule, PhaseId, PhasePatch, ProbedTool, ProjectId,
+    ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId, RepoBoxPath, RepoId, RepoPatch,
+    RepoScope, Run, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, Scope, SessionEvent, SnapshotGraph, SnapshotSettings, Status, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
+    UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -91,6 +92,9 @@ pub const CASES: &[&str] = &[
     "record_box_probe_replaces_profile_and_tools",
     "record_box_probe_refuses_an_unknown_box",
     "boxes_lists_every_box_with_its_tools",
+    "prompt_template_append_is_a_cas_on_the_head",
+    "prompt_template_new_name_starts_at_one",
+    "prompt_template_refuses_what_parse_refuses",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -190,6 +194,15 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             record_box_probe_refuses_an_unknown_box(store).await;
         }
         "boxes_lists_every_box_with_its_tools" => boxes_lists_every_box_with_its_tools(store).await,
+        "prompt_template_append_is_a_cas_on_the_head" => {
+            prompt_template_append_is_a_cas_on_the_head(store).await;
+        }
+        "prompt_template_new_name_starts_at_one" => {
+            prompt_template_new_name_starts_at_one(store).await;
+        }
+        "prompt_template_refuses_what_parse_refuses" => {
+            prompt_template_refuses_what_parse_refuses(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -5148,6 +5161,225 @@ async fn boxes_lists_every_box_with_its_tools<S: WriteStore>(store: &S) {
     assert_eq!(
         record.probe_spec_digest, None,
         "{CASE}: the fixture never recorded a spec digest"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-9 milestone 1: the template writer (plan D1-D4, blueprint D16-D18)
+// ------------------------------------------------------------------------------------------------
+//
+// The bodies below are plain `const`s and never a `format!`-style string: `{{` is an escape
+// there. The two-writer race at one head needs two sessions, so it is not a case here: it is the
+// Postgres race case in `htui-store`'s tests (blueprint D30).
+
+/// A template to append with a fresh id, authored by the fixture user.
+fn new_template(project: ProjectId, name: &str, body: &str) -> NewPromptTemplate {
+    NewPromptTemplate {
+        id: PromptTemplateId::new(),
+        project_id: project,
+        name: name.to_owned(),
+        body: body.to_owned(),
+        created_by: ids::USER,
+    }
+}
+
+/// MOD-9 plan D1, D3, blueprint D16: the head version is the token. A save at the head appends
+/// `head + 1` with the caller's body and author; a second save from the same token finds the new
+/// head; a token on a name with no row is `NotFound`, `Some(0)` included (F-B's regression: the
+/// first SQL shape inserted v1 there while `MemStore` refused).
+async fn prompt_template_append_is_a_cas_on_the_head<S: WriteStore>(store: &S) {
+    const CASE: &str = "prompt_template_append_is_a_cas_on_the_head";
+    const A: &str = "Implement {{item_key}}, edit A.\n\n{{item}}\n";
+    const B: &str = "Implement {{item_key}}, edit B.\n\n{{item}}\n";
+
+    let v2 = applied(
+        CASE,
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "implement", A), Some(1))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(v2.version, 2, "{CASE}: a save at head v1 appends v2");
+    assert_eq!(v2.body, A, "{CASE}: v2 carries the saved body");
+    assert_eq!(v2.name, "implement", "{CASE}: under the saved name");
+    assert_eq!(
+        v2.project_id,
+        ids::PROJECT_HTUI,
+        "{CASE}: in the saved project"
+    );
+    assert_eq!(v2.created_by, ids::USER, "{CASE}: authored by the caller");
+
+    let head = stale(
+        CASE,
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "implement", B), Some(1))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (head.version, head.body.as_str()),
+        (2, A),
+        "{CASE}: a spent token finds v2 with the first body"
+    );
+
+    let v3 = applied(
+        CASE,
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "implement", B), Some(2))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (v3.version, v3.body.as_str()),
+        (3, B),
+        "{CASE}: a save at head v2 appends v3"
+    );
+
+    for token in [7, 0] {
+        let missing = store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "no-such", A), Some(token))
+            .await;
+        assert!(
+            matches!(
+                missing,
+                Err(StoreError::NotFound {
+                    entity: "prompt_template",
+                    ..
+                })
+            ),
+            "{CASE}: Some({token}) on a name with no row is NotFound, got {missing:?}"
+        );
+    }
+}
+
+/// MOD-9 plan D1: a name with no row starts at version 1 under `None`, and `None` is itself a
+/// token - "I expect no row" - so it is `Stale` once the name has one, a seeded reserved name
+/// included.
+async fn prompt_template_new_name_starts_at_one<S: WriteStore>(store: &S) {
+    const CASE: &str = "prompt_template_new_name_starts_at_one";
+    const TRIAGE: &str = "Triage {{item_key}}.\n\n{{item}}\n";
+    const AGAIN: &str = "Triage {{item_key}} again.\n\n{{item}}\n";
+    const JUDGE: &str = "Pick one.\n\n{{candidates}}\n";
+
+    let v1 = applied(
+        CASE,
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "triage", TRIAGE), None)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (v1.version, v1.name.as_str(), v1.body.as_str()),
+        (1, "triage", TRIAGE),
+        "{CASE}: a new name starts at v1"
+    );
+
+    let head = stale(
+        CASE,
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "triage", AGAIN), None)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (head.version, head.body.as_str()),
+        (1, TRIAGE),
+        "{CASE}: `None` on a name that now has a row finds v1"
+    );
+
+    let judge = stale(
+        CASE,
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "judge", JUDGE), None)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(judge.version, 1, "{CASE}: the seeded judge is at v1");
+    assert_eq!(
+        Some(judge.body.as_str()),
+        crate::prompt::body_of("judge"),
+        "{CASE}: and carries the seeded body"
+    );
+}
+
+/// MOD-9 plan D4, blueprint D18: the store refuses what `parse` refuses, in the name's role, and
+/// an invalid name; a spent token answers `Stale` before any of that; an unknown project is a
+/// `Constraint`. A save at the head after the refusals lands at v2, so none of them wrote.
+async fn prompt_template_refuses_what_parse_refuses<S: WriteStore>(store: &S) {
+    const CASE: &str = "prompt_template_refuses_what_parse_refuses";
+    const TYPO: &str = "Implement {{itme}}.\n";
+    const NO_CANDIDATES: &str = "no candidates here\n";
+    const GOOD: &str = "Implement {{item_key}}.\n\n{{item}}\n";
+
+    let constraint =
+        |outcome: Result<CasOutcome<PromptTemplate>, StoreError>, needle: &str, what: &str| {
+            match outcome {
+                Err(StoreError::Constraint(message)) => assert!(
+                    message.contains(needle),
+                    "{CASE}: {what}: the refusal names `{needle}`, got {message:?}"
+                ),
+                other => panic!("{CASE}: {what} is Constraint, got {other:?}"),
+            }
+        };
+
+    constraint(
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "implement", TYPO), Some(1))
+            .await,
+        "unknown prompt placeholder",
+        "a misspelt placeholder",
+    );
+    constraint(
+        store
+            .append_prompt_template(
+                new_template(ids::PROJECT_HTUI, "judge", NO_CANDIDATES),
+                Some(1),
+            )
+            .await,
+        "must use candidates",
+        "a judge body without its candidates",
+    );
+    for name in ["", " plan"] {
+        constraint(
+            store
+                .append_prompt_template(new_template(ids::PROJECT_HTUI, name, GOOD), None)
+                .await,
+            "prompt_template.name",
+            "a blank or untrimmed name",
+        );
+    }
+
+    let head = stale(
+        CASE,
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "implement", TYPO), Some(7))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        head.version, 1,
+        "{CASE}: a spent token is Stale before the body is judged"
+    );
+
+    let v2 = applied(
+        CASE,
+        store
+            .append_prompt_template(new_template(ids::PROJECT_HTUI, "implement", GOOD), Some(1))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (v2.version, v2.body.as_str()),
+        (2, GOOD),
+        "{CASE}: the refusals wrote nothing, so the head was still v1"
+    );
+
+    let unknown = store
+        .append_prompt_template(new_template(ProjectId::new(), "implement", GOOD), None)
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::Constraint(_))),
+        "{CASE}: a project that names no row is Constraint, got {unknown:?}"
     );
 }
 

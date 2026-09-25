@@ -33,13 +33,13 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRecord, ChatRunSpec, Claim, CommandRun,
     Document, DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item, ItemFilter,
     ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun,
-    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    normalize,
+    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRun,
+    NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptScope, PromptTemplate, Quota, QuotaSource, Repo, RepoBoxPath, RepoId,
+    RepoPatch, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
@@ -581,6 +581,13 @@ impl WriteStore for SpyStore {
     }
     async fn phases(&self, graph: StepGraphId) -> StoreResult<Vec<StepGraphPhase>> {
         self.inner.phases(graph).await
+    }
+    async fn append_prompt_template(
+        &self,
+        new: NewPromptTemplate,
+        expected: Option<i32>,
+    ) -> StoreResult<CasOutcome<PromptTemplate>> {
+        self.inner.append_prompt_template(new, expected).await
     }
     async fn set_setting(
         &self,

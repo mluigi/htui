@@ -113,9 +113,9 @@ pub use ids::{
 };
 pub use item::{Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Status};
 pub use kind::{
-    CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewStepGraph, PhaseAgent,
-    PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph, ResolvedPhase, StepGraph,
-    StepGraphPatch, StepGraphPhase,
+    CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewPromptTemplate,
+    NewStepGraph, PhaseAgent, PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph,
+    ResolvedPhase, StepGraph, StepGraphPatch, StepGraphPhase,
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
 pub use note::{NewNote, Note};
