@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id            AS \"id: ItemId\",\n                   project_id    AS \"project_id: ProjectId\",\n                   kind_id       AS \"kind_id: htui_core::model::ItemKindId\",\n                   key_prefix,\n                   key_number,\n                   key           AS \"key!\",\n                   title,\n                   body,\n                   status        AS \"status: htui_core::model::Status\",\n                   priority,\n                   required_tags,\n                   touched_paths,\n                   step_graph_id AS \"step_graph_id: htui_core::model::StepGraphId\",\n                   version,\n                   created_by    AS \"created_by: htui_core::model::UserId\",\n                   created_at,\n                   updated_at,\n                   closed_at\n              FROM item WHERE id = $1\n            ",
+  "query": "\n            WITH c AS (\n                INSERT INTO item_key_counter (project_id, prefix, last_value)\n                SELECT $2, k.prefix, 1 FROM item_kind k WHERE k.id = $3 AND k.project_id = $2\n                ON CONFLICT (project_id, prefix)\n                DO UPDATE SET last_value = item_key_counter.last_value + 1\n                RETURNING prefix, last_value\n            ), i AS (\n                INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, title, body,\n                                  priority, required_tags, touched_paths, step_graph_id, created_by)\n                SELECT $1, $2, $3, c.prefix, c.last_value, $4, $5, $6, $7, $8, $9, $10 FROM c\n                RETURNING id, project_id, kind_id, key_prefix, key_number, key, title, body, status,\n                          priority, required_tags, touched_paths, step_graph_id, version,\n                          created_by, created_at, updated_at, closed_at\n            ), r AS (\n                INSERT INTO item_revision (item_id, version, title, body, required_tags,\n                                           author_id, box_id, reason)\n                SELECT id, version, title, body, required_tags, $10, $11, 'created' FROM i\n                RETURNING item_id\n            )\n            SELECT i.id            AS \"id!: ItemId\",\n                   i.project_id    AS \"project_id!: htui_core::model::ProjectId\",\n                   i.kind_id       AS \"kind_id!: htui_core::model::ItemKindId\",\n                   i.key_prefix    AS \"key_prefix!\",\n                   i.key_number    AS \"key_number!\",\n                   i.key           AS \"key!\",\n                   i.title         AS \"title!\",\n                   i.body          AS \"body!\",\n                   i.status        AS \"status!: Status\",\n                   i.priority      AS \"priority!\",\n                   i.required_tags AS \"required_tags!\",\n                   i.touched_paths AS \"touched_paths!\",\n                   i.step_graph_id AS \"step_graph_id?: htui_core::model::StepGraphId\",\n                   i.version       AS \"version!\",\n                   i.created_by    AS \"created_by!: htui_core::model::UserId\",\n                   i.created_at    AS \"created_at!\",\n                   i.updated_at    AS \"updated_at!\",\n                   i.closed_at     AS \"closed_at?\",\n                   -- MOD-38 T1 bridge: `item.resolution` lands with migration 0005 (T2).\n                   NULL::text      AS \"resolution?: htui_core::model::Resolution\"\n              FROM i, r\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id: ItemId",
+        "name": "id!: ItemId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "project_id: ProjectId",
+        "name": "project_id!: htui_core::model::ProjectId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -27,7 +27,7 @@
       },
       {
         "ordinal": 2,
-        "name": "kind_id: htui_core::model::ItemKindId",
+        "name": "kind_id!: htui_core::model::ItemKindId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -38,7 +38,7 @@
       },
       {
         "ordinal": 3,
-        "name": "key_prefix",
+        "name": "key_prefix!",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -49,7 +49,7 @@
       },
       {
         "ordinal": 4,
-        "name": "key_number",
+        "name": "key_number!",
         "type_info": "Int4",
         "origin": {
           "Table": {
@@ -71,7 +71,7 @@
       },
       {
         "ordinal": 6,
-        "name": "title",
+        "name": "title!",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -82,7 +82,7 @@
       },
       {
         "ordinal": 7,
-        "name": "body",
+        "name": "body!",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -93,7 +93,7 @@
       },
       {
         "ordinal": 8,
-        "name": "status: htui_core::model::Status",
+        "name": "status!: Status",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -104,7 +104,7 @@
       },
       {
         "ordinal": 9,
-        "name": "priority",
+        "name": "priority!",
         "type_info": "Int2",
         "origin": {
           "Table": {
@@ -115,7 +115,7 @@
       },
       {
         "ordinal": 10,
-        "name": "required_tags",
+        "name": "required_tags!",
         "type_info": "TextArray",
         "origin": {
           "Table": {
@@ -126,7 +126,7 @@
       },
       {
         "ordinal": 11,
-        "name": "touched_paths",
+        "name": "touched_paths!",
         "type_info": "TextArray",
         "origin": {
           "Table": {
@@ -137,7 +137,7 @@
       },
       {
         "ordinal": 12,
-        "name": "step_graph_id: htui_core::model::StepGraphId",
+        "name": "step_graph_id?: htui_core::model::StepGraphId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -148,7 +148,7 @@
       },
       {
         "ordinal": 13,
-        "name": "version",
+        "name": "version!",
         "type_info": "Int4",
         "origin": {
           "Table": {
@@ -159,7 +159,7 @@
       },
       {
         "ordinal": 14,
-        "name": "created_by: htui_core::model::UserId",
+        "name": "created_by!: htui_core::model::UserId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -170,7 +170,7 @@
       },
       {
         "ordinal": 15,
-        "name": "created_at",
+        "name": "created_at!",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
@@ -181,7 +181,7 @@
       },
       {
         "ordinal": 16,
-        "name": "updated_at",
+        "name": "updated_at!",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
@@ -192,7 +192,7 @@
       },
       {
         "ordinal": 17,
-        "name": "closed_at",
+        "name": "closed_at?",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
@@ -200,10 +200,26 @@
             "name": "closed_at"
           }
         }
+      },
+      {
+        "ordinal": 18,
+        "name": "resolution?: htui_core::model::Resolution",
+        "type_info": "Text",
+        "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int2",
+        "TextArray",
+        "TextArray",
+        "Uuid",
+        "Uuid",
         "Uuid"
       ]
     },
@@ -225,8 +241,9 @@
       false,
       false,
       false,
-      true
+      true,
+      null
     ]
   },
-  "hash": "8c1bcab9d9b66f90b68875ef7def37d319b643fada5831d1e69abd65327c4175"
+  "hash": "2693b9749e6eaee6945f1d60c73f3788a9be36433cc8e7d42725ff43e80e0c1c"
 }

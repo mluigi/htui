@@ -110,7 +110,9 @@ pub use ids::{
     PromptTemplateId, RepoId, RunId, SkillBindingId, SkillId, StepGraphId, StepId, UserId,
     WorkspaceId,
 };
-pub use item::{Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Status};
+pub use item::{
+    Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Resolution, Status,
+};
 pub use kind::{
     CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewStepGraph, PhaseAgent,
     PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph, ResolvedPhase, StepGraph,
@@ -165,6 +167,21 @@ mod tests {
             let back: T = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(&back, variant, "serde round-trip");
         }
+    }
+
+    #[test]
+    fn resolution_matches_check_list() {
+        check_enum(
+            Resolution::ALL,
+            &[
+                "done",
+                "concluded",
+                "rejected",
+                "withdrawn",
+                "superseded",
+                "duplicate",
+            ],
+        );
     }
 
     #[test]

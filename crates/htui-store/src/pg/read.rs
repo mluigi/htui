@@ -148,7 +148,9 @@ impl ReadStore for PgStore {
                    created_by    AS "created_by: htui_core::model::UserId",
                    created_at,
                    updated_at,
-                   closed_at
+                   closed_at,
+                   -- MOD-38 T1 bridge: `item.resolution` lands with migration 0005 (T2).
+                   NULL::text    AS "resolution: htui_core::model::Resolution"
               FROM item WHERE id = $1
             "#,
             id.as_uuid(),

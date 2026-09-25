@@ -240,6 +240,7 @@ mod tests {
             created_at: at(1, 9),
             updated_at: at(1, 9),
             closed_at: None,
+            resolution: None,
         }
     }
 

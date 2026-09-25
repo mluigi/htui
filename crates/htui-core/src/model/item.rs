@@ -35,13 +35,15 @@ impl Status {
         matches!(self, Self::Done | Self::Closed)
     }
 
-    /// ANA-2 §4.3's `item` table (`docs/ANA-2.md:565-589`): whether the orchestrator or close-out
-    /// may move an item from `self` to `to`. `closed` reaches nothing.
+    /// ANA-2 §4.3's `item` table (`docs/ANA-2.md:565-589`): whether the orchestrator may move an
+    /// item from `self` to `to`. `closed` reaches nothing.
     ///
     /// Every legal pair is a row of that table; a pair outside it is a bug, not a race, and
     /// [`WriteStore::transition`](crate::store::WriteStore::transition) refuses it before it
     /// reaches the row. Note that `is_terminal` and "reaches nothing" are **not** the same set
-    /// here: `done` is terminal for the readiness rule and still reaches `closed` and `open`.
+    /// here: `done` is terminal for the readiness rule and still reaches `open`.
+    ///
+    /// `closed` is reached only by close-out (PRD D1, [`Resolution::closes_from`]).
     ///
     /// `blocked → awaiting_approval` is MOD-4 plan D161's one deviation from
     /// `docs/ANA-2.md:583-584`. `Unblock` uses it to let an escalated item follow its parked run
@@ -56,10 +58,57 @@ impl Status {
                 Self::AwaitingApproval | Self::Done | Self::Failed | Self::Blocked | Self::Open
             ),
             Self::AwaitingApproval => matches!(to, Self::InProgress | Self::Failed | Self::Open),
-            Self::Blocked => matches!(to, Self::Open | Self::AwaitingApproval | Self::Closed),
-            Self::Failed => matches!(to, Self::Queued | Self::Closed),
-            Self::Done => matches!(to, Self::Closed | Self::Open),
+            Self::Blocked => matches!(to, Self::Open | Self::AwaitingApproval),
+            Self::Failed => matches!(to, Self::Queued),
+            Self::Done => matches!(to, Self::Open),
             Self::Closed => false,
+        }
+    }
+}
+
+str_enum!(
+    /// `item.resolution` (ANA-11 §4.2): why a `closed` item closed. Set by
+    /// [`WriteStore::close_out`](crate::store::WriteStore::close_out) only; `None` on every item
+    /// that is not `closed` (`chk_item_resolution_iff_closed`).
+    Resolution {
+        /// The work was done.
+        Done => "done",
+        /// An analysis reached its verdict.
+        Concluded => "concluded",
+        /// Decided against.
+        Rejected => "rejected",
+        /// Dropped without a decision.
+        Withdrawn => "withdrawn",
+        /// Replaced by another item.
+        Superseded => "superseded",
+        /// The same as another item.
+        Duplicate => "duplicate",
+    }
+);
+
+impl Resolution {
+    /// ANA-11 §4.2's close-out law (plan D4): `done` and `concluded` close only a `done` item;
+    /// the other four close an `open`, `blocked`, `failed` or `done` one. Everything else,
+    /// `closed` included, is refused.
+    #[must_use]
+    pub const fn closes_from(self, status: Status) -> bool {
+        match self {
+            Self::Done | Self::Concluded => matches!(status, Status::Done),
+            Self::Rejected | Self::Withdrawn | Self::Superseded | Self::Duplicate => matches!(
+                status,
+                Status::Open | Status::Blocked | Status::Failed | Status::Done
+            ),
+        }
+    }
+
+    /// PRD D2 / plan D6: the resolution the Runs pane closes with until MOD-39's picker. `done`
+    /// closes as `Done`; `blocked` and `failed` close as `Withdrawn`; nothing else is offered.
+    #[must_use]
+    pub const fn default_for(status: Status) -> Option<Self> {
+        match status {
+            Status::Done => Some(Self::Done),
+            Status::Blocked | Status::Failed => Some(Self::Withdrawn),
+            _ => None,
         }
     }
 }
@@ -103,6 +152,9 @@ pub struct Item {
     pub updated_at: DateTime<Utc>,
     /// `item.closed_at`.
     pub closed_at: Option<DateTime<Utc>>,
+    /// `item.resolution` (ANA-11 §4.2): `Some` exactly when `status` is `closed`.
+    #[serde(default)]
+    pub resolution: Option<Resolution>,
 }
 
 impl Item {
@@ -258,12 +310,13 @@ pub struct ItemRevision {
 
 #[cfg(test)]
 mod tests {
-    use super::Status;
+    use super::{Resolution, Status};
 
     /// Every row of ANA-2 §4.3's item transition table (`docs/ANA-2.md:565-589`), transcribed
     /// from the document rather than from [`Status::can_move_to`], so a pair added to or dropped
     /// from the `match` fails here. The one row not in the document is `blocked →
-    /// awaiting_approval`, MOD-4 plan D161's deviation.
+    /// awaiting_approval`, MOD-4 plan D161's deviation. `→ closed` is not a transition since
+    /// MOD-38 (PRD D1); [`CLOSE_OUT_SANCTIONED`] holds the close-out law instead.
     const SANCTIONED: &[(Status, Status)] = &[
         // `open`
         (Status::Open, Status::Queued),
@@ -285,14 +338,34 @@ mod tests {
         // `blocked`
         (Status::Blocked, Status::Open),
         (Status::Blocked, Status::AwaitingApproval),
-        (Status::Blocked, Status::Closed),
         // `failed`
         (Status::Failed, Status::Queued),
-        (Status::Failed, Status::Closed),
         // `done`
-        (Status::Done, Status::Closed),
         (Status::Done, Status::Open),
         // `closed` reaches nothing.
+    ];
+
+    /// ANA-11 §4.2's close-out law, transcribed from the document rather than from
+    /// [`Resolution::closes_from`].
+    const CLOSE_OUT_SANCTIONED: &[(Status, Resolution)] = &[
+        (Status::Open, Resolution::Rejected),
+        (Status::Open, Resolution::Withdrawn),
+        (Status::Open, Resolution::Superseded),
+        (Status::Open, Resolution::Duplicate),
+        (Status::Blocked, Resolution::Rejected),
+        (Status::Blocked, Resolution::Withdrawn),
+        (Status::Blocked, Resolution::Superseded),
+        (Status::Blocked, Resolution::Duplicate),
+        (Status::Failed, Resolution::Rejected),
+        (Status::Failed, Resolution::Withdrawn),
+        (Status::Failed, Resolution::Superseded),
+        (Status::Failed, Resolution::Duplicate),
+        (Status::Done, Resolution::Done),
+        (Status::Done, Resolution::Concluded),
+        (Status::Done, Resolution::Rejected),
+        (Status::Done, Resolution::Withdrawn),
+        (Status::Done, Resolution::Superseded),
+        (Status::Done, Resolution::Duplicate),
     ];
 
     #[test]
@@ -317,5 +390,59 @@ mod tests {
                 "item.status `closed` is terminal, so it cannot reach `{to}`"
             );
         }
+    }
+
+    #[test]
+    fn nothing_transitions_into_closed() {
+        for &from in Status::ALL {
+            assert!(
+                !from.can_move_to(Status::Closed),
+                "item.status `{from}` -> `closed` is close-out's, not a transition (PRD D1)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_close_out_law_sanctions_exactly_the_ana_11_pairs() {
+        assert_eq!(CLOSE_OUT_SANCTIONED.len(), 18);
+        for &status in Status::ALL {
+            for &resolution in Resolution::ALL {
+                let sanctioned = CLOSE_OUT_SANCTIONED.contains(&(status, resolution));
+                assert_eq!(
+                    resolution.closes_from(status),
+                    sanctioned,
+                    "close-out of `{status}` as `{resolution}`: the law says {sanctioned}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_resolution_is_a_sanctioned_close_out() {
+        let defaults: Vec<(Status, Option<Resolution>)> = Status::ALL
+            .iter()
+            .map(|&status| (status, Resolution::default_for(status)))
+            .collect();
+        for &(status, default) in &defaults {
+            if let Some(resolution) = default {
+                assert!(
+                    resolution.closes_from(status),
+                    "the default for `{status}` is `{resolution}`, which cannot close it"
+                );
+            }
+        }
+        assert_eq!(
+            defaults,
+            [
+                (Status::Open, None),
+                (Status::Queued, None),
+                (Status::InProgress, None),
+                (Status::AwaitingApproval, None),
+                (Status::Blocked, Some(Resolution::Withdrawn)),
+                (Status::Done, Some(Resolution::Done)),
+                (Status::Failed, Some(Resolution::Withdrawn)),
+                (Status::Closed, None),
+            ]
+        );
     }
 }

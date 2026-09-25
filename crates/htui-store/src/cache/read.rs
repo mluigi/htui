@@ -176,6 +176,9 @@ fn item_of(row: &SqliteRow) -> Result<Item> {
         created_at: ts_col("item.created_at", get(row, "created_at")?)?,
         updated_at: ts_col("item.updated_at", get(row, "updated_at")?)?,
         closed_at: opt_ts_col("item.closed_at", get(row, "closed_at")?)?,
+        // MOD-38 T1: the cache mirrors `item.resolution` from T5; until then an offline read
+        // answers `None`.
+        resolution: None,
     })
 }
 

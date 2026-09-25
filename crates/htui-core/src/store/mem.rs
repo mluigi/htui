@@ -1241,6 +1241,7 @@ impl State {
             created_at: now,
             updated_at: now,
             closed_at: None,
+            resolution: None,
         };
 
         self.revisions.insert(

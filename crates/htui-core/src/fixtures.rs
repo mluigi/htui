@@ -18,10 +18,10 @@ use uuid::Uuid;
 use crate::model::{
     Agent, AppUser, BoxRow, BoxTool, Document, EventKind, EventRole, GateOutcome, GraphSnapshot,
     Isolation, Item, ItemKind, ItemKindId, ItemLink, ItemRevision, LinkKind, Note, NoteId,
-    OsFamily, PhaseId, Project, ProjectId, PromptTemplate, PromptTemplateId, Run, RunKind, RunMode,
-    RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion, SnapshotCandidate,
-    SnapshotGraph, SnapshotPhase, SnapshotSettings, SnapshotTemplate, Status, StepGraph,
-    StepGraphId, StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
+    OsFamily, PhaseId, Project, ProjectId, PromptTemplate, PromptTemplateId, Resolution, Run,
+    RunKind, RunMode, RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion,
+    SnapshotCandidate, SnapshotGraph, SnapshotPhase, SnapshotSettings, SnapshotTemplate, Status,
+    StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::seed;
@@ -1032,6 +1032,7 @@ fn items() -> Vec<Item> {
             created_at: demo_at(0, i64::from(spec.n)),
             updated_at: demo_at(1, i64::from(spec.n)),
             closed_at: spec.closed.then(|| demo_at(1, i64::from(spec.n))),
+            resolution: (spec.status == Status::Closed).then_some(Resolution::Done),
         })
         .collect()
 }

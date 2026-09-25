@@ -435,7 +435,9 @@ impl WriteStore for PgStore {
                    i.created_by    AS "created_by!: htui_core::model::UserId",
                    i.created_at    AS "created_at!",
                    i.updated_at    AS "updated_at!",
-                   i.closed_at     AS "closed_at?"
+                   i.closed_at     AS "closed_at?",
+                   -- MOD-38 T1 bridge: `item.resolution` lands with migration 0005 (T2).
+                   NULL::text      AS "resolution?: htui_core::model::Resolution"
               FROM i, r
             "#,
             new.id.as_uuid(),
@@ -528,7 +530,9 @@ impl WriteStore for PgStore {
                    u.created_by    AS "created_by!: htui_core::model::UserId",
                    u.created_at    AS "created_at!",
                    u.updated_at    AS "updated_at!",
-                   u.closed_at     AS "closed_at?"
+                   u.closed_at     AS "closed_at?",
+                   -- MOD-38 T1 bridge: `item.resolution` lands with migration 0005 (T2).
+                   NULL::text      AS "resolution?: htui_core::model::Resolution"
               FROM u, r
             "#,
             id.as_uuid(),
