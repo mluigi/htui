@@ -29,6 +29,8 @@ zeroize     = { workspace = true }
 dirs        = { workspace = true }
 gethostname = { workspace = true }
 sha2        = { workspace = true }
+# MOD-7 D1: the box fingerprint, HMAC-SHA256 keyed by the OS machine identity.
+hmac        = { workspace = true }
 toml        = { workspace = true }
 uuid        = { workspace = true }
 chrono      = { workspace = true }
@@ -39,6 +41,11 @@ tokio       = { workspace = true }
 tracing     = { workspace = true }
 qdrant-client      = { workspace = true }
 fastembed          = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# MOD-7 D1: the fingerprint's Windows machine identity, `HKLM\SOFTWARE\Microsoft\Cryptography`
+# `MachineGuid`.
+windows-registry   = { workspace = true }
 
 [dev-dependencies]
 htui-core = { workspace = true, features = ["test-support"] }

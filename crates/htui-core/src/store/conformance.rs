@@ -14,17 +14,17 @@ use uuid::Uuid;
 
 use crate::fixtures::ids;
 use crate::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, ChatRunSpec, Claim, CommandQueue, CommandRun,
-    CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole,
-    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemKindId,
-    ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
-    NoteId, OverlapRule, PhaseId, PhasePatch, ProjectId, ProjectPatch, PromptScope, RepoBoxPath,
-    RepoId, RepoPatch, RepoScope, Run, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph, SnapshotSettings, Status,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRow, ChatRunSpec, Claim, CommandQueue,
+    CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId,
+    EventKind, EventRole, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemFilter, ItemId,
+    ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument,
+    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
+    NewWorkspace, NoteId, OverlapRule, PhaseId, PhasePatch, ProbedTool, ProjectId, ProjectPatch,
+    PromptScope, RepoBoxPath, RepoId, RepoPatch, RepoScope, Run, RunId, RunKind, RunMode, RunScope,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph,
+    SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome,
+    StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -88,6 +88,9 @@ pub const CASES: &[&str] = &[
     "take_lease_moves_only_our_own_or_an_expired_lease",
     "interrupt_step_is_a_cas_on_running",
     "release_lease_frees_the_run_for_its_own_sweep",
+    "record_box_probe_replaces_profile_and_tools",
+    "record_box_probe_refuses_an_unknown_box",
+    "boxes_lists_every_box_with_its_tools",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -180,6 +183,13 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "release_lease_frees_the_run_for_its_own_sweep" => {
             release_lease_frees_the_run_for_its_own_sweep(store).await;
         }
+        "record_box_probe_replaces_profile_and_tools" => {
+            record_box_probe_replaces_profile_and_tools(store).await;
+        }
+        "record_box_probe_refuses_an_unknown_box" => {
+            record_box_probe_refuses_an_unknown_box(store).await;
+        }
+        "boxes_lists_every_box_with_its_tools" => boxes_lists_every_box_with_its_tools(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -4848,6 +4858,296 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
         "{CASE}: an unknown run is NotFound, got {unknown:?}"
+    );
+}
+
+/// The fixture's one `box` row, as `load_demo` and `MemStore::from_demo` both load it.
+fn fixture_box() -> BoxRow {
+    crate::fixtures::demo_data()
+        .boxes
+        .into_iter()
+        .find(|row| row.id == ids::BOX)
+        .expect("the fixture has its box")
+}
+
+/// A fixed probe instant (MOD-7 D33): truncated to [`TIMESTAMPTZ_DIGITS`] so that Postgres, which
+/// keeps microseconds, reads back the value `MemStore` keeps whole.
+fn probe_clock(minutes: i64) -> DateTime<Utc> {
+    (crate::fixtures::demo_at(10, 0)
+        + TimeDelta::minutes(minutes)
+        + TimeDelta::nanoseconds(123_456_789))
+    .trunc_subsecs(TIMESTAMPTZ_DIGITS)
+}
+
+/// One tool of a probe.
+fn probed_tool(name: &str, version: &str) -> ProbedTool {
+    ProbedTool {
+        name: name.to_owned(),
+        version: version.to_owned(),
+        path: format!("/opt/{name}/bin/{name}"),
+    }
+}
+
+/// A probe of `box_id` at `at` with `tools` and a digest of `spec` (MOD-7 D33: a real sha256 hex,
+/// so Postgres's `CHECK` admits it).
+fn box_probe(box_id: BoxId, at: DateTime<Utc>, tools: Vec<ProbedTool>, spec: &str) -> BoxProbe {
+    BoxProbe {
+        box_id,
+        os_version: format!("os {spec}"),
+        cpu: format!("cpu {spec}"),
+        ram_mb: Some(32_768),
+        gpu_present: false,
+        gpu_vendor: None,
+        tools,
+        probed_tags: vec!["cmake".to_owned(), format!("tag-{spec}")],
+        htui_version: format!("9.9.{}", spec.len()),
+        spec_digest: crate::prompt::digest::sha256_hex(spec),
+        probed_at: at,
+    }
+}
+
+/// MOD-7 D10, D33: `record_box_probe` writes the nine probe columns and **replaces** the box's
+/// `box_tool` set, and touches none of the columns a person or registration owns. A probe that
+/// repeats a tool name, or whose spec digest is not 64 lowercase hex, is a `Constraint` and writes
+/// nothing.
+async fn record_box_probe_replaces_profile_and_tools<S: WriteStore>(store: &S) {
+    const CASE: &str = "record_box_probe_replaces_profile_and_tools";
+    let fixture = fixture_box();
+    let (at1, at2) = (probe_clock(0), probe_clock(90));
+
+    store
+        .record_box_probe(&box_probe(
+            ids::BOX,
+            at1,
+            vec![probed_tool("a", "1.0"), probed_tool("b", "2.0")],
+            "one",
+        ))
+        .await
+        .expect(CASE);
+    let second = box_probe(
+        ids::BOX,
+        at2,
+        vec![probed_tool("b", "2.1"), probed_tool("c", "3.0")],
+        "two",
+    );
+    store.record_box_probe(&second).await.expect(CASE);
+
+    let records = store.boxes().await.expect(CASE);
+    assert_eq!(records.len(), 1, "{CASE}: the fixture user has one box");
+    let record = &records[0];
+    let row = &record.row;
+    assert_eq!(row.id, ids::BOX, "{CASE}: the probed box");
+    assert_eq!(
+        record
+            .tools
+            .iter()
+            .map(|tool| (
+                tool.box_id,
+                tool.name.as_str(),
+                tool.version.as_str(),
+                tool.path.as_str(),
+                tool.probed_at
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (ids::BOX, "b", "2.1", "/opt/b/bin/b", at2),
+            (ids::BOX, "c", "3.0", "/opt/c/bin/c", at2),
+        ],
+        "{CASE}: the second probe's tool set replaces the first's, and the fixture's"
+    );
+    assert_eq!(
+        (
+            row.os_version.as_str(),
+            row.cpu.as_str(),
+            row.ram_mb,
+            row.gpu_present,
+            row.gpu_vendor.as_deref(),
+        ),
+        (
+            second.os_version.as_str(),
+            second.cpu.as_str(),
+            second.ram_mb,
+            second.gpu_present,
+            second.gpu_vendor.as_deref(),
+        ),
+        "{CASE}: every hardware column is the second probe's"
+    );
+    assert_eq!(
+        row.probed_tags, second.probed_tags,
+        "{CASE}: probed_tags is written"
+    );
+    assert_eq!(
+        row.htui_version, second.htui_version,
+        "{CASE}: htui_version is written"
+    );
+    assert_eq!(
+        row.last_probed_at,
+        Some(at2),
+        "{CASE}: last_probed_at is the probe's instant"
+    );
+    assert_eq!(
+        record.probe_spec_digest.as_deref(),
+        Some(crate::prompt::digest::sha256_hex("two").as_str()),
+        "{CASE}: the spec digest is the second probe's"
+    );
+    assert_eq!(
+        (
+            row.hostname.as_str(),
+            &row.declared_tags,
+            row.quirks.as_str(),
+            &row.settings,
+            row.registered_at,
+            row.last_seen_at,
+        ),
+        (
+            fixture.hostname.as_str(),
+            &fixture.declared_tags,
+            fixture.quirks.as_str(),
+            &fixture.settings,
+            fixture.registered_at,
+            fixture.last_seen_at,
+        ),
+        "{CASE}: a probe never writes what a person or registration owns (MOD-2 D74)"
+    );
+    assert!(
+        row.updated_at > fixture.updated_at,
+        "{CASE}: updated_at moves, as the BEFORE UPDATE trigger moves it"
+    );
+
+    let before = store.boxes().await.expect(CASE);
+    let twice = store
+        .record_box_probe(&box_probe(
+            ids::BOX,
+            probe_clock(120),
+            vec![probed_tool("b", "2.2"), probed_tool("b", "2.3")],
+            "three",
+        ))
+        .await;
+    assert!(
+        matches!(twice, Err(StoreError::Constraint(_))),
+        "{CASE}: a tool name listed twice is a Constraint, got {twice:?}"
+    );
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        before,
+        "{CASE}: the refused probe wrote nothing"
+    );
+
+    let mut malformed = box_probe(
+        ids::BOX,
+        probe_clock(150),
+        vec![probed_tool("d", "4.0")],
+        "four",
+    );
+    malformed.spec_digest = "abc".to_owned();
+    let malformed = store.record_box_probe(&malformed).await;
+    assert!(
+        matches!(malformed, Err(StoreError::Constraint(_))),
+        "{CASE}: a digest that is not 64 lowercase hex is a Constraint, got {malformed:?}"
+    );
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        before,
+        "{CASE}: the probe with a malformed digest wrote nothing"
+    );
+}
+
+/// MOD-7 D10: a probe of a box nobody registered is `NotFound` and writes nothing, and the
+/// unknown box wins over every `Constraint` the same probe would also hit - a malformed digest or
+/// a repeated tool name - because `PgStore`'s `UPDATE .. WHERE id` finds no row before any
+/// `CHECK` or key is consulted.
+async fn record_box_probe_refuses_an_unknown_box<S: WriteStore>(store: &S) {
+    const CASE: &str = "record_box_probe_refuses_an_unknown_box";
+    let before = store.boxes().await.expect(CASE);
+    let unknown = store
+        .record_box_probe(&box_probe(
+            BoxId::new(),
+            probe_clock(0),
+            vec![probed_tool("a", "1.0")],
+            "one",
+        ))
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box is NotFound, got {unknown:?}"
+    );
+
+    let mut malformed = box_probe(
+        BoxId::new(),
+        probe_clock(30),
+        vec![probed_tool("a", "1.0")],
+        "two",
+    );
+    malformed.spec_digest = "abc".to_owned();
+    let malformed = store.record_box_probe(&malformed).await;
+    assert!(
+        matches!(malformed, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box with a malformed digest is NotFound, not Constraint, got \
+         {malformed:?}"
+    );
+
+    let twice = store
+        .record_box_probe(&box_probe(
+            BoxId::new(),
+            probe_clock(60),
+            vec![probed_tool("a", "1.0"), probed_tool("a", "1.1")],
+            "three",
+        ))
+        .await;
+    assert!(
+        matches!(twice, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box with a repeated tool name is NotFound, not Constraint, got \
+         {twice:?}"
+    );
+
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        before,
+        "{CASE}: the refused probes wrote nothing"
+    );
+}
+
+/// MOD-7 D10, D18: `boxes` lists this user's boxes by id, each with its tools in name byte order
+/// and its recorded spec digest, which the fixture never set.
+async fn boxes_lists_every_box_with_its_tools<S: WriteStore>(store: &S) {
+    const CASE: &str = "boxes_lists_every_box_with_its_tools";
+    let records = store.boxes().await.expect(CASE);
+    assert_eq!(records.len(), 1, "{CASE}: the fixture user has one box");
+    let record = &records[0];
+    assert_eq!(record.row.id, ids::BOX, "{CASE}: the fixture's box");
+    assert_eq!(record.row.hostname, "DESKTOP-HTUI", "{CASE}: its hostname");
+    assert_eq!(
+        record.row.probed_tags,
+        ["rust", "msvc", "cmake"],
+        "{CASE}: its probed tags, in stored order"
+    );
+    assert_eq!(
+        record.row.declared_tags,
+        ["gpu"],
+        "{CASE}: its declared tags"
+    );
+    assert_eq!(
+        record
+            .tools
+            .iter()
+            .map(|tool| (
+                tool.box_id,
+                tool.name.as_str(),
+                tool.version.as_str(),
+                tool.path.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (ids::BOX, "cargo", "1.98.0", "/usr/bin/cargo"),
+            (ids::BOX, "cmake", "", "/usr/bin/cmake"),
+            (ids::BOX, "git", "2.51.0", "/usr/bin/git"),
+            (ids::BOX, "rustc", "1.98.0", "/usr/bin/rustc"),
+        ],
+        "{CASE}: the fixture's tools, in name byte order"
+    );
+    assert_eq!(
+        record.probe_spec_digest, None,
+        "{CASE}: the fixture never recorded a spec digest"
     );
 }
 

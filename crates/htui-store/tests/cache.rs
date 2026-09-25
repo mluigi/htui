@@ -1590,6 +1590,55 @@ async fn a_pass_mirrors_the_agent_registry() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-7 blueprint §3.5, R-13: a copied config directory carries a mirror holding the old box's
+/// row, and `CacheStore::box_info` reads `ORDER BY id LIMIT 1`. A pass prunes every row but this
+/// box's, so the top bar never shows another machine.
+#[tokio::test]
+async fn a_pass_keeps_only_this_box_in_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    let stray = htui_core::model::BoxId::new();
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version, \
+                          registered_at, last_seen_at, updated_at) \
+         VALUES (?, ?, 'another-machine', 'linux', '', 'x86_64', '0.0.0', 0, 0, 0)",
+    )
+    .bind(stray.as_uuid().to_string())
+    .bind(db.store.this_user().as_uuid().to_string())
+    .execute(cache.pool())
+    .await
+    .expect("plant a stray box row in the mirror");
+    assert_eq!(
+        mirror_count(cache.pool(), "box").await,
+        1,
+        "only the stray so far"
+    );
+
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    assert_eq!(
+        mirror_count(cache.pool(), "box").await,
+        1,
+        "the pass leaves exactly one box row"
+    );
+    let id: String = sqlx::query_scalar("SELECT id FROM box")
+        .fetch_one(cache.pool())
+        .await
+        .expect("read the mirrored box id");
+    assert_eq!(
+        uuid::Uuid::parse_str(&id).expect("a uuid"),
+        ids::BOX.as_uuid(),
+        "and it is this box's"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// The registry read an offline chat resolves its driver through (D31).
 #[tokio::test]
 async fn an_offline_backend_lists_the_mirrored_registry() {

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version,\n                             machine_fingerprint)\n            VALUES ($1, $2, $3, $4, '', $5, $6, $7)\n            ON CONFLICT (id) DO NOTHING\n            RETURNING id AS \"id!: BoxId\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2942da93c021e51b549329eca7a33dd64f81f022399ef7d82ff136f7969c47b0"
+}

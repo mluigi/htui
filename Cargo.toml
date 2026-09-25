@@ -52,6 +52,14 @@ zeroize            = "1.9"
 dirs               = "6"
 gethostname        = "1.1"
 sha2               = "0.10"
+# MOD-7 D1: the box fingerprint, HMAC-SHA256 keyed by the OS machine identity. 0.12 because it
+# shares `digest 0.10` with `sha2` above and is already compiled on Linux (dbus-secret-service).
+hmac               = "0.12"
+# MOD-7 D1: `MachineGuid` on Windows (htui-store only). 0.6.1 is already in the lock via hyper-util.
+windows-registry   = "0.6"
+# MOD-7 D6 (OQ-2 answered "use sysinfo"): OS version, CPU brand and total RAM on all three
+# platforms. `system` only: the defaults would also pull `component`, `disk`, `network` and `user`.
+sysinfo            = { version = "0.39.6", default-features = false, features = ["system"] }
 toml               = "1.1"
 # MOD-2 milestone 2 (ANA-4 §4.2, §8). The SDK version is exact-pinned: the protocol is the
 # contract, and a patch bump to it is a wire change until proven otherwise.

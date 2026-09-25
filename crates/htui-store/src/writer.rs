@@ -33,15 +33,15 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, Claim, CommandRun, Document, DocumentHead,
-    DocumentId, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
-    ItemPatch, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
-    NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
-    Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch,
-    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, ChatRunSpec, Claim, CommandRun, Document,
+    DocumentHead, DocumentId, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
+    Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath,
+    RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -362,6 +362,20 @@ impl WriteStore for Writer {
                 pg.set_agent_box_quota(agent_id, box_id, quota, quota_at)
                     .await
             }
+        }
+    }
+
+    async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.record_box_probe(probe).await,
+            Self::Online(pg) => pg.record_box_probe(probe).await,
+        }
+    }
+
+    async fn boxes(&self) -> Result<Vec<BoxRecord>> {
+        match self {
+            Self::Memory(store) => store.boxes().await,
+            Self::Online(pg) => pg.boxes().await,
         }
     }
 

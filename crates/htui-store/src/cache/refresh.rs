@@ -646,6 +646,15 @@ async fn refresh_box(
             .await
             .map_err(map_sqlx)?;
     }
+    // The mirror holds this box's row and no other (§4.4). A config directory copied from another
+    // machine carries a mirror holding that machine's box, and registration minted this one a new
+    // id (MOD-7 D3); `CacheStore::box_info` reads `ORDER BY id LIMIT 1`, so the stale row would
+    // win half the time. It goes in the same transaction the own row lands in.
+    sqlx::query("DELETE FROM box WHERE id <> ?")
+        .bind(this_box.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
     tx.commit().await.map_err(map_sqlx)?;
     report.add("box", rows.len() as u64);
     Ok(())

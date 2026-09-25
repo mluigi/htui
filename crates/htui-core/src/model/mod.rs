@@ -97,7 +97,8 @@ pub mod user;
 
 pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
 pub use box_::{
-    BoxInfo, BoxProfile, BoxRow, BoxSettings, BoxTool, DEFAULT_MAX_CONCURRENT_ITEMS, OsFamily,
+    BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool,
+    DEFAULT_MAX_CONCURRENT_ITEMS, OsFamily, ProbedTool,
 };
 pub use document::{Document, DocumentHead, NewDocument, ResolvedInput};
 pub use event::{EventKind, EventRole, SessionEvent};
