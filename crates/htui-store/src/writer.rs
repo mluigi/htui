@@ -366,12 +366,17 @@ impl WriteStore for Writer {
     }
 
     async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
-        let _ = probe;
-        todo!("MOD-7 T2")
+        match self {
+            Self::Memory(store) => store.record_box_probe(probe).await,
+            Self::Online(pg) => pg.record_box_probe(probe).await,
+        }
     }
 
     async fn boxes(&self) -> Result<Vec<BoxRecord>> {
-        todo!("MOD-7 T2")
+        match self {
+            Self::Memory(store) => store.boxes().await,
+            Self::Online(pg) => pg.boxes().await,
+        }
     }
 
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {

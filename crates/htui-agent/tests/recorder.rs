@@ -400,11 +400,10 @@ impl WriteStore for SpyStore {
         self.inner.upsert_agent_box(row).await
     }
     async fn record_box_probe(&self, probe: &BoxProbe) -> StoreResult<()> {
-        let _ = probe;
-        todo!("MOD-7 T2")
+        self.inner.record_box_probe(probe).await
     }
     async fn boxes(&self) -> StoreResult<Vec<BoxRecord>> {
-        todo!("MOD-7 T2")
+        self.inner.boxes().await
     }
     async fn set_agent_box_quota(
         &self,

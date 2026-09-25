@@ -113,6 +113,9 @@ struct State {
     skill_bindings: Vec<SkillBinding>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
     box_tools: Vec<BoxTool>,
+    /// `box.probe_spec_digest`, which `BoxRow` does not carry (D14). Written by
+    /// [`WriteStore::record_box_probe`]; no fixture loads it.
+    box_probe_digests: HashMap<BoxId, String>,
     /// `app_setting`, the last rung of the prompt's settings chain (`docs/ANA-5.md` §4.4), each
     /// value paired with the `updated_at` the `App` rung's compare-and-set compares against.
     ///
@@ -227,6 +230,7 @@ impl MemStore {
             skill_versions: data.skill_versions,
             skill_bindings: data.skill_bindings,
             box_tools: data.box_tools,
+            box_probe_digests: HashMap::new(),
             app_settings: BTreeMap::new(),
             agents: data.agents.into_iter().map(|row| (row.id, row)).collect(),
             agent_boxes: HashMap::new(),
@@ -1570,6 +1574,93 @@ impl State {
         row.quota_at = Some(quota_at);
         row.updated_at = now;
         Ok(())
+    }
+
+    /// One box probe (MOD-7 D10): the nine probe columns, the whole `box_tool` set and the spec
+    /// digest, or nothing. The checks run before any write, so a refusal leaves the store as it
+    /// stood, as `PgStore`'s transaction rolls back.
+    fn record_box_probe(&mut self, probe: &BoxProbe, now: DateTime<Utc>) -> Result<()> {
+        let digest = &probe.spec_digest;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(StoreError::Constraint(format!(
+                "box.probe_spec_digest `{digest}` is not a lowercase sha256 hex digest"
+            )));
+        }
+        let mut names = HashSet::new();
+        if let Some(name) = probe
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .find(|name| !names.insert(*name))
+        {
+            return Err(StoreError::Constraint(format!(
+                "box_tool `{name}` is listed twice for box `{}`",
+                probe.box_id
+            )));
+        }
+        let id = probe.box_id;
+        let row = self
+            .boxes
+            .get_mut(&id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "box",
+                id: id.to_string(),
+            })?;
+        row.os_version.clone_from(&probe.os_version);
+        row.cpu.clone_from(&probe.cpu);
+        row.ram_mb = probe.ram_mb;
+        row.gpu_present = probe.gpu_present;
+        row.gpu_vendor.clone_from(&probe.gpu_vendor);
+        row.probed_tags.clone_from(&probe.probed_tags);
+        row.htui_version.clone_from(&probe.htui_version);
+        row.last_probed_at = Some(probe.probed_at);
+        row.updated_at = now;
+        self.box_tools.retain(|tool| tool.box_id != id);
+        self.box_tools
+            .extend(probe.tools.iter().map(|tool| BoxTool {
+                box_id: id,
+                name: tool.name.clone(),
+                version: tool.version.clone(),
+                path: tool.path.clone(),
+                probed_at: probe.probed_at,
+            }));
+        self.box_probe_digests.insert(id, digest.clone());
+        Ok(())
+    }
+
+    /// Every box of `user` with its tools and recorded digest (MOD-7 D10, D18): boxes by id,
+    /// tools by name bytes, the order `PgStore`'s `COLLATE "C"` gives. `None` (an empty store) has
+    /// no boxes.
+    fn box_records(&self, user: Option<UserId>) -> Vec<BoxRecord> {
+        let Some(user) = user else {
+            return Vec::new();
+        };
+        let mut rows: Vec<&BoxRow> = self
+            .boxes
+            .values()
+            .filter(|row| row.user_id == user)
+            .collect();
+        rows.sort_by_key(|row| row.id);
+        rows.into_iter()
+            .map(|row| {
+                let mut tools: Vec<BoxTool> = self
+                    .box_tools
+                    .iter()
+                    .filter(|tool| tool.box_id == row.id)
+                    .cloned()
+                    .collect();
+                tools.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+                BoxRecord {
+                    row: row.clone(),
+                    tools,
+                    probe_spec_digest: self.box_probe_digests.get(&row.id).cloned(),
+                }
+            })
+            .collect()
     }
 
     /// The `run` / `run_step` pair of a free-standing chat, both a no-op when the id is already
@@ -4378,12 +4469,13 @@ impl WriteStore for MemStore {
     }
 
     async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
-        let _ = probe;
-        todo!("MOD-7 T2")
+        let now = Utc::now();
+        self.write(|state| state.record_box_probe(probe, now))
     }
 
     async fn boxes(&self) -> Result<Vec<BoxRecord>> {
-        todo!("MOD-7 T2")
+        let user = self.this_user();
+        Ok(self.read(|state| state.box_records(user)))
     }
 
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
