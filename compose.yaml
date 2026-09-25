@@ -49,7 +49,8 @@ services:
       retries: 10
 
   qdrant:
-    image: qdrant/qdrant:latest
+    # MOD-34 D5: pinned to the server matching `qdrant-client 1.19`, as Postgres is pinned to 16.
+    image: qdrant/qdrant:v1.19.1
     container_name: htui-qdrant
     restart: unless-stopped
     ports:

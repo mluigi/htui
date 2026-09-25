@@ -29,7 +29,7 @@ htui-orch          = { workspace = true }
 htui-core          = { workspace = true, features = ["demo"] }
 chrono             = { workspace = true }
 serde_json         = { workspace = true }
-htui-store         = { workspace = true, features = ["demo"] }
+htui-store         = { workspace = true, features = ["demo", "local-embed"] }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
 crossterm          = { workspace = true }

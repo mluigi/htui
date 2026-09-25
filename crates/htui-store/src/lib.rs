@@ -11,6 +11,7 @@
 #![warn(missing_docs)]
 
 pub mod backend;
+pub mod bm25;
 pub mod cache;
 pub mod connect;
 pub mod dsn;
