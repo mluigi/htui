@@ -16,12 +16,14 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AppUser, BoxRow, BoxTool, Document, EventKind, EventRole, GateOutcome, GraphSnapshot,
-    Isolation, Item, ItemKind, ItemKindId, ItemLink, ItemRevision, LinkKind, Note, NoteId,
-    OsFamily, PhaseId, Project, ProjectId, PromptTemplate, PromptTemplateId, Resolution, Run,
-    RunKind, RunMode, RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion,
-    SnapshotCandidate, SnapshotGraph, SnapshotPhase, SnapshotSettings, SnapshotTemplate, Status,
-    StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
+    Agent, AppUser, BoxRow, BoxTool, CitationKind, Document, EventKind, EventRole, GateOutcome,
+    GraphSnapshot, Isolation, Item, ItemKind, ItemKindId, ItemLink, ItemRequirement, ItemRevision,
+    LinkKind, Note, NoteId, OsFamily, PhaseId, Priority, Project, ProjectId, PromptTemplate,
+    PromptTemplateId, Requirement, RequirementArea, RequirementAreaId, RequirementId,
+    RequirementRevision, RequirementSpec, RequirementState, Resolution, Run, RunKind, RunMode,
+    RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion, SnapshotCandidate,
+    SnapshotGraph, SnapshotPhase, SnapshotSettings, SnapshotTemplate, Status, StepGraph,
+    StepGraphId, StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::seed;
@@ -67,6 +69,11 @@ mod class {
     pub const SKILL: u8 = 16;
     /// `skill_binding`. `skill_version` needs none: its primary key is `(skill_id, version)`.
     pub const SKILL_BINDING: u8 = 17;
+    /// `requirement_area` (MOD-38). `requirement_spec`, `requirement_key_counter`,
+    /// `requirement_revision` and `item_requirement` need none: their keys are composite.
+    pub const REQUIREMENT_AREA: u8 = 18;
+    /// `requirement` (MOD-38).
+    pub const REQUIREMENT: u8 = 19;
 }
 
 /// A v7-shaped, fully deterministic UUID: 48-bit timestamp = [`DEMO_EPOCH_MS`] + `class` * 1000 +
@@ -105,8 +112,9 @@ pub fn demo_at(day: i64, hour: i64) -> DateTime<Utc> {
 pub mod ids {
     use super::{class, demo_uuid};
     use crate::model::{
-        AgentId, BoxId, DocumentId, ItemId, ItemKindId, NoteId, PhaseId, ProjectId, RunId,
-        SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
+        AgentId, BoxId, DocumentId, ItemId, ItemKindId, NoteId, PhaseId, ProjectId,
+        RequirementAreaId, RequirementId, RunId, SkillBindingId, SkillId, StepGraphId, StepId,
+        UserId, WorkspaceId,
     };
 
     /// Declares the fixture identifiers of one §5 table.
@@ -307,6 +315,19 @@ pub mod ids {
         /// The `R-SKL-2` override of [`BINDING_HTUI_RUST_STYLE`].
         BINDING_HTUI_IMPLEMENT_RUST_STYLE: SkillBindingId = (class::SKILL_BINDING, 2),
     );
+
+    demo_ids!(
+        /// `requirement_area` `ENT` of project `htui` (MOD-38 blueprint §8).
+        AREA_ENT: RequirementAreaId = (class::REQUIREMENT_AREA, 0),
+        /// `requirement_area` `STO` of project `htui`.
+        AREA_STO: RequirementAreaId = (class::REQUIREMENT_AREA, 1),
+        /// `R-ENT-1`, at v2: amended once by `htui` `ANA-2`, so `ANA-1`'s v1 citation is suspect.
+        REQ_ENT_1: RequirementId = (class::REQUIREMENT, 0),
+        /// `R-ENT-2`, `later`; `htui` `FEAT-2` holds a tombstoned `reserves` citation of it.
+        REQ_ENT_2: RequirementId = (class::REQUIREMENT, 1),
+        /// `R-STO-1`, cited by `htui` `FEAT-1` and the closed `FIX-1`.
+        REQ_STO_1: RequirementId = (class::REQUIREMENT, 2),
+    );
 }
 
 /// The whole fixture: one collection per §5 table `MemStore`'s state holds.
@@ -363,6 +384,18 @@ pub struct DemoData {
     pub steps: Vec<RunStep>,
     /// `session_event` rows.
     pub events: Vec<SessionEvent>,
+    /// `requirement_spec` rows (ANA-11 §5): HTUI only.
+    pub requirement_specs: Vec<RequirementSpec>,
+    /// `requirement_area` rows.
+    pub requirement_areas: Vec<RequirementArea>,
+    /// `requirement_key_counter` rows, keyed by area.
+    pub requirement_key_counter: HashMap<RequirementAreaId, i32>,
+    /// `requirement` rows.
+    pub requirements: Vec<Requirement>,
+    /// `requirement_revision` rows.
+    pub requirement_revisions: Vec<RequirementRevision>,
+    /// `item_requirement` rows, tombstones included.
+    pub item_requirements: Vec<ItemRequirement>,
 }
 
 /// Builds the fixture. Pure: no I/O, no randomness, no clock.
@@ -394,6 +427,12 @@ pub fn demo_data() -> DemoData {
         runs: runs(),
         steps: steps(),
         events: events(),
+        requirement_specs: requirement_specs(),
+        requirement_areas: requirement_areas(),
+        requirement_key_counter: requirement_counters(),
+        requirements: requirements(),
+        requirement_revisions: requirement_revisions(),
+        item_requirements: item_requirements(),
     }
 }
 
@@ -1732,6 +1771,221 @@ fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
+// ---- MOD-38: the requirement set (blueprint §8) ---------------------------------------------
+//
+// `htui` holds a spec header, two areas and three requirements. `R-ENT-1` was amended once, by
+// `ANA-2`, so `ANA-1`'s citation stamped at v1 is the demo's one suspect citation (plan D11).
+
+/// `requirement_spec` (ANA-11 §4.4): `htui` only, so a project without a header is exercised too.
+fn requirement_specs() -> Vec<RequirementSpec> {
+    vec![RequirementSpec {
+        project_id: ids::PROJECT_HTUI,
+        owner_id: ids::USER,
+        preamble: "Requirements of the htui demo project.".to_owned(),
+        version: 1,
+        updated_at: demo_at(2, 9),
+    }]
+}
+
+/// `requirement_area`: `ENT` then `STO`, positions 0 and 1.
+fn requirement_areas() -> Vec<RequirementArea> {
+    [
+        (ids::AREA_ENT, "ENT", "Entity model", 0),
+        (ids::AREA_STO, "STO", "Storage", 1),
+    ]
+    .into_iter()
+    .map(|(id, code, title, position)| RequirementArea {
+        id,
+        project_id: ids::PROJECT_HTUI,
+        code: code.to_owned(),
+        title: title.to_owned(),
+        description: String::new(),
+        position,
+        updated_at: demo_at(2, 9),
+    })
+    .collect()
+}
+
+/// `requirement_key_counter`: the highest number minted per area, so the next mint continues.
+fn requirement_counters() -> HashMap<RequirementAreaId, i32> {
+    HashMap::from([(ids::AREA_ENT, 2), (ids::AREA_STO, 1)])
+}
+
+/// `R-ENT-1`'s body before `ANA-2` amended it: revision 1's text.
+const ENT_1_V1_BODY: &str = "Every item has a key.";
+
+/// `requirement`: `(id, area, code, number, body, rationale, priority, version, created, updated)`.
+fn requirements() -> Vec<Requirement> {
+    type Spec = (
+        RequirementId,
+        RequirementAreaId,
+        &'static str,
+        i32,
+        &'static str,
+        &'static str,
+        Priority,
+        i32,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    );
+    let specs: [Spec; 3] = [
+        (
+            ids::REQ_ENT_1,
+            ids::AREA_ENT,
+            "ENT",
+            1,
+            "Every item has a stable key of the form PREFIX-N.",
+            "Keys are what people type.",
+            Priority::Must,
+            2,
+            demo_at(2, 10),
+            demo_at(4, 10),
+        ),
+        (
+            ids::REQ_ENT_2,
+            ids::AREA_ENT,
+            "ENT",
+            2,
+            "An item may carry a free-form priority.",
+            "",
+            Priority::Later,
+            1,
+            demo_at(2, 11),
+            demo_at(2, 11),
+        ),
+        (
+            ids::REQ_STO_1,
+            ids::AREA_STO,
+            "STO",
+            1,
+            "Postgres is the source of truth; the cache is a read-only mirror.",
+            "",
+            Priority::Must,
+            1,
+            demo_at(2, 12),
+            demo_at(2, 12),
+        ),
+    ];
+    specs
+        .into_iter()
+        .map(
+            |(id, area_id, code, number, body, rationale, priority, version, created, updated)| {
+                Requirement {
+                    id,
+                    project_id: ids::PROJECT_HTUI,
+                    area_id,
+                    area_code: code.to_owned(),
+                    number,
+                    key: format!("R-{code}-{number}"),
+                    body: body.to_owned(),
+                    rationale: rationale.to_owned(),
+                    priority,
+                    state: RequirementState::Active,
+                    version,
+                    created_by: ids::USER,
+                    created_at: created,
+                    updated_at: updated,
+                }
+            },
+        )
+        .collect()
+}
+
+/// `requirement_revision`: v1 of every requirement, plus `R-ENT-1`'s v2 by `ANA-2`.
+fn requirement_revisions() -> Vec<RequirementRevision> {
+    let heads = requirements();
+    let head = |id: RequirementId| {
+        heads
+            .iter()
+            .find(|row| row.id == id)
+            .expect("every revised requirement is a fixture row")
+    };
+    /// `(requirement, version, body if not the head's, reason, amended_by, created_at)`.
+    type Spec = (
+        RequirementId,
+        i32,
+        Option<&'static str>,
+        &'static str,
+        Option<crate::model::ItemId>,
+        DateTime<Utc>,
+    );
+    let specs: [Spec; 4] = [
+        (
+            ids::REQ_ENT_1,
+            1,
+            Some(ENT_1_V1_BODY),
+            "created",
+            None,
+            demo_at(2, 10),
+        ),
+        (
+            ids::REQ_ENT_1,
+            2,
+            None,
+            "amended",
+            Some(ids::HTUI_ANA_2),
+            demo_at(4, 10),
+        ),
+        (ids::REQ_ENT_2, 1, None, "created", None, demo_at(2, 11)),
+        (ids::REQ_STO_1, 1, None, "created", None, demo_at(2, 12)),
+    ];
+    specs
+        .into_iter()
+        .map(|(id, version, body, reason, amended_by, created_at)| {
+            let row = head(id);
+            RequirementRevision {
+                requirement_id: id,
+                version,
+                body: body.map_or_else(|| row.body.clone(), str::to_owned),
+                rationale: row.rationale.clone(),
+                priority: row.priority,
+                state: row.state,
+                author_id: ids::USER,
+                box_id: Some(ids::BOX),
+                reason: reason.to_owned(),
+                amended_by_item_id: amended_by,
+                created_at,
+            }
+        })
+        .collect()
+}
+
+/// `item_requirement`, tombstone included. `created_at` is `demo_at(3, n)` in list order; the
+/// `amends` row was re-stamped by the amend and the tombstone's `updated_at` is its `deleted_at`,
+/// as a store's own write leaves them.
+fn item_requirements() -> Vec<ItemRequirement> {
+    let specs: [(crate::model::ItemId, RequirementId, CitationKind, i32); 5] = [
+        (ids::HTUI_ANA_1, ids::REQ_ENT_1, CitationKind::Addresses, 1),
+        (ids::HTUI_ANA_2, ids::REQ_ENT_1, CitationKind::Amends, 2),
+        (ids::HTUI_FEAT_1, ids::REQ_STO_1, CitationKind::Addresses, 1),
+        (ids::HTUI_FIX_1, ids::REQ_STO_1, CitationKind::Addresses, 1),
+        (ids::HTUI_FEAT_2, ids::REQ_ENT_2, CitationKind::Reserves, 1),
+    ];
+    specs
+        .into_iter()
+        .enumerate()
+        .map(|(index, (item_id, requirement_id, kind, stamp))| {
+            let created_at = demo_at(3, index as i64);
+            let deleted_at = (item_id == ids::HTUI_FEAT_2).then(|| demo_at(5, 9));
+            let updated_at = if kind == CitationKind::Amends {
+                demo_at(4, 10)
+            } else {
+                deleted_at.unwrap_or(created_at)
+            };
+            ItemRequirement {
+                item_id,
+                requirement_id,
+                kind,
+                requirement_version: stamp,
+                proposed_by_step_id: None,
+                created_at,
+                updated_at,
+                deleted_at,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DemoData, demo_at, demo_data, demo_uuid, ids};
@@ -1787,6 +2041,12 @@ mod tests {
             push(row.id.as_uuid());
         }
         for row in &data.steps {
+            push(row.id.as_uuid());
+        }
+        for row in &data.requirement_areas {
+            push(row.id.as_uuid());
+        }
+        for row in &data.requirements {
             push(row.id.as_uuid());
         }
     }

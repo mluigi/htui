@@ -20,19 +20,21 @@ use serde_json::Value;
 
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProfile,
-    BoxRow, BoxSettings, BoxTool, ChatRunSpec, Claim, CommandRun, CommandRunId,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, GateOutcome, Item,
-    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRevision,
-    ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
-    Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
-    PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
-    overlaps, prompt_summary, scope_of,
+    BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
+    CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, GateOutcome,
+    Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink,
+    ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode,
+    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseAgent, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate,
+    PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
+    Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree,
+    RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
+    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceSummary, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -2939,6 +2941,13 @@ impl State {
                     .filter(|row| items.contains(&row.item_id))
                     .count(),
             ),
+            // MOD-38: placeholders until T7 holds the requirement tables.
+            requirement_specs: 0,
+            requirement_areas: 0,
+            requirement_key_counters: 0,
+            requirements: 0,
+            requirement_revisions: 0,
+            item_requirements: 0,
         };
         Some((
             reach,
@@ -4334,6 +4343,43 @@ impl ReadStore for MemStore {
     ) -> Result<Vec<ResolvedInput>> {
         Ok(self.read(|state| state.resolve_inputs(item, run, kinds)))
     }
+
+    // ---- ANA-11 §5.1 (MOD-38): stubs until T7 makes them real ----
+
+    async fn requirement_spec(&self, _project: ProjectId) -> Result<Option<RequirementSpec>> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn requirement_areas(&self, _project: ProjectId) -> Result<Vec<RequirementArea>> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn requirements(
+        &self,
+        _project: ProjectId,
+        _filter: &RequirementFilter,
+    ) -> Result<Vec<Requirement>> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn requirement(&self, _id: RequirementId) -> Result<Option<Requirement>> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn requirement_revisions(
+        &self,
+        _id: RequirementId,
+    ) -> Result<Option<Vec<RequirementRevision>>> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn item_requirements(&self, _item: ItemId) -> Result<Vec<ItemCitation>> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn requirement_coverage(&self, _requirement: RequirementId) -> Result<Vec<CoverageRow>> {
+        unimplemented!("MOD-38 T7")
+    }
 }
 
 impl WriteStore for MemStore {
@@ -4788,6 +4834,79 @@ impl WriteStore for MemStore {
 
     async fn add_note(&self, note: NewNote) -> Result<Note> {
         self.write(|state| state.add_note(note))
+    }
+
+    // ---- ANA-11 §5.1 (MOD-38): stubs until T7 makes them real ----
+
+    async fn set_requirement_spec(
+        &self,
+        _project: ProjectId,
+        _expected_version: Option<i32>,
+        _owner_id: UserId,
+        _preamble: String,
+    ) -> Result<CasOutcome<RequirementSpec>> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn create_requirement_area(&self, _new: NewRequirementArea) -> Result<RequirementArea> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn mint_requirement(
+        &self,
+        _area: RequirementAreaId,
+        _new: NewRequirement,
+    ) -> Result<Requirement> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn amend_requirement(
+        &self,
+        _id: RequirementId,
+        _expected_version: i32,
+        _patch: RequirementPatch,
+        _amended_by: ItemId,
+    ) -> Result<RequirementUpdate> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn withdraw_requirement(
+        &self,
+        _id: RequirementId,
+        _expected_version: i32,
+        _withdrawn_by: ItemId,
+        _author_id: UserId,
+        _box_id: Option<BoxId>,
+    ) -> Result<RequirementUpdate> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn cite(
+        &self,
+        _item: ItemId,
+        _requirement: RequirementId,
+        _kind: CitationKind,
+        _proposed_by: Option<StepId>,
+    ) -> Result<ItemRequirement> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn uncite(
+        &self,
+        _item: ItemId,
+        _requirement: RequirementId,
+        _kind: CitationKind,
+    ) -> Result<()> {
+        unimplemented!("MOD-38 T7")
+    }
+
+    async fn reconfirm(
+        &self,
+        _item: ItemId,
+        _requirement: RequirementId,
+        _kind: CitationKind,
+    ) -> Result<ItemRequirement> {
+        unimplemented!("MOD-38 T7")
     }
 }
 

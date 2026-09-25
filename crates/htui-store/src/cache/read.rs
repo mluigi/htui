@@ -29,13 +29,14 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, Document, DocumentHead, DocumentId,
-    EventKind, EventRole, GateOutcome, Isolation, Item, ItemFilter, ItemId, ItemSummary, LinkEdge,
-    LinkGraph, LinkKind, LinkNode, Note, NoteId, OsFamily, Project, ProjectId, ProjectRef,
-    PromptScope, RepoId, Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus,
-    RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraphId, StepId, StepStatus, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceId,
-    WorkspaceSummary,
+    Agent, AgentId, AgentSummary, Billing, BoxId, BoxInfo, CoverageRow, Document, DocumentHead,
+    DocumentId, EventKind, EventRole, GateOutcome, Isolation, Item, ItemCitation, ItemFilter,
+    ItemId, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, Note, NoteId, OsFamily, Project,
+    ProjectId, ProjectRef, PromptScope, RepoId, Requirement, RequirementArea, RequirementFilter,
+    RequirementId, RequirementRevision, RequirementSpec, Resolution, ResolvedInput, Run, RunId,
+    RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
+    Scope, SessionEvent, Status, StepGraphId, StepId, StepStatus, Transport, UpstreamEntry, UserId,
+    VerifyOutcome, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -1031,6 +1032,43 @@ impl ReadStore for CacheStore {
                 document: by_kind.get(kind.as_str()).map(|&found| found.clone()),
             })
             .collect())
+    }
+
+    // ---- ANA-11 §5.1 (MOD-38): stubs until T9 makes them real ----
+
+    async fn requirement_spec(&self, _project: ProjectId) -> Result<Option<RequirementSpec>> {
+        unimplemented!("MOD-38 T9")
+    }
+
+    async fn requirement_areas(&self, _project: ProjectId) -> Result<Vec<RequirementArea>> {
+        unimplemented!("MOD-38 T9")
+    }
+
+    async fn requirements(
+        &self,
+        _project: ProjectId,
+        _filter: &RequirementFilter,
+    ) -> Result<Vec<Requirement>> {
+        unimplemented!("MOD-38 T9")
+    }
+
+    async fn requirement(&self, _id: RequirementId) -> Result<Option<Requirement>> {
+        unimplemented!("MOD-38 T9")
+    }
+
+    async fn requirement_revisions(
+        &self,
+        _id: RequirementId,
+    ) -> Result<Option<Vec<RequirementRevision>>> {
+        unimplemented!("MOD-38 T9")
+    }
+
+    async fn item_requirements(&self, _item: ItemId) -> Result<Vec<ItemCitation>> {
+        unimplemented!("MOD-38 T9")
+    }
+
+    async fn requirement_coverage(&self, _requirement: RequirementId) -> Result<Vec<CoverageRow>> {
+        unimplemented!("MOD-38 T9")
     }
 }
 

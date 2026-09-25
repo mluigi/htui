@@ -15,14 +15,15 @@ use std::collections::BTreeMap;
 
 use htui_core::model::{
     Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
-    BoxTool, CommandQueue, Document, DocumentHead, DocumentId, Gate, GateOutcome, Isolation, Item,
-    ItemFilter, ItemId, ItemKind, ItemKindId, LinkEdge, LinkGraph, LinkKind, Note, PhaseAgent,
-    PhaseId, Project, ProjectId, ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath,
-    RepoId, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus,
-    RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SkillId,
-    SkillVersion, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, UpstreamEntry,
-    UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject,
-    WorkspaceSummary,
+    BoxTool, CommandQueue, CoverageRow, Document, DocumentHead, DocumentId, Gate, GateOutcome,
+    Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, LinkEdge, LinkGraph,
+    LinkKind, Note, PhaseAgent, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
+    PromptTemplate, Repo, RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementFilter,
+    RequirementId, RequirementRevision, RequirementSpec, ResolvedGraph, ResolvedInput,
+    ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, Scope, SessionEvent, SkillId, SkillVersion, StepGraph, StepGraphId,
+    StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, VerifyOutcome, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -829,6 +830,43 @@ impl ReadStore for PgStore {
                 document: by_kind.get(kind.as_str()).map(|&found| found.clone()),
             })
             .collect())
+    }
+
+    // ---- ANA-11 §5.1 (MOD-38): stubs until T8 makes them real ----
+
+    async fn requirement_spec(&self, _project: ProjectId) -> Result<Option<RequirementSpec>> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn requirement_areas(&self, _project: ProjectId) -> Result<Vec<RequirementArea>> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn requirements(
+        &self,
+        _project: ProjectId,
+        _filter: &RequirementFilter,
+    ) -> Result<Vec<Requirement>> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn requirement(&self, _id: RequirementId) -> Result<Option<Requirement>> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn requirement_revisions(
+        &self,
+        _id: RequirementId,
+    ) -> Result<Option<Vec<RequirementRevision>>> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn item_requirements(&self, _item: ItemId) -> Result<Vec<ItemCitation>> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn requirement_coverage(&self, _requirement: RequirementId) -> Result<Vec<CoverageRow>> {
+        unimplemented!("MOD-38 T8")
     }
 }
 

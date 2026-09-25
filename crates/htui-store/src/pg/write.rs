@@ -17,12 +17,14 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, BoxSettings, ChatRunSpec, Claim, CommandRun, CommandRunId,
-    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
-    NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptTemplateId,
-    Repo, RepoBoxPath, RepoId, RepoPatch, Resolution, Run, RunId, RunKind, RunMode, RunStatus,
+    Agent, AgentBox, AgentId, BoxId, BoxSettings, ChatRunSpec, CitationKind, Claim, CommandRun,
+    CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation,
+    Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
+    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
+    Project, ProjectId, ProjectPatch, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
+    RequirementSpec, RequirementUpdate, Resolution, Run, RunId, RunKind, RunMode, RunStatus,
     RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId,
     StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
     Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, overlaps, scope_of,
@@ -375,6 +377,13 @@ async fn project_reach(conn: &mut PgConnection, id: ProjectId) -> Result<Option<
         revisions: rows(row.revisions),
         links: rows(row.links),
         documents: rows(row.documents),
+        // MOD-38: placeholders until T8 counts the requirement tables.
+        requirement_specs: 0,
+        requirement_areas: 0,
+        requirement_key_counters: 0,
+        requirements: 0,
+        requirement_revisions: 0,
+        item_requirements: 0,
     }))
 }
 
@@ -4060,6 +4069,79 @@ impl WriteStore for PgStore {
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)
+    }
+
+    // ---- ANA-11 §5.1 (MOD-38): stubs until T8 makes them real ----
+
+    async fn set_requirement_spec(
+        &self,
+        _project: ProjectId,
+        _expected_version: Option<i32>,
+        _owner_id: UserId,
+        _preamble: String,
+    ) -> Result<CasOutcome<RequirementSpec>> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn create_requirement_area(&self, _new: NewRequirementArea) -> Result<RequirementArea> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn mint_requirement(
+        &self,
+        _area: RequirementAreaId,
+        _new: NewRequirement,
+    ) -> Result<Requirement> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn amend_requirement(
+        &self,
+        _id: RequirementId,
+        _expected_version: i32,
+        _patch: RequirementPatch,
+        _amended_by: ItemId,
+    ) -> Result<RequirementUpdate> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn withdraw_requirement(
+        &self,
+        _id: RequirementId,
+        _expected_version: i32,
+        _withdrawn_by: ItemId,
+        _author_id: UserId,
+        _box_id: Option<BoxId>,
+    ) -> Result<RequirementUpdate> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn cite(
+        &self,
+        _item: ItemId,
+        _requirement: RequirementId,
+        _kind: CitationKind,
+        _proposed_by: Option<StepId>,
+    ) -> Result<ItemRequirement> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn uncite(
+        &self,
+        _item: ItemId,
+        _requirement: RequirementId,
+        _kind: CitationKind,
+    ) -> Result<()> {
+        unimplemented!("MOD-38 T8")
+    }
+
+    async fn reconfirm(
+        &self,
+        _item: ItemId,
+        _requirement: RequirementId,
+        _kind: CitationKind,
+    ) -> Result<ItemRequirement> {
+        unimplemented!("MOD-38 T8")
     }
 }
 

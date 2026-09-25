@@ -168,6 +168,9 @@ struct Editor {
 
 /// What the section is doing. `Browse` is not a mode in the modal sense: it captures nothing.
 #[derive(Debug, Default)]
+// MOD-38: `DeleteStage` holds a `DeleteReach`, whose six requirement counts pushed `Deleting`
+// past clippy's variant-size threshold; there is one `Mode` per section, so it stays inline.
+#[allow(clippy::large_enum_variant)]
 enum Mode {
     /// The rows, the cursor and the tab's own `h`/`l`.
     #[default]

@@ -13,8 +13,8 @@
 use htui_core::fixtures::DemoData;
 use htui_core::model::{
     AgentId, BoxId, CommandQueue, DocumentId, Gate, GateOutcome, Isolation, ItemId, ItemKindId,
-    NoteId, PhaseId, ProjectId, Resolution, RunId, SkillBindingId, SkillId, StepGraphId, StepId,
-    UserId, WorkspaceId,
+    NoteId, PhaseId, ProjectId, RequirementAreaId, RequirementId, Resolution, RunId,
+    SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
 };
 use htui_core::store::Result;
 
@@ -43,7 +43,7 @@ impl PgStore {
     ///
     /// Whatever the driver reports, through [`map_sqlx`]. The transaction
     /// is rolled back on the first failure.
-    #[allow(clippy::too_many_lines)] // nineteen tables, one INSERT each; splitting hides the order.
+    #[allow(clippy::too_many_lines)] // twenty-nine tables, one INSERT each; splitting hides the order.
     pub async fn load_demo(&mut self, data: &DemoData) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
@@ -469,6 +469,121 @@ impl PgStore {
                 ItemId::as_uuid(row.from_item_id),
                 ItemId::as_uuid(row.to_item_id),
                 row.kind.as_str(),
+                row.proposed_by_step_id.map(StepId::as_uuid),
+                row.created_at,
+                row.updated_at,
+                row.deleted_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        // MOD-38 (blueprint §8): the requirement set, in foreign-key order - spec, areas, their
+        // counters, requirements (never `key`, which is generated), revisions, citations. Every
+        // `updated_at` is passed, as above; `item_requirement` follows the steps for the same
+        // reason `item_link` does.
+        for row in &data.requirement_specs {
+            sqlx::query!(
+                "INSERT INTO requirement_spec (project_id, owner_id, preamble, version, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                ProjectId::as_uuid(row.project_id),
+                UserId::as_uuid(row.owner_id),
+                row.preamble,
+                row.version,
+                row.updated_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        for row in &data.requirement_areas {
+            sqlx::query!(
+                "INSERT INTO requirement_area (id, project_id, code, title, description, position, \
+                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                RequirementAreaId::as_uuid(row.id),
+                ProjectId::as_uuid(row.project_id),
+                row.code,
+                row.title,
+                row.description,
+                row.position,
+                row.updated_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        // Sorted by area id, so the statement order does not follow `HashMap` iteration.
+        let mut requirement_counters: Vec<_> = data.requirement_key_counter.iter().collect();
+        requirement_counters.sort_unstable();
+        for (area, last_value) in requirement_counters {
+            sqlx::query!(
+                "INSERT INTO requirement_key_counter (area_id, last_value) VALUES ($1, $2)",
+                RequirementAreaId::as_uuid(*area),
+                last_value,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        for row in &data.requirements {
+            sqlx::query!(
+                "INSERT INTO requirement (id, project_id, area_id, area_code, number, body, \
+                 rationale, priority, state, version, created_by, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                RequirementId::as_uuid(row.id),
+                ProjectId::as_uuid(row.project_id),
+                RequirementAreaId::as_uuid(row.area_id),
+                row.area_code,
+                row.number,
+                row.body,
+                row.rationale,
+                row.priority.as_str(),
+                row.state.as_str(),
+                row.version,
+                UserId::as_uuid(row.created_by),
+                row.created_at,
+                row.updated_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        for row in &data.requirement_revisions {
+            sqlx::query!(
+                "INSERT INTO requirement_revision (requirement_id, version, body, rationale, \
+                 priority, state, author_id, box_id, reason, amended_by_item_id, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                RequirementId::as_uuid(row.requirement_id),
+                row.version,
+                row.body,
+                row.rationale,
+                row.priority.as_str(),
+                row.state.as_str(),
+                UserId::as_uuid(row.author_id),
+                row.box_id.map(BoxId::as_uuid),
+                row.reason,
+                row.amended_by_item_id.map(ItemId::as_uuid),
+                row.created_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        for row in &data.item_requirements {
+            sqlx::query!(
+                "INSERT INTO item_requirement (item_id, requirement_id, kind, requirement_version, \
+                 proposed_by_step_id, created_at, updated_at, deleted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                ItemId::as_uuid(row.item_id),
+                RequirementId::as_uuid(row.requirement_id),
+                row.kind.as_str(),
+                row.requirement_version,
                 row.proposed_by_step_id.map(StepId::as_uuid),
                 row.created_at,
                 row.updated_at,

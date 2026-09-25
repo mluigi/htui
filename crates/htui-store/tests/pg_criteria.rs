@@ -2466,14 +2466,15 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
 
     /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
     ///
-    /// Twenty-two entries for twenty-two fields: a field added without an entry leaves the struct
-    /// literal below incomplete and the crate does not compile.
+    /// Twenty-eight entries for twenty-eight fields: a field added without an entry leaves the
+    /// struct literal below incomplete and the crate does not compile. MOD-38's six requirement
+    /// tables close the list, in `DeleteReach` field order.
     ///
     /// `TABLES` and `claimed` are zipped **positionally**, so a new name goes where its field sits
     /// in `DeleteReach` and never simply at the end: `run_step_trees` is struct index 16, between
     /// `run_step_commits` and `command_runs`, and appending it to both arrays would compile while
     /// comparing every later field against the wrong table (T1 audit A-3).
-    const TABLES: [&str; 22] = [
+    const TABLES: [&str; 28] = [
         "workspace_project",
         "workspace_box_path",
         "item",
@@ -2496,6 +2497,12 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "item_revision",
         "item_link",
         "document",
+        "requirement_spec",
+        "requirement_area",
+        "requirement_key_counter",
+        "requirement",
+        "requirement_revision",
+        "item_requirement",
     ];
 
     let mut before = Vec::with_capacity(TABLES.len());
@@ -2535,8 +2542,14 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         revisions,
         links,
         documents,
+        requirement_specs,
+        requirement_areas,
+        requirement_key_counters,
+        requirements,
+        requirement_revisions,
+        item_requirements,
     } = report;
-    let claimed: [u64; 22] = [
+    let claimed: [u64; 28] = [
         workspace_links,
         workspace_box_paths,
         items,
@@ -2559,6 +2572,12 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         revisions,
         links,
         documents,
+        requirement_specs,
+        requirement_areas,
+        requirement_key_counters,
+        requirements,
+        requirement_revisions,
+        item_requirements,
     ];
 
     for ((table, was), says) in TABLES.into_iter().zip(before).zip(claimed) {
