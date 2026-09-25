@@ -94,6 +94,11 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   the weight or stays a separate quota concern (ANA-4). Deliver: the weight table's schema and where
   it lives (`agent` row, `app_setting`, or a new table), a refresh method (manual, scripted from
   named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
+  **Findings committed (2026-09-25):** draft verdict in `docs/ANA-21.md` (coarse tiers per phase
+  name in `agent.settings.weights`, cost kept out, deterministic slot rule, manual refresh, draft
+  initial values). Still open: the session's proxy blocked most benchmark and vendor pages, so the
+  figures in §3.3 and the initial values in §5.7 are second-hand and must be re-read from primary
+  sources, and the maintainer calls in §7 are undecided. No close-out yet.
 
 ### Next features
 - [ ] **MOD-38 - Requirements schema, seam and close-out resolution** (from ANA-11). `R-ENT-8`,
