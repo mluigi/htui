@@ -5530,8 +5530,9 @@ mod tests {
 
     /// MOD-7 D37 (blueprint; a deferred T2 finding): `boxes()` lists only this user's boxes, by
     /// ascending id, each box's tools by name bytes, the order `PgStore`'s `ORDER BY id` and
-    /// `COLLATE "C"` give. A second box of the fixture user sorts **before** the fixture's own,
-    /// so insertion order cannot pass; another user's box and its tool never appear.
+    /// `COLLATE "C"` give. Eight more boxes of the fixture user all sort **before** the fixture's
+    /// own, and `State.boxes` is a `HashMap`, so only the sort puts nine rows in id order (an
+    /// accidental hash order is about one in 362 880); another user's box and its tool never appear.
     #[tokio::test]
     async fn boxes_lists_only_this_user_s_boxes_in_id_order() {
         use crate::model::{AppUser, BoxTool};
@@ -5567,6 +5568,20 @@ mod tests {
         theirs.hostname = "ELSEWHERE".to_owned();
         data.boxes.push(mine);
         data.boxes.push(theirs);
+        let extra: Vec<BoxId> = (3..=9)
+            .map(|n| BoxId::from_uuid(Uuid::from_u128(n)))
+            .collect();
+        for (n, id) in extra.iter().enumerate() {
+            let mut row = data
+                .boxes
+                .iter()
+                .find(|row| row.id == second)
+                .expect("the second box")
+                .clone();
+            row.id = *id;
+            row.hostname = format!("EXTRA-{n}");
+            data.boxes.push(row);
+        }
         for (box_id, name) in [
             (second, "awk"),
             (second, "Zig"),
@@ -5591,11 +5606,10 @@ mod tests {
         let records = store.boxes().await.expect("boxes must not fail");
 
         let listed: Vec<BoxId> = records.iter().map(|record| record.row.id).collect();
-        assert_eq!(
-            listed,
-            [second, ids::BOX],
-            "this user's two boxes, by ascending id"
-        );
+        let mut expected = vec![second];
+        expected.extend(extra.iter().copied());
+        expected.push(ids::BOX);
+        assert_eq!(listed, expected, "this user's nine boxes, by ascending id");
         assert!(
             records.iter().all(|record| record.row.user_id == ids::USER),
             "no other user's box is listed: {records:?}"
@@ -5606,7 +5620,7 @@ mod tests {
             .map(|tool| tool.name.as_str())
             .collect();
         assert_eq!(tools, ["Zig", "_x", "awk"], "tools by name bytes");
-        let fixture_tools: Vec<&str> = records[1]
+        let fixture_tools: Vec<&str> = records[records.len() - 1]
             .tools
             .iter()
             .map(|tool| tool.name.as_str())
