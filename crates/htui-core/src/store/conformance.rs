@@ -4908,7 +4908,8 @@ fn box_probe(box_id: BoxId, at: DateTime<Utc>, tools: Vec<ProbedTool>, spec: &st
 
 /// MOD-7 D10, D33: `record_box_probe` writes the nine probe columns and **replaces** the box's
 /// `box_tool` set, and touches none of the columns a person or registration owns. A probe that
-/// repeats a tool name is a `Constraint` and writes nothing.
+/// repeats a tool name, or whose spec digest is not 64 lowercase hex, is a `Constraint` and writes
+/// nothing.
 async fn record_box_probe_replaces_profile_and_tools<S: WriteStore>(store: &S) {
     const CASE: &str = "record_box_probe_replaces_profile_and_tools";
     let fixture = fixture_box();
@@ -5031,9 +5032,30 @@ async fn record_box_probe_replaces_profile_and_tools<S: WriteStore>(store: &S) {
         before,
         "{CASE}: the refused probe wrote nothing"
     );
+
+    let mut malformed = box_probe(
+        ids::BOX,
+        probe_clock(150),
+        vec![probed_tool("d", "4.0")],
+        "four",
+    );
+    malformed.spec_digest = "abc".to_owned();
+    let malformed = store.record_box_probe(&malformed).await;
+    assert!(
+        matches!(malformed, Err(StoreError::Constraint(_))),
+        "{CASE}: a digest that is not 64 lowercase hex is a Constraint, got {malformed:?}"
+    );
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        before,
+        "{CASE}: the probe with a malformed digest wrote nothing"
+    );
 }
 
-/// MOD-7 D10: a probe of a box nobody registered is `NotFound` and writes nothing.
+/// MOD-7 D10: a probe of a box nobody registered is `NotFound` and writes nothing, and the
+/// unknown box wins over every `Constraint` the same probe would also hit - a malformed digest or
+/// a repeated tool name - because `PgStore`'s `UPDATE .. WHERE id` finds no row before any
+/// `CHECK` or key is consulted.
 async fn record_box_probe_refuses_an_unknown_box<S: WriteStore>(store: &S) {
     const CASE: &str = "record_box_probe_refuses_an_unknown_box";
     let before = store.boxes().await.expect(CASE);
@@ -5049,10 +5071,39 @@ async fn record_box_probe_refuses_an_unknown_box<S: WriteStore>(store: &S) {
         matches!(unknown, Err(StoreError::NotFound { entity: "box", .. })),
         "{CASE}: an unknown box is NotFound, got {unknown:?}"
     );
+
+    let mut malformed = box_probe(
+        BoxId::new(),
+        probe_clock(30),
+        vec![probed_tool("a", "1.0")],
+        "two",
+    );
+    malformed.spec_digest = "abc".to_owned();
+    let malformed = store.record_box_probe(&malformed).await;
+    assert!(
+        matches!(malformed, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box with a malformed digest is NotFound, not Constraint, got \
+         {malformed:?}"
+    );
+
+    let twice = store
+        .record_box_probe(&box_probe(
+            BoxId::new(),
+            probe_clock(60),
+            vec![probed_tool("a", "1.0"), probed_tool("a", "1.1")],
+            "three",
+        ))
+        .await;
+    assert!(
+        matches!(twice, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box with a repeated tool name is NotFound, not Constraint, got \
+         {twice:?}"
+    );
+
     assert_eq!(
         store.boxes().await.expect(CASE),
         before,
-        "{CASE}: the refused probe wrote nothing"
+        "{CASE}: the refused probes wrote nothing"
     );
 }
 
