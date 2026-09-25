@@ -10,7 +10,10 @@ authentication, reversing `docs/ANA-4.md` §4.5; implemented as MOD-21), R-AGT-1
 "`agy` over ACP is unverified" clause withdrawn as settled by ANA-4 and proven by MOD-2 milestone 6;
 amended 2026-09-11 by maintainer decision on MOD-25 withdrawing ANA-10 — R-STO-7 withdrawn,
 and previous 11 ANA-10 amendments reverted to online-only requirements;
-amended 2026-09-14 by maintainer decision — R-MCP-2 added spawn_subagent, R-AGT-4 added claude-cli.
+amended 2026-09-14 by maintainer decision — R-MCP-2 added spawn_subagent, R-AGT-4 added claude-cli;
+amended 2026-09-25 by maintainer decision on ANA-11 (`docs/ANA-11.md` §7,
+`docs/decisions/ana/ana-11.md`) — R-ENT-14 and R-ENT-15 added; R-ENT-8, R-NF-4, R-STO-3 and
+R-TUI-1 amended in place; the optional R-MCP-2 `requirement_cite` amendment deferred to MOD-11.
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -101,7 +104,8 @@ conflict. Their verdicts survive only where restated here.
   in a project mirrored from a server, while that server is unreachable, is not supported (see R-STO-4).
 - **R-ENT-8 (must).** Item status is one of `open`, `queued`, `in_progress`, `awaiting_approval`,
   `blocked`, `done`, `failed`, `closed`. Transitions are driven by the orchestrator and by close-out,
-  not edited by hand.
+  not edited by hand. A closed item carries a resolution: `done`, `concluded`, `rejected`,
+  `withdrawn`, `superseded` or `duplicate`. Resolution is not a status.
 - **R-ENT-9 (must).** Item links are directed edges by UUID with kind `blocked_by`, `origin`,
   `relates`, `supersedes`. Because edges use UUIDs, cross-project links need nothing extra. Links
   are proposed by agents through the `htui` MCP server (R-MCP-2) and by the importer (R-LATER-3);
@@ -116,6 +120,12 @@ conflict. Their verdicts survive only where restated here.
   steps or written by hand.
 - **R-ENT-13 (withdrawn).** Atomic facts table with importance scores (ANA-1 `artifact`,
   `artifact_link`). Dropped as over-engineered; summaries cover the need. Re-open only on evidence.
+- **R-ENT-14 (must).** `requirement`: key `R-<AREA>-<N>` minted per project and area, never
+  reused. It has body, rationale, priority `must`/`later`, state `active`/`withdrawn`, and a
+  `version` with revisions naming the deciding item. Text changes only by human action.
+- **R-ENT-15 (must).** Items cite requirements with kind `addresses`, `amends`, `withdraws` or
+  `reserves`. Each citation records the requirement version it was made against, and a newer
+  version marks it suspect until re-confirmed.
 
 ## 4. Storage, cache and offline (R-STO)
 
@@ -126,7 +136,8 @@ conflict. Their verdicts survive only where restated here.
 - **R-STO-2 (must).** TLS to Postgres is supported and optional.
 - **R-STO-3 (must).** Each box keeps a read-only cache of the projects it has opened under the
   user's config directory, refreshed on every successful connection. Contents: items, links,
-  documents, notes, run and step summaries, and transcripts of the last N steps (N configurable).
+  documents, notes, requirements and citations, run and step summaries, and transcripts of the
+  last N steps (N configurable).
 - **R-STO-4 (must).** When Postgres is unreachable, the TUI opens in offline
   read-only mode from the cache: browse items, graph, documents and cached transcripts. No item
   creation, no runs.
@@ -278,7 +289,7 @@ conflict. Their verdicts survive only where restated here.
 
 - **R-TUI-1 (must).** Keyboard driven, mouse optional. Top bar: workspace or project, box, store
   state — distinguishing online, connecting, and offline since T
-  — active run count. Tabs: Backlog, Chat (one per session), Skills, Settings. Workspace switcher
+  — active run count. Tabs: Backlog, Chat (one per session), Skills, Requirements, Settings. Workspace switcher
   overlay. Queue overlay for auto mode with reorder and pause.
 - **R-TUI-2 (must).** Backlog left pane: items grouped by project, filters by status, project,
   capability and readiness. Actions: new, edit, run, queue, close, open graph.
@@ -325,7 +336,8 @@ Designed for, not built in version one. Each needs its own `ANA-N` before implem
 - **R-NF-2 (must).** No dependency on any external daemon other than Postgres and the agents.
 - **R-NF-3 (must).** All long operations (probe, cache refresh, sessions) run off the UI thread;
   the TUI never blocks on network or subprocess I/O.
-- **R-NF-4 (must).** Every `ANA-N` and `MOD-N` item cites the requirement IDs it addresses.
+- **R-NF-4 (must).** Every `ANA-N` and `MOD-N` item cites, as `addresses` citations, the
+  requirement IDs it addresses.
 
 ## 14. Out of scope
 

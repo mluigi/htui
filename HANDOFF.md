@@ -16,8 +16,8 @@
 
 **Current status (2026-09-25):** **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`):
 requirements get dedicated tables with suspect-aware item citations; a decision is a closed item with
-a new `item.resolution` and its `summary` document. Spawned MOD-38 (schema, blocked on the
-maintainer applying `docs/ANA-11.md` §7) and MOD-39 (TUI).
+a new `item.resolution` and its `summary` document. Spawned MOD-38 (schema; §7 applied to
+`docs/REQUIREMENTS.md` 2026-09-25, R-MCP-2 deferred to MOD-11) and MOD-39 (TUI).
 Before it, **ANA-16 was done** (2026-09-24, `docs/decisions/ana/ana-16.md`): remote and container
 execution is a headless `htui worker` per box on Postgres first (MOD-40..46), with a self-hosted
 control plane and config manager as trigger-gated phase 2 (MOD-47, MOD-48); requirement amendments
@@ -97,17 +97,18 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 
 ### Next features
 - [ ] **MOD-38 - Requirements schema, seam and close-out resolution** (from ANA-11). `R-ENT-8`,
-  `R-NF-4`, `R-STO-3`, `R-TUI-9`, proposed `R-ENT-14..15`. Migration `0005_requirements.sql`
+  `R-NF-4`, `R-STO-3`, `R-TUI-9`, `R-ENT-14..15`. Migration `0005_requirements.sql`
   (`requirement_spec`, `requirement_area`, `requirement_key_counter`, `requirement`,
   `requirement_revision`, `item_requirement` with a version stamp for derived suspect links, and
   `item.resolution` with the closed-iff-resolved CHECK and a `done` backfill), cache migration
   `0004_requirements.sql`, and the `ReadStore`/`WriteStore` methods of `docs/ANA-11.md` §5.1 on
   `MemStore`, `PgStore` and the cache. `close_out` takes a resolution and allows `open` → `closed`
   only for `rejected`/`withdrawn`/`superseded`/`duplicate`, which amends ANA-2 §4.3. The demo fixture
-  gains requirements with one suspect citation. **Blocked on a maintainer decision:** apply or
-  amend the requirement text proposed in `docs/ANA-11.md` §7 to `docs/REQUIREMENTS.md` first.
+  gains requirements with one suspect citation. Unblocked 2026-09-25: the maintainer applied
+  `docs/ANA-11.md` §7 to `docs/REQUIREMENTS.md`, deferring the optional `R-MCP-2`
+  `requirement_cite` amendment to MOD-11.
 - [ ] **MOD-39 - Requirements tab and item traceability** (from ANA-11; blocked on MOD-38).
-  `R-TUI-1`, `R-TUI-9`, proposed `R-ENT-14..15`. Requirements tab (areas, requirements, coverage by
+  `R-TUI-1`, `R-TUI-9`, `R-ENT-14..15`. Requirements tab (areas, requirements, coverage by
   citing item with status and resolution, withdrawn rows dimmed, revision trail with the deciding
   item); cited requirements with suspect markers and a re-confirm action in item detail; a
   resolution picker in MOD-4's Runs-pane close-out confirmation; maintainer-only
