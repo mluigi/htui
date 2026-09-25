@@ -151,8 +151,10 @@ pub struct Install {
 /// that does not parse declares nothing.
 #[must_use]
 pub fn declares_install(launch: &serde_json::Value) -> bool {
-    let _ = launch;
-    todo!("MOD-7 T3: declares_install")
+    serde_json::from_value::<AgentLaunch>(launch.clone())
+        .ok()
+        .and_then(|launch| launch.discovery)
+        .is_some_and(|discovery| discovery.install.is_some())
 }
 
 wire_enum!(

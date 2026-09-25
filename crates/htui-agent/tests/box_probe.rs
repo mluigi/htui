@@ -227,13 +227,15 @@ fn tags_from_presence() {
         |answer: bool| -> BTreeMap<String, bool> { BTreeMap::from([("mingw".to_owned(), answer)]) };
     let none = BTreeMap::new();
 
-    let cases: Vec<(
-        &str,
+    // (what, present tools, a GPU, the `ask` answers, the tags expected)
+    type Case<'a> = (
+        &'a str,
         BTreeSet<String>,
         bool,
         BTreeMap<String, bool>,
-        Vec<&str>,
-    )> = vec![
+        Vec<&'a str>,
+    );
+    let cases: Vec<Case<'_>> = vec![
         (
             "cargo alone",
             set(&["cargo"]),
