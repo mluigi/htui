@@ -836,6 +836,7 @@ const ITEM_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
     "closed_at",
+    "resolution",
 ];
 
 async fn refresh_item(
@@ -848,7 +849,7 @@ async fn refresh_item(
     let rows = sqlx::query!(
         r#"SELECT id, project_id, kind_id, key_prefix, key_number, key as "key!", title, body,
                   status, priority, required_tags, touched_paths, step_graph_id, version,
-                  created_by, created_at, updated_at, closed_at
+                  created_by, created_at, updated_at, closed_at, resolution
              FROM item WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at"#,
         project.as_uuid(),
         since,
@@ -879,6 +880,7 @@ async fn refresh_item(
             .bind(ts_bind(row.created_at))
             .bind(ts_bind(row.updated_at))
             .bind(row.closed_at.map(ts_bind))
+            .bind(&row.resolution)
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
