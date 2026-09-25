@@ -957,13 +957,13 @@ pub fn below_min(version: &str, min: &str) -> bool {
 }
 
 /// What one bounded one-shot child produced.
-struct OneShot {
+pub(crate) struct OneShot {
     /// Its stdout, capped at [`STDOUT_LIMIT`](crate::launch::STDOUT_LIMIT).
-    stdout: String,
+    pub(crate) stdout: String,
     /// How it exited.
-    status: ExitStatus,
+    pub(crate) status: ExitStatus,
     /// The last lines it wrote to stderr.
-    stderr: Vec<String>,
+    pub(crate) stderr: Vec<String>,
 }
 
 /// Runs one short-lived child to completion under `env.version_timeout`, or answers `None`.
@@ -979,7 +979,11 @@ struct OneShot {
 /// wait failed, or it hung — because every caller here treats all of those as "this tier found
 /// nothing", which is the honest report for a box whose tool is absent or broken. `what` names the
 /// child in the log.
-async fn run_bounded(what: &str, launch: &ResolvedLaunch, env: &ProbeEnv) -> Option<OneShot> {
+pub(crate) async fn run_bounded(
+    what: &str,
+    launch: &ResolvedLaunch,
+    env: &ProbeEnv,
+) -> Option<OneShot> {
     let spawned = match crate::launch::spawn(launch, &env.cwd).await {
         Ok(spawned) => spawned,
         Err(error) => {
