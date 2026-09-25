@@ -453,7 +453,7 @@ mod tests {
             args,
             [
                 "-c",
-                "code --wait \"$1\"",
+                "exec code --wait \"$1\"",
                 "htui-editor",
                 "/tmp/htui-implement-x.md"
             ]
@@ -668,10 +668,7 @@ mod tests {
             );
             let outcome = run(&cmd, "hello\n", "implement").await;
             assert!(
-                matches!(
-                    outcome,
-                    ExternalEditOutcome::Unchanged { .. } | ExternalEditOutcome::Failed(_)
-                ),
+                matches!(outcome, ExternalEditOutcome::Unchanged { .. }),
                 "{outcome:?}"
             );
             // Still here: the default disposition would have ended this process above.
@@ -679,6 +676,25 @@ mod tests {
             assert!(
                 matches!(outcome, ExternalEditOutcome::Unchanged { .. }),
                 "{outcome:?}"
+            );
+        }
+
+        /// An editor that traps Ctrl-C (`ed`, `ex`) keeps running and saves. The terminal signals
+        /// the whole group, so the editor's parent gets the key too: were that a shell waiting on
+        /// the editor (`sh -c` without `exec`), the shell would die, and htui would report a
+        /// failure and remove the file the editor is about to save. `$PPID` is that parent.
+        #[tokio::test]
+        async fn an_editor_that_survives_the_interrupt_keeps_its_edit() {
+            let dir = TempDir::new().unwrap();
+            let cmd = script(
+                &dir,
+                "trapping",
+                "trap '' INT\nkill -INT $PPID\nsleep 0.2\nprintf 'more\\n' >> \"$1\"",
+            );
+            let outcome = run(&cmd, "hello\n", "implement").await;
+            assert_eq!(
+                outcome,
+                ExternalEditOutcome::Edited("hello\nmore\n".to_owned())
             );
         }
 
@@ -693,11 +709,8 @@ mod tests {
             let ExternalEditOutcome::Failed(message) = outcome else {
                 panic!("expected Failed, got {outcome:?}");
             };
-            // `sh -c` reports its child's death by SIGINT as 130; an `exec`ing shell, as a signal.
-            assert!(
-                message.contains("exited with 130") || message.contains("exited with a signal"),
-                "{message}"
-            );
+            // The editor is htui's own child (`exec`), so its death reads as a signal, not 130.
+            assert!(message.contains("exited with a signal"), "{message}");
         }
     }
 
@@ -823,6 +836,57 @@ mod tests {
             assert!(result.is_err(), "the editor was still running");
             assert!(started.elapsed() < Duration::from_secs(4));
             assert_eq!(term.calls, ["leave", "enter"]);
+        }
+
+        /// `kill_on_drop` reaches the editor itself, not a shell between htui and it. The script
+        /// does not `exec` its `sleep`: the script is the editor, and its pid is what must die.
+        #[tokio::test]
+        async fn a_dropped_future_kills_the_editor() {
+            let dir = TempDir::new().unwrap();
+            let pid_file = dir.path().join("editor.pid");
+            let cmd = script(
+                &dir,
+                "slow",
+                &format!("printf '%s' $$ > '{}'\nsleep 5", pid_file.display()),
+            );
+            let mut term = FakeTerminal::default();
+            let edit = edit();
+            let mut running = Box::pin(run_suspended(&mut term, &cmd, &edit));
+            let pid = loop {
+                tokio::select! {
+                    outcome = &mut running => panic!("the editor returned: {outcome:?}"),
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .filter(|pid| !pid.is_empty())
+                {
+                    break pid;
+                }
+            };
+            drop(running);
+            assert_eq!(term.calls, ["leave", "enter"]);
+
+            // SIGKILL is sent on drop; tokio reaps in the background, so a zombie counts as gone.
+            let started = Instant::now();
+            while alive(&pid) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "the editor (pid {pid}) outlived the dropped future"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Whether `pid` is a live process: `ps` knows it and it is not a zombie.
+        fn alive(pid: &str) -> bool {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .expect("run ps");
+            let stat = String::from_utf8_lossy(&out.stdout);
+            let stat = stat.trim();
+            !stat.is_empty() && !stat.starts_with('Z')
         }
     }
 }
