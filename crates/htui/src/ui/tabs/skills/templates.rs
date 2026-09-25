@@ -203,6 +203,9 @@ struct Editor {
     confirm_item: bool,
     /// `Esc` warned about unsaved changes; the next one discards.
     esc_armed: bool,
+    /// The body the save in flight carries: what tells that save's row from another session's
+    /// at the same version, and a draft typed on since from the one that was saved.
+    sent: Option<String>,
 }
 
 impl Editor {
@@ -223,6 +226,7 @@ impl Editor {
             original: text.to_owned(),
             confirm_item: false,
             esc_armed: false,
+            sent: None,
         }
     }
 }
@@ -310,13 +314,15 @@ impl TemplatesView {
                 self.unavailable = None;
                 if self.busy == Some(SAVE_NAME) {
                     self.busy = None;
-                    if let Mode::Editing(editor) = &mut self.mode
-                        && let Some(head) = snapshot.head(editor.project, &editor.name)
-                    {
-                        // The draft stays; the token moves to the head the user has now been
-                        // told about, so the next `Ctrl+S` is a deliberate overwrite-by-append.
-                        editor.token = Some(head.version);
-                        self.notice = Some(Notice::Error(template_changed_elsewhere(head.version)));
+                    if let Mode::Editing(editor) = &mut self.mode {
+                        editor.sent = None;
+                        if let Some(head) = snapshot.head(editor.project, &editor.name) {
+                            // The draft stays; the token moves to the head the user has now been
+                            // told about, so the next `Ctrl+S` is a deliberate overwrite-by-append.
+                            editor.token = Some(head.version);
+                            self.notice =
+                                Some(Notice::Error(template_changed_elsewhere(head.version)));
+                        }
                     }
                 }
                 self.clamp_cursor();
@@ -327,6 +333,9 @@ impl TemplatesView {
             StoreReply::Failed { request, message } if REQUEST_NAMES.contains(request) => {
                 // A refused save leaves the editor over its text: nothing was written.
                 self.busy = None;
+                if let Mode::Editing(editor) = &mut self.mode {
+                    editor.sent = None;
+                }
                 self.notice = Some(Notice::Error(message.clone()));
             }
             _ => {}
@@ -656,13 +665,15 @@ impl TemplatesView {
                 self.notice = Some(Notice::Info(OMITS_ITEM.to_owned()));
             }
             Ok(_) => {
+                let body = editor.area.text().to_owned();
+                editor.sent = Some(body.clone());
                 self.busy = Some(SAVE_NAME);
                 self.notice = Some(Notice::Info(SAVING.to_owned()));
                 ctx.request(StoreRequest::SaveTemplate {
                     scope: ctx.scope.clone(),
                     project: editor.project,
                     name: editor.name.clone(),
-                    body: editor.area.text().to_owned(),
+                    body,
                     expected: editor.token,
                 });
             }
@@ -756,9 +767,16 @@ impl TemplatesView {
     }
 
     /// Blueprint D27 (F-J): a `Templates` reply is the save's answer only while the save is in
-    /// flight **and** the head of the edited name is above the token. A read served before the
-    /// save (a `Tab` away and back, `2`, `r`) refreshes the tree and leaves the editor, the token
-    /// and `busy` alone.
+    /// flight **and** it holds a version above the token. A read served before the save (a `Tab`
+    /// away and back, `2`, `r`) refreshes the tree and leaves the editor, the token and `busy`
+    /// alone.
+    ///
+    /// "Above the token" is narrowed to the one row an applied save writes: version `token + 1`
+    /// with the body that was sent. A read that shows another session's `token + 1` is not the
+    /// answer either; the save's own reply is then `TemplatesStale`, which keeps the draft.
+    ///
+    /// Keys typed while the save was in flight still edit the draft. When they did, the editor
+    /// stays open on them with the token at the saved version, so the next `Ctrl+S` appends them.
     fn land_save(&mut self) {
         if self.busy != Some(SAVE_NAME) {
             return;
@@ -766,24 +784,44 @@ impl TemplatesView {
         let (Some(snapshot), Mode::Editing(editor)) = (&self.snapshot, &self.mode) else {
             return;
         };
-        let Some(head) = snapshot.head(editor.project, &editor.name) else {
+        let Some(sent) = editor.sent.as_deref() else {
             return;
         };
-        if head.version <= editor.token.unwrap_or(0) {
+        let version = editor.token.unwrap_or(0) + 1;
+        if snapshot
+            .version(editor.project, &editor.name, version)
+            .is_none_or(|row| row.body != sent)
+        {
             return;
         }
         let saved = Row::Template {
             project: editor.project,
             name: editor.name.clone(),
         };
-        self.notice = Some(Notice::Info(format!("saved v{}", head.version)));
         self.busy = None;
-        self.mode = Mode::Browse;
         self.shown = None;
         self.base = None;
         self.pane = Pane::Body;
         if let Some(index) = self.rows().iter().position(|row| *row == saved) {
             self.cursor = index;
+        }
+        let Mode::Editing(editor) = &mut self.mode else {
+            return;
+        };
+        let sent = editor.sent.take().unwrap_or_default();
+        if editor.area.text() == sent {
+            self.notice = Some(Notice::Info(format!("saved v{version}")));
+            self.mode = Mode::Browse;
+        } else {
+            editor.token = Some(version);
+            editor.from = Some(version);
+            editor.original = sent;
+            editor.confirm_item = false;
+            editor.esc_armed = false;
+            self.notice = Some(Notice::Info(format!(
+                "saved v{version} \u{2014} later edits kept, Ctrl+S saves them as v{}",
+                version + 1
+            )));
         }
     }
 
