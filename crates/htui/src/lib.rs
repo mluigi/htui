@@ -42,6 +42,7 @@ use htui_core::store::MemStore;
 use htui_store::{Backend, StartOptions, Started, connect, identity, secret};
 use tokio::sync::mpsc;
 
+use crate::agent_worker::AgentRuntime;
 use crate::app::App;
 use crate::keymap::Keymap;
 
@@ -89,7 +90,13 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     let (request_tx, request_rx) = mpsc::unbounded_channel();
     let (reply_tx, reply_rx) = mpsc::unbounded_channel();
     // The backend moves into the worker here and is unreachable from the UI afterwards (D4).
-    let worker = store_worker::spawn(started, request_rx, reply_tx);
+    // MOD-7 D11: the binary, and only the binary, opts in to the registration probe.
+    let worker = store_worker::spawn_with(
+        started,
+        request_rx,
+        reply_tx,
+        AgentRuntime::production().with_registration_probe(),
+    );
 
     let mut app = App::new(request_tx, Keymap::default_global());
     app.top_bar.store = label;

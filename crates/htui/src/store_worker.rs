@@ -1288,24 +1288,44 @@ pub fn spawn_with_runtimes(
                             // `if held.is_some()` above, so this cannot be the `None` arm; the
                             // store has to be moved out to be applied (`&mut self`).
                             match held.take() {
-                                Some(mut pg) => match pg.apply_migrations().await {
-                                    Ok(()) => {
-                                        let applied = pending.take().unwrap_or(0);
-                                        tracing::info!(applied, "schema migrations applied");
-                                        go_online(
-                                            &mut backend, pg, &mut refresher, &mut health,
-                                            &projects, settings,
-                                        ).await;
-                                        // D190: an `Online` swap sweeps, whichever path made it.
-                                        runs.sweep(&backend, &tx);
-                                        StoreReply::MigrationsApplied { applied }
+                                Some(mut pg) => {
+                                    // What `box.toml` said: this store connected to a pending
+                                    // schema, so nothing has registered it yet (MOD-7 D3).
+                                    let presented = pg.identity().clone();
+                                    match pg.apply_migrations().await {
+                                        Ok(()) => {
+                                            let applied = pending.take().unwrap_or(0);
+                                            tracing::info!(applied, "schema migrations applied");
+                                            // MOD-7 D3: this bootstrap registered the box, so
+                                            // a minted id is written back here, as
+                                            // `try_connect` does over an up-to-date schema.
+                                            if let Some(ctx) = connect.as_ref()
+                                                && let Err(err) = connect::persist_registration(
+                                                    &ctx.config_root, &presented, &pg,
+                                                )
+                                            {
+                                                tracing::warn!(
+                                                    %err,
+                                                    "the registered box id was not written back to box.toml"
+                                                );
+                                            }
+                                            go_online(
+                                                &mut backend, pg, &mut refresher, &mut health,
+                                                &projects, settings,
+                                            ).await;
+                                            // MOD-7 D11: the registration probe, then D190's sweep.
+                                            runtime.on_online(&backend, &tx);
+                                            runs.sweep(&backend, &tx);
+                                            StoreReply::MigrationsApplied { applied }
+                                        }
+                                        Err(err) => {
+                                            // Still pending, still held: `y` can be answered
+                                            // again.
+                                            held = Some(pg);
+                                            failed("apply_migrations", &err)
+                                        }
                                     }
-                                    Err(err) => {
-                                        // Still pending, still held: `y` can be answered again.
-                                        held = Some(pg);
-                                        failed("apply_migrations", &err)
-                                    }
-                                },
+                                }
                                 None => StoreReply::MigrationsApplied { applied: 0 },
                             }
                         }
@@ -1586,6 +1606,8 @@ pub fn spawn_with_runtimes(
                         .await;
                         last_attempt = Some(Attempt { at: Utc::now(), outcome: AttemptOutcome::Online });
                         tracing::info!(label = backend.label(), "store online");
+                        // MOD-7 D11: the registration probe decides on its own task.
+                        runtime.on_online(&backend, &tx);
                         // D190: every `Online` sweeps, so a run a dead process left is adopted.
                         runs.sweep(&backend, &tx);
                     }

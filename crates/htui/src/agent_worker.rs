@@ -120,7 +120,38 @@ impl BoxProbeReport {
     /// half's failure and the ignored spec, each only when there is one.
     #[must_use]
     pub fn status_line(&self) -> String {
-        todo!("MOD-7 T4 (c)")
+        use core::fmt::Write as _;
+
+        let mut line = match &self.box_failed {
+            Some(message) => format!("box probe failed: {message}"),
+            None if self.probed_tags.is_empty() => {
+                format!("box probed: {} tools · no tags", self.tools)
+            }
+            None => format!(
+                "box probed: {} tools · tags {}",
+                self.tools,
+                self.probed_tags.join(", ")
+            ),
+        };
+        if !self.installable.is_empty() {
+            let verb = if self.installable.len() == 1 {
+                "is"
+            } else {
+                "are"
+            };
+            let _ = write!(
+                line,
+                " · {} {verb} missing and can be installed: Settings > Agents, i",
+                self.installable.join(", ")
+            );
+        }
+        if let Some(message) = &self.agents_failed {
+            let _ = write!(line, " · agent probe failed: {message}");
+        }
+        if let Some(error) = &self.spec_error {
+            let _ = write!(line, " · {error}");
+        }
+        line
     }
 }
 
@@ -470,8 +501,38 @@ impl AgentRuntime {
     /// `--demo` and the harness never reach a `go_online`. A claim held elsewhere skips the probe
     /// until the next swap (R-12); nothing was recorded, so the next launch retries.
     pub fn on_online(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
-        let _ = (backend, replies);
-        todo!("MOD-7 T4 (c)")
+        if !self.registration_probe {
+            return;
+        }
+        self.sweep_finished();
+        if let Err(err) = self.claim_is_free() {
+            tracing::info!(reason = %err, "the registration probe waits for the next connect");
+            return;
+        }
+        let Some(writer) = backend.writer() else {
+            return;
+        };
+        let (env, hardware) = match self.probe_env() {
+            Ok(found) => found,
+            Err(err) => {
+                tracing::warn!(%err, "the registration probe has no env to probe through");
+                return;
+            }
+        };
+        self.box_probe = Some(tokio::spawn(run_box_probe(BoxProbeArgs {
+            backend: backend.clone(),
+            writer,
+            env,
+            hardware,
+            decide: true,
+            frames: Frames::new(
+                replies.clone(),
+                ReplyAddr {
+                    seq: UNSOLICITED,
+                    origin: Origin::App,
+                },
+            ),
+        })));
     }
 
     /// The production runtime: every transport this build ships, which is whatever
@@ -1108,8 +1169,23 @@ impl AgentRuntime {
         replies: &mpsc::UnboundedSender<ReplyEnvelope>,
         addr: ReplyAddr,
     ) -> Result<Served, StoreError> {
-        let _ = (backend, replies, addr);
-        todo!("MOD-7 T4 (c)")
+        // Since MOD-25 an offline backend answers `None` here: the registry is on the server.
+        let writer = backend.writer().ok_or_else(|| {
+            StoreError::Unreachable(htui_store::REGISTRY_ON_SERVER_ONLY.to_owned())
+        })?;
+        registered_box(backend).await?;
+        self.claim_is_free()?;
+        let (env, hardware) = self.probe_env()?;
+
+        self.box_probe = Some(tokio::spawn(run_box_probe(BoxProbeArgs {
+            backend: backend.clone(),
+            writer,
+            env,
+            hardware,
+            decide: false,
+            frames: Frames::new(replies.clone(), addr),
+        })));
+        Ok(Served::Deferred)
     }
 
     /// The [`StoreRequest::PromptPreview`] path (MOD-2 D102, D103, D109).
@@ -1943,6 +2019,139 @@ async fn probe_agents_on(
     }
 
     Ok(agents)
+}
+
+/// Everything the box probe task owns (MOD-7 D11, blueprint D26).
+///
+/// The reads go through a [`Backend`] clone — `box_info`, `app_settings` and `agents` are not
+/// `WriteStore` methods — and the writes through the [`Writer`] taken at spawn, so a swap the
+/// loop makes meanwhile cannot redirect them.
+struct BoxProbeArgs {
+    backend: Backend,
+    writer: Writer,
+    env: ProbeEnv,
+    hardware: Arc<dyn HardwareSource>,
+    /// The registration probe's "needs a probe" decision (plan D5, D18); `ProbeBox` skips it.
+    decide: bool,
+    frames: Frames,
+}
+
+impl core::fmt::Debug for BoxProbeArgs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BoxProbeArgs")
+            .field("writer", &self.writer.label())
+            .field("decide", &self.decide)
+            .field("env", &self.env)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One box probe, then one probe of this box's agents (MOD-7 D11–D13, blueprint D25).
+///
+/// One [`EffectiveSpec`](box_probe::spec::EffectiveSpec) is computed from the stored
+/// `box_probe_spec` and used for both the decision and the probe, so the digest compared and the
+/// digest recorded cannot differ. With `decide`, a box probed by this `htui` under this spec is
+/// left alone and **nothing is sent**: a reconnect costs three reads. Otherwise exactly one
+/// [`StoreReply::BoxProbed`] goes back, failures included — never a `Failed`, which the shell
+/// would drop at [`UNSOLICITED`] (blueprint F-D).
+async fn run_box_probe(args: BoxProbeArgs) {
+    let BoxProbeArgs {
+        backend,
+        writer,
+        env,
+        hardware,
+        decide,
+        frames,
+    } = args;
+    let mut report = BoxProbeReport::default();
+    let send = |report: BoxProbeReport| {
+        frames.reply(&frames.addr(), StoreReply::BoxProbed(report));
+    };
+
+    let box_id = match backend.box_info().await {
+        Ok(Some(info)) => info.box_id,
+        Ok(None) => {
+            report.box_failed = Some("this box is not registered".to_owned());
+            return send(report);
+        }
+        Err(err) => {
+            report.box_failed = Some(err.to_string());
+            return send(report);
+        }
+    };
+    let settings = match backend.app_settings().await {
+        Ok(settings) => settings,
+        Err(err) => {
+            report.box_failed = Some(err.to_string());
+            return send(report);
+        }
+    };
+    let effective = box_probe::spec::effective(
+        box_probe::spec::seed(),
+        settings.get(box_probe::spec::SETTING_KEY),
+    );
+    report.spec_error.clone_from(&effective.error);
+
+    if decide {
+        match writer.boxes().await {
+            Ok(records) => match records.iter().find(|record| record.row.id == box_id) {
+                Some(record) if record.needs_probe(htui_store::HTUI_VERSION, &effective.digest) => {
+                }
+                Some(_) => return,
+                None => {
+                    tracing::warn!(%box_id, "this box is not among the user's boxes; no probe");
+                    return;
+                }
+            },
+            Err(err) => {
+                tracing::warn!(%err, "the registration probe could not read the boxes");
+                return;
+            }
+        }
+    }
+
+    let probe = box_probe::probe_box(
+        box_id,
+        &env,
+        hardware.as_ref(),
+        &effective,
+        htui_store::HTUI_VERSION,
+        Utc::now(),
+    )
+    .await;
+    if let Err(err) = writer.record_box_probe(&probe).await {
+        report.box_failed = Some(err.to_string());
+        return send(report);
+    }
+    report.tools = probe.tools.len();
+    report.probed_tags = probe.probed_tags;
+
+    match backend.agents().await {
+        Ok(agents) => match probe_agents_on(&writer, box_id, agents, &env).await {
+            Ok(agents) => report.installable = installable(&agents),
+            Err(err) => report.agents_failed = Some(err.to_string()),
+        },
+        Err(err) => report.agents_failed = Some(err.to_string()),
+    }
+    send(report);
+}
+
+/// The enabled agents a probe just found `missing` whose launch declares where to install them
+/// from (PRD D7): named on the status line, never installed.
+fn installable(agents: &[htui_core::model::AgentSummary]) -> Vec<String> {
+    agents
+        .iter()
+        .filter(|summary| summary.agent.enabled)
+        .filter(|summary| {
+            summary
+                .on_box
+                .as_ref()
+                .and_then(ProbeSnapshot::from_row)
+                .is_some_and(|snapshot| matches!(snapshot.status, ProbeStatus::Missing))
+        })
+        .filter(|summary| htui_agent::launch::declares_install(&summary.agent.launch))
+        .map(|summary| summary.agent.name.clone())
+        .collect()
 }
 
 /// Whether this box's row for an agent is worth re-probing (plan D55).
@@ -7758,7 +7967,7 @@ done
         match served {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "install_plan");
-                assert_eq!(message, BOX_PROBE_RUNNING);
+                assert!(message.contains(BOX_PROBE_RUNNING), "{message}");
             }
             other => panic!("the install is refused while the box probe runs: {other:?}"),
         }
@@ -7789,7 +7998,7 @@ done
         match served {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "probe_agents");
-                assert_eq!(message, BOX_PROBE_RUNNING);
+                assert!(message.contains(BOX_PROBE_RUNNING), "{message}");
             }
             other => panic!("the agent probe is refused while the box probe runs: {other:?}"),
         }
