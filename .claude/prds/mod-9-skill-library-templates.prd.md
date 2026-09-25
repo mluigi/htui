@@ -182,8 +182,8 @@ Answered by the maintainer on 2026-09-25, before planning.
 |---|---|---|---|---|
 | 1 | Templates are editable | Skills tab `Templates` view: list, body, diff between versions; `TextArea` and `$EDITOR` editing; save runs `parse`, puts the cursor on the error, warns on a missing `{{item}}`, and appends a version as a compare-and-set. | pending | — |
 | 2 | Bound skills reach the run | Engine phase and judge steps and the preview resolve `bound_skills(project, Some(phase))`. | pending | — |
-| 3 | Skills are editable and bindable | Skill writers, `Skills` view with library, editor, diff, bindings matrix by project and phase, token estimate — in the shape ANA-22 decides. | blocked (ANA-22) | — |
-| 4 | Existing skills come in | `SKILL.md` import from a file or directory, frontmatter mapped per ANA-22. | blocked (ANA-22) | — |
+| 3 | Skills are editable and bindable | Skill writers, `Skills` view with library, editor, diff, bindings matrix by project and phase, token estimate — in the shape ANA-22 decides. | pending (ANA-22 concluded) | — |
+| 4 | Existing skills come in | `SKILL.md` import from a file or directory, frontmatter mapped per ANA-22. | pending (ANA-22 concluded) | — |
 
 Milestones 1 and 2 are independent of each other and of ANA-22. Milestone 4 needs milestone 3's
 writers.
@@ -194,7 +194,7 @@ writers.
 - [x] Editor — both `TextArea` and `$EDITOR`; agent help is MOD-50 (D2).
 - [x] Skills as files — no; database only (D3).
 - [x] Engine wiring — in scope (D4).
-- [ ] How a skill is stored and when it activates — ANA-22.
+- [x] How a skill is stored and when it activates — ANA-22 concluded (`docs/decisions/ana/ana-22.md`): activation rule per version, `always` or `glob`; §7 schema and import mapping.
 - [ ] How `$EDITOR` is chosen and invoked on Windows (`notepad` fallback?) — plan's call.
 - [ ] Whether the Templates view follows the scope selector's project or has its own picker — plan's call.
 
@@ -209,4 +209,4 @@ writers.
 | The multi-line widget grows into a general editor | Medium | Medium | Scope capped: insert, delete, newline, arrows, home/end, page; no undo stack beyond cancel |
 
 ---
-*Status: APPROVED at the PRD gate — milestones 1–2 ready for /plan; 3–4 blocked on ANA-22.*
+*Status: APPROVED at the PRD gate — milestones 1–2 ready for /plan; 3–4 follow ANA-22 (concluded).*

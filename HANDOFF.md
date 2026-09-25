@@ -14,7 +14,11 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-25):** **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`):
+**Current status (2026-09-25):** **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
+keeps its bindings as scope and gains an activation rule per version (`always` or `glob`, language
+compiled to globs), with frontmatter kept in `source`; it unblocks MOD-9 milestones 3 and 4. MOD-9's
+PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-50.
+Before it, **ANA-11 was concluded** (`docs/decisions/ana/ana-11.md`):
 requirements get dedicated tables with suspect-aware item citations; a decision is a closed item with
 a new `item.resolution` and its `summary` document. Spawned MOD-38 (schema, blocked on the
 maintainer applying `docs/ANA-11.md` §7) and MOD-39 (TUI).
@@ -22,11 +26,6 @@ Before it, **ANA-16 was done** (2026-09-24, `docs/decisions/ana/ana-16.md`): rem
 execution is a headless `htui worker` per box on Postgres first (MOD-40..46), with a self-hosted
 control plane and config manager as trigger-gated phase 2 (MOD-47, MOD-48); requirement amendments
 are open questions inside those items.
-Before it, **MOD-4 was done** (`docs/decisions/mod/mod-4.md`): the
-orchestrator runs in manual mode across all six milestones. `htui-orch` walks step graphs with gates,
-the review loop, judged fan-out and four git isolation modes under a leased heartbeat and a recovery
-sweep, and `run_worker.rs` and the Runs pane let the maintainer drive it, promote a step to chat and
-close an item out. Its carried risks are **MOD-37** and **CLEAN-4**.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default` and `0005_box_identity` (MOD-7 milestone 1; cache: `0001`..`0003`),
 so **the next migration is `0006`**. Pins moved by MOD-7 milestone 1: store `CASES` 56,
@@ -96,20 +95,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   the weight or stays a separate quota concern (ANA-4). Deliver: the weight table's schema and where
   it lives (`agent` row, `app_setting`, or a new table), a refresh method (manual, scripted from
   named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
-
-- [ ] **ANA-22 - How a skill is stored and when it activates** (from MOD-9, PRD gate 2026-09-25).
-  `R-SKL-1`, `R-SKL-2`, `R-SKL-4`, `R-PRM-3`. Blocks MOD-9 milestones 3 and 4
-  (`.claude/prds/mod-9-skill-library-templates.prd.md`). Today a skill is a name, a description and
-  a versioned markdown body (`skill`, `skill_version`, `0001_init.sql:406-426`) that reaches a prompt
-  only through an explicit project or phase binding (`BoundSkill::collapse`). The maintainer wants
-  the frontmatter of an imported SKILL.md file to become real fields — when the skill activates, for
-  which language — and the prompt builder to inject the necessary skills. Survey how skill and rule
-  formats describe themselves and their activation (Claude Code / Agent Skills SKILL.md files, Cursor
-  rules, Copilot instructions, Windsurf rules and others), decide which fields htui stores (columns,
-  a JSON column, or a side table), whether activation is a filter over explicit bindings or a
-  selection of its own, what signals it reads (item kind, phase, repo languages, touched paths), how
-  it interacts with pinning and `max_skill_tokens`, and how import maps frontmatter onto the result.
-  Deliver the schema, the activation rule, the import mapping, and the MOD-9 milestone 3/4 changes.
 
 ### Next features
 - [ ] **MOD-38 - Requirements schema, seam and close-out resolution** (from ANA-11). `R-ENT-8`,
@@ -331,7 +316,9 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   `.claude/prds/mod-9-skill-library-templates.prd.md` (2026-09-25) — everything in the Skills tab
   (templates and skills views, no Settings section), in-app `TextArea` plus `$EDITOR`, bound skills
   wired into engine and preview. Milestones 1 (templates editable) and 2 (skills reach the run) are
-  open; milestones 3 (skill writers, bindings) and 4 (SKILL.md import) are **blocked on ANA-22**.
+  open; milestones 3 (skill writers, bindings) and 4 (SKILL.md import) follow ANA-22's verdict
+  (`docs/decisions/ana/ana-22.md`, concluded 2026-09-25: activation rule per version, §7 schema and
+  import mapping, §8 phasing).
   Agent help while editing is MOD-50.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
@@ -674,7 +661,7 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-17 per-model prompt framing, ANA-21 per-model weights, ANA-22 skill storage and activation)                                 |
+| ANA-N   | 2 (ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
 | MOD-N   | 36 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 agent help in the editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
