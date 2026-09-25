@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/templates.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ judge · editing from v1, saves v2 ─────────────────────────┐┌ judge placeholders ────────────────┐
+│You are judging {{phase}} candidates for {{item_key}}. You d││{{item_key}} scalar                 │
+│                                                            ││{{phase}} scalar                    │
+│{{task}}                                                    ││{{task}} section                    │
+│                                                            ││{{candidates}} section required     │
+│{{candidates}}                                              ││                                    │
+│                                                            ││wire: end with one ```json block    │
+│Pick the candidate that best satisfies the task above. Weigh││{winner, reasons}                   │
+│task, evidence from verification, the smallest change that d││                                    │
+│surrounding code. Ignore candidate order, prose confidence a││                                    │
+│better one.                                                 ││                                    │
+│                                                            ││                                    │
+│Write one paragraph per candidate saying why it wins or lose││                                    │
+│one fenced json block, and nothing after it:                ││                                    │
+│                                                            ││                                    │
+│```json                                                     ││                                    │
+│{ "winner": 0, "reasons": { "0": "one line", "1": "one line"││                                    │
+│```                                                         ││                                    │
+│                                                            ││                                    │
+│`winner` must be one of the `fanout_index` values shown abov││                                    │
+│per candidate shown, keyed by its index as a string.        ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+└────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
+
+ Ctrl+S save  Ctrl+E $EDITOR  Esc cancel  L1:C1
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

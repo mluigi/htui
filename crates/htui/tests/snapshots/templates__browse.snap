@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/templates.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ Templates ───────────────────┐┌ implement v1 (head v1) ──────────────────────────────────────────┐
+│vulkan-tutorials              ││You are running the `implement` phase for {{item_key}}, attempt {{│
+│  fix           v1   phase    ││                                                                  │
+│  handoff       v1   handoff  ││{{item}}                                                          │
+│  implement     v1   phase    ││{{documents}}                                                     │
+│  judge         v1   judge    ││{{verify_failure}}                                                │
+│  plan          v1   phase    ││{{previous_diff}}                                                 │
+│  prd           v1   phase    ││{{upstream}}                                                      │
+│  reproduce     v1   phase    ││{{box}}                                                           │
+│  research      v1   phase    ││{{skills}}                                                        │
+│  review        v1   phase    ││{{excerpts}}                                                      │
+│  verdict       v1   phase    ││{{command_queue}}                                                 │
+│                              ││                                                                  │
+│                              ││Make the change the plan describes, in this working tree. Keep the│
+│                              ││When a prior attempt is shown above, read its diff and its verific│
+│                              ││cause rather than the symptom. Write a `{{output_kind}}` document │
+│                              ││you verified it, one section per file group.                      │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+
+ j/k move  ,/. version  b base  d diff  D default  e edit  E $EDITOR  n new  r reload  h/l view
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

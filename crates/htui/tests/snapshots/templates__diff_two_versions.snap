@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/templates.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ Templates ───────────────────┐┌ diff v1 → v2 ────────────────────────────────────────────────────┐
+│vulkan-tutorials              ││--- implement v1                                                  │
+│  fix           v1   phase    ││+++ implement v2                                                  │
+│  handoff       v1   handoff  ││@@ -1,3 +1,4 @@                                                   │
+│  implement     v2   phase    ││+MARKER                                                           │
+│  judge         v1   judge    ││ You are running the `implement` phase for {{item_key}}, attempt {│
+│  plan          v1   phase    ││                                                                  │
+│  prd           v1   phase    ││ {{item}}                                                         │
+│  reproduce     v1   phase    ││                                                                  │
+│  research      v1   phase    ││                                                                  │
+│  review        v1   phase    ││                                                                  │
+│  verdict       v1   phase    ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+
+ j/k move  ,/. version  b base  d diff  D default  e edit  E $EDITOR  n new  r reload  h/l view
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

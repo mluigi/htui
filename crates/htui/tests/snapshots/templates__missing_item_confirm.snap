@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/templates.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ triage · new, saves v1 ────────────────────────────────────┐┌ phase placeholders ────────────────┐
+│Triage {{item_key}}                                         ││{{item_key}} scalar                 │
+│                                                            ││{{item_title}} scalar               │
+│                                                            ││{{item_kind}} scalar                │
+│                                                            ││{{phase}} scalar                    │
+│                                                            ││{{output_kind}} scalar              │
+│                                                            ││{{attempt}} scalar                  │
+│                                                            ││{{item}} section                    │
+│                                                            ││{{documents}} section               │
+│                                                            ││{{upstream}} section                │
+│                                                            ││{{box}} section                     │
+│                                                            ││{{skills}} section                  │
+│                                                            ││{{excerpts}} section                │
+│                                                            ││{{verify_failure}} section          │
+│                                                            ││{{previous_diff}} section           │
+│                                                            ││{{command_queue}} section           │
+│                                                            ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+└────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
+ this phase template never places {{item}} — Ctrl+S again saves anyway
+ Ctrl+S save  Ctrl+E $EDITOR  Esc cancel  L1:C20
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

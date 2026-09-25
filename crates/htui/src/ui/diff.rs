@@ -18,8 +18,11 @@ pub const NO_DIFFERENCES: &str = "no differences";
 /// the headers with the first hunk, and there is none.
 #[must_use]
 pub fn unified(old: &str, new: &str, old_label: &str, new_label: &str) -> String {
-    let _ = (old, new, old_label, new_label);
-    todo!("MOD-9 T5: the unified diff")
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(old_label, new_label)
+        .to_string()
 }
 
 /// `+` accents, `-` errors, the `---`/`+++` headers and everything else dim — the two gutters a
@@ -42,8 +45,12 @@ pub fn diff_style(line: &str, theme: &Theme) -> Style {
 /// [`NO_DIFFERENCES`].
 #[must_use]
 pub fn lines(diff: &str, theme: &Theme) -> Vec<Line<'static>> {
-    let _ = (diff, theme);
-    todo!("MOD-9 T5: the styled diff lines")
+    if diff.is_empty() {
+        return vec![Line::styled(NO_DIFFERENCES, theme.dim)];
+    }
+    diff.lines()
+        .map(|line| Line::styled(line.to_owned(), diff_style(line, theme)))
+        .collect()
 }
 
 #[cfg(test)]

@@ -77,10 +77,19 @@ fn hint(frame: &str) -> String {
     lines[lines.len() - 2].to_owned()
 }
 
-/// The notice row, just above the hint.
+/// The notice: the rows between the content's bottom border and the hint, joined (it wraps).
 fn notice(frame: &str) -> String {
     let lines: Vec<&str> = frame.lines().collect();
-    lines[lines.len() - 3].to_owned()
+    let hint = lines.len() - 2;
+    let bottom = lines[..hint]
+        .iter()
+        .rposition(|line| line.starts_with('\u{2514}'))
+        .unwrap_or_else(|| panic!("no bottom border above the hint:\n{frame}"));
+    lines[bottom + 1..hint]
+        .iter()
+        .map(|line| line.trim())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Saves `marker` as a new first line of `implement`, which lands as v2.
@@ -105,7 +114,7 @@ async fn the_templates_view_lists_the_scope_s_templates() {
         "the project header: {frame}"
     );
     assert!(
-        frame.contains("  implement     v1  phase"),
+        frame.contains("  implement     v1   phase"),
         "a template row names its head and its role: {frame}"
     );
     assert!(
@@ -116,7 +125,7 @@ async fn the_templates_view_lists_the_scope_s_templates() {
         frame.contains("You are running the `implement` phase"),
         "the body: {frame}"
     );
-    insta::assert_snapshot!("templates__browse", frame);
+    insta::assert_snapshot!("browse", frame);
 }
 
 #[tokio::test]
@@ -141,7 +150,7 @@ async fn the_judge_editor_lists_its_placeholders_and_its_wire() {
     );
     assert!(frame.contains("```json"), "the judge wire note: {frame}");
     assert!(hint(&frame).ends_with("L1:C1"), "{}", hint(&frame));
-    insta::assert_snapshot!("templates__edit_help", frame);
+    insta::assert_snapshot!("edit_help", frame);
 }
 
 #[tokio::test]
@@ -169,7 +178,7 @@ async fn an_unknown_placeholder_puts_the_cursor_on_its_braces() {
         head(&store, "implement").await.map(|row| row.version),
         Some(1)
     );
-    insta::assert_snapshot!("templates__unknown_placeholder_cursor", frame);
+    insta::assert_snapshot!("unknown_placeholder_cursor", frame);
 }
 
 #[tokio::test]
@@ -188,7 +197,7 @@ async fn a_phase_body_without_item_asks_before_saving() {
         "the confirm notice: {frame}"
     );
     assert_eq!(head(&store, "triage").await, None, "nothing was sent");
-    insta::assert_snapshot!("templates__missing_item_confirm", frame);
+    insta::assert_snapshot!("missing_item_confirm", frame);
 }
 
 #[tokio::test]
@@ -205,7 +214,7 @@ async fn any_two_versions_diff() {
         "the pane title: {frame}"
     );
     assert!(frame.contains("+MARKER"), "the added line: {frame}");
-    insta::assert_snapshot!("templates__diff_two_versions", frame);
+    insta::assert_snapshot!("diff_two_versions", frame);
 }
 
 #[tokio::test]
@@ -233,7 +242,10 @@ async fn a_save_over_a_moved_head_keeps_the_draft() {
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        notice(&frame).contains("saved elsewhere since you opened it"),
+        notice(&frame).contains(
+            "saved elsewhere since you opened it \u{2014} v2 is now the latest; your draft is \
+             kept and Ctrl+S saves it as v3"
+        ),
         "the stale notice: {frame}"
     );
     assert!(
@@ -249,7 +261,7 @@ async fn a_save_over_a_moved_head_keeps_the_draft() {
         Some("saved elsewhere {{item}}\n".to_owned()),
         "the stale save wrote nothing"
     );
-    insta::assert_snapshot!("templates__changed_elsewhere", frame);
+    insta::assert_snapshot!("changed_elsewhere", frame);
 }
 
 // --- asserts -----------------------------------------------------------------------------------
@@ -299,7 +311,7 @@ async fn a_second_ctrl_s_saves_without_item_and_a_new_version_appears() {
     let frame = harness.render();
     assert!(notice(&frame).contains("saved v1"), "{frame}");
     assert!(
-        frame.contains("  triage        v1  phase"),
+        frame.contains("  triage        v1   phase"),
         "the new row: {frame}"
     );
 }
