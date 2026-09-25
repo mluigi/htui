@@ -1,6 +1,6 @@
 # Plan: MOD-9 milestone 1 — templates are editable
 
-**Status: CONFIRMED by the maintainer 2026-09-25 with OQ-1..OQ-7 defaults as written.**
+**Status: CONFIRMED by the maintainer 2026-09-25 with OQ-1..OQ-7 defaults as written.** **Implemented** `e971418`..`caacc96` (2026-09-25); final review `rust-reviewer` APPROVE WITH FIXES, all findings (M1, M2, L1–L6) applied.
 
 **Source**: `.claude/prds/mod-9-skill-library-templates.prd.md`, milestone 1 (Delivery Milestones
 table, row 1): "Skills tab `Templates` view: list, body, diff between versions; `TextArea` and

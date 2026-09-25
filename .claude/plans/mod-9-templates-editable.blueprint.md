@@ -1,6 +1,6 @@
 # Blueprint: MOD-9 milestone 1, "templates are editable"
 
-**Status**: proposed (2026-09-25). Findings F-A to F-U (§0) and decisions D16–D36 (§12) are proposed
+**Status**: proposed (2026-09-25). Findings F-A to F-U (§0) and decisions D16–D36 (§12) are proposed **Implemented** `e971418`..`caacc96` (2026-09-25).
 here. A finding marked **Blocker** means the plan, read literally, does not compile, fails its own
 named test, breaks the workspace gate, leaves a hidden coupling between the parallel tasks, or cannot
 be validated at all. The Fix column is what the implementer builds.

@@ -28,8 +28,8 @@ control plane and config manager as trigger-gated phase 2 (MOD-47, MOD-48); requ
 are open questions inside those items.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default` and `0005_box_identity` (MOD-7 milestone 1; cache: `0001`..`0003`),
-so **the next migration is `0006`**. Pins moved by MOD-7 milestone 1: store `CASES` 56,
-`StoreRequest` 64, `StoreReply` 35, 234 `.sqlx` files.
+so **the next migration is `0006`**. Pins moved by MOD-9 milestone 1: store `CASES` 59,
+`StoreRequest` 66, `StoreReply` 37, 235 `.sqlx` files (MOD-7 milestone 1 had 56, 64, 35, 234).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins at MOD-4's close
 (`22cfeea`): store conformance `CASES` 53, `READ_CASES` 9, `htui-orch` `CASES` 70, `StoreRequest`
 62 variants, 227 `.sqlx` files; `cargo doc --workspace --no-deps` shows exactly two baseline errors
@@ -320,6 +320,14 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   (`docs/decisions/ana/ana-22.md`, concluded 2026-09-25: skills attached at global, project or phase
   level with the activation on the attachment, §7 schema and import mapping, §8 phasing).
   Agent help while editing is MOD-50.
+  **Phase 1 landed (`e971418`..`caacc96`, 2026-09-25):** milestone 1, templates editable — the
+  `append_prompt_template` compare-and-set writer on every store (append-only, head version as the
+  token), `ui::TextArea`, the `$EDITOR` handoff with the terminal suspended and SIGINT/SIGQUIT held
+  off htui, `Templates`/`SaveTemplate` on the store worker, and the Skills tab's `Templates` view
+  (parse-gated save with the cursor on the error, wrapped and scrollable diff between any two
+  versions or against the built-in default); plan `.claude/plans/mod-9-templates-editable.plan.md`,
+  blueprint `.claude/plans/mod-9-templates-editable.blueprint.md`. Milestone 2 (skills reach the run)
+  is next; its plan continues at D37 and R-14.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer

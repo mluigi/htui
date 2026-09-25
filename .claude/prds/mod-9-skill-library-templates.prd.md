@@ -180,7 +180,7 @@ Answered by the maintainer on 2026-09-25, before planning.
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Templates are editable | Skills tab `Templates` view: list, body, diff between versions; `TextArea` and `$EDITOR` editing; save runs `parse`, puts the cursor on the error, warns on a missing `{{item}}`, and appends a version as a compare-and-set. | in-progress | [plan](../plans/mod-9-templates-editable.plan.md) |
+| 1 | Templates are editable | Skills tab `Templates` view: list, body, diff between versions; `TextArea` and `$EDITOR` editing; save runs `parse`, puts the cursor on the error, warns on a missing `{{item}}`, and appends a version as a compare-and-set. | complete (`e971418`..`caacc96`, 2026-09-25) | [plan](../plans/mod-9-templates-editable.plan.md), [blueprint](../plans/mod-9-templates-editable.blueprint.md) |
 | 2 | Bound skills reach the run | Engine phase and judge steps and the preview resolve `bound_skills(project, Some(phase))`. | pending | — |
 | 3 | Skills are editable and bindable | Skill writers, `Skills` view with library, editor, diff, bindings matrix by project and phase, token estimate — in the shape ANA-22 decides. | pending (ANA-22 concluded) | — |
 | 4 | Existing skills come in | `SKILL.md` import from a file or directory, frontmatter mapped per ANA-22. | pending (ANA-22 concluded) | — |
