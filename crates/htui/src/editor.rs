@@ -148,7 +148,8 @@ pub trait Suspend {
 ///
 /// Stdio is inherited: the caller has already given the terminal away ([`run_suspended`]). The
 /// temp file is removed on every path out, a dropped future included, and the editor child is
-/// killed if the future is dropped (D25).
+/// killed if the future is dropped (D25). While the editor runs, the terminal's interrupt keys
+/// reach the editor and not htui ([`Interrupts`]).
 pub async fn run(cmd: &EditorCommand, text: &str, stem: &str) -> ExternalEditOutcome {
     use ExternalEditOutcome::{Edited, Failed, Unchanged};
 
@@ -168,12 +169,15 @@ pub async fn run(cmd: &EditorCommand, text: &str, stem: &str) -> ExternalEditOut
     // when `path` drops, on every path out of here, the dropped-future one included.
     let path = file.into_temp_path();
 
+    // Held until the editor has returned, so Ctrl-C at a cooked-mode editor cannot end htui.
+    let interrupts = Interrupts::hold();
     let started = Instant::now();
     let status = tokio::process::Command::from(cmd.command(&path))
         .kill_on_drop(true)
         .status()
         .await;
     let elapsed = started.elapsed();
+    drop(interrupts);
     let status = match status {
         Ok(status) => status,
         Err(err) => return Failed(start_failure(cmd, &err.to_string())),
@@ -264,6 +268,71 @@ impl<S: Suspend> Drop for Resume<'_, S> {
         // re-entering here would leave the alternate screen up behind the panic message.
         if self.armed && !std::thread::panicking() {
             let _ = self.term.enter();
+        }
+    }
+}
+
+/// Ctrl-C and Ctrl-\ (Ctrl-Break on Windows) while an editor has the terminal: htui survives them,
+/// the editor still gets them. Git's `editor.c` does the same around its editor.
+///
+/// `leave` hands the editor a cooked terminal, so those keys signal the whole foreground process
+/// group, htui included. The default disposition would end htui with no destructor run: the temp
+/// file stays behind and `lib.rs`'s shutdown order for the store worker is skipped. A listener
+/// replaces that default while it is held. It is a handler and not `SIG_IGN`, so the `exec`ed
+/// editor starts at the default and still gets the key. Agents, verify commands and git are
+/// spawned as their own group leaders (`ProcessGroup::leader`), so the key never reaches them.
+///
+/// On unix tokio never uninstalls a handler: after the first handoff, an interrupt that reaches
+/// htui outside an editor is swallowed rather than fatal. In raw mode the keyboard cannot send one
+/// (no `ISIG`); `kill -INT` from elsewhere can, and `SIGTERM` still ends htui. On Windows the
+/// console default is back as soon as the listeners drop.
+struct Interrupts {
+    /// The listeners; their existence is the whole effect.
+    #[cfg(unix)]
+    _held: Vec<tokio::signal::unix::Signal>,
+    /// The listeners; their existence is the whole effect.
+    #[cfg(windows)]
+    _held: (
+        Option<tokio::signal::windows::CtrlC>,
+        Option<tokio::signal::windows::CtrlBreak>,
+    ),
+}
+
+impl Interrupts {
+    /// Registers the listeners. One that cannot be registered is logged and skipped: the edit
+    /// still runs, with that key as fatal as it was before.
+    fn hold() -> Self {
+        /// `result`'s listener, or `None` with a warning.
+        fn listener<T>(result: io::Result<T>, which: &str) -> Option<T> {
+            result
+                .inspect_err(|err| {
+                    tracing::warn!("could not hold {which} off htui during the edit: {err}");
+                })
+                .ok()
+        }
+
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                _held: [
+                    (SignalKind::interrupt(), "SIGINT"),
+                    (SignalKind::quit(), "SIGQUIT"),
+                ]
+                .into_iter()
+                .filter_map(|(kind, which)| listener(signal(kind), which))
+                .collect(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows::{ctrl_break, ctrl_c};
+            Self {
+                _held: (
+                    listener(ctrl_c(), "Ctrl-C"),
+                    listener(ctrl_break(), "Ctrl-Break"),
+                ),
+            }
         }
     }
 }
@@ -615,7 +684,7 @@ mod tests {
 
         /// htui catches the interrupt; it does not ignore it. A caught signal is back at its
         /// default in an `exec`ed child, so the editor still gets Ctrl-C (a `SIG_IGN` would be
-        /// inherited, and the script below would live on to `exit 0`).
+        /// inherited, and the script below would live on to `exit 0` and answer `Unchanged`).
         #[tokio::test]
         async fn the_editor_still_gets_the_interrupt() {
             let dir = TempDir::new().unwrap();
@@ -624,7 +693,11 @@ mod tests {
             let ExternalEditOutcome::Failed(message) = outcome else {
                 panic!("expected Failed, got {outcome:?}");
             };
-            assert!(message.contains("exited with a signal"), "{message}");
+            // `sh -c` reports its child's death by SIGINT as 130; an `exec`ing shell, as a signal.
+            assert!(
+                message.contains("exited with 130") || message.contains("exited with a signal"),
+                "{message}"
+            );
         }
     }
 

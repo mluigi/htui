@@ -35,7 +35,8 @@ clap               = { workspace = true }
 crossterm          = { workspace = true }
 futures            = { workspace = true }
 ratatui            = { workspace = true }
-tokio              = { workspace = true }
+# MOD-9: `signal` holds Ctrl-C and Ctrl-\ off htui while `$EDITOR` has the cooked tty (editor.rs).
+tokio              = { workspace = true, features = ["signal"] }
 # MOD-20 D18: `CancellationToken` is how an install is stopped. Cooperative, because the task has
 # to sweep its staging entry and send its own last frame — neither of which an `abort()` allows.
 tokio-util         = { workspace = true }
