@@ -36,8 +36,8 @@ use crate::model::{
     ItemPatch, ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
     NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
     Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath,
-    RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
+    RepoId, RepoPatch, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
     StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath,
     WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
@@ -207,7 +207,8 @@ pub trait WriteStore: ReadStore {
     /// An illegal `(from, to)` is [`StoreError::Constraint`](crate::store::StoreError::Constraint)
     /// without an update ([`legal_move`], ANA-2 §4.3); a missing row is
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) first (plan D14). A stale
-    /// `from` on a legal pair is still `Ok(false)`.
+    /// `from` on a legal pair is still `Ok(false)`. `to = closed` is refused from every status
+    /// (MOD-38 PRD D1); use [`close_out`](WriteStore::close_out).
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool>;
 
     /// Appends session events, skipping any `(run_step_id, seq)` already stored, and answers how
@@ -1027,8 +1028,12 @@ pub trait WriteStore: ReadStore {
     ) -> Result<()>;
 
     /// `R-TUI-9`'s three effects, one transaction (plan D6): the summary document at its next
-    /// version, the commits upserted, the item moved to `closed` under the law with `closed_at`
-    /// set. Refused while any run of the item is active.
+    /// version, the commits upserted, and the item set to `closed` with `resolution` and
+    /// `closed_at`. Close-out is the **only** way into `closed` (MOD-38 PRD D1; it amends ANA-2
+    /// §4.3); its law is [`Resolution::closes_from`], not [`legal_move`], so an `open` item closes
+    /// as one of the four non-success resolutions (ANA-11 §4.2). Refused while any run of the item
+    /// is active. Guard order: NotFound, live run, summary kind, summary item, `closes_from`,
+    /// commit steps.
     ///
     /// # Errors
     /// Its own refusals, plus - because it performs their work - every refusal of
@@ -1038,13 +1043,14 @@ pub trait WriteStore: ReadStore {
     /// `{ entity: "run_step" }` for a commit row naming a step that does not exist;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a run of the item is
     /// `queued | running | awaiting_approval`, when `summary.kind != "summary"`, when
-    /// `summary.item_id != item`, when the item's status cannot move to `closed` (only `blocked`,
-    /// `failed` and `done` can), when a commit row names an unknown repo, or when the summary
+    /// `summary.item_id != item`, when `!resolution.closes_from(status)`
+    /// ([`resolution_not_closable`]), when a commit row names an unknown repo, or when the summary
     /// duplicates a document id or names an unknown `created_by` / `produced_by_step_id`. Any
     /// refusal writes nothing: every one of these is decided before the first write.
     async fn close_out(
         &self,
         item: ItemId,
+        resolution: Resolution,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document>;
@@ -1234,6 +1240,14 @@ pub fn close_out_needs_a_summary(kind: &str) -> String {
 #[must_use]
 pub fn summary_names_another_item(item: ItemId, named: ItemId) -> String {
     format!("the summary of {item} cannot name item {named}")
+}
+
+// ---- MOD-38: ANA-11's refusals ----
+
+/// ANA-11 §4.2: the close-out law refuses this pair (T3).
+#[must_use]
+pub fn resolution_not_closable(item: ItemId, status: Status, resolution: Resolution) -> String {
+    format!("item {item} is `{status}`; it cannot close as `{resolution}` (ANA-11 §4.2)")
 }
 
 /// §4.5: `select_fanout` takes a winner from the candidates of one `(run, position, attempt)`.

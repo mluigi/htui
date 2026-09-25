@@ -1490,7 +1490,14 @@ where
             self.parts.user,
             self.now(),
         );
-        let written = self.parts.store.close_out(item, summary, &[]).await?;
+        // MOD-38 T3's placeholder until T4 threads the command's own resolution through.
+        let resolution = htui_core::model::Resolution::default_for(reads.item.status)
+            .unwrap_or(htui_core::model::Resolution::Withdrawn);
+        let written = self
+            .parts
+            .store
+            .close_out(item, resolution, summary, &[])
+            .await?;
         Ok(CommandOutcome::ClosedOut {
             item,
             summary: written.id,

@@ -20,9 +20,9 @@ use crate::model::{
     ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem,
     NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
     NoteId, OverlapRule, PhaseId, PhasePatch, ProjectId, ProjectPatch, PromptScope, RepoBoxPath,
-    RepoId, RepoPatch, RepoScope, Run, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph, SnapshotSettings, Status,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    RepoId, RepoPatch, RepoScope, Resolution, Run, RunId, RunKind, RunMode, RunScope, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph, SnapshotSettings,
+    Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
     TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath,
     WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
@@ -31,6 +31,7 @@ use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, UpdateOutcome, WriteStore,
+    illegal_move, resolution_not_closable,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -88,6 +89,8 @@ pub const CASES: &[&str] = &[
     "take_lease_moves_only_our_own_or_an_expired_lease",
     "interrupt_step_is_a_cas_on_running",
     "release_lease_frees_the_run_for_its_own_sweep",
+    "close_out_resolution_law",
+    "transition_never_reaches_closed",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -180,6 +183,8 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "release_lease_frees_the_run_for_its_own_sweep" => {
             release_lease_frees_the_run_for_its_own_sweep(store).await;
         }
+        "close_out_resolution_law" => close_out_resolution_law(store).await,
+        "transition_never_reaches_closed" => transition_never_reaches_closed(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -713,18 +718,17 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
 
 /// Items are never deleted; closing is a status (§4.1).
 async fn no_delete_path<S: WriteStore>(store: &S) {
-    // `open` does not reach `closed` in ANA-2 §4.3's item table: only `blocked`, `failed` and
-    // `done` do, so the close-out path takes two sanctioned moves (plan D4).
-    let blocked = store
-        .transition(ids::HTUI_ANA_2, Status::Open, Status::Blocked)
+    // Close-out is the only way into `closed` (MOD-38 PRD D1), and an `open` item closes as one
+    // of the four non-success resolutions (ANA-11 §4.2), so the item closes straight from `open`.
+    store
+        .close_out(
+            ids::HTUI_ANA_2,
+            Resolution::Withdrawn,
+            new_document(ids::HTUI_ANA_2, "summary", None),
+            &[],
+        )
         .await
-        .expect("no_delete_path: transition must not fail");
-    assert!(blocked, "no_delete_path: open -> blocked matches");
-    let closed = store
-        .transition(ids::HTUI_ANA_2, Status::Blocked, Status::Closed)
-        .await
-        .expect("no_delete_path: transition must not fail");
-    assert!(closed, "no_delete_path: blocked -> closed matches");
+        .expect("no_delete_path: open closes out as withdrawn");
 
     let still_there = store
         .item(ids::HTUI_ANA_2)
@@ -6269,6 +6273,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
     let live = store
         .close_out(
             ids::HTUI_FEAT_3,
+            Resolution::Withdrawn,
             new_document(ids::HTUI_FEAT_3, "summary", None),
             &[],
         )
@@ -6296,24 +6301,27 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         "{CASE}: nor moved the item"
     );
 
-    for (item, summary, why) in [
+    for (item, resolution, summary, why) in [
         (
             ids::HTUI_ANA_2,
+            Resolution::Done,
             new_document(ids::HTUI_ANA_2, "summary", None),
-            "open does not reach closed (ANA-2 §4.3)",
+            "open does not close as done (ANA-11 §4.2)",
         ),
         (
             ids::HTUI_FEAT_1,
+            Resolution::Done,
             new_document(ids::HTUI_FEAT_1, "plan", None),
             "the document must be a summary",
         ),
         (
             ids::HTUI_FEAT_1,
+            Resolution::Done,
             new_document(ids::HTUI_ANA_2, "summary", None),
             "the summary must name the item being closed",
         ),
     ] {
-        let refused = store.close_out(item, summary, &[]).await;
+        let refused = store.close_out(item, resolution, summary, &[]).await;
         assert!(
             matches!(refused, Err(StoreError::Constraint(_))),
             "{CASE}: {why}, got {refused:?}"
@@ -6322,6 +6330,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
     let unknown = store
         .close_out(
             ItemId::new(),
+            Resolution::Withdrawn,
             new_document(ItemId::new(), "summary", None),
             &[],
         )
@@ -6346,6 +6355,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
     let written = store
         .close_out(
             ids::HTUI_FEAT_1,
+            Resolution::Done,
             new_document(ids::HTUI_FEAT_1, "summary", None),
             &commits,
         )
@@ -6354,6 +6364,11 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
     assert_eq!(written.version, 1, "{CASE}: the first summary of the item");
     let closed = item_row(CASE, store, ids::HTUI_FEAT_1).await;
     assert_eq!(closed.status, Status::Closed, "{CASE}: the item is closed");
+    assert_eq!(
+        closed.resolution,
+        Some(Resolution::Done),
+        "{CASE}: as the resolution it was handed"
+    );
     assert!(
         closed.closed_at.is_some(),
         "{CASE}: closed_at tracks the current status"
@@ -6383,9 +6398,9 @@ async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
         (Status::Queued, Status::InProgress),
         (Status::InProgress, Status::Done),
         // The fourth pair is what makes `done` a `from` rather than only the row the loop stops
-        // on: `done` reaches `closed` and `open` and nothing else, so six of its eight targets are
-        // refusals this leg would otherwise never ask for.
-        (Status::Done, Status::Closed),
+        // on: `done` reaches `open` and nothing else, so seven of its eight targets are refusals
+        // this leg would otherwise never ask for (`closed` among them since MOD-38 PRD D1).
+        (Status::Done, Status::Open),
     ] {
         let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
         assert_eq!(before.status, from, "{CASE}: the item is driven to {from}");
@@ -6533,6 +6548,179 @@ async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
     assert!(
         matches!(missing, Err(StoreError::NotFound { entity: "run", .. })),
         "{CASE}: an unknown run is NotFound, got {missing:?}"
+    );
+}
+
+/// The HTUI project's fixture items, which between them hold every [`Status`] once (a test in
+/// `fixtures.rs` pins that): the two MOD-38 cases sweep the laws over them rather than over a
+/// list of their own.
+fn htui_fixture_items() -> Vec<ItemId> {
+    crate::fixtures::demo_data()
+        .items
+        .into_iter()
+        .filter(|item| item.project_id == ids::PROJECT_HTUI)
+        .map(|item| item.id)
+        .collect()
+}
+
+/// MOD-38 plan D4: close-out's law is ANA-11 §4.2's [`Resolution::closes_from`], not ANA-2
+/// §4.3's transition table. Every pair the law refuses is exactly [`resolution_not_closable`]'s
+/// sentence with nothing written; an `open` item closes as a non-success resolution and reads it
+/// back; a `closed` item closes as nothing.
+async fn close_out_resolution_law<S: WriteStore>(store: &S) {
+    const CASE: &str = "close_out_resolution_law";
+
+    let mut swept = Vec::new();
+    for item in htui_fixture_items() {
+        // A live run is refused before the law is asked (the guard order of `close_out`'s doc),
+        // which is `close_out_refuses_a_live_run`'s ground, not this case's.
+        if store
+            .runs(item)
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|run| run.status.is_active())
+        {
+            continue;
+        }
+        let before = item_row(CASE, store, item).await;
+        let documents = store.documents(item).await.expect(CASE);
+        for resolution in Resolution::ALL.iter().copied() {
+            if resolution.closes_from(before.status) {
+                continue;
+            }
+            let refused = store
+                .close_out(item, resolution, new_document(item, "summary", None), &[])
+                .await;
+            let StoreError::Constraint(sentence) = refused.expect_err(&format!(
+                "{CASE}: `{}` does not close as `{resolution}`",
+                before.status
+            )) else {
+                panic!("{CASE}: a refused pair is Constraint, not NotFound")
+            };
+            assert_eq!(
+                sentence,
+                resolution_not_closable(item, before.status, resolution),
+                "{CASE}: the refusal is the close-out law's sentence"
+            );
+        }
+        assert_eq!(
+            item_row(CASE, store, item).await,
+            before,
+            "{CASE}: every refused pair left the `{}` row byte-identical",
+            before.status
+        );
+        assert_eq!(
+            store.documents(item).await.expect(CASE),
+            documents,
+            "{CASE}: and wrote no summary"
+        );
+        swept.push(before.status);
+    }
+    for status in [
+        Status::Open,
+        Status::Blocked,
+        Status::Failed,
+        Status::Done,
+        Status::Closed,
+    ] {
+        assert!(
+            swept.contains(&status),
+            "{CASE}: the sweep reached a `{status}` item (fixture precondition)"
+        );
+    }
+
+    let open = item_row(CASE, store, ids::HTUI_ANA_2).await;
+    assert_eq!(open.status, Status::Open, "{CASE}: fixture precondition");
+    let refused = store
+        .close_out(
+            ids::HTUI_ANA_2,
+            Resolution::Done,
+            new_document(ids::HTUI_ANA_2, "summary", None),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(StoreError::Constraint(sentence))
+            if *sentence == resolution_not_closable(ids::HTUI_ANA_2, Status::Open, Resolution::Done)),
+        "{CASE}: an open item does not close as done, got {refused:?}"
+    );
+    let written = store
+        .close_out(
+            ids::HTUI_ANA_2,
+            Resolution::Withdrawn,
+            new_document(ids::HTUI_ANA_2, "summary", None),
+            &[],
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(written.version, 1, "{CASE}: the first summary of the item");
+    let closed = item_row(CASE, store, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        (closed.status, closed.resolution),
+        (Status::Closed, Some(Resolution::Withdrawn)),
+        "{CASE}: an open item closes as withdrawn, and says so"
+    );
+    assert!(
+        closed.closed_at.is_some(),
+        "{CASE}: closed_at tracks the current status"
+    );
+
+    for item in [ids::HTUI_FIX_1, ids::HTUI_ANA_2] {
+        let before = item_row(CASE, store, item).await;
+        for resolution in Resolution::ALL.iter().copied() {
+            let refused = store
+                .close_out(item, resolution, new_document(item, "summary", None), &[])
+                .await;
+            assert!(
+                matches!(&refused, Err(StoreError::Constraint(sentence))
+                    if *sentence == resolution_not_closable(item, Status::Closed, resolution)),
+                "{CASE}: a closed item does not close again as `{resolution}`, got {refused:?}"
+            );
+        }
+        assert_eq!(
+            item_row(CASE, store, item).await,
+            before,
+            "{CASE}: a second close-out keeps the first resolution"
+        );
+    }
+}
+
+/// MOD-38 PRD D1: `transition` never reaches `closed`, from any status; close-out is the only way
+/// in. The refusal is [`illegal_move`]'s sentence with the row untouched, and plan D14's
+/// precedence still holds: an unknown id is `NotFound` first.
+async fn transition_never_reaches_closed<S: WriteStore>(store: &S) {
+    const CASE: &str = "transition_never_reaches_closed";
+
+    for item in htui_fixture_items() {
+        let before = item_row(CASE, store, item).await;
+        let refused = store.transition(item, before.status, Status::Closed).await;
+        let StoreError::Constraint(sentence) = refused.expect_err(&format!(
+            "{CASE}: `{}` does not transition into `closed`",
+            before.status
+        )) else {
+            panic!("{CASE}: an illegal move is Constraint, not NotFound")
+        };
+        assert_eq!(
+            sentence,
+            illegal_move("item", before.status, Status::Closed),
+            "{CASE}: the refusal is `illegal_move`'s sentence"
+        );
+        assert_eq!(
+            item_row(CASE, store, item).await,
+            before,
+            "{CASE}: the refused `{}` row is byte-identical",
+            before.status
+        );
+    }
+
+    let unknown = store
+        .transition(ItemId::new(), Status::Done, Status::Closed)
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "item", .. })),
+        "{CASE}: plan D14 — an unknown item is NotFound even though the pair is illegal, got \
+         {unknown:?}"
     );
 }
 

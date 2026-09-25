@@ -550,7 +550,7 @@ async fn status_cas_never_bumps_version() {
 
     assert!(
         !db.store
-            .transition(before.id, Status::Done, Status::Closed)
+            .transition(before.id, Status::Done, Status::Open)
             .await
             .expect("transition must not fail"),
         "a stale `from` is refused rather than applied"

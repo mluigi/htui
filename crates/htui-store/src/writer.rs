@@ -38,10 +38,10 @@ use htui_core::model::{
     ItemPatch, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
     NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
     Project, ProjectId, ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch,
-    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject,
+    Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -879,12 +879,13 @@ impl WriteStore for Writer {
     async fn close_out(
         &self,
         item: ItemId,
+        resolution: Resolution,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
         match self {
-            Self::Memory(store) => store.close_out(item, summary, commits).await,
-            Self::Online(pg) => pg.close_out(item, summary, commits).await,
+            Self::Memory(store) => store.close_out(item, resolution, summary, commits).await,
+            Self::Online(pg) => pg.close_out(item, resolution, summary, commits).await,
         }
     }
 

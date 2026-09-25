@@ -27,12 +27,12 @@ use crate::model::{
     NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph, NewWorkspace,
     Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
     PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
-    ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
-    SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, overlaps,
-    prompt_summary, scope_of,
+    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -45,8 +45,9 @@ use crate::store::traits::{
     failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     graph_not_in_project, invalid_prefix, item_has_a_live_run, item_kind_is_held,
     item_not_in_project, legal_move, not_a_fanout_candidate, not_a_terminal_status,
-    references_no_row, reserved_phase_name, row_names_another_step, run_is_terminal,
-    step_is_not_promotable, step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
+    references_no_row, reserved_phase_name, resolution_not_closable, row_names_another_step,
+    run_is_terminal, step_is_not_promotable, step_slot_is_taken, summary_names_another_item,
+    winner_is_not_settled,
 };
 use uuid::Uuid;
 
@@ -4066,6 +4067,7 @@ impl State {
     fn close_out(
         &mut self,
         item: ItemId,
+        resolution: Resolution,
         summary: NewDocument,
         commits: &[RunStepCommit],
         now: DateTime<Utc>,
@@ -4094,7 +4096,13 @@ impl State {
                 summary.item_id,
             )));
         }
-        legal_move(status, Status::Closed)?;
+        // ANA-11 §4.2's law, not §4.3's table: close-out is the only way into `closed` (MOD-38
+        // PRD D1), so `legal_move` would refuse every status.
+        if !resolution.closes_from(status) {
+            return Err(StoreError::Constraint(resolution_not_closable(
+                item, status, resolution,
+            )));
+        }
         for row in commits {
             self.check_step_batch(
                 "run_step_commit",
@@ -4108,7 +4116,15 @@ impl State {
             self.step_commits
                 .insert((row.run_step_id, row.repo_id), row.clone());
         }
-        self.transition(item, status, Status::Closed, now)?;
+        // Plan D5: the direct write `transition` no longer makes, under the same `now`.
+        let row = self
+            .items
+            .get_mut(&item)
+            .expect("require_item found it above");
+        row.status = Status::Closed;
+        row.resolution = Some(resolution);
+        row.updated_at = now;
+        row.closed_at = Some(now);
         Ok(document)
     }
 
@@ -4762,11 +4778,12 @@ impl WriteStore for MemStore {
     async fn close_out(
         &self,
         item: ItemId,
+        resolution: Resolution,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
         let now = Utc::now();
-        self.write(|state| state.close_out(item, summary, commits, now))
+        self.write(|state| state.close_out(item, resolution, summary, commits, now))
     }
 
     async fn add_note(&self, note: NewNote) -> Result<Note> {
@@ -4781,9 +4798,9 @@ mod tests {
     use crate::model::{
         AgentBox, AgentId, BoxId, ChatRunSpec, Claim, DocumentId, GateOutcome, GraphSnapshot,
         Isolation, ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject, NewRepo,
-        NewRun, NewRunStep, NoteId, OverlapRule, ProjectId, RepoId, RunId, RunKind, RunMode,
-        RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status,
-        StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+        NewRun, NewRunStep, NoteId, OverlapRule, ProjectId, RepoId, Resolution, RunId, RunKind,
+        RunMode, RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings,
+        Status, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -7157,7 +7174,12 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .close_out(ids::HTUI_FEAT_3, summary(ids::HTUI_FEAT_3, "summary"), &[])
+                    .close_out(
+                        ids::HTUI_FEAT_3,
+                        Resolution::Withdrawn,
+                        summary(ids::HTUI_FEAT_3, "summary"),
+                        &[]
+                    )
                     .await,
                 Err(StoreError::Constraint(_))
             ),
@@ -7166,7 +7188,12 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .close_out(ids::HTUI_FEAT_1, summary(ids::HTUI_FEAT_1, "plan"), &[])
+                    .close_out(
+                        ids::HTUI_FEAT_1,
+                        Resolution::Done,
+                        summary(ids::HTUI_FEAT_1, "plan"),
+                        &[]
+                    )
                     .await,
                 Err(StoreError::Constraint(_))
             ),
@@ -7175,7 +7202,12 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .close_out(ids::HTUI_FEAT_1, summary(ids::HTUI_ANA_2, "summary"), &[])
+                    .close_out(
+                        ids::HTUI_FEAT_1,
+                        Resolution::Done,
+                        summary(ids::HTUI_ANA_2, "summary"),
+                        &[]
+                    )
                     .await,
                 Err(StoreError::Constraint(_))
             ),
@@ -7184,15 +7216,25 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .close_out(ids::HTUI_ANA_2, summary(ids::HTUI_ANA_2, "summary"), &[])
+                    .close_out(
+                        ids::HTUI_ANA_2,
+                        Resolution::Done,
+                        summary(ids::HTUI_ANA_2, "summary"),
+                        &[]
+                    )
                     .await,
                 Err(StoreError::Constraint(_))
             ),
-            "open does not reach closed (ANA-2 §4.3)"
+            "open does not close as done (ANA-11 §4.2)"
         );
         assert!(matches!(
             store
-                .close_out(ItemId::new(), summary(ItemId::new(), "summary"), &[])
+                .close_out(
+                    ItemId::new(),
+                    Resolution::Withdrawn,
+                    summary(ItemId::new(), "summary"),
+                    &[]
+                )
                 .await,
             Err(StoreError::NotFound { entity: "item", .. })
         ));
@@ -7213,6 +7255,7 @@ mod tests {
         let written = store
             .close_out(
                 ids::HTUI_FEAT_1,
+                Resolution::Done,
                 summary(ids::HTUI_FEAT_1, "summary"),
                 &commits,
             )
@@ -7225,6 +7268,7 @@ mod tests {
             .expect("the item reads back")
             .expect("it exists");
         assert_eq!(item.status, Status::Closed);
+        assert_eq!(item.resolution, Some(Resolution::Done), "and says why");
         assert!(item.closed_at.is_some(), "closed_at tracks the status");
         assert_eq!(
             store

@@ -22,10 +22,10 @@ use htui_core::model::{
     ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRevision, NewCommandRun, NewDocument,
     NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep, NewStepGraph,
     NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptTemplateId,
-    Repo, RepoBoxPath, RepoId, RepoPatch, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, overlaps, scope_of,
+    Repo, RepoBoxPath, RepoId, RepoPatch, Resolution, Run, RunId, RunKind, RunMode, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -37,8 +37,8 @@ use htui_core::store::{
     finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move,
     invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
     not_a_fanout_candidate, not_a_terminal_status, references_no_row, reserved_phase_name,
-    row_names_another_step, run_is_terminal, step_is_not_promotable, summary_names_another_item,
-    winner_is_not_settled,
+    resolution_not_closable, row_names_another_step, run_is_terminal, step_is_not_promotable,
+    summary_names_another_item, winner_is_not_settled,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -3898,12 +3898,14 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] `{ entity: "item" }`, or `{ entity: "run_step" }` for a commit row
     /// naming a step that does not exist; [`StoreError::Constraint`] when a run of the item is
     /// `queued | running | awaiting_approval`, when `summary.kind` is not `summary`, when
-    /// `summary.item_id` is not `item`, when the item cannot reach `closed` under §4.3, when a
-    /// commit row names an unknown repo, or when the summary duplicates a document id or names an
-    /// unknown `created_by` / `produced_by_step_id`. No refusal writes anything.
+    /// `summary.item_id` is not `item`, when `resolution` does not close the item's status under
+    /// ANA-11 §4.2 ([`resolution_not_closable`]), when a commit row names an unknown repo, or when
+    /// the summary duplicates a document id or names an unknown `created_by` /
+    /// `produced_by_step_id`. No refusal writes anything.
     async fn close_out(
         &self,
         item: ItemId,
+        resolution: Resolution,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
@@ -3956,7 +3958,14 @@ impl WriteStore for PgStore {
                 summary.item_id,
             )));
         }
-        legal_move(status, Status::Closed)?;
+        // ANA-11 §4.2's law, not §4.3's table: close-out is the only way into `closed` (MOD-38
+        // PRD D1). `chk_item_resolution_iff_closed` would refuse a missing resolution; this refuses
+        // a wrong one, before the first write.
+        if !resolution.closes_from(status) {
+            return Err(StoreError::Constraint(resolution_not_closable(
+                item, status, resolution,
+            )));
+        }
 
         let mut probed: Vec<StepId> = Vec::new();
         for row in commits {
@@ -3986,10 +3995,11 @@ impl WriteStore for PgStore {
         }
 
         let closed = sqlx::query!(
-            "UPDATE item SET status = 'closed', closed_at = clock_timestamp() \
+            "UPDATE item SET status = 'closed', resolution = $3, closed_at = clock_timestamp() \
               WHERE id = $1 AND status = $2",
             item.as_uuid(),
             status.as_str(),
+            resolution.as_str(),
         )
         .execute(&mut *tx)
         .await
