@@ -68,10 +68,19 @@ impl EditorCommand {
 
     /// The process that edits `file`.
     ///
-    /// Unix: `sh -c "<value> \"$1\"" htui-editor <file>`, so the shell parses `value` as the
+    /// Unix: `sh -c "exec <value> \"$1\"" htui-editor <file>`, so the shell parses `value` as the
     /// user's own shell would (git runs `$EDITOR` the same way) and the file is a positional
-    /// argument, never spliced into the script. Windows: `cmd /S /C "<value> "<file>""` as one
-    /// raw argument; `/S` makes `cmd` strip exactly the outer pair of quotes.
+    /// argument, never spliced into the script. `exec` makes the editor htui's own child: `dash`
+    /// forks for a lone command, and a waiting `sh` dies of the Ctrl-C an editor such as `ed`
+    /// traps, which would read as a failure and remove the file it is about to save; the kill on
+    /// drop would also reach only the shell. So `value` is a command and its arguments: a leading
+    /// `VAR=x` or a compound (`a && b`) fails to start, or runs only its first part.
+    ///
+    /// Windows: `cmd /S /C "<value> "<file>""` as one raw argument; `/S` makes `cmd` strip exactly
+    /// the outer pair of quotes. `cmd` has no `exec`. It handles Ctrl-C itself while it waits on
+    /// its child rather than dying of it, so an edit that survives the key survives `cmd` too;
+    /// but the kill on drop ends only `cmd`, and the editor lives on (not exercised: no Windows
+    /// test runs here).
     #[must_use]
     pub fn command(&self, file: &Path) -> std::process::Command {
         #[cfg(not(windows))]
@@ -79,7 +88,7 @@ impl EditorCommand {
             let mut command = std::process::Command::new("sh");
             command
                 .arg("-c")
-                .arg(format!("{} \"$1\"", self.value))
+                .arg(format!("exec {} \"$1\"", self.value))
                 .arg("htui-editor")
                 .arg(file);
             command
@@ -148,7 +157,7 @@ pub trait Suspend {
 ///
 /// Stdio is inherited: the caller has already given the terminal away ([`run_suspended`]). The
 /// temp file is removed on every path out, a dropped future included, and the editor child is
-/// killed if the future is dropped (D25). While the editor runs, the terminal's interrupt keys
+/// killed if the future is dropped (D25; on Windows only `cmd` is, see [`EditorCommand::command`]). While the editor runs, the terminal's interrupt keys
 /// reach the editor and not htui (`Interrupts`, private).
 pub async fn run(cmd: &EditorCommand, text: &str, stem: &str) -> ExternalEditOutcome {
     use ExternalEditOutcome::{Edited, Failed, Unchanged};
