@@ -48,6 +48,9 @@ route on 2026-09-25.
   htui's own development and there is no shared Qdrant for that yet. The filesystem sync
   (`HANDOFF.md`, `docs/`) is removed, not extended.
 - **Requirement:** add one. Proposed **R-STO-8** (T6).
+- **Decisions and requirements:** index decisions (a closed item plus its `summary`/`verdict`
+  document per ANA-11) and requirements once they are in Postgres (D4, D6). Plan confirmed with
+  these folded in, 2026-09-25.
 - **fastembed stays** for the dense vectors (BGE-small-en-v1.5). The question was only which
   sparse vector sits beside it: SPLADE or BM25 (D1).
 
@@ -68,11 +71,20 @@ route on 2026-09-25.
   connection sees) and `htui --search-items <QUERY> [--project <KEY>]`, in the style of
   `--set-dsn`. Automatic sync belongs with the headless worker's background jobs (MOD-41) and the
   `search_concepts` agent tool with MOD-11; both get a cross-link note at close-out.
-- **D4 - One point per item, keyed by the item's UUID.** Text = key, title and body. Payload:
-  `item_id`, `key`, `project_id`, `kind_id`, `status`, `updated_at`. Keyword payload index on
-  `project_id` (ANA-20 §3.4's single collection, with the project as the tenant) so a search is
-  always scoped to projects. Item documents are not indexed in this item.
+- **D4 - Items and their documents, typed points.** Each item is one point keyed by its UUID
+  (text: key, title, body). Each item's **latest document of every kind** is split at `##`
+  headings into points keyed by UUID v5-style `sha256(document_id, chunk)` (text: item key,
+  document kind and title, section). Separate points because BGE-small reads about 512 tokens, so
+  an appended write-up would be cut off. Payload on every point: `type` (`item` | `document`; later
+  `requirement`), `item_id`, `key`, `project_id`, `kind_id`, `status`, `updated_at`; documents add
+  `document_id`, `doc_kind`, `version`, `chunk`. Keyword payload indexes on `type`, `project_id`
+  and `status`, so a search is always scoped to projects and can ask for decisions only (closed
+  items and their `summary`/`verdict` documents, ANA-11 §4.2). `resolution` joins the payload
+  when MOD-38 adds `item.resolution`.
 - **D5 - Pin the compose image** to `qdrant/qdrant:v1.19.1`, matching the client.
+- **D6 - Requirements are indexed after MOD-38.** ANA-11 puts them in their own `requirement`
+  table, which does not exist yet. The collection reserves `type = requirement`; MOD-38 gains a
+  cross-link note at close-out.
 
 ## Tasks
 
@@ -90,27 +102,35 @@ route on 2026-09-25.
 - Tests first: tokenizer keeps `MOD-34` whole and also yields `mod`, `34`; term index is stable
   (golden values); repeated terms saturate per k1; longer texts weigh a term less per b.
 
-### T3 - Item vector store
+### T3 - Vector store over items and documents
 - **Files:** `crates/htui-store/src/vector.rs`
-- `VectorStore` becomes item-only: `upsert_items`, `delete_items`, `indexed(project) -> (ItemId,
-  updated_at)` pairs, `search(query, projects, limit) -> Vec<ItemHit>` (`item_id`, `key`,
-  `score`). `upsert_document` goes.
-- `QdrantStore::connect(&QdrantSettings, embedder)`; collection `htui_items_v1` (never reuses the
-  first pass's SPLADE-shaped collection); point ID = item UUID.
+- `VectorStore` trait: `upsert(points)`, `delete(point_ids)`, `indexed(project) ->
+  Vec<IndexedPoint>` (point ID, `type`, `item_id`, `updated_at`, `document_id`),
+  `search(&SearchQuery) -> Vec<Hit>`. `SearchQuery` = text, projects, optional `types`, optional
+  `statuses`, limit. `Hit` = `type`, `item_id`, `key`, `document_id`, `doc_kind`, `score`, and a
+  short snippet. `upsert_document`/`upsert_item` go.
+- `QdrantStore::connect(&QdrantSettings, embedder)`; collection `htui_concepts_v1` (never reuses
+  the first pass's SPLADE-shaped collection) with `dense` (384, cosine) and `sparse`
+  (`Modifier::Idf`) vectors and the D4 payload indexes.
 - Hybrid query: `query_points` with `dense` and `sparse` prefetches fused by RRF, filtered on
-  `project_id`.
-- Offline tests: point ID and payload shape. Live tests when `HTUI_TEST_QDRANT_URL` is set (skip
-  otherwise, as `HTUI_TEST_DATABASE_URL` does), using `HashEmbedder` so no model download.
+  `project_id` and the optional `type`/`status` sets.
+- Offline tests: point IDs, payload shape, filter building. Live tests when
+  `HTUI_TEST_QDRANT_URL` is set (skip otherwise, as `HTUI_TEST_DATABASE_URL` does), using
+  `HashEmbedder` so no model download.
 
-### T4 - Item indexer (replaces the filesystem sync)
-- **Files:** `crates/htui-store/src/vector_sync.rs` (rewritten), `crates/htui-store/src/lib.rs`
-  only if the module is renamed
-- `ItemIndexer::sync(read: &impl ReadStore, projects, store: &impl VectorStore)`: list
-  `ItemSummary` per project, compare `updated_at` with what is indexed, fetch bodies (`item()`)
-  only for new or changed items, upsert them, delete indexed items no longer listed.
+### T4 - Indexer (replaces the filesystem sync)
+- **Files:** `crates/htui-store/src/vector_sync.rs` (rewritten)
+- `Indexer::sync(read: &impl ReadStore, projects, store: &impl VectorStore) -> SyncReport`:
+  per project, list `ItemSummary`; an item whose `updated_at` differs from the indexed one is
+  re-fetched (`item()`) and re-upserted; for every item, `documents()` heads give the latest
+  `DocumentId` per kind, and a document ID not yet indexed is fetched (`document()`), split and
+  upserted, while points of superseded or vanished documents are deleted; items no longer listed
+  lose their points. Documents are immutable per version, so a document ID never needs
+  re-embedding.
 - Tests first against `htui-core`'s in-memory store and an in-memory `VectorStore` fake: first
-  sync indexes all; a second sync with no change fetches nothing; an edited item is re-indexed; a
-  removed item is deleted; other projects are untouched.
+  sync indexes items and latest documents; a second sync with no change upserts nothing; an edited
+  item is re-indexed; a new document version replaces the old one's points; a removed item loses
+  item and document points; other projects are untouched.
 
 ### T5 - CLI entry point and graceful failure
 - **Files:** `crates/htui/src/cli.rs`, `crates/htui/src/lib.rs`
@@ -123,12 +143,13 @@ route on 2026-09-25.
 - **Files:** `docs/REQUIREMENTS.md`, `compose.yaml`, `HANDOFF.md`
 - New requirement, section 4:
   > **R-STO-8 (must).** Semantic search over items. `htui` indexes each item's key, title and
-  > body into a Qdrant collection (local dense embeddings plus BM25 sparse vectors, ranked
+  > body, and its latest documents, into a Qdrant collection (local dense embeddings plus BM25 sparse vectors, ranked
   > together) and answers searches scoped to projects. The index is derived from Postgres and
   > rebuildable from it (R-STO-1); when Qdrant or the embedding model is unavailable, search fails
   > with a clear error and nothing else is affected.
 - MOD-34's line rescoped to Postgres items and citing `R-STO-8`; the file-sync wording goes.
-- At close-out: MOD-11 gains the `search_concepts` note, MOD-41 the automatic-sync note (D3).
+- At close-out: MOD-11 gains the `search_concepts` note, MOD-41 the automatic-sync note (D3),
+  MOD-38 the requirement-indexing and `resolution` payload note (D4, D6).
   ANA-19/ANA-20 keep their `R-AGT-6`/`R-ID-7` citations (ANA edits are maintainer-only); the
   write-up records that `R-STO-8` is the requirement they serve.
 
@@ -156,4 +177,4 @@ builds with `local-embed` need `ORT_LIB_LOCATION` (see Verified claims).
 
 ## Status
 
-Awaiting maintainer CONFIRM (revision 3).
+Confirmed by the maintainer 2026-09-25 (revision 4: documents and typed points folded in). Implementation in progress.
