@@ -501,6 +501,25 @@ mod tests {
     }
 
     #[test]
+    fn an_edited_outcome_debug_prints_its_length_not_its_text() {
+        let shown = format!(
+            "{:?}",
+            ExternalEditOutcome::Edited("secret body".to_owned())
+        );
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("text_len: 11"), "{shown}");
+        // The other two carry no body, and print as they are.
+        assert_eq!(
+            format!("{:?}", ExternalEditOutcome::Unchanged { quick: true }),
+            "Unchanged { quick: true }"
+        );
+        assert_eq!(
+            format!("{:?}", ExternalEditOutcome::Failed("boom".to_owned())),
+            "Failed(\"boom\")"
+        );
+    }
+
+    #[test]
     fn stems_are_sanitised_and_capped() {
         assert_eq!(sanitise("implement"), "implement");
         assert_eq!(sanitise("a/b ..é-1_x"), "a_b____-1_x");

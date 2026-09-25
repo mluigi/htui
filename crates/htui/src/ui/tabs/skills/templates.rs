@@ -1166,6 +1166,28 @@ mod tests {
         );
     }
 
+    /// The view derives `Debug` down to the open editor, whose `original` and `sent` are the
+    /// body: lengths only, as the draft's `TextArea`.
+    #[test]
+    fn an_open_editor_debug_prints_lengths_not_text() {
+        let mut editor = Editor::new(
+            ids::PROJECT_VULKAN,
+            "implement".to_owned(),
+            Some(1),
+            Some(1),
+            "secret original",
+        );
+        editor.sent = Some("secret sent".to_owned());
+        let view = TemplatesView {
+            mode: Mode::Editing(editor),
+            ..TemplatesView::default()
+        };
+        let shown = format!("{view:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("original_len: 15"), "{shown}");
+        assert!(shown.contains("sent_len: Some(11)"), "{shown}");
+    }
+
     /// D27 (F-J): a `Templates` read served while a save is in flight — `Tab` away and back, `2`,
     /// or `r` — must not be taken for the save's answer. `settle` serves in queue order, save
     /// first, so only a direct drive can put a read's reply ahead of the save's.

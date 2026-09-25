@@ -250,6 +250,30 @@ mod tests {
         assert_eq!(snapshot.head(ids::PROJECT_VULKAN, "implement"), None);
     }
 
+    /// `StoreRequest` derives `Debug`; a body is user text, so the save prints its length only
+    /// (`ExternalEdit`'s and `TextArea`'s rule).
+    #[test]
+    fn a_save_request_debug_prints_the_body_length_not_the_body() {
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            project_ids: vec![ids::PROJECT_VULKAN],
+        };
+        let request = save(
+            &scope,
+            ids::PROJECT_VULKAN,
+            "implement",
+            "secret {{item}}",
+            Some(1),
+        );
+        let shown = format!("{request:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("len: 15"), "{shown}");
+        assert!(
+            shown.contains("implement"),
+            "the name is not user text: {shown}"
+        );
+    }
+
     #[tokio::test]
     async fn a_save_at_the_head_answers_templates_with_the_new_version() {
         let backend = demo();
