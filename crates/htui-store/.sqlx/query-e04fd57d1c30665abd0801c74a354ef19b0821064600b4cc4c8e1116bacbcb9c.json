@@ -1,0 +1,227 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT r.id                   AS \"id!: RequirementId\",\n                   r.project_id           AS \"project_id!: ProjectId\",\n                   r.area_id              AS \"area_id!: RequirementAreaId\",\n                   r.area_code            AS \"area_code!\",\n                   r.number               AS \"number!\",\n                   r.key                  AS \"key!\",\n                   r.body                 AS \"body!\",\n                   r.rationale            AS \"rationale!\",\n                   r.priority             AS \"priority!: Priority\",\n                   r.state                AS \"state!: RequirementState\",\n                   r.version              AS \"version!\",\n                   r.created_by           AS \"created_by!: UserId\",\n                   r.created_at           AS \"created_at!\",\n                   r.updated_at           AS \"updated_at!\",\n                   ir.kind                AS \"kind!: CitationKind\",\n                   ir.requirement_version AS \"requirement_version!\",\n                   ir.proposed_by_step_id AS \"proposed_by_step_id?: StepId\",\n                   r.version > ir.requirement_version AS \"suspect!\"\n              FROM item_requirement ir\n              JOIN requirement r ON r.id = ir.requirement_id\n             WHERE ir.item_id = $1 AND ir.deleted_at IS NULL\n             ORDER BY r.area_code COLLATE \"C\", r.number, ir.kind COLLATE \"C\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: RequirementId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id!: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "area_id!: RequirementAreaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "area_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "area_code!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "area_code"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "number!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "number"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "body!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "rationale!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "rationale"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "priority!: Priority",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "priority"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "state!: RequirementState",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "created_by!: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "kind!: CitationKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "requirement_version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "requirement_version"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "proposed_by_step_id?: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "proposed_by_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "suspect!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "e04fd57d1c30665abd0801c74a354ef19b0821064600b4cc4c8e1116bacbcb9c"
+}

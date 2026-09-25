@@ -20,9 +20,9 @@ use futures::future::Either;
 use htui_core::fixtures::ids;
 use htui_core::model::{
     AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, EventKind, Gate, GateOutcome,
-    Isolation, Item, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId, Run,
-    RunId, RunMode, RunStatus, RunStep, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
-    VerifyOutcome,
+    Isolation, Item, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId,
+    Resolution, Run, RunId, RunMode, RunStatus, RunStep, Status, StepGraphId, StepGraphPhase,
+    StepId, StepStatus, VerifyOutcome,
 };
 use htui_core::model::{
     Claim, NewItem, OverlapRule, Quota, QuotaSource, RunKind, Scope, Spend, WorkspaceId,
@@ -5395,7 +5395,8 @@ async fn summaries_of<O: Orchestrate>(
 
 /// ANA-2 §12 criterion 20 (`docs/ANA-2.md:2141-2143`, MOD-4 plan D167): a `done` item is closed
 /// out. One `summary` document lands at version 1, produced by no step, with a table row per
-/// `(repo, step)` that committed; the item is `closed` with `closed_at` set.
+/// `(repo, step)` that committed; the item is `closed` as the command's resolution with
+/// `closed_at` set.
 async fn close_out_writes_one_summary_and_closes_the_item<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     primary_repo(&orch).await;
@@ -5408,6 +5409,7 @@ async fn close_out_writes_one_summary_and_closes_the_item<H: CaseHarness>(harnes
     let outcome = orch
         .dispatch(Command::CloseOut {
             item: ids::HTUI_FEAT_3,
+            resolution: Resolution::Done,
         })
         .await
         .expect("a done item with no live run");
@@ -5448,6 +5450,11 @@ async fn close_out_writes_one_summary_and_closes_the_item<H: CaseHarness>(harnes
     assert_eq!(summaries_of(&orch, ids::HTUI_FEAT_3).await.len(), 1);
     let row = item_of(&orch, ids::HTUI_FEAT_3).await;
     assert_eq!(row.status, Status::Closed);
+    assert_eq!(
+        row.resolution,
+        Some(Resolution::Done),
+        "the command's resolution (MOD-38 D2)"
+    );
     assert!(row.closed_at.is_some());
 }
 
@@ -5461,6 +5468,7 @@ async fn close_out_is_refused_while_a_run_is_live<H: CaseHarness>(harness: &H) {
     let refused = orch
         .dispatch(Command::CloseOut {
             item: ids::HTUI_FEAT_3,
+            resolution: Resolution::Done,
         })
         .await
         .expect_err("a live run");

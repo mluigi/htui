@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-38](docs/decisions/mod/mod-38.md)** - Requirements schema, seam and close-out resolution (done, 2026-09-25)
 - **[MOD-34](docs/decisions/mod/mod-34.md)** - Qdrant concepts search over items and their documents (done, 2026-09-25)
 - **[ANA-17](docs/decisions/ana/ana-17.md)** - Per-model calibration of the prompt's section framing (concluded, 2026-09-25)
 - **[ANA-11](docs/decisions/ana/ana-11.md)** - Models for requirements and decisions (concluded, 2026-09-25)

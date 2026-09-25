@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE item SET status    = $3, closed_at = CASE WHEN $3 = 'done' THEN clock_timestamp() ELSE NULL END WHERE id = $1 AND status = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "95f3eeedb3491ee386a897d1d4bdd337dad0ff41bd871b3e79b1cafb29960f01"
+}

@@ -30,15 +30,18 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRecord, ChatRunSpec, Claim, CommandRun,
-    Document, DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item, ItemFilter,
-    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun,
-    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRecord, ChatRunSpec, CitationKind,
+    Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, EventKind, EventRole,
+    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
+    ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+    NewRunStep, NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project,
+    ProjectId, ProjectPatch, PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
     ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
     SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId,
+    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
     WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
@@ -669,6 +672,38 @@ impl<S: WriteStore> ReadStore for UsageSpy<'_, S> {
     ) -> StoreResult<Vec<ResolvedInput>> {
         self.inner.resolve_inputs(item, run, kinds).await
     }
+    // ---- ANA-11 §5.1: requirements (MOD-38) ----
+    async fn requirement_spec(&self, project: ProjectId) -> StoreResult<Option<RequirementSpec>> {
+        self.inner.requirement_spec(project).await
+    }
+    async fn requirement_areas(&self, project: ProjectId) -> StoreResult<Vec<RequirementArea>> {
+        self.inner.requirement_areas(project).await
+    }
+    async fn requirements(
+        &self,
+        project: ProjectId,
+        filter: &RequirementFilter,
+    ) -> StoreResult<Vec<Requirement>> {
+        self.inner.requirements(project, filter).await
+    }
+    async fn requirement(&self, id: RequirementId) -> StoreResult<Option<Requirement>> {
+        self.inner.requirement(id).await
+    }
+    async fn requirement_revisions(
+        &self,
+        id: RequirementId,
+    ) -> StoreResult<Option<Vec<RequirementRevision>>> {
+        self.inner.requirement_revisions(id).await
+    }
+    async fn item_requirements(&self, item: ItemId) -> StoreResult<Vec<ItemCitation>> {
+        self.inner.item_requirements(item).await
+    }
+    async fn requirement_coverage(
+        &self,
+        requirement: RequirementId,
+    ) -> StoreResult<Vec<CoverageRow>> {
+        self.inner.requirement_coverage(requirement).await
+    }
 }
 
 impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
@@ -1067,13 +1102,89 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     async fn close_out(
         &self,
         item: ItemId,
+        resolution: Resolution,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> StoreResult<Document> {
-        self.inner.close_out(item, summary, commits).await
+        self.inner
+            .close_out(item, resolution, summary, commits)
+            .await
     }
     async fn add_note(&self, note: NewNote) -> StoreResult<Note> {
         self.inner.add_note(note).await
+    }
+    // ---- ANA-11 §5.1: requirements and citations (MOD-38) ----
+    async fn set_requirement_spec(
+        &self,
+        project: ProjectId,
+        expected_version: Option<i32>,
+        owner_id: UserId,
+        preamble: String,
+    ) -> StoreResult<CasOutcome<RequirementSpec>> {
+        self.inner
+            .set_requirement_spec(project, expected_version, owner_id, preamble)
+            .await
+    }
+    async fn create_requirement_area(
+        &self,
+        new: NewRequirementArea,
+    ) -> StoreResult<RequirementArea> {
+        self.inner.create_requirement_area(new).await
+    }
+    async fn mint_requirement(
+        &self,
+        area: RequirementAreaId,
+        new: NewRequirement,
+    ) -> StoreResult<Requirement> {
+        self.inner.mint_requirement(area, new).await
+    }
+    async fn amend_requirement(
+        &self,
+        id: RequirementId,
+        expected_version: i32,
+        patch: RequirementPatch,
+        amended_by: ItemId,
+    ) -> StoreResult<RequirementUpdate> {
+        self.inner
+            .amend_requirement(id, expected_version, patch, amended_by)
+            .await
+    }
+    async fn withdraw_requirement(
+        &self,
+        id: RequirementId,
+        expected_version: i32,
+        withdrawn_by: ItemId,
+        author_id: UserId,
+        box_id: Option<BoxId>,
+    ) -> StoreResult<RequirementUpdate> {
+        self.inner
+            .withdraw_requirement(id, expected_version, withdrawn_by, author_id, box_id)
+            .await
+    }
+    async fn cite(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+        proposed_by: Option<StepId>,
+    ) -> StoreResult<ItemRequirement> {
+        self.inner.cite(item, requirement, kind, proposed_by).await
+    }
+    async fn uncite(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+    ) -> StoreResult<()> {
+        self.inner.uncite(item, requirement, kind).await
+    }
+    async fn reconfirm(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+    ) -> StoreResult<ItemRequirement> {
+        self.inner.reconfirm(item, requirement, kind).await
     }
 }
 

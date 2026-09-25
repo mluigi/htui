@@ -71,7 +71,7 @@ impl Default for RefreshSettings {
 pub struct PassReport {
     /// Rows upserted, per mirrored table, in pass order.
     pub tables: Vec<(&'static str, u64)>,
-    /// `item_link` tombstones removed from the mirror.
+    /// `item_link` and `item_requirement` tombstones removed from the mirror.
     pub tombstones: u64,
     /// `session_event` rows copied.
     pub events: u64,
@@ -194,7 +194,8 @@ impl Refresher {
     }
 }
 
-/// The eleven cursor-driven tables of §6.2, in foreign-key order.
+/// The fifteen cursor-driven tables of §6.2, in foreign-key order. The last four are MOD-38's
+/// (plan D12, `docs/ANA-11.md` §5.2).
 const PROJECT: &str = "project";
 const REPO: &str = "repo";
 const ITEM_KIND: &str = "item_kind";
@@ -206,6 +207,10 @@ const RUN: &str = "run";
 const RUN_STEP: &str = "run_step";
 const RUN_STEP_COMMIT: &str = "run_step_commit";
 const RUN_STEP_TREE: &str = "run_step_tree";
+const REQUIREMENT_SPEC: &str = "requirement_spec";
+const REQUIREMENT_AREA: &str = "requirement_area";
+const REQUIREMENT: &str = "requirement";
+const ITEM_REQUIREMENT: &str = "item_requirement";
 
 /// One pass, as a free function so `tests/cache.rs` can run it without a task.
 ///
@@ -218,8 +223,9 @@ const RUN_STEP_TREE: &str = "run_step_tree";
 /// 3. per project, per table in foreign-key order, `ts_col > high_water - overlap`, primary-key
 ///    upsert, cursor set to `max(ts_col)` of the fetched rows - server time, so clock skew between
 ///    boxes is irrelevant. `run_step_commit` has no timestamp of its own and rides its parent
-///    step's `updated_at` (H.3). An `item_link` row with `deleted_at` set is *deleted* from the
-///    mirror instead of upserted and still advances the cursor (§4.4);
+///    step's `updated_at` (H.3). An `item_link` or `item_requirement` row with `deleted_at` set is
+///    *deleted* from the mirror instead of upserted and still advances the cursor (§4.4, MOD-38
+///    plan D12);
 /// 4. the last-N **finished** transcripts per project, copied for steps not already mirrored, then
 ///    trimmed scoped to that project so another project's cached steps survive;
 /// 5. `cache_meta.last_full_refresh_at`, set only when every cursor was `0` at the top of the pass.
@@ -260,6 +266,10 @@ pub async fn run_pass(
             RUN_STEP,
             RUN_STEP_COMMIT,
             RUN_STEP_TREE,
+            REQUIREMENT_SPEC,
+            REQUIREMENT_AREA,
+            REQUIREMENT,
+            ITEM_REQUIREMENT,
         ] {
             let hw = cursor(sqlite, project, table).await?;
             if hw != 0 {
@@ -285,6 +295,16 @@ pub async fn run_pass(
                     refresh_run_step_commit(pool, sqlite, project, since, hw).await?
                 }
                 RUN_STEP_TREE => refresh_run_step_tree(pool, sqlite, project, since, hw).await?,
+                REQUIREMENT_SPEC => {
+                    refresh_requirement_spec(pool, sqlite, project, since, hw).await?
+                }
+                REQUIREMENT_AREA => {
+                    refresh_requirement_area(pool, sqlite, project, since, hw).await?
+                }
+                REQUIREMENT => refresh_requirement(pool, sqlite, project, since, hw).await?,
+                ITEM_REQUIREMENT => {
+                    refresh_item_requirement(pool, sqlite, project, since, hw).await?
+                }
                 other => unreachable!("every table of the cursor list has an arm, not `{other}`"),
             };
             tracing::debug!(
@@ -313,7 +333,7 @@ pub async fn run_pass(
 struct Batch {
     /// Rows upserted.
     rows: u64,
-    /// Tombstoned rows deleted from the mirror (`item_link` only).
+    /// Tombstoned rows deleted from the mirror (`item_link` and `item_requirement` only).
     tombstones: u64,
 }
 
@@ -661,7 +681,7 @@ async fn refresh_box(
 }
 
 // ------------------------------------------------------------------------------------------------
-// 3. The ten cursor-driven tables, per project
+// 3. The cursor-driven tables, per project
 // ------------------------------------------------------------------------------------------------
 
 const PROJECT_COLUMNS: &[&str] = &[
@@ -845,6 +865,7 @@ const ITEM_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
     "closed_at",
+    "resolution",
 ];
 
 async fn refresh_item(
@@ -857,7 +878,7 @@ async fn refresh_item(
     let rows = sqlx::query!(
         r#"SELECT id, project_id, kind_id, key_prefix, key_number, key as "key!", title, body,
                   status, priority, required_tags, touched_paths, step_graph_id, version,
-                  created_by, created_at, updated_at, closed_at
+                  created_by, created_at, updated_at, closed_at, resolution
              FROM item WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at"#,
         project.as_uuid(),
         since,
@@ -888,6 +909,7 @@ async fn refresh_item(
             .bind(ts_bind(row.created_at))
             .bind(ts_bind(row.updated_at))
             .bind(row.closed_at.map(ts_bind))
+            .bind(&row.resolution)
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx)?;
@@ -1345,6 +1367,254 @@ async fn refresh_run_step_tree(
     Ok(Batch {
         rows: rows.len() as u64,
         tombstones: 0,
+    })
+}
+
+// ---- MOD-38: ANA-11 §5.2's requirement tables (plan D12) ----------------------------------------
+//
+// `requirement_revision` and `requirement_key_counter` are deliberately absent: the mirror answers
+// `requirement_revisions` with `None` and never mints.
+
+const REQUIREMENT_SPEC_COLUMNS: &[&str] = &[
+    "project_id",
+    "owner_id",
+    "preamble",
+    "version",
+    "updated_at",
+];
+
+/// The project's one spec header, mirrored although §5.2 leaves it out (plan D12): one small row,
+/// and it spares `requirement_spec` a "none or not cached" answer.
+async fn refresh_requirement_spec(
+    pool: &PgPool,
+    sqlite: &SqlitePool,
+    project: ProjectId,
+    since: DateTime<Utc>,
+    hw: i64,
+) -> Result<Batch> {
+    let rows = sqlx::query!(
+        "SELECT project_id, owner_id, preamble, version, updated_at \
+           FROM requirement_spec WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
+        project.as_uuid(),
+        since,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let sql = upsert_sql(REQUIREMENT_SPEC, REQUIREMENT_SPEC_COLUMNS, 1);
+    let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
+    for row in &rows {
+        sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
+            .bind(row.project_id.to_string())
+            .bind(row.owner_id.to_string())
+            .bind(&row.preamble)
+            .bind(i64::from(row.version))
+            .bind(ts_bind(row.updated_at))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+    }
+    let high_water = rows.last().map_or(hw, |row| ts_bind(row.updated_at));
+    finish(tx, project, REQUIREMENT_SPEC, high_water).await?;
+    Ok(Batch {
+        rows: rows.len() as u64,
+        tombstones: 0,
+    })
+}
+
+const REQUIREMENT_AREA_COLUMNS: &[&str] = &[
+    "id",
+    "project_id",
+    "code",
+    "title",
+    "description",
+    "position",
+    "updated_at",
+];
+
+async fn refresh_requirement_area(
+    pool: &PgPool,
+    sqlite: &SqlitePool,
+    project: ProjectId,
+    since: DateTime<Utc>,
+    hw: i64,
+) -> Result<Batch> {
+    let rows = sqlx::query!(
+        "SELECT id, project_id, code, title, description, position, updated_at \
+           FROM requirement_area WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
+        project.as_uuid(),
+        since,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let sql = upsert_sql(REQUIREMENT_AREA, REQUIREMENT_AREA_COLUMNS, 1);
+    let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
+    for row in &rows {
+        sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
+            .bind(row.id.to_string())
+            .bind(row.project_id.to_string())
+            .bind(&row.code)
+            .bind(&row.title)
+            .bind(&row.description)
+            .bind(i64::from(row.position))
+            .bind(ts_bind(row.updated_at))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+    }
+    let high_water = rows.last().map_or(hw, |row| ts_bind(row.updated_at));
+    finish(tx, project, REQUIREMENT_AREA, high_water).await?;
+    Ok(Batch {
+        rows: rows.len() as u64,
+        tombstones: 0,
+    })
+}
+
+const REQUIREMENT_COLUMNS: &[&str] = &[
+    "id",
+    "project_id",
+    "area_id",
+    "area_code",
+    "number",
+    "key",
+    "body",
+    "rationale",
+    "priority",
+    "state",
+    "version",
+    "created_by",
+    "created_at",
+    "updated_at",
+];
+
+/// `requirement`, generated `key` included: the mirror stores the value Postgres computed, so the
+/// key rule lives in one place (`cache_migrations/0004_requirements.sql`).
+async fn refresh_requirement(
+    pool: &PgPool,
+    sqlite: &SqlitePool,
+    project: ProjectId,
+    since: DateTime<Utc>,
+    hw: i64,
+) -> Result<Batch> {
+    let rows = sqlx::query!(
+        r#"SELECT id, project_id, area_id, area_code, number, key as "key!", body, rationale,
+                  priority, state, version, created_by, created_at, updated_at
+             FROM requirement WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at"#,
+        project.as_uuid(),
+        since,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let sql = upsert_sql(REQUIREMENT, REQUIREMENT_COLUMNS, 1);
+    let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
+    for row in &rows {
+        sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
+            .bind(row.id.to_string())
+            .bind(row.project_id.to_string())
+            .bind(row.area_id.to_string())
+            .bind(&row.area_code)
+            .bind(i64::from(row.number))
+            .bind(&row.key)
+            .bind(&row.body)
+            .bind(&row.rationale)
+            .bind(&row.priority)
+            .bind(&row.state)
+            .bind(i64::from(row.version))
+            .bind(row.created_by.to_string())
+            .bind(ts_bind(row.created_at))
+            .bind(ts_bind(row.updated_at))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+    }
+    let high_water = rows.last().map_or(hw, |row| ts_bind(row.updated_at));
+    finish(tx, project, REQUIREMENT, high_water).await?;
+    Ok(Batch {
+        rows: rows.len() as u64,
+        tombstones: 0,
+    })
+}
+
+const ITEM_REQUIREMENT_COLUMNS: &[&str] = &[
+    "item_id",
+    "requirement_id",
+    "kind",
+    "requirement_version",
+    "proposed_by_step_id",
+    "created_at",
+    "updated_at",
+];
+
+/// Citations, live rows only: [`refresh_item_link`]'s twin, tombstone and all (plan D12).
+///
+/// A citation belongs to the pass of either end's project, as a link does, so a cross-project
+/// citation rides both cursors. Its other end may still be outside the mirror; the reads `JOIN`
+/// it away (blueprint F13).
+async fn refresh_item_requirement(
+    pool: &PgPool,
+    sqlite: &SqlitePool,
+    project: ProjectId,
+    since: DateTime<Utc>,
+    hw: i64,
+) -> Result<Batch> {
+    let rows = sqlx::query!(
+        "SELECT item_id, requirement_id, kind, requirement_version, proposed_by_step_id, \
+                created_at, updated_at, deleted_at \
+           FROM item_requirement \
+          WHERE (item_id IN (SELECT id FROM item WHERE project_id = $1) \
+                 OR requirement_id IN (SELECT id FROM requirement WHERE project_id = $1)) \
+            AND updated_at > $2 \
+          ORDER BY updated_at",
+        project.as_uuid(),
+        since,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let sql = upsert_sql(ITEM_REQUIREMENT, ITEM_REQUIREMENT_COLUMNS, 3);
+    let mut upserted = 0u64;
+    let mut tombstones = 0u64;
+    let mut tx = sqlite.begin().await.map_err(map_sqlx)?;
+    for row in &rows {
+        if row.deleted_at.is_some() {
+            // An `uncite` is a tombstone on Postgres and a deletion here, as for `item_link`.
+            sqlx::query(
+                "DELETE FROM item_requirement \
+                  WHERE item_id = ? AND requirement_id = ? AND kind = ?",
+            )
+            .bind(row.item_id.to_string())
+            .bind(row.requirement_id.to_string())
+            .bind(&row.kind)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            tombstones += 1;
+            continue;
+        }
+        sqlx::query(AssertSqlSafe(Arc::clone(&sql)))
+            .bind(row.item_id.to_string())
+            .bind(row.requirement_id.to_string())
+            .bind(&row.kind)
+            .bind(i64::from(row.requirement_version))
+            .bind(row.proposed_by_step_id.map(|id| id.to_string()))
+            .bind(ts_bind(row.created_at))
+            .bind(ts_bind(row.updated_at))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        upserted += 1;
+    }
+    let high_water = rows.last().map_or(hw, |row| ts_bind(row.updated_at));
+    finish(tx, project, ITEM_REQUIREMENT, high_water).await?;
+    Ok(Batch {
+        rows: upserted,
+        tombstones,
     })
 }
 

@@ -15,10 +15,11 @@ pub use mem::MemStore;
 pub use traits::{
     CasOutcome, DeleteReach, DeleteTarget, MAX_UPSTREAM_HOPS, ReadStore, SettingRung,
     StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists, chat_step_status,
-    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
+    citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
     finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move,
-    invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
-    not_a_fanout_candidate, not_a_terminal_status, references_no_row, reserved_phase_name,
-    row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
-    summary_names_another_item, winner_is_not_settled,
+    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
+    legal_move, not_a_fanout_candidate, not_a_terminal_status, references_no_row,
+    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_step,
+    run_is_terminal, step_is_not_promotable, step_slot_is_taken, summary_names_another_item,
+    winner_is_not_settled, withdrawn_requirement_cited,
 };

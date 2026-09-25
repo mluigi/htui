@@ -25,12 +25,13 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    AgentBox, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, Document, DocumentHead,
-    DocumentId, Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemSummary, LinkGraph, Note,
-    PhaseAgent, PhaseId, Project, ProjectId, ProjectRef, PromptScope, PromptTemplate, RepoBoxPath,
-    RepoId, ResolvedGraph, ResolvedInput, Run, RunId, RunStep, RunStepCommit, RunStepTree,
-    RunSummary, Scope, SessionEvent, StepGraph, StepGraphId, StepId, UpstreamEntry, UserId,
-    WorkspaceSummary,
+    AgentBox, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, CoverageRow, Document,
+    DocumentHead, DocumentId, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemSummary, LinkGraph, Note, PhaseAgent, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
+    PromptTemplate, RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementFilter,
+    RequirementId, RequirementRevision, RequirementSpec, ResolvedGraph, ResolvedInput, Run, RunId,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId,
+    StepId, UpstreamEntry, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -754,6 +755,71 @@ impl ReadStore for Backend {
             Self::Memory(store) => store.resolve_inputs(item, run, kinds).await,
             Self::Online { pg, .. } => pg.resolve_inputs(item, run, kinds).await,
             Self::Offline { cache, .. } => cache.resolve_inputs(item, run, kinds).await,
+        }
+    }
+
+    // ---- ANA-11 §5.1: requirements (MOD-38) ----
+
+    async fn requirement_spec(&self, project: ProjectId) -> Result<Option<RequirementSpec>> {
+        match self {
+            Self::Memory(store) => store.requirement_spec(project).await,
+            Self::Online { pg, .. } => pg.requirement_spec(project).await,
+            Self::Offline { cache, .. } => cache.requirement_spec(project).await,
+        }
+    }
+
+    async fn requirement_areas(&self, project: ProjectId) -> Result<Vec<RequirementArea>> {
+        match self {
+            Self::Memory(store) => store.requirement_areas(project).await,
+            Self::Online { pg, .. } => pg.requirement_areas(project).await,
+            Self::Offline { cache, .. } => cache.requirement_areas(project).await,
+        }
+    }
+
+    async fn requirements(
+        &self,
+        project: ProjectId,
+        filter: &RequirementFilter,
+    ) -> Result<Vec<Requirement>> {
+        match self {
+            Self::Memory(store) => store.requirements(project, filter).await,
+            Self::Online { pg, .. } => pg.requirements(project, filter).await,
+            Self::Offline { cache, .. } => cache.requirements(project, filter).await,
+        }
+    }
+
+    async fn requirement(&self, id: RequirementId) -> Result<Option<Requirement>> {
+        match self {
+            Self::Memory(store) => store.requirement(id).await,
+            Self::Online { pg, .. } => pg.requirement(id).await,
+            Self::Offline { cache, .. } => cache.requirement(id).await,
+        }
+    }
+
+    async fn requirement_revisions(
+        &self,
+        id: RequirementId,
+    ) -> Result<Option<Vec<RequirementRevision>>> {
+        match self {
+            Self::Memory(store) => store.requirement_revisions(id).await,
+            Self::Online { pg, .. } => pg.requirement_revisions(id).await,
+            Self::Offline { cache, .. } => cache.requirement_revisions(id).await,
+        }
+    }
+
+    async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
+        match self {
+            Self::Memory(store) => store.item_requirements(item).await,
+            Self::Online { pg, .. } => pg.item_requirements(item).await,
+            Self::Offline { cache, .. } => cache.item_requirements(item).await,
+        }
+    }
+
+    async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {
+        match self {
+            Self::Memory(store) => store.requirement_coverage(requirement).await,
+            Self::Online { pg, .. } => pg.requirement_coverage(requirement).await,
+            Self::Offline { cache, .. } => cache.requirement_coverage(requirement).await,
         }
     }
 }

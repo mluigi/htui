@@ -27,6 +27,7 @@
 
 use htui_core::model::Scope;
 use htui_store::Dsn;
+use htui_store::cache::MIRRORED_TABLES;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -128,12 +129,18 @@ const REBUILD_KEYS: &str = "press Enter or R";
 /// user would reasonably fear from a key called "clear".
 const CONFIRM_CLEAR: &str = "Remove the DSN from the keyring? This session keeps its current connection; the next launch starts offline. y / n";
 
-/// D14's question, written from `CacheStore::rebuild`'s own body.
+/// D14's question, written from `CacheStore::rebuild`'s own body; the table count is
+/// [`MIRRORED_TABLES`]'s, so a table joining the mirror cannot leave the copy behind.
 ///
 /// Both lists, always. The action is never extended to clear anything else — if it were, one of
 /// these two halves would quietly stop being true, and a confirmation that is wrong about what it
 /// destroys is worse than no confirmation at all.
-const CONFIRM_REBUILD: &str = "Rebuild the mirror? Survives: the file, schema_version, db_fingerprint, built_at, the pending/ buffer. Goes: the 17 mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass refills it. y / n";
+fn confirm_rebuild() -> String {
+    format!(
+        "Rebuild the mirror? Survives: the file, schema_version, db_fingerprint, built_at, the pending/ buffer. Goes: the {} mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass refills it. y / n",
+        MIRRORED_TABLES.len()
+    )
+}
 
 /// What the pane says while a rebuild is out. A rebuild can take seconds; a screen that still
 /// showed the question would be inviting a second `y` at nothing.
@@ -588,7 +595,7 @@ impl ConnectionSection {
             }
             Mode::ConfirmClear => question(CONFIRM_CLEAR, room, theme),
             Mode::ConfirmRebuild { stage } => {
-                let mut lines = question(CONFIRM_REBUILD, room, theme);
+                let mut lines = question(&confirm_rebuild(), room, theme);
                 if matches!(stage, ConfirmStage::InFlight) {
                     lines.push(Line::styled(REBUILDING.to_owned(), theme.dim));
                 }
@@ -978,19 +985,20 @@ mod tests {
         assert_eq!(READ_NAME, REQUEST_NAMES[0]);
     }
 
-    /// D14: both lists, in one constant, so a reader of this file sees what the key destroys.
+    /// D14: both lists, in one question, so a reader of this file sees what the key destroys.
     #[test]
     fn the_rebuild_copy_names_both_lists() {
+        let tables = format!("{} mirrored tables", MIRRORED_TABLES.len());
         for named in [
             "schema_version",
             "db_fingerprint",
             "built_at",
             "pending/",
-            "17 mirrored tables",
+            tables.as_str(),
             "cache_cursor",
             "last_full_refresh_at",
         ] {
-            assert!(CONFIRM_REBUILD.contains(named), "`{named}`");
+            assert!(confirm_rebuild().contains(named), "`{named}`");
         }
     }
 }

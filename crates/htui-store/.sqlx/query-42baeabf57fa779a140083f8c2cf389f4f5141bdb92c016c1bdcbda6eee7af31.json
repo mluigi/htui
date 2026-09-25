@@ -1,0 +1,203 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT i.id                   AS \"id!: ItemId\",\n                   i.project_id           AS \"project_id!: ProjectId\",\n                   i.kind_id              AS \"kind_id!: ItemKindId\",\n                   i.key                  AS \"key!\",\n                   i.key_prefix           AS \"key_prefix!\",\n                   i.key_number           AS \"key_number!\",\n                   i.title                AS \"title!\",\n                   i.status               AS \"status!: Status\",\n                   i.priority             AS \"priority!\",\n                   i.required_tags        AS \"required_tags!\",\n                   i.updated_at           AS \"updated_at!\",\n                   i.touched_paths        AS \"touched_paths!\",\n                   i.resolution           AS \"resolution?: Resolution\",\n                   ir.kind                AS \"kind!: CitationKind\",\n                   ir.requirement_version AS \"requirement_version!\",\n                   r.version > ir.requirement_version AS \"suspect!\"\n              FROM item_requirement ir\n              JOIN requirement r ON r.id = ir.requirement_id\n              JOIN item i        ON i.id = ir.item_id\n             WHERE ir.requirement_id = $1 AND ir.deleted_at IS NULL\n             ORDER BY i.key_prefix COLLATE \"C\", i.key_number, i.id, ir.kind COLLATE \"C\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id!: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind_id!: ItemKindId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "kind_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "key_prefix!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key_prefix"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "key_number!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key_number"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "title!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "status!: Status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "priority!",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "priority"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "required_tags!",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "required_tags"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "touched_paths!",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "touched_paths"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "resolution?: Resolution",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "resolution"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "kind!: CitationKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "requirement_version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "requirement_version"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "suspect!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "42baeabf57fa779a140083f8c2cf389f4f5141bdb92c016c1bdcbda6eee7af31"
+}

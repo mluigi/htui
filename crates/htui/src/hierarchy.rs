@@ -320,12 +320,12 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .await?;
             reread(&writer, ws, this_box).await
         }
-        StoreRequest::DeleteReach(target) => {
-            Ok(StoreReply::DeleteReach(writer.delete_reach(*target).await?))
-        }
+        StoreRequest::DeleteReach(target) => Ok(StoreReply::DeleteReach(
+            writer.delete_reach(*target).await?.map(Box::new),
+        )),
         StoreRequest::DeleteWorkspace(id) => Ok(StoreReply::Deleted {
             target: DeleteTarget::Workspace(*id),
-            reach: writer.delete_workspace(*id).await?,
+            reach: Box::new(writer.delete_workspace(*id).await?),
             // `workspace` and `workspace_project` are full-table replaced on every refresh pass,
             // so the mirror cannot serve a workspace this just removed (D10).
             mirror: MirrorAfterDelete::NotNeeded,
@@ -344,7 +344,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             };
             Ok(StoreReply::Deleted {
                 target: DeleteTarget::Project(*id),
-                reach,
+                reach: Box::new(reach),
                 mirror,
             })
         }
@@ -475,7 +475,7 @@ pub const REQUEST_NAMES: [&str; 12] = [
 /// [`DeleteReach`] fails to compile here rather than being silently left out of a warning that
 /// claims to list everything a delete removes (the zero-omission rule, PRD D13). Shared by
 /// [`reach_parts`] and [`reach_totals`] so the two cannot disagree about what they counted.
-fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 22] {
+fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 28] {
     let DeleteReach {
         workspace_links,
         workspace_box_paths,
@@ -499,6 +499,12 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 22] {
         revisions,
         links,
         documents,
+        requirement_specs,
+        requirement_areas,
+        requirement_key_counters,
+        requirements,
+        requirement_revisions,
+        item_requirements,
     } = *reach;
     [
         (workspace_links, "workspace links"),
@@ -523,6 +529,12 @@ fn labelled(reach: &DeleteReach) -> [(u64, &'static str); 22] {
         (revisions, "revisions"),
         (links, "links"),
         (documents, "documents"),
+        (requirement_specs, "requirement specs"),
+        (requirement_areas, "requirement areas"),
+        (requirement_key_counters, "requirement key counters"),
+        (requirements, "requirements"),
+        (requirement_revisions, "requirement revisions"),
+        (item_requirements, "citations"),
     ]
 }
 
@@ -593,6 +605,38 @@ mod tests {
             ]
         );
         assert!(reach_parts(&DeleteReach::default()).is_empty());
+    }
+
+    /// MOD-38 (blueprint F1): the six requirement tables a project delete cascades are named in
+    /// the warning, after `documents` and in field order, with `item_requirement` read as
+    /// citations.
+    #[test]
+    fn reach_parts_names_the_requirement_tables() {
+        let reach = DeleteReach {
+            items: 12,
+            documents: 2,
+            requirement_specs: 1,
+            requirement_areas: 2,
+            requirement_key_counters: 2,
+            requirements: 3,
+            requirement_revisions: 4,
+            item_requirements: 6,
+            ..DeleteReach::default()
+        };
+        assert_eq!(
+            reach_parts(&reach),
+            vec![
+                "12 items".to_owned(),
+                "2 documents".to_owned(),
+                "1 requirement specs".to_owned(),
+                "2 requirement areas".to_owned(),
+                "2 requirement key counters".to_owned(),
+                "3 requirements".to_owned(),
+                "4 requirement revisions".to_owned(),
+                "6 citations".to_owned(),
+            ]
+        );
+        assert_eq!(reach_totals(&reach), (32, 8));
     }
 
     #[test]

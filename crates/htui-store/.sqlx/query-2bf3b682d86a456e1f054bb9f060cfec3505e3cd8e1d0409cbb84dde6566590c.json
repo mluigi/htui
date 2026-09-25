@@ -1,0 +1,188 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT r.id         AS \"id: RequirementId\",\n                   r.project_id AS \"project_id: ProjectId\",\n                   r.area_id    AS \"area_id: RequirementAreaId\",\n                   r.area_code,\n                   r.number,\n                   r.key        AS \"key!\",\n                   r.body,\n                   r.rationale,\n                   r.priority   AS \"priority: Priority\",\n                   r.state      AS \"state: RequirementState\",\n                   r.version,\n                   r.created_by AS \"created_by: UserId\",\n                   r.created_at,\n                   r.updated_at\n              FROM requirement r\n             WHERE r.project_id = $1\n               AND ($2::text[] IS NULL OR r.area_code = ANY($2))\n               AND ($3::text[] IS NULL OR r.state = ANY($3))\n               AND ($4::text[] IS NULL OR r.priority = ANY($4))\n               -- A literal substring, as in `items`: `position`, not ILIKE.\n               AND ($5::text IS NULL\n                    OR position(lower($5::text) in lower(r.key)) > 0\n                    OR position(lower($5::text) in lower(r.body)) > 0)\n             ORDER BY r.area_code COLLATE \"C\", r.number\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: RequirementId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "area_id: RequirementAreaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "area_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "area_code",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "area_code"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "number",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "number"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "body",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "rationale",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "rationale"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "priority: Priority",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "priority"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "state: RequirementState",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "created_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2bf3b682d86a456e1f054bb9f060cfec3505e3cd8e1d0409cbb84dde6566590c"
+}

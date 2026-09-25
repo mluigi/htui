@@ -1,0 +1,190 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH a AS (\n                SELECT id, project_id, code FROM requirement_area WHERE id = $1\n            ), c AS (\n                INSERT INTO requirement_key_counter (area_id, last_value)\n                SELECT id, 1 FROM a\n                ON CONFLICT (area_id)\n                DO UPDATE SET last_value = requirement_key_counter.last_value + 1\n                RETURNING last_value\n            ), r AS (\n                INSERT INTO requirement (id, project_id, area_id, area_code, number, body,\n                                         rationale, priority, created_by)\n                SELECT $2, a.project_id, a.id, a.code, c.last_value, $3, $4, $5, $6 FROM a, c\n                RETURNING id, project_id, area_id, area_code, number, key, body, rationale,\n                          priority, state, version, created_by, created_at, updated_at\n            ), v AS (\n                INSERT INTO requirement_revision (requirement_id, version, body, rationale,\n                                                  priority, state, author_id, box_id, reason)\n                SELECT id, version, body, rationale, priority, state, $6, $7, 'created' FROM r\n                RETURNING requirement_id\n            )\n            SELECT r.id         AS \"id!: RequirementId\",\n                   r.project_id AS \"project_id!: ProjectId\",\n                   r.area_id    AS \"area_id!: RequirementAreaId\",\n                   r.area_code  AS \"area_code!\",\n                   r.number     AS \"number!\",\n                   r.key        AS \"key!\",\n                   r.body       AS \"body!\",\n                   r.rationale  AS \"rationale!\",\n                   r.priority   AS \"priority!: Priority\",\n                   r.state      AS \"state!: RequirementState\",\n                   r.version    AS \"version!\",\n                   r.created_by AS \"created_by!: UserId\",\n                   r.created_at AS \"created_at!\",\n                   r.updated_at AS \"updated_at!\"\n              FROM r, v\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: RequirementId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id!: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "area_id!: RequirementAreaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "area_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "area_code!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "area_code"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "number!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "number"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "body!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "rationale!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "rationale"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "priority!: Priority",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "priority"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "state!: RequirementState",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "created_by!: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "requirement",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b069d66910eb66840eac86c0e195420f8f85a6d22bd0c5783de85c97a68d61b3"
+}

@@ -713,7 +713,10 @@ fn close_out_key(item: ItemId, stage: CloseOutStage, key: KeyEvent, ctx: &Ctx<'_
         },
         CloseOutStage::Typed { preview, mut field } => match field.on_key(key) {
             FieldOutcome::Submit if field.text() == Some(preview.key.as_str()) => {
-                ctx.request(command(Command::CloseOut { item }));
+                ctx.request(command(Command::CloseOut {
+                    item,
+                    resolution: preview.resolution,
+                }));
                 CloseOutStage::InFlight
             }
             FieldOutcome::Submit => {
@@ -1260,8 +1263,12 @@ impl RunsTab {
             Mode::CloseOut(CloseOutStage::Warn(preview)) => vec![
                 Line::styled(
                     format!(
-                        "close {} · {} runs · {} commit rows · summary v{}",
-                        preview.key, preview.runs, preview.rows, preview.version
+                        "close {} as {} · {} runs · {} commit rows · summary v{}",
+                        preview.key,
+                        preview.resolution,
+                        preview.runs,
+                        preview.rows,
+                        preview.version
                     ),
                     theme.title,
                 ),
@@ -2494,14 +2501,20 @@ mod tests {
             key: "FEAT-1".to_owned(),
             title: "TUI scaffold".to_owned(),
             status: htui_core::model::Status::Done,
+            resolution: htui_core::model::Resolution::Done,
             runs: 1,
             rows: 3,
             version: 2,
         }
     }
 
-    /// `C` on an allowed pane, then the preview's answer: the pane at the warning.
+    /// `C` on an allowed pane, then [`preview`]'s answer: the pane at the warning.
     async fn warned(shell: &Shell) -> RunsTab {
+        warned_with(shell, preview()).await
+    }
+
+    /// `C` on an allowed pane, then `preview` as the answer: the pane at the warning.
+    async fn warned_with(shell: &Shell, preview: Preview) -> RunsTab {
         let (mut pane, _) = driven(shell, true).await;
         pane.on_key(shift('C'), &mut shell.ctx());
         let emitted = shell.emit.take();
@@ -2517,7 +2530,7 @@ mod tests {
             ["counting what the close-out writes\u{2026}"]
         );
         pane.on_reply(
-            &StoreReply::Orch(OrchReply::CloseOutPreview(Box::new(preview()))),
+            &StoreReply::Orch(OrchReply::CloseOutPreview(Box::new(preview))),
             &mut shell.ctx(),
         );
         assert!(
@@ -2534,7 +2547,7 @@ mod tests {
         assert_eq!(
             footer(&pane),
             [
-                "close FEAT-1 · 1 runs · 3 commit rows · summary v2",
+                "close FEAT-1 as done · 1 runs · 3 commit rows · summary v2",
                 "y continue · n cancel"
             ]
         );
@@ -2569,6 +2582,35 @@ mod tests {
         assert!(!pane.captures_input());
 
         assert_refused(shift('C'), "close_out").await;
+    }
+
+    /// MOD-38 PRD D2: the first confirmation names the resolution the item closes as, and the
+    /// typed key sends that resolution: a `failed` item closes as `withdrawn` (plan D6).
+    #[tokio::test]
+    async fn the_close_out_warn_names_the_resolution() {
+        let shell = Shell::new();
+        let failed = Preview {
+            status: htui_core::model::Status::Failed,
+            resolution: htui_core::model::Resolution::Withdrawn,
+            ..preview()
+        };
+        let mut pane = warned_with(&shell, failed).await;
+        assert_eq!(
+            footer(&pane)[0],
+            "close FEAT-1 as withdrawn · 1 runs · 3 commit rows · summary v2"
+        );
+
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        type_text(&mut pane, &shell, "FEAT-1");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert_eq!(
+            emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
+            [&Command::CloseOut {
+                item: ids::HTUI_FEAT_1,
+                resolution: htui_core::model::Resolution::Withdrawn,
+            }]
+        );
     }
 
     /// D167: the typed stage wants the item's key exactly; a wrong key clears the field, `n` is a
@@ -2608,7 +2650,8 @@ mod tests {
         assert_eq!(
             emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
             [&Command::CloseOut {
-                item: ids::HTUI_FEAT_1
+                item: ids::HTUI_FEAT_1,
+                resolution: htui_core::model::Resolution::Done,
             }]
         );
         for swallowed in [KeyCode::Esc, KeyCode::Char('y'), KeyCode::Enter] {
@@ -2966,7 +3009,7 @@ mod tests {
         assert!(
             drawn
                 .iter()
-                .any(|line| line.starts_with("close FEAT-1 \u{b7}")),
+                .any(|line| line.starts_with("close FEAT-1 as done \u{b7}")),
             "the warning is on screen: {drawn:#?}"
         );
         pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());

@@ -111,5 +111,6 @@ on, so the `htui` binary does too. An offline build sets `ORT_LIB_LOCATION` to a
 - **MOD-11**: the agent-facing `search_concepts` tool over `VectorStore::search`.
 - **MOD-41**: automatic sync as a headless-worker background job; until then it is
   `htui --index-items`.
-- **MOD-38**: index requirements (`type = requirement`) once the table exists, and add
-  `item.resolution` to the payload so "decisions" stops meaning "done or closed".
+- **MOD-50** (first left on MOD-38, which closed before this landed): index requirements
+  (`type = requirement`), and add `item.resolution` to the payload so "decisions" stops meaning
+  "done or closed".

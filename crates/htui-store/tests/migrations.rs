@@ -14,8 +14,8 @@ use htui_core::store::StoreError;
 use htui_store::{MIGRATOR, MigrationState, PgStore, Registration, identity};
 use sqlx::Row as _;
 
-/// The 33 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
-/// adds (`run_step_tree`, ANA-2 §9).
+/// The 39 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -51,6 +51,13 @@ const TABLES: &[&str] = &[
     "app_setting",
     // 0003_orchestration.sql (ANA-2 §9), and therefore last.
     "run_step_tree",
+    // 0006_requirements.sql (ANA-11 §5, MOD-38), in its creation order.
+    "requirement_spec",
+    "requirement_area",
+    "requirement_key_counter",
+    "requirement",
+    "requirement_revision",
+    "item_requirement",
 ];
 
 #[tokio::test]
@@ -71,10 +78,11 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5],
+        vec![1, 2, 3, 4, 5, 6],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
-         0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql and \
-         MOD-7 milestone 1's 0005_box_identity.sql, in ordinal order"
+         0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
+         MOD-7 milestone 1's 0005_box_identity.sql and MOD-38's 0006_requirements.sql, in \
+         ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -92,16 +100,16 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        33,
-        "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1) and \
-         0003_orchestration.sql adds run_step_tree"
+        39,
+        "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
+         0003_orchestration.sql adds run_step_tree and 0006_requirements.sql adds ANA-11 §5's six"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 33 tables of B.1 as amended by ANA-2 §9 and nothing else, \
-         got {present:?}"
+        "the migrations create the 39 tables of B.1 as amended by ANA-2 §9 and ANA-11 §5 and \
+         nothing else, got {present:?}"
     );
 
     db.drop_db().await;
@@ -591,7 +599,8 @@ async fn the_twelve_ana2_defaults_land_with_their_values() {
 /// deliberate 5 from a default, so it touches nothing but the exact seed.
 ///
 /// Staged through [`MIGRATOR`] itself: `run_to(3)` stops after 0003, so the seed is observable
-/// before 0004 runs, and the plain `run` afterwards applies 0004 alone.
+/// before 0004 runs, and `run_to(4)` afterwards applies 0004 alone (a plain `run` would carry on
+/// into 0005 and later, which this case is not about).
 #[tokio::test]
 async fn the_0004_bump_moves_only_an_untouched_six() {
     let Some(db) = common::bare_db().await else {
@@ -620,20 +629,180 @@ async fn the_0004_bump_moves_only_an_untouched_six() {
         .execute(&db.pool)
         .await
         .expect("a user lowers the cap to 5");
-    MIGRATOR.run(&db.pool).await.expect("apply 0004 and 0005");
+    MIGRATOR
+        .run_to(4, &db.pool)
+        .await
+        .expect("apply 0004 alone");
     let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY 1")
         .fetch_all(&db.pool)
         .await
         .expect("read _sqlx_migrations");
-    assert_eq!(
-        applied,
-        vec![1, 2, 3, 4, 5],
-        "0004 ran, and 0005_box_identity.sql after it"
-    );
+    assert_eq!(applied, vec![1, 2, 3, 4], "0004 ran");
     assert_eq!(
         read().await,
         serde_json::json!(5),
         "0004 leaves a value that is not the seeded 6 alone"
+    );
+
+    db.drop_db().await;
+}
+
+/// The smallest FK chain an `item` row needs (project -> step_graph -> item_kind), under the
+/// `created_by` the caller names. Returns `(project, kind)`; the kind's prefix is `RES`.
+async fn plant_item_kind(pool: &sqlx::PgPool, user: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
+    let project = uuid::Uuid::now_v7();
+    let graph = uuid::Uuid::now_v7();
+    let kind = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO project (id, slug, name, created_by) VALUES ($1, 'res', 'Res', $2)")
+        .bind(project)
+        .bind(user)
+        .execute(pool)
+        .await
+        .expect("insert project");
+    sqlx::query("INSERT INTO step_graph (id, project_id, name) VALUES ($1, $2, 'default')")
+        .bind(graph)
+        .bind(project)
+        .execute(pool)
+        .await
+        .expect("insert step_graph");
+    sqlx::query(
+        "INSERT INTO item_kind (id, project_id, prefix, name, default_graph_id) \
+         VALUES ($1, $2, 'RES', 'resolution', $3)",
+    )
+    .bind(kind)
+    .bind(project)
+    .bind(graph)
+    .execute(pool)
+    .await
+    .expect("insert item_kind");
+    (project, kind)
+}
+
+/// MOD-38 (ANA-11 §4.2, blueprint F10): `chk_item_resolution_iff_closed` holds both halves. A
+/// `closed` row must say how it closed, and a row that is not closed must not claim a resolution.
+#[tokio::test]
+async fn item_resolution_iff_closed_rejects_both_halves() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let user = db.store.this_user().as_uuid();
+    let (project, kind) = plant_item_kind(&db.pool, user).await;
+
+    let insert = |number: i32, status: &'static str, resolution: Option<&'static str>| {
+        sqlx::query(
+            "INSERT INTO item (project_id, kind_id, key_prefix, key_number, title, status, \
+             resolution, created_by) VALUES ($1, $2, 'RES', $3, 'r', $4, $5, $6)",
+        )
+        .bind(project)
+        .bind(kind)
+        .bind(number)
+        .bind(status)
+        .bind(resolution)
+        .bind(user)
+        .execute(&db.pool)
+    };
+
+    for (number, status, resolution, why) in [
+        (1, "closed", None, "a closed row with no resolution"),
+        (2, "open", Some("done"), "an open row with a resolution"),
+    ] {
+        let err = insert(number, status, resolution)
+            .await
+            .expect_err("the CHECK refuses the row");
+        let constraint = err
+            .as_database_error()
+            .and_then(|e| e.constraint())
+            .map(str::to_owned);
+        assert_eq!(
+            constraint.as_deref(),
+            Some("chk_item_resolution_iff_closed"),
+            "{why} is refused by the iff constraint, got {err}"
+        );
+    }
+
+    insert(3, "closed", Some("withdrawn"))
+        .await
+        .expect("a closed row with a resolution is accepted");
+    insert(4, "open", None)
+        .await
+        .expect("an open row without one is accepted");
+
+    db.drop_db().await;
+}
+
+/// MOD-38 (plan D8): every item closed before 0006 closed through the old `-> closed` edges, which
+/// only a finished item took, so 0006 backfills `done` before it adds the iff constraint, with
+/// `trg_item_updated_at` off so no row's `updated_at` moves. Staged like the 0004 case:
+/// `run_to(5)`, plant a closed row, then the plain `run` applies 0006.
+#[tokio::test]
+async fn closed_rows_backfill_to_done() {
+    const PLANTED_AT: &str = "2020-01-02T03:04:05Z";
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+
+    MIGRATOR
+        .run_to(5, &db.pool)
+        .await
+        .expect("apply 0001 through 0005");
+    let user = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO app_user (id, name) VALUES ($1, 'backfill')")
+        .bind(user)
+        .execute(&db.pool)
+        .await
+        .expect("insert app_user");
+    let (project, kind) = plant_item_kind(&db.pool, user).await;
+    let mut planted = Vec::new();
+    for (number, status) in [(1, "closed"), (2, "open"), (3, "done")] {
+        let id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, title, status, \
+             created_by, updated_at) VALUES ($1, $2, $3, 'RES', $4, 'r', $5, $6, $7::timestamptz)",
+        )
+        .bind(id)
+        .bind(project)
+        .bind(kind)
+        .bind(number)
+        .bind(status)
+        .bind(user)
+        .bind(PLANTED_AT)
+        .execute(&db.pool)
+        .await
+        .expect("insert a pre-0006 item");
+        planted.push((id, status));
+    }
+
+    MIGRATOR.run(&db.pool).await.expect("apply 0006");
+
+    for (id, status) in planted {
+        let (resolution, kept): (Option<String>, bool) = sqlx::query_as(
+            "SELECT resolution, updated_at = $2::timestamptz FROM item WHERE id = $1",
+        )
+        .bind(id)
+        .bind(PLANTED_AT)
+        .fetch_one(&db.pool)
+        .await
+        .expect("read item.resolution and updated_at");
+        let expected = (status == "closed").then(|| "done".to_owned());
+        assert_eq!(
+            resolution, expected,
+            "a pre-0006 `{status}` row backfills to {expected:?}"
+        );
+        assert!(
+            kept,
+            "the backfill leaves a pre-0006 `{status}` row's updated_at at {PLANTED_AT}"
+        );
+    }
+    let enabled: String = sqlx::query_scalar(
+        "SELECT tgenabled::text FROM pg_trigger \
+          WHERE tgrelid = 'item'::regclass AND tgname = 'trg_item_updated_at'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("read trg_item_updated_at");
+    assert_eq!(
+        enabled, "O",
+        "0006 re-enables trg_item_updated_at after the backfill"
     );
 
     db.drop_db().await;
@@ -661,8 +830,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(5),
-        "five embedded migrations, none applied"
+        MigrationState::Pending(6),
+        "six embedded migrations, none applied"
     );
 
     db.drop_db().await;
@@ -1234,6 +1403,12 @@ async fn load_demo_round_trips_a_count_per_table() {
         "run",
         "run_step",
         "session_event",
+        "requirement_spec",
+        "requirement_area",
+        "requirement_key_counter",
+        "requirement",
+        "requirement_revision",
+        "item_requirement",
     ];
     let mut before = Vec::new();
     for table in tables {
@@ -1243,7 +1418,7 @@ async fn load_demo_round_trips_a_count_per_table() {
     let data = htui_core::fixtures::demo_data();
     db.store.load_demo(&data).await.expect("load the fixture");
 
-    let expected: [(&str, usize); 19] = [
+    let expected: [(&str, usize); 25] = [
         ("app_user", data.users.len()),
         ("box", data.boxes.len()),
         ("workspace", data.workspaces.len()),
@@ -1263,7 +1438,30 @@ async fn load_demo_round_trips_a_count_per_table() {
         ("run", data.runs.len()),
         ("run_step", data.steps.len()),
         ("session_event", data.events.len()),
+        ("requirement_spec", data.requirement_specs.len()),
+        ("requirement_area", data.requirement_areas.len()),
+        (
+            "requirement_key_counter",
+            data.requirement_key_counter.len(),
+        ),
+        ("requirement", data.requirements.len()),
+        ("requirement_revision", data.requirement_revisions.len()),
+        ("item_requirement", data.item_requirements.len()),
     ];
+    // MOD-38 blueprint §8: the requirement set's own sizes, pinned so a fixture edit that drops a
+    // row is loud here and not only a smaller delta. The citation tombstone is a row too.
+    assert_eq!(
+        [
+            data.requirement_specs.len(),
+            data.requirement_areas.len(),
+            data.requirement_key_counter.len(),
+            data.requirements.len(),
+            data.requirement_revisions.len(),
+            data.item_requirements.len(),
+        ],
+        [1, 2, 2, 3, 4, 5],
+        "spec, areas, counters, requirements, revisions, citations"
+    );
 
     for (i, (table, len)) in expected.iter().enumerate() {
         let after = common::count(&db.pool, table).await;

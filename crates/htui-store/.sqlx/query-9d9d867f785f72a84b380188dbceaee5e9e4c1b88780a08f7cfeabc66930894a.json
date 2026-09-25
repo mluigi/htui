@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id            AS \"id: ItemId\",\n                   project_id    AS \"project_id: ProjectId\",\n                   kind_id       AS \"kind_id: htui_core::model::ItemKindId\",\n                   key_prefix,\n                   key_number,\n                   key           AS \"key!\",\n                   title,\n                   body,\n                   status        AS \"status: htui_core::model::Status\",\n                   priority,\n                   required_tags,\n                   touched_paths,\n                   step_graph_id AS \"step_graph_id: htui_core::model::StepGraphId\",\n                   version,\n                   created_by    AS \"created_by: htui_core::model::UserId\",\n                   created_at,\n                   updated_at,\n                   closed_at\n              FROM item WHERE id = $1\n            ",
+  "query": "SELECT id, project_id, kind_id, key_prefix, key_number, key as \"key!\", title, body,\n                  status, priority, required_tags, touched_paths, step_graph_id, version,\n                  created_by, created_at, updated_at, closed_at, resolution\n             FROM item WHERE project_id = $1 AND updated_at > $2 ORDER BY updated_at",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id: ItemId",
+        "name": "id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "project_id: ProjectId",
+        "name": "project_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -27,7 +27,7 @@
       },
       {
         "ordinal": 2,
-        "name": "kind_id: htui_core::model::ItemKindId",
+        "name": "kind_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -93,7 +93,7 @@
       },
       {
         "ordinal": 8,
-        "name": "status: htui_core::model::Status",
+        "name": "status",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -137,7 +137,7 @@
       },
       {
         "ordinal": 12,
-        "name": "step_graph_id: htui_core::model::StepGraphId",
+        "name": "step_graph_id",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -159,7 +159,7 @@
       },
       {
         "ordinal": 14,
-        "name": "created_by: htui_core::model::UserId",
+        "name": "created_by",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -200,11 +200,23 @@
             "name": "closed_at"
           }
         }
+      },
+      {
+        "ordinal": 18,
+        "name": "resolution",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "resolution"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -225,8 +237,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "8c1bcab9d9b66f90b68875ef7def37d319b643fada5831d1e69abd65327c4175"
+  "hash": "9d9d867f785f72a84b380188dbceaee5e9e4c1b88780a08f7cfeabc66930894a"
 }

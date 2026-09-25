@@ -564,8 +564,8 @@ async fn set_dsn_under_offline_stores_but_does_not_dial() {
     drop(root);
 }
 
-/// `RebuildCache` empties the seventeen mirrored tables and the cursor, and keeps the file's
-/// identity (D14, `cache/mod.rs:166-171`).
+/// `RebuildCache` empties the mirrored tables (`MIRRORED_TABLES`) and the cursor, and keeps the
+/// file's identity (D14, `cache/mod.rs:166-171`).
 #[tokio::test]
 async fn rebuild_cache_empties_the_mirrored_tables_and_keeps_the_meta() {
     // `RebuildCache` answers with a `connection::snapshot`, which reads the keyring over any
@@ -577,7 +577,8 @@ async fn rebuild_cache_empties_the_mirrored_tables_and_keeps_the_meta() {
         .expect("the mirror is seeded");
     let before = cache.meta().await.expect("a seeded mirror has meta");
     // `project`, not `item`: `seed_mirror` writes the six unscoped tables an offline *write* path
-    // needs, and the cursor-driven ones are not among them. It is one of the seventeen either way.
+    // needs, and the cursor-driven ones are not among them. It is one of `MIRRORED_TABLES` either
+    // way.
     let projects: i64 = sqlx::query_scalar("SELECT count(*) FROM project")
         .fetch_one(cache.pool())
         .await
@@ -1662,7 +1663,11 @@ async fn rebuild_needs_a_confirmation_and_names_both_lists() {
     for survives in ["schema_version", "db_fingerprint", "built_at", "pending/"] {
         assert!(frame.contains(survives), "`{survives}` survives: {frame}");
     }
-    for goes in ["17 mirrored tables", "cache_cursor", "last_full_refresh_at"] {
+    let tables = format!(
+        "{} mirrored tables",
+        htui_store::cache::MIRRORED_TABLES.len()
+    );
+    for goes in [tables.as_str(), "cache_cursor", "last_full_refresh_at"] {
         assert!(frame.contains(goes), "`{goes}` goes: {frame}");
     }
     assert!(

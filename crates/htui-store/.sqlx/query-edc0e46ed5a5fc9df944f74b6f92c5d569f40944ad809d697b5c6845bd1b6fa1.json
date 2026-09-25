@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            WITH u AS (\n                UPDATE item SET\n                    title         = COALESCE($3, title),\n                    body          = COALESCE($4, body),\n                    kind_id       = COALESCE($5, kind_id),\n                    required_tags = COALESCE($6, required_tags),\n                    priority      = COALESCE($7, priority),\n                    touched_paths = COALESCE($8, touched_paths),\n                    step_graph_id = CASE WHEN $9 THEN $10 ELSE step_graph_id END,\n                    version       = version + 1\n                 WHERE id = $1\n                   AND version = $2\n                   AND ($5::uuid IS NULL OR EXISTS (\n                           SELECT 1 FROM item_kind k\n                            WHERE k.id = $5 AND k.project_id = item.project_id))\n                RETURNING id, project_id, kind_id, key_prefix, key_number, key, title, body, status,\n                          priority, required_tags, touched_paths, step_graph_id, version,\n                          created_by, created_at, updated_at, closed_at\n            ), r AS (\n                INSERT INTO item_revision (item_id, version, title, body, required_tags,\n                                           author_id, box_id, reason)\n                SELECT id, version, title, body, required_tags, $11, $12, $13 FROM u\n                RETURNING item_id\n            )\n            SELECT u.id            AS \"id!: ItemId\",\n                   u.project_id    AS \"project_id!: htui_core::model::ProjectId\",\n                   u.kind_id       AS \"kind_id!: htui_core::model::ItemKindId\",\n                   u.key_prefix    AS \"key_prefix!\",\n                   u.key_number    AS \"key_number!\",\n                   u.key           AS \"key!\",\n                   u.title         AS \"title!\",\n                   u.body          AS \"body!\",\n                   u.status        AS \"status!: Status\",\n                   u.priority      AS \"priority!\",\n                   u.required_tags AS \"required_tags!\",\n                   u.touched_paths AS \"touched_paths!\",\n                   u.step_graph_id AS \"step_graph_id?: htui_core::model::StepGraphId\",\n                   u.version       AS \"version!\",\n                   u.created_by    AS \"created_by!: htui_core::model::UserId\",\n                   u.created_at    AS \"created_at!\",\n                   u.updated_at    AS \"updated_at!\",\n                   u.closed_at     AS \"closed_at?\"\n              FROM u, r\n            ",
+  "query": "\n            WITH c AS (\n                INSERT INTO item_key_counter (project_id, prefix, last_value)\n                SELECT $2, k.prefix, 1 FROM item_kind k WHERE k.id = $3 AND k.project_id = $2\n                ON CONFLICT (project_id, prefix)\n                DO UPDATE SET last_value = item_key_counter.last_value + 1\n                RETURNING prefix, last_value\n            ), i AS (\n                INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, title, body,\n                                  priority, required_tags, touched_paths, step_graph_id, created_by)\n                SELECT $1, $2, $3, c.prefix, c.last_value, $4, $5, $6, $7, $8, $9, $10 FROM c\n                RETURNING id, project_id, kind_id, key_prefix, key_number, key, title, body, status,\n                          priority, required_tags, touched_paths, step_graph_id, version,\n                          created_by, created_at, updated_at, closed_at, resolution\n            ), r AS (\n                INSERT INTO item_revision (item_id, version, title, body, required_tags,\n                                           author_id, box_id, reason)\n                SELECT id, version, title, body, required_tags, $10, $11, 'created' FROM i\n                RETURNING item_id\n            )\n            SELECT i.id            AS \"id!: ItemId\",\n                   i.project_id    AS \"project_id!: htui_core::model::ProjectId\",\n                   i.kind_id       AS \"kind_id!: htui_core::model::ItemKindId\",\n                   i.key_prefix    AS \"key_prefix!\",\n                   i.key_number    AS \"key_number!\",\n                   i.key           AS \"key!\",\n                   i.title         AS \"title!\",\n                   i.body          AS \"body!\",\n                   i.status        AS \"status!: Status\",\n                   i.priority      AS \"priority!\",\n                   i.required_tags AS \"required_tags!\",\n                   i.touched_paths AS \"touched_paths!\",\n                   i.step_graph_id AS \"step_graph_id?: htui_core::model::StepGraphId\",\n                   i.version       AS \"version!\",\n                   i.created_by    AS \"created_by!: htui_core::model::UserId\",\n                   i.created_at    AS \"created_at!\",\n                   i.updated_at    AS \"updated_at!\",\n                   i.closed_at     AS \"closed_at?\",\n                   i.resolution    AS \"resolution?: htui_core::model::Resolution\"\n              FROM i, r\n            ",
   "describe": {
     "columns": [
       {
@@ -200,23 +200,32 @@
             "name": "closed_at"
           }
         }
+      },
+      {
+        "ordinal": 18,
+        "name": "resolution?: htui_core::model::Resolution",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "resolution"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
-        "Int4",
-        "Text",
-        "Text",
         "Uuid",
-        "TextArray",
+        "Uuid",
+        "Text",
+        "Text",
         "Int2",
         "TextArray",
-        "Bool",
+        "TextArray",
         "Uuid",
         "Uuid",
-        "Uuid",
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -237,8 +246,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "7fc78d86c606c2096e312c4f974cf120d8088f6b78d3cf2198aa916e22c36a43"
+  "hash": "edc0e46ed5a5fc9df944f74b6f92c5d569f40944ad809d697b5c6845bd1b6fa1"
 }
