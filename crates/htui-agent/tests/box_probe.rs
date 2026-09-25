@@ -12,20 +12,28 @@
 //! and the tool-name grep over `src/box_probe/*.rs` is literal.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use chrono::{TimeZone, Utc};
 use htui_agent::box_probe::hardware::{
-    FixedHardware, Hardware, HardwareSource, SystemHardware, pci_display_vendors,
-    pnp_device_vendors, ram_mb, system_profiler_vendors,
+    FixedHardware, Hardware, pci_display_vendors, pnp_device_vendors, ram_mb,
+    system_profiler_vendors,
 };
+#[cfg(target_os = "linux")]
+use htui_agent::box_probe::hardware::{HardwareSource, SystemHardware};
 use htui_agent::box_probe::spec::{
     EffectiveSpec, Fact, GpuVendor, SETTING_KEY, SPEC_IGNORED, Spec, TagRule, digest, effective,
     seed, validate,
 };
 // `tags_from_presence` is called by path: the blueprint names its test after it.
-use htui_agent::box_probe::{self as box_probe, MAX_CONCURRENT_TOOLS, pick_gpu_vendor, probe_box};
+#[cfg(unix)]
+use htui_agent::box_probe::MAX_CONCURRENT_TOOLS;
+use htui_agent::box_probe::{self as box_probe, pick_gpu_vendor, probe_box};
 use htui_agent::launch::{ToolProbe, VersionProbe, declares_install};
 use htui_agent::probe::ProbeEnv;
 use htui_core::model::{BoxId, BoxProbe};
@@ -85,6 +93,7 @@ fn seeded() -> EffectiveSpec {
 }
 
 /// Probes `env` under `spec` with no hardware facts.
+#[cfg(unix)]
 async fn probe(env: &ProbeEnv, spec: &EffectiveSpec) -> BoxProbe {
     probe_box(
         BoxId::new(),
@@ -98,6 +107,7 @@ async fn probe(env: &ProbeEnv, spec: &EffectiveSpec) -> BoxProbe {
 }
 
 /// `(name, version)` of every tool the probe reported, in its order.
+#[cfg(unix)]
 fn found(probe: &BoxProbe) -> Vec<(&str, &str)> {
     probe
         .tools
