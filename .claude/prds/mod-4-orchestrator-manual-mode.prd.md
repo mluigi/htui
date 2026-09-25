@@ -309,7 +309,7 @@ Concretely in scope:
 | 3 | Work happens in a real tree | The `Isolator` over `gix`: four isolation modes, `run_step_tree` rows, before/after hashes per repo, winner reconciliation, cleanup, and `verify_command` with its three outcomes. | complete (`6307a3d`..`1b78753`, 2026-09-22) | [plan](../plans/mod-4-orch-tree.plan.md), [blueprint](../plans/mod-4-orch-tree.blueprint.md) |
 | 4 | Three candidates, one winner | Fan-out with the verification prefilter, the two-order judge call, the selection transaction, and `R-AGT-8`'s walk with the three skip conditions and the empty-candidate fallback. | complete (`fa03782`..`7ee0ac6`, 2026-09-23) | [plan](../plans/mod-4-orch-fanout.plan.md), [blueprint](../plans/mod-4-orch-fanout.blueprint.md) |
 | 5 | Two runs do not collide, and a crash is survivable | The overlap predicate, the admission transaction, the lease and its refresh, and the recovery sweep's artefact test — including the refusal to reset a dirty tree. | complete (`a1fb291`..`8dc4755`, 2026-09-23) | [plan](../plans/mod-4-orch-lease.plan.md), [blueprint](../plans/mod-4-orch-lease.blueprint.md) |
-| 6 | The maintainer drives it | `run_worker.rs`, the seven `R-TUI-4` actions plus `Unblock`/`AcceptArtifact`/`CloseOut`, the step list with agent, model, gate, usage and duration, promotion to chat, and close-out. | pending | — |
+| 6 | The maintainer drives it | `run_worker.rs`, the seven `R-TUI-4` actions plus `Unblock`/`AcceptArtifact`/`CloseOut`, the step list with agent, model, gate, usage and duration, promotion to chat, and close-out. | complete (`8b2e39f`..`22cfeea`, 2026-09-25) | [plan](../plans/mod-4-orch-drive.plan.md), [blueprint](../plans/mod-4-orch-drive.blueprint.md) |
 
 **Six milestones, not the seven D1 approved** — amended while planning milestone 1, for a reason
 that is structural rather than editorial: the store traits carry **no default bodies** (`writer.rs`'s
@@ -402,4 +402,5 @@ under Evidence.
 | Two `htui` processes on one box adopt each other's runs | Low | High | `lease_owner` is per process, the refresh is a compare-and-set on it, a zero-row refresh means abandon, and adoption requires an expired lease |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via `/plan`.*
+*Status: COMPLETE — all six milestones landed (`33277b1`..`22cfeea`, 2026-09-25). Write-up:
+`docs/decisions/mod/mod-4.md`.*
