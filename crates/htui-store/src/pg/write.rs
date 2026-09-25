@@ -411,7 +411,7 @@ impl WriteStore for PgStore {
                 SELECT $1, $2, $3, c.prefix, c.last_value, $4, $5, $6, $7, $8, $9, $10 FROM c
                 RETURNING id, project_id, kind_id, key_prefix, key_number, key, title, body, status,
                           priority, required_tags, touched_paths, step_graph_id, version,
-                          created_by, created_at, updated_at, closed_at
+                          created_by, created_at, updated_at, closed_at, resolution
             ), r AS (
                 INSERT INTO item_revision (item_id, version, title, body, required_tags,
                                            author_id, box_id, reason)
@@ -436,8 +436,7 @@ impl WriteStore for PgStore {
                    i.created_at    AS "created_at!",
                    i.updated_at    AS "updated_at!",
                    i.closed_at     AS "closed_at?",
-                   -- MOD-38 T1 bridge: `item.resolution` lands with migration 0005 (T2).
-                   NULL::text      AS "resolution?: htui_core::model::Resolution"
+                   i.resolution    AS "resolution?: htui_core::model::Resolution"
               FROM i, r
             "#,
             new.id.as_uuid(),
@@ -506,7 +505,7 @@ impl WriteStore for PgStore {
                             WHERE k.id = $5 AND k.project_id = item.project_id))
                 RETURNING id, project_id, kind_id, key_prefix, key_number, key, title, body, status,
                           priority, required_tags, touched_paths, step_graph_id, version,
-                          created_by, created_at, updated_at, closed_at
+                          created_by, created_at, updated_at, closed_at, resolution
             ), r AS (
                 INSERT INTO item_revision (item_id, version, title, body, required_tags,
                                            author_id, box_id, reason)
@@ -531,8 +530,7 @@ impl WriteStore for PgStore {
                    u.created_at    AS "created_at!",
                    u.updated_at    AS "updated_at!",
                    u.closed_at     AS "closed_at?",
-                   -- MOD-38 T1 bridge: `item.resolution` lands with migration 0005 (T2).
-                   NULL::text      AS "resolution?: htui_core::model::Resolution"
+                   u.resolution    AS "resolution?: htui_core::model::Resolution"
               FROM u, r
             "#,
             id.as_uuid(),

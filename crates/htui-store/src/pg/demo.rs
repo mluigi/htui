@@ -13,8 +13,8 @@
 use htui_core::fixtures::DemoData;
 use htui_core::model::{
     AgentId, BoxId, CommandQueue, DocumentId, Gate, GateOutcome, Isolation, ItemId, ItemKindId,
-    NoteId, PhaseId, ProjectId, RunId, SkillBindingId, SkillId, StepGraphId, StepId, UserId,
-    WorkspaceId,
+    NoteId, PhaseId, ProjectId, Resolution, RunId, SkillBindingId, SkillId, StepGraphId, StepId,
+    UserId, WorkspaceId,
 };
 use htui_core::store::Result;
 
@@ -351,9 +351,9 @@ impl PgStore {
             sqlx::query!(
                 "INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, title, body, \
                  status, priority, required_tags, touched_paths, step_graph_id, version, \
-                 created_by, created_at, updated_at, closed_at) \
+                 created_by, created_at, updated_at, closed_at, resolution) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                 $17)",
+                 $17, $18)",
                 ItemId::as_uuid(row.id),
                 ProjectId::as_uuid(row.project_id),
                 ItemKindId::as_uuid(row.kind_id),
@@ -371,6 +371,7 @@ impl PgStore {
                 row.created_at,
                 row.updated_at,
                 row.closed_at,
+                row.resolution.map(Resolution::as_str),
             )
             .execute(&mut *tx)
             .await
