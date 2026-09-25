@@ -267,6 +267,20 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   **Relates to ANA-16** (`docs/ANA-16.md` §6.1 C4, §8): box registration is keyed on the `box.toml`
   id, not the hostname (C4, owned by MOD-40); under phase 2, registration is by enrolment with a
   server-minted box id (MOD-47). Container boxes are child boxes of their host (MOD-44).
+  **Routed PRD 2026-09-25** (`.claude/prds/mod-7-box-registry.prd.md`, decisions D0-D7). MOD-40 is
+  not a dependency. **ANA-16 C4's re-key moves here** (D1): registration keys on the `box.toml` id,
+  checked by a keyed hash of the OS machine identity; MOD-40 keeps the heartbeat half. Correction to
+  the text above: `repo_box_path` **does** have a writer, MOD-15's `SetRepoPath`
+  (`crates/htui/src/hierarchy.rs`), which canonicalises the root and so honours F-102; what is
+  missing is automatic inference (D5), now in scope with a manual text box as fallback.
+- [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
+  `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
+  when inference fails. Replace the typed fallback with a popup window that browses the box's
+  filesystem and selects a directory, reusable wherever the Settings tab asks for a path (repo paths
+  in the box section, workspace roots in the hierarchy section). The chosen path goes through the
+  same canonicalisation as the text box (`htui_core::root_path::canonical_root`, F-102). Listing runs
+  off the UI task (`R-NF-3`). Blocked on MOD-7 milestone 4. Raised by the maintainer at MOD-7's PRD
+  gate, 2026-09-25.
 - [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
   project and phase bindings, template rows, Skills tab editor with version diff, import of
   existing skill markdown files. Per ANA-5 (`docs/ANA-5.md` §4.1, §5.4): template save validation
@@ -489,6 +503,9 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   C5: a headless connect never migrates; `htui_version` compared against a target. **Open question
   for the maintainer:** `R-STO-5` amendment ("a headless worker never migrates; it refuses and
   reports"). No dependencies; blocks MOD-41.
+  **C4's re-key moved to MOD-7** (MOD-7 PRD D1, 2026-09-25): registration keyed on the `box.toml` id
+  with a machine-fingerprint check lands there. This item keeps C4's box heartbeat bumping
+  `last_seen_at`.
   **MOD-4 M6 landed** (MOD-4 done, `docs/decisions/mod/mod-4.md`): C1 and C8 now guard shipped
   code, the step write paths `run_worker.rs` and the engine drive in production.
 - [ ] **MOD-41 - Headless worker (`htui worker`)** (from ANA-16, §8 item 2). `R-ORCH-12`, `R-ID-2`,
@@ -606,6 +623,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-17 per-model prompt framing, ANA-21 per-model weights)                                 |
-| MOD-N   | 34 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 35 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-34 Qdrant, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-38 requirements schema, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
