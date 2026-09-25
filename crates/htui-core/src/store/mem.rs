@@ -5528,6 +5528,96 @@ mod tests {
         }
     }
 
+    /// MOD-7 D37 (blueprint; a deferred T2 finding): `boxes()` lists only this user's boxes, by
+    /// ascending id, each box's tools by name bytes, the order `PgStore`'s `ORDER BY id` and
+    /// `COLLATE "C"` give. A second box of the fixture user sorts **before** the fixture's own,
+    /// so insertion order cannot pass; another user's box and its tool never appear.
+    #[tokio::test]
+    async fn boxes_lists_only_this_user_s_boxes_in_id_order() {
+        use crate::model::{AppUser, BoxTool};
+
+        let mut data = crate::fixtures::demo_data();
+        let template = data
+            .boxes
+            .iter()
+            .find(|row| row.id == ids::BOX)
+            .expect("the fixture box")
+            .clone();
+        let second = BoxId::from_uuid(Uuid::from_u128(1));
+        let foreign = BoxId::from_uuid(Uuid::from_u128(2));
+        assert!(
+            second < ids::BOX && foreign < ids::BOX,
+            "the planted ids sort before the fixture's"
+        );
+        let stranger = UserId::new();
+        let now = Utc::now();
+        data.users.push(AppUser {
+            id: stranger,
+            name: "stranger".to_owned(),
+            email: None,
+            created_at: now,
+            updated_at: now,
+        });
+        let mut mine = template.clone();
+        mine.id = second;
+        mine.hostname = "SECOND-BOX".to_owned();
+        let mut theirs = template;
+        theirs.id = foreign;
+        theirs.user_id = stranger;
+        theirs.hostname = "ELSEWHERE".to_owned();
+        data.boxes.push(mine);
+        data.boxes.push(theirs);
+        for (box_id, name) in [
+            (second, "awk"),
+            (second, "Zig"),
+            (second, "_x"),
+            (foreign, "leak"),
+        ] {
+            data.box_tools.push(BoxTool {
+                box_id,
+                name: name.to_owned(),
+                version: "1".to_owned(),
+                path: format!("/usr/bin/{name}"),
+                probed_at: now,
+            });
+        }
+        let store = MemStore::from_demo(data);
+        assert_eq!(
+            store.this_user(),
+            Some(ids::USER),
+            "the fixture user is still the oldest"
+        );
+
+        let records = store.boxes().await.expect("boxes must not fail");
+
+        let listed: Vec<BoxId> = records.iter().map(|record| record.row.id).collect();
+        assert_eq!(
+            listed,
+            [second, ids::BOX],
+            "this user's two boxes, by ascending id"
+        );
+        assert!(
+            records.iter().all(|record| record.row.user_id == ids::USER),
+            "no other user's box is listed: {records:?}"
+        );
+        let tools: Vec<&str> = records[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(tools, ["Zig", "_x", "awk"], "tools by name bytes");
+        let fixture_tools: Vec<&str> = records[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(
+            fixture_tools,
+            ["cargo", "cmake", "git", "rustc"],
+            "the fixture box keeps its own tools, sorted"
+        );
+    }
+
     /// MOD-2 plan D70: `project.settings` is readable per project, because the per-run token cap
     /// lives in it and a chat reads it at `ChatStart`.
     ///
