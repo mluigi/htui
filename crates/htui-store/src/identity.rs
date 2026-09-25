@@ -221,6 +221,11 @@ impl Fingerprint {
 }
 
 /// Read once per process: the machine identity does not change under a running `htui`.
+///
+/// A read that fails or times out is cached too, as `None`, on purpose: the box then registers by
+/// `box.toml`'s id alone until the process restarts, rather than flipping between "no fingerprint"
+/// and "a fingerprint" from one reconnect to the next, which keeps what registration answers and
+/// `this_box` stable across every reconnect within the session.
 static MACHINE_FINGERPRINT: tokio::sync::OnceCell<Option<Fingerprint>> =
     tokio::sync::OnceCell::const_new();
 
@@ -230,6 +235,11 @@ static MACHINE_FINGERPRINT: tokio::sync::OnceCell<Option<Fingerprint>> =
 /// Linux reads `/etc/machine-id` (then the dbus copy), macOS the `IOPlatformUUID` of `ioreg`, and
 /// Windows `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`. The raw text is only ever a
 /// [`Zeroizing`] local of the reader, and only the keyed hash leaves this function.
+///
+/// The answer is cached for the process whatever it is, including a failed or timed-out read
+/// (`None`): deliberately so, because the box then registers by id alone until restart, and
+/// registration and `this_box` stay stable across reconnects within the session instead of
+/// changing when a later read happens to succeed.
 pub async fn machine_fingerprint() -> Option<Fingerprint> {
     MACHINE_FINGERPRINT
         .get_or_init(|| async {
