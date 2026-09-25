@@ -160,7 +160,7 @@ from the primary docs or the tool's own source on GitHub.
 |---|---|---|
 | L1 Globs only | What every format does | The maintainer asked for language explicitly; `**/*.rs, **/Cargo.toml` is tedious to type |
 | L2 Language as its own trigger, matched against a repo language column | Reads well | No repo language exists; it would need detection, storage and a refresh rule, and still reduces to file extensions |
-| **L3 Language as authoring sugar compiled to globs at save** | Reads well in the editor; one matcher; the effective globs are stored on the version, so a later change to the language map never changes a saved version | Two fields shown in the editor (languages as typed, globs as stored) |
+| **L3 Language as authoring sugar compiled to globs at save** | Reads well in the editor; one matcher; the effective globs are stored on the attachment, so a later change to the language map never changes a saved attachment | Two fields shown in the editor (languages as typed, globs as stored) |
 
 ### 5.4 What file set a glob is matched against
 
