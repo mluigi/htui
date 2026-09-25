@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 /// `htui` command line.
 #[derive(Debug, Clone, Default, clap::Parser)]
+#[command(group = clap::ArgGroup::new("concepts").args(["index_items", "search_items"]))]
 #[command(
     name = "htui",
     version,
@@ -29,6 +30,32 @@ pub struct Args {
     /// Open from the local cache and never attempt a connection (demos, tests, a flaky network).
     #[arg(long)]
     pub offline: bool,
+
+    /// Bring the Qdrant concepts index in step with Postgres items and documents, then exit
+    /// (`R-STO-8`).
+    #[arg(long, conflicts_with_all = ["set_dsn", "clear_dsn", "demo", "offline"])]
+    pub index_items: bool,
+
+    /// Search items and their documents by meaning and exact term, print the hits and exit.
+    #[arg(long, value_name = "QUERY", conflicts_with_all = ["set_dsn", "clear_dsn", "demo", "offline"])]
+    pub search_items: Option<String>,
+
+    /// With `--index-items` or `--search-items`: only the project with this slug.
+    #[arg(long, value_name = "SLUG", requires = "concepts")]
+    pub project: Option<String>,
+
+    /// With `--search-items`: decisions only (done and closed items and their documents).
+    #[arg(long, requires = "search_items", conflicts_with = "index_items")]
+    pub decisions: bool,
+
+    /// With `--search-items`: how many hits to print (default 10).
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "search_items",
+        conflicts_with = "index_items"
+    )]
+    pub limit: Option<u64>,
 }
 
 #[cfg(test)]
@@ -47,6 +74,36 @@ mod tests {
                 Args::try_parse_from(["htui", pair[0], pair[1]]).is_err(),
                 "{pair:?} must not parse together"
             );
+        }
+    }
+
+    #[test]
+    fn the_concepts_flags_parse_and_exclude_each_other() {
+        let args = Args::try_parse_from([
+            "htui",
+            "--search-items",
+            "MOD-34",
+            "--project",
+            "htui",
+            "--decisions",
+            "--limit",
+            "3",
+        ])
+        .expect("parse");
+        assert_eq!(args.search_items.as_deref(), Some("MOD-34"));
+        assert_eq!(args.project.as_deref(), Some("htui"));
+        assert!(args.decisions);
+        assert_eq!(args.limit, Some(3));
+        assert!(Args::try_parse_from(["htui", "--index-items", "--project", "htui"]).is_ok());
+        for bad in [
+            &["htui", "--index-items", "--search-items", "q"][..],
+            &["htui", "--index-items", "--demo"],
+            &["htui", "--project", "htui"],
+            &["htui", "--decisions"],
+            &["htui", "--index-items", "--decisions"],
+            &["htui", "--index-items", "--limit", "3"],
+        ] {
+            assert!(Args::try_parse_from(bad).is_err(), "{bad:?} must not parse");
         }
     }
 

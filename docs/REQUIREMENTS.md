@@ -138,6 +138,12 @@ conflict. Their verdicts survive only where restated here.
   conditioned on a reachable server and binds no offline start (R-STO-4); that scope was decided,
   not overlooked (maintainer, 2026-09-08).
 - **R-STO-7 (withdrawn).** Local-only mode. Withdrawn by maintainer decision MOD-25, 2026-09-11.
+- **R-STO-8 (must).** Semantic search over items. `htui` indexes each item's key, title and body,
+  and its latest documents, into a Qdrant collection (local dense embeddings plus BM25 sparse
+  vectors, ranked together) and answers searches scoped to projects. The index is derived from
+  Postgres and rebuildable from it (R-STO-1); when Qdrant or the embedding model is unavailable,
+  search fails with a clear error and nothing else is affected. Added by maintainer decision on
+  MOD-34, 2026-09-25 (`docs/ANA-19.md`, `docs/ANA-20.md`).
 
 ## 5. Agent driver (R-AGT)
 
