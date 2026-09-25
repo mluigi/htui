@@ -81,6 +81,65 @@ pub struct BoxTool {
     pub probed_at: DateTime<Utc>,
 }
 
+/// One tool the box probe found (MOD-7 plan D9): a future `box_tool` row without its box or instant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbedTool {
+    /// `box_tool.name`: the key of the probe spec's `tools` map, never a file name.
+    pub name: String,
+    /// `box_tool.version`; empty for a presence-only tool.
+    pub version: String,
+    /// `box_tool.path`: the file `which` resolved.
+    pub path: String,
+}
+
+/// Everything one box probe learned, as `WriteStore::record_box_probe` writes it (MOD-7 D10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoxProbe {
+    /// The probed box.
+    pub box_id: BoxId,
+    /// `box.os_version`.
+    pub os_version: String,
+    /// `box.cpu`.
+    pub cpu: String,
+    /// `box.ram_mb`.
+    pub ram_mb: Option<i32>,
+    /// `box.gpu_present`.
+    pub gpu_present: bool,
+    /// `box.gpu_vendor`: the spec's vendor name, `None` without a GPU.
+    pub gpu_vendor: Option<String>,
+    /// The whole `box_tool` set; replaces the previous one. Names are unique.
+    pub tools: Vec<ProbedTool>,
+    /// `box.probed_tags`, sorted and deduplicated.
+    pub probed_tags: Vec<String>,
+    /// `box.htui_version`: the version that probed (D5).
+    pub htui_version: String,
+    /// `box.probe_spec_digest`: sha256 hex of the effective spec (D18).
+    pub spec_digest: String,
+    /// `box.last_probed_at` and every `box_tool.probed_at`.
+    pub probed_at: DateTime<Utc>,
+}
+
+/// One box as `WriteStore::boxes` lists it (MOD-7 D10, D18).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoxRecord {
+    /// The row.
+    pub row: BoxRow,
+    /// Its `box_tool` rows, name-byte-ordered.
+    pub tools: Vec<BoxTool>,
+    /// `box.probe_spec_digest`, which is not a `BoxRow` field (D14 keeps every constructor still).
+    pub probe_spec_digest: Option<String>,
+}
+
+impl BoxRecord {
+    /// Whether the next `Online` swap must probe this box (D5, D18): never probed, probed by another
+    /// `htui`, or under another effective spec.
+    #[must_use]
+    pub fn needs_probe(&self, running: &str, spec_digest: &str) -> bool {
+        let _ = (running, spec_digest);
+        todo!("MOD-7 T0: needs_probe")
+    }
+}
+
 /// Top-bar projection of the current box (`R-TUI-1`). Not a table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoxInfo {
@@ -319,6 +378,62 @@ mod tests {
             empty.more_tools, 0,
             "nothing over the cap, nothing to count"
         );
+    }
+
+    const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A box probed at `row()`'s version (`0.4.1`) under [`DIGEST_A`].
+    fn record() -> BoxRecord {
+        BoxRecord {
+            row: row(),
+            tools: Vec::new(),
+            probe_spec_digest: Some(DIGEST_A.to_owned()),
+        }
+    }
+
+    /// MOD-7 D5: a box that was never probed probes, whatever its version and digest say.
+    #[test]
+    fn a_box_never_probed_needs_a_probe() {
+        let never = BoxRecord {
+            row: BoxRow {
+                last_probed_at: None,
+                ..row()
+            },
+            ..record()
+        };
+        assert!(
+            never.needs_probe("0.4.1", DIGEST_A),
+            "same version and digest, but never probed"
+        );
+    }
+
+    /// MOD-7 D5: an `htui` upgrade re-probes (`R-BOX-2`).
+    #[test]
+    fn a_box_probed_by_another_version_needs_a_probe() {
+        assert!(record().needs_probe("0.4.2", DIGEST_A));
+    }
+
+    /// MOD-7 D5, D18: same version, same effective spec, nothing to do.
+    #[test]
+    fn a_box_probed_at_this_version_needs_none() {
+        assert!(!record().needs_probe("0.4.1", DIGEST_A));
+    }
+
+    /// MOD-7 D18: a changed effective spec re-probes.
+    #[test]
+    fn a_changed_spec_digest_needs_a_probe() {
+        assert!(record().needs_probe("0.4.1", DIGEST_B));
+    }
+
+    /// MOD-7 D18: a row probed before `probe_spec_digest` existed re-probes.
+    #[test]
+    fn a_box_with_no_recorded_digest_needs_a_probe() {
+        let undigested = BoxRecord {
+            probe_spec_digest: None,
+            ..record()
+        };
+        assert!(undigested.needs_probe("0.4.1", DIGEST_A));
     }
 
     /// `box_tool.version` is `TEXT NOT NULL`, so there is no null case; an empty string is kept as
