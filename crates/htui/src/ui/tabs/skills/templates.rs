@@ -35,8 +35,13 @@ const SAVE_NAME: &str = REQUEST_NAMES[1];
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
 
-/// The tree's width, borders included: `  {name:<13} v{head:<3} {role}` is at most 28 chars.
+/// The tree's width, borders included: `  {name:<13} v{head:<3} {role}` is at most 28 chars, a
+/// longer name cut to [`NAME_WIDTH`].
 const LIST_WIDTH: u16 = 32;
+
+/// A template row's name field, in chars: a longer name is cut to `NAME_WIDTH - 1` and `…`, so the
+/// head and the role stay on the row.
+const NAME_WIDTH: usize = 13;
 
 /// The help column's width, borders included: `{{failure_reason}} section required`, the widest
 /// placeholder line (a handoff's), is 35 chars.
@@ -888,7 +893,16 @@ impl TemplatesView {
                             .and_then(|snapshot| snapshot.head(*project, name))
                             .map_or(0, |row| row.version);
                         let role = TemplateRole::of_name(name).as_str();
-                        (format!("  {name:<13} v{head:<3} {role}"), theme.base)
+                        let name = if name.chars().count() > NAME_WIDTH {
+                            let cut: String = name.chars().take(NAME_WIDTH - 1).collect();
+                            format!("{cut}\u{2026}")
+                        } else {
+                            name.clone()
+                        };
+                        (
+                            format!("  {name:<NAME_WIDTH$} v{head:<3} {role}"),
+                            theme.base,
+                        )
                     }
                 };
                 let style = if index == self.cursor {
