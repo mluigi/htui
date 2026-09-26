@@ -32,7 +32,7 @@ use htui_core::model::{
     RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Status,
     StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
     UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, overlaps, scope_of,
+    WorkspaceProject, canonical_declared_tags, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -1226,13 +1226,77 @@ impl WriteStore for PgStore {
             .collect())
     }
 
+    /// The editors' compare-and-set (MOD-7 D41, D58): one `UPDATE` with the user filter and the
+    /// token in its `WHERE`, `COALESCE` so a `None` field keeps its column. A miss re-reads the row
+    /// through [`PgStore::box_row`], kept only when it is this user's, and [`cas_miss`] decides
+    /// `Stale` or `NotFound`. An invalid tag list takes the same read first, so `NotFound` and
+    /// `Stale` win over `Constraint` (the order `update_item_kind` keeps).
+    ///
+    /// No `updated_at` is written here: the `set_updated_at` trigger stamps it.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an unknown box or another user's, `Constraint` for a refused tag, and
+    /// whatever the driver reports, through [`map_sqlx`].
     async fn edit_box(
         &self,
-        _id: BoxId,
-        _expected: i32,
-        _edit: BoxEdit,
+        id: BoxId,
+        expected: i32,
+        edit: BoxEdit,
     ) -> Result<CasOutcome<BoxRow>> {
-        todo!("MOD-7 milestone 2 T1: PgStore::edit_box")
+        let me = self.this_user();
+        let tags = match edit
+            .declared_tags
+            .as_deref()
+            .map(canonical_declared_tags)
+            .transpose()
+        {
+            Ok(tags) => tags,
+            Err(sentence) => {
+                let current = self.box_row(id).await?.filter(|row| row.user_id == me);
+                return match current {
+                    None => Err(StoreError::NotFound {
+                        entity: "box",
+                        id: id.to_string(),
+                    }),
+                    Some(row) if row.edit_version != expected => Ok(CasOutcome::Stale(row)),
+                    Some(_) => Err(StoreError::Constraint(sentence)),
+                };
+            }
+        };
+        let written = sqlx::query_as!(
+            BoxRow,
+            r#"
+            UPDATE box
+               SET declared_tags = COALESCE($3, declared_tags),
+                   quirks        = COALESCE($4, quirks),
+                   edit_version  = edit_version + 1
+             WHERE id = $1 AND user_id = $5 AND edit_version = $2
+            RETURNING id             AS "id: BoxId",
+                      user_id        AS "user_id: htui_core::model::UserId",
+                      hostname,
+                      os_family      AS "os_family: htui_core::model::OsFamily",
+                      os_version, arch, cpu, ram_mb, gpu_present, gpu_vendor, htui_version,
+                      probed_tags, declared_tags, quirks, settings,
+                      registered_at, last_seen_at, last_probed_at, updated_at, edit_version
+            "#,
+            id.as_uuid(),
+            expected,
+            tags.as_deref(),
+            edit.quirks,
+            me.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        match written {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => cas_miss(
+                self.box_row(id).await?.filter(|row| row.user_id == me),
+                "box",
+                id,
+            ),
+        }
     }
 
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both
