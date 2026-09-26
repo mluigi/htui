@@ -785,6 +785,31 @@ async fn p_on_this_box_sends_probe_box() {
     assert!(frame.contains("probing\u{2026}"), "{frame}");
 }
 
+/// One `ProbeBox` in flight: a second `p` sends nothing, because a second request would
+/// supersede the first's seq and drop its `BoxProbed` (and so the re-read) at the shell.
+#[tokio::test]
+async fn p_while_probing_sends_nothing() {
+    let (bench, mut section) = bench_with(&snap_of(two_boxes()).await).await;
+    bench.key(&mut section, "p");
+    assert_eq!(names(&requests(&bench)), ["probe_box"]);
+
+    assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
+
+    assert!(requests(&bench).is_empty());
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("probing\u{2026}"), "{frame}");
+    assert!(
+        frame.contains("a box probe is running on this box"),
+        "{frame}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::BoxProbed(BoxProbeReport::default()),
+    );
+    assert_eq!(names(&requests(&bench)), ["boxes"]);
+}
+
 /// PRD D4: the probe runs on this box only; on another box `p` sends nothing and says why.
 #[tokio::test]
 async fn p_on_another_box_sends_nothing_and_says_why() {

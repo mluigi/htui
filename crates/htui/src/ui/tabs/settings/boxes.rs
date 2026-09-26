@@ -302,8 +302,18 @@ impl BoxesSection {
     }
 
     /// `p` (D49, PRD D4): milestone 1's probe, on this box only.
+    ///
+    /// One `ProbeBox` in flight per section, a deviation from D63: a second one would supersede
+    /// the first's seq in the shell's freshness gate, so the runtime's instant `BOX_PROBE_RUNNING`
+    /// refusal would clear `probing` while the first probe still runs, and the first's
+    /// `BoxProbed` would be dropped before the section could re-read. The runtime's own sentence
+    /// is shown instead, so there is still no second local sentence.
     fn probe(&mut self, ctx: &Ctx<'_>) {
         if self.unavailable.is_some() {
+            return;
+        }
+        if self.probing {
+            self.notice = Some(crate::agent_worker::BOX_PROBE_RUNNING.to_owned());
             return;
         }
         let Some(snapshot) = &self.snapshot else {
