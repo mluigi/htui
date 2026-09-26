@@ -679,7 +679,11 @@ where
     /// [`EngineError::ClaimRefused`] naming the rule when the box is full or the scope overlaps,
     /// the run then left `queued` with nothing written; [`EngineError::MissingTags`] when the
     /// run's item needs tags this box lacks, after `claim_run` failed the run and blocked its item
-    /// in its transaction and this engine noted it (`R-ORCH-10`, MOD-7 milestone 3 D85);
+    /// in its transaction and this engine wrote the note afterwards in a separate call, outside
+    /// that transaction (`R-ORCH-10`, MOD-7 milestone 3 D85, as rung 4 does). If the walk is
+    /// preempted or a store call fails in between, the run stays `failed` and the item `blocked`
+    /// without the note, and `run.failure` (`missing_tags_failure`'s sentence) is the lasting
+    /// record;
     /// [`EngineError::LeaseLost`] when another orchestrator takes the lease mid-walk; every other
     /// [`EngineError`] the walk raises.
     pub async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
