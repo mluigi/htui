@@ -12,7 +12,7 @@
 //! Known residue, the kinds section's H-9 (D56, R-29): a `Boxes` reply carries nothing that says
 //! which request it answers, so `busy` is the whole of the attribution. A read that lands between
 //! a save and its reply (a scope change or a tab re-activation) is taken for that reply and closes
-//! the editor early; if the save then comes back `BoxesStale`, [`CHANGED_ELSEWHERE_CLOSED`] says
+//! the editor early; if the save then comes back `BoxesStale`, `CHANGED_ELSEWHERE_CLOSED` says
 //! nothing was written and how to retry.
 
 use htui_core::model::{BoxId, BoxRecord, Scope, canonical_declared_tags, declared_tags_from_text};
