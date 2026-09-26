@@ -311,6 +311,28 @@ mod tests {
             let parsed = SkillGlob::parse(text).expect("parses");
             assert_eq!(parsed.to_string(), text, "`Display` is the canonical text");
         }
+        for text in ["htui: src", "htui :src"] {
+            let parsed = SkillGlob::parse(text);
+            assert_eq!(
+                parsed,
+                Ok(SkillGlob {
+                    repo: Some("htui".to_owned()),
+                    glob: "src".to_owned(),
+                }),
+                "whitespace around the `:` of `{text}` is dropped"
+            );
+            assert_eq!(
+                parsed.expect("parses").to_string(),
+                "htui:src",
+                "`{text}` stores as `htui:src`"
+            );
+        }
+        assert_eq!(
+            canonical_globs(&strings(&["htui: src", "htui:src"]), &[]),
+            Ok(strings(&["htui:src"])),
+            "a spaced qualifier is the same glob as the unspaced one"
+        );
+        assert_eq!(refusal("htui:  "), "has no glob after `htui:`");
     }
 
     /// D94: the refusal names the entry and says why, in `globset`'s words or this module's.
