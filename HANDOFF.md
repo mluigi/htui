@@ -367,8 +367,8 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   WITH FIXES, findings applied).
   **Phase 3 landed (`df91c82`..`e5db119`, 2026-09-26):** milestone 3, skills editable and
   attachable, **split by the maintainer** (glob *firing* is the PRD's new row 5, "Glob attachments
-  fire": the F2 file set, roots for fan-out groups, changed paths, `matched`/`no_match`; better after
-  MOD-7 milestone 4). Shipped: skill names checked by the Agent Skills rule; `globset` (new
+  fire": the F2 file set, roots for fan-out groups, changed paths, `matched`/`no_match`; unblocked
+  now that MOD-7 milestone 4 runs the excerpt pass over `repo_box_path` roots). Shipped: skill names checked by the Agent Skills rule; `globset` (new
   dependency) behind `model::skill_glob` (`<repo>:` qualifiers, brace-aware lists,
   `canonical_globs`) and a seed language map (`model::skill_language`, fourteen languages); seven
   `WriteStore` methods on every store (`skills`, `skill_versions`, `skill_bindings`, `create_skill`
