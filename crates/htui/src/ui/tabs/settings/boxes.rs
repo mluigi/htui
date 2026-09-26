@@ -75,6 +75,11 @@ const ID_SUFFIX: usize = 8;
 /// A second save while the first is in flight (D56).
 const IN_FLIGHT: &str = "edit_box in flight";
 
+/// [`CHANGED_ELSEWHERE`] for the quirks editor, where `Enter` breaks the line (OQ-16) and
+/// `ctrl-s` is the save that retries. Starts `changed elsewhere`, so `is_error` draws it in
+/// `theme.error`.
+const CHANGED_ELSEWHERE_QUIRKS: &str = "changed elsewhere since you opened it \u{2014} reloaded; ctrl-s retries against the current row";
+
 /// `p` on a box that is not this one (PRD D4).
 const THIS_BOX_ONLY: &str = "the probe runs on this box only";
 
@@ -222,22 +227,44 @@ impl BoxesSection {
             .iter()
             .find(|record| record.row.id == box_id)
             .map(|record| record.row.edit_version);
-        match (now, &mut self.mode) {
-            (Some(token), Mode::Tags(editor)) => editor.expected = token,
-            (Some(token), Mode::Quirks(editor)) => editor.expected = token,
-            (Some(_), Mode::Browse) => {}
+        let notice = match (now, &mut self.mode) {
+            (Some(token), Mode::Tags(editor)) => {
+                editor.expected = token;
+                CHANGED_ELSEWHERE
+            }
+            (Some(token), Mode::Quirks(editor)) => {
+                editor.expected = token;
+                CHANGED_ELSEWHERE_QUIRKS
+            }
+            (Some(_), Mode::Browse) => CHANGED_ELSEWHERE,
             (None, _) => {
                 self.mode = Mode::Browse;
-                self.notice = Some(DELETED_ELSEWHERE.to_owned());
-                return;
+                DELETED_ELSEWHERE
             }
+        };
+        self.notice = Some(notice.to_owned());
+    }
+
+    /// Whether `t`/`e`/`p` must do nothing: a list the read could not confirm (the body shows the
+    /// refusal, not the rows), or a save in flight (D56, the kinds section's `blocked`): its reply
+    /// closes whatever editor is open, so a second one would lose its text to the first's reply.
+    fn blocked(&mut self) -> bool {
+        if self.unavailable.is_some() {
+            return true;
         }
-        self.notice = Some(CHANGED_ELSEWHERE.to_owned());
+        if self.busy.is_some() {
+            self.notice = Some(IN_FLIGHT.to_owned());
+            return true;
+        }
+        false
     }
 
     /// `t`: the tag editor over the selected row, prefilled with its list. A stored list the rule
     /// refuses (hand-written SQL) opens anyway; its refusal comes on save (R-31).
     fn open_tags(&mut self) {
+        if self.blocked() {
+            return;
+        }
         let Some(record) = self.selected_record() else {
             return;
         };
@@ -256,6 +283,9 @@ impl BoxesSection {
     /// `e`: the quirks editor over the selected row. "Unchanged" is measured against what the
     /// widget made of the stored text, which normalises line endings (D59).
     fn open_quirks(&mut self) {
+        if self.blocked() {
+            return;
+        }
         let Some(record) = self.selected_record() else {
             return;
         };
@@ -273,6 +303,9 @@ impl BoxesSection {
 
     /// `p` (D49, PRD D4): milestone 1's probe, on this box only.
     fn probe(&mut self, ctx: &Ctx<'_>) {
+        if self.unavailable.is_some() {
+            return;
+        }
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -478,6 +511,20 @@ impl SettingsSection for BoxesSection {
         .areas(area);
 
         match (&self.unavailable, &self.snapshot) {
+            // An open editor survives a refused read (the re-read after a probe, a reconnect):
+            // the refusal takes the body's first line and the editor stays on screen under it,
+            // because an editor that still takes keys has to be one the user can see.
+            (Some(why), Some(snapshot))
+                if !matches!(self.mode, Mode::Browse) && !snapshot.boxes.is_empty() =>
+            {
+                let [refusal, rest] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+                frame.render_widget(
+                    Paragraph::new(Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error)),
+                    refusal,
+                );
+                self.render_body(frame, rest, snapshot, theme);
+            }
             // The refusal wins the body even with a list behind it: what is on screen would
             // otherwise be boxes nothing has confirmed since the outage started (the kinds rule).
             (Some(why), _) => frame.render_widget(
@@ -489,18 +536,7 @@ impl SettingsSection for BoxesSection {
             (None, Some(snapshot)) if snapshot.boxes.is_empty() => {
                 message(frame, body, NO_BOXES, theme);
             }
-            (None, Some(snapshot)) => {
-                let [list, detail] =
-                    Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Min(0)])
-                        .areas(body);
-                self.render_list(frame, list, snapshot, theme);
-                if let Some(record) = self.selected_record() {
-                    frame.render_widget(
-                        Paragraph::new(self.detail(record, snapshot, detail.width, theme)),
-                        detail,
-                    );
-                }
-            }
+            (None, Some(snapshot)) => self.render_body(frame, body, snapshot, theme),
         }
 
         frame.render_widget(
@@ -523,6 +559,25 @@ impl SettingsSection for BoxesSection {
 }
 
 impl BoxesSection {
+    /// The list and the detail pane side by side.
+    fn render_body(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        snapshot: &BoxesSnapshot,
+        theme: &Theme,
+    ) {
+        let [list, detail] =
+            Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Min(0)]).areas(area);
+        self.render_list(frame, list, snapshot, theme);
+        if let Some(record) = self.selected_record() {
+            frame.render_widget(
+                Paragraph::new(self.detail(record, snapshot, detail.width, theme)),
+                detail,
+            );
+        }
+    }
+
     /// The list pane: one row per box, the selected one in `theme.selected`, scrolled so the
     /// selection stays on screen.
     fn render_list(

@@ -686,6 +686,93 @@ async fn a_second_save_while_saving_sends_nothing() {
     assert!(frame.contains("edit_box in flight"), "{frame}");
 }
 
+/// D56 (the kinds section's `blocked`): no editor opens while a save is in flight, because that
+/// save's reply closes whatever editor is open and would take the new one's text with it.
+#[tokio::test]
+async fn no_editor_opens_while_a_save_is_in_flight() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+
+    bench.key(&mut section, "t");
+    type_at(&bench, &mut section, ", vulkan");
+    bench.key(&mut section, "enter");
+    only_edit(&requests(&bench));
+    bench.key(&mut section, "esc");
+    bench.key(&mut section, "e");
+
+    assert!(!section.captures_input(), "no editor opened");
+    assert!(requests(&bench).is_empty());
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("edit_box in flight"), "{frame}");
+}
+
+/// OQ-16: over the quirks editor `Enter` breaks the line, so the stale notice names `ctrl-s` as
+/// the retry, and it is still drawn as an error.
+#[tokio::test]
+async fn a_stale_reply_over_the_quirks_editor_names_ctrl_s() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "no admin rights");
+    bench.key(&mut section, "ctrl-s");
+    only_edit(&requests(&bench));
+    bench.reply(
+        &mut section,
+        &StoreReply::BoxesStale(Box::new(demo_at_version(5).await)),
+    );
+
+    assert!(section.captures_input(), "the editor stays open");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("changed elsewhere since you opened it"),
+        "{frame}"
+    );
+    assert!(frame.contains("ctrl-s retries"), "{frame}");
+    assert!(!frame.contains("Enter retries"), "{frame}");
+
+    bench.key(&mut section, "ctrl-s");
+    let (_, expected, edit) = only_edit(&requests(&bench));
+    assert_eq!(expected, 5, "the current row's token");
+    assert_eq!(edit.quirks.as_deref(), Some("no admin rights"));
+}
+
+/// A refused read over an open editor leaves the editor on screen under the refusal, since it
+/// still takes the keys; in Browse, `t`/`e`/`p` do nothing over a list the read did not confirm.
+#[tokio::test]
+async fn a_refused_read_keeps_an_open_editor_visible_and_blocks_new_ones() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+    let refused = StoreReply::Failed {
+        request: "boxes",
+        message: "store unreachable".to_owned(),
+    };
+
+    bench.key(&mut section, "t");
+    type_at(&bench, &mut section, ", vulkan");
+    bench.reply(&mut section, &refused);
+    assert!(section.captures_input(), "the editor stays open");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("boxes unavailable: store unreachable"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("gpu, vulkan"),
+        "the editor is on screen: {frame}"
+    );
+
+    bench.key(&mut section, "esc");
+    for key in ["t", "e", "p"] {
+        bench.key(&mut section, key);
+        assert!(!section.captures_input(), "{key} opened nothing");
+    }
+    assert!(requests(&bench).is_empty());
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("boxes unavailable: store unreachable"),
+        "{frame}"
+    );
+    assert!(!frame.contains("gpu, vulkan"), "{frame}");
+}
+
 /// D49: `p` on this box sends milestone 1's `ProbeBox`, and the hint says a probe is running.
 #[tokio::test]
 async fn p_on_this_box_sends_probe_box() {
