@@ -6,7 +6,8 @@
 //! path belongs to — are resolved from [`Backend`] here, so no view ever holds a `UserId` or a
 //! `BoxId`.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use htui_core::model::{
@@ -17,7 +18,7 @@ use htui_core::root_path::canonical_root;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, Result, StoreError, WriteStore,
 };
-use htui_orch::infer::MatchedBy;
+use htui_orch::infer::{Checkout, Choice, MatchedBy};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -516,8 +517,143 @@ async fn infer(
     ws: WorkspaceId,
     this_box: Option<BoxId>,
 ) -> Result<StoreReply> {
-    let _ = (backend, writer, ws, this_box);
-    todo!("MOD-7 milestone 4 T4: the inference pass")
+    let box_id = box_id(this_box)?;
+    let tree = snapshot(writer, ws, this_box)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "workspace",
+            id: ws.to_string(),
+        })?;
+    let Some(root_row) = &tree.root_path else {
+        return Ok(StoreReply::RepoPathsInferred {
+            tree: Box::new(tree),
+            report: InferReport {
+                root: None,
+                truncated: false,
+                repos: Vec::new(),
+            },
+        });
+    };
+    // A root that no longer resolves is a `Constraint`, which the status line reads as
+    // `infer_repo_paths: constraint violated: …`.
+    let root = canonical(&root_row.root_path).await?;
+
+    let entries: Vec<&RepoEntry> = tree
+        .projects
+        .iter()
+        .flat_map(|entry| entry.repos.iter())
+        .collect();
+    // Walk only when some repo has no row here: a workspace whose repos are all set answers
+    // without touching the disk.
+    let mut walk = if entries.iter().all(|entry| entry.local_path.is_some()) {
+        None
+    } else {
+        // Every repo's row on this box, not only this workspace's: a checkout another repo already
+        // owns is never a candidate.
+        let held: BTreeSet<PathBuf> = backend
+            .repo_paths(box_id)
+            .await?
+            .into_iter()
+            .map(|row| PathBuf::from(row.local_path))
+            .collect();
+        let scan = tokio::task::spawn_blocking({
+            let root = PathBuf::from(&root);
+            move || htui_orch::infer::find_checkouts(&root)
+        })
+        .await
+        .map_err(|err| StoreError::Backend(err.to_string()))?;
+        Some((scan, held))
+    };
+
+    let truncated = walk.as_ref().is_some_and(|(scan, _)| scan.truncated);
+    let mut repos = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let outcome = match &mut walk {
+            // D134: sequentially, in tree order, so a path written for one repo is held for the
+            // next. A truncated scan writes nothing.
+            Some((scan, held)) if entry.local_path.is_none() => {
+                if scan.truncated {
+                    InferOutcome::ScanTruncated
+                } else {
+                    infer_one(writer, &entry.repo, box_id, &scan.checkouts, held).await?
+                }
+            }
+            // A row on this box before the pass; with no walk at all, every repo had one.
+            _ => InferOutcome::AlreadySet,
+        };
+        repos.push(RepoInference {
+            repo: entry.repo.id,
+            name: entry.repo.name.clone(),
+            outcome,
+        });
+    }
+
+    let fresh = snapshot(writer, ws, this_box)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "workspace",
+            id: ws.to_string(),
+        })?;
+    Ok(StoreReply::RepoPathsInferred {
+        tree: Box::new(fresh),
+        report: InferReport {
+            root: Some(root),
+            truncated,
+            repos,
+        },
+    })
+}
+
+/// One repo without a row on this box: `choose`, `canonical` of the chosen path, then the
+/// insert-if-absent write (plan D116). A refusal, by the guard or by the store's constraints, is
+/// the repo's outcome rather than the request's; any other error fails the request.
+async fn infer_one(
+    writer: &Writer,
+    repo: &Repo,
+    box_id: BoxId,
+    checkouts: &[Checkout],
+    held: &mut BTreeSet<PathBuf>,
+) -> Result<InferOutcome> {
+    let (path, by) = match htui_orch::infer::choose(repo, checkouts, held) {
+        Choice::NoMatch => return Ok(InferOutcome::NoMatch),
+        Choice::Ambiguous { candidates } => return Ok(InferOutcome::Ambiguous { candidates }),
+        Choice::Inferred { path, by } => (path, by),
+    };
+    let Some(found) = path.to_str() else {
+        return Ok(InferOutcome::Refused(
+            "the checkout's path is not valid UTF-8".to_owned(),
+        ));
+    };
+    // The same guard `SetRepoPath` runs (F-102): the walk never follows a link, so this is the
+    // path as found, and a refusal names it and never a target.
+    let local_path = match canonical(found).await {
+        Ok(local_path) => local_path,
+        Err(StoreError::Constraint(message)) => return Ok(InferOutcome::Refused(message)),
+        Err(err) => return Err(err),
+    };
+    let written = writer
+        .infer_repo_box_path(&RepoBoxPath {
+            repo_id: repo.id,
+            box_id,
+            local_path: local_path.clone(),
+            // The store's trigger stamps the column, as for every other path write.
+            updated_at: Utc::now(),
+        })
+        .await;
+    match written {
+        Ok(true) => {
+            held.insert(path);
+            held.insert(PathBuf::from(&local_path));
+            Ok(InferOutcome::Inferred {
+                path: local_path,
+                by,
+            })
+        }
+        // A row landed between the tree read and this insert, a manual write most likely: it wins.
+        Ok(false) => Ok(InferOutcome::AlreadySet),
+        Err(StoreError::Constraint(message)) => Ok(InferOutcome::Refused(message)),
+        Err(err) => Err(err),
+    }
 }
 
 /// The thirteen request names, in [`StoreRequest`] order.
